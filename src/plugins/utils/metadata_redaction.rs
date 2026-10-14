@@ -475,10 +475,13 @@ fn names_key_material(text: &str) -> bool {
         let from_key = &text[offset..];
         // Fail closed: after a key-material qualifier, `key` followed by any
         // representation (`keyjwk`, `keystring`, `keyseed`) is key material,
-        // unless it starts an ordinary word (`keyboard`, `keyword`).
-        !BENIGN_KEY_WORD_PREFIXES
-            .iter()
-            .any(|word| from_key.starts_with(word))
+        // unless the rest of the text is exactly an ordinary word (or its
+        // plural): `keyboard` is ordinary, `keywordsbase64` is not.
+        !BENIGN_KEY_WORD_PREFIXES.iter().any(|word| {
+            from_key
+                .strip_prefix(word)
+                .is_some_and(|after| after.is_empty() || after == "s")
+        })
     })
 }
 
@@ -602,6 +605,14 @@ const BENIGN_LEADING_SHORT_CLASS_WORDS: &[&str] = &[
     "sessile",
 ];
 
+/// Owner qualifiers that make any following short-class compound a
+/// credential (`dbpin…`, `vendorsig…`, `usersid…`, `hsmpin…`).
+const SHORT_CLASS_OWNER_QUALIFIERS: &[&str] = &[
+    "db", "vendor", "user", "admin", "hsm", "sim", "card", "device", "master", "client", "api",
+    "app", "service", "root", "account", "login", "auth", "sms", "email", "totp", "hmac", "jwt",
+    "gpg", "pgp", "ssh", "tls", "door", "atm", "bank", "wallet", "puk",
+];
+
 /// Words that may follow a short credential class inside one segment
 /// (`pinvalue`, `vendorpincode`, `usersidhash`, `smsotpcode`).
 const SHORT_CLASS_TRAILERS: &[&str] = &[
@@ -655,6 +666,17 @@ fn has_qualified_short_class(lower: &str) -> bool {
                     || rest
                         .strip_prefix('s')
                         .is_some_and(|plural| !plural.is_empty() && is_credential_suffix(plural)))
+            {
+                return true;
+            }
+            // After a recognized owner qualifier (`db`, `vendor`, `user`, …)
+            // any representation fails closed (`dbpincleartext`,
+            // `vendorsigheader`); ordinary words such as `mapping` or `inside`
+            // have no such qualifier in front.
+            if !rest.is_empty()
+                && SHORT_CLASS_OWNER_QUALIFIERS
+                    .iter()
+                    .any(|owner| prefix.ends_with(owner))
             {
                 return true;
             }
