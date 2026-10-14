@@ -52,7 +52,9 @@ fn published_openapi_validator_fields_match_constructor_bounds_and_syntax() {
     let validator = openapi_validator_config_validator();
     for (patch, accepted) in [
         (json!({"max_body_bytes": 1}), true),
-        (json!({"max_body_bytes": u64::MAX}), true),
+        (json!({"max_body_bytes": 67_108_864}), true),
+        (json!({"max_body_bytes": 67_108_865}), false),
+        (json!({"max_body_bytes": u64::MAX}), false),
         (json!({"max_body_bytes": 0}), false),
         (json!({"max_body_bytes": -1}), false),
         (json!({"error_truncate_chars": 0}), true),

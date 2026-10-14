@@ -2549,10 +2549,39 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
                 "mode": "enforce",
                 "default_rule_action": "enforce",
                 "rule_modes": { "FE-XSS-001": "enforce" },
-                "global_exemptions": { "header_present": { "x-skip-waf": null } }
+                "global_exemptions": {
+                    "header_present": { "x-skip-waf": "trusted-hop-shared-secret" },
+                    "match": "any"
+                }
             }))
             .is_ok()
     );
+    for (exemptions, why) in [
+        (
+            json!({ "header_present": { "x-skip-waf": null } }),
+            "presence-only header_present entries are not admitted",
+        ),
+        (
+            json!({ "header_present": { "x-skip-waf": "short" } }),
+            "header_present values must be long shared secrets",
+        ),
+        (json!({ "match": "either" }), "match is all or any"),
+    ] {
+        assert!(
+            validator
+                .validate(&json!({ "global_exemptions": exemptions }))
+                .is_err(),
+            "{why}"
+        );
+    }
+    for value in ["allow", "fail_closed", "block"] {
+        assert!(
+            validator
+                .validate(&json!({ "on_unlisted_response_content_type": value }))
+                .is_ok(),
+            "on_unlisted_response_content_type {value} must be admitted"
+        );
+    }
     assert!(
         validator
             .validate(&json!({
@@ -7478,6 +7507,20 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         &json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": 0}),
         false,
     );
+    // Hard ceiling: component and constructor agree at and just above it.
+    for (limit, expected_valid) in [
+        (67_108_864_u64, true),
+        (67_108_865, false),
+        (u64::MAX, false),
+    ] {
+        let config = json!({"validate_xml": true, "grpc_max_decompressed_size_bytes": limit});
+        assert_component_validity(&spec, "BodyValidatorConfig", &config, expected_valid);
+        assert_eq!(
+            ferrum_edge::plugins::body_validator::BodyValidator::new(&config).is_ok(),
+            expected_valid,
+            "constructor must agree on grpc_max_decompressed_size_bytes={limit}"
+        );
+    }
     assert_component_validity(
         &spec,
         "BodyValidatorConfig",
@@ -15138,10 +15181,30 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         schema["properties"]["ttl_seconds"]["maximum"],
         json!(u64::MAX)
     );
+    // Issue #6612: `max_entries` sizes eviction bookkeeping, so it carries a
+    // hard admission ceiling instead of the whole u64 domain.
     assert_eq!(
         schema["properties"]["max_entries"]["maximum"],
-        json!(u64::MAX)
+        json!(10_000_000)
     );
+    for (max_entries, expected_valid) in [
+        (10_000_000_u64, true),
+        (10_000_001, false),
+        (u64::MAX, false),
+    ] {
+        let config = json!({"max_entries": max_entries});
+        assert_component_validity(&spec, "ResponseCachingConfig", &config, expected_valid);
+        assert_eq!(
+            ResponseCaching::new(&config).is_ok(),
+            expected_valid,
+            "component and constructor must agree on max_entries={max_entries}"
+        );
+        assert_eq!(
+            validate_plugin_config("response_caching", &config).is_ok(),
+            expected_valid,
+            "shared admission must agree on max_entries={max_entries}"
+        );
+    }
     assert_eq!(
         schema["properties"]["max_entry_size_bytes"]["maximum"],
         json!(u64::MAX)

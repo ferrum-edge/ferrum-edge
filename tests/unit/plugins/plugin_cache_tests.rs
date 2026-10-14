@@ -10064,7 +10064,7 @@ fn test_request_conditional_unbounded_trailer_policy_follows_waf_exemptions() {
         vec![enforcing_response_header_waf(
             "waf1",
             "p1",
-            json!({ "paths": ["/internal/*"], "consumers": ["trusted-partner"] }),
+            json!({ "paths": ["/internal/*"], "consumers": ["trusted-partner"], "match": "any" }),
         )],
     );
     let cache = PluginCache::new(&config).unwrap();

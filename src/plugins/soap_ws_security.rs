@@ -338,7 +338,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 use x509_parser::prelude::*;
 
 use crate::tls::source::{CertSource, MaterialKind, SecretString, load_material_blocking};
@@ -1019,6 +1019,54 @@ struct TrustedCert {
     /// controlled or personally identifying value. Operators map it to a
     /// Consumer by registering that string as the Consumer's username/id.
     principal: String,
+    /// Certificate validity window (`notBefore`/`notAfter`), as Unix seconds.
+    ///
+    /// A fingerprint pin authenticates the key, not its lifetime. The window
+    /// is enforced on every request so a pinned certificate stops being
+    /// trusted the moment it expires (or before it becomes valid), without
+    /// waiting for an operator to remove it from the trust list.
+    validity: CertValidityWindow,
+}
+
+/// Inclusive `notBefore..=notAfter` window of a pinned signer certificate.
+#[derive(Clone, Copy, Debug)]
+struct CertValidityWindow {
+    not_before: i64,
+    not_after: i64,
+}
+
+impl CertValidityWindow {
+    fn from_cert(cert: &X509Certificate<'_>) -> Self {
+        let validity = cert.validity();
+        Self {
+            not_before: validity.not_before.timestamp(),
+            not_after: validity.not_after.timestamp(),
+        }
+    }
+
+    fn contains(&self, now: DateTime<Utc>) -> bool {
+        let now = now.timestamp();
+        self.not_before <= now && now <= self.not_after
+    }
+
+    /// Admission-time check. A pinned certificate outside its window is still
+    /// loaded (so staged rotation and reloads keep working), but it is
+    /// refused on every request until it is valid, and the operator is told
+    /// now instead of discovering it from request failures.
+    fn warn_if_outside(&self, field: &str, index: usize, now: DateTime<Utc>) {
+        let now_ts = now.timestamp();
+        if now_ts > self.not_after {
+            warn!(
+                "soap_ws_security: `{field}[{index}]` has expired; signatures from it are \
+                 rejected until it is replaced"
+            );
+        } else if now_ts < self.not_before {
+            warn!(
+                "soap_ws_security: `{field}[{index}]` is not yet valid; signatures from it are \
+                 rejected until its notBefore time"
+            );
+        }
+    }
 }
 
 // ── Nonce cache entry ───────────────────────────────────────────────────────
@@ -1901,11 +1949,14 @@ impl SoapWsSecurity {
                 .as_ref()
                 .to_vec();
             let principal = format!("x509:sha256:{}", sha256_hex_lower(&der_bytes));
+            let validity = CertValidityWindow::from_cert(&cert);
+            validity.warn_if_outside("config.x509_signature.trusted_certs", index, Utc::now());
 
             trusted_certs.push(TrustedCert {
                 public_key_der,
                 fingerprint,
                 principal,
+                validity,
             });
         }
 
@@ -2130,11 +2181,14 @@ impl SoapWsSecurity {
                 .as_ref()
                 .to_vec();
             let principal = format!("x509:sha256:{}", sha256_hex_lower(&der_bytes));
+            let validity = CertValidityWindow::from_cert(&cert);
+            validity.warn_if_outside("config.saml.trusted_signing_certs", index, Utc::now());
 
             saml_trusted_signing_certs.push(TrustedCert {
                 public_key_der,
                 fingerprint,
                 principal,
+                validity,
             });
         }
 
@@ -3549,6 +3603,7 @@ impl SoapWsSecurity {
         security: Node<'a, 'i>,
         id_index: &DocumentIdIndex<'a, 'i>,
         envelope: &str,
+        now: DateTime<Utc>,
         budget: &mut WorkBudget,
     ) -> Result<&str, String> {
         let sig_node =
@@ -3615,6 +3670,11 @@ impl SoapWsSecurity {
         let Some(trusted) = trusted else {
             return Err("WS-Security: signing certificate is not trusted".to_string());
         };
+        if !trusted.validity.contains(now) {
+            return Err(
+                "WS-Security: signing certificate is outside its validity period".to_string(),
+            );
+        }
 
         // Verify the signature over the canonicalized SignedInfo node. Parsing
         // the full envelope preserves namespace declarations inherited from
@@ -3978,7 +4038,7 @@ impl SoapWsSecurity {
         // ── 1. Signature verification ─────────────────────────────────
         // Must run before any other check — every other field is
         // attacker-controlled until we know the IdP signed this assertion.
-        self.validate_saml_signature(assertion_node, envelope, budget)?;
+        self.validate_saml_signature(assertion_node, envelope, now, budget)?;
 
         // ── 2. Issuer trust ───────────────────────────────────────────
         let issuer_node = unique_ns_child(
@@ -4261,6 +4321,7 @@ impl SoapWsSecurity {
         &self,
         assertion_node: Node<'_, '_>,
         envelope: &str,
+        now: DateTime<Utc>,
         budget: &mut WorkBudget,
     ) -> Result<(), String> {
         let sig_node = unique_ns_child(
@@ -4338,7 +4399,13 @@ impl SoapWsSecurity {
             .find(|tc| tc.fingerprint == cert_fingerprint);
 
         let public_key_der = match trusted {
-            Some(tc) => &tc.public_key_der,
+            Some(tc) if tc.validity.contains(now) => &tc.public_key_der,
+            Some(_) => {
+                return Err(
+                    "WS-Security: SAML signing certificate is outside its validity period"
+                        .to_string(),
+                );
+            }
             None => {
                 return Err("WS-Security: SAML signing certificate is not trusted".to_string());
             }
@@ -5073,6 +5140,7 @@ impl SoapWsSecurity {
                 security,
                 &id_index,
                 envelope,
+                now,
                 &mut budget,
             ) {
                 Ok(cert_principal) => {
@@ -8188,7 +8256,8 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
-/// Parse WS-Security datetime formats (ISO 8601 variants).
+/// Parse WS-Security datetime formats (ISO 8601 variants with an explicit
+/// `Z` or `±hh:mm` zone designator).
 fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
     // Reject instants outside the representable WS-Security window. `chrono`'s
     // `%Y` accepts years far beyond four digits and its `DateTime` `Add`/`Sub`
@@ -8226,14 +8295,12 @@ fn parse_ws_datetime_unbounded(s: &str) -> Option<DateTime<Utc>> {
         }
     }
 
-    // Try without timezone (assume UTC)
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
-        return Some(dt.and_utc());
-    }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Some(dt.and_utc());
-    }
-
+    // A value without a zone designator is refused rather than assumed to be
+    // UTC. `xsd:dateTime` leaves such a value's instant undefined (it is
+    // local to an unknown zone), and WS-Security (`wsu:Created`/`Expires`)
+    // and SAML 2.0 (`NotBefore`/`NotOnOrAfter`) both require
+    // UTC with an explicit designator. Guessing would silently shift every
+    // freshness and validity window by the sender's UTC offset.
     None
 }
 
