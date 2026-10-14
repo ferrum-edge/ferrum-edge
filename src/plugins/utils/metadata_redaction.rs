@@ -348,11 +348,10 @@ const CREDENTIAL_KEY_QUALIFIERS: &[&str] = &[
     "jwt",
 ];
 
-/// Segments a key-material context stays open for after its qualifier, so
-/// algorithm, curve, size and mode descriptors in between (`private_ec_p256_key`,
-/// `signing_rsa_pss_key`, `private_rsa_2048_key`) never close it. Unlisted
-/// descriptors are not evidence of safety.
-const KEY_MATERIAL_CONTEXT_SEGMENTS: u8 = 4;
+// A key-material qualifier keeps the context open for the rest of the key,
+// so any number of algorithm, curve, size, encoding or mode descriptors in
+// between (`private_ec_p256_pkcs8_pem_key`) never closes it. Unlisted
+// descriptors are not evidence of safety.
 
 /// Complete metadata keys that name a policy OUTCOME about an assertion, not
 /// the assertion itself, compared case-insensitively against the WHOLE key.
@@ -407,8 +406,8 @@ const BENIGN_SHORT_CLASS_SEGMENTS: &[&str] = &[
 /// (`pinvalue`, `vendorpincode`, `usersidhash`, `smsotpcode`).
 const SHORT_CLASS_TRAILERS: &[&str] = &[
     "s", "value", "values", "code", "codes", "id", "ids", "number", "num", "hash", "data",
-    "string", "str", "secret", "seed", "key", "token", "block", "base64", "b64", "b64url", "hex",
-    "pem", "der", "raw", "bytes", "bin", "blob", "json", "enc", "encoded",
+    "string", "secret", "seed", "key", "token", "block", "base64", "b64", "b64url", "hex", "pem",
+    "der", "raw", "bytes", "bin", "blob", "json", "enc", "encoded",
 ];
 
 /// Short credential classes that only count inside a qualified compound,
@@ -433,7 +432,10 @@ fn has_qualified_short_class(lower: &str) -> bool {
             let rest = &lower[offset + class.len()..];
             // A real trailer word makes it a compound whatever precedes it;
             // the bare plural `s` only counts after a full qualifier.
-            if rest.len() >= 2 && SHORT_CLASS_TRAILERS.contains(&rest) {
+            if SHORT_CLASS_TRAILERS
+                .iter()
+                .any(|trailer| trailer.len() >= 2 && rest.starts_with(trailer))
+            {
                 return true;
             }
             !prefix.is_empty() && prefix.len() >= *min_prefix && (rest.is_empty() || rest == "s")
@@ -441,9 +443,8 @@ fn has_qualified_short_class(lower: &str) -> bool {
     })
 }
 
-/// Judge one lowercased segment. `in_key_context` says whether a
-/// key-material qualifier occurred within the last
-/// [`KEY_MATERIAL_CONTEXT_SEGMENTS`] segments.
+/// Judge one lowercased segment. `in_key_context` says whether any earlier
+/// segment of the key contained a key-material qualifier.
 fn lowered_segment_is_credential(lower: &str, in_key_context: bool) -> bool {
     CREDENTIAL_CLASS_SEGMENTS.contains(&lower)
         || (lower.len() > "token".len() && lower.ends_with("token"))
@@ -488,7 +489,7 @@ pub fn is_credential_class_metadata_key(key: &str) -> bool {
         return false;
     }
     let mut sensitive = false;
-    let mut key_context_remaining: u8 = 0;
+    let mut in_key_context = false;
     for_each_metadata_key_segment(key, |segment| {
         if sensitive {
             return;
@@ -509,14 +510,10 @@ pub fn is_credential_class_metadata_key(key: &str) -> bool {
             heap = segment.to_ascii_lowercase();
             heap.as_str()
         };
-        sensitive = lowered_segment_is_credential(lower, key_context_remaining > 0);
-        // A qualifier opens (or refreshes) the key-material window; every
-        // other segment spends one step of it.
-        key_context_remaining = if opens_key_context(lower) {
-            KEY_MATERIAL_CONTEXT_SEGMENTS
-        } else {
-            key_context_remaining.saturating_sub(1)
-        };
+        sensitive = lowered_segment_is_credential(lower, in_key_context);
+        // Once a qualifier appears, the context stays open for the rest of
+        // the key: a later `key` segment is key material.
+        in_key_context |= opens_key_context(lower);
     });
     sensitive
 }

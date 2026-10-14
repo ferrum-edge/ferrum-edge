@@ -629,6 +629,11 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "x-private-ec-p256-key",
     "mesh.private_ec_p256_key",
     "privateecp256key",
+    "x-sigBase64Url",
+    "x-dbPinValueHex",
+    "private_ec_p256_pkcs8_pem_key",
+    "mesh.private_ec_p256_pkcs8_pem_key",
+    "x-private-ec-p256-pkcs8-pem-der-key",
     // The outcome-signal exemption covers only its complete key.
     "session_id.assertion_out_of_scope",
     "HSM_PIN_ASSERTION_OUT_OF_SCOPE",

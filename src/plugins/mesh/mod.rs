@@ -102,6 +102,10 @@ mod tests {
                 "mesh.private_rsa2048_key".to_string(),
                 "sized-key-secret".to_string(),
             ),
+            (
+                "mesh.private_ec_p256_pkcs8_pem_key".to_string(),
+                "long-key-secret".to_string(),
+            ),
             ("tenant".to_string(), "acme".to_string()),
             (
                 "x-session-id".to_string(),

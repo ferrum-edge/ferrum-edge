@@ -336,8 +336,9 @@ credential stem or a qualified compound (`usersession`, `dbpassword`,
 `dbpwd`, `gpgpassphrase`, `idjwt`, `requestsignature`, `assertion`,
 `clientassertion`, `csrfvalue`, `totpseed`, `hsmpin`, `otpcode`, `mfasecret`),
 contains `jws`/`jwe`, contains a short class (`pin`, `sid`, `otp`, `sig`, `cred`)
-inside a qualified compound, meaning before a listed trailer word (`value`,
-`code`, `id`, `hash`, `base64`, `hex`, `pem`, …) or ending the segment after a
+inside a qualified compound, meaning followed by a listed trailer word
+(`value`, `code`, `id`, `hash`, `base64`, `hex`, `pem`, …, including composed
+trailers such as `valuehex` or `base64url`) or ending the segment after a
 qualifier of at least two letters (`dbpin`, `dbpinvalue`, `usersid`,
 `smsotpcode`, `sigbase64`, `vendorcred`; ordinary words such as `spin`,
 `hairpin`, `inside`, `design`, `footprint`, `signal`, `credit`, `sacred` and
@@ -346,11 +347,11 @@ linear in the key length. Key material counts when a
 segment contains a key-material qualifier (`private`, `access`, `secret`,
 `signing`, `session`, `client`, `master`, `encryption`, `decryption`, `ssh`,
 `pgp`, `gpg`, `hmac`, `jwt`) followed by `key` in the same segment
-(`privatekey`, `awsaccesskeyid`, `privateecp256key`), or when a segment
-containing `key` follows such a qualifier within four segments. Algorithm,
-curve, size and mode descriptors in between never close the window
-(`private_key`, `private_rsa_2048_key`, `private_ec_p256_key`,
-`signing_rsa_pss_key`), while `cache_key` and `routing_key` stay visible. Lowercase compounds are
+(`privatekey`, `awsaccesskeyid`, `privateecp256key`), or when a later segment
+of the key contains `key`. Any algorithm, curve, size, encoding or mode
+descriptors in between never close the context (`private_key`,
+`private_rsa_2048_key`, `private_ec_p256_key`, `signing_rsa_pss_key`,
+`private_ec_p256_pkcs8_pem_key`), while `cache_key` and `routing_key` stay visible. Lowercase compounds are
 recognized as well as camelCase ones, so a name normalized before
 classification (an HTTP header name such as `x-hsmpin`) is still caught. The
 only exemption is the complete documented outcome key

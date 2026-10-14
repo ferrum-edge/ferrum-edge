@@ -211,6 +211,9 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "DBPIN",
         "SIGBASE64",
         "PRIVATE_EC_P256_KEY",
+        "SIGBASE64URL",
+        "DBPINVALUEHEX",
+        "PRIVATE_EC_P256_PKCS8_PEM_KEY",
     ];
 
     for env_var in cases {
@@ -348,6 +351,9 @@ fn custom_header_tags_reject_credential_class_header_names() {
         "x-dbPin",
         "x-sigBase64",
         "x-private-ec-p256-key",
+        "x-sigBase64Url",
+        "x-dbPinValueHex",
+        "x-private-ec-p256-pkcs8-pem-key",
     ] {
         let error = workload_metrics_new_with_env_lookup_for_test(
             &json!({
