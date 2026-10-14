@@ -6000,6 +6000,37 @@ pub(crate) struct PluginCacheInner {
     /// single `ArcSwap` load — never by scanning plugins and never by
     /// retaining a stale removed/replaced instance across reloads.
     mesh_bpf_metrics_exporter: Option<crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter>,
+    /// Precomputed request views for this generation (issue #6671): a view
+    /// is a pure function of the resolved protocol entry plus the request
+    /// key's buffering/frame/envelope flags, so it is built once here and
+    /// shared as an `Arc` instead of cloning ~15 `Arc`s and re-running
+    /// four map lookups per request. Populated by
+    /// [`PluginCacheInner::build_request_views`] inside
+    /// [`PluginCacheInner::new`] before the generation is published; any
+    /// key not present (defensive) falls back to computing the view
+    /// exactly as before.
+    request_views: RequestViewSnapshot,
+}
+
+/// Mirror of [`ProtocolSnapshot`]'s resolution shape for precomputed
+/// [`PluginCacheRequestView`]s: per-key per-protocol views, global views
+/// for keys with no proxy entry, and the composed gRPC-Web views.
+#[derive(Clone, Default)]
+struct RequestViewSnapshot {
+    proxy: HashMap<String, HashMap<ProxyProtocol, Arc<PluginCacheRequestView>>>,
+    global: HashMap<ProxyProtocol, Arc<PluginCacheRequestView>>,
+    grpc_web_proxy: HashMap<String, Arc<PluginCacheRequestView>>,
+    grpc_web_global: Option<Arc<PluginCacheRequestView>>,
+}
+
+/// The four per-key flags a request view derives outside the resolved
+/// protocol entry (buffering/frame/envelope requirements).
+#[derive(Clone, Copy)]
+struct RequestViewFlags {
+    requires_response_body_buffering: bool,
+    requires_request_body_buffering: bool,
+    requires_ws_frame_hooks: bool,
+    uses_openai_auth_error_envelope: bool,
 }
 
 /// Advance or assign per-proxy lifecycle ownership generations for `config`.
@@ -6147,7 +6178,7 @@ impl PluginCacheInner {
             crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter,
         >,
     ) -> Self {
-        Self {
+        let mut inner = Self {
             proxy_plugins,
             global_plugins,
             requires_buffering,
@@ -6167,7 +6198,90 @@ impl PluginCacheInner {
             proxy_lifecycle_generations,
             proxy_lifecycle_generation_high_water,
             mesh_bpf_metrics_exporter,
+            request_views: RequestViewSnapshot::default(),
+        };
+        inner.request_views = inner.build_request_views();
+        inner
+    }
+
+    /// The flag set a request view for `proxy_key` carries beyond its
+    /// resolved protocol entry.
+    fn request_view_flags(&self, proxy_key: &str) -> RequestViewFlags {
+        RequestViewFlags {
+            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
+            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
+            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
+            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
         }
+    }
+
+    /// The flag set for a key present in none of the per-proxy maps: every
+    /// per-key lookup falls back to the global flag.
+    fn global_request_view_flags(&self) -> RequestViewFlags {
+        RequestViewFlags {
+            requires_response_body_buffering: self.global_requires_buffering,
+            requires_request_body_buffering: self.global_requires_request_buffering,
+            requires_ws_frame_hooks: self.global_requires_ws_frame,
+            uses_openai_auth_error_envelope: self.global_openai_auth_error_envelope,
+        }
+    }
+
+    /// Build every request view this generation can serve, replicating
+    /// [`Self::request_view`] / [`Self::grpc_web_request_view`] resolution
+    /// exactly: for each key known to any per-proxy map, the view for
+    /// every protocol (entry resolved with the usual global fallback,
+    /// flags from that key); for unknown keys, the global views (global
+    /// entry, global flags), which is what the per-request computation
+    /// produced for them since every per-key map misses.
+    fn build_request_views(&self) -> RequestViewSnapshot {
+        let mut keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        keys.extend(self.protocol_snapshot.proxy.keys().map(String::as_str));
+        keys.extend(
+            self.protocol_snapshot
+                .grpc_web_proxy
+                .keys()
+                .map(String::as_str),
+        );
+        keys.extend(self.requires_buffering.keys().map(String::as_str));
+        keys.extend(self.requires_request_buffering.keys().map(String::as_str));
+        keys.extend(self.requires_ws_frame.keys().map(String::as_str));
+        keys.extend(self.openai_auth_error_envelope.keys().map(String::as_str));
+
+        let mut snapshot = RequestViewSnapshot::default();
+        for key in &keys {
+            let flags = self.request_view_flags(key);
+            let mut per_protocol = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
+            for &protocol in &ALL_PROXY_PROTOCOLS {
+                let view = match self.protocol_entry(key, protocol) {
+                    Some(entry) => Self::view_from_entry_with_flags(entry, flags),
+                    None => Self::empty_view_with_flags(flags),
+                };
+                per_protocol.insert(protocol, Arc::new(view));
+            }
+            snapshot.proxy.insert((*key).to_owned(), per_protocol);
+            let grpc_web_entry = self
+                .protocol_snapshot
+                .grpc_web_proxy
+                .get(*key)
+                .unwrap_or(&self.protocol_snapshot.grpc_web_global);
+            snapshot.grpc_web_proxy.insert(
+                (*key).to_owned(),
+                Arc::new(Self::view_from_entry_with_flags(grpc_web_entry, flags)),
+            );
+        }
+        let global_flags = self.global_request_view_flags();
+        for &protocol in &ALL_PROXY_PROTOCOLS {
+            let view = match self.protocol_snapshot.global.get(&protocol) {
+                Some(entry) => Self::view_from_entry_with_flags(entry, global_flags),
+                None => Self::empty_view_with_flags(global_flags),
+            };
+            snapshot.global.insert(protocol, Arc::new(view));
+        }
+        snapshot.grpc_web_global = Some(Arc::new(Self::view_from_entry_with_flags(
+            &self.protocol_snapshot.grpc_web_global,
+            global_flags,
+        )));
+        snapshot
     }
 
     fn apply_tcp_connection_throttle_cleanup_intervals(&self) {
@@ -6414,17 +6528,32 @@ impl PluginCacheInner {
         namespace: &str,
         proxy_id: &str,
         protocol: ProxyProtocol,
-    ) -> PluginCacheRequestView {
+    ) -> Arc<PluginCacheRequestView> {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             let proxy_key = key.as_str();
+            // Precomputed at generation build (issue #6671); the fallback
+            // recomputes exactly the pre-#6671 per-request view.
+            if let Some(view) = self
+                .request_views
+                .proxy
+                .get(proxy_key)
+                .and_then(|per_protocol| per_protocol.get(&protocol))
+            {
+                return Arc::clone(view);
+            }
+            if !self.request_views.proxy.contains_key(proxy_key)
+                && let Some(view) = self.request_views.global.get(&protocol)
+            {
+                return Arc::clone(view);
+            }
             // One protocol lookup per request instead of one per field: every
             // per-field getter resolves this same entry (issue #5588).
-            match self.protocol_entry(proxy_key, protocol) {
+            Arc::new(match self.protocol_entry(proxy_key, protocol) {
                 Some(entry) => self.request_view_from_entry(proxy_key, entry),
                 None => self.empty_request_view(proxy_key),
-            }
+            })
         })
     }
 
@@ -6434,6 +6563,13 @@ impl PluginCacheInner {
         &self,
         proxy_key: &str,
         entry: &ProtocolEntry,
+    ) -> PluginCacheRequestView {
+        Self::view_from_entry_with_flags(entry, self.request_view_flags(proxy_key))
+    }
+
+    fn view_from_entry_with_flags(
+        entry: &ProtocolEntry,
+        flags: RequestViewFlags,
     ) -> PluginCacheRequestView {
         let capabilities = entry.phase.capabilities;
         let backend_path_plugins = capabilities
@@ -6464,10 +6600,10 @@ impl PluginCacheInner {
             response_presentation_policy_digest: entry.phase.response_presentation_policy_digest,
             early_route_total_plan: Arc::clone(&entry.phase.early_route_total_plan),
             capabilities,
-            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
+            requires_response_body_buffering: flags.requires_response_body_buffering,
+            requires_request_body_buffering: flags.requires_request_body_buffering,
+            requires_ws_frame_hooks: flags.requires_ws_frame_hooks,
+            uses_openai_auth_error_envelope: flags.uses_openai_auth_error_envelope,
             enforced_request_body_limit: entry.phase.enforced_request_body_limit,
             enforced_response_body_limit: entry.phase.enforced_response_body_limit,
         }
@@ -6476,6 +6612,10 @@ impl PluginCacheInner {
     /// The request view when no protocol entry resolves: every per-field
     /// getter's `None` default.
     fn empty_request_view(&self, proxy_key: &str) -> PluginCacheRequestView {
+        Self::empty_view_with_flags(self.request_view_flags(proxy_key))
+    }
+
+    fn empty_view_with_flags(flags: RequestViewFlags) -> PluginCacheRequestView {
         PluginCacheRequestView {
             plugins: Arc::new(Vec::new()),
             grpc_deadline_plugins: Arc::new(Vec::new()),
@@ -6493,10 +6633,10 @@ impl PluginCacheInner {
             response_presentation_policy_digest: None,
             early_route_total_plan: Arc::default(),
             capabilities: PluginCapabilities::default(),
-            requires_response_body_buffering: self.requires_response_body_buffering(proxy_key),
-            requires_request_body_buffering: self.requires_request_body_buffering(proxy_key),
-            requires_ws_frame_hooks: self.requires_ws_frame_hooks(proxy_key),
-            uses_openai_auth_error_envelope: self.uses_openai_auth_error_envelope(proxy_key),
+            requires_response_body_buffering: flags.requires_response_body_buffering,
+            requires_request_body_buffering: flags.requires_request_body_buffering,
+            requires_ws_frame_hooks: flags.requires_ws_frame_hooks,
+            uses_openai_auth_error_envelope: flags.uses_openai_auth_error_envelope,
             enforced_request_body_limit: None,
             enforced_response_body_limit: None,
         }
@@ -6506,17 +6646,25 @@ impl PluginCacheInner {
         &self,
         namespace: &str,
         proxy_id: &str,
-    ) -> PluginCacheRequestView {
+    ) -> Arc<PluginCacheRequestView> {
         PROXY_KEY_BUF.with(|buf| {
             let mut key = buf.borrow_mut();
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             let proxy_key = key.as_str();
+            if let Some(view) = self.request_views.grpc_web_proxy.get(proxy_key) {
+                return Arc::clone(view);
+            }
+            if !self.request_views.grpc_web_proxy.contains_key(proxy_key)
+                && let Some(view) = &self.request_views.grpc_web_global
+            {
+                return Arc::clone(view);
+            }
             let entry = self
                 .protocol_snapshot
                 .grpc_web_proxy
                 .get(proxy_key)
                 .unwrap_or(&self.protocol_snapshot.grpc_web_global);
-            self.request_view_from_entry(proxy_key, entry)
+            Arc::new(self.request_view_from_entry(proxy_key, entry))
         })
     }
 }
@@ -7216,12 +7364,16 @@ impl PluginCache {
         namespace: &str,
         proxy_id: &str,
         protocol: ProxyProtocol,
-    ) -> PluginCacheRequestView {
+    ) -> Arc<PluginCacheRequestView> {
         let inner = self.inner.load();
         inner.request_view(namespace, proxy_id, protocol)
     }
 
-    pub fn grpc_web_request_view(&self, namespace: &str, proxy_id: &str) -> PluginCacheRequestView {
+    pub fn grpc_web_request_view(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Arc<PluginCacheRequestView> {
         let inner = self.inner.load();
         inner.grpc_web_request_view(namespace, proxy_id)
     }

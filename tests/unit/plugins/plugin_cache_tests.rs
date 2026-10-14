@@ -832,6 +832,89 @@ fn client_selected_flavor_views_flag_an_omitted_route_admission_policy() {
     }
 }
 
+#[test]
+fn request_views_are_precomputed_shared_and_flag_exact() {
+    // Issue #6671: views are built once per generation and shared as Arcs.
+    // The standalone per-flag accessors resolve through their own maps, so
+    // flag parity against them is an independent check that the
+    // precomputation replicated per-request view construction exactly —
+    // including the global fallback for unknown proxies.
+    let config = make_config(
+        vec![
+            make_proxy("cached", "/cached", vec!["cache"]),
+            make_proxy("keyed", "/keyed", vec!["key"]),
+            make_proxy("bare", "/bare", vec![]),
+        ],
+        vec![
+            make_plugin_config(
+                "cache",
+                "response_caching",
+                PluginScope::Proxy,
+                Some("cached"),
+                true,
+            ),
+            make_plugin_config("key", "key_auth", PluginScope::Proxy, Some("keyed"), true),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    for proxy in ["cached", "keyed", "bare", "no-such-proxy"] {
+        for protocol in [
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+            ProxyProtocol::Tcp,
+            ProxyProtocol::Udp,
+        ] {
+            let first = cache.request_view("ferrum", proxy, protocol);
+            let second = cache.request_view("ferrum", proxy, protocol);
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "{proxy} {protocol:?}: view must be the precomputed shared Arc"
+            );
+            assert_eq!(
+                first.requires_response_body_buffering(),
+                cache.requires_response_body_buffering("ferrum", proxy),
+                "{proxy} {protocol:?} response buffering"
+            );
+            assert_eq!(
+                first.requires_request_body_buffering(),
+                cache.requires_request_body_buffering("ferrum", proxy),
+                "{proxy} {protocol:?} request buffering"
+            );
+            assert_eq!(
+                first.requires_ws_frame_hooks(),
+                cache.requires_ws_frame_hooks("ferrum", proxy),
+                "{proxy} {protocol:?} ws frame hooks"
+            );
+            assert_eq!(
+                first.uses_openai_auth_error_envelope(),
+                cache.uses_openai_auth_error_envelope("ferrum", proxy),
+                "{proxy} {protocol:?} openai envelope"
+            );
+        }
+        let grpc_web_first = cache.grpc_web_request_view("ferrum", proxy);
+        let grpc_web_second = cache.grpc_web_request_view("ferrum", proxy);
+        assert!(
+            Arc::ptr_eq(&grpc_web_first, &grpc_web_second),
+            "{proxy}: gRPC-Web view must be the precomputed shared Arc"
+        );
+        assert_eq!(
+            grpc_web_first.requires_response_body_buffering(),
+            cache.requires_response_body_buffering("ferrum", proxy),
+            "{proxy} gRPC-Web response buffering"
+        );
+    }
+
+    // Two distinct unknown proxies resolve to the one shared global view.
+    let unknown_a = cache.request_view("ferrum", "ghost-a", ProxyProtocol::Http);
+    let unknown_b = cache.request_view("ferrum", "ghost-b", ProxyProtocol::Http);
+    assert!(Arc::ptr_eq(&unknown_a, &unknown_b));
+    // A known proxy's view is never the global one.
+    let bare = cache.request_view("ferrum", "bare", ProxyProtocol::Http);
+    assert!(!Arc::ptr_eq(&bare, &unknown_a));
+}
+
 /// A timestamp-only `soap_ws_security` policy: freshness enforcement with no
 /// identity, so the plugin is not an auth plugin but still refuses requests.
 fn timestamp_only_soap_config() -> serde_json::Value {

@@ -2305,7 +2305,7 @@ impl HboneAdmissionFence {
 fn admitting_request_view(
     snapshot: &HboneAdmissionSnapshot,
     epoch: &RequestEpoch,
-) -> PluginCacheRequestView {
+) -> std::sync::Arc<PluginCacheRequestView> {
     let proxy = &snapshot.proxy;
     if snapshot.grpc_web_request {
         epoch
