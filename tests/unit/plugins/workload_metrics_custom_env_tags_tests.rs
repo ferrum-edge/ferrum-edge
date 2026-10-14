@@ -214,6 +214,8 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "SIGBASE64URL",
         "DBPINVALUEHEX",
         "DBPINUTF8",
+        "SIGNINGKEYBASE64URL",
+        "SIGNINGKEY1",
         "PRIVATE_EC_P256_PKCS8_PEM_KEY",
     ];
 
@@ -358,6 +360,7 @@ fn custom_header_tags_reject_credential_class_header_names() {
         "x-dbPinValueHex",
         "x-dbPinUtf8",
         "x-pin1",
+        "x-signingKeyBase64Url",
         // The metadata-only outcome-key exemption never covers a header.
         "mesh_authz.ignored_baggage.assertion_out_of_scope",
         "x-private-ec-p256-pkcs8-pem-key",

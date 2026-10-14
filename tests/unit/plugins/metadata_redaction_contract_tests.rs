@@ -9,7 +9,7 @@ use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema};
 use ferrum_edge::plugins::utils::metadata_redaction::{
     INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_dedup_internal_metadata_key,
-    is_internal_only_metadata_key, is_mesh_metrics_internal_metadata_key,
+    is_internal_only_metadata_key, is_mesh_metrics_internal_metadata_key, is_sensitive_header_name,
     is_sensitive_metadata_key_with_extras, parse_extras_list, strip_dedup_internal_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
@@ -633,6 +633,10 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "x-dbPinUtf8",
     "x-pin1",
     "ssh_keys",
+    "signingKeyBase64Url",
+    "signingkeybase64url",
+    "signingkey1",
+    "mesh.signingkeybase64url",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",
     "mesh.private_ec_p256_pkcs8_pem_key",
@@ -667,6 +671,8 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "residency",
     "data_residency",
     "client_keyboard_layout",
+    "client_keyword",
+    "client_keyspace",
 ];
 
 #[test]
@@ -755,4 +761,16 @@ fn credential_class_classification_is_linear_on_overlapping_algorithm_words() {
         "classification took {:?}",
         started.elapsed()
     );
+}
+
+/// The outcome-key exemption is metadata-only: header names (debugger,
+/// transcript-audit header capture, cache vary hashing, telemetry header
+/// tags) are caller or upstream data and never take it.
+#[test]
+fn header_names_never_take_the_metadata_outcome_exemption() {
+    let exempt = "mesh_authz.ignored_baggage.assertion_out_of_scope";
+    assert!(!is_sensitive_metadata_key_with_extras(exempt, &[]));
+    assert!(is_sensitive_header_name(exempt));
+    assert!(is_sensitive_header_name("x-session-id"));
+    assert!(!is_sensitive_header_name("x-request-id"));
 }

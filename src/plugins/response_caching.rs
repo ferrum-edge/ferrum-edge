@@ -453,7 +453,7 @@ fn is_auto_sensitive_vary_header(header: &str) -> bool {
 
 fn should_hash_vary_header_value(header: &str) -> bool {
     is_auto_sensitive_vary_header(header)
-        || super::utils::metadata_redaction::is_sensitive_metadata_key(header)
+        || super::utils::metadata_redaction::is_sensitive_header_name(header)
 }
 
 fn should_snapshot_header_value_as_cache_key_part(header: &str) -> bool {

@@ -382,13 +382,20 @@ const KEY_MATERIAL_TRAILERS: &[&str] = &[
     "hex", "json", "material", "pair", "raw", "blob", "bin", "string", "secret",
 ];
 
-/// Whether `text` contains `key` / `keys` that ends it or is followed only by a
-/// key-material trailer (`key`, `rsakey`, `keypem`, `p256keyid`).
+/// Whether `text` contains `key` / `keys` that ends it, is followed by digits,
+/// or is followed by a key-material trailer (`key`, `rsakey`, `keypem`,
+/// `p256keyid`, `keybase64url`, `key1`).
 fn names_key_material(text: &str) -> bool {
     text.match_indices("key").any(|(offset, _)| {
         let rest = &text[offset + "key".len()..];
         let rest = rest.strip_prefix('s').unwrap_or(rest);
-        rest.is_empty() || KEY_MATERIAL_TRAILERS.contains(&rest)
+        // Empty, numbered (`signingkey1`), or starting with a material trailer,
+        // including composed ones (`keybase64url`, `keypemfile`).
+        rest.is_empty()
+            || rest.bytes().all(|byte| byte.is_ascii_digit())
+            || KEY_MATERIAL_TRAILERS
+                .iter()
+                .any(|trailer| rest.starts_with(trailer))
     })
 }
 
