@@ -28,17 +28,6 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `soap_ws_security` checks pinned certificate validity and refuses zoneless instants (PR #6632)
-
-A certificate in `x509_signature.trusted_certs` or
-`saml.trusted_signing_certs` is now trusted only between its `notBefore` and
-`notAfter`. Signatures from an expired or not-yet-valid pin get `401`. Such a
-pin still loads, with a warning, so a replacement can be staged ahead of its
-`notBefore`. Before upgrading, replace any pinned certificate that has expired.
-`xsd:dateTime` values without a `Z` or `±hh:mm` designator (Timestamp,
-PasswordDigest `Created`, SAML `Conditions`/`SubjectConfirmationData`) are now
-rejected. Make sure partners send UTC instants with a designator.
-
 ### Shared consumer credentials are refused (#6572)
 
 Consumers whose `id`, `username` or `custom_id` collide are still quarantined

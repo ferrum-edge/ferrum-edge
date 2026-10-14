@@ -9,18 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `soap_ws_security` enforces the validity window of pinned
-  signer certificates and requires zoned instants** (issue n/a, PR #6632).
-  A certificate in
-  `x509_signature.trusted_certs` or `saml.trusted_signing_certs` is now
-  trusted only between its `notBefore` and `notAfter`: a signature from an
-  expired or not-yet-valid pin is refused with `401`. Such a pin is still
-  admitted (so replacements can be staged and reloads keep working) but is
-  logged as a warning when the plugin is built. `xsd:dateTime` values without
-  a `Z` or `±hh:mm` designator (Timestamp, PasswordDigest UsernameToken
-  `Created`, SAML `Conditions`/`SubjectConfirmationData` bounds) are now
-  rejected instead of being read as UTC. The docs now spell out the risk of the opt-in `rsa-sha1`
-  / `sha1` algorithms.
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
