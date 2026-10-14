@@ -13,7 +13,11 @@ status-check rulesets trust). So every workflow must state its own default:
 * a workflow that pull-request, push, merge-queue, or `workflow_run` events
   can start keeps a read-only (or empty) top-level default. Jobs that need a
   write scope ask for it in their own job-level `permissions:` block, where
-  review sees it next to the steps that use it.
+  review sees it next to the steps that use it;
+* every `actions/checkout` step, in a workflow or a local composite action,
+  states `persist-credentials: false`, so the token is not persisted for later
+  steps. `true` is admitted only in a workflow started solely by `schedule`
+  or `workflow_dispatch` (#6581).
 
 Executed by verify_required_ci.py inside the `Tests` aggregate, so a pull
 request that adds or edits a workflow without explicit permissions fails CI.
@@ -23,9 +27,11 @@ from __future__ import annotations
 
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 WORKFLOW_DIR = Path(".github/workflows")
+ACTIONS_DIR = Path(".github/actions")
 
 # Events whose runs a contributor can start by opening, updating, queueing, or
 # pushing code, rather than only by a maintainer dispatch or a schedule.
@@ -50,6 +56,43 @@ SCOPE_LINE = re.compile(
 FLOW_ENTRY = re.compile(r"^\s*" + QUOTED.format("scope") + r"\s*:\s*" + QUOTED.format("level") + r"\s*$")
 EVENT_NAME = re.compile(r"^\s*" + QUOTED.format("event") + r"\s*$")
 EVENT_LINE = re.compile(r"^  " + QUOTED.format("event") + r"\s*:(?:\s.*)?$")
+# Block-style step keys only; `lead` ends where the key starts, so its length
+# is the step's key column whether or not the key sits on the `- ` line.
+# GitHub resolves owner/repo case-insensitively, so `Actions/Checkout@` is the
+# same action and must be matched the same way.
+CHECKOUT_USES = re.compile(
+    r"^(?P<lead> *(?:- +)?)uses *: *(?i:actions/checkout)@[0-9a-f]{40} *(?:#.*)?$"
+)
+# Any `uses` key, block or flow, after escapes are resolved. Its value must be
+# one plain literal on this line: no quotes left open, aliases, tags, or block
+# scalars, so a reference cannot be assembled where this reader cannot see it.
+USES_KEY_LINE = re.compile(r"^ *(?:- +)?[\"']?uses[\"']? *:(?P<value>.*)$", re.IGNORECASE)
+FLOW_USES_KEY = re.compile(r"[{,] *[\"']?uses[\"']? *:", re.IGNORECASE)
+WITH_KEY = re.compile(r"^(?P<lead> *(?:- +)?)with *:(?P<rest>.*)$")
+JOB_KEY = re.compile(r"^  (?P<job>[A-Za-z0-9_-]+): *(?:#.*)?$")
+# Checkouts inside jobs whose bytes the trusted Cross policy
+# (`verify_cross_build_policy.py`) freezes: the release ARM64 publication
+# dependency contract and the required live suites' trusted relevance/execution
+# contracts. A pull request cannot change them, so they keep the action default
+# until a reviewed policy migration adds `persist-credentials: false`. A missing
+# key is the only thing admitted here; `true` is still refused.
+POLICY_FROZEN_CHECKOUT_JOBS = frozenset(
+    {
+        ("release.yml", "create-release"),
+        ("release.yml", "docker"),
+        ("release.yml", "docker-ebpf"),
+        ("ambient-host-udp-live.yml", "changes"),
+        ("ambient-host-udp-live.yml", "ambient-host-udp-live"),
+        ("cni-lifecycle-live.yml", "changes"),
+        ("istio-status-cas-live.yml", "changes"),
+        ("mesh-e2e-sidecar-live.yml", "changes"),
+        ("multicluster-federation-live.yml", "changes"),
+        ("multicluster-poller-partition-live.yml", "changes"),
+    }
+)
+PERSIST_LINE = re.compile(
+    r"^ +persist-credentials *: *(?P<q>[\"']?)(?P<value>[A-Za-z]+)(?P=q) *(?:#.*)?$"
+)
 
 
 def _strip_comment(value: str) -> str:
@@ -175,6 +218,273 @@ def workflow_permission_errors(text: str, source: str) -> list[str]:
     return errors
 
 
+PERSIST_TRUE_TRIGGERS = frozenset({"schedule", "workflow_dispatch"})
+ESCAPE = re.compile(r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|.)")
+
+
+def _decode_escapes(line: str) -> str:
+    """Resolve every backslash escape on the line, quoted or not.
+
+    Deliberately over-eager: YAML decodes escapes only inside double quotes,
+    and deciding where those start needs a full lexer. Decoding everywhere can
+    only reveal more, so an escaped `actions\\u002fcheckout` is always seen.
+    """
+
+    def unescape(match: re.Match[str]) -> str:
+        code = match.group(1)
+        if code[0] in "xuU" and len(code) > 1:
+            try:
+                return chr(int(code[1:], 16))
+            except ValueError:
+                return code
+        return code
+
+    return ESCAPE.sub(unescape, line)
+
+
+CHILD_INPUT = re.compile(r"^ *(?P<key>[A-Za-z0-9_-]+) *:(?: +(?P<value>.*))?$")
+# Step keys whose empty value opens a nested mapping this reader understands.
+STEP_MAPPING_KEYS = frozenset({"with", "env"})
+SINGLE_QUOTED_VALUE = re.compile(r"^'(?:[^']|'')*' *(?:#.*)?$")
+DOUBLE_QUOTED_VALUE = re.compile(r'^"(?:[^"\\]|\\.)*" *(?:#.*)?$')
+
+
+def _single_line_input(line: str, mapping_keys: frozenset[str] = frozenset()) -> bool:
+    """Whether a key's value is complete on this line and cannot continue onward.
+
+    Block scalars (`|`, `>`) are fine: their bodies are indented deeper than
+    the key and are skipped. Quoted and flow values must close on this line.
+    An empty value is admitted only for the named mapping keys: elsewhere it
+    lets a scalar start on the next, deeper line and swallow what follows.
+    """
+
+    match = CHILD_INPUT.match(line)
+    if match is None:
+        return False
+    value = (match.group("value") or "").strip()
+    if not value or value.startswith("#"):
+        return match.group("key") in mapping_keys
+    if value.startswith("'"):
+        return SINGLE_QUOTED_VALUE.match(value) is not None
+    if value.startswith('"'):
+        return DOUBLE_QUOTED_VALUE.match(value) is not None
+    if value.startswith(("[", "{")):
+        # Only simple flow collections: a quote inside could hold the closing
+        # bracket and carry the value onto later lines.
+        closing = "]" if value[0] == "[" else "}"
+        return "'" not in value and '"' not in value and _strip_comment(value).endswith(closing)
+    if value.startswith(("&", "*", "!")):
+        return False  # anchors, aliases, and tags are not read here
+    return True
+
+
+BLOCK_SCALAR_HEADER = re.compile(r"(?:^|[ :-]) *[|>][1-9+-]{0,2} *(?:#.*)?$")
+EXPLICIT_KEY = re.compile(r"^ *(?:- +)?[?:](?: |$)")
+
+
+def _block_scalar_body_lines(lines: list[str]) -> set[int]:
+    """Indices of lines inside `|` / `>` block scalar bodies (e.g. `run: |`)."""
+
+    body: set[int] = set()
+    header_indent: int | None = None
+    for number, line in enumerate(lines):
+        if header_indent is not None:
+            if not line.strip() or _indent(line) > header_indent:
+                body.add(number)
+                continue
+            header_indent = None
+        if _is_content(line) and BLOCK_SCALAR_HEADER.search(line.rstrip()):
+            header_indent = _indent(line)
+    return body
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _is_content(line: str) -> bool:
+    return bool(line.strip()) and not line.lstrip().startswith("#")
+
+
+def checkout_credential_errors(text: str, source: str, *, composite: bool = False) -> list[str]:
+    """Every `actions/checkout` step states `persist-credentials` explicitly.
+
+    The action's default (`true`) writes the job's `GITHUB_TOKEN` to a
+    credentials file under `$RUNNER_TEMP` that the checkout's `.git/config`
+    includes, so every later step, build script, and test can read it or use
+    it through git (#6581). A checkout must say `persist-credentials: false`. `true` is
+    admitted only in a workflow started solely by `schedule` or
+    `workflow_dispatch` (not a reusable `workflow_call` callee), for jobs that
+    push with the persisted token. Only direct children of `with:` count as
+    inputs, YAML-escaped checkout references are refused, and any spelling this
+    line-based reader cannot follow fails closed.
+    """
+
+    lines = text.splitlines()
+    triggers = workflow_triggers(text)
+    # `true` is only for scheduled or manual pushers. Anything else, including a
+    # reusable `workflow_call` callee that a pull-request workflow can invoke,
+    # or an unreadable trigger set, must say `false`.
+    # A composite action runs inside whatever workflow calls it; an `on:` key in
+    # its metadata is ignored by the runner and restricts nothing.
+    true_admitted = (
+        not composite and triggers is not None and triggers <= PERSIST_TRUE_TRIGGERS
+    )
+    errors: list[str] = []
+    block_bodies = _block_scalar_body_lines(lines)
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            continue
+        located = f"{source}:{index + 1}"
+        if index not in block_bodies and EXPLICIT_KEY.match(line):
+            errors.append(
+                f"{located} uses an explicit YAML key (`?` / `:` line); write plain "
+                "`key: value` mappings so checkout steps can be verified"
+            )
+            continue
+        decoded = _decode_escapes(line)
+        if FLOW_USES_KEY.search(decoded):
+            errors.append(
+                f"{located} declares a step `uses` in flow style; write steps in "
+                "block style so checkout credentials can be verified"
+            )
+            continue
+        uses_key = USES_KEY_LINE.match(decoded)
+        if uses_key is not None:
+            value = uses_key.group("value").strip()
+            if value.startswith(("*", "&", "!", "|", ">")) or not _single_line_input(
+                f"uses: {value}"
+            ):
+                errors.append(
+                    f"{located} `uses` must be one literal value on its own line "
+                    "(no alias, tag, block scalar, or open quote)"
+                )
+                continue
+        if "actions/checkout" not in decoded.lower():
+            continue
+        match = CHECKOUT_USES.match(line)
+        if match is None or decoded != line:
+            errors.append(
+                f"{located} must reference actions/checkout as a literal block-style "
+                "`uses: actions/checkout@<40-hex SHA>` step key so persist-credentials "
+                "can be verified"
+            )
+            continue
+        key_indent = len(match.group("lead"))
+        start = index
+        if "-" not in match.group("lead"):
+            start = -1
+            for back in range(index - 1, -1, -1):
+                if _is_content(lines[back]) and _indent(lines[back]) < key_indent:
+                    start = back
+                    break
+            dash_line = lines[start] if start >= 0 else ""
+            if not dash_line.lstrip().startswith("- ") or (
+                _indent(dash_line) + 2 != key_indent
+            ):
+                errors.append(f"{located} checkout step start could not be read")
+                continue
+        end = index + 1
+        while end < len(lines) and not (
+            _is_content(lines[end]) and _indent(lines[end]) < key_indent
+        ):
+            end += 1
+        # Every step key must be one complete line. A quoted or flow value left
+        # open (`name: 'x`) would swallow later lines that only look like a
+        # `with:` mapping.
+        step_keys_readable = True
+        for number in range(start, end):
+            step_line = lines[number]
+            if not _is_content(step_line):
+                continue
+            if number == start and step_line.lstrip().startswith("- "):
+                step_line = " " * key_indent + step_line.lstrip()[2:].lstrip()
+            if _indent(step_line) == key_indent and not _single_line_input(
+                step_line, STEP_MAPPING_KEYS
+            ):
+                step_keys_readable = False
+                break
+        if not step_keys_readable:
+            errors.append(
+                f"{located} checkout step keys must each be one complete `key: value` "
+                "line; a value left open across lines is refused"
+            )
+            continue
+        with_lines = [
+            number
+            for number in range(start, end)
+            if WITH_KEY.match(lines[number]) is not None
+            and len(WITH_KEY.match(lines[number]).group("lead")) == key_indent
+        ]
+        values: list[str] = []
+        unreadable = False
+        if len(with_lines) > 1:
+            unreadable = True
+        for number in with_lines:
+            if _strip_comment(WITH_KEY.match(lines[number]).group("rest")):
+                unreadable = True  # flow mapping or scalar: not read here
+                continue
+            # Only direct children of `with:` are inputs. A deeper line is the
+            # body of another input's block scalar (`ssh-known-hosts: |`), whose
+            # text must not count as the key.
+            child_indent = None
+            for body in lines[number + 1 : end]:
+                if not _is_content(body):
+                    continue
+                if _indent(body) <= key_indent:
+                    break
+                if child_indent is None:
+                    child_indent = _indent(body)
+                if _indent(body) != child_indent:
+                    continue
+                # Every direct child must be one complete `key: value` line. A
+                # quoted or flow value left open here continues onto later lines
+                # at this same indent, which would then only look like keys.
+                if not _single_line_input(body):
+                    unreadable = True
+                    continue
+                if "persist-credentials" not in body:
+                    continue
+                persist = PERSIST_LINE.match(body)
+                if persist is None:
+                    unreadable = True
+                else:
+                    values.append(persist.group("value"))
+        if unreadable or len(values) > 1:
+            errors.append(
+                f"{located} checkout `with:` must be one block mapping holding a "
+                "single plain `persist-credentials: false`"
+            )
+        elif not values:
+            job = None
+            for back in range(index - 1, -1, -1):
+                job_match = JOB_KEY.match(lines[back])
+                if job_match is not None:
+                    job = job_match.group("job")
+                    break
+                if _is_content(lines[back]) and _indent(lines[back]) == 0:
+                    break
+            if (Path(source).name, job) in POLICY_FROZEN_CHECKOUT_JOBS:
+                continue
+            errors.append(
+                f"{located} checkout must set `persist-credentials: false` so the "
+                "job token is not persisted for later steps"
+            )
+        elif values[0] == "true":
+            if not true_admitted:
+                errors.append(
+                    f"{located} checkout persists credentials outside a workflow "
+                    "started only by schedule or workflow_dispatch; use "
+                    "`persist-credentials: false`"
+                )
+        elif values[0] != "false":
+            errors.append(
+                f"{located} checkout persist-credentials must be `false` "
+                f"(found {values[0]!r})"
+            )
+    return errors
+
+
 def check_repository(root: Path = Path(".")) -> list[str]:
     directory = root / WORKFLOW_DIR
     paths = sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])
@@ -182,8 +492,21 @@ def check_repository(root: Path = Path(".")) -> list[str]:
         return [f"no workflows found under {directory}"]
     errors: list[str] = []
     for path in paths:
+        text = path.read_text(encoding="utf-8")
+        errors.extend(workflow_permission_errors(text, path.as_posix()))
+        errors.extend(checkout_credential_errors(text, path.as_posix()))
+    # A workflow can call a local composite action that runs its own checkout.
+    # An action has no trigger of its own, so it reads as code-triggered and
+    # must always say `false`.
+    actions = root / ACTIONS_DIR
+    action_paths = (
+        [*actions.rglob("action.yml"), *actions.rglob("action.yaml")] if actions.is_dir() else []
+    )
+    for path in sorted(action_paths):
         errors.extend(
-            workflow_permission_errors(path.read_text(encoding="utf-8"), path.as_posix())
+            checkout_credential_errors(
+                path.read_text(encoding="utf-8"), path.as_posix(), composite=True
+            )
         )
     return errors
 
@@ -256,6 +579,230 @@ def run_self_test() -> list[str]:
             failures.append(f"workflow permission self-test {label!r} rejected: {errors}")
         if not accepted and not errors:
             failures.append(f"workflow permission self-test {label!r} was accepted")
+
+    pin = "actions/checkout@" + "0" * 40 + " # v6"
+    pr = "on:\n  pull_request:\npermissions:\n  contents: read\njobs:\n  build:\n    steps:\n"
+    scheduled = "on:\n  schedule:\n    - cron: '0 0 * * *'\npermissions: {}\njobs:\n  build:\n    steps:\n"
+    tail = "      - run: true\n"
+    checkout_cases = (
+        ("dash false", pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail, True),
+        (
+            "named false after other input",
+            pr + f"      - name: Checkout\n        uses: {pin}\n        with:\n"
+            "          fetch-depth: 0\n          persist-credentials: 'false'  # no token\n" + tail,
+            True,
+        ),
+        (
+            "with before uses",
+            pr + "      - name: Checkout\n        with:\n          persist-credentials: false\n"
+            f"        uses: {pin}\n" + tail,
+            True,
+        ),
+        ("scheduled push true", scheduled + f"      - uses: {pin}\n        with:\n          persist-credentials: true\n" + tail, True),
+        ("missing with", pr + f"      - uses: {pin}\n" + tail, False),
+        ("missing key", pr + f"      - uses: {pin}\n        with:\n          fetch-depth: 0\n" + tail, False),
+        ("pr true", pr + f"      - uses: {pin}\n        with:\n          persist-credentials: true\n" + tail, False),
+        (
+            "expression",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: ${{{{ inputs.p }}}}\n" + tail,
+            False,
+        ),
+        ("flow with", pr + f"      - uses: {pin}\n        with: {{persist-credentials: false}}\n" + tail, False),
+        ("flow step", pr + f"      - {{uses: {pin}, with: {{persist-credentials: false}}}}\n" + tail, False),
+        (
+            "next step's input",
+            pr + f"      - uses: {pin}\n      - uses: other/action@{'0' * 40}\n"
+            "        with:\n          persist-credentials: false\n" + tail,
+            False,
+        ),
+        (
+            "duplicate value",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "          persist-credentials: true\n" + tail,
+            False,
+        ),
+        (
+            "unreadable trigger true",
+            "on: ${{ x }}\npermissions: {}\njobs:\n  build:\n    steps:\n"
+            f"      - uses: {pin}\n        with:\n          persist-credentials: true\n" + tail,
+            False,
+        ),
+    )
+    for label, text, accepted in checkout_cases:
+        errors = checkout_credential_errors(text, f"self-test checkout {label}")
+        if accepted and errors:
+            failures.append(f"checkout credential self-test {label!r} rejected: {errors}")
+        if not accepted and not errors:
+            failures.append(f"checkout credential self-test {label!r} was accepted")
+
+    mixed = pin.replace("actions/checkout", "Actions/Checkout")
+    sha = "0" * 40
+    persist_true = "        with:\n          persist-credentials: true\n"
+    scalar_body = (
+        "        with:\n          ssh-known-hosts: |\n            persist-credentials: false\n"
+    )
+    quoted_ok = pr + f"      - uses: {pin}\n        with:\n          ref: 'main' # base\n" \
+        "          path: \"src\"\n          persist-credentials: false\n" + tail
+    if checkout_credential_errors(quoted_ok, "self-test checkout quoted single-line inputs"):
+        failures.append("checkout credential self-test: single-line quoted inputs were rejected")
+    for label, text in (
+        ("mixed-case missing", pr + f"      - uses: {mixed}\n" + tail),
+        ("mixed-case true", pr + f"      - uses: {mixed}\n" + persist_true + tail),
+        ("escaped separator missing", pr + f'      - uses: "actions\\u002fcheckout@{sha}"\n' + tail),
+        ("escaped separator true", pr + f'      - uses: "actions\\x2fcheckout@{sha}"\n' + persist_true + tail),
+        ("escaped owner true", pr + f'      - uses: "\\u0061ctions/checkout@{sha}"\n' + persist_true + tail),
+        ("escaped slash missing", pr + f'      - uses: "actions\\/checkout@{sha}"\n' + tail),
+        ("escaped key missing", pr + f'      - "u\\u0073es": actions/checkout@{sha}\n' + tail),
+        ("block scalar impersonation", pr + f"      - uses: {pin}\n" + scalar_body + tail),
+        (
+            "reusable callee true",
+            "on:\n  workflow_call:\npermissions:\n  contents: read\njobs:\n  build:\n    steps:\n"
+            f"      - uses: {pin}\n" + persist_true + tail,
+        ),
+        (
+            "single-quoted scalar impersonation",
+            pr + f"      - uses: {pin}\n        with:\n          ssh-known-hosts: 'ignored\n"
+            "          persist-credentials: false\n          '\n" + tail,
+        ),
+        (
+            "double-quoted scalar impersonation",
+            pr + f"      - uses: {pin}\n        with:\n          ssh-known-hosts: \"ignored\n"
+            "          persist-credentials: false\n          \"\n" + tail,
+        ),
+        (
+            "composite quoted scalar impersonation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        ssh-known-hosts: 'ignored\n"
+            "        persist-credentials: false\n        '\n    - run: true\n      shell: bash\n",
+        ),
+        (
+            "composite true",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        persist-credentials: true\n",
+        ),
+        (
+            "quoted name hides with",
+            pr + f"      - uses: {pin}\n        name: 'ignored\n        with:\n"
+            "          persist-credentials: false\n        '\n" + tail,
+        ),
+        (
+            "composite quoted name hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      name: 'ignored\n      with:\n"
+            "        persist-credentials: false\n      '\n    - run: true\n      shell: bash\n",
+        ),
+        (
+            "single-quoted quote hides escaped flow reference",
+            pr + f"      - {{name: '\"', uses: \"actions\\u002fcheckout@{sha}\"}}\n" + tail,
+        ),
+        (
+            "composite single-quoted quote hides escaped flow reference",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - {{name: '\"', uses: \"actions\\u002fcheckout@{sha}\"}}\n",
+        ),
+        (
+            "alias reference",
+            pr.replace("jobs:\n", f"env:\n  REF: &ref actions/checkout@{sha}\njobs:\n")
+            + "      - uses: *ref\n" + tail,
+        ),
+        (
+            "escaped line continuation",
+            pr + '      - uses: "actions/che\\\n          ckout@' + sha + '"\n' + tail,
+        ),
+        (
+            "empty input value impersonation",
+            pr + f"      - uses: {pin}\n        with:\n          ssh-known-hosts:\n"
+            "            'ignored\n          persist-credentials: false\n            '\n" + tail,
+        ),
+        (
+            "empty name hides with",
+            pr + f"      - uses: {pin}\n        name:\n          'ignored\n        with:\n"
+            "          persist-credentials: false\n          '\n" + tail,
+        ),
+        (
+            "composite empty input value impersonation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        ssh-known-hosts:\n"
+            "          'ignored\n        persist-credentials: false\n          '\n",
+        ),
+        (
+            "composite empty name hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      name:\n        'ignored\n      with:\n"
+            "        persist-credentials: false\n        '\n",
+        ),
+        (
+            "flow value with quote hides with",
+            pr + f"      - uses: {pin}\n        env: {{ X: 'ignored}}\n        with:\n"
+            "          persist-credentials: false\n            '}}\n" + tail,
+        ),
+        (
+            "composite flow value with quote hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      env: {{ X: 'ignored}}\n      with:\n"
+            "        persist-credentials: false\n          '}}\n",
+        ),
+        (
+            "explicit key escaped continuation",
+            pr + '      - ? uses\n        : "actions/che\\\n            ckout@' + sha + '"\n' + tail,
+        ),
+        (
+            "composite explicit key escaped continuation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            '    - ? uses\n      : "actions/che\\\n          ckout@' + sha + '"\n',
+        ),
+        (
+            "tagged input",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: !!str false\n" + tail,
+        ),
+        (
+            "composite block scalar impersonation",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        ssh-known-hosts: |\n"
+            "          persist-credentials: false\n    - run: true\n      shell: bash\n",
+        ),
+    ):
+        if not checkout_credential_errors(text, f"self-test checkout {label}"):
+            failures.append(f"checkout credential self-test {label!r} was accepted")
+
+    # Repository level: a compliant workflow cannot hide a credential-persisting
+    # checkout inside a local composite action.
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / WORKFLOW_DIR).mkdir(parents=True)
+        (root / WORKFLOW_DIR / "ci.yml").write_text(
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "      - uses: ./.github/actions/hidden\n",
+            encoding="utf-8",
+        )
+        if check_repository(root):
+            failures.append(f"checkout credential self-test: compliant repository rejected: {check_repository(root)}")
+        (root / ACTIONS_DIR / "hidden").mkdir(parents=True)
+        (root / ACTIONS_DIR / "hidden" / "action.yml").write_text(
+            "name: hidden\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n    - run: true\n      shell: bash\n",
+            encoding="utf-8",
+        )
+        if not check_repository(root):
+            failures.append("checkout credential self-test: composite-action checkout was accepted")
+        (root / ACTIONS_DIR / "hidden" / "action.yml").write_text(
+            "name: hidden\non:\n  workflow_dispatch:\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      with:\n        persist-credentials: true\n",
+            encoding="utf-8",
+        )
+        if not check_repository(root):
+            failures.append(
+                "checkout credential self-test: composite with a fake trigger persisted credentials"
+            )
+
+    frozen = pr.replace("  build:\n", "  docker:\n") + f"      - uses: {pin}\n" + tail
+    if checkout_credential_errors(frozen, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: policy-frozen release job was rejected")
+    if not checkout_credential_errors(frozen, ".github/workflows/ci.yml"):
+        failures.append("checkout credential self-test: frozen-job exemption leaked to another file")
+    frozen_true = frozen.replace(tail, "        with:\n          persist-credentials: true\n" + tail)
+    if not checkout_credential_errors(frozen_true, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: policy-frozen job admitted true")
     return failures
 
 
@@ -265,7 +812,10 @@ def main() -> int:
         print(f"::error::{error}", file=sys.stderr)
     if errors:
         return 1
-    print("Every workflow declares explicit least-privilege top-level permissions.")
+    print(
+        "Every workflow declares explicit least-privilege top-level permissions "
+        "and every checkout sets persist-credentials."
+    )
     return 0
 
 
