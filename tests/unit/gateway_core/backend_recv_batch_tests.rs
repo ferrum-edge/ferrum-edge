@@ -82,12 +82,21 @@ fn receives_whole_datagrams_in_order_in_one_call() {
     assert_eq!(batch.datagram(0), b"one");
     assert_eq!(batch.datagram(1), b"twotwo");
     assert_eq!(batch.datagram(2), vec![0x5au8; 4096].as_slice());
-    // Only the slots the burst touched were allocated.
+    // Reservation is proportional to the burst bound offered to the
+    // syscall (8 here), never to untouched capacity beyond it, and a
+    // batch that only ever offers one slot reserves exactly one.
     let allocated = batch.datagram_buffer_capacity_bytes();
-    assert!(allocated >= 3 * 65535, "touched slots are full-size");
-    assert!(
-        allocated <= 3 * 65535,
-        "untouched slots must stay unallocated; got {allocated}"
+    assert_eq!(
+        allocated,
+        8 * 65535,
+        "slots are reserved lazily up to the offered burst bound"
+    );
+    let mut single = BackendRecvBatch::new(8);
+    let _ = single.recv(backend.as_raw_fd(), 1);
+    assert_eq!(
+        single.datagram_buffer_capacity_bytes(),
+        65535,
+        "offering one slot must reserve only one slot"
     );
 }
 

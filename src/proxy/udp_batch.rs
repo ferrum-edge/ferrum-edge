@@ -475,10 +475,23 @@ impl BackendRecvBatch {
     }
 
     /// Ensure slot `i` has a full-size buffer, allocating on first use only.
+    ///
+    /// The buffer is reserved *uninitialized* (capacity + `set_len`, no
+    /// memset): pages stay untouched until the kernel writes a datagram
+    /// into the slot, so resident memory tracks slots actually filled, not
+    /// slots merely offered to `recvmmsg`. The only safe reads are
+    /// `datagram()` slices bounded by the kernel-reported `msg_len`, i.e.
+    /// bytes the kernel initialized; `u8` has no drop or validity
+    /// invariant beyond initialization for those reads.
     fn ensure_slot_buf(&mut self, i: usize) {
         let buf = &mut self.bufs[i];
         if buf.len() < MAX_DGRAM_SIZE {
-            buf.resize(MAX_DGRAM_SIZE, 0);
+            buf.reserve_exact(MAX_DGRAM_SIZE - buf.len());
+            // SAFETY: capacity is at least MAX_DGRAM_SIZE after
+            // reserve_exact; the newly exposed bytes are handed to the
+            // kernel as a write-only iovec and only ever read back up to
+            // the received msg_len (see above).
+            unsafe { buf.set_len(MAX_DGRAM_SIZE) };
         }
     }
 
