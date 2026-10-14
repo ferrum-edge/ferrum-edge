@@ -4609,6 +4609,8 @@ fn ldap_auth_value_constraints_match_runtime_admission() {
         // A password is opaque: it is taken verbatim, never trimmed.
         search_bind(json!({"service_account_password": "  padded  "})),
         direct_bind(json!({"max_cache_entries": 1_000_000})),
+        direct_bind(json!({"group_cache_ttl_seconds": 0})),
+        direct_bind(json!({"group_cache_ttl_seconds": 86_400})),
         // An empty userinfo carries no credential.
         direct_bind(json!({"ldap_url": "ldaps://@localhost"})),
         direct_bind(json!({"ldap_url": "ldaps://[2001:db8::50]:636"})),
@@ -4626,6 +4628,7 @@ fn ldap_auth_value_constraints_match_runtime_admission() {
         search_bind(json!({"service_account_password": ""})),
         // Every resource knob is bounded.
         direct_bind(json!({"max_cache_entries": 1_000_001})),
+        direct_bind(json!({"group_cache_ttl_seconds": 86_401})),
         // A hostname is required and an explicit port must fit in 16 bits.
         direct_bind(json!({"ldap_url": "ldaps://"})),
         direct_bind(json!({"ldap_url": "ldaps://localhost:65536"})),

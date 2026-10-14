@@ -37,6 +37,10 @@ is now a config validation error, and a stored config that carries one fails
 to load. Delete the key if no allow restriction is intended, or list the
 consumers or groups that should be admitted. Empty deny-lists are unaffected.
 
+### `openapi_validator` bypass headers need a secret (PR #6634)
+
+Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
