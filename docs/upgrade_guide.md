@@ -28,17 +28,6 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### keyauth API keys need at least 16 non-whitespace characters (#6577)
-
-Consumer create, update, batch, restore, and the credential endpoints now
-reject a `keyauth` `key` with fewer than 16 non-whitespace characters (`400`),
-and a file-mode config that contains one fails to load. A database-mode gateway
-or control plane keeps authenticating keys it already stores, with a validation
-warning at each load. A data plane, however, refuses any CP snapshot that
-contains a short key and keeps its previous config; a newly started DP has no
-config at all. **Rotate every short key before upgrading** file-mode gateways
-and CP/DP deployments, through `POST /consumers/{id}/credentials/keyauth` (add
-the new key, move clients, then delete the old entry).
 ### Shared consumer credentials are refused (#6572)
 
 Consumers whose `id`, `username` or `custom_id` collide are still quarantined

@@ -9,20 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — keyauth API keys need at least 16 non-whitespace characters**
-  (issue #6577). Any non-empty key used to be accepted, including a single
-  character. Consumer create, update, batch, restore, and the dedicated
-  credential endpoints now reject a shorter key with `400`, and file-mode
-  config loading fails on one. A database-mode gateway or CP that already
-  stores a shorter key keeps serving it with a validation warning, but a data
-  plane refuses a CP snapshot containing one and keeps its previous config, so
-  rotate short keys before upgrading.
-  The OpenAPI `KeyAuthCredential` schema (create, update, and restore) carries
-  the same floor. `KeyAuthCredentialBackup` stays the stored-value shape, so a
-  legacy short key still exports in `GET /backup` but must be rotated before
-  that backup can be restored. The floor is lower than the 32-character HMAC/JWT secret
-  minimum because an API key can only be guessed online, while those secrets
-  can be attacked offline from one captured signature or token.
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
