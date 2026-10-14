@@ -28,13 +28,6 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `jwt_auth` rejects an unexpected `aud` claim (#6576)
-
-With no `audiences` configured, `jwt_auth` used to skip audience checks
-entirely. It now keeps strict validation: a token without `aud` still
-authenticates, but a token that carries an `aud` claim gets `401` unless
-`audiences` lists a matching value. If your issuers put `aud` in consumer
-tokens, list the accepted values in the plugin's `audiences`.
 ### Shared consumer credentials are refused (#6572)
 
 Consumers whose `id`, `username` or `custom_id` collide are still quarantined

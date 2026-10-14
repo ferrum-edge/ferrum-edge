@@ -9,17 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING — `jwt_auth` keeps strict audience validation when no
-  `audiences` are configured** (issue #6576). It used to disable `aud`
-  checking entirely in that case, so a token minted for another service with
-  the same consumer secret authenticated. A token without `aud` still passes;
-  a token that carries `aud` is now rejected unless `audiences` lists a
-  matching value, the same contract as `jwks_auth` and the Admin API verifier.
-- **Admin API 401 responses no longer reflect the JWT verification reason**
-  (issue #6578). Every verification failure (expired, bad signature, wrong
-  issuer or audience, malformed) returns the static body
-  `{"error":"Token verification failed"}`. The reason is logged server-side
-  at debug level, without token contents.
 - **BREAKING — shared keyauth, basicauth, and mtls_auth credentials are
   refused instead of resolving last-wins** (issue #6572). The SQL and MongoDB
   full loaders only warned when two consumers in one namespace, whose
