@@ -2386,6 +2386,14 @@ async fn capture_mirror_request_headers(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
 ) -> HashMap<String, String> {
+    capture_mirror_request_headers_with_config(ctx, headers, json!({})).await
+}
+
+async fn capture_mirror_request_headers_with_config(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    extra: serde_json::Value,
+) -> HashMap<String, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2427,16 +2435,18 @@ async fn capture_mirror_request_headers(
         }
     });
 
-    let plugin = RequestMirror::new(
-        &json!({
-            "mirror_host": addr.ip().to_string(),
-            "mirror_port": addr.port(),
-            "mirror_request_body": false,
-            "percentage": 100.0
-        }),
-        PluginHttpClient::default(),
-    )
-    .unwrap();
+    let mut config = json!({
+        "mirror_host": addr.ip().to_string(),
+        "mirror_port": addr.port(),
+        "mirror_request_body": false,
+        "percentage": 100.0
+    });
+    if let (Some(dest), Some(extra_obj)) = (config.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra_obj {
+            dest.insert(key.clone(), value.clone());
+        }
+    }
+    let plugin = RequestMirror::new(&config, PluginHttpClient::default()).unwrap();
     let _ = plugin.finalized_egress(ctx, headers).await;
     let _ = ctx.collect_mirror_result().await;
     rx.await.expect("mirror sink should capture headers")
@@ -7183,6 +7193,72 @@ async fn transformer_introduced_and_chained_renames_keep_provenance() {
     let (mut ctx, mut headers) = build(first, second).await;
     let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
     for name in ["x-debug", "x-hop-a", "x-hop-b", "x-proof", "x-api-key"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}
+
+/// Operator `sensitive_*_patterns` decide rename provenance too: a credential
+/// that only the mirror's pattern recognises, introduced or updated by a
+/// transformer and renamed across chained instances, is still withheld.
+#[tokio::test]
+async fn operator_pattern_credentials_keep_provenance_through_renames() {
+    let first = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-proof", "value": "backend-secret"},
+            {"operation": "update", "target": "header", "key": "x-proof", "value": "backend-secret-2"},
+            {"operation": "rename", "target": "header", "key": "x-proof", "new_key": "x-hop-a"},
+            {"operation": "add", "target": "query", "key": "proof", "value": "backend-query-secret"},
+            {"operation": "rename", "target": "query", "key": "proof", "new_key": "hop_a"}
+        ]}),
+    )
+    .expect("first transformer config")
+    .expect("first transformer plugin");
+    let second = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-hop-a", "new_key": "x-debug"},
+            {"operation": "rename", "target": "query", "key": "hop_a", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("second transformer config")
+    .expect("second transformer plugin");
+    let patterns = json!({
+        "sensitive_header_patterns": ["proof"],
+        "sensitive_query_patterns": ["proof"]
+    });
+
+    let build = |first: Arc<dyn Plugin>, second: Arc<dyn Plugin>| async move {
+        let mut ctx = make_ctx_with_proxy();
+        ctx.set_raw_query_string("x=1".to_string());
+        ctx.query_params.insert("x".to_string(), "1".to_string());
+        let mut headers = HashMap::new();
+        headers.insert("x-custom".to_string(), "keep-me".to_string());
+        plugin_utils::assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("x-debug").map(String::as_str),
+            Some("backend-secret-2")
+        );
+        (ctx, headers)
+    };
+
+    let (mut ctx, _) = build(first.clone(), second.clone()).await;
+    let line = capture_mirror_request_line_with_config(&mut ctx, patterns.clone()).await;
+    assert!(
+        !line.contains("backend-query-secret") && !line.contains("tracking="),
+        "{line}"
+    );
+    assert!(line.contains("x=1"), "{line}");
+
+    let (mut ctx, mut headers) = build(first, second).await;
+    let observed =
+        capture_mirror_request_headers_with_config(&mut ctx, &mut headers, patterns).await;
+    for name in ["x-debug", "x-hop-a", "x-proof"] {
         assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
     }
     assert_eq!(

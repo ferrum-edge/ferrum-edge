@@ -680,16 +680,12 @@ impl Plugin for RequestTransformer {
                             rule.key, new_key
                         );
                         headers.insert(new_key.clone(), val);
-                        // Carry credential provenance to the new name so
-                        // secondary egress (request_mirror) still treats it
-                        // as a credential.
-                        if super::request_mirror::request_header_name_is_credential(ctx, &rule.key)
-                        {
-                            let renamed = &mut ctx.plugin_state_mut().renamed_credential_headers;
-                            if !renamed.iter().any(|known| known == new_key) {
-                                renamed.push(new_key.clone());
-                            }
-                        }
+                        // Record the rename so secondary egress
+                        // (request_mirror) can carry credential provenance to
+                        // the new name under its own classifiers.
+                        ctx.plugin_state_mut()
+                            .request_header_rename_lineage
+                            .push((rule.key.clone(), new_key.clone()));
                     }
                 }
             }
@@ -792,14 +788,10 @@ fn apply_query_rules(plugin: &RequestTransformer, ctx: &mut RequestContext) {
                             "request_transformer: renamed query param {} -> {}",
                             rule.key, new_key
                         );
-                        // Carry credential provenance to the new name.
-                        if super::request_mirror::request_query_name_is_credential(ctx, &rule.key) {
-                            let renamed =
-                                &mut ctx.plugin_state_mut().renamed_credential_query_names;
-                            if !renamed.iter().any(|known| known == new_key) {
-                                renamed.push(new_key.clone());
-                            }
-                        }
+                        // Record the rename for credential provenance.
+                        ctx.plugin_state_mut()
+                            .request_query_rename_lineage
+                            .push((rule.key.clone(), new_key.clone()));
                     }
                     query_mutated |= changed;
                 }

@@ -3585,14 +3585,13 @@ pub(crate) struct PluginRequestState {
     /// authentication strip may remove the parameter before a retained-result
     /// plugin builds its key.
     pub(crate) query_credential_partition_digests: Vec<(String, [u8; 32])>,
-    /// Header and query names that a `request_transformer` rename gave to a
-    /// credential (its source name was credential-shaped, a route credential
-    /// location, or itself a renamed credential). Secondary egress such as
-    /// `request_mirror` treats these names as credentials, so a rename cannot
-    /// launder one, across chained instances. Lowercased; empty unless a rename
-    /// moved a credential.
-    pub(crate) renamed_credential_headers: Vec<String>,
-    pub(crate) renamed_credential_query_names: Vec<String>,
+    /// Every `(source, destination)` header and query rename a request
+    /// transformer applied, in order (header names lowercased). Secondary
+    /// egress such as `request_mirror` replays this lineage against its own
+    /// classifiers and operator patterns, so a rename (across chained
+    /// instances) cannot launder a credential name. Empty unless a rename ran.
+    pub(crate) request_header_rename_lineage: Vec<(String, String)>,
+    pub(crate) request_query_rename_lineage: Vec<(String, String)>,
     /// Deltas from the original request-header view to the complete
     /// backend-visible view, staged by `response_caching` instances during
     /// lookup and consumed when the origin supplies its final `Vary`
@@ -5910,17 +5909,17 @@ impl RequestContext {
     }
 
     /// Credential-query digests captured before authentication stripping.
-    /// Names a request rename gave to a credential header (lowercased).
-    pub(crate) fn renamed_credential_headers(&self) -> &[String] {
+    /// Header renames applied to this request, in order.
+    pub(crate) fn request_header_rename_lineage(&self) -> &[(String, String)] {
         self.plugin_state()
-            .map(|state| state.renamed_credential_headers.as_slice())
+            .map(|state| state.request_header_rename_lineage.as_slice())
             .unwrap_or(&[])
     }
 
-    /// Names a request rename gave to a credential query parameter.
-    pub(crate) fn renamed_credential_query_names(&self) -> &[String] {
+    /// Query renames applied to this request, in order.
+    pub(crate) fn request_query_rename_lineage(&self) -> &[(String, String)] {
         self.plugin_state()
-            .map(|state| state.renamed_credential_query_names.as_slice())
+            .map(|state| state.request_query_rename_lineage.as_slice())
             .unwrap_or(&[])
     }
 

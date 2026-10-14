@@ -776,7 +776,7 @@ fn is_port_suffix(rest: &str) -> bool {
 /// sensitive if it is a well-known credential name, contains a built-in
 /// credential substring, or contains any operator-configured
 /// `sensitive_header_patterns` substring.
-pub(crate) fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
+fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
     MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
         || name_has_credential_class(name_lower)
         || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
@@ -1111,42 +1111,6 @@ pub(crate) fn resolve_mirror_timeout_ms(
     raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
 }
 
-/// Whether a request header name is a credential for provenance purposes:
-/// built-in mirror classes, the replay credential inventory, the route
-/// registry, or an earlier credential rename. Used by `request_transformer`
-/// to carry credential provenance across a rename.
-pub(crate) fn request_header_name_is_credential(ctx: &RequestContext, name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    is_mirror_sensitive_header(&lower, &[])
-        || crate::plugins::utils::replay_partition::is_credential_context_header(&lower)
-        || ctx
-            .request_headers_requiring_redaction()
-            .iter()
-            .chain(ctx.renamed_credential_headers())
-            .any(|known| known.eq_ignore_ascii_case(&lower))
-}
-
-/// Query counterpart of [`request_header_name_is_credential`], over the
-/// raw name: built-in classes, marked credential locations, and earlier
-/// credential renames.
-pub(crate) fn request_query_name_is_credential(ctx: &RequestContext, name: &str) -> bool {
-    let marked = MirrorRouteCredentials::marked_query_names(ctx);
-    !matches!(
-        classify_mirror_query_name(name, &[], &marked),
-        MirrorQueryNameDecision::NonSensitive
-    )
-}
-
-/// Route-registered credential header names plus names a rename gave to a
-/// credential header.
-fn route_credential_header_names(ctx: &RequestContext) -> Vec<String> {
-    ctx.request_headers_requiring_redaction()
-        .iter()
-        .chain(ctx.renamed_credential_headers())
-        .cloned()
-        .collect()
-}
-
 /// Credential provenance for one mirrored request, gathered from the request
 /// context rather than from the outbound names, so a credential renamed by a
 /// later plugin (`request_transformer` header/query `rename`, route overlays)
@@ -1157,6 +1121,10 @@ struct MirrorRouteCredentials {
     /// locations on this request (whether or not it strips them from the
     /// primary request).
     query_names: Vec<String>,
+    /// Route-registered credential header names plus every name a header
+    /// rename gave to a credential (replayed from the request's rename
+    /// lineage against this mirror's classifiers and patterns).
+    header_names: Vec<String>,
     /// SHA-256 digests of the credential values the client presented: every
     /// value of a built-in credential header or a route-registered credential
     /// header on the inbound request, plus the recorded query credential
@@ -1189,9 +1157,6 @@ impl MirrorRouteCredentials {
                 add(name);
             }
         }
-        for name in ctx.renamed_credential_query_names() {
-            add(name);
-        }
         names
     }
 
@@ -1212,7 +1177,35 @@ impl MirrorRouteCredentials {
         use crate::fips::approved::Sha256;
         use crate::plugins::utils::replay_partition::is_credential_context_header;
 
-        let query_names = Self::marked_query_names(ctx);
+        let mut query_names = Self::marked_query_names(ctx);
+        // Replay the rename lineage: a destination is a credential when its
+        // source was one, under this mirror's classifiers and patterns.
+        for (source, destination) in ctx.request_query_rename_lineage() {
+            let source_is_credential = query_names.iter().any(|known| known == source)
+                || !matches!(
+                    classify_mirror_query_name(source, query_patterns, &query_names),
+                    MirrorQueryNameDecision::NonSensitive
+                );
+            if source_is_credential && !query_names.iter().any(|known| known == destination) {
+                query_names.push(destination.clone());
+            }
+        }
+        let mut header_names: Vec<String> = ctx.request_headers_requiring_redaction().to_vec();
+        for (source, destination) in ctx.request_header_rename_lineage() {
+            let lower = source.to_ascii_lowercase();
+            let source_is_credential = is_mirror_sensitive_header(&lower, header_patterns)
+                || is_credential_context_header(&lower)
+                || header_names
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&lower));
+            if source_is_credential
+                && !header_names
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(destination))
+            {
+                header_names.push(destination.to_ascii_lowercase());
+            }
+        }
         let mut value_digests: Vec<[u8; 32]> = Vec::new();
         for (_, digest) in ctx.query_credential_partition_digests() {
             if !value_digests.contains(digest) {
@@ -1233,10 +1226,8 @@ impl MirrorRouteCredentials {
             let lower = name.to_ascii_lowercase();
             is_mirror_sensitive_header(&lower, header_patterns)
                 || is_credential_context_header(&lower)
-                || ctx
-                    .request_headers_requiring_redaction()
+                || header_names
                     .iter()
-                    .chain(ctx.renamed_credential_headers())
                     .any(|known| known.eq_ignore_ascii_case(&lower))
         };
         if let Some(raw) = ctx.raw_headers_snapshot() {
@@ -1273,6 +1264,7 @@ impl MirrorRouteCredentials {
         }
         Self {
             query_names,
+            header_names,
             value_digests,
         }
     }
@@ -3128,7 +3120,7 @@ impl Plugin for RequestMirror {
             self.forward_sensitive_headers,
             &self.forward_sensitive_header_allowlist,
             &self.sensitive_header_patterns,
-            &route_credential_header_names(ctx),
+            &route_credentials.header_names,
             &route_credentials,
         );
         if let Some(shadow_host) = mesh_shadow_host {

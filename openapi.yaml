@@ -32701,7 +32701,12 @@ components:
         x-amz-signature, x-goog-signature denied; continuation_token and signal
         retained). The same credential-shaped rule as headers applies to the
         decoded name (session_id, jwt, access_key, private_key, key, sid, …
-        denied; continuation_token retained).
+        denied; continuation_token retained). Credentials keep provenance
+        through renames: a request_transformer rename whose source is a
+        credential name under this mirror's classifiers and patterns (across
+        chained instances) makes the destination a credential, and any header
+        or query value equal to a credential value seen on the request is
+        withheld under whatever name it now has.
         Delimiter variants of api_key are denied, and raw semicolon-
         bearing segments fail closed because backend query parsers disagree on
         whether they contain additional pairs. Retained pairs keep raw encoding,
@@ -37308,7 +37313,11 @@ components:
                 Must be a valid HTTP header name; rejected at config validation
                 otherwise. Names in the gateway-owned `x-consumer-*` request
                 namespace (case-insensitive, `_` equivalent to `-`) are
-                rejected because the gateway scrubs them before dispatch.
+                rejected because the gateway scrubs them before dispatch. Both
+                configured session header names are registered as credential
+                headers for the route (redacted from diagnostics and policy
+                calls, withheld from request_mirror, bound into replay
+                partitions).
             initialize_upstreams:
               type: [string, "null"]
               enum: [lazy, startup, passthrough, null]

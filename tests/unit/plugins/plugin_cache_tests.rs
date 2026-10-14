@@ -4447,6 +4447,47 @@ fn test_request_view_redacts_openapi_validator_bypass_header() {
 }
 
 #[test]
+fn test_request_view_registers_custom_mcp_session_headers() {
+    // Custom MCP session header names reach the route's credential-header
+    // registry through ordinary plugin-cache composition, which is what
+    // diagnostics/OPA redaction, replay partitioning and request_mirror read.
+    let config = make_config(
+        vec![make_proxy("p1", "/mcp", vec!["mcp"])],
+        vec![make_plugin_config_with_json(
+            "mcp",
+            "mcp_gateway",
+            json!({
+                "enabled": true,
+                "mode": "aggregate_router",
+                "endpoint": {"path": "/mcp", "protocol_versions": ["2025-11-25"]},
+                "sessions": {
+                    "initialize_upstreams": "passthrough",
+                    "downstream_session_header": "X-Client-Session",
+                    "upstream_session_header": "x-proof"
+                },
+                "servers": {
+                    "github": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "github",
+                        "enabled": true
+                    }
+                }
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names = view.request_headers_to_redact();
+    assert!(
+        names.iter().any(|name| name == "x-client-session"),
+        "{names:?}"
+    );
+    assert!(names.iter().any(|name| name == "x-proof"), "{names:?}");
+}
+
+#[test]
 fn test_authorize_plugin_default_preserves_legacy_custom_plugins() {
     let plugin: Arc<dyn Plugin> = Arc::new(LegacyAuthorizePlugin);
 
