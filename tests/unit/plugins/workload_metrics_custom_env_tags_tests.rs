@@ -208,6 +208,9 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "CREDVALUE",
         "PRIVATE_RSA_2048_KEY",
         "ENCRYPTION_AES256_KEY",
+        "DBPIN",
+        "SIGBASE64",
+        "PRIVATE_EC_P256_KEY",
     ];
 
     for env_var in cases {
@@ -342,6 +345,9 @@ fn custom_header_tags_reject_credential_class_header_names() {
         "x-vendorCred",
         "x-dbPinValue",
         "x-private-rsa2048-key",
+        "x-dbPin",
+        "x-sigBase64",
+        "x-private-ec-p256-key",
     ] {
         let error = workload_metrics_new_with_env_lookup_for_test(
             &json!({

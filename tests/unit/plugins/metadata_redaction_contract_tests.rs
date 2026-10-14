@@ -622,6 +622,13 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "privateRSA2048Key",
     "encryption_aes256_key",
     "mesh.private_rsa2048_key",
+    "x-dbPin",
+    "x-sigBase64",
+    "private_ec_p256_key",
+    "signing_rsa_pss_key",
+    "x-private-ec-p256-key",
+    "mesh.private_ec_p256_key",
+    "privateecp256key",
     // The outcome-signal exemption covers only its complete key.
     "session_id.assertion_out_of_scope",
     "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
@@ -646,6 +653,9 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "credit_card_brand",
     "sidecar_version",
     "cache_2048_key",
+    "design_version",
+    "outside_count",
+    "sacred_flag",
 ];
 
 #[test]

@@ -336,22 +336,21 @@ credential stem or a qualified compound (`usersession`, `dbpassword`,
 `dbpwd`, `gpgpassphrase`, `idjwt`, `requestsignature`, `assertion`,
 `clientassertion`, `csrfvalue`, `totpseed`, `hsmpin`, `otpcode`, `mfasecret`),
 contains `jws`/`jwe`, contains a short class (`pin`, `sid`, `otp`, `sig`, `cred`)
-inside a qualified compound, meaning before a listed trailer word such as
-`value`, `code`, `id` or `hash`, or ending the segment after a qualifier of at
-least three letters (two for `otp`) (`dbpinvalue`, `vendorpin`, `usersid`,
-`smsotpcode`, `sigvalue`, `vendorcred`; ordinary words such as `spin`,
-`hairpin`, `inside`, `footprint`, `signal`, `credit` and `sidecar` stay
-visible), or ends in `token` after a qualifier (`accesstoken`). Matching is
+inside a qualified compound, meaning before a listed trailer word (`value`,
+`code`, `id`, `hash`, `base64`, `hex`, `pem`, …) or ending the segment after a
+qualifier of at least two letters (`dbpin`, `dbpinvalue`, `usersid`,
+`smsotpcode`, `sigbase64`, `vendorcred`; ordinary words such as `spin`,
+`hairpin`, `inside`, `design`, `footprint`, `signal`, `credit`, `sacred` and
+`sidecar` stay visible), or ends in `token` after a qualifier (`accesstoken`). Matching is
 linear in the key length. Key material counts when a
-key-material qualifier (`private`, `access`, `secret`, `signing`, `session`,
-`client`, `master`, `encryption`, `decryption`, `ssh`, `pgp`, `gpg`, `hmac`,
-`jwt`) reaches `key`/`keys`. Algorithm or encoding words such as `rsa`,
-`ec`, `ecc`, `ed25519`, `pem`, `pkcs8` or `pkcs12`, and key sizes (`rsa2048`,
-a separate `2048` segment, `aes256`), may sit in between, and a
-qualifier may end a longer segment. This works across segments
-(`private_key`, `private_rsa_key`, `privateRsaKey`, `awsaccess_key`,
-`private_rsapem_key`) and inside one segment (`privatekey`, `x-clientkey`,
-`awsaccesskeyid`, `privateecckey`, `privatepkcs12key`). Lowercase compounds are
+segment contains a key-material qualifier (`private`, `access`, `secret`,
+`signing`, `session`, `client`, `master`, `encryption`, `decryption`, `ssh`,
+`pgp`, `gpg`, `hmac`, `jwt`) followed by `key` in the same segment
+(`privatekey`, `awsaccesskeyid`, `privateecp256key`), or when a segment
+containing `key` follows such a qualifier within four segments. Algorithm,
+curve, size and mode descriptors in between never close the window
+(`private_key`, `private_rsa_2048_key`, `private_ec_p256_key`,
+`signing_rsa_pss_key`), while `cache_key` and `routing_key` stay visible. Lowercase compounds are
 recognized as well as camelCase ones, so a name normalized before
 classification (an HTTP header name such as `x-hsmpin`) is still caught. The
 only exemption is the complete documented outcome key
