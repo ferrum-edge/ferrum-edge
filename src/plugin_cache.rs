@@ -3645,20 +3645,38 @@ fn effective_route_override_configs_for_proxy<'a>(
         &["ai_stream_router", "mcp_gateway", "mesh_route_dispatch"];
     let mut route_configs = Vec::new();
 
-    // Match PluginCache construction order before its stable priority sort:
-    // globals, proxy-scoped configs in config order, then proxy-group configs
-    // in association order.
-    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
-        pc.scope == PluginScope::Global
-            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
-            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
-    }));
-    route_configs.extend(config.plugin_configs.iter().filter(|pc| {
-        pc.scope == PluginScope::Proxy
-            && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
-            && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
-    }));
-    for association in &proxy.plugins {
+    // Match PluginCache construction order before its stable
+    // `(priority, name)` sort: globals, then proxy-scoped configs, then
+    // proxy-group configs, each class in ascending plugin-config id. Only the
+    // few matching route-override configs are ordered, never the whole set.
+    let by_canonical_id = |left: &&PluginConfig, right: &&PluginConfig| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.namespace.cmp(&right.namespace))
+    };
+    let mut globals: Vec<&PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .filter(|pc| {
+            pc.scope == PluginScope::Global
+                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+        })
+        .collect();
+    globals.sort_by(by_canonical_id);
+    route_configs.extend(globals);
+    let mut scoped: Vec<&PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .filter(|pc| {
+            pc.scope == PluginScope::Proxy
+                && ROUTE_OVERRIDE_PLUGINS.contains(&pc.plugin_name.as_str())
+                && plugin_config_effectively_applies_to_proxy(pc, proxy, config)
+        })
+        .collect();
+    scoped.sort_by(by_canonical_id);
+    route_configs.extend(scoped);
+    for association in proxy_plugin_associations_in_canonical_order(proxy) {
         if let Some(pc) = config.plugin_configs.iter().find(|pc| {
             pc.id == association.plugin_config_id
                 && pc.namespace == proxy.namespace
@@ -3669,7 +3687,11 @@ fn effective_route_override_configs_for_proxy<'a>(
             route_configs.push(pc);
         }
     }
-    route_configs.sort_by_key(|pc| route_override_priority(pc));
+    route_configs.sort_by(|left, right| {
+        route_override_priority(left)
+            .cmp(&route_override_priority(right))
+            .then_with(|| left.plugin_name.cmp(&right.plugin_name))
+    });
     route_configs
 }
 
@@ -4529,6 +4551,47 @@ pub(crate) fn composition_shape_plugin(config: &PluginConfig) -> Option<Arc<dyn 
     }))
 }
 
+/// Total order of one effective chain: effective priority, then plugin name.
+///
+/// The sort that uses it is stable, so instances that tie on both keep their
+/// assembly order. Every assembly site builds that order canonically (globals,
+/// then proxy-scoped instances, then proxy-group instances, each class in
+/// ascending plugin-config id; see [`plugin_configs_in_canonical_order`] and
+/// [`proxy_plugin_associations_in_canonical_order`]), so the complete tie order
+/// is `(priority, name, scope class, id)`. That makes the chain independent of
+/// database row order, file entry order, and which incremental rebuild path
+/// produced it (issue #6614).
+fn plugin_chain_order(left: &Arc<dyn Plugin>, right: &Arc<dyn Plugin>) -> std::cmp::Ordering {
+    left.priority()
+        .cmp(&right.priority())
+        .then_with(|| left.name().cmp(right.name()))
+}
+
+/// Plugin configs in the canonical assembly order chain construction iterates:
+/// ascending plugin-config id, then namespace (global fallback chains span
+/// namespaces, where bare ids may repeat).
+///
+/// Built once per cache generation; the request path never sees it.
+fn plugin_configs_in_canonical_order(configs: &[PluginConfig]) -> Vec<&PluginConfig> {
+    let mut ordered: Vec<&PluginConfig> = configs.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left.namespace.cmp(&right.namespace))
+    });
+    ordered
+}
+
+/// A proxy's plugin associations in ascending plugin-config id, so proxy-group
+/// instances join the chain independently of association row order.
+fn proxy_plugin_associations_in_canonical_order(
+    proxy: &Proxy,
+) -> Vec<&crate::config::types::PluginAssociation> {
+    let mut ordered: Vec<&crate::config::types::PluginAssociation> = proxy.plugins.iter().collect();
+    ordered.sort_by(|left, right| left.plugin_config_id.cmp(&right.plugin_config_id));
+    ordered
+}
+
 /// One assembly gate for admission, full construction and incremental rebuilds.
 /// Call only with the complete effective chain, including topology-only entries
 /// during admission, so an omitted plugin cannot conceal an interleaving.
@@ -4542,7 +4605,7 @@ fn prepare_plugin_chain(
         |proxy| format!("proxy_id={:?}", proxy.id),
     );
     let mut errors = Vec::new();
-    plugins.sort_by_key(|plugin| plugin.priority());
+    plugins.sort_by(plugin_chain_order);
     for result in [
         install_cors_finalizer(plugins),
         install_mesh_route_dispatch_finalizer(plugins),
@@ -4587,7 +4650,7 @@ pub(crate) fn validate_plugin_security_composition_candidate(
     let current_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
     let mut staged_tcp_throttle_states = TcpConnectionThrottleInstanceMap::new();
 
-    for plugin_config in &config.plugin_configs {
+    for plugin_config in plugin_configs_in_canonical_order(&config.plugin_configs) {
         let has_trigger = plugin_config.trigger.is_some();
         if !plugin_config.enabled {
             continue;
@@ -4711,8 +4774,8 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             .iter()
             .map(|plugin| Arc::as_ptr(plugin) as *const () as usize)
             .collect();
-        // Match runtime's stable tie ordering: config-order proxy instances,
-        // then association-order proxy-group instances, after all globals.
+        // Match runtime's canonical tie ordering: id-ordered proxy instances,
+        // then id-ordered proxy-group instances, after all globals.
         let attached_ids: HashSet<&str> = proxy
             .plugins
             .iter()
@@ -4724,13 +4787,15 @@ pub(crate) fn validate_plugin_security_composition_candidate(
             .flatten()
             .copied()
             .filter(|pc| attached_ids.contains(pc.id.as_str()));
-        let group_configs = proxy.plugins.iter().filter_map(|association| {
-            let (pc, _) = scoped_plugins.get(&(
-                proxy.namespace.as_str(),
-                association.plugin_config_id.as_str(),
-            ))?;
-            (pc.scope == PluginScope::ProxyGroup && pc.proxy_id.is_none()).then_some(*pc)
-        });
+        let group_configs = proxy_plugin_associations_in_canonical_order(proxy)
+            .into_iter()
+            .filter_map(|association| {
+                let (pc, _) = scoped_plugins.get(&(
+                    proxy.namespace.as_str(),
+                    association.plugin_config_id.as_str(),
+                ))?;
+                (pc.scope == PluginScope::ProxyGroup && pc.proxy_id.is_none()).then_some(*pc)
+            });
         for plugin_config in local_configs.chain(group_configs) {
             let Some((_, plugin)) =
                 scoped_plugins.get(&(plugin_config.namespace.as_str(), plugin_config.id.as_str()))
@@ -7527,7 +7592,7 @@ impl PluginCache {
                 }
             }
 
-            for pc in &config.plugin_configs {
+            for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
                 if !pc.enabled {
                     continue;
                 }
@@ -7570,7 +7635,7 @@ impl PluginCache {
             // without any global PluginConfig changing. Replace only those
             // wrappers so unrelated stateful globals retain their Arc/state.
             let mut global_plugins = globals_without_adaptive_concurrency(&current.global_plugins);
-            for pc in &config.plugin_configs {
+            for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
                 if !pc.enabled
                     || pc.scope != PluginScope::Global
                     || pc.plugin_name != "adaptive_concurrency"
@@ -7621,7 +7686,7 @@ impl PluginCache {
         // resolves plugin configs from its own tenant.
         let mut proxy_scoped_configs: ProxyScopedConfigIndex = HashMap::new();
         let mut proxy_group_configs: ProxyGroupConfigIndex = HashMap::new();
-        for pc in &config.plugin_configs {
+        for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
             if !pc.enabled {
                 continue;
             }
@@ -7787,7 +7852,7 @@ impl PluginCache {
 
             // Resolve proxy_group-scoped plugins via the proxy's association
             // list, resolved within the proxy's own namespace.
-            for assoc in &proxy.plugins {
+            for assoc in proxy_plugin_associations_in_canonical_order(proxy) {
                 let group_identity = NamespacedResourceId::new(
                     proxy.namespace.as_str(),
                     assoc.plugin_config_id.as_str(),
@@ -8452,7 +8517,7 @@ impl PluginCache {
 
         // Second pass: everything else, including other globals,
         // proxy-scoped, and proxy_group-scoped configs.
-        for pc in &config.plugin_configs {
+        for pc in plugin_configs_in_canonical_order(&config.plugin_configs) {
             if !pc.enabled {
                 continue;
             }
@@ -8574,7 +8639,7 @@ impl PluginCache {
             // Resolve proxy_group-scoped plugins via the proxy's association
             // list, resolved within the proxy's own namespace. Shared Arc
             // instances are reused across all proxies in the group.
-            for assoc in &proxy.plugins {
+            for assoc in proxy_plugin_associations_in_canonical_order(proxy) {
                 let group_identity = NamespacedResourceId::new(
                     proxy.namespace.as_str(),
                     assoc.plugin_config_id.as_str(),

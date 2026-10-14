@@ -24801,14 +24801,21 @@ components:
           default: 64
           minimum: 1
           maximum: 1024
-          description: "Maximum concurrent uncached LDAP authentication flows per plugin instance; excess requests fail immediately"
+          description: "Maximum concurrent LDAP directory flows per plugin instance, shared by uncached authentications and due cached group re-checks; excess requests fail immediately"
         cache_ttl_seconds:
           type: integer
           format: uint64
           default: 0
           minimum: 0
           maximum: 86400
-          description: "Cache TTL for successful auth results (0 = disabled, maximum 24 hours)"
+          description: "Cache TTL for successful auth results (0 = disabled, maximum 24 hours). A cache hit skips the bind, so a password change or account disablement in the directory takes effect only when the entry expires; values above 900 seconds log that revocation lag at construction. required_groups membership is re-checked separately (group_cache_ttl_seconds)."
+        group_cache_ttl_seconds:
+          type: integer
+          format: uint64
+          default: 60
+          minimum: 0
+          maximum: 86400
+          description: "With required_groups and the cache enabled, the longest a cached authentication is admitted without re-running the group search (0 = every cache hit). A due hit re-checks membership under max_concurrent_requests and request_timeout_seconds; a user no longer in any required group gets 403 and the entry is evicted, and a directory failure returns 500 and keeps the entry. Never extends cache_ttl_seconds."
         max_cache_entries:
           type: integer
           format: uint64
@@ -31587,12 +31594,23 @@ components:
               propertyNames:
                 pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$(?![\\s\\S])"
               additionalProperties:
-                type: [string, "null"]
+                type: string
+                minLength: 16
+                maxLength: 4096
+                pattern: "^[!-~]+$(?![\\s\\S])"
               default: {}
               description: >-
-                Header-name map. Null means any value; a string requires exact
-                value. Keys are matched case-insensitively at runtime; case-
-                equivalent duplicate keys are rejected at construction.
+                Header name to shared secret. A request skips validation only
+                when that header carries exactly the configured secret
+                (compared in constant time). Presence alone never skips
+                validation, because clients can send any header, so null is
+                rejected. The secret must be 16 to 4096 visible ASCII
+                characters (0x21-0x7E: no spaces, controls or non-ASCII), so
+                characters and bytes coincide. Bypass header names are
+                redacted from diagnostics and policy calls. Inject it from a trusted
+                hop or gateway plugin and keep it out of client hands. Keys
+                are matched case-insensitively at runtime; case-equivalent
+                duplicate keys are rejected at construction.
         error_response:
           type: object
           additionalProperties: false
