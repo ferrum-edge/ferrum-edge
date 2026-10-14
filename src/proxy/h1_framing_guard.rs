@@ -779,8 +779,8 @@ impl H1StreamScanner {
         while offset < bytes.len() {
             let transition = match &mut self.state {
                 H1State::Head(head) => {
-                    let step = head.observe(bytes[offset], signals);
-                    offset += 1;
+                    let (consumed, step) = head.observe_slice(&bytes[offset..], signals);
+                    offset += consumed;
                     match step {
                         HeadStep::Continue => None,
                         HeadStep::Complete(outcome) => {
@@ -948,9 +948,41 @@ impl RequestLineUtf8 {
         }
     }
 
+    /// Bulk form of [`Self::observe`] for a slice with no partial sequence
+    /// pending. Equivalent outcomes: valid UTF-8 leaves `partial_len == 0`,
+    /// an invalid sequence latches `invalid`, and a sequence truncated by
+    /// the slice end is retained in `partial` for per-byte continuation.
+    fn observe_slice(&mut self, bytes: &[u8]) {
+        if self.invalid {
+            return;
+        }
+        if self.partial_len > 0 {
+            for &byte in bytes {
+                self.observe(byte);
+            }
+            return;
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(_) => {}
+            Err(err) if err.error_len().is_some() => self.invalid = true,
+            Err(err) => {
+                let tail = &bytes[err.valid_up_to()..];
+                self.partial[..tail.len()].copy_from_slice(tail);
+                self.partial_len = tail.len() as u8;
+            }
+        }
+    }
+
     fn finish_ok(&self) -> bool {
         !self.invalid && self.partial_len == 0
     }
+}
+
+#[derive(Clone, Copy)]
+enum FastForward {
+    RequestLine,
+    Value,
+    DeadName,
 }
 
 struct HeadScanner {
@@ -1027,6 +1059,117 @@ impl HeadScanner {
                 HeadStep::Continue
             }
         }
+    }
+
+    /// Slice form of [`Self::observe`]: consumes bytes until the head
+    /// completes, observation disables, or the slice ends, returning the
+    /// number of bytes consumed (always >= 1 for a non-empty slice).
+    ///
+    /// Decision-identical to feeding `observe` one byte at a time. The only
+    /// acceleration is `memchr` fast-forward over byte runs whose per-byte
+    /// handling is provably a no-op beyond counters this method updates in
+    /// bulk: header values (`Other`/post-conflict), header names whose
+    /// Content-Length/Transfer-Encoding candidates are already dead, and
+    /// the request line (bulk UTF-8 validation + tail window). Every byte
+    /// that can change state — CR, LF, `:`, candidate name bytes,
+    /// Content-Length value bytes — still goes through `observe`.
+    fn observe_slice(&mut self, bytes: &[u8], signals: &H1FramingSignals) -> (usize, HeadStep) {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if !self.pending_cr {
+                let skipped = self.fast_forward(&bytes[offset..], signals);
+                if skipped > 0 {
+                    offset += skipped;
+                    continue;
+                }
+            }
+            let step = self.observe(bytes[offset], signals);
+            offset += 1;
+            match step {
+                HeadStep::Continue => {}
+                other => return (offset, other),
+            }
+        }
+        (offset, HeadStep::Continue)
+    }
+
+    /// Bulk-consume a prefix of `bytes` whose per-byte `observe` handling
+    /// cannot change scanner state beyond the counters updated here.
+    /// Returns the number of bytes consumed (0 = not eligible). The run
+    /// never crosses CR/LF, never exceeds the remaining `max_bytes`
+    /// budget (the byte that would exceed it is left for `observe` to
+    /// disable on, exactly as the per-byte path does), and leaves
+    /// `pending_cr` unset.
+    fn fast_forward(&mut self, bytes: &[u8], signals: &H1FramingSignals) -> usize {
+        let budget = self.max_bytes.saturating_sub(self.bytes_seen);
+        if budget == 0 || bytes.is_empty() {
+            return 0;
+        }
+        let (run, kind) = if self.request_line {
+            // Bulk UTF-8 validation assumes no partial sequence is pending;
+            // a split multi-byte sequence falls back to per-byte handling.
+            if self.request_line_utf8.partial_len > 0 {
+                return 0;
+            }
+            (
+                memchr::memchr2(b'\r', b'\n', bytes).unwrap_or(bytes.len()),
+                FastForward::RequestLine,
+            )
+        } else if self.conflict || matches!(self.current_header, CurrentHeader::Other) {
+            (
+                memchr::memchr2(b'\r', b'\n', bytes).unwrap_or(bytes.len()),
+                FastForward::Value,
+            )
+        } else if matches!(self.current_header, CurrentHeader::Name)
+            && !self.content_length_candidate
+            && !self.transfer_encoding_candidate
+        {
+            (
+                memchr::memchr3(b':', b'\r', b'\n', bytes).unwrap_or(bytes.len()),
+                FastForward::DeadName,
+            )
+        } else {
+            return 0;
+        };
+        let run = run.min(budget);
+        if run == 0 {
+            return 0;
+        }
+        self.bytes_seen = self.bytes_seen.saturating_add(run);
+        self.line_has_data = true;
+        match kind {
+            FastForward::Value => {}
+            FastForward::DeadName => {
+                self.name_len = self.name_len.saturating_add(run);
+            }
+            FastForward::RequestLine => {
+                self.request_line_utf8.observe_slice(&bytes[..run]);
+                self.push_request_line_tail(&bytes[..run]);
+                self.store_utf8_hint_if_invalid(signals);
+            }
+        }
+        run
+    }
+
+    /// Bulk form of the request-line tail window update in
+    /// `observe_line_byte`: keep the last `request_line_tail.len()` bytes.
+    fn push_request_line_tail(&mut self, bytes: &[u8]) {
+        let cap = self.request_line_tail.len();
+        if bytes.len() >= cap {
+            self.request_line_tail
+                .copy_from_slice(&bytes[bytes.len() - cap..]);
+            self.request_line_tail_len = cap;
+            return;
+        }
+        let keep = (self.request_line_tail_len + bytes.len()).saturating_sub(cap);
+        if keep > 0 {
+            self.request_line_tail
+                .copy_within(keep..self.request_line_tail_len, 0);
+            self.request_line_tail_len -= keep;
+        }
+        let dst = &mut self.request_line_tail[self.request_line_tail_len..][..bytes.len()];
+        dst.copy_from_slice(bytes);
+        self.request_line_tail_len += bytes.len();
     }
 
     fn observe_line_byte(&mut self, byte: u8) {
@@ -1927,6 +2070,60 @@ mod tests {
                 ));
                 assert_eq!(guard.inner.written, response);
                 assert_eq!(signals.take_parse_rejects(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn slice_scanning_matches_byte_at_a_time_across_every_split() {
+        // Corpus chosen to exercise every fast-forward arm: long ignored
+        // header values, dead header-name candidates, live CL/TE
+        // candidates, an invalid-UTF8 request line, a split multi-byte
+        // UTF-8 sequence, bare-LF lines, and a pipelined second head.
+        let corpora: &[&[u8]] = &[
+            b"GET /a-very/long/request/target?with=query&more=padding HTTP/1.1\r\nHost: example.test\r\nUser-Agent: some-quite-long-agent-string/1.0 (padding padding)\r\nX-Totally-Unrelated-Header: value value value value value\r\nContent-Length: 4\r\n\r\nbodyGET /next HTTP/1.0\nHost: b\nTransfer-Encoding: chunked\n\n0\n\n",
+            b"POST / HTTP/1.1\r\nContent-Length: 6\r\nTransfer-Encoding: chunked\r\nX-Padding: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n0\r\n\r\n",
+            b"GET /\xff\xfe HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /caf\u{e9}/au/lait HTTP/1.1\r\nHost: x\r\n\r\n".as_bytes(),
+            b"POST / HTTP/1.1\r\nContent-Lengt: 9\r\nTransfer-Encodin: chunked\r\nContent-Length: 99999999999999999999999999\r\n\r\n",
+        ];
+        for wire in corpora {
+            let whole = scan(&[wire]);
+            // One-byte parts limit every fast-forward run to a single
+            // byte, which is the reference behaviour long runs must match.
+            let bytewise_parts: Vec<&[u8]> = wire.iter().map(std::slice::from_ref).collect();
+            let bytewise = scan(&bytewise_parts);
+            assert_eq!(whole.results, bytewise.results, "wire: {wire:?}");
+            assert_eq!(whole.overflowed, bytewise.overflowed, "wire: {wire:?}");
+            assert_eq!(whole.unknown, bytewise.unknown, "wire: {wire:?}");
+            assert_eq!(
+                whole.parse_reject_hint, bytewise.parse_reject_hint,
+                "wire: {wire:?}"
+            );
+            for split in 0..=wire.len() {
+                let outcome = scan(&[&wire[..split], &wire[split..]]);
+                assert_eq!(
+                    outcome.results, whole.results,
+                    "wire: {wire:?} split {split}"
+                );
+                assert_eq!(
+                    outcome.parse_reject_hint, whole.parse_reject_hint,
+                    "wire: {wire:?} split {split}"
+                );
+            }
+            // A head budget that lands inside fast-forwarded runs must
+            // disable at the same place the per-byte path does.
+            for max in [8usize, 33, 64, 101] {
+                let capped = scan_with_max_head(max, &[wire]);
+                let capped_bytewise = scan_with_max_head(max, &bytewise_parts);
+                assert_eq!(
+                    capped.results, capped_bytewise.results,
+                    "wire: {wire:?} max {max}"
+                );
+                assert_eq!(
+                    capped.unknown, capped_bytewise.unknown,
+                    "wire: {wire:?} max {max}"
+                );
             }
         }
     }
