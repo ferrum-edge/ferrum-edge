@@ -4418,6 +4418,35 @@ fn test_request_view_precomputes_key_auth_header_redaction() {
 }
 
 #[test]
+fn test_request_view_redacts_openapi_validator_bypass_header() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["oav"])],
+        vec![make_plugin_config_with_json(
+            "oav",
+            "openapi_validator",
+            json!({
+                "bypass": {"header_present": {"X-Bypass-Validator": "bypass-secret-0123456789"}},
+                "operations": [{
+                    "method": "GET",
+                    "path_template": "/items",
+                    "path_regex": "^/items$",
+                    "responses": {"200": {"application/json": {"type": "object"}}}
+                }]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+
+    assert_eq!(
+        view.request_headers_to_redact().as_ref(),
+        &["x-bypass-validator"]
+    );
+}
+
+#[test]
 fn test_authorize_plugin_default_preserves_legacy_custom_plugins() {
     let plugin: Arc<dyn Plugin> = Arc::new(LegacyAuthorizePlugin);
 
@@ -14399,18 +14428,28 @@ fn candidate_and_runtime_reject_every_runtime_composition_rule() {
 
 #[test]
 fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interlopers() {
-    // Equal priorities follow config order for proxy instances, not association
-    // order. Put the interloper last in associations to expose that difference.
-    for middle_name in ["ip_restriction", "udp_rate_limiting"] {
+    // Equal priorities break ties by plugin name (issue #6614), so an
+    // equal-priority HTTP interloper sorts after both `cors` instances and can
+    // no longer split them, whatever the config or association order. A
+    // distinct middle priority still splits them, and only an HTTP interloper
+    // makes that an error. Admission and runtime must agree in every scope and
+    // under both input orders.
+    for (middle_name, middle_priority, expect_ok) in [
+        ("ip_restriction", 100, true),
+        ("udp_rate_limiting", 100, true),
+        ("ip_restriction", 150, false),
+        ("udp_rate_limiting", 150, true),
+    ] {
+        let last_priority = if middle_priority == 100 { 100 } else { 200 };
         let mut first = cors_config("a", &["GET"], &["X-Test"], Some(100), None);
-        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(100), None);
+        let mut last = cors_config("b", &["GET"], &["X-Test"], Some(last_priority), None);
         let mut middle = make_plugin_config_with_priority(
             "middle",
             middle_name,
             PluginScope::Proxy,
             Some("p1"),
             true,
-            Some(100),
+            Some(middle_priority),
             None,
         );
         for scope in [
@@ -14422,28 +14461,24 @@ fn candidate_ordering_matches_runtime_for_ties_scopes_and_stream_only_interloper
                 pc.scope = scope.clone();
                 pc.proxy_id = (scope == PluginScope::Proxy).then(|| "p1".to_string());
             }
-            let associations = if scope == PluginScope::ProxyGroup {
-                vec!["a", "middle", "b"]
-            } else {
-                vec!["a", "b", "middle"]
-            };
-            let config = make_config(
-                vec![make_proxy("p1", "/api", associations)],
-                vec![first.clone(), middle.clone(), last.clone()],
-            );
-            let admission =
-                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None);
-            let runtime = PluginCache::new(&config);
-            assert_eq!(
-                admission.is_ok(),
-                middle_name == "udp_rate_limiting",
-                "{middle_name}/{scope:?}: {admission:?}"
-            );
-            assert_eq!(
-                runtime.is_ok(),
-                admission.is_ok(),
-                "{middle_name}/{scope:?}"
-            );
+            for reversed in [false, true] {
+                let mut associations = vec!["a", "middle", "b"];
+                let mut plugin_configs = vec![first.clone(), middle.clone(), last.clone()];
+                if reversed {
+                    associations.reverse();
+                    plugin_configs.reverse();
+                }
+                let config =
+                    make_config(vec![make_proxy("p1", "/api", associations)], plugin_configs);
+                let label =
+                    format!("{middle_name}@{middle_priority}/{scope:?}/reversed={reversed}");
+                let admission = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+                    &config, None,
+                );
+                let runtime = PluginCache::new(&config);
+                assert_eq!(admission.is_ok(), expect_ok, "{label}: {admission:?}");
+                assert_eq!(runtime.is_ok(), admission.is_ok(), "{label}");
+            }
         }
     }
 }
@@ -14488,4 +14523,288 @@ fn candidate_topology_does_not_open_node_local_geo_database() {
             "{error}"
         );
     }
+}
+
+// ── Deterministic equal-priority ordering (issue #6614) ─────────────────────
+
+fn update_header_transformer(
+    id: &str,
+    value: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "request_transformer",
+        json!({"rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "x-order",
+            "value": value
+        }]}),
+        scope,
+        proxy_id,
+    )
+}
+
+fn chain_names(cache: &PluginCache, proxy_id: &str) -> Vec<String> {
+    cache
+        .get_plugins("ferrum", proxy_id)
+        .iter()
+        .map(|plugin| plugin.name().to_string())
+        .collect()
+}
+
+async fn final_order_header(cache: &PluginCache, proxy_id: &str) -> Option<String> {
+    let plugins = cache.get_plugins_for_protocol("ferrum", proxy_id, ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let mut headers = HashMap::new();
+    for plugin in plugins.iter() {
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    headers.get("x-order").cloned()
+}
+
+#[test]
+fn equal_priority_plugins_order_by_name_regardless_of_config_order() {
+    let mut size_limit = make_plugin_config(
+        "a-size",
+        "response_size_limiting",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    size_limit.priority_override = Some(500);
+    let mut ip_filter = make_plugin_config(
+        "z-ip",
+        "ip_restriction",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    ip_filter.priority_override = Some(500);
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["a-size", "z-ip"])],
+        vec![size_limit.clone(), ip_filter.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["z-ip", "a-size"])],
+        vec![ip_filter, size_limit],
+    );
+
+    let forward_names = chain_names(&PluginCache::new(&forward).unwrap(), "p1");
+    let reversed_names = chain_names(&PluginCache::new(&reversed).unwrap(), "p1");
+    assert_eq!(
+        forward_names,
+        vec!["ip_restriction", "response_size_limiting"]
+    );
+    assert_eq!(
+        forward_names, reversed_names,
+        "config row order must not reorder equal-priority plugins"
+    );
+}
+
+#[tokio::test]
+async fn same_plugin_instances_order_by_config_id_regardless_of_row_order() {
+    let a = update_header_transformer("rt-a", "a", PluginScope::Proxy, Some("p1"));
+    let b = update_header_transformer("rt-b", "b", PluginScope::Proxy, Some("p1"));
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt-a", "rt-b"])],
+        vec![a.clone(), b.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt-b", "rt-a"])],
+        vec![b, a],
+    );
+
+    // `update` is last-writer-wins, so the surviving value names the instance
+    // that ran last: ascending id order puts `rt-b` after `rt-a`.
+    let forward_cache = PluginCache::new(&forward).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+    let reversed_cache = PluginCache::new(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&reversed_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+
+    // A reload that only reorders rows keeps the same chain order.
+    forward_cache.rebuild(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+}
+
+#[tokio::test]
+async fn proxy_group_instances_order_by_config_id_regardless_of_association_order() {
+    let a = update_header_transformer("pg-a", "a", PluginScope::ProxyGroup, None);
+    let b = update_header_transformer("pg-b", "b", PluginScope::ProxyGroup, None);
+
+    let forward = make_config(
+        vec![make_proxy("p1", "/api", vec!["pg-a", "pg-b"])],
+        vec![a.clone(), b.clone()],
+    );
+    let reversed = make_config(
+        vec![make_proxy("p1", "/api", vec!["pg-b", "pg-a"])],
+        vec![b, a],
+    );
+
+    let forward_cache = PluginCache::new(&forward).unwrap();
+    let reversed_cache = PluginCache::new(&reversed).unwrap();
+    assert_eq!(
+        final_order_header(&forward_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+    assert_eq!(
+        final_order_header(&reversed_cache, "p1").await.as_deref(),
+        Some("b")
+    );
+}
+
+// ---- PluginInstanceWrapper forwards every capability predicate (#6606) ----
+
+/// Build a single-plugin HTTP proxy whose instance carries a `priority_override`,
+/// so the cache publishes it inside `PluginInstanceWrapper`, and return that
+/// published instance.
+fn wrapped_http_instance(plugin_name: &str, config: serde_json::Value) -> Arc<dyn Plugin> {
+    let mut plugin = make_plugin_config_with_json(
+        "wrapped",
+        plugin_name,
+        config,
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    plugin.priority_override = Some(4321);
+    let cache = PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/api", vec!["wrapped"])],
+        vec![plugin],
+    ))
+    .unwrap_or_else(|error| panic!("{plugin_name} with priority_override must admit: {error}"));
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let instance = plugins
+        .iter()
+        .find(|plugin| plugin.name() == plugin_name)
+        .unwrap_or_else(|| panic!("{plugin_name} must be published"))
+        .clone();
+    assert_eq!(
+        instance.priority(),
+        4321,
+        "the published {plugin_name} instance must be the priority-override wrapper"
+    );
+    instance
+}
+
+#[test]
+fn wrapped_mtls_auth_still_declares_an_authenticated_stream_principal() {
+    let instance = wrapped_http_instance("mtls_auth", json!({"cert_field": "subject_cn"}));
+    assert!(
+        instance.admits_authenticated_stream_principal(),
+        "a priority-overridden mtls_auth must keep its stream-principal declaration"
+    );
+    assert!(
+        !ferrum_edge::_test_support::ktls_handoff_eligible_for_test(
+            true,
+            false,
+            false,
+            std::slice::from_ref(&instance),
+        ),
+        "a wrapped mtls_auth must keep the listener off the kTLS handoff"
+    );
+}
+
+#[test]
+fn wrapped_cors_keeps_its_strict_origin_policy_declaration() {
+    let instance = wrapped_http_instance(
+        "cors",
+        json!({"allowed_origins": ["https://trusted.example"]}),
+    );
+    assert!(instance.cors_uses_strict_origin_policy());
+}
+
+#[test]
+fn wrapped_response_caching_keeps_its_origin_response_declaration() {
+    let instance = wrapped_http_instance("response_caching", json!({"ttl_seconds": 60}));
+    assert!(instance.rejects_with_origin_response());
+}
+
+/// Names of the methods declared directly inside the first `{ ... }` block
+/// that follows `header` in `source` (a trait or an `impl` block).
+fn block_method_names(source: &str, header: &str) -> std::collections::BTreeSet<String> {
+    let start = source
+        .find(header)
+        .unwrap_or_else(|| panic!("{header} must exist"));
+    let body_start = start + header.len();
+    let end = source[body_start..]
+        .find("\n}\n")
+        .map(|offset| body_start + offset)
+        .unwrap_or_else(|| panic!("{header} block must terminate"));
+    source[body_start..end]
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .strip_prefix("    async fn ")
+                .or_else(|| line.strip_prefix("    fn "))?;
+            let name: String = rest
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Every `Plugin` trait method must be overridden by `PluginInstanceWrapper`.
+/// A missing forward silently resolves to the trait default for any instance
+/// carrying a `priority_override` or trigger, which is how #6606 dropped
+/// `admits_authenticated_stream_principal` and two CORS/diagnostic predicates.
+#[test]
+fn plugin_instance_wrapper_forwards_every_plugin_trait_method() {
+    let trait_methods = block_method_names(
+        include_str!("../../../src/plugins/mod.rs"),
+        "pub trait Plugin: Any + Send + Sync {",
+    );
+    let wrapper_methods = block_method_names(
+        include_str!("../../../src/plugin_cache.rs"),
+        "impl Plugin for PluginInstanceWrapper {",
+    );
+    assert!(
+        trait_methods.len() > 100 && wrapper_methods.len() > 100,
+        "source scan must find the Plugin trait and the wrapper impl \
+         (trait={}, wrapper={})",
+        trait_methods.len(),
+        wrapper_methods.len()
+    );
+    // The wrapper is deliberately NOT the deferred-CORS marker; see the
+    // `PluginInstanceWrapper` docs in src/plugin_cache.rs.
+    const DELIBERATELY_NOT_FORWARDED: &[&str] = &["is_deferred_cors_wrapper"];
+    let missing: Vec<&String> = trait_methods
+        .iter()
+        .filter(|name| {
+            !wrapper_methods.contains(*name) && !DELIBERATELY_NOT_FORWARDED.contains(&name.as_str())
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "PluginInstanceWrapper must forward every Plugin trait method; missing: {missing:?}"
+    );
+    let stale: Vec<&String> = wrapper_methods
+        .iter()
+        .filter(|name| !trait_methods.contains(*name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "PluginInstanceWrapper overrides names the Plugin trait no longer declares: {stale:?}"
+    );
 }
