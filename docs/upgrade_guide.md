@@ -28,6 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Shared consumer credentials are refused (#6572)
+
+Consumers whose `id`, `username` or `custom_id` collide are still quarantined
+as before: the later consumer is left out of the snapshot. Among the remaining
+consumers, a configuration in which two consumers of one namespace share a
+`keyauth` key, a `basicauth` username, or an exact `mtls_auth` identity is now
+refused by
+database full loads, control planes, data planes, and incremental applies; the
+previous configuration stays live on a running gateway. The Admin API already
+refused to create such collisions, so only rows written out of band or before
+that check can trigger it.
+
+At **startup** there is no previous configuration: a database-mode gateway
+whose initial load is refused falls back to a valid backup if one is configured,
+and otherwise exits before its Admin API binds. **Before upgrading**, look for
+`Credential collision` warnings in the gateway log and rotate or remove one
+side of each collision, either through the Admin API of a still-running
+(pre-upgrade) instance or directly in storage.
 ### `openapi_validator` bypass headers need a secret (PR #6634)
 
 Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
@@ -94,28 +112,6 @@ check the server version with `db.version()`.
 
 See [docs/mongodb.md](mongodb.md#supported-server-versions) for the full table
 and the Linux kernel note for MongoDB 8.0.21+, 8.3 and 9.0.
-
-### Azure Key Vault references must use `https://` (#6570, PR #6603)
-
-The Azure Key Vault backend now uses the 1.x Azure SDK. That SDK sends the
-Entra bearer token only over TLS, and Ferrum now refuses any vault URL that is
-not `https://`. This applies to `_AZURE` values and to `azure://` TLS sources.
-Such a URL fails `ferrum-edge validate` and startup.
-
-- **Public or private-link vaults (`https://<vault>.vault.azure.net/...`):** no
-  change.
-- **`http://` emulators, fakes, sidecars, or proxies:** serve them over TLS. If
-  their certificate is not publicly trusted, set `FERRUM_TLS_CA_BUNDLE_PATH` in
-  the process environment to the issuing CA. Key Vault calls trust it in
-  addition to the platform roots. An unreadable, non-regular, or oversized
-  bundle, or one with no certificates, now fails resolution. A sidecar that
-  relays Azure's `resource="https://vault.azure.net"` challenge must be
-  addressed as `<vault>.vault.azure.net`, because the SDK checks the challenge
-  domain against the request host.
-- **Embedding code:** `AzureCredentials::new` and
-  `AzureCredentials::from_static_token` are `async` and return a `Result`.
-
-See [FEATURES.md](../FEATURES.md#tls-and-trust) for an emulator example.
 
 ### HTTP/3 `ctx.query_params` is percent-decoded (#6580)
 
