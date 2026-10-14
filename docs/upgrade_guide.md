@@ -32,6 +32,10 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 A `jwks_auth` instance accepts at most 64 `providers`. For every `issuer`, the providers that share it plus the providers that set no `issuer` must total at most 8, and at most 8 providers may omit `issuer`. A config past these limits is refused at construction. A token is now verified only against providers whose `issuer` equals its `iss`, plus issuer-less providers. Merge duplicate providers, or split very large provider sets across routes. In mesh mode, identical RequestAuthentication rules are installed once. A combined set past the limits fails construction, so the data plane keeps its last accepted configuration.
 
+### `openapi_validator` bypass headers need a secret (PR #6634)
+
+Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
+
 ### `jwks_auth` metadata flag no longer allows missing tokens (PR #6596)
 
 `emit_mesh_request_principal_metadata: true` used to let a request without a
