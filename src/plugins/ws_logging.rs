@@ -63,6 +63,7 @@ use super::{
 use crate::config::BackendEgressPolicy;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::observability_delivery::DeliveryWorkerControl;
+use crate::plugins::utils::log_sampling::warn_sampled;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -1059,6 +1060,16 @@ impl Plugin for WsLogging {
         let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             "ws_logging: start_background_tasks requires a Tokio runtime".to_string()
         })?;
+        // The three activation slots are only ever filled together, under this
+        // lock. Refuse up front, before any config is consumed, if one of them
+        // is somehow already populated, so the `set` calls below cannot leave a
+        // half-staged activation (a sender without its worker) that a later
+        // call would mistake for a running one.
+        if self.commit_tx.get().is_some() || self.worker.get().is_some() {
+            return Err(
+                "ws_logging: activation state is partially staged; refusing to start".to_string(),
+            );
+        }
 
         // Take pending config under the start lock. On any failure before the
         // sender is staged, restore it so activation remains retryable.
@@ -1197,31 +1208,6 @@ async fn flush_loop(
 ) {
     if !wait_until_committed_or_closed(commit_rx, close_rx.clone()).await {
         drop(receiver);
-        return;
-    }
-
-    if cfg.endpoint_url.is_empty() {
-        let mut closing = *close_rx.borrow();
-        if closing {
-            worker.wait_for_admissions().await;
-            receiver.close();
-        }
-        loop {
-            tokio::select! {
-                biased;
-                _ = close_rx.changed(), if !closing => {
-                    closing = true;
-                    worker.wait_for_admissions().await;
-                    receiver.close();
-                }
-                entry = receiver.recv() => {
-                    if entry.is_none() {
-                        break;
-                    }
-                    decrement_outstanding(&outstanding_count, 1);
-                }
-            }
-        }
         return;
     }
 
@@ -1406,16 +1392,21 @@ async fn send_batch(
             conn = None;
         }
 
-        // Ensure we have a live connection.
+        // Ensure we have a live connection. Exactly one back-off is charged
+        // between two attempts — `reconnect_delay` after a failed connection,
+        // `retry_delay` after a failed send — and none after the final
+        // attempt, which can no longer be followed by anything.
         if conn.is_none() {
             conn = connect(cfg).await;
             if conn.is_none() {
-                warn!(
-                    "WebSocket logging: connection failed to {} (attempt {}/{})",
-                    cfg.endpoint_url_for_logs, attempt, total_attempts,
+                warn_sampled!(
+                    "WebSocket logging: connection to {} failed (attempt {}/{})",
+                    cfg.endpoint_url_for_logs,
+                    attempt,
+                    total_attempts,
                 );
                 if attempt < total_attempts {
-                    tokio::time::sleep(cfg.retry_delay).await;
+                    tokio::time::sleep(cfg.reconnect_delay).await;
                 }
                 continue;
             }
@@ -1426,9 +1417,11 @@ async fn send_batch(
             match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
                 Ok(Ok(())) => return conn,
                 Ok(Err(e)) => {
-                    warn!(
+                    warn_sampled!(
                         "WebSocket logging: send failed to {}: {e} (attempt {}/{})",
-                        cfg.endpoint_url_for_logs, attempt, total_attempts,
+                        cfg.endpoint_url_for_logs,
+                        attempt,
+                        total_attempts,
                     );
                     // Connection is broken — dropping `conn` aborts the
                     // drain task so the underlying stream is released
@@ -1440,9 +1433,12 @@ async fn send_batch(
                     }
                 }
                 Err(_) => {
-                    warn!(
+                    warn_sampled!(
                         "WebSocket logging: write/flush timeout to {} after {:?} (attempt {}/{})",
-                        cfg.endpoint_url_for_logs, cfg.write_timeout, attempt, total_attempts,
+                        cfg.endpoint_url_for_logs,
+                        cfg.write_timeout,
+                        attempt,
+                        total_attempts,
                     );
                     conn = None;
                     if attempt < total_attempts {
@@ -1619,28 +1615,28 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
                 drain_done: done_rx,
             })
         }
+        // No back-off here: the caller (`send_batch`) owns the retry ladder and
+        // charges `reconnect_delay` once between attempts, never after the last.
         Ok(Err(WsConnectError::Egress(reason))) => {
-            warn!(
-                "WebSocket logging: refusing to connect to {}: {reason} — will retry in {:?}",
-                cfg.endpoint_url_for_logs, cfg.reconnect_delay,
+            warn_sampled!(
+                "WebSocket logging: refusing to connect to {}: {reason}",
+                cfg.endpoint_url_for_logs,
             );
-            tokio::time::sleep(cfg.reconnect_delay).await;
             None
         }
         Ok(Err(WsConnectError::Handshake(e))) => {
-            warn!(
-                "WebSocket logging: failed to connect to {}: {e} — will retry in {:?}",
-                cfg.endpoint_url_for_logs, cfg.reconnect_delay,
+            warn_sampled!(
+                "WebSocket logging: failed to connect to {}: {e}",
+                cfg.endpoint_url_for_logs,
             );
-            tokio::time::sleep(cfg.reconnect_delay).await;
             None
         }
         Err(_) => {
-            warn!(
-                "WebSocket logging: connect timeout to {} after {:?} — will retry in {:?}",
-                cfg.endpoint_url_for_logs, cfg.connect_timeout, cfg.reconnect_delay,
+            warn_sampled!(
+                "WebSocket logging: connect timeout to {} after {:?}",
+                cfg.endpoint_url_for_logs,
+                cfg.connect_timeout,
             );
-            tokio::time::sleep(cfg.reconnect_delay).await;
             None
         }
     }
