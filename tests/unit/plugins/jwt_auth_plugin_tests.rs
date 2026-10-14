@@ -363,6 +363,56 @@ async fn token_missing_issuer_and_audience_succeeds_when_not_configured() {
     assert_continue(result);
 }
 
+// With no audiences configured, a validly signed token that carries an `aud`
+// claim was minted for some other audience and must be rejected (strict
+// jsonwebtoken default, matching `jwt_verifier.rs` and the admin verifier).
+// With audiences configured, a malformed `aud` that jsonwebtoken would treat
+// as unparsed must still be rejected.
+#[tokio::test]
+async fn malformed_audience_rejects_when_audience_configured() {
+    let plugin = JwtAuth::new(&json!({"audiences": ["my-api"]})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    for aud in [
+        json!(123),
+        json!({"service": "my-api"}),
+        json!(["my-api", 1]),
+        json!([]),
+    ] {
+        let token = create_jwt_token(&json!({"sub": "testuser", "aud": aud}), "test-jwt-secret");
+
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {}", token));
+
+        let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+        assert_reject(result, Some(401));
+    }
+}
+
+#[tokio::test]
+async fn token_with_audience_rejects_when_no_audience_configured() {
+    let plugin = JwtAuth::new(&json!({})).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_test_consumer()]);
+    for aud in [
+        json!("other-api"),
+        json!(["other-api"]),
+        json!([]),
+        json!(null),
+        json!(123),
+        json!({"service": "other-api"}),
+        json!(["other-api", 1]),
+    ] {
+        let token = create_jwt_token(&json!({"sub": "testuser", "aud": aud}), "test-jwt-secret");
+
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {}", token));
+
+        let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+        assert_reject(result, Some(401));
+    }
+}
+
 #[tokio::test]
 async fn leeway_allows_token_within_skew_window() {
     let plugin = JwtAuth::new(&json!({"leeway_secs": 60})).unwrap();

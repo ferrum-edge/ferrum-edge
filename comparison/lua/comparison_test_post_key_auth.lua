@@ -21,7 +21,7 @@ wrk.body = payload
 wrk.headers["Content-Type"] = "application/json"
 wrk.headers["Accept"] = "application/json"
 wrk.headers["User-Agent"] = "wrk-gateway-comparison"
-wrk.headers["apikey"] = "test-api-key"
+wrk.headers["apikey"] = "comparison-key-auth-0001"
 
 done = function(summary, latency, requests)
     -- Machine-parseable output block

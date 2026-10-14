@@ -1266,7 +1266,7 @@ test_tyk_key_auth() {
 
     # Override the lua script key with the Tyk-generated key
     local tyk_lua="$COMP_DIR/lua/.tyk_key_auth_runtime.lua"
-    sed "s/test-api-key/$tyk_api_key/g" "$LUA_SCRIPT_POST_KEY_AUTH" > "$tyk_lua"
+    sed "s/comparison-key-auth-0001/$tyk_api_key/g" "$LUA_SCRIPT_POST_KEY_AUTH" > "$tyk_lua"
 
     # Run wrk with the Tyk-specific key
     local label="tyk/key_auth/api/echo-auth"

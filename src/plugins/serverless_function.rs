@@ -1700,6 +1700,10 @@ fn unambiguous_query_params(
                 "duplicate_query_parameter",
                 "query forwarding rejected a duplicate decoded parameter name",
             ),
+            QueryAmbiguity::SemicolonSeparator => InvocationFailure::governed_input(
+                "ambiguous_query_encoding",
+                "query forwarding rejected a raw ';' character",
+            ),
         });
     }
     if canonical.is_empty()

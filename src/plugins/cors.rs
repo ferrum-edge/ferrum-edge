@@ -170,7 +170,8 @@ const ORIGIN_REGEX_MOZ_EXTENSION_UNIVERSALITY_PROBES: &[&str] = &[
 pub(crate) enum OriginPolicyBreadth {
     /// Explicit allow-all: native `"*"` or Istio `{exact: "*"}`.
     Wildcard,
-    /// An opaque exact `null`, or a prefix/regex that admits every origin (or
+    /// An opaque exact `null`, a `*.suffix` wildcard whose suffix is a single
+    /// label or a public suffix, or a prefix/regex that admits every origin (or
     /// every origin of a scheme). Not the `AllowedOrigins::Wildcard` variant,
     /// but equivalent for credentialed reflection.
     EffectivelyUniversal,
@@ -189,6 +190,10 @@ pub(crate) enum OriginMatcherSpec<'a> {
     /// `null` is non-strict because unrelated sandboxed/file origins collapse
     /// to that same value.
     Exact(&'a str),
+    /// Native `*.suffix` wildcard-subdomain string, as configured (`*.` form).
+    /// An entry the wildcard validator refuses is not classified universal —
+    /// the caller already refused it at admission.
+    WildcardSubdomain(&'a str),
     Prefix(&'a str),
     /// Already-compiled regex (plugin construction).
     CompiledRegex(&'a Regex),
@@ -211,6 +216,12 @@ pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolic
                 OriginPolicyBreadth::Strict
             }
         }
+        OriginMatcherSpec::WildcardSubdomain(pattern) => match validate_wildcard_origin(pattern) {
+            Ok(suffix) if wildcard_suffix_is_effectively_universal(&suffix) => {
+                OriginPolicyBreadth::EffectivelyUniversal
+            }
+            _ => OriginPolicyBreadth::Strict,
+        },
         OriginMatcherSpec::Prefix(prefix) => {
             if origin_prefix_is_effectively_universal(prefix) {
                 OriginPolicyBreadth::EffectivelyUniversal
@@ -238,6 +249,11 @@ pub(crate) fn origin_matcher_breadth(spec: OriginMatcherSpec<'_>) -> OriginPolic
 pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMatcherSpec<'_>> {
     match origin {
         Value::String(value) if value == "*" => Some(OriginMatcherSpec::AllowAll),
+        // Native plain strings starting with `*` are wildcard-subdomain
+        // patterns at plugin construction; classify them the same way here.
+        Value::String(value) if value.starts_with('*') => {
+            Some(OriginMatcherSpec::WildcardSubdomain(value))
+        }
         Value::String(value) => Some(OriginMatcherSpec::Exact(value)),
         Value::Object(map) => {
             if let Some(exact) = map.get("exact").and_then(Value::as_str) {
@@ -261,9 +277,283 @@ pub(crate) fn origin_matcher_spec_from_entry(origin: &Value) -> Option<OriginMat
 
 /// Whether one projected `allowed_origins` entry is wildcard or effectively
 /// universal. Shared Istio/mesh admission screen (issue #4269).
+///
+/// Istio translation deliberately screens with the reserved-name probe set
+/// only, not the host-pinning proof. A credentialed policy that is only
+/// unprovable (for example `^https://[a-z]{2,}\.com$`) is therefore still
+/// projected, and `cors` construction then refuses it. `cors` is registered
+/// fail-closed, so the reload is rejected and the last published policy keeps
+/// serving. Deferring it instead would publish the route with no CORS
+/// ownership, letting a backend's own permissive CORS headers through.
 pub(crate) fn allowed_origin_entry_is_non_strict(origin: &Value) -> bool {
-    origin_matcher_spec_from_entry(origin)
-        .is_some_and(|spec| origin_matcher_breadth(spec) != OriginPolicyBreadth::Strict)
+    origin_matcher_spec_from_entry(origin).is_some_and(|spec| match spec {
+        OriginMatcherSpec::CompiledRegex(re) => origin_regex_matches_universality_probes(re),
+        OriginMatcherSpec::RegexPattern(pattern) => compile_origin_regex(pattern)
+            .is_ok_and(|re| origin_regex_matches_universality_probes(&re)),
+        OriginMatcherSpec::WildcardSubdomain(_) => false,
+        other => origin_matcher_breadth(other) != OriginPolicyBreadth::Strict,
+    })
+}
+
+/// Whether a validated wildcard-subdomain suffix (`.example.com`, as stored
+/// by [`validate_wildcard_origin`]) admits hosts that anyone can register.
+///
+/// `*.com` or `*.co.uk` matches every site under a TLD or public registry
+/// suffix, and `*.github.io` every tenant of a shared hosting suffix, so for
+/// credentialed reflection they are as broad as `*`. A suffix is therefore
+/// strict only when it has at least two labels, is not itself a public suffix
+/// (ICANN or private section of the Public Suffix List), and is not the parent
+/// of a wildcard rule (`*.run.app` makes every `<x>.run.app` a public suffix,
+/// so `*.run.app` as an origin wildcard covers independent tenants). A suffix
+/// the list does not resolve is treated as universal (fail closed).
+///
+/// A domain with any PSL rule strictly beneath it (`amazonaws.com`, above
+/// `s3.amazonaws.com`) is universal too, because the wildcard covers that
+/// subtree's independent tenants. The `psl` crate exposes lookups only, so
+/// those ancestors come from a generated index of the same list
+/// (`cors_psl_ancestors.rs`).
+pub(crate) fn wildcard_suffix_is_effectively_universal(suffix: &str) -> bool {
+    let domain = suffix.strip_prefix('.').unwrap_or(suffix);
+    let domain = domain
+        .strip_suffix('.')
+        .unwrap_or(domain)
+        .to_ascii_lowercase();
+    if domain.is_empty() || !domain.contains('.') {
+        return true;
+    }
+    // A numeric final label is an IP-literal fragment (`1.1` in `*.1.1`), not
+    // a DNS suffix with a registrable owner.
+    if domain
+        .rsplit('.')
+        .next()
+        .is_none_or(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
+    if psl::suffix_str(&domain).is_none_or(|public_suffix| public_suffix == domain) {
+        return true;
+    }
+    if psl_ancestors::PSL_SUFFIX_ANCESTORS
+        .binary_search(&domain.as_str())
+        .is_ok()
+    {
+        return true;
+    }
+    let child = format!("{WILDCARD_RULE_PROBE_LABEL}.{domain}");
+    psl::suffix_str(&child).is_none_or(|public_suffix| public_suffix == child)
+}
+
+#[path = "cors_psl_ancestors.rs"]
+mod psl_ancestors;
+
+/// Label placed under a wildcard suffix to detect a PSL wildcard rule
+/// (`*.<domain>`) directly beneath it. Chosen so no exception rule names it.
+const WILDCARD_RULE_PROBE_LABEL: &str = "ferrum-psl-probe";
+
+/// Positive proof that every origin a regex admits has a host pinned to a
+/// registrable domain (or below one).
+///
+/// The pattern is parsed with `regex-syntax` and its literal **suffixes** are
+/// extracted: every match must end with one of them. Each must either be
+/// exact (the whole match, so the origin is fully literal), contain the scheme
+/// separator (`://host[:port]`, so the whole authority is literal), or carry,
+/// after its first `.`, a domain that [`wildcard_suffix_is_effectively_universal`]
+/// accepts as strict, optionally followed by a literal `:port`. The text
+/// before that first `.` may be extended to the left by the match, so it never
+/// counts: `[a-z]+example\.com` leaves only `com` and is refused, while
+/// `pr-[0-9]+\.preview\.example\.com` keeps `preview.example.com`. Anything
+/// else — an unbounded suffix set, a variable port, or a public suffix
+/// (`[a-z]{2,}\.com`) — is not provable and is classified non-strict. Finite host alternations
+/// such as `^https://(?:a|b)\.github\.io$` extract as exact literals and
+/// stay strict.
+fn origin_regex_host_is_provably_constrained(re: &Regex) -> bool {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+
+    let Ok(hir) = regex_syntax::ParserBuilder::new()
+        .nest_limit(ORIGIN_REGEX_NEST_LIMIT)
+        .build()
+        .parse(re.as_str())
+    else {
+        return false;
+    };
+    let suffix_proof = |hir: &regex_syntax::hir::Hir| {
+        let suffixes = Extractor::new().kind(ExtractKind::Suffix).extract(hir);
+        suffixes.literals().is_some_and(|literals| {
+            !literals.is_empty()
+                && literals.iter().all(|literal| {
+                    origin_suffix_literal_pins_host(literal.as_bytes(), literal.is_exact())
+                })
+        })
+    };
+    if suffix_proof(&hir) {
+        return true;
+    }
+    // A fixed DNS suffix followed by a variable numeric port
+    // (`[a-z]+\.example\.com:[0-9]+`): prove the host without the port.
+    if origin_regex_without_trailing_port(&hir).is_some_and(|stripped| suffix_proof(&stripped)) {
+        return true;
+    }
+    // A pattern whose every match STARTS with `scheme://host:` (or is a
+    // complete literal origin) also pins the host, whatever follows the port
+    // separator, e.g. `^https://app\.example\.com:[0-9]+$`.
+    let prefixes = Extractor::new().kind(ExtractKind::Prefix).extract(&hir);
+    prefixes.literals().is_some_and(|literals| {
+        !literals.is_empty()
+            && literals.iter().all(|literal| {
+                origin_prefix_literal_pins_host(literal.as_bytes(), literal.is_exact())
+            })
+    })
+}
+
+fn origin_prefix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let Some((_, authority)) = text.split_once("://") else {
+        return false;
+    };
+    if exact {
+        return !authority.is_empty();
+    }
+    // Inexact: the complete host must be terminated by the port separator
+    // inside the literal, so nothing after it can extend the host. A
+    // bracketed IPv6 host ends at `]`; its inner colons are not separators.
+    let host_end = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(close) => close + 1,
+            None => return false,
+        }
+    } else {
+        match authority.find(':') {
+            Some(colon) => colon,
+            None => return false,
+        }
+    };
+    let (host, rest) = authority.split_at(host_end);
+    let host_ok = if let Some(inner) = host.strip_prefix('[') {
+        inner
+            .strip_suffix(']')
+            .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+    } else {
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    };
+    host_ok && rest.starts_with(':')
+}
+
+/// `hir` with a trailing variable port removed: `...:[0-9]+` or an optional
+/// `(?::[0-9]+)?` group at the end of the top-level concatenation (end
+/// anchors kept). Lets the suffix proof see the fixed host before the port.
+fn origin_regex_without_trailing_port(
+    hir: &regex_syntax::hir::Hir,
+) -> Option<regex_syntax::hir::Hir> {
+    use regex_syntax::hir::{Hir, HirKind, Literal};
+
+    fn unwrap_capture(hir: &Hir) -> &Hir {
+        match hir.kind() {
+            HirKind::Capture(capture) => unwrap_capture(&capture.sub),
+            _ => hir,
+        }
+    }
+    fn is_ascii_digit_class(hir: &Hir) -> bool {
+        match hir.kind() {
+            HirKind::Class(regex_syntax::hir::Class::Unicode(class)) => class
+                .ranges()
+                .iter()
+                .all(|range| range.start() >= '0' && range.end() <= '9'),
+            HirKind::Class(regex_syntax::hir::Class::Bytes(class)) => class
+                .ranges()
+                .iter()
+                .all(|range| range.start() >= b'0' && range.end() <= b'9'),
+            _ => false,
+        }
+    }
+    fn is_digit_run(hir: &Hir) -> bool {
+        match unwrap_capture(hir).kind() {
+            HirKind::Repetition(rep) => rep.min >= 1 && is_ascii_digit_class(&rep.sub),
+            _ => false,
+        }
+    }
+    fn is_optional_port(hir: &Hir) -> bool {
+        let HirKind::Repetition(rep) = unwrap_capture(hir).kind() else {
+            return false;
+        };
+        if rep.min != 0 || rep.max != Some(1) {
+            return false;
+        }
+        match unwrap_capture(&rep.sub).kind() {
+            HirKind::Concat(parts) => {
+                parts.len() == 2
+                    && matches!(parts[0].kind(), HirKind::Literal(Literal(bytes)) if &**bytes == b":")
+                    && is_digit_run(&parts[1])
+            }
+            _ => false,
+        }
+    }
+
+    let HirKind::Concat(items) = hir.kind() else {
+        return None;
+    };
+    let mut items: Vec<Hir> = items.to_vec();
+    let mut trailing_looks = Vec::new();
+    while items
+        .last()
+        .is_some_and(|last| matches!(last.kind(), HirKind::Look(_)))
+    {
+        trailing_looks.push(items.pop()?);
+    }
+    let last = items.last()?;
+    if is_optional_port(last) {
+        items.pop();
+    } else if is_digit_run(last) {
+        items.pop();
+        let previous = items.pop()?;
+        let HirKind::Literal(Literal(bytes)) = previous.kind() else {
+            return None;
+        };
+        let host_part = bytes.strip_suffix(b":")?;
+        if !host_part.is_empty() {
+            items.push(Hir::literal(host_part.to_vec()));
+        }
+    } else {
+        return None;
+    }
+    items.extend(trailing_looks.into_iter().rev());
+    Some(Hir::concat(items))
+}
+
+fn origin_suffix_literal_pins_host(bytes: &[u8], exact: bool) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    if let Some((_, authority)) = text.split_once("://") {
+        // The whole authority is literal: one host (and at most one port).
+        return !authority.is_empty();
+    }
+    if exact {
+        // A complete match with no scheme separator is not a host-bearing
+        // origin (for example the opaque `null`).
+        return false;
+    }
+    // The match may extend this literal to the left, so its first label is
+    // open-ended; everything after the first `.` is fixed and must be a domain
+    // that pins a registrable owner.
+    let Some((_, rest)) = text.split_once('.') else {
+        return false;
+    };
+    let host = match rest.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => rest,
+    };
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && matches!(Host::parse(host), Ok(Host::Domain(_)))
+        && !wildcard_suffix_is_effectively_universal(host)
 }
 
 /// A prefix is strict only when it terminates at an origin boundary, i.e. it
@@ -307,6 +597,12 @@ pub(crate) fn origin_prefix_is_effectively_universal(prefix: &str) -> bool {
 /// probe in at least one scheme group. Bounded: the probe sets are fixed, the
 /// engine is finite-automaton based, and this runs once at config construction.
 pub(crate) fn origin_regex_is_effectively_universal(re: &Regex) -> bool {
+    origin_regex_matches_universality_probes(re) || !origin_regex_host_is_provably_constrained(re)
+}
+
+/// The reserved-name probe screen alone: matches `null` or every probe origin
+/// of one scheme.
+fn origin_regex_matches_universality_probes(re: &Regex) -> bool {
     // `null` represents every opaque origin (for example sandboxed documents
     // and local files), so admitting it with credentials is itself non-strict.
     let matches_all = |probes: &[&str]| probes.iter().all(|origin| re.is_match(origin));
@@ -611,7 +907,13 @@ fn origin_pattern_breadth(pattern: &OriginPattern) -> OriginPolicyBreadth {
         OriginPattern::Exact(value) | OriginPattern::LiteralExact(value) => {
             OriginMatcherSpec::Exact(value)
         }
-        OriginPattern::WildcardSubdomain(_) => return OriginPolicyBreadth::Strict,
+        OriginPattern::WildcardSubdomain(suffix) => {
+            return if wildcard_suffix_is_effectively_universal(suffix) {
+                OriginPolicyBreadth::EffectivelyUniversal
+            } else {
+                OriginPolicyBreadth::Strict
+            };
+        }
         OriginPattern::Prefix(prefix) => OriginMatcherSpec::Prefix(prefix),
         OriginPattern::Regex(re) => OriginMatcherSpec::CompiledRegex(re),
     };
@@ -727,11 +1029,13 @@ impl CorsPlugin {
                 OriginPolicyBreadth::EffectivelyUniversal => {
                     return Err(
                         "cors: allow_credentials=true is incompatible with an effectively \
-                         universal origin matcher (the opaque exact `null` origin, a prefix \
+                         universal origin matcher (the opaque exact `null` origin, a `*.suffix` \
+                         wildcard whose suffix is a single label or a public suffix such as \
+                         `*.com` or `*.co.uk`, a prefix \
                          that does not terminate at an origin boundary — only a \
                          `scheme://host:` prefix pins the host, because prefix matching is an \
                          unbounded starts_with — or a regex that admits every origin of a \
-                         scheme); specify a host-constraining origin policy to use credentials"
+                         scheme or every host under a public suffix); specify a host-constraining origin policy to use credentials"
                             .to_string(),
                     );
                 }
@@ -1816,4 +2120,33 @@ fn ascii_ends_with_ignore_case(value: &str, suffix: &str) -> bool {
         .iter()
         .zip(suffix.iter())
         .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+#[cfg(test)]
+mod psl_ancestor_index_tests {
+    use super::psl_ancestors::PSL_SUFFIX_ANCESTORS;
+
+    #[test]
+    fn ancestor_index_is_sorted_lowercase_ascii_and_not_itself_a_suffix() {
+        assert!(
+            PSL_SUFFIX_ANCESTORS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "index must be strictly sorted for binary search"
+        );
+        for domain in PSL_SUFFIX_ANCESTORS {
+            assert!(
+                domain.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'-'
+                    || b == b'.'),
+                "{domain}"
+            );
+            assert_ne!(
+                psl::suffix_str(domain),
+                Some(*domain),
+                "{domain} is itself a public suffix; regenerate the index"
+            );
+        }
+    }
 }

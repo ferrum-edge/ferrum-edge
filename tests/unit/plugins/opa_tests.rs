@@ -386,6 +386,27 @@ async fn opa_rejects_literal_plus_query_name() {
 }
 
 #[tokio::test]
+async fn opa_rejects_unencoded_semicolon_without_calling_opa() {
+    // Issue #6579: OPA would read one `a` while a `;`-splitting backend also
+    // executes `tenant=admin`.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a=1;tenant=admin".to_string());
+
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock request history should be available");
+    assert!(
+        requests.is_empty(),
+        "OPA must not be called with an unencoded ';' in the query"
+    );
+}
+
+#[tokio::test]
 async fn opa_rejects_malformed_percent_encoding() {
     let server = MockServer::start().await;
     let plugin = plugin(&server, json!({}));
@@ -466,6 +487,136 @@ async fn opa_delegate_mode_omits_flat_query_and_reports_ambiguity() {
         ]),
         "delegate mode must expose every occurrence, not just the last"
     );
+}
+
+#[tokio::test]
+async fn opa_delegate_mode_redacts_credentials_behind_a_semicolon() {
+    // Issue #6579: `carrier=;api_key=secret` is a `carrier` pair to Ferrum but
+    // an `api_key` credential to a backend that also splits on `;`. Delegate
+    // mode must not hand its value to the policy service.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({"query_ambiguity_policy": "delegate", "redact_query_keys": ["tenant_secret"]}),
+    );
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(
+        "carrier=;api_key=builtin-secret&x=;api%5Fkey=encoded-secret&y=;tenant_secret=explicit-secret&page=1"
+            .to_string(),
+    );
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let input = &payload["input"];
+    let rendered = serde_json::to_string(&payload).unwrap();
+    for secret in ["builtin-secret", "encoded-secret", "explicit-secret"] {
+        assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+    }
+    assert_eq!(
+        input["query_pairs"],
+        json!([{"name": "page", "value": "1", "bare": false}])
+    );
+    assert_eq!(input["query_ambiguity"], json!(["semicolon_separator"]));
+}
+
+#[tokio::test]
+async fn opa_delegate_mode_redacts_sub_pairs_by_their_encoded_names() {
+    // Sub-pairs are split on the still-encoded bytes, so a configured name
+    // containing `=` or `;` matches its encoded spelling behind a raw `;`.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({
+            "query_ambiguity_policy": "delegate",
+            "redact_query_keys": ["private=key", "a;b"]
+        }),
+    );
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string(
+        "carrier=;private%3Dkey=first-secret&other=;a%3Bb=second-secret&page=1".to_string(),
+    );
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let rendered = serde_json::to_string(&payload).unwrap();
+    assert!(!rendered.contains("first-secret"), "{rendered}");
+    assert!(!rendered.contains("second-secret"), "{rendered}");
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([{"name": "page", "value": "1", "bare": false}])
+    );
+}
+
+#[tokio::test]
+async fn opa_delegate_mode_redacts_form_decoded_semicolon_names() {
+    // `;private+key=` is `private key` to a form-decoding backend, so the
+    // explicit redaction must hold for it too.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({"query_ambiguity_policy": "delegate", "redact_query_keys": ["private key"]}),
+    );
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("carrier=;private+key=form-secret&page=1".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let rendered = serde_json::to_string(&payload).unwrap();
+    assert!(!rendered.contains("form-secret"), "{rendered}");
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([{"name": "page", "value": "1", "bare": false}])
+    );
+}
+
+#[tokio::test]
+async fn opa_delegate_mode_redacts_an_ordinary_form_decoded_alias() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(
+        &server,
+        json!({"query_ambiguity_policy": "delegate", "redact_query_keys": ["private key"]}),
+    );
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("private+key=alias-secret&private%2Bkey=literal&page=1".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let rendered = serde_json::to_string(&payload).unwrap();
+    assert!(!rendered.contains("alias-secret"), "{rendered}");
+    // `%2B` decodes to a literal `+`; `private+key` is not the redacted name.
+    assert!(rendered.contains("literal"), "{rendered}");
+}
+
+#[tokio::test]
+async fn opa_keeps_a_value_with_an_encoded_semicolon() {
+    // `%3B` is content, not a separator: the query is unambiguous, and the
+    // whole `action` value must reach the policy so a denial on it holds.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("action=delete%3Btoken%3Dx".to_string());
+
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(
+        payload["input"]["query"],
+        json!({"action": "delete;token=x"})
+    );
+    assert_eq!(
+        payload["input"]["query_pairs"],
+        json!([{"name": "action", "value": "delete;token=x", "bare": false}])
+    );
+    assert_eq!(payload["input"]["query_ambiguity"], json!([]));
 }
 
 #[tokio::test]

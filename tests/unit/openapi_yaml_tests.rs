@@ -828,7 +828,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
         "namespace": "ferrum",
         "custom_id": "ext-123",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "basicauth": [{"password_hash": password_hash}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}],
@@ -930,7 +930,7 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
     let valid_create = json!({
         "username": "alice",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "basicauth": [{"password": "correct horse battery staple"}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}],
@@ -1481,7 +1481,7 @@ fn consumer_update_surface_accepts_redaction_placeholders_and_reserves_them() {
     let real_values = json!({
         "username": "alice",
         "credentials": {
-            "keyauth": [{"key": "live-api-key"}],
+            "keyauth": [{"key": "live-api-key-0123456789"}],
             "jwt": [{"secret": jwt_secret}],
             "hmac_auth": [{"secret": hmac_secret}]
         }
@@ -2651,7 +2651,6 @@ fn access_control_schema_matches_runtime_validation() {
         json!({"allowed_consumers": ["alice"]}),
         json!({"disallowed_consumers": ["bad"], "allow_authenticated_identity": true}),
         json!({"allow_authenticated_identity": true}),
-        json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
         json!({"allowed_consumers": ["  alice  "]}),
         // U+FEFF ZWNBSP is not in Rust's Unicode White_Space set.
         json!({"allowed_consumers": ["\u{feff}"]}),
@@ -2680,6 +2679,11 @@ fn access_control_schema_matches_runtime_validation() {
         json!({}),
         json!({"allowed_consumer": ["alice"]}),
         json!({"allowed_consumers": [], "allowed_groups": []}),
+        // Issue #6607: an explicitly empty allow-list is refused, not allow-all.
+        json!({"allow_authenticated_identity": true, "allowed_consumers": []}),
+        json!({"allowed_consumers": [], "disallowed_consumers": ["mallory"]}),
+        json!({"allowed_groups": [], "disallowed_groups": ["banned"]}),
+        json!({"allowed_consumers": [], "allowed_groups": ["engineering"]}),
         json!({"allowed_consumers": ["alice"], "allow_authenticated_identity": true}),
         json!({"allowed_groups": ["engineering"], "allow_authenticated_identity": true}),
         json!({"allowed_consumers": [""]}),
@@ -8915,6 +8919,12 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
             "forward_sensitive_query": true,
             "forward_sensitive_query_allowlist": ["access_token"]
         }),
+        // Query names are not header names: brackets are valid.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["filter[key]"]
+        }),
         json!({"mirror_host": "127.0.0.1", "sensitive_header_patterns": ["x-vault-"]}),
         json!({"mirror_host": "127.0.0.1", "percentage": 0}),
         json!({"mirror_host": "127.0.0.1", "mirror_path": ""}),
@@ -8958,6 +8968,37 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
             "forward_sensitive_header_allowlist": ["auth token"]
         }),
         json!({"mirror_host": "127.0.0.1", "forward_sensitive_query": true}),
+        // Entries match the decoded name, so encoded or delimiter forms are refused.
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["api+key"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["api%5fkey"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["a;key"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": [" access_token "]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["\taccess_token"]
+        }),
+        json!({
+            "mirror_host": "127.0.0.1",
+            "forward_sensitive_query": true,
+            "forward_sensitive_query_allowlist": ["access_token\n"]
+        }),
         json!({
             "mirror_host": "127.0.0.1",
             "forward_sensitive_query_allowlist": ["access_token"]

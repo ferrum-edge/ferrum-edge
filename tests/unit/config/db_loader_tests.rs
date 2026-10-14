@@ -773,26 +773,30 @@ async fn consumer_credential_index_enforces_keyauth_uniqueness() {
         .unwrap();
 
     let mut c1 = make_consumer("c1", "alice");
-    c1.credentials
-        .insert("keyauth".to_string(), json!([{ "key": "shared-key" }]));
+    c1.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "shared-key-0123456789" }]),
+    );
     store.create_consumer(&c1).await.unwrap();
 
     assert!(
         !store
-            .check_keyauth_key_unique("ferrum", "shared-key", None)
+            .check_keyauth_key_unique("ferrum", "shared-key-0123456789", None)
             .await
             .unwrap()
     );
     assert!(
         store
-            .check_keyauth_key_unique("ferrum", "shared-key", Some("c1"))
+            .check_keyauth_key_unique("ferrum", "shared-key-0123456789", Some("c1"))
             .await
             .unwrap()
     );
 
     let mut c2 = make_consumer("c2", "bob");
-    c2.credentials
-        .insert("keyauth".to_string(), json!([{ "key": "shared-key" }]));
+    c2.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "shared-key-0123456789" }]),
+    );
     let err = store
         .create_consumer(&c2)
         .await
@@ -1351,9 +1355,10 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
         .await
         .unwrap()
         .unwrap();
-    guarded_consumer
-        .credentials
-        .insert("keyauth".to_string(), json!([{ "key": "guarded-key" }]));
+    guarded_consumer.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "guarded-key-0123456789" }]),
+    );
     DatabaseBackend::update_consumer(&store_a, &guarded_consumer, &guarded_mode)
         .await
         .expect("the pre-read guard owner must be able to persist the credential update");
@@ -1694,18 +1699,20 @@ async fn consumer_credential_index_updates_on_consumer_update() {
         .unwrap();
 
     let mut consumer = make_consumer("c1", "alice");
-    consumer
-        .credentials
-        .insert("keyauth".to_string(), json!([{ "key": "old-key" }]));
+    consumer.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "old-key-0123456789" }]),
+    );
     consumer.credentials.insert(
         "mtls_auth".to_string(),
         json!([{ "identity": "spiffe://example.test/ns/default/sa/alice" }]),
     );
     store.create_consumer(&consumer).await.unwrap();
 
-    consumer
-        .credentials
-        .insert("keyauth".to_string(), json!([{ "key": "new-key" }]));
+    consumer.credentials.insert(
+        "keyauth".to_string(),
+        json!([{ "key": "new-key-0123456789" }]),
+    );
     consumer.credentials.insert(
         "mtls_auth".to_string(),
         json!([{ "identity": "spiffe://example.test/ns/default/sa/alice-v2" }]),
@@ -1717,13 +1724,13 @@ async fn consumer_credential_index_updates_on_consumer_update() {
 
     assert!(
         store
-            .check_keyauth_key_unique("ferrum", "old-key", None)
+            .check_keyauth_key_unique("ferrum", "old-key-0123456789", None)
             .await
             .unwrap()
     );
     assert!(
         !store
-            .check_keyauth_key_unique("ferrum", "new-key", None)
+            .check_keyauth_key_unique("ferrum", "new-key-0123456789", None)
             .await
             .unwrap()
     );

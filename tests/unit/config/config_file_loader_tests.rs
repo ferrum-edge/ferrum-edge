@@ -1000,7 +1000,7 @@ consumers:
     username: "user1"
     credentials:
       keyauth:
-        - key: "api-key-123"
+        - key: "api-key-123-0123456789"
       jwt:
         - secret: "jwt-secret-padding-12345678901234"
       basicauth:

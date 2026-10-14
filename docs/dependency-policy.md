@@ -627,6 +627,18 @@ patch", or the emergency procedure above. Nothing else is ignored: the
 `mongodb` driver follows the latest release, and its server floor (MongoDB 4.4
 for driver 3.9) is documented in `docs/mongodb.md`.
 
+The Azure SDK crates (`azure_core`, `azure_identity`,
+`azure_security_keyvault_secrets`, and their `typespec*` support crates) have
+their own `azure-sdk` group, majors included. `azure_identity`'s credentials
+and the Key Vault client both implement or consume `azure_core`'s
+`TokenCredential`, so a lone `azure_core` bump does not compile (#6559). Upgrade
+them as one set. The 1.x line (`azure_core` 1.1, `azure_identity` 1.0,
+`azure_security_keyvault_secrets` 1.0.1) also sends bearer tokens only over
+TLS, so Key Vault references must be `https://`; see
+[`FEATURES.md`](../FEATURES.md#tls-and-trust) for pointing the backend at an
+emulator. The azure crates appear only in the root `Cargo.lock`; the mesh and
+fuzz graphs do not compile `secrets-azure`.
+
 The other standalone lockfiles get no version updates: `ebpf/` and `fuzz/` pin
 nightly toolchains, `tests/performance/multi_protocol/` must keep `# SYNC:`
 versions equal to the root, and the remaining benchmark harnesses are not worth

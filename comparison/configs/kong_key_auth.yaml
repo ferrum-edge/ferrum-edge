@@ -51,4 +51,4 @@ services:
 consumers:
   - username: benchuser
     keyauth_credentials:
-      - key: test-api-key
+      - key: comparison-key-auth-0001

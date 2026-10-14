@@ -157,6 +157,17 @@ fn source_reference_candidates(reference: &str) -> Vec<String> {
                     candidates.push(format!("{vault_url}/secrets/{secret_name}/{version}"));
                     candidates.push(version);
                 }
+                // The SDK's challenge-resource check echoes the bare request
+                // host (and transport errors may echo `host:port`), neither of
+                // which contains the `https://` prefix of `vault_url`.
+                if let Some(authority) = vault_url.strip_prefix("https://") {
+                    candidates.push(authority.to_string());
+                    if let Ok(url) = url::Url::parse(&vault_url)
+                        && let Some(host) = url.host_str()
+                    {
+                        candidates.push(host.to_string());
+                    }
+                }
                 candidates.push(vault_url);
                 candidates.push(secret_name);
             }
@@ -423,7 +434,11 @@ fn timeout_error(key: &str, backend_name: &str, timeout: Duration) -> String {
 /// Deterministic and reference-free: client/credential discovery can stall on
 /// ADC or instance-metadata without ever touching a source reference, so the
 /// message names only the backend and the configured bound.
-#[cfg(any(feature = "secrets-aws", feature = "secrets-gcp"))]
+#[cfg(any(
+    feature = "secrets-aws",
+    feature = "secrets-gcp",
+    feature = "secrets-azure"
+))]
 fn client_init_timeout_error(backend_name: &str, timeout: Duration) -> String {
     format!(
         "Timeout initializing {} client after {}s",
@@ -1250,7 +1265,11 @@ impl SecretBackend for AzureBackend {
         secrets: &[PendingSecret],
         timeout: Duration,
     ) -> Result<Vec<ResolvedPendingSecret>, String> {
-        let creds = azure::AzureCredentials::new()?;
+        // Credential construction reads `FERRUM_TLS_CA_BUNDLE_PATH`; bound it
+        // with the same timeout as the fetches (once per provider batch).
+        let creds = tokio::time::timeout(timeout, azure::AzureCredentials::new())
+            .await
+            .map_err(|_| client_init_timeout_error(self.display_name(), timeout))??;
         resolve_many_concurrent(
             secrets,
             timeout,
@@ -1375,11 +1394,14 @@ mod tests {
         const REFERENCE: &str =
             "https://ferrum-vault-sentinel.vault.azure.net:8443/secrets/jwt-name-sentinel/v9abc";
         // Shaped like an `azure_core` transport error, which may echo either the
-        // unversioned or versioned URL plus the secret name.
+        // unversioned or versioned URL plus the secret name, and like the Key
+        // Vault challenge check, which echoes the bare host (or `host:port`).
         let sdk_error = "Failed to get Azure secret for FERRUM_ADMIN_JWT_SECRET: \
              HTTP 404 from https://ferrum-vault-sentinel.vault.azure.net:8443\
              /secrets/jwt-name-sentinel/v9abc?api-version=7.4 (secret 'jwt-name-sentinel' \
-             in https://ferrum-vault-sentinel.vault.azure.net:8443)"
+             in https://ferrum-vault-sentinel.vault.azure.net:8443); challenge resource \
+             doesn't match the requested domain 'ferrum-vault-sentinel.vault.azure.net' \
+             (connect ferrum-vault-sentinel.vault.azure.net:8443)"
             .to_string();
 
         let redacted = redact_source_reference(sdk_error, REFERENCE, "FERRUM_ADMIN_JWT_SECRET");
