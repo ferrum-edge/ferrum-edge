@@ -234,11 +234,13 @@ at construction without disclosing credentials.
 
 ### LDAP Auth Cache
 
-**What it stores:** Successful LDAP bind results (a process-random HMAC over the presented username/password -> canonical identity and expiry timestamp) to avoid repeated LDAP round-trips. The HMAC prevents a cache-only disclosure from exposing a reusable fast password verifier; a full process-memory compromise can still recover the in-process HMAC key.
+**What it stores:** Successful LDAP bind results (a process-random HMAC over the presented username/password -> canonical identity, entry DN, expiry timestamp and last group-check time) to avoid repeated LDAP round-trips. The HMAC prevents a cache-only disclosure from exposing a reusable fast password verifier; a full process-memory compromise can still recover the in-process HMAC key.
 
 **Default limit:** 10,000 entries. Caching is disabled by default.
 
-**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours) and `max_cache_entries` (default `10,000`; maximum `1,000,000`).
+**Config field:** `cache_ttl_seconds` (default `0`, disabled; maximum `86,400` seconds / 24 hours), `group_cache_ttl_seconds` (default `60`; maximum `86,400`) and `max_cache_entries` (default `10,000`; maximum `1,000,000`).
+
+**Revocation lag:** a hit skips the bind, so a password change or account disablement takes effect only when the entry expires (`cache_ttl_seconds`; values above 900 seconds log a warning). With `required_groups`, a hit older than `group_cache_ttl_seconds` since its last group check re-runs the group search first; a user removed from every required group is refused and evicted.
 
 **Cleanup mechanism:** TTL-based expiration is checked on lookup. Admission uses atomic entry accounting to preserve the hard cap during concurrent authentication. At capacity, one existing entry is replaced for each new admission; the request path never performs a full-cache scan.
 
@@ -327,6 +329,7 @@ at construction without disclosing credentials.
 | `soap_ws_security` | `nonce.max_total_cache_bytes` | `67108864` | Maximum retained nonce-key UTF-8 payload bytes (one count per shared key allocation) |
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results (1–1,000,000) |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
+| `ldap_auth` | `group_cache_ttl_seconds` | `60` | Longest a cached entry is admitted without re-checking `required_groups` (`0` = every hit; maximum `86400`) |
 | `oauth2_introspection` | `providers[].max_cache_entries` | `10000` | Per-provider hard entry ceiling, split 75/25 between active and negative results |
 | `oauth2_introspection` | `providers[].max_cache_entry_bytes` | `16384` | Maximum normalized active authorization-result bytes retained per token |
 | `oauth2_introspection` | `providers[].max_cache_total_bytes` | `16777216` | Per-provider total retained bytes, including fixed eviction indexes and entry/key state |

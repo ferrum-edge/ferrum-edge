@@ -544,7 +544,7 @@ fn contract_config(backend_port: u16) -> String {
                     "schema_draft": "draft7",
                     "validate_response": false,
                     "fail_on_unknown_operation": false,
-                    "bypass": {"header_present": {"x-post-client-contract-bypass": null}},
+                    "bypass": {"header_present": {"x-post-client-contract-bypass": "post-transform-bypass-secret"}},
                     "operations": [
                         {
                             "method": "POST",
@@ -636,7 +636,7 @@ fn contract_config(backend_port: u16) -> String {
                             "operation": "add",
                             "target": "header",
                             "key": "x-post-client-contract-bypass",
-                            "value": "bypass"
+                            "value": "post-transform-bypass-secret"
                         },
                         {
                             "target": "body",

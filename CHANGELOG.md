@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   challenge check can echo. The `Secret Backends` Azure fake now serves TLS
   with a per-test CA. Dependabot groups the Azure SDK crates so they move
   together.
+- **BREAKING — `openapi_validator` `bypass.header_present` requires a
+  shared secret.** (issue n/a, PR #6634) Each entry now maps a header name to a secret of
+  16–4096 visible ASCII characters, and a request skips validation only
+  when that header carries exactly the secret, compared in constant time.
+  Presence-only entries (`null`) and short, padded, non-ASCII or control
+  values are rejected at construction, because a client can send any header
+  name. The bypass header names are redacted from diagnostics and policy
+  calls. Inject the header from a trusted hop or gateway plugin.
 - **Reproducible release builds and no persisted checkout tokens** (issues
   #6574, #6581). The production `Dockerfile` builds its eBPF ELF with a dated
   nightly (`EBPF_NIGHTLY_TOOLCHAIN`, currently `nightly-2026-09-30`) instead
@@ -178,6 +186,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`ldap_auth` re-checks `required_groups` on cached credentials** (issue
+  #6609). With the opt-in credential cache, a hit used to skip the group
+  search for the whole `cache_ttl_seconds` (up to 24 hours). A hit whose last
+  group check is older than the new `group_cache_ttl_seconds` (default 60,
+  `0` = every hit) now re-runs it under the usual concurrency and deadline
+  bounds; a user removed from every required group gets 403 and the entry is
+  evicted. Password-change and disablement lag stays bounded by
+  `cache_ttl_seconds`, now documented, and values above 900 seconds log a
+  warning. Search-then-bind also spends one connection and bind on an unknown
+  username, removing the extra round trips a known user's wrong password used
+  to cost; directory-side password-hash cost for existing entries can still
+  differ.
 - **BREAKING — MongoDB 4.4.2 is now the oldest supported server** (issue
   #6592; PR #6571). The `mongodb` driver moves from 3.8.2 to 3.9.1 and the `<3.9` cap and its
   Dependabot ignore are gone. Driver 3.9 requires wire version 9, so MongoDB
@@ -196,6 +216,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Equal-priority plugins now run in a deterministic order** (issue #6614).
+  Ties used to follow config iteration order, which a database (unordered
+  `proxy_plugins` association rows), a reordered config file, or an
+  incremental reload could change. Chains now order by priority, then plugin
+  name, then scope (global, proxy, proxy group), then plugin-config id.
+  Candidate admission and every rebuild path use the same order. No two
+  built-in plugins share a default priority, so chains of distinct plugin
+  types are unchanged. Several instances of one plugin at the same priority
+  now run in plugin-config id order instead of config/association order, and
+  two `cors` instances sharing a priority can no longer be split by an
+  equal-priority interloper.
+- **Documented the custom-plugin trust boundary and constructor contract**
+  (issue #6616). `CUSTOM_PLUGINS.md` now states that `custom_plugins/` code is
+  trusted, in-process gateway code whose declared failure policy is taken as
+  given. It also says constructors double as validators and must be free of
+  side effects, because admin, CP, and `ferrum-edge validate` construct and
+  drop them.
 - **Plugin instances with a `priority_override` or trigger keep every
   capability declaration** (issue #6606). The cache wrapper did not forward
   `admits_authenticated_stream_principal`, `cors_uses_strict_origin_policy`
