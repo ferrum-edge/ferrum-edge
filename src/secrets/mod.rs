@@ -20,6 +20,14 @@ mod registry;
 #[cfg(feature = "secrets-vault")]
 mod vault;
 
+/// Emit warnings that external secret resolution recorded before the logging
+/// subscriber existed. Startup resolution runs before logging is initialized,
+/// so callers invoke this right after `init_logging` succeeds.
+pub fn emit_deferred_startup_warnings() {
+    #[cfg(feature = "secrets-vault")]
+    vault::emit_deferred_plaintext_warning();
+}
+
 #[cfg(any(feature = "secrets-aws", feature = "secrets-vault"))]
 pub(crate) fn split_reference_field(reference: &str) -> (&str, Option<&str>) {
     match reference.split_once('#') {
