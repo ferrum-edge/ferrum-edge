@@ -295,6 +295,7 @@ const CREDENTIAL_CLASS_STEMS: &[&str] = &[
     "session",
     "sessid",
     "passw",
+    "passkey",
     "passphrase",
     "passcode",
     "pwd",
@@ -383,6 +384,32 @@ const KEY_MATERIAL_TRAILERS: &[&str] = &[
     "hex", "json", "material", "pair", "raw", "blob", "bin", "string", "secret",
 ];
 
+/// Plural usage-counter shapes after `token`: `tokens`, or `tokens` followed
+/// by a counter word (`tokenspersecond`, `tokensused`). A singular credential
+/// representation that merely starts with `s` (`tokensigned`) is not one.
+fn is_token_count_shape(rest: &str) -> bool {
+    const COUNTER_WORDS: &[&str] = &[
+        "per",
+        "used",
+        "total",
+        "count",
+        "in",
+        "out",
+        "remaining",
+        "limit",
+        "max",
+        "min",
+        "sent",
+        "received",
+        "consumed",
+        "estimated",
+        "budget",
+    ];
+    rest.strip_prefix('s').is_some_and(|after| {
+        after.is_empty() || COUNTER_WORDS.iter().any(|word| after.starts_with(word))
+    })
+}
+
 /// A singular `token` followed by digits or a representation trailer inside
 /// one segment (`vendortokenvalue`, `token1`, `accesstokenhash`). A plural
 /// `tokens` names a usage count and stays visible (`ai_total_tokens`).
@@ -392,7 +419,7 @@ fn has_token_compound(lower: &str) -> bool {
     // (`tokens…`) and the tokenizer vocabulary.
     if let Some(rest) = lower.strip_prefix("token")
         && !rest.is_empty()
-        && !rest.starts_with('s')
+        && !is_token_count_shape(rest)
         && !rest.starts_with("iz")
     {
         return true;

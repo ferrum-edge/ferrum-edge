@@ -670,6 +670,10 @@ const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
     "pass_codes",
     "x-tokenOpaque",
     "tokenopaque",
+    "x-tokenSigned",
+    "tokenserialized",
+    "x-passKey",
+    "passkey",
     "mesh.signingkeybase64url",
     "x-dbPinValueHex",
     "private_ec_p256_pkcs8_pem_key",
@@ -712,6 +716,7 @@ const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
     "private_monkey_count",
     "tokenizer_name",
     "tokens_per_second",
+    "tokenspersecond",
 ];
 
 #[test]
