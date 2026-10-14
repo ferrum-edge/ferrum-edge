@@ -740,3 +740,896 @@ fn stacked_leading_boms_are_stripped_before_the_first_sse_line() {
         }
     }
 }
+
+// ─── Issue #6623: cache / thinking / tool-use token categories ─────────
+
+#[test]
+fn anthropic_stream_prompt_includes_cache_creation_and_read_tokens() {
+    let body = sse(&[
+        &json!({
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 25,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 1000,
+                "output_tokens": 1
+            }}
+        })
+        .to_string(),
+        &json!({"type": "message_delta", "usage": {"output_tokens": 40}}).to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
+        Some(1125)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
+        Some(1165)
+    );
+}
+
+#[test]
+fn anthropic_message_delta_cumulative_input_refreshes_the_prompt() {
+    // Newer API revisions restate cumulative input counts on message_delta.
+    let body = sse(&[
+        &json!({"type": "message_start", "message": {"usage": {"input_tokens": 25}}}).to_string(),
+        &json!({
+            "type": "message_delta",
+            "usage": {
+                "input_tokens": 25,
+                "cache_read_input_tokens": 500,
+                "output_tokens": 40
+            }
+        })
+        .to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
+        Some(525)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
+        Some(565)
+    );
+}
+
+#[test]
+fn gemini_stream_counts_thoughts_as_output_and_tool_use_as_input() {
+    let with_total = sse(&[&json!({
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": 3,
+            "totalTokenCount": 58
+        }
+    })
+    .to_string()]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&with_total], "prompt_tokens"),
+        Some(13)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&with_total], "completion_tokens"),
+        Some(45)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&with_total], "total_tokens"),
+        Some(58)
+    );
+
+    // Without a provider total, the derived total includes both categories.
+    let without_total = sse(&[&json!({
+        "usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40
+        }
+    })
+    .to_string()]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&without_total], "total_tokens"),
+        Some(55)
+    );
+}
+
+#[test]
+fn bedrock_converse_stream_prompt_includes_cache_tokens() {
+    let payload = serde_json::to_vec(&json!({
+        "usage": {
+            "inputTokens": 5,
+            "outputTokens": 6,
+            "cacheReadInputTokens": 400,
+            "cacheWriteInputTokens": 30,
+            "totalTokens": 441
+        }
+    }))
+    .unwrap();
+    let stream = event_stream_message(b"\x00\x00\x00\x00", &payload);
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "prompt_tokens"
+        ),
+        Some(435)
+    );
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(441)
+    );
+}
+
+#[test]
+fn buffered_extraction_counts_the_same_categories() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let anthropic = extract_response_usage(
+        &json!({"usage": {
+            "input_tokens": 12,
+            "cache_creation_input_tokens": 8,
+            "cache_read_input_tokens": 80,
+            "output_tokens": 20
+        }}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(anthropic.prompt_tokens, Some(100));
+    assert_eq!(anthropic.completion_tokens, Some(20));
+    assert_eq!(anthropic.total_tokens, Some(120));
+
+    let gemini = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": 3,
+            "totalTokenCount": 58
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(gemini.prompt_tokens, Some(13));
+    assert_eq!(gemini.completion_tokens, Some(45));
+    assert_eq!(gemini.total_tokens, Some(58));
+
+    // A provider total below its own components is raised to their sum.
+    let low_total = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 15
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(low_total.total_tokens, Some(55));
+
+    let bedrock = extract_response_usage(
+        &json!({"usage": {
+            "inputTokens": 5,
+            "outputTokens": 6,
+            "cacheReadInputTokens": 400,
+            "cacheWriteInputTokens": 30,
+            "totalTokens": 11
+        }}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(bedrock.prompt_tokens, Some(435));
+    assert_eq!(bedrock.total_tokens, Some(441));
+}
+
+#[test]
+fn anthropic_partial_delta_does_not_erase_earlier_cache_categories() {
+    // A delta restating `input_tokens` without the cache counters keeps the
+    // cache counters the start reported (categories merge field by field).
+    let body = sse(&[
+        &json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 100}}
+        })
+        .to_string(),
+        &json!({
+            "type": "message_delta",
+            "usage": {"input_tokens": 20, "output_tokens": 5}
+        })
+        .to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "prompt_tokens"),
+        Some(120)
+    );
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&body], "total_tokens"),
+        Some(125)
+    );
+}
+
+#[test]
+fn cumulative_merge_preserves_categories_for_buffered_sse_metrics() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    // The `ai_token_metrics` SSE path merges per-event extractions.
+    let mut merged = extract_response_usage(
+        &json!({"usage": {"input_tokens": 10, "cache_read_input_tokens": 100}}),
+        AiProvider::Anthropic,
+    );
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"usage": {"input_tokens": 20, "output_tokens": 5}}),
+        AiProvider::Anthropic,
+    ));
+    assert_eq!(merged.prompt_tokens, Some(120));
+    assert_eq!(merged.total_tokens, Some(125));
+
+    // Gemini: a later snapshot that omits the thinking counter keeps it.
+    let mut gemini = extract_response_usage(
+        &json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 2, "thoughtsTokenCount": 40}}),
+        AiProvider::Google,
+    );
+    gemini.merge_cumulative(extract_response_usage(
+        &json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5}}),
+        AiProvider::Google,
+    ));
+    assert_eq!(gemini.completion_tokens, Some(45));
+    assert_eq!(gemini.total_tokens, Some(55));
+}
+
+#[test]
+fn malformed_counters_are_unmetered_not_partial() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    // Malformed base, valid extra: never publish the extra alone.
+    let bad_base = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": "bad",
+            "toolUsePromptTokenCount": 3,
+            "candidatesTokenCount": 5
+        }}),
+        AiProvider::Google,
+    );
+    // The whole usage is unmetered, so the consumer's policy decides.
+    assert_eq!(bad_base.prompt_tokens, None);
+    assert!(!bad_base.is_complete_for_mode("prompt_tokens"));
+    assert_eq!(bad_base.completion_tokens, None);
+    assert_eq!(bad_base.total_for_mode("total_tokens"), None);
+
+    // Valid base, malformed extra: the side is unmetered, not the base alone.
+    let bad_extra = extract_response_usage(
+        &json!({"usage": {
+            "input_tokens": 10,
+            "cache_read_input_tokens": -1,
+            "output_tokens": 5
+        }}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(bad_extra.prompt_tokens, None);
+    assert!(!bad_extra.is_complete_for_mode("prompt_tokens"));
+    assert!(!bad_extra.is_complete_for_mode("total_tokens"));
+    // No surviving side is offered as a partial lower bound: the configured
+    // unmetered-response policy applies.
+    assert_eq!(bad_extra.total_for_mode("total_tokens"), None);
+    assert_eq!(bad_extra.total_for_mode("completion_tokens"), None);
+
+    // `null` is absence (Anthropic types its cache counters as nullable).
+    let nullable = extract_response_usage(
+        &json!({"usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": null,
+            "cache_read_input_tokens": null,
+            "output_tokens": 5
+        }}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(nullable.prompt_tokens, Some(10));
+    assert_eq!(nullable.total_tokens, Some(15));
+}
+
+#[test]
+fn gemini_zero_omitted_candidates_overflow_and_one_sided_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    // proto3 omits a zero `candidatesTokenCount`; thoughts are still output.
+    let filtered = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 50
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(filtered.completion_tokens, Some(40));
+    assert_eq!(filtered.total_tokens, Some(50));
+
+    // An overflowing category sum is unmetered (the documented policy for
+    // overflowing usage), so a tiny reported total cannot stand in for it.
+    let overflow = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 1,
+            "toolUsePromptTokenCount": u64::MAX,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": 2
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(overflow.prompt_tokens, None);
+    assert_eq!(overflow.total_tokens, None);
+    assert!(!overflow.is_complete_for_mode("total_tokens"));
+
+    // A one-sided usage still clamps an explicit low total.
+    let one_sided = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "toolUsePromptTokenCount": 1000,
+            "totalTokenCount": 1
+        }}),
+        AiProvider::Google,
+    );
+    // A provider total below the reported prompt, with the completion side
+    // unknown, is an inconsistent partial report: not published as complete.
+    assert_eq!(one_sided.prompt_tokens, Some(1010));
+    assert_eq!(one_sided.total_tokens, None);
+    assert!(!one_sided.is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn anthropic_start_output_placeholder_is_not_a_complete_count() {
+    // `message_start` carries an initial `output_tokens` placeholder; a stream
+    // interrupted before `message_delta` must stay incomplete for completion
+    // and total modes so the reservation is kept.
+    let body = sse(&[
+        &json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 25, "output_tokens": 1}}
+        })
+        .to_string(),
+        &json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "partial"}})
+            .to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    let usage = extractor.usage();
+    assert_eq!(usage.total_for_mode("prompt_tokens"), Some(25));
+    assert!(usage.is_complete_for_mode("prompt_tokens"));
+    assert!(!usage.is_complete_for_mode("completion_tokens"));
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn valid_then_malformed_update_invalidates_the_stale_count() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let start = json!({
+        "type": "message_start",
+        "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 100}}
+    });
+    let malformed_delta = json!({
+        "type": "message_delta",
+        "usage": {"input_tokens": 20, "cache_read_input_tokens": "bad", "output_tokens": 5}
+    });
+    // Streaming accumulator.
+    let body = sse(&[&start.to_string(), &malformed_delta.to_string()]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("prompt_tokens"));
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+
+    // A malformed-only event still reaches invalidation.
+    let body = sse(&[
+        &start.to_string(),
+        &json!({"type": "message_delta", "usage": {"cache_read_input_tokens": "bad"}}).to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("prompt_tokens"));
+
+    // Cumulative merge (buffered SSE metrics path).
+    let mut merged = extract_response_usage(&start["message"], AiProvider::Anthropic);
+    assert_eq!(merged.prompt_tokens, Some(110));
+    merged.merge_cumulative(extract_response_usage(
+        &malformed_delta,
+        AiProvider::Anthropic,
+    ));
+    assert_eq!(merged.prompt_tokens, None);
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn bedrock_invoke_stream_keeps_anthropic_cache_categories_through_terminal_metrics() {
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&bedrock_invoke_chunk(json!({
+        "type": "message_start",
+        "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 1000, "output_tokens": 1}}
+    })));
+    stream.extend_from_slice(&bedrock_invoke_chunk(
+        json!({"type": "message_delta", "usage": {"output_tokens": 5}}),
+    ));
+    // Terminal metrics restate the uncached input/output and omit the cache
+    // counters: the cache categories reported earlier must survive.
+    stream.extend_from_slice(&bedrock_invoke_chunk(json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 10, "outputTokenCount": 5}
+    })));
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "prompt_tokens"
+        ),
+        Some(1010)
+    );
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(1015)
+    );
+
+    // Metrics that carry the cache counters themselves fold them too.
+    let terminal_only = bedrock_invoke_chunk(json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {
+            "inputTokenCount": 10,
+            "outputTokenCount": 5,
+            "cacheReadInputTokenCount": 1000,
+            "cacheWriteInputTokenCount": 20
+        }
+    }));
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&terminal_only],
+            "prompt_tokens"
+        ),
+        Some(1030)
+    );
+}
+
+#[test]
+fn bedrock_converse_partial_updates_are_recognized() {
+    let usage_message = |usage: serde_json::Value| {
+        let payload = serde_json::to_vec(&json!({ "usage": usage })).unwrap();
+        event_stream_message(b"\x00\x00\x00\x00", &payload)
+    };
+    // A later total-only update stays authoritative.
+    let mut stream = usage_message(json!({"inputTokens": 5, "outputTokens": 6, "totalTokens": 11}));
+    stream.extend_from_slice(&usage_message(json!({"totalTokens": 1000})));
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(1000)
+    );
+    // A cache-only update extends the prompt.
+    let mut stream = usage_message(json!({"inputTokens": 5, "outputTokens": 6}));
+    stream.extend_from_slice(&usage_message(json!({"cacheReadInputTokens": 400})));
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "prompt_tokens"
+        ),
+        Some(405)
+    );
+    // A malformed-only update invalidates.
+    let mut stream = usage_message(json!({"inputTokens": 5, "outputTokens": 6}));
+    stream.extend_from_slice(&usage_message(json!({"cacheReadInputTokens": "bad"})));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("prompt_tokens"));
+}
+
+#[test]
+fn malformed_total_is_never_rebuilt_from_components() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let valid = json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 100}});
+    let bad_total = json!({"usageMetadata": {"totalTokenCount": "bad"}});
+
+    // Buffered extraction.
+    let usage = extract_response_usage(
+        &json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": "bad"}}),
+        AiProvider::Google,
+    );
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+    assert_eq!(usage.total_for_mode("total_tokens"), None);
+
+    // Streaming accumulation.
+    let body = sse(&[&valid.to_string(), &bad_total.to_string()]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
+
+    // Cumulative merge.
+    let mut merged = extract_response_usage(&valid, AiProvider::Google);
+    assert_eq!(merged.total_tokens, Some(100));
+    merged.merge_cumulative(extract_response_usage(&bad_total, AiProvider::Google));
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+    assert_eq!(merged.total_for_mode("total_tokens"), None);
+}
+
+#[test]
+fn combined_overflow_clears_a_stale_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let mut merged = extract_response_usage(
+        &json!({"usage": {"input_tokens": 10, "output_tokens": 5}}),
+        AiProvider::Anthropic,
+    );
+    assert_eq!(merged.total_tokens, Some(15));
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"usage": {"cache_read_input_tokens": u64::MAX - 10}}),
+        AiProvider::Anthropic,
+    ));
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+
+    let body = sse(&[
+        &json!({"type": "message_start", "message": {"usage": {"input_tokens": 10}}}).to_string(),
+        &json!({"type": "message_delta", "usage": {"output_tokens": 5}}).to_string(),
+        &json!({"type": "message_delta", "usage": {"cache_read_input_tokens": u64::MAX - 10}})
+            .to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
+}
+
+#[test]
+fn categories_without_their_base_unmeter_instead_of_flooring() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    // Cache reads without the uncached-input base Bedrock always sends cannot
+    // be a complete prompt, and the inconsistent provider total (5) cannot
+    // stand in for it either: the usage is unmetered, never complete.
+    let usage = extract_response_usage(
+        &json!({"usage": {"cacheReadInputTokens": 1000, "outputTokens": 5, "totalTokens": 5}}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(usage.prompt_tokens, None);
+    assert_eq!(usage.total_tokens, None);
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+    assert!(!usage.is_complete_for_mode("prompt_tokens"));
+
+    // Anthropic: cache reads without `input_tokens` likewise unmeter.
+    let usage = extract_response_usage(
+        &json!({"usage": {"cache_read_input_tokens": 1000, "output_tokens": 5}}),
+        AiProvider::Anthropic,
+    );
+    assert!(!usage.is_complete_for_mode("prompt_tokens"));
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+
+    // Streamed: a total-only snapshot followed by a cache-only update.
+    let usage_message = |usage: serde_json::Value| {
+        let payload = serde_json::to_vec(&json!({ "usage": usage })).unwrap();
+        event_stream_message(b"\x00\x00\x00\x00", &payload)
+    };
+    let mut stream = usage_message(json!({"totalTokens": 5}));
+    stream.extend_from_slice(&usage_message(json!({"cacheReadInputTokens": 1000})));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn titan_stream_chunk_keeps_terminal_metrics_completion() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({
+            "outputText": "done",
+            "inputTextTokenCount": 21,
+            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 21, "outputTokenCount": 60}
+        }),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+
+    // A component the metrics omit falls back to the Titan counter.
+    let usage = extract_response_usage(
+        &json!({
+            "results": [{"tokenCount": 60}],
+            "amazon-bedrock-invocationMetrics": {"inputTokenCount": 21}
+        }),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+}
+
+#[test]
+fn overflowing_category_floor_clears_a_stale_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let mut merged = extract_response_usage(
+        &json!({"usage": {"outputTokens": 5, "totalTokens": 5}}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(merged.total_tokens, Some(5));
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"usage": {"cacheReadInputTokens": u64::MAX}}),
+        AiProvider::Bedrock,
+    ));
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+
+    let usage_message = |usage: serde_json::Value| {
+        let payload = serde_json::to_vec(&json!({ "usage": usage })).unwrap();
+        event_stream_message(b"\x00\x00\x00\x00", &payload)
+    };
+    let mut stream = usage_message(json!({"outputTokens": 5, "totalTokens": 5}));
+    stream.extend_from_slice(&usage_message(json!({"cacheReadInputTokens": u64::MAX})));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
+}
+
+#[test]
+fn nullable_gemini_counters_are_absence() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": null,
+            "thoughtsTokenCount": 40,
+            "totalTokenCount": 50
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(
+        (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens
+        ),
+        (Some(10), Some(40), Some(50))
+    );
+}
+
+#[test]
+fn titan_fallback_survives_accumulation_and_merging() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let chunk = json!({
+        "inputTextTokenCount": 21,
+        "amazon-bedrock-invocationMetrics": {"outputTokenCount": 60}
+    });
+    let stream = bedrock_invoke_chunk(chunk.clone());
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "prompt_tokens"
+        ),
+        Some(21)
+    );
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(81)
+    );
+
+    let mut merged =
+        extract_response_usage(&json!({"inputTextTokenCount": 21}), AiProvider::Bedrock);
+    merged.merge_cumulative(extract_response_usage(&chunk, AiProvider::Bedrock));
+    assert_eq!(
+        (
+            merged.prompt_tokens,
+            merged.completion_tokens,
+            merged.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+}
+
+#[test]
+fn malformed_usage_container_unmeters_instead_of_keeping_stale_counts() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let valid = json!({"usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}});
+    let malformed = json!({"usageMetadata": []});
+    let body = sse(&[&valid.to_string(), &malformed.to_string()]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+    assert_eq!(extractor.usage().total_for_mode("total_tokens"), None);
+
+    let mut merged = extract_response_usage(&valid, AiProvider::Google);
+    merged.merge_cumulative(extract_response_usage(&malformed, AiProvider::Google));
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+    assert_eq!(merged.total_for_mode("total_tokens"), None);
+}
+
+#[test]
+fn malformed_converse_usage_container_unmeters_on_both_framings() {
+    let valid = json!({"usage": {"inputTokens": 5, "outputTokens": 6, "totalTokens": 11}});
+    let malformed = json!({"usage": []});
+
+    // SSE framing under a configured provider.
+    let body = sse(&[&valid.to_string(), &malformed.to_string()]);
+    let mut extractor =
+        UsageStreamExtractor::new(UsageStreamFormat::Sse, Some(AiProvider::Bedrock));
+    extractor.push(&body);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+
+    // AWS event-stream framing, provider identified from the earlier report.
+    let mut stream =
+        event_stream_message(b"\x00\x00\x00\x00", &serde_json::to_vec(&valid).unwrap());
+    stream.extend_from_slice(&event_stream_message(
+        b"\x00\x00\x00\x00",
+        &serde_json::to_vec(&malformed).unwrap(),
+    ));
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::AwsEventStream, None);
+    extractor.push(&stream);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn buffered_claude_on_bedrock_body_folds_cache_categories() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({"usage": {"input_tokens": 10, "cache_read_input_tokens": 1000, "output_tokens": 5}}),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(
+        (usage.prompt_tokens, usage.total_tokens, usage.provider),
+        (Some(1010), Some(1015), Some(AiProvider::Bedrock))
+    );
+}
+
+#[test]
+fn malformed_gemini_completion_alternate_invalidates_completion() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let usage = extract_response_usage(
+        &json!({"usageMetadata": {
+            "promptTokenCount": 10,
+            "candidatesTokenCount": 5,
+            "completionTokenCount": "bad"
+        }}),
+        AiProvider::Google,
+    );
+    assert_eq!(usage.completion_tokens, None);
+    assert!(!usage.is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn co_located_invocation_metrics_merge_beside_native_usage() {
+    let mut stream = bedrock_invoke_chunk(json!({
+        "type": "message_start",
+        "message": {"usage": {"input_tokens": 10}}
+    }));
+    stream.extend_from_slice(&bedrock_invoke_chunk(json!({
+        "type": "message_delta",
+        "usage": {"output_tokens": 5},
+        "amazon-bedrock-invocationMetrics": {
+            "inputTokenCount": 10,
+            "outputTokenCount": 5,
+            "cacheReadInputTokenCount": 1000
+        }
+    })));
+    assert_eq!(
+        extract(
+            UsageStreamFormat::AwsEventStream,
+            &[&stream],
+            "total_tokens"
+        ),
+        Some(1015)
+    );
+
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+    let buffered = extract_response_usage(
+        &json!({
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "amazon-bedrock-invocationMetrics": {"cacheReadInputTokenCount": 1000}
+        }),
+        AiProvider::Bedrock,
+    );
+    assert_eq!(buffered.total_tokens, Some(1015));
+}
+
+#[test]
+fn inconsistent_partial_update_clears_an_earlier_total() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let total_only = json!({"usageMetadata": {"totalTokenCount": 5}});
+    let larger_prompt =
+        json!({"usageMetadata": {"promptTokenCount": 10, "toolUsePromptTokenCount": 1000}});
+
+    let body = sse(&[&total_only.to_string(), &larger_prompt.to_string()]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&body);
+    extractor.finish();
+    assert_eq!(
+        extractor.usage().total_for_mode("prompt_tokens"),
+        Some(1010)
+    );
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+
+    let mut merged = extract_response_usage(&total_only, AiProvider::Google);
+    merged.merge_cumulative(extract_response_usage(&larger_prompt, AiProvider::Google));
+    assert_eq!(merged.prompt_tokens, Some(1010));
+    assert_eq!(merged.total_tokens, None);
+    assert!(!merged.is_complete_for_mode("total_tokens"));
+}
+
+#[test]
+fn titan_counters_survive_a_later_metrics_only_chunk() {
+    use ferrum_edge::plugins::utils::ai_providers::extract_response_usage;
+
+    let mut merged =
+        extract_response_usage(&json!({"inputTextTokenCount": 21}), AiProvider::Bedrock);
+    merged.merge_cumulative(extract_response_usage(
+        &json!({"amazon-bedrock-invocationMetrics": {"outputTokenCount": 60}}),
+        AiProvider::Bedrock,
+    ));
+    assert_eq!(
+        (
+            merged.prompt_tokens,
+            merged.completion_tokens,
+            merged.total_tokens
+        ),
+        (Some(21), Some(60), Some(81))
+    );
+}
+
+#[test]
+fn untyped_cache_only_updates_reach_the_anthropic_fold() {
+    let start = json!({"usage": {"input_tokens": 10, "output_tokens": 5}});
+    let valid = sse(&[
+        &start.to_string(),
+        &json!({"usage": {"cache_read_input_tokens": 1000}}).to_string(),
+    ]);
+    assert_eq!(
+        extract(UsageStreamFormat::Sse, &[&valid], "total_tokens"),
+        Some(1015)
+    );
+
+    let malformed = sse(&[
+        &start.to_string(),
+        &json!({"usage": {"cache_read_input_tokens": "bad"}}).to_string(),
+    ]);
+    let mut extractor = UsageStreamExtractor::new(UsageStreamFormat::Sse, None);
+    extractor.push(&malformed);
+    extractor.finish();
+    assert!(!extractor.usage().is_complete_for_mode("total_tokens"));
+}

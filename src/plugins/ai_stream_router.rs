@@ -4574,6 +4574,10 @@ struct AnthropicSseNormalizer {
     next_tool_index: u32,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    /// Raw Anthropic usage categories merged across `message_start` and
+    /// `message_delta`, so a delta restating only some categories cannot erase
+    /// the cache counters an earlier event reported.
+    usage_categories: super::utils::ai_providers::UsageCategories,
 }
 
 impl AnthropicSseNormalizer {
@@ -4599,7 +4603,57 @@ impl AnthropicSseNormalizer {
             next_tool_index: 0,
             prompt_tokens: None,
             completion_tokens: None,
+            usage_categories: Default::default(),
         }
+    }
+
+    /// Fold one Anthropic `usage` carrier (the `message_start` message or the
+    /// `message_delta` event) into the running counters. The billed input
+    /// includes prompt-cache writes and reads, which Anthropic reports beside
+    /// `input_tokens` rather than in it.
+    ///
+    /// Returns `false` when a usage counter is malformed or its category sum
+    /// overflows; the caller fails the stream closed, exactly as the Gemini
+    /// normalizer does for a malformed `usageMetadata`.
+    fn absorb_anthropic_usage(&mut self, carrier: &Value) -> bool {
+        let usage = super::utils::ai_providers::extract_response_usage(
+            carrier,
+            super::utils::ai_providers::AiProvider::Anthropic,
+        );
+        let folded = self.usage_categories.absorb(usage);
+        let (prompt_invalid, completion_invalid) = self.usage_categories.invalid_sides();
+        if prompt_invalid || completion_invalid {
+            return false;
+        }
+        if folded.prompt_tokens.is_some() {
+            self.prompt_tokens = folded.prompt_tokens;
+        }
+        if folded.completion_tokens.is_some() {
+            self.completion_tokens = folded.completion_tokens;
+        }
+        true
+    }
+
+    /// Merge Bedrock invocation metrics carried on any Anthropic event (an
+    /// InvokeModel stream wrapping the Messages events) into the running
+    /// usage. Returns `false` when they are malformed or overflow.
+    fn absorb_invocation_metrics(&mut self, event: &Value) -> bool {
+        let Some(metrics) = super::utils::ai_providers::extract_bedrock_invocation_metrics(event)
+        else {
+            return true;
+        };
+        let folded = self.usage_categories.absorb(metrics);
+        let (prompt_invalid, completion_invalid) = self.usage_categories.invalid_sides();
+        if prompt_invalid || completion_invalid {
+            return false;
+        }
+        if folded.prompt_tokens.is_some() {
+            self.prompt_tokens = folded.prompt_tokens;
+        }
+        if folded.completion_tokens.is_some() {
+            self.completion_tokens = folded.completion_tokens;
+        }
+        true
     }
 
     fn unread_len(&self) -> usize {
@@ -4719,6 +4773,13 @@ impl AnthropicSseNormalizer {
     /// Transcode one Anthropic event JSON into zero or more OpenAI SSE lines.
     /// Returns whether the upstream inspector driver should terminate now.
     fn transcode_event(&mut self, event: &Value, out: &mut NormalizedSseOut) -> bool {
+        if !self.absorb_invocation_metrics(event) {
+            self.fail_bound(
+                "upstream provider sent malformed Bedrock invocation metrics; stream terminated",
+                out,
+            );
+            return true;
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if self.message_started {
@@ -4737,11 +4798,16 @@ impl AnthropicSseNormalizer {
                 if let Some(m) = message.get("model").and_then(Value::as_str) {
                     self.model = m.to_string();
                 }
-                if let Some(tokens) = message["usage"]["input_tokens"].as_u64() {
-                    self.prompt_tokens = Some(tokens);
-                }
-                if let Some(tokens) = message["usage"]["output_tokens"].as_u64() {
-                    self.completion_tokens = Some(tokens);
+                // `output_tokens` here is a placeholder the terminal delta
+                // supersedes; only the input side is authoritative.
+                let start_usage =
+                    super::utils::ai_providers::anthropic_message_start_usage(message);
+                if !self.absorb_anthropic_usage(&start_usage) {
+                    self.fail_bound(
+                        "upstream provider sent malformed or overflowing Anthropic usage; stream terminated",
+                        out,
+                    );
+                    return true;
                 }
                 if !self.role_emitted {
                     self.role_emitted = true;
@@ -4867,8 +4933,12 @@ impl AnthropicSseNormalizer {
                 if !self.require_message_start("message_delta", out) {
                     return true;
                 }
-                if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
-                    self.completion_tokens = Some(tokens);
+                if !self.absorb_anthropic_usage(event) {
+                    self.fail_bound(
+                        "upstream provider sent malformed or overflowing Anthropic usage; stream terminated",
+                        out,
+                    );
+                    return true;
                 }
                 let stop_reason = event["delta"]["stop_reason"].as_str();
                 if self.tools_forbidden && stop_reason == Some("tool_use") {
@@ -6433,43 +6503,70 @@ struct GeminiUsageCounters {
 
 impl GeminiUsageCounters {
     /// Render the terminal OpenAI-shaped `usage` object, or `None` when the
-    /// provider never reported both sides.
+    /// provider reported no counter at all.
     ///
-    /// An omitted counter is never charged as zero: prompt and candidate counts
-    /// must both have been reported before any usage is published at all, and
-    /// the optional categories only ever add to what the provider stated.
+    /// Each side is published when reported. proto3 JSON omits zero counters,
+    /// so an omitted base is zero when a sibling category on its side
+    /// (tool-use prompt, thoughts) was reported; a side with nothing reported
+    /// stays absent rather than charged as zero. A provider total is
+    /// published when it is at least the reported components, raised to them
+    /// when both sides are known, and otherwise withheld as inconsistent;
+    /// without a provider total, only both sides make a complete one.
     fn to_openai_usage(&self) -> Result<Option<Value>, &'static str> {
-        let (Some(prompt_base), Some(candidates)) = (self.prompt, self.candidates) else {
-            return Ok(None);
-        };
+        // proto3 JSON omits zero counters, so an omitted base is zero when a
+        // sibling on its side was reported (same rule as the shared
+        // `UsageCategories` fold every other metering surface uses).
+        let prompt_base = self.prompt.or_else(|| self.tool_use_prompt.map(|_| 0));
+        let candidates = self.candidates.or_else(|| self.thoughts.map(|_| 0));
         // Gemini bills tool-use prompting on the input side, and OpenAI's
         // `completion_tokens` is defined to include reasoning tokens, so each
         // extra category folds into the counter that already carries it.
-        let prompt = checked_usage_sum(prompt_base, self.tool_use_prompt)?;
-        let completion = checked_usage_sum(candidates, self.thoughts)?;
-        let derived = prompt
-            .checked_add(completion)
+        let prompt = prompt_base
+            .map(|base| checked_usage_sum(base, self.tool_use_prompt))
+            .transpose()?;
+        let completion = candidates
+            .map(|base| checked_usage_sum(base, self.thoughts))
+            .transpose()?;
+        if prompt.is_none() && completion.is_none() && self.total.is_none() {
+            return Ok(None);
+        }
+        // Components the provider did report, even one-sided, are published;
+        // an unreported side stays absent rather than charged as zero.
+        let known = prompt
+            .unwrap_or(0)
+            .checked_add(completion.unwrap_or(0))
             .ok_or(GEMINI_USAGE_OVERFLOW_MESSAGE)?;
         // The provider's own total stays authoritative and may exceed the sum
         // of the categories this adapter can represent (a category added by a
         // later API revision). Never publish a total below the components
-        // printed in the same chunk either.
-        let total = self.total.map_or(derived, |reported| reported.max(derived));
+        // printed in the same chunk either. Without a provider total, only
+        // both sides make a complete one.
+        // A provider total below the reported components is raised to them
+        // only when both sides are known; with a side missing it is an
+        // inconsistent partial report and is not published as complete.
+        let total = match (self.total, prompt, completion) {
+            (Some(reported), _, _) if reported >= known => Some(reported),
+            (Some(_), Some(_), Some(_)) | (None, Some(_), Some(_)) => Some(known),
+            _ => None,
+        };
 
-        let mut usage = json!({
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "total_tokens": total,
-        });
-        if let Some(thoughts) = self.thoughts
-            && let Some(object) = usage.as_object_mut()
-        {
-            object.insert(
+        let mut usage = serde_json::Map::new();
+        if let Some(prompt) = prompt {
+            usage.insert("prompt_tokens".to_string(), json!(prompt));
+        }
+        if let Some(completion) = completion {
+            usage.insert("completion_tokens".to_string(), json!(completion));
+        }
+        if let Some(total) = total {
+            usage.insert("total_tokens".to_string(), json!(total));
+        }
+        if let Some(thoughts) = self.thoughts {
+            usage.insert(
                 "completion_tokens_details".to_string(),
                 json!({ "reasoning_tokens": thoughts }),
             );
         }
-        Ok(Some(usage))
+        Ok(Some(Value::Object(usage)))
     }
 }
 
@@ -6530,7 +6627,8 @@ fn gemini_optional_usage_count(
     usage: &serde_json::Map<String, Value>,
     field: &'static str,
 ) -> Result<Option<u64>, &'static str> {
-    let Some(value) = usage.get(field) else {
+    // ProtoJSON defines `null` as unset, the same as an omitted field.
+    let Some(value) = usage.get(field).filter(|value| !value.is_null()) else {
         return Ok(None);
     };
     match value.as_u64() {

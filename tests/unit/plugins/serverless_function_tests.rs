@@ -257,7 +257,8 @@ fn test_warmup_hostnames_aws_endpoint_ipv6_override() {
             "aws_access_key_id": "AKIAIOSFODNN7EXAMPLE",
             "aws_secret_access_key": "secret",
             "aws_function_name": "my-function",
-            "aws_endpoint_url": "http://[2001:db8::30]:4566"
+            "aws_endpoint_url": "http://[2001:db8::30]:4566",
+            "allow_plaintext": true
         }),
         default_client(),
     )
@@ -687,11 +688,105 @@ fn test_aws_endpoint_url_valid_accepts() {
             "aws_access_key_id": "AKIATEST",
             "aws_secret_access_key": "secret",
             "aws_function_name": "fn",
-            "aws_endpoint_url": "http://localhost:4566",
+            "aws_endpoint_url": "http://127.0.0.1:4566",
         }),
         default_client(),
     )
     .expect("valid http aws_endpoint_url should be accepted");
+}
+
+#[test]
+#[parallel(serverless_env)]
+fn test_cleartext_endpoints_need_the_opt_in_off_loopback() {
+    let aws = |endpoint: &str, opt_in: Option<bool>| {
+        let mut config = json!({
+            "provider": "aws_lambda",
+            "aws_region": "us-east-1",
+            "aws_access_key_id": "AKIATEST",
+            "aws_secret_access_key": "secret",
+            "aws_function_name": "fn",
+            "aws_endpoint_url": endpoint,
+        });
+        if let Some(flag) = opt_in {
+            config["allow_plaintext"] = json!(flag);
+        }
+        config
+    };
+    let azure = |url: &str, opt_in: Option<bool>| {
+        let mut config = json!({"provider": "azure_functions", "function_url": url});
+        if let Some(flag) = opt_in {
+            config["allow_plaintext"] = json!(flag);
+        }
+        config
+    };
+    for (config, field) in [
+        (aws("http://lambda.internal:4566", None), "aws_endpoint_url"),
+        (
+            aws("http://localhost:4566", Some(false)),
+            "aws_endpoint_url",
+        ),
+        (azure("http://func.internal/api/run", None), "function_url"),
+        (azure("http://127.1/api/run", None), "function_url"),
+    ] {
+        let err = expect_err(ServerlessFunction::new(&config, default_client()));
+        assert!(
+            err.contains(field) && err.contains("allow_plaintext"),
+            "got: {err}"
+        );
+    }
+    for config in [
+        aws("http://lambda.internal:4566", Some(true)),
+        aws("http://[::1]:4566", None),
+        azure("http://func.internal/api/run", Some(true)),
+        azure("http://127.0.0.1:7071/api/run", None),
+        azure("https://func.internal/api/run", None),
+    ] {
+        ServerlessFunction::new(&config, default_client())
+            .unwrap_or_else(|error| panic!("{config} must be admitted: {error}"));
+    }
+    let err = expect_err(ServerlessFunction::new(
+        &azure("https://func.internal/api/run", None)
+            .as_object()
+            .map(|object| {
+                let mut object = object.clone();
+                object.insert("allow_plaintext".to_string(), json!("yes"));
+                serde_json::Value::Object(object)
+            })
+            .unwrap(),
+        default_client(),
+    ));
+    assert!(
+        err.contains("`allow_plaintext` must be a boolean"),
+        "got: {err}"
+    );
+}
+
+/// `allow_plaintext` is boolean-only: schema and runtime both refuse null.
+#[test]
+#[parallel(serverless_env)]
+fn test_allow_plaintext_null_is_refused_by_schema_and_runtime() {
+    let config = json!({
+        "provider": "azure_functions",
+        "function_url": "https://functions.example/run",
+        "allow_plaintext": null
+    });
+    expect_err(ServerlessFunction::new(&config, default_client()));
+    assert!(ferrum_edge::plugins::validate_plugin_config("serverless_function", &config).is_err());
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ServerlessFunctionConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("schema compiles");
+    assert!(!validator.is_valid(&config));
+    let mut ok = config.clone();
+    ok["allow_plaintext"] = json!(false);
+    assert!(validator.is_valid(&ok));
+    assert!(ServerlessFunction::new(&ok, default_client()).is_ok());
 }
 
 #[test]
@@ -6943,6 +7038,12 @@ fn credential_less_lambda_config(endpoint: Option<&str>) -> Value {
     });
     if let Some(endpoint) = endpoint {
         config["aws_endpoint_url"] = json!(endpoint);
+        // These fixtures exercise ambient-credential scoping, not the
+        // cleartext gate: opt in so a local `http://` emulator stays
+        // admissible and the ambient checks remain the deciding rule.
+        if endpoint.starts_with("http://") {
+            config["allow_plaintext"] = json!(true);
+        }
     }
     config
 }

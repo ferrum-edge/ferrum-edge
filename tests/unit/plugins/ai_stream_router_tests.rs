@@ -10410,3 +10410,189 @@ async fn test_gemini_usage_without_extended_categories_is_unchanged() {
         "no reasoning detail without a reported thoughts count: {out}"
     );
 }
+
+/// Issue #6623: Anthropic reports prompt-cache writes and reads beside
+/// `input_tokens`, not inside it. The normalized OpenAI usage must charge the
+/// whole billed input (`input + cache_creation + cache_read`).
+#[tokio::test]
+async fn test_anthropic_normalized_usage_includes_prompt_cache_tokens() {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}",
+        "\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":200,\"cache_read_input_tokens\":3000,\"output_tokens\":1}",
+    );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":3210"), "{out}");
+    assert!(out.contains("\"completion_tokens\":5"), "{out}");
+    assert!(out.contains("\"total_tokens\":3215"), "{out}");
+}
+
+#[tokio::test]
+async fn test_anthropic_normalized_usage_keeps_cache_categories_across_partial_delta() {
+    let sse = ANTHROPIC_SSE
+        .replace(
+            "\"usage\":{\"input_tokens\":10,\"output_tokens\":1}",
+            "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":100,\"output_tokens\":1}",
+        )
+        .replace(
+            "\"usage\":{\"output_tokens\":5}",
+            "\"usage\":{\"input_tokens\":20,\"output_tokens\":5}",
+        );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":120"), "{out}");
+    assert!(out.contains("\"total_tokens\":125"), "{out}");
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_fails_closed_on_malformed_usage() {
+    let sse = ANTHROPIC_SSE.replace(
+        "\"usage\":{\"output_tokens\":5}",
+        "\"usage\":{\"cache_read_input_tokens\":\"bad\",\"output_tokens\":5}",
+    );
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(
+        out.contains("malformed or overflowing Anthropic usage"),
+        "{out}"
+    );
+    assert!(!out.contains("\"prompt_tokens\""), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_normalizer_publishes_one_sided_usage_with_its_total() {
+    let one_sided = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\"}]},\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":10000,\"totalTokenCount\":10000}}\n\n";
+    let out = run_gemini_normalizer(4096, one_sided, "text/event-stream").await;
+    assert!(out.contains("\"prompt_tokens\":10000"), "{out}");
+    assert!(out.contains("\"total_tokens\":10000"), "{out}");
+    assert!(!out.contains("\"completion_tokens\""), "{out}");
+
+    let total_only = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"totalTokenCount\":77}}\n\n";
+    let out = run_gemini_normalizer(4096, total_only, "text/event-stream").await;
+    assert!(out.contains("\"total_tokens\":77"), "{out}");
+    assert!(!out.contains("\"prompt_tokens\""), "{out}");
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_ignores_the_start_output_placeholder() {
+    // A terminal delta without an output counter leaves completion (and so the
+    // total) unreported rather than taking `message_start`'s placeholder.
+    let sse = ANTHROPIC_SSE.replace(",\"usage\":{\"output_tokens\":5}", "");
+    assert_ne!(sse, ANTHROPIC_SSE, "fixture substitution must apply");
+
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    let out = String::from_utf8(collected).unwrap();
+
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":null"), "{out}");
+    assert!(out.contains("\"total_tokens\":null"), "{out}");
+}
+
+#[tokio::test]
+async fn test_gemini_normalizer_treats_null_counters_as_absent() {
+    let sse = "data: {\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":null,\"thoughtsTokenCount\":40,\"toolUsePromptTokenCount\":null,\"totalTokenCount\":50}}\n\n";
+    let out = run_gemini_normalizer(4096, sse, "text/event-stream").await;
+    assert!(!out.contains("upstream_error"), "{out}");
+    assert!(out.contains("\"prompt_tokens\":10"), "{out}");
+    assert!(out.contains("\"completion_tokens\":40"), "{out}");
+    assert!(out.contains("\"total_tokens\":50"), "{out}");
+}
+
+async fn run_anthropic_normalizer_on(sse: &str) -> String {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector should be created");
+    let mut collected = Vec::new();
+    for chunk in sse.as_bytes().chunks(4096) {
+        collected.extend_from_slice(&forwarded(inspector.on_chunk(chunk).await));
+    }
+    collected.extend_from_slice(&forwarded(inspector.on_end().await));
+    String::from_utf8(collected).unwrap()
+}
+
+#[tokio::test]
+async fn test_anthropic_normalizer_merges_terminal_invocation_metrics() {
+    let with_metrics = ANTHROPIC_SSE.replace(
+        "data: {\"type\":\"message_stop\"}",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"inputTokenCount\":10,\"outputTokenCount\":5,\"cacheReadInputTokenCount\":1000}}",
+    );
+    assert_ne!(
+        with_metrics, ANTHROPIC_SSE,
+        "fixture substitution must apply"
+    );
+    let out = run_anthropic_normalizer_on(&with_metrics).await;
+    assert!(out.contains("\"prompt_tokens\":1010"), "{out}");
+    assert!(out.contains("\"total_tokens\":1015"), "{out}");
+
+    let malformed = ANTHROPIC_SSE.replace(
+        "data: {\"type\":\"message_stop\"}",
+        "data: {\"type\":\"message_stop\",\"amazon-bedrock-invocationMetrics\":{\"cacheReadInputTokenCount\":\"bad\"}}",
+    );
+    let out = run_anthropic_normalizer_on(&malformed).await;
+    assert!(
+        out.contains("malformed Bedrock invocation metrics"),
+        "{out}"
+    );
+}

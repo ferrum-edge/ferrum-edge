@@ -52,7 +52,7 @@ async fn test_all_protocol_plugins() {
         ("correlation_id", json!({})),
         (
             "otel_tracing",
-            json!({"endpoint": "http://example.com/traces"}),
+            json!({"endpoint": "https://example.com/traces"}),
         ),
         (
             "http_logging",
@@ -534,7 +534,7 @@ async fn test_correlation_id_stream_connect_assigns_id() {
 async fn test_otel_tracing_stream_connect_assigns_trace_id() {
     let plugin = make_plugin(
         "otel_tracing",
-        json!({"endpoint": "http://example.com/traces"}),
+        json!({"endpoint": "https://example.com/traces"}),
     )
     .unwrap();
     let mut ctx = make_stream_ctx();

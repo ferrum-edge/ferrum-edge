@@ -9919,7 +9919,7 @@ fn opa_schema_matches_runtime_validation_contract() {
     }
 
     let base = json!({
-        "opa_host": "http://opa.internal:8181",
+        "opa_host": "https://opa.internal:8181",
         "policy_path": "ferrum/authz/allow",
         "timeout_ms": 45000,
         "max_response_bytes": 262144,
@@ -19155,6 +19155,43 @@ fn batch_create_request_publishes_the_complete_closed_envelope() {
         b"{}"
     ));
     assert_component_validity(&spec, "BatchCreateRequest", &json!({}), true);
+}
+
+/// Issue #6620: every `claim_headers` schema encodes the 16-mapping bound the
+/// runtime enforces. Path and header lengths stay prose-only: the runtime
+/// checks them after trimming, so a raw-key `maxLength` would be stricter.
+#[test]
+fn claim_headers_schemas_encode_runtime_object_bounds() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for pointer in [
+        "/components/schemas/JwksAuthConfig/properties/claim_headers",
+        "/components/schemas/JwksAuthConfig/properties/providers/items/properties/claim_headers",
+        "/components/schemas/Oauth2IntrospectionConfig/properties/providers/items/properties/claim_headers",
+        "/components/schemas/OidcRelyingPartyConfig/properties/providers/items/properties/claim_headers",
+    ] {
+        let schema = spec
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("missing {pointer}"));
+        let validator = jsonschema::draft202012::options()
+            .build(schema)
+            .unwrap_or_else(|error| panic!("{pointer} compiles: {error}"));
+
+        let at_cap: serde_json::Map<String, serde_json::Value> = (0..16)
+            .map(|index| (format!("claim{index}"), json!(format!("x-claim-{index}"))))
+            .collect();
+        assert!(
+            validator.validate(&json!(at_cap)).is_ok(),
+            "{pointer}: 16 mappings"
+        );
+        let over_cap: serde_json::Map<String, serde_json::Value> = (0..17)
+            .map(|index| (format!("claim{index}"), json!(format!("x-claim-{index}"))))
+            .collect();
+        assert!(
+            validator.validate(&json!(over_cap)).is_err(),
+            "{pointer}: 17 mappings"
+        );
+    }
 }
 
 /// Cleartext embedding endpoints need the explicit opt-in unless the host is a
