@@ -31,6 +31,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 ### `openapi_validator` bypass headers need a secret (PR #6634)
 
 Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
+
 ### AI guard pattern and scan bounds (#6608, PR #6640)
 
 `ai_response_guard` and `ai_prompt_shield` now refuse at admission:
