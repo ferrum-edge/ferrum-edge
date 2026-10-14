@@ -7816,3 +7816,43 @@ async fn grpc_raw_growth_is_charged_even_when_escaped_size_shrinks() {
             .is_none()
     );
 }
+
+/// Negative control for the live-capacity bound: a same-size second pass
+/// (`8` → `x`, one byte each) would need a second ~61 KB buffer beside the
+/// resident ~61 KB intermediate, which does not fit a 64 KiB window, even
+/// though the final output and its growth charge would.
+#[tokio::test]
+async fn second_pass_cannot_double_the_live_capacity() {
+    let plugin = make_plugin(json!({
+        "blocked_patterns": [
+            {"name": "8".repeat(128), "regex": "7"},
+            {"name": "x", "regex": "8"}
+        ],
+        "redaction_placeholder": "{type}",
+        "action": "redact"
+    }));
+    let body = chat_body(&["7".repeat(480)]);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers.clone(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    ctx.max_response_body_size_bytes = 64 * 1024;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none()
+    );
+}
