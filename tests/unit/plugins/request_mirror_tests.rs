@@ -7038,3 +7038,85 @@ async fn renamed_credentials_are_withheld_from_the_mirror() {
         Some("keep-me")
     );
 }
+
+async fn unregistered_and_repeated_credential_request() -> (RequestContext, HashMap<String, String>)
+{
+    use ferrum_edge::plugins::utils::token_extract::{
+        TokenLocation, mark_present_query_credential_locations,
+    };
+
+    let transformer = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-csrf-token", "new_key": "x-debug"},
+            {"operation": "rename", "target": "header", "key": "cookie2", "new_key": "x-trace-a"},
+            {"operation": "rename", "target": "query", "key": "proof", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("request_transformer config")
+    .expect("request_transformer plugin");
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.headers
+        .insert("x-csrf-token".to_string(), "live-csrf".to_string());
+    ctx.headers
+        .insert("cookie2".to_string(), "live-cookie".to_string());
+    ctx.set_raw_query_string("proof=keyA&proof=key%42&x=1".to_string());
+    ctx.query_params
+        .insert("proof".to_string(), "keyB".to_string());
+    ctx.query_params.insert("x".to_string(), "1".to_string());
+    mark_present_query_credential_locations(
+        &mut ctx,
+        &[TokenLocation::QueryParam("proof".to_string())],
+    );
+    let mut headers = ctx.headers.clone();
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    plugin_utils::assert_continue(transformer.before_proxy(&mut ctx, &mut headers).await);
+    (ctx, headers)
+}
+
+/// Every occurrence of a repeated credential query name keeps its provenance,
+/// and sensitive headers without a route registration (`x-csrf-token`,
+/// `cookie2`) keep theirs through a rename too.
+#[tokio::test]
+async fn renamed_repeated_and_unregistered_credentials_are_withheld() {
+    let (mut ctx, _) = unregistered_and_repeated_credential_request().await;
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !line.contains("keyA") && !line.contains("key%42") && !line.contains("tracking="),
+        "a repeated credential occurrence leaked: {line}"
+    );
+    assert!(line.contains("x=1"), "{line}");
+
+    let (mut ctx, mut headers) = unregistered_and_repeated_credential_request().await;
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in ["x-debug", "x-trace-a", "x-csrf-token", "cookie2"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}
+
+/// A value a plugin installs under a registered credential header (as
+/// `mcp_gateway` does with the mediated upstream session) keeps its
+/// provenance when a later plugin copies or renames it.
+#[tokio::test]
+async fn plugin_installed_credential_values_keep_provenance() {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+
+    let mut ctx = make_ctx_with_proxy();
+    set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+    let mut headers = HashMap::new();
+    headers.insert("x-proof".to_string(), "upstream-session-u".to_string());
+    headers.insert("x-debug".to_string(), "upstream-session-u".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(!observed.contains_key("x-proof"), "{observed:?}");
+    assert!(!observed.contains_key("x-debug"), "{observed:?}");
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}

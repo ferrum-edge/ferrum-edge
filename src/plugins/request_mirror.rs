@@ -1130,9 +1130,22 @@ struct MirrorRouteCredentials {
 }
 
 impl MirrorRouteCredentials {
-    fn from_ctx(ctx: &RequestContext) -> Self {
+    /// Gather provenance from every place a credential value is visible
+    /// before renames can hide it: the pristine inbound headers, the
+    /// materialised request headers, the final outbound headers (values a
+    /// plugin such as `mcp_gateway` installed under a credential name), the
+    /// original raw query and the outbound query. A header or query name
+    /// counts when the mirror's own classifiers deny it (built-in classes,
+    /// operator patterns, route registry, marked query locations). Every
+    /// occurrence of a repeated name contributes its own digest.
+    fn collect(
+        ctx: &RequestContext,
+        outbound_headers: &HashMap<String, String>,
+        header_patterns: &[String],
+        query_patterns: &[String],
+    ) -> Self {
         use crate::fips::approved::Sha256;
-        use crate::plugins::utils::replay_partition::CREDENTIAL_CONTEXT_HEADERS;
+        use crate::plugins::utils::replay_partition::is_credential_context_header;
         use crate::plugins::utils::token_extract::{
             QUERY_CREDENTIAL_METADATA_PREFIX, STRIP_QUERY_PARAM_METADATA_PREFIX,
         };
@@ -1157,28 +1170,54 @@ impl MirrorRouteCredentials {
             }
         }
 
-        let mut push_value = |bytes: &[u8]| {
+        fn push(digests: &mut Vec<[u8; 32]>, bytes: &[u8]) {
             if bytes.is_empty() {
                 return;
             }
             let digest: [u8; 32] = Sha256::digest(bytes);
-            if !value_digests.contains(&digest) {
-                value_digests.push(digest);
+            if !digests.contains(&digest) {
+                digests.push(digest);
             }
+        }
+        let registry = ctx.request_headers_requiring_redaction();
+        let header_is_credential = |name: &str| {
+            let lower = name.to_ascii_lowercase();
+            is_mirror_sensitive_header(&lower, header_patterns)
+                || is_credential_context_header(&lower)
+                || registry
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&lower))
         };
-        let header_names = CREDENTIAL_CONTEXT_HEADERS.iter().copied().chain(
-            ctx.request_headers_requiring_redaction()
-                .iter()
-                .map(String::as_str),
-        );
-        for name in header_names {
-            for value in ctx.raw_header_value_bytes(name) {
-                push_value(value);
-            }
-            for (key, value) in &ctx.headers {
-                if key.eq_ignore_ascii_case(name) {
-                    push_value(value.as_bytes());
+        if let Some(raw) = ctx.raw_headers_snapshot() {
+            for (name, value) in raw.iter() {
+                if header_is_credential(name.as_str()) {
+                    push(&mut value_digests, value.as_bytes());
                 }
+            }
+        }
+        for (name, value) in ctx.headers.iter().chain(outbound_headers.iter()) {
+            if header_is_credential(name) {
+                push(&mut value_digests, value.as_bytes());
+            }
+        }
+
+        let raw_query = ctx.raw_query_string();
+        let outbound_query = ctx.outbound_query_string();
+        for query in [raw_query, outbound_query].into_iter().flatten() {
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+                if matches!(
+                    classify_mirror_query_name(raw_name, query_patterns, &query_names),
+                    MirrorQueryNameDecision::NonSensitive
+                ) {
+                    continue;
+                }
+                push(&mut value_digests, raw_value.as_bytes());
+                let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
+                push(&mut value_digests, &decoded);
+                let form = raw_value.replace('+', " ");
+                let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
+                push(&mut value_digests, &form_decoded);
             }
         }
         Self {
@@ -1193,9 +1232,7 @@ impl MirrorRouteCredentials {
         use crate::fips::approved::Sha256;
         !value.is_empty()
             && !self.value_digests.is_empty()
-            && self
-                .value_digests
-                .contains(&<[u8; 32]>::from(Sha256::digest(value)))
+            && self.value_digests.contains(&Sha256::digest(value))
     }
 
     fn query_value_carries_credential(&self, raw_value: &str) -> bool {
@@ -2985,7 +3022,12 @@ impl Plugin for RequestMirror {
         // request are credentials whatever they are called.
         // Credential provenance comes from the request context, so a
         // credential renamed by a later plugin is still recognised by value.
-        let route_credentials = MirrorRouteCredentials::from_ctx(ctx);
+        let route_credentials = MirrorRouteCredentials::collect(
+            ctx,
+            headers,
+            &self.sensitive_header_patterns,
+            &self.sensitive_query_patterns,
+        );
         let mirror_url = self.build_mirror_url(
             mirror_path,
             effective_query.as_deref(),
