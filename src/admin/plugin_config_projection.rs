@@ -311,7 +311,13 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         ],
     ),
     ("a2a_gateway", NONE),
-    ("mesh_route_dispatch", NONE),
+    (
+        "mesh_route_dispatch",
+        // Per-route request-header writes reach the upstream exactly like
+        // `request_transformer` rule values, so they are secret for the same
+        // reason.
+        &[secret(&["rules", "*", "request_transform", "*", "value"])],
+    ),
     (
         "ai_semantic_cache",
         &[
@@ -321,7 +327,15 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         ],
     ),
     // ---- Transform / dispatch --------------------------------------------
-    ("request_transformer", NONE),
+    (
+        "request_transformer",
+        // Each rule writes its `value` into the upstream request (a header,
+        // query parameter or body field). Operators use it to inject backend
+        // credentials (`Authorization`, `X-Api-Key`, `api_key=`), and the
+        // destination name is arbitrary, so every rule value is secret. The
+        // operation, target and names stay visible as routing diagnostics.
+        &[secret(&["rules", "*", "value"])],
+    ),
     (
         "serverless_function",
         &[

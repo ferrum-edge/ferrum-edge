@@ -1333,3 +1333,72 @@ fn placeholder_outside_a_masked_site_is_not_reported() {
     let config = json!({"service": "[REDACTED]", "batch_size": 50});
     assert!(placeholder_sites("http_logging", &config).is_empty());
 }
+
+#[test]
+fn request_transformer_rule_values_are_secret_for_every_target() {
+    let projected = project(
+        "request_transformer",
+        json!({
+            "rules": [
+                {"operation": "update", "target": "header", "key": "Authorization",
+                 "value": "Bearer rt-header-canary"},
+                {"operation": "add", "target": "header", "key": "X-Tenant",
+                 "value": "rt-plain-header-canary"},
+                {"operation": "add", "target": "query", "key": "api_key",
+                 "value": "rt-query-canary"},
+                {"operation": "update", "target": "body", "key": "auth.token",
+                 "value": "rt-body-canary"},
+                {"operation": "rename", "target": "header", "key": "X-Old",
+                 "new_key": "X-New"},
+                {"operation": "remove", "target": "query", "key": "debug"}
+            ]
+        }),
+    );
+    let rules = projected["rules"].as_array().expect("rules stay an array");
+    for index in 0..4 {
+        assert_eq!(rules[index]["value"], REDACTED, "rule {index}");
+    }
+    // Operations, targets, header names and rename destinations stay visible.
+    assert_eq!(rules[0]["operation"], "update");
+    assert_eq!(rules[1]["target"], "header");
+    assert_eq!(rules[2]["target"], "query");
+    assert_eq!(rules[4]["new_key"], "X-New");
+    assert!(rules[5].get("value").is_none());
+    assert_no_canaries(
+        &projected,
+        &[
+            "rt-header-canary",
+            "rt-plain-header-canary",
+            "rt-query-canary",
+            "rt-body-canary",
+        ],
+    );
+}
+
+#[test]
+fn mesh_route_dispatch_request_transform_values_are_secret() {
+    let projected = project(
+        "mesh_route_dispatch",
+        json!({
+            "rules": [{
+                "match": {"path_prefix": "/api"},
+                "request_transform": [
+                    {"operation": "update", "target": "header", "key": "Authorization",
+                     "value": "Bearer mrd-route-canary"},
+                    {"operation": "remove", "target": "header", "key": "x-debug"}
+                ],
+                "response_transform": [
+                    {"operation": "add", "target": "header", "key": "x-route",
+                     "value": "api"}
+                ]
+            }]
+        }),
+    );
+    let rule = &projected["rules"][0];
+    assert_eq!(rule["request_transform"][0]["value"], REDACTED);
+    assert_eq!(rule["request_transform"][1]["operation"], "remove");
+    assert_eq!(rule["match"]["path_prefix"], "/api");
+    // Response header values are sent to clients, not upstream.
+    assert_eq!(rule["response_transform"][0]["value"], "api");
+    assert_no_canaries(&projected, &["mrd-route-canary"]);
+}

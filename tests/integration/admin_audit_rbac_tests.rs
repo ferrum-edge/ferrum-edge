@@ -1083,6 +1083,84 @@ async fn otel_tracing_config_projections_redact_endpoint_auth_and_headers() {
     }
 }
 
+#[tokio::test]
+async fn request_transformer_rule_values_are_redacted_for_non_admins_and_audit() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("ops", Some("operator"));
+
+    let header_secret = "rt-upstream-header-canary";
+    let query_secret = "rt-upstream-query-canary";
+    let plugin = json!({
+        "id": "rt-redaction-config",
+        "plugin_name": "request_transformer",
+        "scope": "global",
+        "config": {
+            "rules": [
+                {"operation": "update", "target": "header", "key": "X-Upstream-Token",
+                 "value": format!("Bearer {header_secret}")},
+                {"operation": "add", "target": "query", "key": "token",
+                 "value": query_secret}
+            ]
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "request_transformer create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=rt-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"].clone();
+
+    let mut projections = vec![audit_config];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/rt-redaction-config", bearer).await;
+        assert_eq!(status, 200, "non-admin config read failed: {projected:?}");
+        projections.push(projected["config"].clone());
+
+        let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+        assert_eq!(status, 200, "non-admin config list failed: {list:?}");
+        let listed = list["data"]
+            .as_array()
+            .expect("plugin list data")
+            .iter()
+            .find(|item| item["id"] == "rt-redaction-config")
+            .expect("listed request_transformer config");
+        projections.push(listed["config"].clone());
+    }
+    for projection in &projections {
+        assert_eq!(projection["rules"][0]["value"], "[REDACTED]");
+        assert_eq!(projection["rules"][1]["value"], "[REDACTED]");
+        assert_eq!(projection["rules"][1]["target"], "query");
+        let serialized = projection.to_string();
+        for secret in [header_secret, query_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "request_transformer projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+
+    // Admin reads stay raw for read-modify-write.
+    let (status, raw) = get_json(&base, "/plugins/config/rt-redaction-config", &admin).await;
+    assert_eq!(status, 200, "admin config read failed: {raw:?}");
+    assert_eq!(
+        raw["config"]["rules"][0]["value"],
+        format!("Bearer {header_secret}")
+    );
+    assert_eq!(raw["config"]["rules"][1]["value"], query_secret);
+}
+
 fn assert_otel_config_projection_redacted(config: &Value) {
     assert_eq!(
         config["endpoint"],

@@ -1691,6 +1691,8 @@ Fields covered by the schema include:
 | `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |
 | `proxy_alerts` | `channels.*.url` | structural URL (`channels.*.webhook_url` is caught wholesale by the name heuristic and projects as `[REDACTED]`) |
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
+| `request_transformer` | `rules.*.value` | `[REDACTED]` (header, query and body values are written into the upstream request and may carry a backend credential; operation, target and names stay visible) |
+| `mesh_route_dispatch` | `rules.*.request_transform.*.value` | `[REDACTED]` (same reason as `request_transformer`) |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
 | `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
 | `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |
