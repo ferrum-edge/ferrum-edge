@@ -326,6 +326,10 @@ impl Plugin for DeferredCorsPlugin {
         self.inner.on_request_received(ctx).await
     }
 
+    fn execution_trigger_reads_query(&self) -> bool {
+        self.inner.execution_trigger_reads_query()
+    }
+
     fn is_deferred_cors_wrapper(&self) -> bool {
         true
     }
@@ -1126,6 +1130,12 @@ impl Plugin for PluginInstanceWrapper {
     }
     fn may_inject_route_fault(&self) -> bool {
         self.inner.may_inject_route_fault()
+    }
+    fn execution_trigger_reads_query(&self) -> bool {
+        self.trigger
+            .as_ref()
+            .is_some_and(PluginTriggerGate::reads_query)
+            || self.inner.execution_trigger_reads_query()
     }
     fn answers_cors_preflights(&self) -> bool {
         self.inner.answers_cors_preflights()
@@ -5051,6 +5061,14 @@ impl PluginCapabilities {
     /// response as gRPC-Web for that translator's body transform only when
     /// this is set, so a custom plugin reporting `grpc_web` cannot select it.
     pub const RUNS_BUILTIN_GRPC_WEB: u32 = 1 << 20;
+    /// At least one instance carries an execution trigger that reads a
+    /// `query` field (`Plugin::execution_trigger_reads_query`). Trigger query
+    /// predicates split pairs only on `&`, while some backends also split on
+    /// `;`, so the request dispatchers refuse a query containing an unencoded
+    /// `;` with `400` (`semicolon_separator`) before any plugin phase runs
+    /// (issue #6655). `%3B` is an unambiguous literal and is unaffected, and a
+    /// view without such a trigger never inspects the query on this path.
+    pub const HAS_QUERY_READING_TRIGGER: u32 = 1 << 21;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -5220,6 +5238,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
         if p.deferred_before_proxy_may_change_routing_headers() {
             caps |= PluginCapabilities::HAS_DEFERRED_ROUTING_HEADER_HOOKS;
+        }
+        if p.execution_trigger_reads_query() {
+            caps |= PluginCapabilities::HAS_QUERY_READING_TRIGGER;
         }
         if p.is_initial_response_header_policy() {
             initial_response_header_policy_plugins.push(Arc::clone(p));

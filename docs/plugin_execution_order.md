@@ -1347,6 +1347,13 @@ instance when every request must authenticate.
   configured name and is skipped. The bytes are never copied, reflected, or
   logged. Lossy transcoding is deliberately not used — it would let `?q=%FF`
   match a configured `U+FFFD` and, under `not`, switch a security instance off.
+* **An unencoded `;` in the query is refused.** `query` predicates split
+  pairs only on `&`, while some backends also split on `;`. When any instance
+  on the chain has a trigger that reads `query`, a request whose raw query
+  contains an unencoded `;` is answered `400` (`semicolon_separator`,
+  rejection phase `query_trigger_admission`) before any plugin phase runs, on
+  HTTP/1.1, HTTP/2, and HTTP/3. `%3B` is a literal `;` and is accepted. A
+  chain without a query-reading trigger is unaffected.
 * **Protocol identity is a set.** Transport and flavor are independent, so an
   HTTP/2 native-gRPC request matches both `http2` and `grpc`.
   Stream identities are likewise client-facing: `udp` versus `dtls` comes from

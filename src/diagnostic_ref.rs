@@ -199,6 +199,10 @@ pub const RETIRED_GATEWAY_LISTENER_PHASE: &str = "gateway_listener_retired";
 /// gRPC, WebSocket) cannot run the route's authentication or admission policy.
 pub const ROUTE_PROTOCOL_ADMISSION_PHASE: &str = "route_protocol_admission";
 
+/// Rejection phase of a request whose raw query carries an unencoded `;` on a
+/// chain with a query-reading plugin execution trigger (issue #6655).
+pub const QUERY_TRIGGER_ADMISSION_PHASE: &str = "query_trigger_admission";
+
 /// Plugin hook phases. A rejection recorded in one of them is a plugin
 /// rejection even when the rejecting plugin's name is not known.
 const PLUGIN_HOOK_PHASES: [&str; 9] = [
@@ -221,6 +225,7 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     MESH_REGISTRY_ONLY_PHASE,
     RETIRED_GATEWAY_LISTENER_PHASE,
     ROUTE_PROTOCOL_ADMISSION_PHASE,
+    QUERY_TRIGGER_ADMISSION_PHASE,
     BACKEND_ADMISSION_PHASE,
     "h1_framing_unverified",
     "config_stale",

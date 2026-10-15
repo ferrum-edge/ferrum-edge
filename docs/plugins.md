@@ -254,6 +254,16 @@ intentionally public. For `response_caching`, the default
 therefore incompatible with a trigger; set it to `false` for a triggered cache
 instance.
 
+A `query` predicate splits pairs only on `&`. When any instance on a request's
+plugin chain carries a trigger that reads `query` (at any depth, including under
+`not`), a request whose raw query contains an unencoded `;` is refused with
+`400` (`semicolon_separator`; native gRPC: `INVALID_ARGUMENT`) before any plugin
+phase runs, because backends that also split on `;` (Rack before 3.0, Go before
+1.17, Python before 3.9.2) would read parameters the trigger never evaluated.
+`%3B` is an unambiguous literal `;` and is accepted. Chains whose triggers read
+no `query` field are unaffected. This matches the `mesh_route_dispatch`
+`match.query_params` rule.
+
 See [Per-Instance Execution Triggers](plugin_execution_order.md#per-instance-execution-triggers)
 for the full predicate table, the deterministic absent/multi-value/case rules,
 the decide-once phase model, the fail-closed composition rules, and the bounds.
@@ -1503,7 +1513,7 @@ latency fields remain `-1.0`; a configured target in such a record is not proof
 that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
 phase or gateway admission gate that rejected the request. Possible values
 include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
-`route_protocol_admission`, `grpc_backend_error`, and
+`route_protocol_admission`, `query_trigger_admission`, `grpc_backend_error`, and
 `websocket_backend_error`. Gateway-generated gRPC
 errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
 sinks can distinguish gRPC failures even though the downstream HTTP status is
@@ -1518,6 +1528,7 @@ Terminal transaction logging is independent of ordinary request hooks:
 | Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
 | Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
 | Matched proxy whose native-gRPC or WebSocket plugin view omits an HTTP-only authentication or admission plugin, a plain HTTP or WebSocket request (other than a bodiless CORS preflight that the route's `cors` plugin answers) to a gRPC-intended route whose own chain carries a gRPC-only admission plugin such as `grpc_method_router`, or a gRPC-Web request whose composed view cannot run a gRPC-only admission plugin (see [Protocol Support](plugin_execution_order.md#protocol-support)) | 403 (native gRPC: trailers-only `PERMISSION_DENIED`) | Emitted once with `rejection_phase: "route_protocol_admission"` | Not run |
+| Matched proxy whose plugin chain carries an execution trigger that reads `query`, and whose raw query contains an unencoded `;` (`%3B` is accepted) | 400 (native gRPC: trailers-only `INVALID_ARGUMENT`) | Emitted once with `rejection_phase: "query_trigger_admission"` | Not run |
 | Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.

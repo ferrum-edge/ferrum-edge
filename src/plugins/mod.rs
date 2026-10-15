@@ -10926,6 +10926,16 @@ pub trait Plugin: Any + Send + Sync {
         false
     }
 
+    /// Whether this instance's execution trigger reads a `query` field.
+    /// Only the plugin cache's trigger wrapper (and wrappers around it)
+    /// return `true`; plugins never override it. The dispatchers refuse a
+    /// query with an unencoded `;` before any phase runs on a chain that
+    /// carries such a trigger (issue #6655).
+    #[doc(hidden)]
+    fn execution_trigger_reads_query(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin participates in target-aware backend
     /// admission after load balancing and before backend dispatch.
     fn is_backend_admission_plugin(&self) -> bool {

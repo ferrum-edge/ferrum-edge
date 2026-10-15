@@ -286,6 +286,32 @@ static EMPTY_HEADERS: std::sync::LazyLock<HashMap<String, String>> =
 pub(crate) const ROUTE_PROTOCOL_NOT_PERMITTED_BODY: &str =
     r#"{"error":"Request protocol not permitted on this route"}"#;
 
+/// Client-visible body (`400`, or gRPC `INVALID_ARGUMENT`) for a request
+/// refused by [`query_trigger_refuses_request`].
+pub(crate) const QUERY_TRIGGER_SEMICOLON_BODY: &str =
+    r#"{"error":"ambiguous query parameters","reason":"semicolon_separator"}"#;
+
+/// Whether a request must be refused before any plugin phase because a plugin
+/// execution trigger on its chain reads `query` and the raw query carries an
+/// unencoded `;` (issue #6655).
+///
+/// Trigger query predicates split pairs only on `&`. A backend that also
+/// splits on `;` (Rack before 3.0, Go before 1.17, Python before 3.9.2) can
+/// read a parameter the trigger never saw, so the trigger could skip an
+/// instance for a request the backend treats as matching it. This refuses the
+/// request outright rather than evaluating the trigger under two readings,
+/// matching how `mesh_route_dispatch` query predicates fail closed. Any `;` in
+/// the raw query counts, the same rule as `QueryAmbiguity::SemicolonSeparator`.
+/// `%3B` is an unambiguous literal and is accepted. A view whose triggers read
+/// no query field never inspects the query here.
+pub fn query_trigger_refuses_request(
+    capabilities: PluginCapabilities,
+    raw_query: Option<&str>,
+) -> bool {
+    capabilities.has(PluginCapabilities::HAS_QUERY_READING_TRIGGER)
+        && raw_query.is_some_and(|query| query.contains(';'))
+}
+
 /// Precomputed circuit-breaker-open reject headers. Open-breaker 503s are
 /// still a reject path, but the map is rebuilt from this snapshot so the
 /// observability token is not `format!()`ed or assembled per request.
@@ -34740,6 +34766,49 @@ async fn handle_proxy_request_inner(
             0,
         )
         .await;
+        return Ok(build_response_from_normalized_reject(reject));
+    }
+
+    // A plugin execution trigger on this view reads `query`, and the raw query
+    // carries an unencoded `;`. Trigger predicates split pairs only on `&`, so
+    // refuse before any plugin phase runs instead of deciding the instance on
+    // a reading a `;`-splitting backend does not share (issue #6655).
+    if query_trigger_refuses_request(caps, ctx.raw_query_string()) {
+        state.request_count.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            proxy_id = %proxy.id,
+            reason = "semicolon_separator",
+            "Rejected request: unencoded ';' in the query on a chain with a query-reading plugin trigger"
+        );
+        let mut reject = normalize_reject_response(
+            StatusCode::BAD_REQUEST,
+            Bytes::from_static(QUERY_TRIGGER_SEMICOLON_BODY.as_bytes()),
+            &EMPTY_HEADERS,
+            is_grpc_request,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        // Empty plugin list: no request hook may run for a refused request.
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
+        record_status(&state, StatusCode::BAD_REQUEST.as_u16());
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::BAD_REQUEST.as_u16(),
+            start_time,
+            crate::diagnostic_ref::QUERY_TRIGGER_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
         return Ok(build_response_from_normalized_reject(reject));
     }
 

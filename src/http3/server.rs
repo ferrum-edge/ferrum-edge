@@ -4165,6 +4165,39 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Same refusal as the H1/H2 dispatcher: a query-reading plugin trigger on
+    // this view and an unencoded `;` in the raw query (issue #6655).
+    if crate::proxy::query_trigger_refuses_request(caps, ctx.raw_query_string()) {
+        debug!(
+            proxy_id = %proxy.id,
+            reason = "semicolon_separator",
+            "Rejected HTTP/3 request: unencoded ';' in the query on a chain with a query-reading plugin trigger"
+        );
+        record_h3_flavor_aware_reject(&state, http_flavor, 400);
+        send_h3_error_flavor_aware_with_policy(
+            &mut stream,
+            http_flavor,
+            grpc_web_response_content_type,
+            StatusCode::BAD_REQUEST,
+            crate::proxy::QUERY_TRIGGER_SEMICOLON_BODY,
+            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+            "ambiguous query parameters",
+            initial_response_header_policy_plugins.as_ref(),
+        )
+        .await?;
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::BAD_REQUEST.as_u16(),
+            start_time,
+            crate::diagnostic_ref::QUERY_TRIGGER_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        return Ok(());
+    }
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
     // Publish this route's client-facing body ceilings before any request DATA
