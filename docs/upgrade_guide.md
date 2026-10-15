@@ -2258,34 +2258,12 @@ helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
   --take-ownership --set crds.adoptExisting=true
 ```
 
-`--take-ownership` was added in Helm 3.17.0, so this command needs a Helm
-3.17+ client; older clients reject the flag. With an older client, first check
-that no Helm release owns the CRD yet:
+`--take-ownership` was added in Helm 3.17.0, so this adoption step needs a
+Helm 3.17+ client; older clients reject the flag. Upgrade the Helm client
+before this upgrade rather than editing Helm ownership metadata on the CRD by
+hand.
 
-```bash
-CRD=udpresponseamplificationpolicies.gateway.ferrum.io
-kubectl get crd "$CRD" -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}{" "}{.metadata.annotations.meta\.helm\.sh/release-namespace}{"\n"}'
-```
-
-How to proceed depends on what that prints:
-
-- Exactly `<release> <namespace>`: your release already owns the CRD. Run the
-  plain `helm upgrade`; no adoption is needed.
-- Another release: that release owns this cluster-scoped CRD. Leave it alone.
-  This chart then skips the CRD and does not need adoption.
-- Nothing: the CRD is unmanaged. Mark it as owned by your release, without
-  `--overwrite`, so a concurrent owner is never displaced (`kubectl` fails if
-  one appeared in the meantime), then upgrade without the flag:
-
-```bash
-kubectl label crd "$CRD" app.kubernetes.io/managed-by=Helm
-kubectl annotate crd "$CRD" \
-  meta.helm.sh/release-name=<release> \
-  meta.helm.sh/release-namespace=<namespace>
-helm upgrade <release> ./charts/ferrum-mesh -n <namespace>
-```
-
-Either path keeps the CRD in the cluster and leaves its existing policy
+Adoption keeps the CRD in the cluster and leaves its existing policy
 objects untouched. The chart renders the CRD with
 `helm.sh/resource-policy: keep`, so a later uninstall still does not delete
 it. After adoption, leave `crds.install=true` and drop `crds.adoptExisting`.
