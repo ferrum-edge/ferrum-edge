@@ -513,7 +513,20 @@ Two client-side options, both applying equally to DP ConfigSync, native
   short-lived rotated token needs no restart.
 
   The issuer — not the node — decides what the token asserts, so it must mint
-  to Ferrum's CP/DP token contract exactly. The CP requires:
+  to Ferrum's CP/DP token contract exactly. The CP requires the claims in the
+  table below.
+
+  > **Current limitation for DP ConfigSync.** A stock DP (`FERRUM_MODE=dp`)
+  > generates a random per-process `node_id` at startup and sends it in
+  > `ConfigSync.Subscribe`. It does not derive that ID from an external
+  > token's `sub`, and there is no setting to pin it. Because the CP requires
+  > `sub` to equal `node_id`, an externally issued token is refused with
+  > `PERMISSION_DENIED`, and that DP never receives config. Until DP node
+  > identity can be bound to the token, give each DP its own per-tenant secret
+  > plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID`, the second option below. A
+  > self-minted token always carries the DP's own `node_id` as `sub`. Mesh
+  > `MeshSubscribe` and xDS clients send their configured node ID, so an issuer
+  > can mint `sub` to match it.
 
   | Claim | Requirement |
   |---|---|
@@ -573,7 +586,9 @@ distributed.
 4. **Point data planes at their credential**: give each DP/mesh node either
    `FERRUM_DP_CP_GRPC_TOKEN_FILE` (an externally issued short-lived token, so
    the node holds no signing key) or its own per-tenant secret plus
-   `FERRUM_CP_DP_GRPC_JWT_KEY_ID`. A token with no `kid` is rejected by a
+   `FERRUM_CP_DP_GRPC_JWT_KEY_ID`. For stock DPs (`FERRUM_MODE=dp`) use the
+   per-tenant secret for now: see the
+   [DP ConfigSync limitation](#data-plane-side) on external tokens. A token with no `kid` is rejected by a
    trust-bundle CP, so roll data planes before flipping CP scope.
 
 5. **Expand scope incrementally**: set `FERRUM_CP_NAMESPACES="ns-a,ns-b"`

@@ -2259,13 +2259,24 @@ helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
 ```
 
 `--take-ownership` was added in Helm 3.17.0, so this command needs a Helm
-3.17+ client; older clients reject the flag. With an older client, mark the
-CRD as owned by the release yourself, then upgrade without the flag:
+3.17+ client; older clients reject the flag. With an older client, first check
+that no Helm release owns the CRD yet:
 
 ```bash
 CRD=udpresponseamplificationpolicies.gateway.ferrum.io
-kubectl label crd "$CRD" app.kubernetes.io/managed-by=Helm --overwrite
-kubectl annotate crd "$CRD" --overwrite \
+kubectl get crd "$CRD" -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}{" "}{.metadata.annotations.meta\.helm\.sh/release-namespace}{"\n"}'
+```
+
+Continue only if that prints nothing, which means the CRD is unmanaged, or
+prints exactly `<release> <namespace>`. If it names another release, that
+release already owns this cluster-scoped CRD. Leave it alone: this chart then
+skips the CRD and does not need adoption. Otherwise, mark the CRD as owned by
+your release without `--overwrite`, so a concurrent owner is never displaced,
+then upgrade without the flag:
+
+```bash
+kubectl label crd "$CRD" app.kubernetes.io/managed-by=Helm
+kubectl annotate crd "$CRD" \
   meta.helm.sh/release-name=<release> \
   meta.helm.sh/release-namespace=<namespace>
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace>
