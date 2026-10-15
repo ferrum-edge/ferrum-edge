@@ -4303,6 +4303,47 @@ async fn global_exemptions_cover_ips_headers_and_capture_filters() {
     assert!(!capture_ctx.metadata.contains_key("waf.rule_hits"));
 }
 
+/// An IPv6-only exemption (`::/0`) must not exempt native IPv4 callers:
+/// matching an IPv4 caller against an IPv6 network would skip WAF inspection
+/// for every IPv4 client.
+#[tokio::test]
+async fn ipv6_ip_exemption_does_not_exempt_native_ipv4_callers() {
+    let plugin = waf(json!({
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "global_exemptions": { "ips": ["::/0"] }
+    }))
+    .unwrap();
+
+    let mut v4_ctx = RequestContext::new("10.1.2.3".into(), "GET".into(), "/search".into());
+    v4_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    match plugin.authorize(&mut v4_ctx).await {
+        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+        other => panic!("an IPv4 caller must still be inspected, got {other:?}"),
+    }
+
+    let mut v6_ctx = RequestContext::new("2001:db8::7".into(), "GET".into(), "/search".into());
+    v6_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    assert!(matches!(
+        plugin.authorize(&mut v6_ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(!v6_ctx.metadata.contains_key("waf.rule_hits"));
+
+    // An IPv4 exemption still covers the IPv4-mapped spelling of its range.
+    let plugin = waf(json!({
+        "rule_modes": { "FE-XSS-001": "enforce" },
+        "global_exemptions": { "ips": ["10.0.0.0/8"] }
+    }))
+    .unwrap();
+    let mut mapped_ctx =
+        RequestContext::new("::ffff:10.1.2.3".into(), "GET".into(), "/search".into());
+    mapped_ctx.set_raw_query_string("q=%3Cscript%3Ealert(1)%3C/script%3E".into());
+    assert!(matches!(
+        plugin.authorize(&mut mapped_ctx).await,
+        PluginResult::Continue
+    ));
+}
+
 #[test]
 fn invalid_global_exemption_cidr_fails_construction() {
     let err = Waf::new(&json!({

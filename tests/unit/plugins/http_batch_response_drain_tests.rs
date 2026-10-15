@@ -359,18 +359,40 @@ async fn shared_helper_transport_failure_is_classified_without_logging_body() {
 /// credential in its path or query.
 #[tokio::test]
 async fn transport_error_does_not_echo_endpoint_url() {
+    // Keep the listener: accept the connection and close it after reading the
+    // request headers, so the request fails deterministically instead of
+    // racing another fixture for a released port.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
-    drop(listener);
+    let server = tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = read_http11_request_headers(&mut socket).await;
+        drop(socket);
+    });
 
-    let result = reqwest::Client::new()
+    let result = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("client")
         .post(format!(
             "http://{addr}/ingest/path-secret?api_key=query-secret"
         ))
         .body("[]")
         .send()
         .await;
-    assert!(result.is_err(), "closed port must fail to connect");
+    let error = result
+        .as_ref()
+        .expect_err("a closed connection must fail the request");
+    assert!(
+        !error.is_timeout(),
+        "request must fail on the closed connection: {error}"
+    );
+    assert!(
+        error.to_string().contains("query-secret"),
+        "precondition: reqwest's own Display carries the URL: {error}"
+    );
 
     let err = handle_http_batch_response("http_batch_url_redaction", "", 1, result)
         .await
@@ -378,4 +400,5 @@ async fn transport_error_does_not_echo_endpoint_url() {
     assert!(err.contains("batch failed"), "{err}");
     assert!(!err.contains("path-secret"), "{err}");
     assert!(!err.contains("query-secret"), "{err}");
+    server.abort();
 }
