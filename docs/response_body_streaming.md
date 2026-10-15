@@ -174,7 +174,8 @@ response_body_mode = buffer?
                        cross-protocol bridge behaves the same; when the
                        initial target is native H3, that handler's retry loop
                        buffers its attempts, even ones rotated onto non-H3
-                       targets (see Interaction with Retry Logic).
+                       targets, and plain-HTTP mesh attempts from H3 are
+                       always buffered (see Interaction with Retry Logic).
                     └─ No → continue
                 Response size limit enabled?
                     └─ Yes →
@@ -1002,7 +1003,7 @@ When retry is configured on a proxy, the gateway must be able to inspect the res
 
 - **Every attempt (HTTP/1.1 and HTTP/2 frontends)**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
 - **Buffered proxies**: When `response_body_mode: buffer` or a plugin forces buffering, attempts are buffered instead. Inherently streaming responses may still be released to stream after headers through the all-plugin opt-in described above; a retryable status is discarded before any bytes reach the client.
-- **HTTP/3 frontend**: Which retry loop runs is decided by the **initially selected** target. When it is not native-H3-capable, the H3 cross-protocol bridge (`http3/cross_protocol.rs`) runs the retry loop, decides every attempt from headers, and streams like the H1/H2 frontends. When the initial target is dispatched on the native QUIC pool, the native H3 handler's retry loop runs instead and, with retries configured, buffers each attempt's response — including attempts that rotate onto a non-H3 target, which it sends through the buffered reqwest retry path. Its one exception is the **initial** attempt, which may still stream an inherently streaming response when every plugin opts in to releasing it after headers; every retry attempt after that is buffered.
+- **HTTP/3 frontend**: Which retry loop runs is decided by the **initially selected** target. When it is not native-H3-capable, the H3 cross-protocol bridge (`http3/cross_protocol.rs`) runs the retry loop, decides every attempt from headers, and streams like the H1/H2 frontends — for its reqwest (HTTP/1.1, HTTP/2) and gRPC response paths. Plain-HTTP attempts to mesh targets (HBONE or sidecar mesh-mTLS) are the exception: the bridge sends them through a buffered mesh dispatch, so their responses are collected whole whether or not retries are configured. When the initial target is dispatched on the native QUIC pool, the native H3 handler's retry loop runs instead and, with retries configured, buffers each attempt's response — including attempts that rotate onto a non-H3 target, which it sends through the buffered reqwest retry path (or the buffered mesh dispatch for a mesh target). Its one exception is the **initial** attempt, which may still stream an inherently streaming response when every plugin opts in to releasing it after headers; every retry attempt after that is buffered.
 - **After streaming begins**: On any attempt, a failure that occurs once response bytes have been committed downstream cannot be retried.
 
 ```
