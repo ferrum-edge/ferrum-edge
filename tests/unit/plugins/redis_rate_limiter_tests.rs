@@ -2518,6 +2518,10 @@ fn batch_contains(batch: &[Vec<String>], command: &str) -> bool {
 #[derive(Clone)]
 struct KeyspaceState {
     keys: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// Raw byte values a hostile writer parked under counter keys, served in
+    /// preference to the integer keyspace so bounded counter reads can be
+    /// exercised against oversized/non-integer stored values (issue #6653).
+    raw_values: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
     incrs: Arc<AtomicUsize>,
     decrs: Arc<AtomicUsize>,
     charges: Arc<AtomicUsize>,
@@ -2583,6 +2587,34 @@ impl KeyspaceState {
             };
         }
         let key = args.get(1).cloned().unwrap_or_default();
+        if matches!(name.as_str(), "GET" | "GETRANGE") {
+            let raw = self
+                .raw_values
+                .lock()
+                .expect("raw values mutex")
+                .get(&key)
+                .cloned();
+            if let Some(raw) = raw {
+                let slice: &[u8] = if name == "GET" {
+                    &raw
+                } else {
+                    let start: usize = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(0);
+                    let end: usize = args
+                        .get(3)
+                        .and_then(|arg| arg.parse().ok())
+                        .unwrap_or(usize::MAX);
+                    if raw.is_empty() || start >= raw.len() {
+                        &[]
+                    } else {
+                        &raw[start..=end.min(raw.len() - 1)]
+                    }
+                };
+                let mut reply = format!("${}\r\n", slice.len()).into_bytes();
+                reply.extend_from_slice(slice);
+                reply.extend_from_slice(b"\r\n");
+                return reply;
+            }
+        }
         let mut store = self.keys.lock().expect("keyspace mutex");
         match name.as_str() {
             "GET" => match store.get(&key) {
@@ -2592,11 +2624,35 @@ impl KeyspaceState {
                 }
                 None => b"$-1\r\n".to_vec(),
             },
+            "GETRANGE" => match store.get(&key) {
+                Some(value) => {
+                    let rendered = value.to_string();
+                    let start: usize = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(0);
+                    let end: usize = args
+                        .get(3)
+                        .and_then(|arg| arg.parse().ok())
+                        .unwrap_or(usize::MAX);
+                    let slice = rendered
+                        .get(start..=end.min(rendered.len().saturating_sub(1)))
+                        .unwrap_or_default();
+                    format!("${}\r\n{slice}\r\n", slice.len()).into_bytes()
+                }
+                None => b"$0\r\n\r\n".to_vec(),
+            },
             "INCR" => {
                 self.incrs.fetch_add(1, Ordering::Relaxed);
                 self.ops.lock().expect("op log mutex").push("INCR");
                 let slot = store.entry(key).or_insert(0);
                 *slot += 1;
+                let value = *slot;
+                format!(":{value}\r\n").into_bytes()
+            }
+            "INCRBY" => {
+                self.incrs.fetch_add(1, Ordering::Relaxed);
+                self.ops.lock().expect("op log mutex").push("INCR");
+                let amount: i64 = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(0);
+                let slot = store.entry(key).or_insert(0);
+                *slot += amount;
                 let value = *slot;
                 format!(":{value}\r\n").into_bytes()
             }
@@ -2729,6 +2785,16 @@ impl KeyspaceServer {
         *self.state.time_mode.lock().expect("time mode mutex") = mode;
     }
 
+    /// Park a raw byte value under a key, as a hostile writer with access to
+    /// the configured prefix could.
+    fn set_raw(&self, key: &str, value: Vec<u8>) {
+        self.state
+            .raw_values
+            .lock()
+            .expect("raw values mutex")
+            .insert(key.to_string(), value);
+    }
+
     fn counter(&self, key: &str) -> i64 {
         self.state
             .keys
@@ -2825,6 +2891,7 @@ async fn spawn_keyspace_redis_server(options: KeyspaceServerOptions) -> Keyspace
     let port = listener.local_addr().expect("local_addr").port();
     let state = KeyspaceState {
         keys: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        raw_values: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         incrs: Arc::new(AtomicUsize::new(0)),
         decrs: Arc::new(AtomicUsize::new(0)),
         charges: Arc::new(AtomicUsize::new(0)),
@@ -2906,6 +2973,83 @@ fn keyspace_config(port: u16) -> RedisConfig {
 
 fn keyspace_client(port: u16) -> RedisRateLimitClient {
     redis_rate_limit_client_for_test(keyspace_config(port))
+}
+
+/// Issue #6653: counter reads are bounded with `GETRANGE`, so a hostile or
+/// corrupt oversized value parked under a trailing sub-bucket key fails the
+/// charge closed instead of being materialized whole and misread as a count.
+#[tokio::test]
+async fn charge_fails_closed_on_oversized_trailing_counter() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisWindowCharges;
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    let bucket = RedisRateLimitClient::sub_bucket_at(Duration::from_micros(100_124_000), 1);
+    let mut charges = RedisWindowCharges::default();
+    assert!(charges.push(client.window_charge("ip:127.0.0.1", bucket, 3)));
+    let trailing_key = charges.as_slice()[0]
+        .trailing_keys()
+        .next()
+        .expect("a trailing sub-bucket key")
+        .to_string();
+    server.set_raw(&trailing_key, vec![b'1'; 30]);
+
+    assert!(
+        client
+            .charge_rate_limit_windows(charges.as_slice())
+            .await
+            .is_err(),
+        "an oversized trailing counter must fail the charge closed"
+    );
+    assert!(
+        !client.is_available(),
+        "an unreadable counter marks the endpoint unusable"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Issue #6653: the sliding-window and two-counter reads bound their counter
+/// reads the same way — a non-integer value under a counter key fails the
+/// command instead of reading as zero.
+#[tokio::test]
+async fn sliding_and_pair_reads_fail_closed_on_non_integer_counter() {
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = keyspace_client(server.port);
+
+    // Positive control: clean counters charge and read back exactly.
+    assert_eq!(
+        client
+            .sliding_window_increment_by("prev", "curr", 2, 60)
+            .await
+            .expect("clean sliding-window charge"),
+        (0, 2)
+    );
+    assert_eq!(
+        client
+            .get_two_counters("prev", "curr")
+            .await
+            .expect("clean paired read"),
+        (0, 2)
+    );
+
+    server.set_raw("prev", b"not-a-number".to_vec());
+    assert!(
+        client
+            .sliding_window_increment_by("prev", "curr", 1, 60)
+            .await
+            .is_err(),
+        "a non-integer previous counter must fail the sliding-window charge"
+    );
+
+    let second = keyspace_client(server.port);
+    assert!(
+        second.get_two_counters("prev", "curr").await.is_err(),
+        "a non-integer counter must fail the paired read"
+    );
+
+    let _ = server.shutdown.send(());
 }
 
 /// Two requests that select adjacent sub-buckets must not both be admitted

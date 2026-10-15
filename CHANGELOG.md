@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
+  #6653). The request-quota charge transaction, the sliding-window charge,
+  and the paired counter read previously fetched counters with a plain
+  `GET`, so a writer with access to the configured key prefix could park an
+  oversized value (up to the Redis 512 MB string limit) under a counter key
+  and every admission would allocate it whole. Counter reads now use
+  `GETRANGE key 0 20` (at most 21 bytes; the widest `i64` is 20): an empty
+  reply is a missing counter, and a truncated or non-integer reply fails the
+  command closed so `redis_failure_policy` governs. **Operator action:**
+  Redis ACLs for the rate-limit plugins must now grant `GETRANGE` on the
+  configured key prefix (the counter reads no longer use `GET`).
+
 - **An unencoded `;` in the query is now an ambiguity that fail-closed query
   consumers reject** (issue #6579; query counterpart of GHSA-fcqw-793q-wg5x /
   GHSA-5mrg-vq2h-6j3w). The canonical query view split pairs only on `&`, so
