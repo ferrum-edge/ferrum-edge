@@ -975,6 +975,26 @@ fn container_json_path_waf(
 }
 
 #[tokio::test]
+async fn body_json_path_rule_with_many_matching_duplicates_records_one_hit() {
+    let plugin = enforcing_json_path_waf(false);
+    let mut body = String::from(r#"{"user":{"#);
+    for index in 0..20_000 {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(r#""bio":"forbidden-canary""#);
+    }
+    body.push_str("}}");
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "application/json", body.as_bytes()).await;
+    assert!(json_path_rule_hit(&result, &ctx));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-JSON-CANARY")
+    );
+}
+
+#[tokio::test]
 async fn body_json_path_container_rules_see_each_duplicate_reading() {
     // `equals` on a container keeps matching the last-wins reading it matched
     // before duplicates were preserved, and also matches the first-wins one.
