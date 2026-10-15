@@ -195,6 +195,9 @@ struct ContentPattern {
 struct RedactionBudget {
     /// Remaining net growth, in bytes, that this pass may still produce.
     remaining: Cell<usize>,
+    /// The allowance this budget started with, so callers can account the
+    /// growth actually charged against a live-capacity ledger (#6657).
+    initial: usize,
     /// Set once the pass has failed. Every later rewrite is skipped and the
     /// caller discards the partially rewritten document.
     exhausted: Cell<bool>,
@@ -216,8 +219,14 @@ impl RedactionBudget {
             .min(ceiling.saturating_sub(body_len));
         Self {
             remaining: Cell::new(limit),
+            initial: limit,
             exhausted: Cell::new(false),
         }
+    }
+
+    /// Net growth charged so far, in serialized bytes.
+    fn charged_growth(&self) -> usize {
+        self.initial.saturating_sub(self.remaining.get())
     }
 
     fn is_exhausted(&self) -> bool {
@@ -239,6 +248,58 @@ impl RedactionBudget {
                 false
             }
         }
+    }
+}
+
+/// One live-capacity ledger for a structured verification/redaction pass
+/// (issue #6657).
+///
+/// The growth allowance ([`RedactionBudget`]) bounds how much larger the
+/// rewritten document may become, and each serializer is ceiling-bounded on
+/// its own — but the verification copies (the cloned document tree, the
+/// placeholder-stripping scratch, the residual-scan serialization, the final
+/// serialization) used to be accounted independently, so the peak was a small
+/// constant multiple of the retained ceiling rather than the single window
+/// the budget module documents. This ledger charges every one of those
+/// allocations, in serialized-byte units (the units every other bound here
+/// uses), BEFORE it is made: an allocation that does not fit the room left
+/// by the allocations still live is refused, and the caller fails closed.
+struct LiveCapacityLedger {
+    ceiling: usize,
+    live: usize,
+}
+
+impl LiveCapacityLedger {
+    fn new(ceiling: usize) -> Self {
+        Self { ceiling, live: 0 }
+    }
+
+    /// Room left for the next allocation.
+    fn room(&self) -> usize {
+        self.ceiling.saturating_sub(self.live)
+    }
+
+    /// Charge `capacity` resident bytes. False (nothing charged) when they do
+    /// not fit beside what is already live.
+    fn try_charge(&mut self, capacity: usize) -> bool {
+        match self.live.checked_add(capacity) {
+            Some(live) if live <= self.ceiling => {
+                self.live = live;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Re-state the live total after an in-place phase (document redaction)
+    /// changed the size of an already-charged allocation. False when the new
+    /// total no longer fits.
+    fn restate(&mut self, live: usize) -> bool {
+        if live > self.ceiling {
+            return false;
+        }
+        self.live = live;
+        true
     }
 }
 
@@ -1227,30 +1288,26 @@ impl AiResponseGuard {
     /// bytes that will actually be delivered, not at text the redactor itself
     /// wrote. Placeholders are fixed strings rendered at construction, so this
     /// is a plain substring removal with no regex on the hot path.
-    fn strip_known_placeholders(&self, text: &str) -> String {
-        let mut result = text.to_string();
-        for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
-            if result.contains(pattern.placeholder.as_str()) {
-                result = result.replace(pattern.placeholder.as_str(), "");
-            }
-        }
-        result
-    }
-
-    /// Verify a whole-body text replacement using only the scratch room left
-    /// by its retained allocation. Sequential placeholder removal may keep two
-    /// scratch buffers live, so their capacities share that remaining room.
-    fn text_has_residual(&self, redacted: &[u8], scratch_ceiling: usize) -> Option<bool> {
+    /// Strip the redactor's own placeholder markers under a live-capacity bound:
+    /// sequential removal may keep two scratch buffers live, so their
+    /// capacities share `room` (the input itself is the caller's charge and
+    /// is not counted again). `None` when the cleaned text cannot be built
+    /// inside `room` — callers fail closed rather than materialize it.
+    fn strip_known_placeholders_bounded<'a>(
+        &self,
+        text: &'a [u8],
+        room: usize,
+    ) -> Option<std::borrow::Cow<'a, [u8]>> {
         use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
 
         let mut current: Option<Vec<u8>> = None;
         for pattern in self.pii_patterns.iter().chain(self.blocked_phrases.iter()) {
-            let input = std::str::from_utf8(current.as_deref().unwrap_or(redacted)).ok()?;
+            let input = std::str::from_utf8(current.as_deref().unwrap_or(text)).ok()?;
             if pattern.placeholder.is_empty() || !input.contains(pattern.placeholder.as_str()) {
                 continue;
             }
-            let room = scratch_ceiling.checked_sub(current.as_ref().map_or(0, Vec::capacity))?;
-            let mut sink = BoundedResponseBodySink::with_ceiling(room);
+            let sink_ceiling = room.checked_sub(current.as_ref().map_or(0, Vec::capacity))?;
+            let mut sink = BoundedResponseBodySink::with_ceiling(sink_ceiling);
             let mut last = 0;
             for (start, matched) in input.match_indices(pattern.placeholder.as_str()) {
                 if !sink.push(&input.as_bytes()[last..start]) {
@@ -1263,8 +1320,26 @@ impl AiResponseGuard {
             }
             current = Some(sink.finish()?);
         }
-        let cleaned = std::str::from_utf8(current.as_deref().unwrap_or(redacted)).ok()?;
+        Some(match current {
+            Some(cleaned) => std::borrow::Cow::Owned(cleaned),
+            None => std::borrow::Cow::Borrowed(text),
+        })
+    }
+
+    /// Whether `text` still matches detection after the redactor's own
+    /// placeholder markers are stripped under `room`. `None` when the
+    /// stripped text cannot be built inside `room`.
+    fn text_residual_bounded(&self, text: &[u8], room: usize) -> Option<bool> {
+        let cleaned = self.strip_known_placeholders_bounded(text, room)?;
+        let cleaned = std::str::from_utf8(&cleaned).ok()?;
         Some(self.detection_set.is_match(cleaned))
+    }
+
+    /// Verify a whole-body text replacement using only the scratch room left
+    /// by its retained allocation. Sequential placeholder removal may keep two
+    /// scratch buffers live, so their capacities share that remaining room.
+    fn text_has_residual(&self, redacted: &[u8], scratch_ceiling: usize) -> Option<bool> {
+        self.text_residual_bounded(redacted, scratch_ceiling)
     }
 
     /// `ScanMode::All` redact mode: after applying the same redaction the
@@ -1299,10 +1374,23 @@ impl AiResponseGuard {
         if self.detection_pattern_count == 0 {
             return false;
         }
+        // One live-capacity ledger for every verification copy (#6657): the
+        // cloned tree is charged BEFORE it is made (its serialized size is
+        // body_len until redaction growth is charged against it), and the
+        // strip scratch and the residual serialization must each fit the
+        // room the still-live clone leaves. Anything that does not fit is
+        // residual (fail closed), never materialised beside the clone.
+        let mut ledger = LiveCapacityLedger::new(ceiling);
+        if !ledger.try_charge(body_len) {
+            return true;
+        }
         let mut redacted = original.clone();
         let budget = RedactionBudget::for_response(body_len, ceiling);
         self.redact_all_strings_with_argument_shield(&mut redacted, &budget);
         if budget.is_exhausted() {
+            return true;
+        }
+        if !ledger.restate(body_len.saturating_add(budget.charged_growth())) {
             return true;
         }
         blank_top_level_structural_scalars(&mut redacted);
@@ -1314,24 +1402,27 @@ impl AiResponseGuard {
         collect_decoded_json_strings(&redacted, &mut texts);
         collect_decoded_argument_tokens(&redacted, &mut texts);
         for text in &texts {
-            let cleaned = self.strip_known_placeholders(text.as_ref());
-            if self.detection_set.is_match(&cleaned) {
-                return true;
+            match self.text_residual_bounded(text.as_ref().as_bytes(), ledger.room()) {
+                Some(true) => return true,
+                Some(false) => {}
+                None => return true,
             }
         }
-        // The raw/contextual pass serializes the candidate through the same
-        // window bound; a candidate that does not fit is not deliverable, so it
-        // is treated as residual (fail closed) rather than materialised.
+        drop(texts);
+        // The raw/contextual pass serializes the candidate beside the live
+        // clone; a candidate that does not fit the remaining room is not
+        // deliverable, so it is treated as residual (fail closed) rather
+        // than materialised.
         let Some(serialized) =
-            crate::proxy::response_buffer_budget::bounded_json_vec(&redacted, ceiling)
+            crate::proxy::response_buffer_budget::bounded_json_vec(&redacted, ledger.room())
         else {
             return true;
         };
-        let Ok(serialized) = String::from_utf8(serialized) else {
+        if !ledger.try_charge(serialized.capacity()) {
             return true;
-        };
-        let serialized = self.strip_known_placeholders(&serialized);
-        self.detection_set.is_match(&serialized)
+        }
+        self.text_residual_bounded(&serialized, ledger.room())
+            .unwrap_or(true)
     }
 
     /// `ScanMode::Content` redact mode: decide whether the structured redactor
@@ -1351,16 +1442,40 @@ impl AiResponseGuard {
         if self.detection_pattern_count == 0 {
             return false;
         }
+        // Same one-window live-capacity ledger as the all-fields pre-check
+        // (#6657): the clone is charged before it is made and every strip
+        // must fit the room it leaves.
+        let mut ledger = LiveCapacityLedger::new(ceiling);
+        if !ledger.try_charge(body_len) {
+            return true;
+        }
         let mut redacted = original.clone();
         let budget = RedactionBudget::for_response(body_len, ceiling);
         self.redact_response_json(&mut redacted, &budget);
         if budget.is_exhausted() {
             return true;
         }
+        if !ledger.restate(body_len.saturating_add(budget.charged_growth())) {
+            return true;
+        }
         let texts = self.extract_completion_texts(&redacted);
+        // Owned extraction joins are resident beside the clone; charge them
+        // before stripping so the scratch cannot stack on top unaccounted.
+        let owned_capacity: usize = texts
+            .iter()
+            .map(|text| match text {
+                Cow::Owned(owned) => owned.capacity(),
+                Cow::Borrowed(_) => 0,
+            })
+            .fold(0usize, usize::saturating_add);
+        if !ledger.try_charge(owned_capacity) {
+            return true;
+        }
         texts.iter().any(|text| {
-            self.detection_set
-                .is_match(&self.strip_known_placeholders(text.as_ref()))
+            !matches!(
+                self.text_residual_bounded(text.as_ref().as_bytes(), ledger.room()),
+                Some(false)
+            )
         })
     }
 
@@ -1410,7 +1525,7 @@ impl AiResponseGuard {
             // A refused rewrite delivers nothing redacted: fail closed.
             SseRewrite::Refused => return Some(true),
         };
-        let residual = self.sse_body_has_residual(redacted.as_deref().unwrap_or(body));
+        let residual = self.sse_body_has_residual(redacted.as_deref().unwrap_or(body), ceiling);
         drop(redacted);
         drop(window);
         Some(residual)
@@ -1422,7 +1537,10 @@ impl AiResponseGuard {
     /// both decoded and raw/contextual passes so an IP-shaped `id` does not
     /// cause a false residual, while keys, numbers outside the carve-out,
     /// non-`data:` fields, and cross-token patterns remain fail-closed.
-    fn sse_body_has_residual(&self, redacted: &[u8]) -> bool {
+    fn sse_body_has_residual(&self, redacted: &[u8], ceiling: usize) -> bool {
+        // Placeholder-stripping scratch shares the one window beside the
+        // candidate body itself (#6657); a strip that cannot fit is residual.
+        let scratch_room = ceiling.saturating_sub(redacted.len());
         let Ok(redacted_str) = std::str::from_utf8(redacted) else {
             // Redacted output is not valid UTF-8 — cannot re-scan safely, so
             // fail closed rather than risk forwarding undetectable residual.
@@ -1436,8 +1554,10 @@ impl AiResponseGuard {
         if self.scan_mode == ScanMode::Content {
             let (accumulated, _) = self.extract_sse_completion_texts_checked(&frames, &events);
             return accumulated.iter().any(|text| {
-                self.detection_set
-                    .is_match(&self.strip_known_placeholders(text))
+                !matches!(
+                    self.text_residual_bounded(text.as_bytes(), scratch_room),
+                    Some(false)
+                )
             });
         }
 
@@ -1456,15 +1576,19 @@ impl AiResponseGuard {
             collect_decoded_argument_tokens(frame, &mut texts);
         }
         for text in &texts {
-            let cleaned = self.strip_known_placeholders(text.as_ref());
-            if self.detection_set.is_match(&cleaned) {
+            if !matches!(
+                self.text_residual_bounded(text.as_ref().as_bytes(), scratch_room),
+                Some(false)
+            ) {
                 return true;
             }
         }
 
         for text in &accumulated {
-            let cleaned = self.strip_known_placeholders(text);
-            if self.detection_set.is_match(&cleaned) {
+            if !matches!(
+                self.text_residual_bounded(text.as_bytes(), scratch_room),
+                Some(false)
+            ) {
                 return true;
             }
         }
@@ -1476,8 +1600,13 @@ impl AiResponseGuard {
         let Some(sanitized) = mask_sse_top_level_structural_scalars(redacted_str) else {
             return true;
         };
-        let cleaned_raw = self.strip_known_placeholders(&sanitized);
-        self.detection_set.is_match(&cleaned_raw)
+        // The masked copy is resident beside the candidate; the final strip
+        // gets only what both leave in the window.
+        let final_room = scratch_room.saturating_sub(sanitized.capacity());
+        !matches!(
+            self.text_residual_bounded(sanitized.as_bytes(), final_room),
+            Some(false)
+        )
     }
 
     fn redact_string_value(&self, value: &mut Value, budget: &RedactionBudget) {
@@ -2602,10 +2731,17 @@ impl AiResponseGuard {
         // is refused WHILE it is being built (GHSA-pwcm-6rh8-f2gh).
         use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
         let mut rewritten = BoundedResponseBodySink::with_ceiling(ceiling);
+        // The decoded message tree is live beside the rewritten bytes built
+        // so far; charge it (in serialized units, its payload size) against
+        // the same window before decoding it (#6657).
+        let mut ledger = LiveCapacityLedger::new(ceiling);
         let mut changed = false;
         let redaction = RedactionBudget::for_response(body.len(), ceiling);
         for frame in &frames {
             let payload = frame.payload.as_ref();
+            if !ledger.restate(rewritten.len()) || !ledger.try_charge(payload.len()) {
+                return None;
+            }
             let mut message = DynamicMessage::decode(method.descriptor.clone(), payload).ok()?;
             let mut budget = GrpcWalkBudget::default();
             let mut redact = |text: &str| -> String { self.redact_text(text, &redaction) };
@@ -2626,6 +2762,12 @@ impl AiResponseGuard {
         }
         let rewritten = rewritten.finish()?;
 
+        // The re-verify scan re-parses the candidate beside the candidate
+        // itself; charge a second candidate-sized allocation before running
+        // it so the pair stays inside the one window (#6657).
+        if !ledger.restate(rewritten.len()) || !ledger.try_charge(rewritten.len()) {
+            return None;
+        }
         // Re-verify against the exact bytes the client would receive, using the
         // same selected-field surface and aggregate matching as inspection.
         let verify_scan =
@@ -4320,7 +4462,7 @@ impl Plugin for AiResponseGuard {
                     .ai_response_guard_pending_redactions
                     .contains_key(&self.instance_id)
             })
-            && !self.sse_body_has_residual(body)
+            && !self.sse_body_has_residual(body, ceiling)
         {
             // Structural-only SSE matches deliberately leave the exact event
             // bytes untouched. A clean residual scan discharges that promise
@@ -4667,7 +4809,7 @@ impl AiResponseGuard {
                         return None;
                     }
                 };
-                return (!self.sse_body_has_residual(&redacted)).then_some(redacted);
+                return (!self.sse_body_has_residual(&redacted, ceiling)).then_some(redacted);
             }
             if !is_json_content_type(ct) {
                 if self.scan_mode != ScanMode::All {
@@ -4732,7 +4874,14 @@ impl AiResponseGuard {
             return None;
         }
 
-        crate::proxy::response_buffer_budget::bounded_json_vec(&json, ceiling)
+        // The working tree is still live while its serialization is built, so
+        // the serializer gets only the room the tree (body + charged growth,
+        // in serialized units) leaves in the one window (#6657).
+        let tree_live = body.len().saturating_add(budget.charged_growth());
+        crate::proxy::response_buffer_budget::bounded_json_vec(
+            &json,
+            ceiling.saturating_sub(tree_live),
+        )
     }
 }
 
