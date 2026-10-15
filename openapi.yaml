@@ -29852,26 +29852,26 @@ components:
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[\u0009\u0020-\u007E]*$'
+              pattern: '^(?:[\t ]*[Nn][Oo][Ss][Nn][Ii][Ff][Ff][\t ]*)?$'
             - type: "null"
           default: nosniff
-          description: "X-Content-Type-Options. true = nosniff (default); a string sets a custom value; false/null disables."
+          description: "X-Content-Type-Options. true = nosniff (default); a string must be `nosniff` (ASCII case-insensitive, optional surrounding spaces/tabs); false/null/\"\" disables."
         frame_options:
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[\u0009\u0020-\u007E]*$'
+              pattern: '^(?:[\t ]*(?:[Dd][Ee][Nn][Yy]|[Ss][Aa][Mm][Ee][Oo][Rr][Ii][Gg][Ii][Nn])[\t ]*)?$'
             - type: "null"
           default: SAMEORIGIN
-          description: "X-Frame-Options. Default SAMEORIGIN; string overrides; false disables."
+          description: "X-Frame-Options. Default SAMEORIGIN; a string must be `DENY` or `SAMEORIGIN` (ASCII case-insensitive, optional surrounding spaces/tabs), because browsers ignore any other value; false/null/\"\" disables."
         referrer_policy:
           oneOf:
             - type: boolean
             - type: string
-              pattern: '^[\u0009\u0020-\u007E]*$'
+              pattern: '^(?:[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*(?:,[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*)*)?$'
             - type: "null"
           default: strict-origin-when-cross-origin
-          description: "Referrer-Policy. Default strict-origin-when-cross-origin; string overrides; false disables."
+          description: "Referrer-Policy. Default strict-origin-when-cross-origin; a string must be a comma-separated list of Referrer-Policy tokens (no-referrer, no-referrer-when-downgrade, origin, origin-when-cross-origin, same-origin, strict-origin, strict-origin-when-cross-origin, unsafe-url; ASCII case-insensitive); false/null/\"\" disables."
         hsts:
           description: "Strict-Transport-Security (opt-in). true = max-age=31536000; includeSubDomains; a string is used verbatim; false/null/\"\" disables; an object {max_age, include_subdomains, preload} builds the value. Object members accept JSON null as the documented default: max_age 31536000 (unsigned 64-bit integer), include_subdomains true, preload false."
           oneOf:

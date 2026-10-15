@@ -5368,9 +5368,9 @@ strip; use it when the intent is to drop the field rather than author one.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `content_type_options` | bool/string/null | `true` | Sets `X-Content-Type-Options`; `true` uses `nosniff`, a string customizes it, `false`/`null` disables it. |
-| `frame_options` | bool/string/null | `true` | Sets `X-Frame-Options`; `true` uses `SAMEORIGIN`, a string customizes it, `false`/`null` disables it. |
-| `referrer_policy` | bool/string/null | `true` | Sets `Referrer-Policy`; `true` uses `strict-origin-when-cross-origin`, a string customizes it, `false`/`null` disables it. |
+| `content_type_options` | bool/string/null | `true` | Sets `X-Content-Type-Options`; `true` uses `nosniff`, `false`/`null`/`""` disables it. A string must be `nosniff`. |
+| `frame_options` | bool/string/null | `true` | Sets `X-Frame-Options`; `true` uses `SAMEORIGIN`, `false`/`null`/`""` disables it. A string must be `DENY` or `SAMEORIGIN`. |
+| `referrer_policy` | bool/string/null | `true` | Sets `Referrer-Policy`; `true` uses `strict-origin-when-cross-origin`, `false`/`null`/`""` disables it. A string must be one Referrer-Policy token or a comma-separated list of them: `no-referrer`, `no-referrer-when-downgrade`, `origin`, `origin-when-cross-origin`, `same-origin`, `strict-origin`, `strict-origin-when-cross-origin`, `unsafe-url`. |
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, `false`/`null`/`""` disables, or an object may set `max_age` (non-negative unsigned 64-bit integer, default `31536000`; `null` selects the default), `include_subdomains` (bool, default `true`; `null` selects the default), and `preload` (bool, default `false`; `null` selects the default). |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
@@ -5379,6 +5379,8 @@ strip; use it when the intent is to drop the field rather than author one.
 | `override_existing` | bool or null | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. `null` selects `true`. |
 
 `config` must be an object. Disabling the three built-in headers (`false`/`null`/`""`) while leaving HSTS/CSP/Permissions-Policy unset, `set` empty, and `remove` `[]` or `null` is rejected — the plugin would set and remove nothing.
+
+Custom `content_type_options`, `frame_options` and `referrer_policy` strings are checked against the tokens browsers recognize (ASCII case-insensitive, surrounding spaces and tabs allowed). A browser ignores any other value, so a typo such as `SAMEORGIN` would otherwise drop the protection without any error.
 
 ```yaml
 config:
