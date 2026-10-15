@@ -1491,7 +1491,7 @@ jobs:
           # on 2026-10-04. Preserve the existing tags/majors and client versions.
           postgres_image='postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea'
           mysql_image='mysql:8@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242'
-          mongo_image='mongo:7@sha256:1f995ad6fdb93244a1addab1b58f934a0bc2f5643c38e02f5e9d7f0c7d227a7b'
+          mongo_image='mongo:9@sha256:f90507905ce6e52e4a63d0ff8964fc254fa4d37ccbe56c56f4bc0186eb02edea'
           deadline=$((SECONDS + 480))
           fixture_phase='initializing credentials'
           cleanup_on_failure() {
@@ -2443,12 +2443,10 @@ jobs:
         # - TLS 27018: verify-full + require modes (issue #2399)
         # - mTLS 27019: client certificate authentication (issue #2399)
         # Neither plaintext topology can substitute for the TLS fixtures. The
-        # others stay on MongoDB 7.0: the official mongo:9 image (9.0.2) exits
-        # at startup on the ubuntu-26.04 runner kernel, which reports 7.0.0 and
-        # so falls inside the server's 6.19-7.0.13 tcmalloc/rseq startup gate
-        # (SERVER-125742; 8.0.21+ and 8.3 have the same gate). Move them to
-        # mongo:9 once an official image starts there (SERVER-136272, fixed in
-        # 9.0.4, targets the Ubuntu 26.04 kernel detection).
+        # others run MongoDB 9.0 (the `mongo:9` tag now resolves to 9.0.4+,
+        # whose SERVER-136272 fix starts on the ubuntu-26.04 runner kernel;
+        # 9.0.2 exited inside the 6.19-7.0.13 tcmalloc/rseq startup gate,
+        # SERVER-125742).
         run: |
           set -euo pipefail
 
@@ -2459,7 +2457,7 @@ jobs:
           # advertised. Behind a `-p` mapping it would advertise the container
           # port and the driver would dial the wrong process.
           docker run -d --name ferrum-ci-mongo-rs --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            mongo:9 --replSet rs0 --port 27020 --bind_ip_all \
             --setParameter enableTestCommands=1
           docker run -d --name ferrum-ci-postgres \
             -e POSTGRES_DB=ferrum \
@@ -2676,7 +2674,7 @@ jobs:
             --health-timeout=5s \
             --health-retries=60 \
             --entrypoint bash \
-            mongo:7 \
+            mongo:9 \
             -c '
               set -e
               mkdir -p /certs
@@ -2705,7 +2703,7 @@ jobs:
             --health-timeout=5s \
             --health-retries=60 \
             --entrypoint bash \
-            mongo:7 \
+            mongo:9 \
             -c '
               set -e
               mkdir -p /certs
