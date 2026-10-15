@@ -64,6 +64,7 @@ use tokio::time::Instant;
 use url::{Host, Url};
 
 use crate::dns::DnsCacheResolver;
+use crate::plugins::utils::http_client::{DedicatedClientAlpn, DedicatedPluginClient};
 use crate::retry::classify_reqwest_error;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
@@ -236,7 +237,7 @@ pub struct SpecExpose {
     /// Bounds both the in-flight fetch and callers waiting for its completion.
     /// Excess anonymous requests fail quickly instead of growing a mutex queue.
     fetch_admission: Arc<Semaphore>,
-    http_client: reqwest::Client,
+    http_client: DedicatedPluginClient,
 }
 
 impl SpecExpose {
@@ -376,26 +377,35 @@ impl SpecExpose {
         // We use a separate client so we can honour the per-plugin tls_no_verify
         // setting independently of the shared plugin HTTP client, but we still
         // wire the gateway's shared DNS cache for consistent resolution + TTL.
-        let mut builder = reqwest::Client::builder()
-            // Ignore ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY process
-            // state: a selected proxy would resolve and dial the spec host
-            // itself, so the ultimate destination would never reach the
-            // `DnsCacheResolver` egress screen wired below.
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            // Do not follow redirects: a 3xx from an allowed spec host could
-            // otherwise bounce the fetch to an egress-policy-denied IP (matches
-            // the shared PluginHttpClient redirect policy). The literal-IP first
-            // hop is screened above; this closes the redirect bypass.
-            .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(tls_no_verify);
-
-        if let Some(dns_cache) = plugin_http_client.dns_cache() {
-            builder = builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())));
-        }
+        let base_builder = {
+            let dns_cache = plugin_http_client.dns_cache().cloned();
+            move || {
+                let builder = reqwest::Client::builder()
+                    // Ignore ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY
+                    // process state: a selected proxy would resolve and dial the
+                    // spec host itself, so the ultimate destination would never
+                    // reach the `DnsCacheResolver` egress screen wired below.
+                    .no_proxy()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(30))
+                    // Do not follow redirects: a 3xx from an allowed spec host
+                    // could otherwise bounce the fetch to an egress-policy-denied
+                    // IP (matches the shared PluginHttpClient redirect policy).
+                    // The literal-IP first hop is screened above; this closes the
+                    // redirect bypass.
+                    .redirect(reqwest::redirect::Policy::none())
+                    .danger_accept_invalid_certs(tls_no_verify);
+                match &dns_cache {
+                    Some(dns_cache) => {
+                        builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())))
+                    }
+                    None => builder,
+                }
+            }
+        };
 
         // Load custom CA bundle when not skipping verification.
+        let mut ca_bundle: Option<(Vec<u8>, Vec<reqwest::Certificate>)> = None;
         if !tls_no_verify && let Some(ca_path) = plugin_http_client.tls_ca_bundle_path() {
             let source = CertSource::parse(ca_path, MaterialKind::CaBundle);
             let source_id = source.redacted_source_id();
@@ -421,14 +431,35 @@ impl SpecExpose {
                     ca_material.display_source_id
                 ));
             }
-            // reqwest 0.13: `tls_certs_only` replaces the trust store entirely
-            // (CA exclusivity). All load/parse failures above abort construction.
-            builder = builder.tls_certs_only(certificates);
+            ca_bundle = Some((ca_material.bytes.expose_secret().to_vec(), certificates));
         }
 
-        let http_client = builder
-            .build()
-            .map_err(|_| "spec_expose: failed to build HTTP client".to_string())?;
+        // With gateway CRLs enforced (and verification on), the client trusts
+        // the same CA bundle (or the bundled webpki roots) through a verifier
+        // that applies the live CRL generation (issue #6651). Otherwise
+        // reqwest 0.13 `tls_certs_only` replaces the trust store entirely (CA
+        // exclusivity). All load/parse failures above abort construction.
+        let custom_ca_pem = ca_bundle.as_ref().map(|(pem, _)| pem.clone());
+        let certificates = ca_bundle.map(|(_, certificates)| certificates);
+        let http_client = plugin_http_client
+            .dedicated_client(
+                !tls_no_verify,
+                custom_ca_pem.as_deref(),
+                None,
+                DedicatedClientAlpn::Negotiated,
+                move |crl_tls| {
+                    let builder = base_builder();
+                    let builder = match (crl_tls, &certificates) {
+                        (Some(tls), _) => builder.use_preconfigured_tls(tls),
+                        (None, Some(certificates)) => builder.tls_certs_only(certificates.clone()),
+                        (None, None) => builder,
+                    };
+                    builder
+                        .build()
+                        .map_err(|_| "spec_expose: failed to build HTTP client".to_string())
+                },
+            )
+            .map_err(|error| format!("spec_expose: {error}"))?;
 
         Ok(Self {
             spec_url,
@@ -555,20 +586,24 @@ impl SpecExpose {
     /// Fetch the spec from the upstream. The caller publishes either the fresh
     /// success or a sanitized negative-cache completion.
     async fn fetch_spec(&self) -> Result<CachedSpec, FetchFailure> {
-        let response = self
-            .http_client
-            .get(&self.spec_url)
-            .send()
-            .await
-            .map_err(|e| {
-                let error_class = classify_reqwest_error(&e);
-                tracing::warn!(
-                    spec_origin = %self.spec_origin,
-                    error_class = %error_class,
-                    "spec_expose: failed to fetch spec document"
-                );
-                fetch_failure(502, "Failed to fetch API specification from upstream")
-            })?;
+        // A failed CRL-generation rebuild leaves no usable client: fail the
+        // fetch closed instead of reusing the previous generation's pool.
+        let client = self.http_client.current().map_err(|_| {
+            tracing::warn!(
+                spec_origin = %self.spec_origin,
+                "spec_expose: plugin HTTP client unavailable for the current CRL generation"
+            );
+            fetch_failure(502, "Failed to fetch API specification from upstream")
+        })?;
+        let response = client.get(&self.spec_url).send().await.map_err(|e| {
+            let error_class = classify_reqwest_error(&e);
+            tracing::warn!(
+                spec_origin = %self.spec_origin,
+                error_class = %error_class,
+                "spec_expose: failed to fetch spec document"
+            );
+            fetch_failure(502, "Failed to fetch API specification from upstream")
+        })?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();

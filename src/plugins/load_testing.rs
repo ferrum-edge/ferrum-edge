@@ -77,6 +77,7 @@ use url::Url;
 use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
+use crate::plugins::utils::http_client::{DedicatedClientAlpn, DedicatedPluginClient};
 use crate::proxy::headers::{SecondaryRequestHostPolicy, filter_secondary_request_headers};
 use crate::retry::classify_reqwest_error;
 use crate::util::unknown_keys::reject_unknown_keys;
@@ -386,7 +387,7 @@ enum BodyConsumeOutcome {
 
 pub struct LoadTesting {
     http_client: PluginHttpClient,
-    load_test_client: reqwest::Client,
+    load_test_client: DedicatedPluginClient,
     key: String,
     concurrent_clients: u32,
     duration_seconds: u64,
@@ -577,32 +578,47 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
         let scheme = if gateway_tls { "https" } else { "http" };
         let gateway_base_url = format!("{}://127.0.0.1:{}", scheme, gateway_port);
 
-        let mut load_test_builder = reqwest::Client::builder()
-            // Ignore ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY process
-            // state so self-directed load traffic cannot be relayed off-box by
-            // inherited proxy environment (matches the shared PluginHttpClient
-            // builders).
-            .no_proxy()
-            // Synthetic replays dial `127.0.0.1:{gateway_port}` while carrying
-            // the triggering request's `Host` so host-based routing selects the
-            // same virtual host. RFC 9113 §8.3.1 / RFC 9114 §4.3.1 forbid
-            // `Host` and `:authority` from disagreeing, and Ferrum's own
-            // ingress check correctly answers 400 before routing when they do —
-            // so an ALPN-negotiated `h2` loopback (the ordinary `gateway_tls`
-            // case) rejects every replay. HTTP/1.1 makes the preserved `Host`
-            // the request authority, keeping the intended virtual host without
-            // weakening inbound validation (issue #5155).
-            .http1_only()
-            .danger_accept_invalid_certs(gateway_tls_no_verify)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_millis(request_timeout_ms));
-        if let Some(dns_cache) = http_client.dns_cache() {
-            load_test_builder =
-                load_test_builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache.clone())));
-        }
-        let load_test_client = load_test_builder
-            .build()
-            .map_err(|_| "load_testing: failed to build HTTP client".to_string())?;
+        let dns_cache = http_client.dns_cache().cloned();
+        let build_load_test_client = move |crl_tls: Option<rustls::ClientConfig>| {
+            let mut load_test_builder = reqwest::Client::builder()
+                // Ignore ambient HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY process
+                // state so self-directed load traffic cannot be relayed off-box by
+                // inherited proxy environment (matches the shared PluginHttpClient
+                // builders).
+                .no_proxy()
+                // Synthetic replays dial `127.0.0.1:{gateway_port}` while carrying
+                // the triggering request's `Host` so host-based routing selects the
+                // same virtual host. RFC 9113 §8.3.1 / RFC 9114 §4.3.1 forbid
+                // `Host` and `:authority` from disagreeing, and Ferrum's own
+                // ingress check correctly answers 400 before routing when they do —
+                // so an ALPN-negotiated `h2` loopback (the ordinary `gateway_tls`
+                // case) rejects every replay. HTTP/1.1 makes the preserved `Host`
+                // the request authority, keeping the intended virtual host without
+                // weakening inbound validation (issue #5155).
+                .http1_only()
+                .danger_accept_invalid_certs(gateway_tls_no_verify)
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_millis(request_timeout_ms));
+            if let Some(dns_cache) = dns_cache.clone() {
+                load_test_builder =
+                    load_test_builder.dns_resolver(Arc::new(DnsCacheResolver::new(dns_cache)));
+            }
+            // Verified HTTPS loopback traffic applies the gateway CRLs when
+            // they are enforced (issue #6651).
+            if let Some(tls) = crl_tls {
+                load_test_builder = load_test_builder.use_preconfigured_tls(tls);
+            }
+            load_test_builder
+                .build()
+                .map_err(|_| "load_testing: failed to build HTTP client".to_string())
+        };
+        let load_test_client = http_client.dedicated_client(
+            gateway_tls && !gateway_tls_no_verify,
+            None,
+            None,
+            DedicatedClientAlpn::Http1Only,
+            build_load_test_client,
+        )?;
 
         let gateway_addresses = parse_gateway_addresses(config, &http_client, &gateway_base_url)?;
         let compatibility = LoadTestingCompatibility {
@@ -1060,7 +1076,15 @@ impl Plugin for LoadTesting {
         let max_response_body_bytes = self.max_response_body_bytes;
         let request_timeout_ms = self.request_timeout_ms;
         let gateway_base_url = self.gateway_base_url.clone();
-        let load_test_client = self.load_test_client.clone();
+        // One CRL generation's client for this run. A failed CRL-generation
+        // rebuild leaves no usable client: refuse the run instead of reusing
+        // the previous generation's pool.
+        let Ok(load_test_client) = self.load_test_client.current() else {
+            tracing::warn!(
+                "load_testing: plugin HTTP client unavailable for the current CRL generation; ignoring trigger"
+            );
+            return self.refuse_for_resource_budget(is_fanout);
+        };
         let state = Arc::clone(&self.state);
         let gateway_addresses = self.gateway_addresses.clone();
         let http_client = self.http_client.clone();
@@ -1096,7 +1120,7 @@ impl Plugin for LoadTesting {
                         return;
                     };
                     let Ok(mut req) =
-                        build_request(http, &fanout_method, &fanout_url, &fanout_hdrs, proxy_hops)
+                        build_request(&http, &fanout_method, &fanout_url, &fanout_hdrs, proxy_hops)
                     else {
                         tracing::warn!(
                             remote = %remote_label,
