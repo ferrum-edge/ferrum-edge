@@ -2386,6 +2386,14 @@ async fn capture_mirror_request_headers(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
 ) -> HashMap<String, String> {
+    capture_mirror_request_headers_with_config(ctx, headers, json!({})).await
+}
+
+async fn capture_mirror_request_headers_with_config(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    extra: serde_json::Value,
+) -> HashMap<String, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -2427,16 +2435,18 @@ async fn capture_mirror_request_headers(
         }
     });
 
-    let plugin = RequestMirror::new(
-        &json!({
-            "mirror_host": addr.ip().to_string(),
-            "mirror_port": addr.port(),
-            "mirror_request_body": false,
-            "percentage": 100.0
-        }),
-        PluginHttpClient::default(),
-    )
-    .unwrap();
+    let mut config = json!({
+        "mirror_host": addr.ip().to_string(),
+        "mirror_port": addr.port(),
+        "mirror_request_body": false,
+        "percentage": 100.0
+    });
+    if let (Some(dest), Some(extra_obj)) = (config.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra_obj {
+            dest.insert(key.clone(), value.clone());
+        }
+    }
+    let plugin = RequestMirror::new(&config, PluginHttpClient::default()).unwrap();
     let _ = plugin.finalized_egress(ctx, headers).await;
     let _ = ctx.collect_mirror_result().await;
     rx.await.expect("mirror sink should capture headers")
@@ -6786,8 +6796,11 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
     );
 
     let mut allowed = make_ctx_with_proxy();
+    // Value digests are credential provenance too, so every value here is
+    // distinct: a benign pair reusing a credential's exact value is treated
+    // as that credential under a new name (covered separately below).
     allowed.set_raw_query_string(
-        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1"
+        "%50HPSESSID=live&%63ode=cb&clientSid=s&pin=9876&x-vercel-protection-bypass=v&user_code=u&x=1"
             .to_string(),
     );
     let allowed_line = capture_mirror_request_line_with_config(
@@ -6807,9 +6820,22 @@ async fn credential_class_query_name_forwards_only_when_allowlisted() {
     .await;
     assert!(
         allowed_line.contains(
-            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=1&x-vercel-protection-bypass=v&user_code=u&x=1 "
+            "?%50HPSESSID=live&%63ode=cb&clientSid=s&pin=9876&x-vercel-protection-bypass=v&user_code=u&x=1 "
         ),
         "exact allowlist must forward the decoded name with its raw encoding: {allowed_line}"
+    );
+}
+
+/// A benign-named query pair carrying a presented credential's exact value
+/// is treated as that credential under a new name and withheld by default.
+#[tokio::test]
+async fn query_pair_reusing_a_credential_value_is_withheld_from_the_mirror() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("pin=9876&tracking=9876&x=1".to_string());
+    let default_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        default_line.contains("?x=1 ") && !default_line.contains("9876"),
+        "default mirror must drop both the credential and its renamed copy: {default_line}"
     );
 }
 
@@ -6962,5 +6988,297 @@ async fn route_credential_locations_are_withheld_from_the_mirror() {
     assert!(
         escaped_line.contains("?x=1 ") && !escaped_line.contains("live-api-key"),
         "{escaped_line}"
+    );
+}
+
+/// Builds a request whose route credentials (`x-proof` header registry,
+/// `Authorization`, `proof` query location) were then renamed by
+/// `request_transformer`, returning the context and outbound headers.
+async fn renamed_credential_request() -> (RequestContext, HashMap<String, String>) {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+    use ferrum_edge::plugins::utils::token_extract::{
+        TokenLocation, mark_present_query_credential_locations,
+    };
+
+    let transformer = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-proof", "new_key": "x-debug"},
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-copy"},
+            {"operation": "rename", "target": "query", "key": "proof", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("request_transformer config")
+    .expect("request_transformer plugin");
+
+    let mut ctx = make_ctx_with_proxy();
+    set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+    ctx.headers
+        .insert("x-proof".to_string(), "live-api-key".to_string());
+    ctx.headers
+        .insert("authorization".to_string(), "Bearer live-token".to_string());
+    ctx.set_raw_query_string("proof=live-query-key&x=1".to_string());
+    ctx.query_params
+        .insert("proof".to_string(), "live-query-key".to_string());
+    ctx.query_params.insert("x".to_string(), "1".to_string());
+    mark_present_query_credential_locations(
+        &mut ctx,
+        &[TokenLocation::QueryParam("proof".to_string())],
+    );
+
+    let mut headers = ctx.headers.clone();
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    plugin_utils::assert_continue(transformer.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("x-debug").map(String::as_str),
+        Some("live-api-key"),
+        "the primary keeps the renamed credential"
+    );
+    (ctx, headers)
+}
+
+/// A credential renamed by `request_transformer` after authentication keeps
+/// its provenance: the mirror recognises the presented value under the new
+/// header or query name.
+#[tokio::test]
+async fn renamed_credentials_are_withheld_from_the_mirror() {
+    let (mut ctx, _) = renamed_credential_request().await;
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !line.contains("live-query-key") && !line.contains("tracking="),
+        "renamed query credential leaked: {line}"
+    );
+    assert!(line.contains("x=1"), "benign pair kept: {line}");
+
+    let (mut ctx, mut headers) = renamed_credential_request().await;
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in ["x-debug", "x-copy", "x-proof", "authorization"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert!(
+        !observed.values().any(|value| value.contains("live-")),
+        "credential value leaked: {observed:?}"
+    );
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}
+
+async fn unregistered_and_repeated_credential_request() -> (RequestContext, HashMap<String, String>)
+{
+    use ferrum_edge::plugins::utils::token_extract::{
+        TokenLocation, mark_present_query_credential_locations,
+    };
+
+    let transformer = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-csrf-token", "new_key": "x-debug"},
+            {"operation": "rename", "target": "header", "key": "cookie2", "new_key": "x-trace-a"},
+            {"operation": "rename", "target": "query", "key": "proof", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("request_transformer config")
+    .expect("request_transformer plugin");
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.headers
+        .insert("x-csrf-token".to_string(), "live-csrf".to_string());
+    ctx.headers
+        .insert("cookie2".to_string(), "live-cookie".to_string());
+    ctx.set_raw_query_string("proof=keyA&proof=key%42&x=1".to_string());
+    ctx.query_params
+        .insert("proof".to_string(), "keyB".to_string());
+    ctx.query_params.insert("x".to_string(), "1".to_string());
+    mark_present_query_credential_locations(
+        &mut ctx,
+        &[TokenLocation::QueryParam("proof".to_string())],
+    );
+    let mut headers = ctx.headers.clone();
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    plugin_utils::assert_continue(transformer.before_proxy(&mut ctx, &mut headers).await);
+    (ctx, headers)
+}
+
+/// Every occurrence of a repeated credential query name keeps its provenance,
+/// and sensitive headers without a route registration (`x-csrf-token`,
+/// `cookie2`) keep theirs through a rename too.
+#[tokio::test]
+async fn renamed_repeated_and_unregistered_credentials_are_withheld() {
+    let (mut ctx, _) = unregistered_and_repeated_credential_request().await;
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !line.contains("keyA") && !line.contains("key%42") && !line.contains("tracking="),
+        "a repeated credential occurrence leaked: {line}"
+    );
+    assert!(line.contains("x=1"), "{line}");
+
+    let (mut ctx, mut headers) = unregistered_and_repeated_credential_request().await;
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in ["x-debug", "x-trace-a", "x-csrf-token", "cookie2"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}
+
+/// A value a plugin installs under a registered credential header (as
+/// `mcp_gateway` does with the mediated upstream session) keeps its
+/// provenance when a later plugin copies or renames it.
+#[tokio::test]
+async fn plugin_installed_credential_values_keep_provenance() {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+
+    let mut ctx = make_ctx_with_proxy();
+    set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+    let mut headers = HashMap::new();
+    headers.insert("x-proof".to_string(), "upstream-session-u".to_string());
+    headers.insert("x-debug".to_string(), "upstream-session-u".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(!observed.contains_key("x-proof"), "{observed:?}");
+    assert!(!observed.contains_key("x-debug"), "{observed:?}");
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}
+
+/// Credentials introduced or renamed by `request_transformer` keep
+/// provenance by name: an operator-added `x-api-key` / `api_key` renamed in
+/// the same instance, and a route credential renamed twice across chained
+/// instances, are withheld under their final names, and a value appended to a
+/// renamed credential still carries it.
+#[tokio::test]
+async fn transformer_introduced_and_chained_renames_keep_provenance() {
+    use ferrum_edge::_test_support::set_replay_credential_headers_for_test;
+
+    let first = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-api-key", "value": "backend-secret"},
+            {"operation": "rename", "target": "header", "key": "x-api-key", "new_key": "x-debug"},
+            {"operation": "rename", "target": "header", "key": "x-proof", "new_key": "x-hop-a"},
+            {"operation": "add", "target": "query", "key": "api_key", "value": "backend-query-secret"},
+            {"operation": "rename", "target": "query", "key": "api_key", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("first transformer config")
+    .expect("first transformer plugin");
+    let second = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-hop-a", "new_key": "x-hop-b"}
+        ]}),
+    )
+    .expect("second transformer config")
+    .expect("second transformer plugin");
+
+    let build = |first: Arc<dyn Plugin>, second: Arc<dyn Plugin>| async move {
+        let mut ctx = make_ctx_with_proxy();
+        set_replay_credential_headers_for_test(&mut ctx, vec!["x-proof".to_string()]);
+        ctx.headers
+            .insert("x-proof".to_string(), "live-api-key".to_string());
+        ctx.set_raw_query_string("x=1".to_string());
+        ctx.query_params.insert("x".to_string(), "1".to_string());
+        let mut headers = ctx.headers.clone();
+        headers.insert("x-custom".to_string(), "keep-me".to_string());
+        plugin_utils::assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("x-debug").map(String::as_str),
+            Some("backend-secret"),
+            "the primary keeps the renamed operator credential"
+        );
+        // A later route-header `add` appends to the renamed credential.
+        headers.insert("x-hop-b".to_string(), "live-api-key,marker".to_string());
+        (ctx, headers)
+    };
+
+    let (mut ctx, _) = build(first.clone(), second.clone()).await;
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !line.contains("backend-query-secret") && !line.contains("tracking="),
+        "renamed operator query credential leaked: {line}"
+    );
+    assert!(line.contains("x=1"), "{line}");
+
+    let (mut ctx, mut headers) = build(first, second).await;
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for name in ["x-debug", "x-hop-a", "x-hop-b", "x-proof", "x-api-key"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+}
+
+/// Operator `sensitive_*_patterns` decide rename provenance too: a credential
+/// that only the mirror's pattern recognises, introduced or updated by a
+/// transformer and renamed across chained instances, is still withheld.
+#[tokio::test]
+async fn operator_pattern_credentials_keep_provenance_through_renames() {
+    let first = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "add", "target": "header", "key": "x-proof", "value": "backend-secret"},
+            {"operation": "update", "target": "header", "key": "x-proof", "value": "backend-secret-2"},
+            {"operation": "rename", "target": "header", "key": "x-proof", "new_key": "x-hop-a"},
+            {"operation": "add", "target": "query", "key": "proof", "value": "backend-query-secret"},
+            {"operation": "rename", "target": "query", "key": "proof", "new_key": "hop_a"}
+        ]}),
+    )
+    .expect("first transformer config")
+    .expect("first transformer plugin");
+    let second = create_plugin(
+        "request_transformer",
+        &json!({"rules": [
+            {"operation": "rename", "target": "header", "key": "x-hop-a", "new_key": "x-debug"},
+            {"operation": "rename", "target": "query", "key": "hop_a", "new_key": "tracking"}
+        ]}),
+    )
+    .expect("second transformer config")
+    .expect("second transformer plugin");
+    let patterns = json!({
+        "sensitive_header_patterns": ["proof"],
+        "sensitive_query_patterns": ["proof"]
+    });
+
+    let build = |first: Arc<dyn Plugin>, second: Arc<dyn Plugin>| async move {
+        let mut ctx = make_ctx_with_proxy();
+        ctx.set_raw_query_string("x=1".to_string());
+        ctx.query_params.insert("x".to_string(), "1".to_string());
+        let mut headers = HashMap::new();
+        headers.insert("x-custom".to_string(), "keep-me".to_string());
+        plugin_utils::assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+        plugin_utils::assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("x-debug").map(String::as_str),
+            Some("backend-secret-2")
+        );
+        (ctx, headers)
+    };
+
+    let (mut ctx, _) = build(first.clone(), second.clone()).await;
+    let line = capture_mirror_request_line_with_config(&mut ctx, patterns.clone()).await;
+    assert!(
+        !line.contains("backend-query-secret") && !line.contains("tracking="),
+        "{line}"
+    );
+    assert!(line.contains("x=1"), "{line}");
+
+    let (mut ctx, mut headers) = build(first, second).await;
+    let observed =
+        capture_mirror_request_headers_with_config(&mut ctx, &mut headers, patterns).await;
+    for name in ["x-debug", "x-hop-a", "x-proof"] {
+        assert!(!observed.contains_key(name), "{name} leaked: {observed:?}");
+    }
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
     );
 }
