@@ -683,8 +683,9 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # Retirement plan: when a compatible SQLx release treats a configured root CA
 # as exclusive and handles both rustls hostname-error variants while keeping
 # chain, validity, and signature verification, and preserves native REAL/DOUBLE
-# typed-NULL parameter types, remove the `[patch.crates-io]` line, drop
-# `vendor/sqlx-core-0.8.6-ferrum-patched/`, and update both lockfiles and the drift
+# typed-NULL parameter types, remove the `[patch.crates-io]` line (here, in
+# `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`), update the three
+# lockfiles, then drop `vendor/sqlx-core-0.8.6-ferrum-patched/` and update the drift
 # manifest. See `docs/upstream-sqlx-patches/` for both retirement plans.
 #
 # We also carry a vendored copy of hyper-util 0.1.21 whose legacy client stops
@@ -700,9 +701,9 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when a hyper-util release no longer holds the only HTTP/1
 # sender while waiting (or hyper's dispatcher no longer strands a racing send),
-# remove the `[patch.crates-io]` line, drop
-# `vendor/hyper-util-0.1.21-ferrum-patched/`, and update both lockfiles and the
-# drift manifest. See
+# remove the `[patch.crates-io]` line (here, in `fuzz/Cargo.toml` and in
+# `tests/performance/mesh/Cargo.toml`), update the three lockfiles, then drop
+# `vendor/hyper-util-0.1.21-ferrum-patched/` and update the drift manifest. See
 # `docs/upstream-hyper-util-patches/001-release-h1-sender-on-dispatch-close/README.md`.
 #
 # We also carry a vendored copy of hyper 1.10.0 that adds
@@ -714,9 +715,12 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # `CONNECT_ERROR` as the signal for a tunnel whose connection failed.
 #
 # Retirement plan: when a hyper release can reset an upgraded HTTP/2 stream
-# with a chosen error code, remove the `hyper` line below, drop
-# `vendor/hyper-1.10.0-ferrum-patched/`, move the HBONE relays to the upstream
-# API, and update the three lockfiles and the drift manifest. See
+# with a chosen error code, move the HBONE relays to the upstream API and drop
+# only patch 001's hunks. The vendored copy also carries hyper patches 002-005
+# (`docs/upstream-hyper-patches/series`), so remove the `hyper` line below (and
+# its fuzz and mesh mirrors), update the three lockfiles, and drop
+# `vendor/hyper-1.10.0-ferrum-patched/` only once every one of them has an
+# adopted upstream replacement. See
 # `docs/upstream-hyper-patches/001-upgraded-h2-connect-error-reset/README.md`.
 #
 # We also carry a vendored copy of h2 0.4.20 whose frame writer copies DATA

@@ -162,7 +162,17 @@ CONNECTs through the gateway with a raw h2 client:
 
 Retire when a hyper release can reset an upgraded HTTP/2 stream with a chosen
 error code (the API in hyperium/hyper#4210, whose text is in
-[`pr-description.md`](pr-description.md), or an equivalent). Then:
+[`pr-description.md`](pr-description.md), or an equivalent). The vendored
+hyper copy also carries patches 002–005 (see [`../series`](../series)), and
+production code uses Ferrum-only APIs from them (for example patch 004's
+`hyper::ext::Http2BodyWriteTimeout`). So:
+
+- **While any of patches 002–005 is still needed:** move
+  `end_hbone_connect_stream` in `src/proxy/hbone_proxy.rs` to the upstream API,
+  drop only this patch's hunks from `vendor/hyper-1.10.0-ferrum-patched/`, remove
+  it from `series`, and regenerate the remaining patch stack and the drift
+  manifest. Keep the `[patch.crates-io]` entries and the vendor copy.
+- **Only when every hyper patch has an adopted upstream replacement:**
 
 1. Move `end_hbone_connect_stream` in `src/proxy/hbone_proxy.rs` to the
    upstream API.

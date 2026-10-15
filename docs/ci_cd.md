@@ -3136,12 +3136,16 @@ LINUX_GNU_PROTOC_SHA256='<from release.yml>' \
 # unpinned `cargo install cross` or an inherited environment. It produces both
 # target/aarch64-unknown-linux-gnu/release/ferrum-edge and .../ferrum-cni.
 
-# On a macOS host (install protoc first):
-cargo build --features cloud-secrets --release --target x86_64-apple-darwin
-cargo build --features cloud-secrets --release --target aarch64-apple-darwin
+# On a macOS host (install protoc first). Set the same deployment targets as
+# release.yml: without them cc-rs/cmake-built C code targets the host SDK
+# version, not the advertised macOS floor.
+MACOSX_DEPLOYMENT_TARGET=10.12 \
+  cargo build --locked --features cloud-secrets --release --target x86_64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=11.0 \
+  cargo build --locked --features cloud-secrets --release --target aarch64-apple-darwin
 
 # On a Windows host (protoc and NASM in PATH):
-cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
+cargo build --locked --features cloud-secrets --release --target x86_64-pc-windows-msvc
 
 # Stage all seven platform-suffixed assets, matching CI asset names. Run these
 # POSIX staging commands from one checkout after copying in the built
