@@ -2694,7 +2694,9 @@ async fn test_protobuf_frame_rejects_undefined_compressed_flag() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
-    let mut frame = grpc_frame(&encode_hello_request("Bob", 25));
+    // A valid gzip payload passes with flag 1 and is refused with flag 2.
+    let mut frame = compressed_grpc_frame(&gzip_member(&encode_hello_request("Bob", 25)));
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
     frame[0] = 2;
     assert_reject(
         plugin.on_final_request_body(&headers, &frame).await,
