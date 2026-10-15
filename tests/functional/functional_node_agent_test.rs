@@ -52,7 +52,6 @@ fn prepend_noop_shell(command: &mut Command, temp_dir: &Path) {
 async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cgroup_root = tmp.path().join("missing-cgroup-root");
-    let bpf_root = tmp.path().join("missing-bpf-root");
     let client = reqwest::Client::new();
     let mut last_error = String::from("no spawn error recorded");
     let mut last_port = 0u16;
@@ -78,7 +77,9 @@ async fn node_agent_boots_with_contract_env_and_exposes_metrics() {
             .env("FERRUM_NODE_AGENT_ADMIN_ENABLED", "true")
             .env("FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT", "16008")
             .env("FERRUM_NODE_AGENT_CGROUP_ROOT", &cgroup_root)
-            .env("FERRUM_NODE_AGENT_BPF_FS_PATH", &bpf_root)
+            // The only supported in-container bpffs mount (issue #6698); the
+            // missing cgroup root above already forces the iptables fallback.
+            .env("FERRUM_NODE_AGENT_BPF_FS_PATH", "/sys/fs/bpf")
             .env("FERRUM_NODE_AGENT_FALLBACK_MODE", "iptables")
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_ADMIN_HTTPS_PORT", "0")
