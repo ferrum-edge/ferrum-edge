@@ -1583,9 +1583,11 @@ pub fn classify_reqwest_error(e: &reqwest::Error) -> ErrorClass {
         return ErrorClass::ReadWriteTimeout;
     }
 
-    // Post-TCP: handshake rustls is still TlsError (reqwest is_connect()
-    // is TCP-only). hyper is_canceled is ConnectionPoolError (pre-wire,
-    // no rustls on this request). Other typed io/hyper/rustls is mid-stream.
+    // Post-TCP: reqwest's is_connect() is TCP-only, so nothing here proves
+    // the request is still in setup. A typed rustls error therefore maps to
+    // ConnectionReset (post-wire, issue #4536), never TlsError. hyper
+    // is_canceled is ConnectionPoolError (pre-wire, no rustls on this
+    // request). Other typed io/hyper is mid-stream.
     if let Some(class) = classify_typed_chain(StdError::source(e), false) {
         return class;
     }

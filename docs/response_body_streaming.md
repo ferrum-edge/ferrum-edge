@@ -64,16 +64,18 @@ When `response_body_mode: stream` is active and no plugin requires buffering, th
 
 This means the client sees the first byte of the response as soon as the backend sends it, rather than waiting for the entire response to be collected — unless adaptive buffering applies.
 
-The H1/H2 frontend and routing handler store boxed concrete futures. Routing
-also boxes each selected backend attempt; generic dispatch boxes its selected
-large transport child. These boxes keep child state out of enclosing coroutine
-poll frames and add heap allocations: one
-frontend box per request beyond the existing routing box, one per attempt,
-and one per selected generic transport. They run in the original request task,
-preserving task-local affinity, cancellation, and request/response/body/backend
-guards. Coroutine-size checks complement
-real default-stack listener tests; a boxed async trampoline alone would still
-embed its awaited child and would not establish a small poll frame.
+The frontend admission wrapper, ordinary HTTP backend attempts (initial and
+retry), and the direct H1/H2 dispatch children are constructed out of line
+without a per-request heap box. The large routing handler keeps its box, as do
+the remaining large children — gRPC attempts, HBONE / mesh-mTLS attempts and
+other large transport and connection-setup futures — so only those add an
+allocation per request or attempt. Every one of them runs in the original
+request task, preserving task-local affinity, cancellation, and
+request/response/body/backend guards. See
+[request_lifetime_dispatch.md](request_lifetime_dispatch.md#request-future-stack-boundaries)
+for the canonical boundary list. Coroutine-size checks complement real
+default-stack listener tests; a boxed async trampoline alone would still embed
+its awaited child and would not establish a small poll frame.
 
 ### Small Response Buffering
 
@@ -165,9 +167,12 @@ response_body_mode = buffer?
             └─ No →
                 Retries configured?
                     └─ Yes → stream on every attempt when the proxy streams
-                       (retry decides from headers alone; a retryable attempt
-                       drops its undrained body before client commit). Buffer
-                       only when response_body_mode/plugins force buffering.
+                       (HTTP/1.1 and HTTP/2 frontends; retry decides from
+                       headers alone; a retryable attempt drops its undrained
+                       body before client commit). Buffer only when
+                       response_body_mode/plugins force buffering. The native
+                       HTTP/3 frontend's retry path buffers each attempt (see
+                       Interaction with Retry Logic).
                     └─ No → continue
                 Response size limit enabled?
                     └─ Yes →
@@ -993,8 +998,9 @@ once.
 
 When retry is configured on a proxy, the gateway must be able to inspect the response status code before deciding whether to retry. That decision is made entirely at response-header time — `retry::should_retry` consults only the status code, the connection-error flag, the error class, and the request method — so retry does not require reading a response body:
 
-- **Every attempt**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
+- **Every attempt (HTTP/1.1 and HTTP/2 frontends)**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
 - **Buffered proxies**: When `response_body_mode: buffer` or a plugin forces buffering, attempts are buffered instead. Inherently streaming responses may still be released to stream after headers through the all-plugin opt-in described above; a retryable status is discarded before any bytes reach the client.
+- **Native HTTP/3 frontend**: A proxy with retries configured buffers each attempt's response (and replays a buffered request) on the native H3 retry path, so an H3 client does not get first-byte streaming on a retried route. The only exception is the same all-plugin opt-in: when every plugin allows an inherently streaming response to be released after headers, the H3 path decides from headers and can stream it.
 - **After streaming begins**: On any attempt, a failure that occurs once response bytes have been committed downstream cannot be retried.
 
 ```
