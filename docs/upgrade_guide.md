@@ -28,6 +28,42 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `security_headers` values browsers ignore are refused (#6617, PR #6685)
+
+Custom `content_type_options`, `frame_options` and `referrer_policy` strings,
+and `set` entries for `X-Content-Type-Options`, `X-Frame-Options` and
+`Referrer-Policy`, must now be values browsers recognize: `nosniff`; `DENY` or
+`SAMEORIGIN`; a comma-separated list of Referrer-Policy tokens. Matching is
+ASCII case-insensitive. Any other value, including `ALLOW-FROM` and an empty
+`set` value, fails config admission. Before upgrading, correct such values or
+disable the header with `false`.
+
+### Mesh RequestAuthentication needs `jwksUri` or `jwks` (follow-up to PR #6668)
+
+A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
+`jwksUri` nor `jwks` is now refused at translation, and its selected workloads
+answer inbound HTTP with `503` (see the fail-closed note under Security in the
+CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
+source to each rule before upgrading.
+
+### Custom plugins: `PluginHttpClient` accessors return an owned client (#6651, PR #6669)
+
+`PluginHttpClient::get()`, `get_http1()` and `get_http2()` now return
+`Result<reqwest::Client, PluginHttpClientUnavailable>` instead of
+`Result<&reqwest::Client, PluginHttpClientUnavailable>`. The owned handle is a
+cheap `Arc` clone. With gateway CRLs enforced it is the client for the current
+CRL generation, and a CRL refresh replaces it, so a client cached across
+requests would keep using connections opened before a revocation. Built-in
+plugins are unaffected. Before upgrading, update custom plugins:
+
+- Call the accessor per request and bind the result
+  (`let client = http.get()?;`), then use `client.post(...)` as before.
+- Pass `&client` where a function takes `&reqwest::Client`.
+- Do not store the returned client in plugin state; keep the
+  `PluginHttpClient` and call the accessor again on the next request.
+- Keep handling the `Err(PluginHttpClientUnavailable)` case as before: the
+  shared client could not be built, and the request should fail closed.
+
 ### Underscore spellings in `output_claim_headers` / `outputClaimToHeaders` (#6656)
 
 `output_claim_headers` on `jwks_auth`, and Istio `RequestAuthentication`
@@ -67,9 +103,11 @@ validation time where it previously loaded:
   `x-session-id` or `x-key-private`, and environment-variable tag sources
   such as `GPG_PASSPHRASE`, `HSM_PIN` or `KEY_PRIVATE`.
 
-Rename such fields or tags to a non-credential name before upgrading. Values
-logged under these names were already secrets, so dropping them is the
-intended behaviour.
+Before upgrading, remove each such field or tag, or replace its value with a
+fixed placeholder. Values logged under these names are treated as secrets, so
+renaming a field that still carries one (for example `session_id` to
+`correlation`) would log the same secret under the new name. Rename only a
+field whose value you have confirmed is not a secret.
 
 ### Cleartext OPA, serverless and tracing endpoints need an opt-in (issue #6617)
 
@@ -161,7 +199,9 @@ An omitted `body_validator` value inherited from a larger `FERRUM_MAX_REQUEST_BO
   safe alone).
 - `on_unlisted_content_type` and the new `on_unlisted_response_content_type`
   default to `fail_closed`. Under enforcing body rules, a non-empty body whose
-  `Content-Type` is not in the scan scope is now refused (`403`). Before
+  `Content-Type` is not in the scan scope is now refused (`403`).
+  `text/event-stream` responses, bodiless responses (`HEAD`, 1xx, 204, 304)
+  and exempt requests are not governed by the response option. Before
   upgrading, add the types your routes legitimately carry to
   `body_content_types`, enable `inspect_multipart` / `inspect_binary_body`,
   exempt upload/download routes, or set the option to `allow` explicitly.

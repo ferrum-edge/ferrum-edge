@@ -602,6 +602,96 @@ fn refused_request_authentication_is_carried_as_a_fail_closed_marker() {
     }
 }
 
+/// An issuer-only rule (no `jwksUri`, no `jwks`) cannot be enforced: Ferrum
+/// has no OIDC discovery and native mesh admission requires a key source. It
+/// is refused at translation, so the published configuration carries a
+/// refusal marker and still passes mesh admission. Before, it was published as
+/// an accepted rule that `validate_mesh_fields` rejected, vetoing the whole
+/// reload, including a sibling refusal, and keeping the previous configuration.
+#[test]
+fn issuer_only_request_authentication_is_refused_and_does_not_veto_admission() {
+    let issuer_only = object(
+        "security.istio.io/v1",
+        "RequestAuthentication",
+        "default",
+        "issuer-only",
+        json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "jwtRules": [{"issuer": "https://issuer.example.com"}]
+        }),
+    );
+    let blank_uri = object(
+        "security.istio.io/v1",
+        "RequestAuthentication",
+        "default",
+        "blank-uri",
+        json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "jwtRules": [{"issuer": "https://issuer.example.com", "jwksUri": " "}]
+        }),
+    );
+    let blank_issuer = object(
+        "security.istio.io/v1",
+        "RequestAuthentication",
+        "default",
+        "blank-issuer",
+        json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "jwtRules": [{"issuer": " ", "jwksUri": "https://issuer.example.com/jwks"}]
+        }),
+    );
+    let duplicate_claims = object(
+        "security.istio.io/v1",
+        "RequestAuthentication",
+        "default",
+        "duplicate-claims",
+        json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks",
+                "outputClaimToHeaders": [
+                    {"header": "x-claim", "claim": "sub"},
+                    {"header": "X-Claim", "claim": "email"},
+                ],
+            }]
+        }),
+    );
+    let (translation, skipped) = translate_k8s_objects_collecting_skips(
+        &[issuer_only, blank_uri, blank_issuer, duplicate_claims],
+        options("default"),
+    )
+    .expect("translation completes with the resources skipped");
+    let mut skipped_names: Vec<&str> = skipped.keys().map(|key| key.name.as_str()).collect();
+    skipped_names.sort_unstable();
+    assert_eq!(
+        skipped_names,
+        vec![
+            "blank-issuer",
+            "blank-uri",
+            "duplicate-claims",
+            "issuer-only"
+        ]
+    );
+
+    let mesh = translation
+        .config
+        .mesh
+        .as_deref()
+        .expect("refused markers published");
+    assert_eq!(mesh.request_authentications.len(), 4);
+    assert!(
+        mesh.request_authentications
+            .iter()
+            .all(|ra| ra.refused && ra.jwt_rules.is_empty())
+    );
+    let errors = translation.config.validate_mesh_fields();
+    assert!(
+        errors.is_empty(),
+        "published refusal markers must pass mesh admission: {errors:?}"
+    );
+}
+
 /// A valid RequestAuthentication is never marked refused.
 #[test]
 fn accepted_request_authentication_is_not_marked_refused() {
