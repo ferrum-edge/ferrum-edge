@@ -125,7 +125,7 @@ services:
   # interpolation of unrelated profiles. Initialization variables never rotate
   # the user in an existing volume; see docs/upgrade_guide.md.
   mongodb:
-    image: mongo:9-noble@sha256:61dd87ff554dc20386c63ebe1f7ede27314370ad5a7bf357c685fab424672158
+    image: mongo:9@sha256:f90507905ce6e52e4a63d0ff8964fc254fa4d37ccbe56c56f4bc0186eb02edea
     container_name: ferrum-mongodb-db
     environment:
       MONGO_INITDB_ROOT_USERNAME: ferrum
