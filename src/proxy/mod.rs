@@ -34872,6 +34872,22 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        // HEAD keeps the representation `Content-Length` but carries no body
+        // bytes on any protocol (HTTP/2 would otherwise send DATA).
+        if reject.grpc_status.is_none()
+            && crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+                &ctx.method,
+                reject.http_status.as_u16(),
+                &mut reject.headers,
+                reject.body.len(),
+            )
+        {
+            reject.body = Bytes::new();
+        }
+        reject.body_disposition = headers_mod::RejectBodyDisposition::for_request(
+            &ctx.method,
+            reject.http_status.as_u16(),
+        );
         // Same bookkeeping as a plugin rejection: native gRPC and gRPC-Web
         // carry `grpc_status`/`grpc_message` metadata, and metrics, the
         // transaction log and the diagnostic reference record the status the

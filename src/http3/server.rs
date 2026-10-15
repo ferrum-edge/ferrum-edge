@@ -4227,6 +4227,16 @@ async fn handle_h3_request(
             )
             .await?;
         } else {
+            // HEAD keeps the representation `Content-Length` but sends no DATA.
+            let mut reject_body = reject_body;
+            if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+                &ctx.method,
+                StatusCode::BAD_REQUEST.as_u16(),
+                &mut headers,
+                reject_body.len(),
+            ) {
+                reject_body = Bytes::new();
+            }
             send_h3_finalized_reject_flavor_aware(
                 &mut stream,
                 http_flavor,

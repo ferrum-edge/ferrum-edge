@@ -756,6 +756,17 @@ async fn functional_query_trigger_refuses_unencoded_semicolon_on_h1_and_h2() {
         .expect("h2 request");
     assert_eq!(refused.version(), reqwest::Version::HTTP_2);
     assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    let head = h2
+        .head(gateway.proxy_url("/qt?x=;action=delete"))
+        .send()
+        .await
+        .expect("h2 HEAD");
+    assert_eq!(head.version(), reqwest::Version::HTTP_2);
+    assert_eq!(head.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        head.bytes().await.expect("h2 HEAD body").is_empty(),
+        "an HTTP/2 HEAD refusal must carry no DATA"
+    );
     let grpc = h2
         .post(gateway.proxy_url("/qt/pkg.Service/Method?x=;action=delete"))
         .header("content-type", "application/grpc")
