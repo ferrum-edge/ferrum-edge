@@ -1978,18 +1978,21 @@ pub async fn start_http3_listener_with_signal(
     // moment the listener task exited — exactly the abrupt-abort behaviour
     // the soft-shutdown sequence is here to avoid.
     //
-    // This phase runs before the serving mode's global drain (which starts
-    // only once this listener handle returns), so it draws on the SAME budget
-    // through `shutdown_drain_remaining` rather than a fresh one (issue
-    // #6714). A repeated shutdown signal stops the wait, as it does for the
-    // global drain.
+    // On process shutdown this phase runs before the serving mode's global
+    // drain (which starts only once this listener handle returns), so it
+    // draws on the SAME budget through `shutdown_drain_remaining` rather than
+    // a fresh one (issue #6714). A routine listener retirement (Gateway API
+    // reconcile) is not process shutdown: it gets its own budget and must not
+    // start the process-wide clock. A repeated shutdown signal stops the
+    // wait, as it does for the global drain.
     let drain_budget = Duration::from_secs(drain_seconds);
+    let drain_scope = H3DrainBudget::new(crate::overload::shutdown_drain_announced());
     let escalation = crate::overload::shutdown_escalation_token();
     if drain_seconds > 0 {
         let outcome = wait_for_h3_drain(
             || endpoint.open_connections(),
             &overload_state.drain_complete,
-            overload_state.shutdown_drain_remaining(drain_budget),
+            drain_scope.remaining(&overload_state, drain_budget),
             escalation,
         )
         .await;
@@ -2024,7 +2027,7 @@ pub async fn start_http3_listener_with_signal(
         quinn::VarInt::from_u32(H3_NO_ERROR_CLOSE_CODE),
         H3_NO_ERROR_CLOSE_REASON,
     );
-    let close_tail = overload_state.shutdown_drain_remaining(drain_budget);
+    let close_tail = drain_scope.remaining(&overload_state, drain_budget);
     if !close_tail.is_zero() && !escalation.is_cancelled() {
         let _ = tokio::time::timeout(close_tail, async {
             tokio::select! {
@@ -2036,6 +2039,34 @@ pub async fn start_http3_listener_with_signal(
     }
 
     Ok(())
+}
+
+/// Which budget an HTTP/3 listener's drain and close draw on.
+#[derive(Debug, Clone, Copy)]
+enum H3DrainBudget {
+    /// Process shutdown: the budget shared with the global drain
+    /// ([`crate::overload::OverloadState::shutdown_drain_remaining`]).
+    ProcessShutdown,
+    /// Routine listener retirement: a budget of its own, measured from when
+    /// the retirement drain began. Never touches the process-wide clock.
+    Retirement(tokio::time::Instant),
+}
+
+impl H3DrainBudget {
+    fn new(process_shutdown_announced: bool) -> Self {
+        if process_shutdown_announced {
+            Self::ProcessShutdown
+        } else {
+            Self::Retirement(tokio::time::Instant::now())
+        }
+    }
+
+    fn remaining(&self, overload: &crate::overload::OverloadState, budget: Duration) -> Duration {
+        match self {
+            Self::ProcessShutdown => overload.shutdown_drain_remaining(budget),
+            Self::Retirement(started) => budget.saturating_sub(started.elapsed()),
+        }
+    }
 }
 
 /// How the HTTP/3 listener's shutdown drain wait ended.
@@ -2084,7 +2115,7 @@ async fn wait_for_h3_drain(
 
 #[cfg(test)]
 mod shutdown_drain_budget_tests {
-    use super::{H3DrainOutcome, wait_for_h3_drain};
+    use super::{H3DrainBudget, H3DrainOutcome, wait_for_h3_drain};
     use crate::overload::{OverloadState, begin_drain, wait_for_drain_with_escalation};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -2155,6 +2186,42 @@ mod shutdown_drain_budget_tests {
         let h3_spent = started.elapsed();
         assert!(h3_spent >= Duration::from_secs(10) && h3_spent < Duration::from_secs(11));
 
+        state.active_connections.fetch_add(1, Ordering::Relaxed);
+        begin_drain(&state);
+        assert!(!wait_for_drain_with_escalation(&state, BUDGET, escalation).await);
+        assert_within_one_budget(started.elapsed());
+    }
+
+    /// A Gateway API listener retirement long before SIGTERM must not start
+    /// (or spend) the process shutdown budget.
+    #[tokio::test(start_paused = true)]
+    async fn listener_retirement_does_not_consume_the_process_shutdown_budget() {
+        let state = Arc::new(OverloadState::new());
+        let escalation = CancellationToken::new();
+
+        // Retire an idle H3 listener during normal operation.
+        let retirement = H3DrainBudget::new(false);
+        assert_eq!(retirement.remaining(&state, BUDGET), BUDGET);
+        let outcome = wait_for_h3_drain(
+            || 0,
+            &state.drain_complete,
+            retirement.remaining(&state, BUDGET),
+            &escalation,
+        )
+        .await;
+        assert_eq!(outcome, H3DrainOutcome::Drained);
+        // Its own budget runs from the retirement, independent of others.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            retirement.remaining(&state, BUDGET),
+            Duration::from_secs(20)
+        );
+
+        // Much later, the process shuts down: active work gets the full budget.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        let shutdown = H3DrainBudget::new(true);
+        assert_eq!(shutdown.remaining(&state, BUDGET), BUDGET);
+        let started = tokio::time::Instant::now();
         state.active_connections.fetch_add(1, Ordering::Relaxed);
         begin_drain(&state);
         assert!(!wait_for_drain_with_escalation(&state, BUDGET, escalation).await);
