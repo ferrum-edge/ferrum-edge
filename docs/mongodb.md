@@ -23,8 +23,8 @@ so the practical floor is **4.4.2**.
 
 | Server | Status |
 |---|---|
-| MongoDB 9.0 | Supported and recommended. |
-| MongoDB 5.0 – 8.x | Supported. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 7.0 (see the kernel note below). |
+| MongoDB 9.0 | Supported and recommended. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 9.0 (9.0.4 or later; see the kernel note below). |
+| MongoDB 5.0 – 8.x | Supported. |
 | MongoDB 4.4.2+ | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
 | MongoDB 4.4.0 – 4.4.1, 4.2 and older | Not supported (no `hello` command, or wire version 8 or lower). |
 | MongoDB Atlas | Supported on any Atlas-offered version. |
@@ -44,10 +44,11 @@ is in [SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742).
   there.
 - 7.0 is unaffected.
 
-The `mongo:9` image (9.0.2) also exits on hosts whose kernel reports 7.0.0, such
-as Ubuntu 26.04 kernels and the GitHub-hosted `ubuntu-26.04` runners
-([SERVER-136272](https://jira.mongodb.org/browse/SERVER-136272), fixed in
-9.0.4). Ferrum's CI uses 7.0 for this reason.
+The `mongo:9` image at 9.0.2 also exited on hosts whose kernel reports 7.0.0,
+such as Ubuntu 26.04 kernels and the GitHub-hosted `ubuntu-26.04` runners;
+that is fixed in 9.0.4
+([SERVER-136272](https://jira.mongodb.org/browse/SERVER-136272)), and Ferrum's
+CI runs the current 9.0 images.
 
 Replica-set features (transactions, `POST /batch`, change streams) need a
 replica set on any version; see [Replica Sets and
@@ -57,7 +58,7 @@ Transactions](#replica-sets-and-transactions).
 
 ```bash
 # Start MongoDB (Docker)
-docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:7
+docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:9
 
 # Start Ferrum Edge
 FERRUM_MODE=database \
@@ -439,7 +440,7 @@ available.
 
 ```bash
 # Start a single-node replica set for development
-docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0
+docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:9 --replSet rs0
 docker exec mongo-rs mongosh --eval "rs.initiate()"
 
 # Configure Ferrum Edge
