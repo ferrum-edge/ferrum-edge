@@ -599,9 +599,12 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # fields like `backend_connect_timeout_ms`) would also share whichever
 # connect timeout the underlying `reqwest::Client` was first built with.
 #
-# Retirement plan: when reqwest#3017 merges and ships in a release we use,
-# remove this `[patch.crates-io]` entry, drop `vendor/reqwest-0.13.4-ferrum-patched/`,
-# and unpin the dependency. The call-site change in `src/connection_pool.rs`
+# Retirement plan: when reqwest#3017 merges and ships in a release we use, and
+# reqwest patches 002-004 in the same vendor copy are retired too, remove the
+# `reqwest` entry from every `[patch.crates-io]` table (here, in
+# `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`), update the
+# three lockfiles, then drop `vendor/reqwest-0.13.4-ferrum-patched/` and unpin
+# the dependency (docs/dependency-policy.md, "Retiring a vendored patch"). The call-site change in `src/connection_pool.rs`
 # uses the upstream API as proposed in the PR, so it stays intact.
 # See `docs/upstream-reqwest-patches/001-per-request-connect-timeout/README.md`.
 #
@@ -617,9 +620,12 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 # errors; a stream reset or any other stream-level error (including a rejected
 # 0-RTT read) surfaces ahead of buffered bytes, as in stock h3.
 #
-# Retirement plan: when h3 ships a release with the fix, remove the
-# corresponding `[patch.crates-io]` line, drop `vendor/h3-0.0.8-ferrum-patched/`,
-# and bump the `h3` floor in `Cargo.toml` to that version. The gateway-side
+# Retirement plan: when h3 ships a release with the fix, bump the `h3` floor.
+# The vendor copy also carries h3 patches 002-005 (co-retirement group
+# `h3-all`; production uses patch 005's `max_buffered_frame_len`), so only once
+# all of them are upstream remove the `h3` entry from every `[patch.crates-io]`
+# table (here, in `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`),
+# update the three lockfiles, then drop `vendor/h3-0.0.8-ferrum-patched/`. The gateway-side
 # suppression in PR #506 stays — it is correct independently of whether the
 # underlying h3 library can recover the response.
 # See `docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md`.
@@ -633,8 +639,10 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when both upstream changes and equivalent frame/message
 # capacity attribution ship in compatible published releases consumed by
-# ferrum-edge, remove both `[patch.crates-io]` lines, drop the two vendor
-# directories, bump dependency versions/lockfile normally, and keep the gateway
+# ferrum-edge, bump the dependency versions, remove both lines from every
+# `[patch.crates-io]` table (here, in `fuzz/Cargo.toml` and in
+# `tests/performance/mesh/Cargo.toml`), update the three lockfiles, then drop
+# the two vendor directories, and keep the gateway
 # call site using the same upstream API. See
 # `docs/upstream-tungstenite-patches/README.md`.
 #
@@ -659,9 +667,10 @@ tokio = { version = "1", features = ["net", "io-util", "time", "rt", "test-util"
 #
 # Retirement plan: when h3-quinn ships a release whose `stop_sending` is
 # correct while a read is in flight *and* whose `SendStream`/`BidiStream`
-# expose an equivalent `&self` + `'static` `stopped` watch, remove the
-# `[patch.crates-io]` line, drop `vendor/h3-quinn-0.0.10-ferrum-patched/`,
-# and bump the `h3-quinn` floor. See `docs/upstream-h3-quinn-patches/`.
+# expose an equivalent `&self` + `'static` `stopped` watch, bump the `h3-quinn`
+# floor, remove the `h3-quinn` entry from every `[patch.crates-io]` table (here,
+# in `fuzz/Cargo.toml` and in `tests/performance/mesh/Cargo.toml`), update the
+# three lockfiles, then drop `vendor/h3-quinn-0.0.10-ferrum-patched/`. See `docs/upstream-h3-quinn-patches/`.
 #
 # We also carry a vendored copy of sqlx-core 0.8.6 whose rustls handshake
 # treats a configured root CA as EXCLUSIVE and accepts rustls 0.23's

@@ -92,7 +92,7 @@ adding, removing, or materially changing a workflow.
 | `connection-saturation-benchmark.yml` | Connection Saturation Benchmark | Manual | Connection saturation benchmark suite. |
 | `scale-benchmark.yml` | Resources Scale Benchmark | Manual | Large resource/config scale benchmark suite. |
 | `ci-latency-report.yml` | CI Latency Report | Manual, weekly schedule, and PR/push on its own sources | Read-only Actions-API latency report for [#4672](https://github.com/ferrum-edge/ferrum-edge/issues/4672): queued time, execution, serial dependency waves, attempt numbers, cancellations and whole-required-set completion. Holds `contents: read` + `actions: read` only, dispatches nothing, and is **not** a required check. |
-| `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Supplies the single required human-root approval for one exact independently reviewed PR head after hosted checks and review-thread resolution; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
+| `root-merge-gate-attestation.yml` | Root Merge Gate Attestation | Manual (`workflow_dispatch` on `main` only) | Records an audit approval from the human root for one exact independently reviewed PR head. The live rules require no approval, so it is not currently a merge gate; see [Root Merge Gate Attestation](#root-merge-gate-attestation). |
 | `base-image-digest-refresh.yml` | Base Image Digest Refresh | Weekly schedule, manual | Resolves the current `@sha256:` digest for each pinned Dockerfile `FROM`/`ARG` image tag and opens an ordinary PR with every non-workflow consumer of a drifted pin rotated, including the distroless runtime base. It uses only its own `GITHUB_TOKEN`, so its required CI does not start on its own; a maintainer reopens the PR to run every required check, then reviews and merges it (see `docs/dependency-policy.md`). |
 | `dependabot-auto-merge.yml` | Dependabot Auto-Merge | `pull_request_target` (opened, reopened, synchronize) for PRs to `main` | Queues merge-commit auto-merge on Dependabot's own non-major PRs using only `GITHUB_TOKEN`, and withdraws it after any non-Dependabot push. GitHub merges only once every required check passes. It checks out no PR content. See [automated dependency merges](dependency-policy.md#automated-dependency-merges). |
 | `trusted-policy-candidate.yml` | Trusted Policy Candidate | PRs and push to `main` on `.github/scripts/**` or `.github/workflows/**` | Read-only `Candidate policy self-test`: runs the candidate `verify_required_ci.py` and the candidate Cross verifier's `--self-test`; nothing consumes its output. Not a required check. |
@@ -3177,23 +3177,37 @@ do
 done)
 
 # Gate the exact staged Linux bytes the way the workflow does, before upload.
+# Each block runs under `set -euo pipefail`, so any failed check stops it;
+# do not upload unless BOTH blocks finished with "passed".
 # x86_64 on an x86_64 Linux host with Docker (copy the LINUX_GNU_SMOKE_* image
 # pins from release.yml into the environment, as for the build step):
-(cd dist && sha256sum -c ferrum-edge-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256)
-python3 -I .github/scripts/verify_linux_gnu_abi.py \
-  dist/ferrum-edge-linux-x86_64 dist/ferrum-cni-linux-x86_64
-bash .github/scripts/smoke_linux_gnu_baseline.sh \
-  --edge dist/ferrum-edge-linux-x86_64 --cni dist/ferrum-cni-linux-x86_64
+bash -euo pipefail -c '
+  (cd dist && sha256sum -c ferrum-edge-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256)
+  python3 -I .github/scripts/verify_linux_gnu_abi.py \
+    dist/ferrum-edge-linux-x86_64 dist/ferrum-cni-linux-x86_64
+  bash .github/scripts/smoke_linux_gnu_baseline.sh \
+    --edge dist/ferrum-edge-linux-x86_64 --cni dist/ferrum-cni-linux-x86_64
+  echo "x86_64 gates passed"'
 # ARM64 on an arm64 Linux host with Docker (the workflow uses ubuntu-26.04-arm):
-(cd dist && sha256sum -c ferrum-edge-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256)
-python3 -I .github/scripts/verify_linux_gnu_abi.py \
-  dist/ferrum-edge-linux-aarch64 dist/ferrum-cni-linux-aarch64
-bash .github/scripts/smoke_linux_gnu_baseline.sh \
-  --edge dist/ferrum-edge-linux-aarch64 --cni dist/ferrum-cni-linux-aarch64
+bash -euo pipefail -c '
+  (cd dist && sha256sum -c ferrum-edge-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256)
+  python3 -I .github/scripts/verify_linux_gnu_abi.py \
+    dist/ferrum-edge-linux-aarch64 dist/ferrum-cni-linux-aarch64
+  bash .github/scripts/smoke_linux_gnu_baseline.sh \
+    --edge dist/ferrum-edge-linux-aarch64 --cni dist/ferrum-cni-linux-aarch64
+  echo "aarch64 gates passed"'
 
-# Upload only after every gate above passed and dist/ holds 14 files
-# (7 binaries + 7 .sha256 sidecars). The glob matches both.
-ls dist | wc -l   # expect 14
+# Upload from the publishing checkout only when dist/ holds exactly the seven
+# binaries and their seven verified .sha256 sidecars.
+bash -euo pipefail -c '
+  cd dist
+  expected="ferrum-cni-linux-aarch64 ferrum-cni-linux-x86_64 ferrum-edge-linux-aarch64 ferrum-edge-linux-x86_64 ferrum-edge-macos-aarch64 ferrum-edge-macos-x86_64 ferrum-edge-windows-x86_64.exe"
+  want=$(for a in $expected; do printf "%s\n%s.sha256\n" "$a" "$a"; done | LC_ALL=C sort)
+  have=$(ls -1 | LC_ALL=C sort)
+  [ "$want" = "$have" ] || { echo "dist/ does not hold exactly the 14 release files" >&2; exit 1; }
+  for a in $expected; do
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum -c "$a.sha256"; else shasum -a 256 -c "$a.sha256"; fi
+  done'
 gh release create v0.2.0 \
   dist/ferrum-edge-* dist/ferrum-cni-* \
   --title "Release v0.2.0" \
