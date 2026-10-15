@@ -522,22 +522,37 @@ impl Waf {
             return;
         };
         for path_rule in &self.compiled.body_json_paths {
-            for value in json_doc::select(&json, &path_rule.path) {
+            // One hit per rule is all the outcome records. Stop at it, and skip
+            // a rule an earlier view already hit, so duplicated members cannot
+            // multiply matching or hit-deduplication work.
+            if outcome
+                .hits
+                .iter()
+                .any(|hit| hit.rule_index == path_rule.rule_index)
+            {
+                continue;
+            }
+            'occurrences: for value in json_doc::select(&json, &path_rule.path) {
                 for text in json_doc::scan_texts(value) {
                     let text = text.as_ref();
-                    self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
+                    if self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject) {
+                        break 'occurrences;
+                    }
                     // `text` is already JSON-unescaped; its single-character
                     // escapes are not resolved a second time.
                     for variant in normalize::decoded_json_value_variants(text) {
-                        self.push_json_path_hit_if_matched(
+                        if self.push_json_path_hit_if_matched(
                             outcome, path_rule, &variant, text, subject,
-                        );
+                        ) {
+                            break 'occurrences;
+                        }
                     }
                 }
             }
         }
     }
 
+    /// Records the rule's hit when it matches; returns whether it did.
     fn push_json_path_hit_if_matched(
         &self,
         outcome: &mut ScanOutcome,
@@ -545,13 +560,16 @@ impl Waf {
         match_value: &str,
         fp_filter_target: &str,
         subject: ScanSubject<'_>,
-    ) {
-        if self.json_path_rule_matches(path_rule, match_value, fp_filter_target, subject) {
+    ) -> bool {
+        let matched =
+            self.json_path_rule_matches(path_rule, match_value, fp_filter_target, subject);
+        if matched {
             outcome.push(RuleHit {
                 rule_index: path_rule.rule_index,
                 target_name: path_rule.target_name,
             });
         }
+        matched
     }
 
     fn json_path_rule_matches(
