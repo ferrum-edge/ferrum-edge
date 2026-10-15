@@ -28,6 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Custom plugins: `PluginHttpClient` accessors return an owned client (#6651, PR #6669)
+
+`PluginHttpClient::get()`, `get_http1()` and `get_http2()` now return
+`Result<reqwest::Client, PluginHttpClientUnavailable>` instead of
+`Result<&reqwest::Client, PluginHttpClientUnavailable>`. The owned handle is a
+cheap `Arc` clone. With gateway CRLs enforced it is the client for the current
+CRL generation, and a CRL refresh replaces it, so a client cached across
+requests would keep using connections opened before a revocation. Built-in
+plugins are unaffected. Before upgrading, update custom plugins:
+
+- Call the accessor per request and bind the result
+  (`let client = http.get()?;`), then use `client.post(...)` as before.
+- Pass `&client` where a function takes `&reqwest::Client`.
+- Do not store the returned client in plugin state; keep the
+  `PluginHttpClient` and call the accessor again on the next request.
+- Keep handling the `Err(PluginHttpClientUnavailable)` case as before: the
+  shared client could not be built, and the request should fail closed.
+
 ### Underscore spellings in `output_claim_headers` / `outputClaimToHeaders` (#6656)
 
 `output_claim_headers` on `jwks_auth`, and Istio `RequestAuthentication`

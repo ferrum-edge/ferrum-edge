@@ -492,11 +492,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `claim_headers`: `X_Real_IP` is reserved like `X-Real-IP`, and `X_Tenant_Id`
   duplicates `X-Tenant-Id`. Such configs are refused at load; a RequestAuthentication
   refused for this reason fails closed as described under Security.
-- **`PluginHttpClient::get()`, `get_http1()` and `get_http2()` return an owned
-  `reqwest::Client`** (`Result<reqwest::Client, PluginHttpClientUnavailable>`
-  instead of `Result<&reqwest::Client, _>`, issue #6651), so callers always use
-  the current CRL generation's client. Custom plugins that stored the reference
-  need `&client` where a `&reqwest::Client` is expected.
+- **BREAKING — `PluginHttpClient::get()`, `get_http1()` and `get_http2()`
+  return an owned `reqwest::Client`** (issue #6651, PR #6669). The accessors
+  now return `Result<reqwest::Client, PluginHttpClientUnavailable>` instead of
+  `Result<&reqwest::Client, _>`, so callers always use the current CRL
+  generation's client. Custom plugins that stored the reference, or pass it
+  where a `&reqwest::Client` is expected, no longer compile until they bind the
+  owned handle and pass `&client`.
 - **BREAKING — `claim_headers` follows the `output_claim_headers` bounds**
   (issue #6620). On `jwks_auth`, `oauth2_introspection` and
   `oidc_relying_party`, a resolved claim value that is not a valid header value
