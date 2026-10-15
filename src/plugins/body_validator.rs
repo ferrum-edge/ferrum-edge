@@ -653,7 +653,7 @@ impl BodyValidator {
         // is compiled per request, and the reported message never echoes the
         // rejected value.
         if let Some(schema) = json_schema {
-            // jsonschema 0.46.5 compares object members in insertion order for
+            // jsonschema compares object members in insertion order for
             // `uniqueItems` when serde_json's workspace-wide `preserve_order`
             // feature is active. JSON object equality is order-insensitive, so
             // canonicalize only for schemas that actually use `uniqueItems`.
