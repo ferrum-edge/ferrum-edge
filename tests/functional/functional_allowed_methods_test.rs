@@ -536,10 +536,17 @@ impl RecordingBackend {
                             _ => return,
                         }
                     }
-                    recorded
-                        .lock()
-                        .expect("backend log")
-                        .push(String::from_utf8_lossy(&head).to_ascii_lowercase());
+                    // Record only requests for the test routes; the gateway's
+                    // own backend capability probes are not client traffic.
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let target = head.split(' ').nth(1).unwrap_or("");
+                    if ["/qt", "/qterm", "/nq"].iter().any(|route| {
+                        target == *route
+                            || target.starts_with(&format!("{route}?"))
+                            || target.starts_with(&format!("{route}/"))
+                    }) {
+                        recorded.lock().expect("backend log").push(head);
+                    }
                     let response = "HTTP/1.1 200 OK\r\n\
                                     Content-Length: 2\r\n\
                                     Content-Type: text/plain\r\n\
@@ -687,7 +694,8 @@ async fn functional_query_trigger_refuses_unencoded_semicolon_on_h1_and_h2() {
     }
     assert!(
         backend.requests().is_empty(),
-        "a refused request must not reach the backend"
+        "a refused request must not reach the backend: {:?}",
+        backend.requests()
     );
 
     let head = h1
@@ -861,7 +869,8 @@ async fn functional_query_trigger_refuses_unencoded_semicolon_on_h3() {
     );
     assert!(
         backend.requests().is_empty(),
-        "a refused request must not reach the backend"
+        "a refused request must not reach the backend: {:?}",
+        backend.requests()
     );
 
     let both = h3_send(
