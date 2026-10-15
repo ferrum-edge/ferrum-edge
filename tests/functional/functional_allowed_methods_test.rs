@@ -309,16 +309,32 @@ async fn functional_allowed_methods_http3_rejects_before_backend() {
 }
 
 /// A refused `HEAD` keeps its representation `Content-Length` but carries no
-/// body bytes, whichever pre-plugin path refused it: `allowed_methods` (JSON
-/// and gRPC-Web shapes), a route miss, or a path-parameter refusal. Hyper drops
+/// body bytes, whichever gateway path answered it: `allowed_methods` (JSON
+/// and gRPC-Web shapes), a route miss, a path-parameter refusal, or a
+/// backend-dispatch error. Hyper drops
 /// a HEAD body on HTTP/1.1 itself, so HTTP/2 and HTTP/3 are the protocols that
 /// would otherwise send DATA.
 #[ignore]
 #[tokio::test]
 async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
     let backend = CountingBackend::start().await;
+    // `/down` admits HEAD but its backend port is closed, so the gateway
+    // answers with its own backend-dispatch error.
+    let closed_port = {
+        let listener = TcpListener::bind_test("127.0.0.1:0")
+            .await
+            .expect("bind closed port");
+        listener.local_addr().expect("closed addr").port()
+    };
+    let config = build_config(backend.port, &["GET"]).replacen(
+        "proxies:\n",
+        &format!(
+            "proxies:\n  - id: \"down\"\n    listen_path: \"/down\"\n    backend_scheme: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {closed_port}\n    strip_listen_path: false\n    pool_enable_http2: false\n"
+        ),
+        1,
+    );
     let gateway = TestGateway::builder()
-        .mode_file(build_config(backend.port, &["GET"]))
+        .mode_file(config)
         .log_level("warn")
         .env("FERRUM_ENABLE_HTTP3", "true")
         .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
@@ -345,6 +361,7 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
         ("/allowed", Some("application/grpc-web-text"), None),
         ("/no-such-route", None, Some(404)),
         ("/allowed;v=1", None, None),
+        ("/down", None, Some(502)),
     ];
 
     let h2 = reqwest::Client::builder()
@@ -405,6 +422,11 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
         assert!(
             response.body_bytes.is_empty(),
             "an HTTP/3 HEAD refusal must carry no DATA: {path} {content_type:?}"
+        );
+        assert!(
+            response.body_error.is_none(),
+            "an HTTP/3 HEAD refusal must complete cleanly: {path} {content_type:?}: {:?}",
+            response.body_error
         );
     }
     assert_eq!(

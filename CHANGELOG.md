@@ -619,11 +619,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Gateway-authored `HEAD` responses carry no body on HTTP/2 and HTTP/3.**
   Responses built outside the shared synthetic-response finalizer (the
   `allowed_methods` `405`, the route-protocol admission `403`, route misses,
-  path-parameter refusals, and gRPC-Web error frames) sent their body as DATA
-  to a `HEAD` request on HTTP/2 and HTTP/3; HTTP/1.1 was unaffected because
-  Hyper drops it. The HTTP/1.1 and HTTP/2 response boundary and the HTTP/3
-  gateway response writers now omit the bytes of a buffered body for `HEAD`,
-  keeping the representation `Content-Length`.
+  path-parameter refusals, gRPC-Web error frames, and the HTTP/3 bridge's
+  backend-dispatch errors) sent their body as DATA to a `HEAD` request on
+  HTTP/2 and HTTP/3; HTTP/1.1 was unaffected because Hyper drops it. The
+  HTTP/1.1 and HTTP/2 response boundary and the HTTP/3 gateway response
+  writers (native and cross-protocol bridge) now omit the bytes of a buffered
+  body for `HEAD`, keeping the representation `Content-Length`.
 
 - **AI token metering counts prompt-cache, thinking and tool-use tokens**
   (issue #6623). Anthropic `cache_creation_input_tokens` and

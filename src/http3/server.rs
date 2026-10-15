@@ -18439,7 +18439,7 @@ tokio::task_local! {
 
 /// Whether the current HTTP/3 request is `HEAD`, whose response carries no
 /// body bytes (RFC 9110 §9.3.2).
-fn h3_request_is_head() -> bool {
+pub(crate) fn h3_request_is_head() -> bool {
     H3_HEAD_REQUEST.try_with(|_| ()).is_ok()
 }
 
