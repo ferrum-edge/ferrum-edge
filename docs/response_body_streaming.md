@@ -170,10 +170,11 @@ response_body_mode = buffer?
                        (HTTP/1.1 and HTTP/2 frontends; retry decides from
                        headers alone; a retryable attempt drops its undrained
                        body before client commit). Buffer only when
-                       response_body_mode/plugins force buffering. H3
-                       cross-protocol bridges behave the same; only the
-                       native H3-to-H3 retry path buffers its attempts (see
-                       Interaction with Retry Logic).
+                       response_body_mode/plugins force buffering. The H3
+                       cross-protocol bridge behaves the same; when the
+                       initial target is native H3, that handler's retry loop
+                       buffers its attempts, even ones rotated onto non-H3
+                       targets (see Interaction with Retry Logic).
                     └─ No → continue
                 Response size limit enabled?
                     └─ Yes →
@@ -1001,7 +1002,7 @@ When retry is configured on a proxy, the gateway must be able to inspect the res
 
 - **Every attempt (HTTP/1.1 and HTTP/2 frontends)**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
 - **Buffered proxies**: When `response_body_mode: buffer` or a plugin forces buffering, attempts are buffered instead. Inherently streaming responses may still be released to stream after headers through the all-plugin opt-in described above; a retryable status is discarded before any bytes reach the client.
-- **HTTP/3 frontend**: The H3 cross-protocol bridges (an H3 client to an HTTP/1.1, HTTP/2 or gRPC backend) decide every attempt from headers and stream like the H1/H2 frontends. Only the native H3-to-H3 path (backend dispatched on the native QUIC pool) differs: with retries configured it buffers each attempt's response. Its one exception is the **initial** attempt, which may still stream an inherently streaming response when every plugin opts in to releasing it after headers; every retry attempt after that is buffered.
+- **HTTP/3 frontend**: Which retry loop runs is decided by the **initially selected** target. When it is not native-H3-capable, the H3 cross-protocol bridge (`http3/cross_protocol.rs`) runs the retry loop, decides every attempt from headers, and streams like the H1/H2 frontends. When the initial target is dispatched on the native QUIC pool, the native H3 handler's retry loop runs instead and, with retries configured, buffers each attempt's response — including attempts that rotate onto a non-H3 target, which it sends through the buffered reqwest retry path. Its one exception is the **initial** attempt, which may still stream an inherently streaming response when every plugin opts in to releasing it after headers; every retry attempt after that is buffered.
 - **After streaming begins**: On any attempt, a failure that occurs once response bytes have been committed downstream cannot be retried.
 
 ```
@@ -1074,7 +1075,7 @@ HTTP/3 responses support **streaming** across three distinct paths. See [docs/ht
 - **Request body** — streamed via a bounded `tokio::sync::mpsc` bridge into `reqwest::Body::wrap_stream` for `Plain` flavor. Mirrors the H1/H2 plugin-driven policy: stream by default, buffer only when a plugin pre-collected the body. Bridge capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 32). `Grpc` flavor streams request DATA and trailers through a bounded channel into `GrpcBody::Channel` when no retry, body plugin, or pre-buffered body requires replay; otherwise it keeps the buffered representation.
 - **Response body** — streamed frame-by-frame with the same `http3_coalesce_*` window as the native H3 writer, so QUIC frame cadence is identical across dispatch kinds. `Plain` polls `reqwest::Response::chunk()`; `Grpc` polls hyper `Incoming::frame()` so trailer frames split off for `RequestStream::send_trailers()`.
 
-On the H3 frontend, when plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, responses fall back to **buffered** mode with full `on_response_body` and `transform_response_body` plugin hook support (subject to the after-headers release described in [Response-Header-Aware Downgrade](#response-header-aware-downgrade-after-response-headers)).
+On the H3 frontend, when plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`), or when retries are configured and the initial target runs on the native H3 handler's retry loop, responses fall back to **buffered** mode with full `on_response_body` and `transform_response_body` plugin hook support (subject to the after-headers release described in [Response-Header-Aware Downgrade](#response-header-aware-downgrade-after-response-headers)).
 
 ### gRPC
 
