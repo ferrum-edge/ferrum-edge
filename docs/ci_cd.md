@@ -3198,7 +3198,8 @@ bash -euo pipefail -c '
     --edge dist/ferrum-edge-linux-aarch64 --cni dist/ferrum-cni-linux-aarch64
   mkdir -p gates && sha256sum dist/ferrum-edge-linux-aarch64 dist/ferrum-cni-linux-aarch64 > gates/aarch64.ok'
 
-# Upload from the publishing checkout. This one shell verifies both gate
+# Upload from the publishing checkout on a Linux host (GNU coreutils
+# `sha256sum` verifies the gate markers). This one shell verifies both gate
 # markers against the staged bytes, requires dist/ to hold exactly the seven
 # binaries and their seven verified .sha256 sidecars, and only then uploads,
 # so any failed check exits before `gh release create` runs.
