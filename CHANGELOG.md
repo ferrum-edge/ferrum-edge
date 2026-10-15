@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as an `Authorization` header, API-key header, or query/body value. Every rule
   value is now `[REDACTED]` (fingerprinted in the export), as are the
   `mesh_route_dispatch` `rules[].request_transform[].value` route-level header
-  writes; operations, targets and names stay visible. Admin reads and
+  writes; `operation`, `target` and `new_key` stay visible (`key` was already
+  masked by the name heuristic). Admin reads and
   `GET /backup` stay raw. **Operator action:** an `operator` read-modify-write
   of these plugins must resend the real values, since a write that echoes a
   `[REDACTED]` placeholder back is refused with `400`.

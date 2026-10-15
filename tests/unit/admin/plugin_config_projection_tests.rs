@@ -1358,7 +1358,9 @@ fn request_transformer_rule_values_are_secret_for_every_target() {
     for (index, rule) in rules.iter().take(4).enumerate() {
         assert_eq!(rule["value"], REDACTED, "rule {index}");
     }
-    // Operations, targets, header names and rename destinations stay visible.
+    // Operations, targets and rename destinations stay visible; `key` is
+    // masked by the pre-existing name heuristic.
+    assert_eq!(rules[1]["key"], REDACTED);
     assert_eq!(rules[0]["operation"], "update");
     assert_eq!(rules[1]["target"], "header");
     assert_eq!(rules[2]["target"], "query");

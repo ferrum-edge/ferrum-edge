@@ -332,8 +332,9 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         // Each rule writes its `value` into the upstream request (a header,
         // query parameter or body field). Operators use it to inject backend
         // credentials (`Authorization`, `X-Api-Key`, `api_key=`), and the
-        // destination name is arbitrary, so every rule value is secret. The
-        // operation, target and names stay visible as routing diagnostics.
+        // destination name is arbitrary, so every rule value is secret.
+        // `operation`, `target` and `new_key` stay visible; `key` is already
+        // masked by the name heuristic.
         &[secret(&["rules", "*", "value"])],
     ),
     (
