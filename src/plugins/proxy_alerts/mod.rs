@@ -170,9 +170,11 @@ impl ProxyAlerts {
             .iter()
             .map(|r| (r.id(), r.window_spec()))
             .collect();
-        let windows = Arc::new(WindowStore::new(rule_specs));
-        let cooldowns = Arc::new(CooldownGate::new());
-        let recovery = Arc::new(RecoveryGate::new());
+        // Honour `FERRUM_POOL_SHARD_AMOUNT` like every other hot-path plugin map.
+        let shard_amount = http_client.pool_shard_amount();
+        let windows = Arc::new(WindowStore::with_shard_amount(rule_specs, shard_amount));
+        let cooldowns = Arc::new(CooldownGate::with_shard_amount(shard_amount));
+        let recovery = Arc::new(RecoveryGate::with_shard_amount(shard_amount));
         let lifecycle_keep_ms = lifecycle_keep_ms(parsed.rules.as_ref());
         let active_proxy_generations = Arc::new(ArcSwap::from_pointee(None));
         let retention_lock = Arc::new(Mutex::new(()));

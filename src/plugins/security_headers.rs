@@ -116,14 +116,19 @@ impl SecurityHeaders {
     }
 
     fn apply(&self, headers: &mut HashMap<String, String>) {
-        for name in &self.remove {
-            remove_header_ci(headers, name);
+        // One pass over the response map drops every case-insensitive copy of
+        // a removed name and, when overriding, of every set name. `set` names
+        // are unique, and `policy_header_names` is exactly `remove` ∪ `set`.
+        let dropped: &[String] = if self.override_existing {
+            &self.policy_header_names
+        } else {
+            &self.remove
+        };
+        if !dropped.is_empty() {
+            headers.retain(|key, _| !dropped.iter().any(|name| key.eq_ignore_ascii_case(name)));
         }
         for (name, value) in &self.set {
-            if self.override_existing {
-                remove_header_ci(headers, name);
-                headers.insert(name.clone(), value.clone());
-            } else if find_header_ci(headers, name).is_none() {
+            if self.override_existing || find_header_ci(headers, name).is_none() {
                 headers.insert(name.clone(), value.clone());
             }
         }
@@ -215,10 +220,6 @@ fn find_header_ci<'a>(headers: &'a HashMap<String, String>, name: &str) -> Optio
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
-}
-
-fn remove_header_ci(headers: &mut HashMap<String, String>, name: &str) {
-    headers.retain(|key, _| !key.eq_ignore_ascii_case(name));
 }
 
 /// Resolve a built-in security header. `key` is the config field; when present
@@ -557,6 +558,27 @@ mod tests {
             .filter(|k| k.eq_ignore_ascii_case("x-frame-options"))
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn removed_and_set_name_without_override_takes_the_set_value() {
+        let headers = apply_to(
+            json!({
+                "override_existing": false,
+                "remove": ["X-Policy"],
+                "set": { "X-Policy": "gateway" }
+            }),
+            HashMap::from([
+                ("X-Policy".to_string(), "backend".to_string()),
+                ("x-POLICY".to_string(), "backend-2".to_string()),
+            ]),
+        );
+        let copies: Vec<&str> = headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("x-policy"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(copies, vec!["gateway"]);
     }
 
     #[test]

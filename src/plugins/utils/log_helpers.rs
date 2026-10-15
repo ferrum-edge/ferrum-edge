@@ -485,10 +485,10 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 /// [`HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT`] so HTTP/1.1 keep-alive connections can
 /// be reused. Peer-controlled body bytes are never logged or retained.
 ///
-/// Retained for sinks whose endpoint cannot carry a credential and for the
-/// shared drain/classification tests; the observability sinks covered by
-/// advisory GHSA-8594-2xhc-8g38 use
-/// [`handle_http_batch_response_redacted`] instead.
+/// A transport error is rendered without its request URL, so the result never
+/// echoes an endpoint credential. The observability sinks covered by advisory
+/// GHSA-8594-2xhc-8g38 use [`handle_http_batch_response_redacted`], which
+/// takes an already-redacted error string.
 #[allow(dead_code)] // No in-binary caller remains; used by tests/unit/plugins/
 pub async fn handle_http_batch_response(
     plugin_label: &str,
@@ -502,7 +502,13 @@ pub async fn handle_http_batch_response(
             let drain = drain_http_batch_response_body(response).await;
             classify_http_batch_response(plugin_label, plugin_name, entry_count, status, drain)
         }
-        Err(error) => Err(format!("{plugin_label} batch failed: {error}")),
+        // `reqwest::Error`'s `Display` includes the request URL, which can
+        // carry a credential in its path or query. Strip it so this helper is
+        // safe for any sink, not only credential-free endpoints.
+        Err(error) => Err(format!(
+            "{plugin_label} batch failed: {}",
+            error.without_url()
+        )),
     }
 }
 
