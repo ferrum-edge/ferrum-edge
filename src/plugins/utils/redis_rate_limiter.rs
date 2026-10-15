@@ -165,7 +165,7 @@
 //! drop-in for the sub-bucket ladder; their residual boundary-burst exposure is
 //! documented rather than silently shared with the quota path.
 //!
-//! Neither scheme needs Lua: both are native `GET`/`INCR`/`INCRBY`/`EXPIRE`
+//! Neither scheme needs Lua: both are native `GETRANGE`/`INCR`/`INCRBY`/`EXPIRE`
 //! commands pipelined into one transaction.
 //!
 //! HTTP, GraphQL, and gRPC-method quotas add **charge-then-compensate**
@@ -256,7 +256,7 @@
 //! **Bucket mis-settlement has a bounded rebuild, and it is not a retry
 //! budget.** Bucket selection precedes connection acquisition, so a charge is
 //! always slightly stale when it lands. One sub-bucket of that is covered by
-//! the forward `GET`. Past that the transaction's own `TIME` reply settles it
+//! the forward read. Past that the transaction's own `TIME` reply settles it
 //! ([`sub_bucket_charge_is_settled`]): if the server executed `EXEC` at
 //! `b + 2` or later, a peer may have charged a bucket this ladder neither read
 //! nor charged; if it executed BEFORE `b`, this charge was placed in the future
@@ -725,7 +725,7 @@ impl RedisServerClock {
 /// The offset a reply teaches is `server_time − local_time_at_reply`, so a
 /// reply held for `d` teaches an offset `d` too small, and the NEXT selection
 /// lands `d` earlier than the server's clock. While `d` is under one sub-bucket
-/// the ladder's forward `GET` and the two-sided settlement band already cover
+/// the ladder's forward read and the two-sided settlement band already cover
 /// that placement. Past it they do not, and adopting the sample would let one
 /// delayed reply — an `EXEC` whose response was held while the rest of the
 /// process moved on — walk the base backwards. Keeping the previous offset is
@@ -2685,6 +2685,45 @@ pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrange
         return Err(RedisGetrangeEndIndexError::ZeroCap);
     }
     isize::try_from(max_bytes).map_err(|_| RedisGetrangeEndIndexError::Overflow)
+}
+
+/// Inclusive `GETRANGE` end for reading an `i64` counter: at most 21 bytes
+/// transfer, one more than the widest `i64` (`-9223372036854775808`, 20
+/// bytes), so a truncated 21-byte reply is distinguishable from a complete
+/// extreme value. A plain `GET` would allocate whatever a writer with access
+/// to the key prefix parked under a counter key (issue #6653).
+const COUNTER_GETRANGE_END: isize = 20;
+const COUNTER_MAX_BYTES: usize = 20;
+
+/// Parse bytes read with `GETRANGE key 0 20` as a counter.
+///
+/// The outer `None` is malformed — a truncated (21-byte), non-UTF-8, or
+/// non-integer reply — and callers must fail the command rather than read it
+/// as a count. The inner `None` is a missing counter: `GETRANGE` on an absent
+/// key answers an empty bulk string, never nil.
+fn parse_bounded_counter_bytes(bytes: &[u8]) -> Option<Option<i64>> {
+    if bytes.is_empty() {
+        return Some(None);
+    }
+    if bytes.len() > COUNTER_MAX_BYTES {
+        return None;
+    }
+    std::str::from_utf8(bytes)
+        .ok()?
+        .parse::<i64>()
+        .ok()
+        .map(Some)
+}
+
+/// Decode one transaction element as a bounded counter: an `INCR` integer
+/// reply or a `GETRANGE` bulk string. Outer `None` is malformed.
+fn decode_bounded_counter(value: redis::Value) -> Option<Option<i64>> {
+    match value {
+        redis::Value::Nil => Some(None),
+        redis::Value::Int(count) => Some(Some(count)),
+        redis::Value::BulkString(bytes) => parse_bounded_counter_bytes(&bytes),
+        _ => None,
+    }
 }
 
 /// Whether a reply is the exact `+OK` acknowledgement `WATCH` / `MULTI` return.
@@ -5081,10 +5120,12 @@ impl RedisRateLimitClient {
         let amount = amount.max(1);
         let mut conn = self.get_connection().await.ok_or(())?;
 
-        let result: Result<(Option<i64>, i64), redis::RedisError> = redis::pipe()
+        let result: Result<(Vec<u8>, i64), redis::RedisError> = redis::pipe()
             .atomic()
-            .cmd("GET")
+            .cmd("GETRANGE")
             .arg(previous_key)
+            .arg(0)
+            .arg(COUNTER_GETRANGE_END)
             .cmd("INCRBY")
             .arg(current_key)
             .arg(amount)
@@ -5096,14 +5137,26 @@ impl RedisRateLimitClient {
             .await;
 
         match result {
-            Ok((previous_count, current_count)) => {
+            Ok((previous_bytes, current_count)) => {
+                let Some(previous_count) = parse_bounded_counter_bytes(&previous_bytes) else {
+                    // A counter this code cannot read is NOT a zero: it would
+                    // under-count and over-admit. The INCRBY already landed,
+                    // so mark the endpoint unusable like the charge path.
+                    self.mark_unavailable();
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "GETRANGE+INCRBY+EXPIRE",
+                        "Redis sliding-window transaction returned an unreadable counter"
+                    );
+                    return Err(());
+                };
                 self.note_command_success()?;
                 Ok((previous_count.unwrap_or(0), current_count))
             }
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+INCRBY+EXPIRE",
+                    operation = "GETRANGE+INCRBY+EXPIRE",
                     error = %e,
                     "Redis sliding-window transaction failed"
                 );
@@ -5280,23 +5333,40 @@ impl RedisRateLimitClient {
     pub async fn get_two_counters(&self, key1: &str, key2: &str) -> Result<(i64, i64), ()> {
         let mut conn = self.get_connection().await.ok_or(())?;
 
-        let result: Result<(Option<i64>, Option<i64>), redis::RedisError> = redis::pipe()
-            .cmd("GET")
+        let result: Result<(Vec<u8>, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("GETRANGE")
             .arg(key1)
-            .cmd("GET")
+            .arg(0)
+            .arg(COUNTER_GETRANGE_END)
+            .cmd("GETRANGE")
             .arg(key2)
+            .arg(0)
+            .arg(COUNTER_GETRANGE_END)
             .query_async(&mut conn)
             .await;
 
         match result {
-            Ok((v1, v2)) => {
+            Ok((bytes1, bytes2)) => {
+                let parsed = parse_bounded_counter_bytes(&bytes1)
+                    .and_then(|v1| parse_bounded_counter_bytes(&bytes2).map(|v2| (v1, v2)));
+                let Some((v1, v2)) = parsed else {
+                    // A counter this code cannot read is NOT a zero: it would
+                    // under-count and over-admit, so fail the command.
+                    self.mark_unavailable();
+                    warn!(
+                        redis_url = %self.config.redacted_url(),
+                        operation = "GETRANGE+GETRANGE",
+                        "Redis pipeline returned an unreadable counter"
+                    );
+                    return Err(());
+                };
                 self.note_command_success()?;
                 Ok((v1.unwrap_or(0), v2.unwrap_or(0)))
             }
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+GET",
+                    operation = "GETRANGE+GETRANGE",
                     error = %e,
                     "Redis pipeline failed"
                 );
@@ -6102,7 +6172,7 @@ impl RedisRateLimitClient {
     /// decision the caller derives is tied to its own mutation and can never be
     /// a stale read that two gateways both act on.
     ///
-    /// The forward `GET` is what makes the pair of decisions independent of the
+    /// The forward read is what makes the pair of decisions independent of the
     /// order two concurrent transactions reach the server in, and the extra old
     /// `GET` is what keeps a peer's retained charge inside this ladder when its
     /// key is one bucket older than the bucket it executed in; see
@@ -6175,7 +6245,7 @@ impl RedisRateLimitClient {
         if !self.requires_server_clock() {
             warn_sampled!(
                 redis_url = %self.config.redacted_url(),
-                operation = "GET+INCR+EXPIRE+TIME",
+                operation = "GETRANGE+INCR+EXPIRE+TIME",
                 "Redis rate-limit charge attempted on a client that did not declare the \
                  server-clock requirement"
             );
@@ -6187,7 +6257,7 @@ impl RedisRateLimitClient {
         if windows.len() > MAX_REDIS_ADMISSION_WINDOWS {
             warn_sampled!(
                 redis_url = %self.config.redacted_url(),
-                operation = "GET+INCR+EXPIRE",
+                operation = "GETRANGE+INCR+EXPIRE",
                 windows = windows.len(),
                 max_windows = MAX_REDIS_ADMISSION_WINDOWS,
                 "Redis rate-limit charge exceeds the supported window count"
@@ -6213,9 +6283,17 @@ impl RedisRateLimitClient {
             // read-only; only the bucket this request lands in is mutated and
             // retained.
             for key in window.trailing_keys() {
-                pipeline.cmd("GET").arg(key);
+                pipeline
+                    .cmd("GETRANGE")
+                    .arg(key)
+                    .arg(0)
+                    .arg(COUNTER_GETRANGE_END);
             }
-            pipeline.cmd("GET").arg(window.next_key());
+            pipeline
+                .cmd("GETRANGE")
+                .arg(window.next_key())
+                .arg(0)
+                .arg(COUNTER_GETRANGE_END);
             pipeline
                 .cmd("INCR")
                 .arg(window.charged_key())
@@ -6230,9 +6308,10 @@ impl RedisRateLimitClient {
         // connection that could not answer `TIME` was never published.
         pipeline.cmd("TIME");
 
-        // `GET` answers a bulk string or nil, `INCR` an integer, and `TIME` a
-        // two-element array, so the reply is decoded one element at a time
-        // rather than through a single scalar type. `Vec<redis::Value>` IS
+        // `GETRANGE` answers a bulk string (empty for a missing key), `INCR`
+        // an integer, and `TIME` a two-element array, so the reply is decoded
+        // one element at a time rather than through a single scalar type.
+        // `Vec<redis::Value>` IS
         // redis-rs's own decode allocation, and it is consumed element by
         // element below — redis-rs decodes a `Value` by value, so borrowing
         // would add one clone per counter on the admission hot path.
@@ -6254,7 +6333,7 @@ impl RedisRateLimitClient {
                 for _ in 0..windows.len() {
                     for slot in ladder.iter_mut() {
                         let decoded = match values.next() {
-                            Some(value) => redis::from_redis_value::<Option<i64>>(value).ok(),
+                            Some(value) => decode_bounded_counter(value),
                             None => None,
                         };
                         let Some(count) = decoded else {
@@ -6265,7 +6344,7 @@ impl RedisRateLimitClient {
                             self.mark_unavailable();
                             warn_sampled!(
                                 redis_url = %self.config.redacted_url(),
-                                operation = "GET+INCR+EXPIRE",
+                                operation = "GETRANGE+INCR+EXPIRE",
                                 "Redis rate-limit charge returned an unreadable sub-bucket \
                                  counter"
                             );
@@ -6284,7 +6363,7 @@ impl RedisRateLimitClient {
                     self.mark_unavailable();
                     warn_sampled!(
                         redis_url = %self.config.redacted_url(),
-                        operation = "GET+INCR+EXPIRE+TIME",
+                        operation = "GETRANGE+INCR+EXPIRE+TIME",
                         "Redis rate-limit charge returned an unreadable server clock"
                     );
                     return Err(());
@@ -6320,7 +6399,7 @@ impl RedisRateLimitClient {
                 self.mark_unavailable();
                 warn_sampled!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+INCR+EXPIRE",
+                    operation = "GETRANGE+INCR+EXPIRE",
                     fields = reply.len(),
                     "Redis rate-limit charge returned an unexpected reply shape"
                 );
@@ -6337,7 +6416,7 @@ impl RedisRateLimitClient {
                 // revocation seen at connect time gets.
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+INCR+EXPIRE",
+                    operation = "GETRANGE+INCR+EXPIRE",
                     error = %e,
                     "Redis rate-limit charge transaction failed"
                 );

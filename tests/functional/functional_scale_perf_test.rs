@@ -1273,7 +1273,7 @@ async fn test_scale_perf_30k_proxies_mongodb() {
         println!("SKIPPED: ferrum-scale-test-mongo container not running.");
         println!("Start it with:");
         println!("  docker run -d --name ferrum-scale-test-mongo --network host \\");
-        println!("    mongo:9 --replSet rs0 --port 27117 --bind_ip 127.0.0.1");
+        println!("    mongo:7 --replSet rs0 --port 27117 --bind_ip 127.0.0.1");
         println!("  docker exec ferrum-scale-test-mongo mongosh --port 27117 --eval \\");
         println!(
             "    'rs.initiate({{_id: \"rs0\", members: [{{_id: 0, host: \"127.0.0.1:27117\"}}]}})'"
@@ -1289,7 +1289,7 @@ async fn test_scale_perf_30k_proxies_mongodb() {
     let mongo_database = "ferrum_scale";
 
     // Clean the database for a fresh run by dropping it inside the container.
-    // `mongosh` ships with the mongo:9 image, so we exec it there rather than
+    // `mongosh` ships with the mongo:7 image, so we exec it there rather than
     // depending on a host-installed Mongo client.
     let drop_result = Command::new("docker")
         .args([
