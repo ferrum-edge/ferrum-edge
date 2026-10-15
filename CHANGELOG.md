@@ -21,6 +21,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Redis ACLs for the rate-limit plugins must now grant `GETRANGE` on the
   configured key prefix (the counter reads no longer use `GET`).
 
+- **A rejected mesh RequestAuthentication fails closed** (issue #6656). Kubernetes
+  translation used to drop a RequestAuthentication it rejected (for example a
+  reserved or duplicate `outputClaimToHeaders` destination, a missing issuer, or an
+  unsupported `targetRef(s)`), so the workloads it selected ran with no JWT
+  validation, no token stripping and no gateway-owned claim headers. It is now
+  published as a rule-less refusal marker with its own scope (namespace scope for
+  `targetRef(s)`, mesh-wide in the Istio root namespace), status still reports
+  `FerrumAccepted=False` and now adds `status.ferrum.translation.enforcement:
+  refuse_all`, and the data plane answers every inbound HTTP request to those
+  workloads with `503` through a forced `request_termination`
+  (`__mesh_request_auth_refused`) until the resource is fixed. The refusal
+  replaces the workload's mesh `jwks_auth` and an operator `request_termination`
+  global cannot suppress it. It is gated to the workload's mesh inbound routes,
+  so outbound requests from the workload keep flowing; with no inbound route it
+  applies to every route.
+- **`request_mirror` keeps credential provenance through renames, and
+  `mcp_gateway` session headers are credential headers** (issue #6658,
+  PR #6667). The mirror now also withholds any header or query value equal
+  to a credential value seen on the request: every inbound, outbound or
+  query value under a name the mirror classifies as a credential (built-in
+  classes, operator patterns, route-registered credential headers, marked
+  query credentials, every repeated occurrence), including values a plugin
+  installed under such a header. A credential renamed by
+  `request_transformer` therefore stays withheld under its new name, behind
+  the same flag plus exact-allowlist gate. `request_transformer` also records
+  every header and query rename, and the mirror replays that lineage against
+  its own classifiers and `sensitive_*_patterns`: a destination whose source
+  was a credential name (built-in, operator pattern, route-registered, or an
+  earlier credential rename, across chained instances) is a credential too,
+  which covers operator-added or updated credentials. Appended header values
+  are matched per comma-separated member. `mcp_gateway` reports its
+  configured downstream and upstream session header names as credential
+  headers, so they are redacted, withheld from mirrors and bound into
+  replay partitions whatever they are called.
+- **BREAKING — metadata values are redacted unless their key is allowlisted**
+  (issue #6619). Log-metadata redaction relied on a credential-name denylist,
+  so values under names such as `session_id`, `passwd`, `passphrase`,
+  `private_key`, `jwt` or `signature`, or under any spelling the list missed,
+  reached every log sink verbatim. Metadata VALUES on every sink (transaction
+  logs, nested and flattened schema projections, `ai_transcript_audit`
+  records, debugger-selected metadata) are now emitted only when the key is a
+  reviewed built-in key or matches the new `FERRUM_LOG_SAFE_METADATA_KEYS`;
+  every other value serializes as `[REDACTED]` and the key stays visible. The
+  built-in allowlist is an exact-key list of about 390 names
+  (`BUILTIN_SAFE_METADATA_KEYS`, for example `mesh.source.workload`,
+  `grpc_web_mode`, `request_id` and `ai_total_tokens`) plus a few per-instance
+  families with a fixed grammar (`grpc_web.instance.<id>.mode`,
+  `ai_semantic_cache.<id>.cache_status`, …). Whole namespaces are never
+  allowlisted, so a name a plugin invents under a built-in prefix
+  (`mesh.vault_blob`) stays redacted. `FERRUM_LOG_SAFE_METADATA_KEYS` takes
+  exact case-insensitive names or `prefix*` entries. `request_body` and
+  `response_body` are never emitted, and `mesh.*` trace attributes outside the
+  allowlist are not exported.
+- **BREAKING — telemetry tag sources and debugger text fields need a
+  declaration, and credential-shaped names are refused** (issue #6619).
+  `workload_metrics` `custom_header_tags` / `custom_env_tags` copy a source
+  verbatim only when the header or environment variable is declared in the new
+  `safe_tag_sources` list (also accepted as mesh `tracing.safe_tag_sources`);
+  otherwise the tag value is `[REDACTED]`, including for sources translated
+  from an Istio `Telemetry` CRD. `transaction_debugger` `text/plain` captures
+  keep a `name=value` / `name: value` line only when every field name parses
+  as plain ASCII letters, digits, `_`, `-` or `.` and is listed in the new
+  `safe_text_fields`. A credential-class classifier is the deny layer on top
+  of these allowlists and always wins: it fails closed on unlisted spellings
+  across delimiters, camelCase and concatenation (session identifiers,
+  passwords, passphrases and passcodes, PINs and one-time codes, credentials,
+  JWTs, signatures, private/access/signing key material, bearer assertions,
+  CSRF state). It rejects credential-shaped log-schema output names
+  (`static_fields`, `derived_fields`, `rename` targets), `workload_metrics`
+  tag names and tag sources (`x-session-id`, `GPG_PASSPHRASE`, `HSM_PIN`), and
+  `safe_tag_sources` / `safe_text_fields` entries; a credential-shaped
+  `FERRUM_LOG_SAFE_METADATA_KEYS` entry is ignored with a startup warning.
+  Admin plugin-config projection keeps its listed-name rules, so
+  configuration fields such as `session_ttl_seconds` stay visible.
+
 - **`ai_response_guard` structured verification now shares one live-capacity
   window** (issue #6657). The JSON/SSE/gRPC residual pre-checks cloned the
   document tree, stripped placeholder markers into fresh scratch strings, and
@@ -34,6 +109,193 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fit fails closed exactly like an exhausted redaction budget. A redaction
   whose output fits the ceiling alone but cannot be built beside its own
   working tree is therefore now refused during construction.
+
+- **Plugin HTTP clients retire pooled connections on a CRL refresh, and
+  plugin-owned clients apply the gateway CRLs** (issue #6651, follow-up to #6621).
+  When the live CRL generation changes, the shared plugin HTTP clients are rebuilt
+  on next use, so keep-alive connections opened before a revocation no longer
+  carry new requests; a request already in flight finishes on its connection.
+  `spec_expose`, `api_chargeback_sink` with ClickHouse custom TLS
+  (`clickhouse.tls.*`), and `load_testing` loopback traffic with `gateway_tls` now
+  verify servers against the gateway CRLs while their own settings keep
+  verification on (not `tls_no_verify`, `insecure_skip_verify`,
+  `verify_hostname: false` or `gateway_tls_no_verify`), keeping their CA bundle
+  and client identity. A plugin-owned client that cannot be rebuilt for a new
+  CRL generation refuses requests until a rebuild succeeds instead of reusing
+  the previous pool. A `load_testing` run keeps the generation it started with.
+- **BREAKING — `opa`, `serverless_function`, `otel_tracing` and
+  `workload_metrics` refuse a cleartext endpoint off loopback** (issue
+  #6617). Each sends authorization input, invocation payloads, spans, or
+  credentials to its endpoint. An `http://` `opa_host`, `function_url`,
+  `aws_endpoint_url`, OTLP `endpoint`, or tracing-provider URL is now admitted
+  without an opt-in only for a `127.d.d.d` or `[::1]` literal; any other host,
+  `localhost` included, needs `allow_plaintext: true` on that plugin. Mesh
+  injection writes `allow_plaintext: true` on the injected `workload_metrics`
+  plugin whenever a translated Telemetry/MeshConfig provider uses `http://`,
+  so in-cluster collectors keep working with the posture visible in config.
+  The trusted `AWS_LAMBDA_ENDPOINT_URL` environment fallback is not screened.
+- **BREAKING — `jwks_auth` bounds per-token verification work.** (issue n/a, PR #6644) A token
+  is now verified only against providers whose `issuer` equals its
+  unverified `iss`, then providers without an `issuer`, each at most once.
+  Providers pinning a different issuer are no longer tried, since they
+  would reject the token anyway. `providers` is capped at 64 entries, and
+  for every issuer the providers sharing it plus the providers without an
+  `issuer` must total at most 8, so one token costs at most 8 signature
+  verifications.
+- **BREAKING — `VAULT_ADDR` must use `https` unless the Vault host is
+  loopback** (issue #6582). `_VAULT` and `vault://` resolution accepted
+  `http` for any host, so a remote plaintext address sent `VAULT_TOKEN` and
+  every fetched secret unencrypted. Plaintext `http` is now refused for a
+  non-loopback host with a diagnostic naming `VAULT_ADDR` (the address and
+  token are not echoed). `localhost`, `127.0.0.0/8`, `::1`, and IPv4-mapped
+  loopback stay accepted for a local Vault agent or dev server. Set
+  `FERRUM_VAULT_ALLOW_PLAINTEXT=true` in the environment to accept remote
+  plaintext explicitly; Ferrum then logs a warning once, deferred until logging
+  starts when the address is first used during startup. The rule also covers
+  redirects, since `X-Vault-Token` survives them: a redirect to plaintext
+  `http` is refused unless the opt-in is set or both ends are loopback. A
+  loopback `http` Vault is contacted directly, never through `HTTP_PROXY`.
+- **BREAKING — `soap_ws_security` enforces the validity window of pinned
+  signer certificates and requires zoned instants** (issue n/a, PR #6632).
+  A certificate in
+  `x509_signature.trusted_certs` or `saml.trusted_signing_certs` is now
+  trusted only between its `notBefore` and `notAfter`: a signature from an
+  expired or not-yet-valid pin is refused with `401`. Such a pin is still
+  admitted (so replacements can be staged and reloads keep working) but is
+  logged as a warning when the plugin is built. `xsd:dateTime` values without
+  a `Z` or `±hh:mm` designator (Timestamp, PasswordDigest UsernameToken
+  `Created`, SAML `Conditions`/`SubjectConfirmationData` bounds) are now
+  rejected instead of being read as UTC. The docs now spell out the risk of the opt-in `rsa-sha1`
+  / `sha1` algorithms.
+- **BREAKING — `waf` tightens exemption and body-scope defaults** (issue n/a,
+  PR #6646).
+  - `global_exemptions.header_present` values must now be shared secrets of at
+    least 16 characters, compared in constant time. Presence-only (`null`)
+    entries are rejected at admission, because clients choose their own headers.
+  - `global_exemptions` criteria (`paths`, `methods`, `ips`, `consumers`) now
+    combine with AND by default (`match: all`), so adding a criterion narrows an
+    exemption. `match: any` restores the previous OR behavior.
+  - `on_unlisted_content_type` now defaults to `fail_closed`. A non-empty
+    request body whose `Content-Type` is outside the scan scope is refused when
+    an enforcing request-body policy applies; monitor-only deployments are
+    unaffected. Set `allow` to keep the previous behavior.
+  - New `on_unlisted_response_content_type` (`allow` / `fail_closed` /
+    `block`, default `fail_closed`) gives response bodies the same control,
+    so an origin cannot stream a disclosure past an enforcing response-body
+    rule by labelling it with an unscanned type. Unlisted bodies now record
+    `waf.body_uninspected_target`.
+  - A body rule that neither enforces nor adds to the anomaly score (for
+    example `score: 0`) no longer makes a body policy "enforcing" for the
+    fail-closed size, timeout, and content-type decisions.
+  - `global_exemptions.header_present` values are redacted from non-admin
+    config reads, audit records, and exports, and the named headers are
+    redacted from transaction debugging and policy inputs.
+  - `body_methods` now defaults to `POST`, `PUT`, `PATCH`, and `DELETE`.
+- **BREAKING — `ai_transcript_audit` `redaction.hash_secret` must be at least
+  32 characters** (issue #6617). The floor was 16. The key protects small PII value
+  spaces from offline guessing, so it now has the same floor as the OIDC
+  session secret. Shorter values are rejected at construction and by the
+  OpenAPI `minLength`.
+- **Credential and diagnostic hygiene across plugins** (issues #6617, #6628).
+  `hmac_auth` runs a fixed number of MAC rounds for every username (padding
+  missing or unrotated entries), so timing no longer separates unknown users
+  or reveals how many secrets a user is rotating. The
+  `Debug` output of extracted credentials and of AWS SigV4 signing configs
+  redacts tokens, passwords, API keys, secret keys and session tokens.
+  `transaction_debugger` also redacts any header whose name the central
+  metadata classifier treats as credential-shaped. `oidc_relying_party`
+  relays a provider callback `error` only when it is a short token-like code.
+  `compression`, `ai_stream_router` and `spiffe_identity` no longer echo a
+  client header value, a configured endpoint, or a rejected config value in
+  their diagnostics. `mcp_gateway` caps `observability.log_raw_arguments`
+  metadata at 4096 bytes and marks a cut value with `mcp.arguments_truncated`.
+  `api_chargeback` length-prefixes the text fields of its registry key so names
+  containing `|` cannot merge two consumers' charges.
+- **BREAKING — `ai_semantic_cache` and `ai_semantic_firewall` refuse a
+  cleartext embedding endpoint off loopback** (issue #6617). Both send an API
+  key with every embedding call. An `http://` endpoint is now admitted without
+  an opt-in only for a `127.0.0.0/8` or `::1` literal. Any other host, the name
+  `localhost` included, needs
+  `semantic_embedding_allow_plaintext: true` (cache) or
+  `provider.allow_plaintext: true` (firewall), matching the `allow_plaintext`
+  opt-in `ai_federation` and `ai_stream_router` already require. `ai_semantic_firewall`
+  also refuses whitespace or control characters in `provider.endpoint`.
+- **BREAKING — keyauth API keys need at least 16 non-whitespace characters**
+  (issue #6577). Any non-empty key used to be accepted, including a single
+  character. Consumer create, update, batch, restore, and the dedicated
+  credential endpoints now reject a shorter key with `400`, and file-mode
+  config loading fails on one. A database-mode gateway or CP that already
+  stores a shorter key keeps serving it with a validation warning, but a data
+  plane refuses a CP snapshot containing one and keeps its previous config, so
+  rotate short keys before upgrading.
+  The OpenAPI `KeyAuthCredential` schema (create, update, and restore) carries
+  the same floor. `KeyAuthCredentialBackup` stays the stored-value shape, so a
+  legacy short key still exports in `GET /backup` but must be rotated before
+  that backup can be restored. The floor is lower than the 32-character HMAC/JWT secret
+  minimum because an API key can only be guessed online, while those secrets
+  can be attacked offline from one captured signature or token.
+- **BREAKING — `cors` treats public-suffix wildcards as effectively
+  universal.** (issue n/a, PR #6639) A native `"*.suffix"` origin whose suffix is a single label
+  (`*.com`, `*.localhost`) or a Public Suffix List entry (`*.co.uk`,
+  `*.github.io`) is now refused together with `allow_credentials: true`,
+  like `*`-equivalent prefixes and regexes. A domain with any Public
+  Suffix List rule beneath it (`*.run.app`, `*.amazonaws.com`) is treated the
+  same way. Such entries
+  still work without credentials. A credentialed `regex` origin must now
+  also prove that it pins the host: its literal suffixes must be complete
+  origins, contain the literal authority, or end in a fixed non-public
+  domain (a trailing literal or variable numeric port is allowed;
+  numeric IP-fragment suffixes never count). `https://[a-z]+\.com`,
+  `https://[a-z]+example\.com`, hosts not terminated before a variable part
+  and patterns the analysis cannot bound are refused with credentials. A
+  pattern whose every match starts with a literal `scheme://host:` still
+  pins the host.
+- **BREAKING — Azure Key Vault references must use `https://`** (issue #6570).
+  The Azure Key Vault backend moves to the 1.x Azure SDK (`azure_core` 1.1,
+  `azure_identity` 1.0, `azure_security_keyvault_secrets` 1.0.1; Dependabot
+  #6559 bumped only `azure_core` and did not compile). The 1.x SDK refuses to
+  send the Entra bearer token over plain HTTP, so `_AZURE` values and
+  `azure://` TLS sources with an `http://` (or other non-`https`) vault URL now
+  fail `ferrum-edge validate` and startup with an explicit error that does not
+  echo the reference. Before this change an `http://` reference to a
+  non-loopback host sent the token and the fetched secret in cleartext. To use
+  an emulator, sidecar, or private endpoint, serve it over TLS and set
+  `FERRUM_TLS_CA_BUNDLE_PATH`: Key Vault calls trust that bundle in addition to
+  the platform roots. The bundle is read without blocking, and an unreadable,
+  non-regular, over-4 MiB or certificate-free bundle is an error. The SDK's
+  challenge-resource check stays on, so a sidecar that relays Azure's
+  challenge must be addressed as `<vault>.vault.azure.net`.
+  `AzureCredentials::new` and `AzureCredentials::from_static_token` are now
+  `async` and return a `Result`. Secret
+  redaction also covers the bare vault host and `host:port`, which the SDK's
+  challenge check can echo. The `Secret Backends` Azure fake now serves TLS
+  with a per-test CA. Dependabot groups the Azure SDK crates so they move
+  together.
+- **BREAKING — `jwt_auth` keeps strict audience validation when no
+  `audiences` are configured** (issue #6576). It used to disable `aud`
+  checking entirely in that case, so a token minted for another service with
+  the same consumer secret authenticated. A token without `aud` still passes;
+  a token that carries `aud` is now rejected unless `audiences` lists a
+  matching value, the same contract as `jwks_auth` and the Admin API verifier.
+- **Admin API 401 responses no longer reflect the JWT verification reason**
+  (issue #6578). Every verification failure (expired, bad signature, wrong
+  issuer or audience, malformed) returns the static body
+  `{"error":"Token verification failed"}`. The reason is logged server-side
+  at debug level, without token contents.
+- **BREAKING — `request_mirror` strips credential-shaped header and query
+  names by class, not only by list.** (issue n/a, PR #6631) Cross-origin credential stripping
+  now splits each header name and decoded query name into alphanumeric
+  segments and denies any name with a credential-class word (`auth`, `jwt`,
+  `session`, `sid`, `key`, `pass`, `pwd`, `ticket`, `otp`, …), a credential
+  stem inside a segment (`session`, `sessid`, `token`, `secret`, `auth`,
+  `passw`, `pwd`, `otp`, `verifier`, …), or a segment containing `key` or
+  `pass` (other than ordinary words such as `keyword` or `passenger`). The
+  whole name `code` (OAuth authorization code) is denied too. Names such as
+  `x-session-id`, `jwt`, `x-access-key`, `x-private-key`, `session_id`,
+  `PHPSESSID` and `key` no longer reach the mirror origin. The exceptions
+  are continuation cursors (`x-continuation-token`, `continuation_token`),
+  `author`/`authority` names and `Idempotency-Key`. The exact `forward_sensitive_*_allowlist`
+  stays the only way to forward a denied name.
 
 - **An unencoded `;` in the query is now an ambiguity that fail-closed query
   consumers reject** (issue #6579; query counterpart of GHSA-fcqw-793q-wg5x /
@@ -225,6 +487,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `output_claim_headers` and mesh `outputClaimToHeaders` compare
+  destinations with `_` treated as `-`** (issue #6656, follow-up to #6620), like
+  `claim_headers`: `X_Real_IP` is reserved like `X-Real-IP`, and `X_Tenant_Id`
+  duplicates `X-Tenant-Id`. Such configs are refused at load; a RequestAuthentication
+  refused for this reason fails closed as described under Security.
+- **`PluginHttpClient::get()`, `get_http1()` and `get_http2()` return an owned
+  `reqwest::Client`** (`Result<reqwest::Client, PluginHttpClientUnavailable>`
+  instead of `Result<&reqwest::Client, _>`, issue #6651), so callers always use
+  the current CRL generation's client. Custom plugins that stored the reference
+  need `&client` where a `&reqwest::Client` is expected.
+- **BREAKING — `claim_headers` follows the `output_claim_headers` bounds**
+  (issue #6620). On `jwks_auth`, `oauth2_introspection` and
+  `oidc_relying_party`, a resolved claim value that is not a valid header value
+  (CR, LF or other control bytes) or exceeds 8192 bytes, including a joined
+  array claim, now leaves the destination absent. Before, an oversized valid
+  value was forwarded to the backend, and a malformed one was either dropped
+  at the outbound header conversion or failed the backend request on the
+  reqwest path, depending on the adapter. The object form also takes the list
+  form's admission rules: at most 16 mappings, bounded claim paths and header
+  names, no duplicate destination, and the strict reserved-destination list
+  (`cookie`, `content-length`, `x-forwarded-*`, `x-ferrum-*` and the other
+  framing and provenance names). `claim_headers` compares destinations the
+  way a CGI-style backend does, so `X_Real_IP` is reserved like `X-Real-IP`
+  and `X_Tenant_Id` duplicates `X-Tenant-Id`, including against `jwks_auth`'s
+  `output_claim_headers`; instances owning such spellings sanitize one shared
+  destination.
+- **BREAKING — `ai_response_guard` and `ai_prompt_shield` bound their
+  pattern and scan configuration** (issue #6608). `ai_response_guard` now
+  refuses a `custom_pii_patterns` or `blocked_patterns` regex that matches
+  the empty string (parity with `ai_prompt_shield`), caps pattern names at
+  128 characters and each rendered `redaction_placeholder` at 512 bytes, and
+  charges structured (JSON, SSE, gRPC) redaction against a per-response
+  growth allowance, so sequential patterns that rewrite each other's
+  placeholders fail closed instead of compounding. A zero-width match
+  produced at run time also fails closed. Both plugins cap `max_scan_bytes`
+  at 64 MiB and custom regex lists at 256 entries (`blocked_phrases` at 1024).
+  Both refuse a repeated built-in pattern name. Re-serialized tool-argument
+  documents are charged against the same allowance, including JSON escaping
+  growth. Growth is charged on the JSON-escaped form of every rewritten
+  string, live intermediate buffers are bounded by the allowance, the
+  allowance never exceeds the room the response's retained-body window leaves,
+  and a refused SSE rewrite fails closed instead of being treated as a no-op.
+- **Fuzz targets for the hand-rolled OCSP, JWT-SVID, and TLS material
+  parsers** (issue #6584). `ocsp_response` fuzzes the stapled-OCSP DER grammar
+  under both the interoperable and FIPS-enforced profiles. `jwt_svid` fuzzes
+  the strict duplicate-key-refusing JSON parser, the compact-token validator
+  through signature verification, authority PEM admission, and external JWKS
+  admission. `tls_material` fuzzes PEM certificate/key admission and CRL window
+  classification. All three run in the scheduled sanitizer lane and the
+  bounded `Fuzz Smoke` budget at the 64 KiB fuzz input budget, with synthetic
+  seeds and deterministic property tests.
+- **BREAKING — `response_caching` caps `max_entries` at 10,000,000**
+  (issue #6612). The value sized an up-front capacity reservation, so one
+  huge integer in config could abort the process during a reload instead
+  of failing validation. Admission now rejects anything above the ceiling,
+  `openapi.yaml` publishes the same `maximum`, and the predictor's initial
+  reservation is capped at 1024 slots whatever `max_entries` is.
+- **BREAKING — `openapi_validator` caps `max_body_bytes` at 64 MiB**
+  (issue #6612 sibling audit). The value is also the per-layer decoded
+  ceiling while undoing `Content-Encoding` (amplification checks off), so an
+  arbitrary 64-bit value let a small compressed body inflate without a
+  meaningful bound. Values above 67108864 are now rejected at admission.
+- **BREAKING — `body_validator` caps `grpc_max_decompressed_size_bytes` at
+  64 MiB** (issue #6612 sibling audit). Compressed gRPC frames inflate into
+  a buffer bounded only by this value, so an explicit value above 67108864
+  is now rejected at admission. An environment-inherited
+  `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` above the ceiling is clamped to it.
+- **Plugin hot-path allocations** (issues #6617, #6628). `prometheus_metrics`
+  counter maps and the global JWKS cache are now sharded through
+  `pool_shard_amount`, like other hot-path `DashMap`s. `mcp_gateway` reads
+  the one session field it needs instead of deep-cloning the whole downstream
+  session. Route header `add` rules no longer allocate a key when appending
+  to an existing header.
+- **BREAKING — `access_control` refuses an explicitly empty allow-list**
+  (issue #6607). `allowed_consumers: []` or `allowed_groups: []` used to mean
+  "no allow restriction", so emptying the list to lock a route down admitted
+  every consumer the deny side did not name. A present but empty allow-list is
+  now a config validation error (`minItems: 1` in `openapi.yaml`); omit the key
+  for no allow restriction.
+- **`ip_restriction` `mode` is deprecated and documented as
+  decision-neutral** (issue #6610). `allow_first` and `deny_first` never
+  changed whether a request is admitted: a deny match always rejects and a
+  non-empty `allow` list always rejects addresses outside it. The key only
+  selects the rejection reason for an address failing both checks. It still
+  loads, is marked `deprecated` in `openapi.yaml`, and a test pins the
+  decision across both modes.
 - **Plugin HTTP egress enforces the gateway CRLs** (issue #6621). With
   `FERRUM_TLS_CRL_FILE_PATH` set and verification on, the shared plugin HTTP
   clients (JWKS, OIDC discovery, token introspection, webhooks, HTTP logging
@@ -266,6 +614,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **AI token metering counts prompt-cache, thinking and tool-use tokens**
+  (issue #6623). Anthropic `cache_creation_input_tokens` and
+  `cache_read_input_tokens` and Bedrock Converse `cacheReadInputTokens` and
+  `cacheWriteInputTokens` are now part of the prompt count. Gemini
+  `thoughtsTokenCount` is part of the completion count and
+  `toolUsePromptTokenCount` part of the prompt. This applies to buffered and
+  streamed extraction (`ai_rate_limiter`, `ai_token_metrics`) and to the
+  `ai_stream_router` and `ai_federation` normalizers, so token budgets no
+  longer undercharge cached or thinking requests and every surface agrees.
+  A Gemini or Bedrock provider total is never published below its own
+  reported counters.
+  Categories merge field by field across streamed events, and a malformed
+  counter leaves the whole usage unmetered instead of partially counted.
+- **`mesh_authz` evaluates each distinct destination scope once** (issue
+  #6625). The destination index listed one scope per backing workload, so
+  authorizing a request to a Service with N identical replicas ran the full
+  policy evaluation N times. Equal scopes are now collapsed when the index is
+  built, keeping first-occurrence order. Decisions, reported policies and
+  delegations are unchanged.
+- **The mesh service graph is bounded and built on demand** (issue #6626).
+  Each data plane tracks at most 10,000 live edges, and new edges past the cap
+  are dropped with a sampled warning until idle edges expire. The
+  every-second worker that cloned and sorted every edge now only evicts idle
+  edges every 30 seconds. `GET /mesh/service-graph` rebuilds the snapshot when
+  the published one is at least a second old. Existing edges are updated
+  under a shard read lock instead of a write lock.
+- **`oauth2_introspection` reads a JSON `null` `exp`, `active_until` or
+  `expires_in` as omitted** (issue #6611), matching its `nbf` handling.
+  Authorization servers that serialize unset members as `null` used to fail
+  every authentication with a 503. A null member never hides a present sibling
+  bound, and other non-integer values are still a 503.
+- **`request_deduplication` no longer downloads Redis records unbounded**
+  (issue #6622). It read its operation record with a plain `GET`, and its
+  ownership compare-and-delete and compare-and-set compared against a full
+  `GET` of the stored value, so one oversized value under a consumed key
+  forced an allocation of that size. Records are now read with
+  `EXISTS`/`STRLEN`/`GETRANGE`, capped at `max_entry_size_bytes` plus a 4 KiB
+  envelope. An over-cap or empty record is a fail-closed 409 conflict. The
+  ownership compares transfer at most the owner record's length plus one
+  byte. **Redis ACLs for `request_deduplication` must now allow `EXISTS`,
+  `STRLEN`, and `GETRANGE`.** The unbounded `get_bytes` helper is now
+  test-only, and a source guard keeps production code from calling it.
+  Counter reads in the rate-limit transactions are tracked separately in
+  #6653. The Redis compare/claim primitives also stop treating malformed
+  replies as success. `WATCH` and `MULTI` must answer exactly `OK` before a
+  fenced write is sent. A fenced publication's `SET` must answer `OK`. The
+  shared `set_bytes_nx_with_expire` (`request_deduplication` acquisition,
+  `soap_ws_security` nonce claims) accepts only `OK` or nil. Any other reply
+  fails closed and marks the client unavailable.
+- **The streamed-SSE reassembler bounds its OpenAI-style index families**
+  (issue #6624). Chat choices, legacy Completions choices, `(choice, tool)`
+  tool calls, and Responses-API output text and arguments were keyed by
+  unbounded provider-supplied indexes. Each family now holds at most 128 live
+  accumulators, and further keys fold into one overflow accumulator whose
+  text is still inspected. The stream is marked uninspectable so enforcing
+  callers fail closed, the same rule the Anthropic and Gemini paths already
+  apply. The streamed-inspect `texts()` snapshot no longer deep-clones the
+  reassembler on every call.
 - **`ws_logging` charges one back-off per failed attempt and none after the
   last** (issue #6613). `connect()` slept `reconnect_delay_ms` on every
   failure, including after the final attempt, and `send_batch` added

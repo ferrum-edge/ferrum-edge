@@ -28,6 +28,231 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Underscore spellings in `output_claim_headers` / `outputClaimToHeaders` (#6656)
+
+`output_claim_headers` on `jwks_auth`, and Istio `RequestAuthentication`
+`outputClaimToHeaders`, now treat `_` as `-` when checking reserved and duplicate
+destinations. A mapping to `X_Real_IP`, `X_Forwarded_User` or another underscore
+spelling of a reserved header, or two mappings such as `X-Tenant-Id` and
+`X_Tenant_Id`, is refused. A RequestAuthentication refused for any reason now makes
+the workloads it selects answer every inbound HTTP request with `503` until it is
+fixed, so check `FerrumAccepted` on every RequestAuthentication before upgrading.
+
+### Metadata values are redacted unless allowlisted (issue #6619)
+
+- Metadata values are now logged only under the gateway's reviewed built-in
+  keys, an exact list of names rather than whole namespaces. Transaction-log
+  metadata from custom plugins (including names under a built-in prefix such as
+  `mesh.`), operator-configured metadata keys (for example a custom
+  `model_key`) and `workload_metrics` custom tag names now log as
+  `[REDACTED]`. List the names you have reviewed as non-secret in
+  `FERRUM_LOG_SAFE_METADATA_KEYS` (comma-separated, exact names or `prefix*`).
+  Credential-shaped entries are ignored with a startup warning.
+- `workload_metrics` `custom_header_tags` / `custom_env_tags` now emit
+  `[REDACTED]` unless the source header or environment variable is listed in
+  `safe_tag_sources` (plugin config, or mesh `tracing.safe_tag_sources`).
+  Tags translated from an Istio `Telemetry` CRD need the same declaration.
+- `transaction_debugger` `text/plain` captures drop every assignment line
+  whose field name is not listed in `safe_text_fields`.
+
+### Stricter admission of credential-shaped names (issue #6619)
+
+Configuration that names a credential-class field is now rejected at
+validation time where it previously loaded:
+
+- log-schema `static_fields` (including nested names), rename targets and
+  derived field names such as `session_id`, `client_assertion` or
+  `gpg_passphrase`;
+- `workload_metrics` custom tag dimension names, header-tag sources such as
+  `x-session-id` or `x-key-private`, and environment-variable tag sources
+  such as `GPG_PASSPHRASE`, `HSM_PIN` or `KEY_PRIVATE`.
+
+Rename such fields or tags to a non-credential name before upgrading. Values
+logged under these names were already secrets, so dropping them is the
+intended behaviour.
+
+### Cleartext OPA, serverless and tracing endpoints need an opt-in (issue #6617)
+
+`opa` (`opa_host`), `serverless_function` (`function_url`, `aws_endpoint_url`),
+`otel_tracing` (`endpoint`) and `workload_metrics` (tracing-provider URLs) now
+refuse an `http://` endpoint at load time unless its host is a loopback IP
+literal written as `127.d.d.d` or `[::1]`. Before upgrading, for each such
+plugin either:
+
+- switch the endpoint to `https://`,
+- point a co-located sidecar at `127.0.0.1` instead of `localhost`, or
+- set `allow_plaintext: true` on the plugin when cleartext to that host is
+  intended (for example an in-cluster OPA or collector service).
+
+Mesh mode needs no action: injection sets `allow_plaintext: true` on the
+`workload_metrics` plugin for translated providers that use `http://`. A
+`workload_metrics` instance you configure directly needs the flag yourself.
+
+### `claim_headers` follows the `output_claim_headers` bounds (#6620)
+
+On `jwks_auth`, `oauth2_introspection` and `oidc_relying_party`, a
+`claim_headers` object now admits at most 16 mappings, claim paths of at most
+256 bytes with no whitespace or control characters, header names of at most
+128 bytes, no two mappings naming the same header (`X_Tenant_Id` counts as
+`X-Tenant-Id`), and none of the framing, provenance, credential-bearing or
+gateway-reserved destinations `output_claim_headers` already refused
+(`cookie`, `content-length`, `forwarded`, `via`, `x-real-ip`, `x-forwarded-*`,
+`x-ferrum-*` and similar). A stored config outside these bounds fails to load:
+map the claim to a non-reserved header such as `x-authenticated-user`, and
+split or merge mappings as needed. At request time a claim value that is not a
+valid header value or exceeds 8192 bytes now leaves the destination absent.
+
+### AI guard pattern and scan bounds (#6608, PR #6640)
+
+`ai_response_guard` and `ai_prompt_shield` now refuse at admission:
+- a custom regex that matches the empty string;
+- a pattern `name` over 128 characters;
+- a rendered `redaction_placeholder` over 512 bytes;
+- a repeated built-in pattern name;
+- more than 256 custom regex patterns per list (1024 `blocked_phrases`);
+- a `max_scan_bytes` above 67108864 (64 MiB).
+
+Structured redaction that would grow a response past its allowance now fails closed (`502` for the response guard, `413` for the prompt shield) instead of delivering an oversized rewrite. Adjust configs that exceed these bounds before upgrading.
+
+### `jwks_auth` provider limits (PR #6644)
+
+A `jwks_auth` instance accepts at most 64 `providers`. For every `issuer`, the providers that share it plus the providers that set no `issuer` must total at most 8, and at most 8 providers may omit `issuer`. A config past these limits is refused at construction. A token is now verified only against providers whose `issuer` equals its `iss`, plus issuer-less providers. Merge duplicate providers, or split very large provider sets across routes. In mesh mode, identical RequestAuthentication rules are installed once. A combined set past the limits fails construction, so the data plane keeps its last accepted configuration.
+
+### `VAULT_ADDR` must use `https` for a remote Vault (#6582)
+
+`_VAULT` and `vault://` resolution now refuses a plaintext `http` `VAULT_ADDR`
+unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Startup and
+`ferrum-edge validate` exit with a diagnostic naming `VAULT_ADDR`. Switch the
+address to `https`. If you must keep plaintext to a remote Vault, set
+`FERRUM_VAULT_ALLOW_PLAINTEXT=true` in the environment and expect a warning at
+startup. A Vault redirect to a plaintext address is refused under the same
+rule, and a loopback `http` Vault (for example a local agent) is no longer
+reached through `HTTP_PROXY`/`ALL_PROXY`.
+
+### `soap_ws_security` checks pinned certificate validity and refuses zoneless instants (PR #6632)
+
+A certificate in `x509_signature.trusted_certs` or
+`saml.trusted_signing_certs` is now trusted only between its `notBefore` and
+`notAfter`. Signatures from an expired or not-yet-valid pin get `401`. Such a
+pin still loads, with a warning, so a replacement can be staged ahead of its
+`notBefore`. Before upgrading, replace any pinned certificate that has expired.
+`xsd:dateTime` values without a `Z` or `±hh:mm` designator (Timestamp,
+PasswordDigest `Created`, SAML `Conditions`/`SubjectConfirmationData`) are now
+rejected. Make sure partners send UTC instants with a designator.
+
+### Hard ceilings on cache and decode size knobs (#6612, PR #6638)
+
+These plugin fields are now refused at admission above a hard ceiling:
+- `response_caching` `max_entries` is capped at 10000000.
+- `openapi_validator` `max_body_bytes` is capped at 67108864 (64 MiB).
+- `body_validator` `grpc_max_decompressed_size_bytes` is capped at 67108864.
+
+An omitted `body_validator` value inherited from a larger `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` is clamped to the ceiling instead of refused. Lower any configured value above its ceiling before upgrading; otherwise the plugin config is rejected (`400` on the Admin API, startup failure in file mode).
+
+### `waf` exemption and unlisted-content-type defaults are stricter (PR #6646)
+
+- `global_exemptions.header_present` values must be shared secrets of at
+  least 16 characters. Replace any `null` (presence-only) or short value with
+  a secret that a trusted hop in front of the gateway injects, and have that
+  hop strip client copies of the header.
+- `global_exemptions` criteria now combine with AND. If an exemption lists
+  several of `paths`, `methods`, `ips`, and `consumers` and relied on any one
+  of them matching, add `match: any` (or split the intent so each criterion is
+  safe alone).
+- `on_unlisted_content_type` and the new `on_unlisted_response_content_type`
+  default to `fail_closed`. Under enforcing body rules, a non-empty body whose
+  `Content-Type` is not in the scan scope is now refused (`403`). Before
+  upgrading, add the types your routes legitimately carry to
+  `body_content_types`, enable `inspect_multipart` / `inspect_binary_body`,
+  exempt upload/download routes, or set the option to `allow` explicitly.
+  gRPC, protobuf, and image bodies are unlisted by default.
+- `body_methods` now includes `DELETE`.
+
+### `ai_transcript_audit` `redaction.hash_secret` needs 32 characters (issue #6617)
+
+The minimum length of `redaction.hash_secret` rose from 16 to 32 characters
+(Unicode code points). A config with a shorter secret is refused at load time.
+Before upgrading, replace the secret with a random value of at least 32
+characters. Placeholder digests and body hashes keyed with the old secret will
+no longer match the new ones, so collectors that correlate across the upgrade
+see a one-time break.
+
+### Cleartext AI embedding endpoints need an opt-in (issue #6617)
+
+`ai_semantic_cache` and `ai_semantic_firewall` send an API key with every
+embedding call. An `http://` embedding endpoint is now refused at load time
+unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`.
+The name `localhost` does not count, because DNS overrides decide where it
+connects. Before upgrading, either:
+
+- switch the endpoint to `https://`,
+- point a local sidecar at `127.0.0.1` instead of `localhost`, or
+- set `semantic_embedding_allow_plaintext: true` (cache) or
+  `provider.allow_plaintext: true` (firewall) when cleartext to that host is
+  intended.
+
+`ai_semantic_firewall` also refuses a `provider.endpoint` that contains
+whitespace or control characters instead of trimming them.
+
+### keyauth API keys need at least 16 non-whitespace characters (#6577)
+
+Consumer create, update, batch, restore, and the credential endpoints now
+reject a `keyauth` `key` with fewer than 16 non-whitespace characters (`400`),
+and a file-mode config that contains one fails to load. A database-mode gateway
+or control plane keeps authenticating keys it already stores, with a validation
+warning at each load. A data plane, however, refuses any CP snapshot that
+contains a short key and keeps its previous config; a newly started DP has no
+config at all. **Rotate every short key before upgrading** file-mode gateways
+and CP/DP deployments, through `POST /consumers/{id}/credentials/keyauth` (add
+the new key, move clients, then delete the old entry).
+
+### `cors` credentialed origin matchers (PR #6639)
+
+With `allow_credentials: true`, a `"*.suffix"` origin is refused when the suffix is a single label, a public suffix, or has a Public Suffix List rule beneath it (`*.com`, `*.co.uk`, `*.github.io`, `*.amazonaws.com`). A credentialed `regex` origin must prove that it pins the host. Use exact origins, a registrable-domain wildcard such as `"*.example.com"`, an anchored regex ending in a fixed domain, or the host-bounded prefix `scheme://host:`. Without credentials these matchers are unchanged.
+
+### `access_control` refuses an explicitly empty allow-list (#6607)
+
+`allowed_consumers: []` or `allowed_groups: []` used to mean "no allow
+restriction", so beside a deny-list or `allow_authenticated_identity` it
+admitted everyone the deny side did not name. A present but empty allow-list
+is now a config validation error, and a stored config that carries one fails
+to load. Delete the key if no allow restriction is intended, or list the
+consumers or groups that should be admitted. Empty deny-lists are unaffected.
+
+### Azure Key Vault references must use `https://` (#6570, PR #6603)
+
+The Azure Key Vault backend now uses the 1.x Azure SDK. That SDK sends the
+Entra bearer token only over TLS, and Ferrum now refuses any vault URL that is
+not `https://`. This applies to `_AZURE` values and to `azure://` TLS sources.
+Such a URL fails `ferrum-edge validate` and startup.
+
+- **Public or private-link vaults (`https://<vault>.vault.azure.net/...`):** no
+  change.
+- **`http://` emulators, fakes, sidecars, or proxies:** serve them over TLS. If
+  their certificate is not publicly trusted, set `FERRUM_TLS_CA_BUNDLE_PATH` in
+  the process environment to the issuing CA. Key Vault calls trust it in
+  addition to the platform roots. An unreadable, non-regular, or oversized
+  bundle, or one with no certificates, now fails resolution. A sidecar that
+  relays Azure's `resource="https://vault.azure.net"` challenge must be
+  addressed as `<vault>.vault.azure.net`, because the SDK checks the challenge
+  domain against the request host.
+- **Embedding code:** `AzureCredentials::new` and
+  `AzureCredentials::from_static_token` are `async` and return a `Result`.
+
+See [FEATURES.md](../FEATURES.md#tls-and-trust) for an emulator example.
+
+### `jwt_auth` rejects an unexpected `aud` claim (#6576)
+
+With no `audiences` configured, `jwt_auth` used to skip audience checks
+entirely. It now keeps strict validation: a token without `aud` still
+authenticates, but a token that carries an `aud` claim gets `401` unless
+`audiences` lists a matching value. If your issuers put `aud` in consumer
+tokens, list the accepted values in the plugin's `audiences`.
+
+### `request_mirror` strips credential-shaped names (PR #6631)
+
+Cross-origin mirrors now drop any header or decoded query name that looks like a credential (for example `x-session-id`, `jwt`, `session_id`, `key`, `code`, `PHPSESSID`), in addition to the previous lists. If a mirror target legitimately needs one of these names, list it in `forward_sensitive_header_allowlist` or `forward_sensitive_query_allowlist` together with `forward_sensitive_headers` / `forward_sensitive_query: true`. Query allowlist entries may now contain brackets (`filter[key]`) but not `%`, `+` or query delimiters.
+
 ### Shared consumer credentials are refused (#6572)
 
 Consumers whose `id`, `username` or `custom_id` collide are still quarantined
@@ -46,6 +271,7 @@ and otherwise exits before its Admin API binds. **Before upgrading**, look for
 `Credential collision` warnings in the gateway log and rotate or remove one
 side of each collision, either through the Admin API of a still-running
 (pre-upgrade) instance or directly in storage.
+
 ### `openapi_validator` bypass headers need a secret (PR #6634)
 
 Each `bypass.header_present` entry must now map the header name to a secret of 16–4096 visible ASCII characters. A request skips validation only when the header carries exactly that secret. Replace `null` (presence-only) entries with a long random secret, and have a trusted hop or gateway plugin inject the header. Configs that still use `null` or a short value are refused at construction.
