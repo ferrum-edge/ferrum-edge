@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **WAF `body_json_path` rules inspect wide-charset and duplicate-member JSON.**
+  A JSON-path rule previously parsed only the raw request bytes with a parser
+  that keeps the last of any duplicated object member, so a UTF-16 / UTF-32
+  (or UTF-8 BOM-prefixed) JSON body was never matched, and a value carried by
+  an earlier duplicate member was never inspected, while the original bytes
+  were forwarded. JSON-path rules now parse the raw body and every UTF-16 /
+  UTF-32 inspection view the body-text rules already use, and follow every
+  occurrence of a duplicated member (including escaped spellings of the same
+  name); the rule matches if any selected value matches.
+
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,
   and the paired counter read previously fetched counters with a plain

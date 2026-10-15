@@ -5,10 +5,11 @@ use std::net::IpAddr;
 use super::BodyDirection;
 use super::Waf;
 use super::decode;
+use super::json_doc;
 use super::normalize;
 use super::rules::{
-    BytesRuleSet, CompiledRule, Field, FieldExclusions, JsonPathMatcher, JsonPathRule,
-    JsonPathSegment, RuleHit, RuleRef, RuleTarget, TextRuleSet, UrlQuery, extract_ip_tokens,
+    BytesRuleSet, CompiledRule, Field, FieldExclusions, JsonPathMatcher, JsonPathRule, RuleHit,
+    RuleRef, RuleTarget, TextRuleSet, UrlQuery, extract_ip_tokens,
 };
 use super::websocket::WsSessionPolicy;
 use crate::plugins::RequestContext;
@@ -320,21 +321,28 @@ impl Waf {
         };
         let mut outcome = ScanOutcome::default();
         self.scan_bytes_set(&mut outcome, bytes, body, subject);
-        if direction == BodyDirection::Request {
-            // JSON-path rules normalize selected scalars, never the whole
-            // document: normalization must not rewrite unrelated '+' values.
-            self.scan_json_path_rules(&mut outcome, body, subject);
-        }
-        // Encoding-only packs also consume text views. JSON-path-only packs
-        // retain their semantic parser without allocating unused wide views.
-        let transcoded_views = if text_rules_active
+        // Encoding-only packs also consume text views.
+        let text_views_active = text_rules_active
             || self.specials.encoding.is_some()
-            || self.specials.overlong_utf8.is_some()
-        {
+            || self.specials.overlong_utf8.is_some();
+        let json_paths_active =
+            direction == BodyDirection::Request && !self.compiled.body_json_paths.is_empty();
+        let transcoded_views = if text_views_active || json_paths_active {
             normalize::decode_wide_charset_body_views(body, content_type)
         } else {
             normalize::WideCharsetViews::empty()
         };
+        if json_paths_active {
+            // JSON-path rules normalize selected scalars, never the whole
+            // document: normalization must not rewrite unrelated '+' values.
+            // They parse every admitted reading of the body — the raw bytes and
+            // each UTF-16 / UTF-32 view — since a backend may accept any of
+            // them as JSON.
+            self.scan_json_path_rules(&mut outcome, body, subject);
+            for decoded in transcoded_views.iter() {
+                self.scan_json_path_rules(&mut outcome, decoded.as_bytes(), subject);
+            }
+        }
         let text = String::from_utf8_lossy(body);
         if transcoded_views.uninspectable_charset()
             && let Some(rule_index) = self.specials.encoding
@@ -344,9 +352,11 @@ impl Waf {
         // A declared charset adds coverage; it must not remove matches from
         // raw text or its transformations (including mixed representations).
         self.scan_body_text_view(&mut outcome, text.as_ref(), subject, direction);
-        for decoded in transcoded_views.iter() {
-            self.scan_bytes_set(&mut outcome, bytes, decoded.as_bytes(), subject);
-            self.scan_body_text_view(&mut outcome, decoded, subject, direction);
+        if text_views_active {
+            for decoded in transcoded_views.iter() {
+                self.scan_bytes_set(&mut outcome, bytes, decoded.as_bytes(), subject);
+                self.scan_body_text_view(&mut outcome, decoded, subject, direction);
+            }
         }
         outcome
     }
@@ -506,22 +516,23 @@ impl Waf {
         if self.compiled.body_json_paths.is_empty() {
             return;
         }
-        let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        // Duplicate-preserving parse: every occurrence of a repeated member
+        // is inspected, so the verdict holds whichever one the backend reads.
+        let Some(json) = json_doc::parse(body) else {
             return;
         };
         for path_rule in &self.compiled.body_json_paths {
-            let Some(value) = json_path_value(&json, &path_rule.path) else {
-                continue;
-            };
-            let mut scratch = None;
-            let Some(text) = json_scan_text(value, &mut scratch) else {
-                continue;
-            };
-            self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
-            // `text` is already JSON-unescaped; its single-character escapes
-            // are not resolved a second time.
-            for variant in normalize::decoded_json_value_variants(text) {
-                self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
+            for value in json_doc::select(&json, &path_rule.path) {
+                let mut scratch = None;
+                let Some(text) = json_doc::scan_text(value, &mut scratch) else {
+                    continue;
+                };
+                self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
+                // `text` is already JSON-unescaped; its single-character
+                // escapes are not resolved a second time.
+                for variant in normalize::decoded_json_value_variants(text) {
+                    self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
+                }
             }
         }
     }
@@ -1120,43 +1131,6 @@ fn header_value_target_matches(target: &RuleTarget, header_name: &str) -> bool {
             .iter()
             .any(|configured| configured.eq_ignore_ascii_case(header_name)),
         _ => false,
-    }
-}
-
-fn json_path_value<'a>(
-    value: &'a serde_json::Value,
-    path: &[JsonPathSegment],
-) -> Option<&'a serde_json::Value> {
-    let mut current = value;
-    for segment in path {
-        match segment {
-            JsonPathSegment::Key(key) => {
-                current = current.get(key)?;
-            }
-            JsonPathSegment::Index(index) => {
-                current = current.get(*index)?;
-            }
-        }
-    }
-    Some(current)
-}
-
-fn json_scan_text<'a>(
-    value: &'a serde_json::Value,
-    scratch: &'a mut Option<String>,
-) -> Option<&'a str> {
-    match value {
-        serde_json::Value::String(value) => Some(value.as_str()),
-        serde_json::Value::Number(value) => {
-            *scratch = Some(value.to_string());
-            scratch.as_deref()
-        }
-        serde_json::Value::Bool(value) => Some(if *value { "true" } else { "false" }),
-        serde_json::Value::Null => Some("null"),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            *scratch = Some(value.to_string());
-            scratch.as_deref()
-        }
     }
 }
 

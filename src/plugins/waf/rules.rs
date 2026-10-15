@@ -513,9 +513,9 @@ pub(super) struct CompiledRules {
     pub(super) body_cidr_rules: Vec<usize>,
     pub(super) response_cidr_rules: Vec<usize>,
     pub(super) request_body_rules_active: bool,
-    /// Precomputed cold-path decision for charset transcoding. JSON-path-only
-    /// packs keep their semantic parser path and do not allocate a whole-body
-    /// UTF-8 view that no active rule would consume.
+    /// Precomputed cold-path decision for the whole-body text scans. JSON-path
+    /// rules are gated separately: they transcode UTF-16 / UTF-32 bodies for
+    /// their own parse, but never run the text-view scans.
     pub(super) request_body_text_rules_active: bool,
     pub(super) request_cheap_rules_active: bool,
     /// Any compiled rule (text set or CIDR) targets cookies, so the cookie
