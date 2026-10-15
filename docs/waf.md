@@ -228,8 +228,10 @@ matching request and response bodies, the WAF also scans **decoded variants**:
 
 - UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request and response bodies
   admitted by the direction's body content-type gates, using an explicit
-  `charset`, a byte-order mark, or an undeclared wide-text prefix signature
-  (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
+  `charset`, a byte-order mark, or a wide-text prefix signature when no
+  UTF-16 / UTF-32 charset is declared (a `utf-8` or unrecognized label does not
+  switch the signature off; bare `utf-16` / `utf-32` without a BOM tries both
+  endiannesses)
 - JSON / JavaScript string escapes — `\uXXXX`, `\u{...}`, `\xXX`, and the
   single-character escapes `\n`, `\t`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`,
   `\'`, `\\`. A JSON parser resolves these before the application sees the
@@ -416,6 +418,19 @@ Runtime aliases map onto those targets: `request_headers` → `header_values`,
 `request_url` → `full_url`, `request_method` → `method`, and
 `request_body` → `body_text`. `path` is valid only on `body_json_path`;
 `names` is valid only on `header_values` / `request_headers`.
+
+A `body_json_path` rule parses every reading of the body the WAF inspects: the
+raw bytes (a leading UTF-8 byte-order mark is skipped) and each UTF-16 / UTF-32
+view described under decoded variants below, so a JSON body re-encoded in a
+wide charset is matched like its UTF-8 form. Duplicated object members are not
+collapsed: the path follows every occurrence of each member name (including a
+`\u`-escaped spelling of the same name), at the leaf and on enclosing objects,
+and the rule matches if any selected value matches. A path that selects an
+object or array is matched against its compact JSON as a last-wins parser
+reads it and, when the subtree holds duplicated members, also as a
+first-wins parser reads it and with every member kept; each reading is
+matched and false-positive-filtered on its own. A backend that keeps the
+first, the last, or every occurrence is therefore covered by the same verdict.
 
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
