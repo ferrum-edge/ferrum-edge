@@ -616,6 +616,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pre-plugin `HEAD` refusals carry no body on HTTP/2 and HTTP/3.** The
+  `allowed_methods` `405` and the route-protocol admission `403` were built
+  outside the shared synthetic-response finalizer, so a refused `HEAD` sent
+  its JSON body as DATA on HTTP/2 and HTTP/3 (HTTP/1.1 was unaffected because
+  Hyper drops it). Both now apply the shared wire contract: the response keeps
+  its representation `Content-Length` and sends no body bytes.
+
 - **AI token metering counts prompt-cache, thinking and tool-use tokens**
   (issue #6623). Anthropic `cache_creation_input_tokens` and
   `cache_read_input_tokens` and Bedrock Converse `cacheReadInputTokens` and

@@ -28224,6 +28224,31 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     normalized
 }
 
+/// Apply the shared synthetic-response wire contract to a gateway-authored
+/// rejection that is built without the after-proxy finalizer (the pre-plugin
+/// admission refusals): a `HEAD` response keeps its representation
+/// `Content-Length` but carries no body bytes, and the normalized reject
+/// carries the matching body disposition. Hyper drops a `HEAD` body on
+/// HTTP/1.1, but HTTP/2 would send it as DATA. Native gRPC rejections are
+/// trailers-only already and are left untouched.
+pub(crate) fn apply_synthetic_reject_wire_contract(
+    reject: &mut NormalizedRejectResponse,
+    method: &str,
+) {
+    let status = reject.http_status.as_u16();
+    if reject.grpc_status.is_none()
+        && crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+            method,
+            status,
+            &mut reject.headers,
+            reject.body.len(),
+        )
+    {
+        reject.body = Bytes::new();
+    }
+    reject.body_disposition = headers_mod::RejectBodyDisposition::for_request(method, status);
+}
+
 pub(crate) fn build_response_from_normalized_reject(
     reject: NormalizedRejectResponse,
 ) -> Response<ProxyBody> {
@@ -34729,6 +34754,7 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
+        apply_synthetic_reject_wire_contract(&mut reject, &ctx.method);
         record_status(&state, StatusCode::FORBIDDEN.as_u16());
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
@@ -34766,6 +34792,7 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
+        apply_synthetic_reject_wire_contract(&mut reject, &ctx.method);
         // Empty plugin list: do not run after_proxy / request hooks merely to
         // shape the response. Logging uses a separate immutable cache view.
         let grpc_web_response =

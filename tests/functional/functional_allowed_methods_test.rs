@@ -304,6 +304,73 @@ async fn functional_allowed_methods_http3_rejects_before_backend() {
     );
 }
 
+/// A refused `HEAD` keeps its representation `Content-Length` but carries no
+/// body bytes. Hyper drops a HEAD body on HTTP/1.1 itself, so HTTP/2 and
+/// HTTP/3 are the protocols that would otherwise send DATA.
+#[ignore]
+#[tokio::test]
+async fn functional_allowed_methods_head_refusal_has_no_body_on_h2_and_h3() {
+    let backend = CountingBackend::start().await;
+    let gateway = TestGateway::builder()
+        .mode_file(build_config(backend.port, &["GET"]))
+        .log_level("warn")
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
+
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h2c client");
+    let h2_head = h2
+        .head(gateway.proxy_url("/allowed"))
+        .send()
+        .await
+        .expect("h2 HEAD");
+    assert_eq!(h2_head.version(), reqwest::Version::HTTP_2);
+    assert_eq!(h2_head.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    assert_allow_header(h2_head.headers(), &["GET"]);
+    assert!(
+        h2_head.bytes().await.expect("h2 HEAD body").is_empty(),
+        "an HTTP/2 HEAD refusal must carry no DATA"
+    );
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://localhost:{https_port}/allowed");
+    let options = GetOptions::default().method(Method::HEAD);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let h3_head = loop {
+        match client.get_with_options(&url, options.clone()).await {
+            Ok(response) => break response,
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+            Err(err) => panic!("H3 HEAD did not complete: {err}"),
+        }
+    };
+    assert_eq!(h3_head.status, http::StatusCode::METHOD_NOT_ALLOWED);
+    assert_allow_header(&h3_head.headers, &["GET"]);
+    assert!(
+        h3_head.body_bytes.is_empty(),
+        "an HTTP/3 HEAD refusal must carry no DATA"
+    );
+    assert_eq!(
+        backend.hits(),
+        0,
+        "a refused HEAD must not reach the backend"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Client-selected flavors that cannot run the route's admission policy
 // ---------------------------------------------------------------------------

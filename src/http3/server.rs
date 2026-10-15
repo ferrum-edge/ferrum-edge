@@ -4036,11 +4036,17 @@ async fn handle_h3_request(
             )
             .await?;
         } else {
+            let body = h3_synthetic_reject_wire_body(
+                &ctx.method,
+                StatusCode::METHOD_NOT_ALLOWED,
+                &mut headers,
+                Bytes::from_static(br#"{"error":"Method Not Allowed"}"#),
+            );
             send_h3_finalized_reject_flavor_aware(
                 &mut stream,
                 http_flavor,
                 StatusCode::METHOD_NOT_ALLOWED,
-                Bytes::from_static(br#"{"error":"Method Not Allowed"}"#),
+                body,
                 &headers,
                 RejectBodyDisposition::for_request(
                     &ctx.method,
@@ -4141,17 +4147,51 @@ async fn handle_h3_request(
             "Rejected HTTP/3 request: route admission policy does not run on the requested protocol"
         );
         record_h3_flavor_aware_reject(&state, http_flavor, 403);
-        send_h3_error_flavor_aware_with_policy(
-            &mut stream,
-            http_flavor,
-            grpc_web_response_content_type,
-            StatusCode::FORBIDDEN,
-            crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY,
-            crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
-            "Request protocol not permitted on this route",
-            initial_response_header_policy_plugins.as_ref(),
-        )
-        .await?;
+        if grpc_web_response_content_type.is_none()
+            && !matches!(http_flavor, HttpFlavor::Grpc)
+            && crate::plugins::utils::synthetic_response::synthetic_response_omits_body(
+                &ctx.method,
+                StatusCode::FORBIDDEN.as_u16(),
+            )
+        {
+            // A plain `HEAD` to a gRPC-intended route: keep the representation
+            // `Content-Length` and send no DATA.
+            let mut headers = HashMap::new();
+            finalize_h3_gateway_error_headers(
+                http_flavor,
+                StatusCode::FORBIDDEN,
+                crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY.as_bytes(),
+                &mut headers,
+                initial_response_header_policy_plugins.as_ref(),
+            );
+            let body = h3_synthetic_reject_wire_body(
+                &ctx.method,
+                StatusCode::FORBIDDEN,
+                &mut headers,
+                Bytes::from_static(crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY.as_bytes()),
+            );
+            send_h3_finalized_reject_flavor_aware(
+                &mut stream,
+                http_flavor,
+                StatusCode::FORBIDDEN,
+                body,
+                &headers,
+                RejectBodyDisposition::for_request(&ctx.method, StatusCode::FORBIDDEN.as_u16()),
+            )
+            .await?;
+        } else {
+            send_h3_error_flavor_aware_with_policy(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::FORBIDDEN,
+                crate::proxy::ROUTE_PROTOCOL_NOT_PERMITTED_BODY,
+                crate::proxy::grpc_proxy::grpc_status::PERMISSION_DENIED,
+                "Request protocol not permitted on this route",
+                initial_response_header_policy_plugins.as_ref(),
+            )
+            .await?;
+        }
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
             &logging_plugins,
@@ -18541,6 +18581,27 @@ fn reject_response_sets_content_type(headers: &HashMap<String, String>) -> bool 
     headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case("content-type"))
+}
+
+/// Body bytes for a pre-plugin gateway refusal under the shared
+/// synthetic-response wire contract: a `HEAD` response keeps its
+/// representation `Content-Length` (added to `headers`) and sends no DATA.
+fn h3_synthetic_reject_wire_body(
+    method: &str,
+    status: StatusCode,
+    headers: &mut HashMap<String, String>,
+    body: Bytes,
+) -> Bytes {
+    if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+        method,
+        status.as_u16(),
+        headers,
+        body.len(),
+    ) {
+        Bytes::new()
+    } else {
+        body
+    }
 }
 
 fn finalize_h3_gateway_error_headers(
