@@ -7134,6 +7134,7 @@ fn telemetry(
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
                 custom_env_tags: HashMap::new(),
+                safe_tag_sources: Vec::new(),
                 providers: Vec::new(),
             };
             let mut emits_server = false;
@@ -11186,7 +11187,7 @@ mod tests {
                 serde_json::json!({
                     "tracing": [{
                         "customTags": {
-                            "credential": {
+                            "env_tag": {
                                 "environment": {
                                     "name": "FERRUM_ADMIN_JWT_SECRET"
                                 }

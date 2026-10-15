@@ -9,8 +9,9 @@ use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema};
 use ferrum_edge::plugins::utils::metadata_redaction::{
     INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_dedup_internal_metadata_key,
-    is_internal_only_metadata_key, is_mesh_metrics_internal_metadata_key,
-    is_sensitive_metadata_key_with_extras, parse_extras_list, strip_dedup_internal_metadata,
+    is_internal_only_metadata_key, is_mesh_metrics_internal_metadata_key, is_sensitive_header_name,
+    is_sensitive_metadata_key_with_extras, metadata_value_is_redacted, parse_extras_list,
+    strip_dedup_internal_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
 use serde_json::{Map, Value, json};
@@ -48,8 +49,8 @@ const NON_SECRET_COUNTERS: &[&str] = &[
     "ai_total_tokens",
     "ai_prompt_tokens",
     "ai_completion_tokens",
-    "cache_key",
-    "routing_key",
+    "grpc_status",
+    "route_request_timeout",
 ];
 
 const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
@@ -544,4 +545,441 @@ fn operator_extra_keys_redact_on_native_and_shaped_views() {
         "ai_total_tokens",
         &extras
     ));
+}
+
+/// Issue #6619: credential classes redact by class, not by list. None of these
+/// spellings appears in any exact or substring list.
+const UNLISTED_CREDENTIAL_CLASS_KEYS: &[&str] = &[
+    "session_id",
+    "x-session-id",
+    "userSessionIdentifier",
+    "SESSIONID",
+    "sid",
+    "passwd",
+    "db_pwd",
+    "GPG_PASSPHRASE",
+    "doorPasscode",
+    "hsm_pin",
+    "totp_seed",
+    "otp",
+    "credential",
+    "client_credentials",
+    "jwt",
+    "idJwt",
+    "request_signature",
+    "x-signature",
+    "private_key",
+    "privateKeyPem",
+    "awsAccessKey",
+    "access-key",
+    "signing_key",
+    "client_assertion",
+    "samlAssertion",
+    "assertion",
+    "x-csrf",
+    "xsrf",
+    "accesstoken",
+    "privatekey",
+    "x-privatekey",
+    "clientkey",
+    "encryptionKey",
+    "masterkey",
+    "awsaccesskeyid",
+    "assertion_value",
+    "assertion_xml",
+    "ASSERTION_VALUE",
+    "private_rsa_key",
+    "privateRsaKey",
+    "x-private-rsa-key",
+    "signing-ed25519-key",
+    "hsmpin",
+    "x-hsmpin",
+    "totpseed",
+    "dbpwd",
+    "x-csrfValue",
+    "x-csrfvalue",
+    "x-vendorPin",
+    "x-vendorpin",
+    "smsotp",
+    "privateecckey",
+    "privatepkcs12key",
+    "awsaccess_key",
+    "x-awsaccess-key",
+    "private_rsapem_key",
+    "x-private-rsapem-key",
+    "x-vendorPinValue",
+    "x-userSid",
+    "idJws",
+    "idJwe",
+    "pinvalue",
+    "smsOtpCode",
+    "x-sigValue",
+    "x-vendorCred",
+    "x-dbPinValue",
+    "SIGVALUE",
+    "CREDVALUE",
+    "private_rsa2048_key",
+    "private_rsa_2048_key",
+    "privateRSA2048Key",
+    "encryption_aes256_key",
+    "mesh.private_rsa2048_key",
+    "x-dbPin",
+    "x-sigBase64",
+    "private_ec_p256_key",
+    "signing_rsa_pss_key",
+    "x-private-ec-p256-key",
+    "mesh.private_ec_p256_key",
+    "privateecp256key",
+    "x-sigBase64Url",
+    "x-dbPinUtf8",
+    "x-pin1",
+    "ssh_keys",
+    "signingKeyBase64Url",
+    "signingkeybase64url",
+    "signingkey1",
+    // Owner-qualified `…pass` joined, then `phrase` / `code` split off.
+    "gpgpass_phrase",
+    "GPGPASS_PHRASE",
+    "x-gpgpass-phrase",
+    "vaultPass_code",
+    // Key material with the qualifier after `key`.
+    "key_private",
+    "keyPrivate",
+    "x-key-private",
+    "key_signing",
+    "keys_private",
+    "mesh.key_private",
+    "keyprivate",
+    "x-signingKey1Base64Url",
+    "x-dbPin1Value",
+    "x-signingKeyEncoded",
+    "x-signingKeyUtf8",
+    "mesh.signingkeyencoded",
+    "x-signingKeyString",
+    "signingkeyseed",
+    "x-signingKeyJwk",
+    "x-pinCleartext",
+    "pincleartext",
+    "x-sessValue",
+    "sessvalue",
+    "pinencrypted",
+    "x-pinText",
+    "x-sidEncrypted",
+    "x-sigHeader",
+    "CREDOPAQUE",
+    "dbCredsValue",
+    "userPinsValue",
+    "userSidsHash",
+    "x-vendorTokenValue",
+    "x-apiKeyValue",
+    "gpgPassPhrase",
+    "pass_phrase",
+    "passCode",
+    "pass_code",
+    "pass_word",
+    "vendorTokenString",
+    "vendorTokenSeed",
+    "gpgPassPhrase1",
+    "pass_phrase1",
+    "pass_codes",
+    "x-tokenOpaque",
+    "tokenopaque",
+    "x-tokenSigned",
+    "tokenserialized",
+    "x-passKey",
+    "passkey",
+    "x-tokenSingleUse",
+    "tokensingleuse",
+    "mfaCode",
+    "mfa_code",
+    "mfa_seed",
+    "x-mfa-code",
+    "x-mfaKey",
+    "mfakey",
+    "redis_integrity_key",
+    "x-integrity-key",
+    "x-vendorTokenOpaque",
+    "vendortokensigned",
+    "mfa_recovery_code",
+    "mfa_backup_code",
+    "mfarecoverycode",
+    "aes_key",
+    "aeskey",
+    "x-aes-key",
+    "mesh.aes_key",
+    "dbPinCleartext",
+    "vendorSigHeader",
+    "privateKeyWordsBase64",
+    "privatekeychainpem",
+    "XPin",
+    "XSig",
+    "XCred",
+    "XOtp",
+    "tenantPinOpaque",
+    "JwT",
+    "HSM_PiN",
+    "privateKeY",
+    "mesh.privateKeY",
+    "ToKeN",
+    "SIGNING_KeY",
+    "HSM_PiNs",
+    "GPG_PaSs_Phrase",
+    "MfA_RECOVERY_CODE",
+    "PiN1",
+    "SiGValue",
+    "SeSsValue",
+    "mFaRecoveryCode",
+    "access_tokens",
+    "refreshTokens",
+    "x-access-tokens",
+    "refresh_v2_tokens",
+    "access_opaque_tokens",
+    "refreshOpaqueTokens",
+    "refreshopaquetokens",
+    "oauth2_tokens",
+    "refreshopaque_v2_tokens",
+    "crypto_key",
+    "cryptokey",
+    "mesh.crypto_key",
+    "mesh.signingkeybase64url",
+    "x-dbPinValueHex",
+    "private_ec_p256_pkcs8_pem_key",
+    "mesh.private_ec_p256_pkcs8_pem_key",
+    "x-private-ec-p256-pkcs8-pem-der-key",
+    // The outcome-signal exemption covers only its complete key.
+    "session_id.assertion_out_of_scope",
+    "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
+];
+
+/// Ordinary dimensions that share a word or stem with a credential class.
+const CREDENTIAL_CLASS_NEGATIVE_CONTROLS: &[&str] = &[
+    "ai_total_tokens",
+    "cache_key",
+    "routing_key",
+    "request_id",
+    "correlation_id",
+    "keyboard_layout",
+    "spin_count",
+    "pinned_version",
+    "auth_method",
+    "consumer_username",
+    "mesh_authz.ignored_baggage",
+    "mesh_authz.ignored_baggage.assertion_out_of_scope",
+    "ai_stream_router_pass_through",
+    "signal_strength",
+    "credit_card_brand",
+    "sidecar_version",
+    "cache_2048_key",
+    "design_version",
+    "outside_count",
+    "sacred_flag",
+    "residency",
+    "data_residency",
+    "client_keyboard_layout",
+    "client_keyword",
+    "client_keyspace",
+    "sign_count",
+    "signed_url",
+    "private_monkey_count",
+    "tokenizer_name",
+    "tokens_per_second",
+    "tokenspersecond",
+    "integrity_status",
+    "assess_score",
+    "clientKeyboard",
+    "cacheKey",
+    "bypass_code",
+    "compass_word",
+    "key_count",
+    "keyspace_name",
+];
+
+#[test]
+fn credential_classes_redact_unlisted_spellings_and_keep_ordinary_dimensions() {
+    let extras: Vec<String> = Vec::new();
+    for key in UNLISTED_CREDENTIAL_CLASS_KEYS {
+        assert!(
+            is_sensitive_metadata_key_with_extras(key, &extras),
+            "{key} must be redacted"
+        );
+        // Normalization (HTTP header names are lowercased) must not change
+        // the decision.
+        let lowered = key.to_ascii_lowercase();
+        assert!(
+            is_sensitive_metadata_key_with_extras(&lowered, &extras),
+            "{lowered} (lowercased {key}) must be redacted"
+        );
+    }
+    for key in CREDENTIAL_CLASS_NEGATIVE_CONTROLS {
+        assert!(
+            !is_sensitive_metadata_key_with_extras(key, &extras),
+            "{key} must remain visible"
+        );
+    }
+
+    // The serializer shares the decision: values under unlisted credential
+    // names never reach a sink.
+    let mut metadata = HashMap::new();
+    for (index, key) in UNLISTED_CREDENTIAL_CLASS_KEYS.iter().enumerate() {
+        metadata.insert(
+            (*key).to_string(),
+            format!("credential-class-sentinel-{index}"),
+        );
+    }
+    metadata.insert("request_id".to_string(), "visible-request-id".to_string());
+    let summary = TransactionSummary {
+        metadata,
+        ..TransactionSummary::default()
+    };
+    let json = serde_json::to_string(&summary).expect("serialize summary");
+    assert!(
+        !json.contains("credential-class-sentinel"),
+        "credential-class value leaked: {json}"
+    );
+    assert!(json.contains("visible-request-id"));
+}
+
+#[test]
+fn credential_class_names_are_rejected_as_log_schema_field_names() {
+    for name in [
+        "session_id",
+        "client_assertion",
+        "gpg_passphrase",
+        "session_id.assertion_out_of_scope",
+    ] {
+        let compiled = SummarySchema::compile(
+            &json!({
+                "summary_type": "http",
+                "static_fields": { name: "fixed" }
+            }),
+            "test",
+            SchemaCapabilities::BASE,
+        );
+        assert!(
+            compiled.is_err(),
+            "{name} would always be redacted, so a schema must not emit it"
+        );
+    }
+}
+
+/// Key-material matching is linear in the name: overlapping algorithm words
+/// (`ecdsa` = `ec` + `dsa`) must not drive exponential search on a
+/// client-chosen header name (the transaction debugger classifies those).
+#[test]
+fn credential_class_classification_is_linear_on_overlapping_algorithm_words() {
+    let extras: Vec<String> = Vec::new();
+    let started = std::time::Instant::now();
+    let miss = format!("x-private{}z", "ecdsa".repeat(4_000));
+    let hit = format!("x-private{}key", "ecdsa".repeat(4_000));
+    for _ in 0..10 {
+        assert!(!is_sensitive_metadata_key_with_extras(&miss, &extras));
+        assert!(is_sensitive_metadata_key_with_extras(&hit, &extras));
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "classification took {:?}",
+        started.elapsed()
+    );
+}
+
+/// The outcome-key exemption is metadata-only: header names (debugger,
+/// transcript-audit header capture, cache vary hashing, telemetry header
+/// tags) are caller or upstream data and never take it.
+#[test]
+fn header_names_never_take_the_metadata_outcome_exemption() {
+    let exempt = "mesh_authz.ignored_baggage.assertion_out_of_scope";
+    assert!(!is_sensitive_metadata_key_with_extras(exempt, &[]));
+    assert!(is_sensitive_header_name(exempt));
+    assert!(is_sensitive_header_name("x-session-id"));
+    assert!(!is_sensitive_header_name("x-request-id"));
+    // Debugger header capture and header-tag admission share this decision.
+    for header in [
+        "x-key-private",
+        "x-keyprivate",
+        "x-gpgpass-phrase",
+        "x-key-signing",
+    ] {
+        assert!(is_sensitive_header_name(header), "{header}");
+    }
+}
+
+/// Issue #6619 redesign: metadata values are redacted by default. Names that
+/// slipped past successive classifier rounds, and names no classifier could
+/// recognize, never reach any sink unless they are allowlisted; built-in
+/// gateway names stay visible.
+#[test]
+fn unlisted_metadata_names_are_redacted_by_default_on_every_projection() {
+    const ADVERSARIAL: &[&str] = &[
+        "gpgpass_phrase",
+        "GPGPASS_PHRASE",
+        "x-gpgpass-phrase",
+        "key_private",
+        "keyPrivate",
+        "privateKeY",
+        "hsm_pin\u{e9}",
+        "hsm_pin/opaque",
+        "vault_blob",
+        "custom_plugin_value",
+        // Unknown names beneath built-in prefixes are not allowlisted either.
+        "mesh.vault_blob",
+        "mesh.projectpinopaque",
+        "mcp.custom_blob",
+        "ai_semantic_cache.1.cache_key",
+        // Payloads are never emitted.
+        "request_body",
+        "response_body",
+    ];
+    let mut metadata = HashMap::new();
+    for (index, key) in ADVERSARIAL.iter().enumerate() {
+        metadata.insert((*key).to_string(), format!("default-deny-sentinel-{index}"));
+    }
+    metadata.insert("mesh.source.workload".to_string(), "frontend".to_string());
+    metadata.insert("request_id".to_string(), "visible-request-id".to_string());
+    let summary = summary_with(metadata);
+
+    let native = serialize_native(&summary);
+    let nested = serialize_schema(&summary, json!({ "summary_type": "http" }));
+    let flattened = serialize_schema(
+        &summary,
+        json!({
+            "summary_type": "http",
+            "metadata": { "mode": "flatten", "prefix": "meta_" }
+        }),
+    );
+    for projection in [&native, &nested, &flattened] {
+        let json = projection.to_string();
+        assert!(
+            !json.contains("default-deny-sentinel"),
+            "unlisted metadata value leaked: {json}"
+        );
+        assert!(json.contains("visible-request-id"), "{json}");
+        assert!(json.contains("frontend"), "{json}");
+    }
+    for key in ADVERSARIAL {
+        assert!(metadata_value_is_redacted(key), "{key}");
+    }
+
+    // `mesh.*` trace attributes take the same gate.
+    let attributes = ferrum_edge::plugins::mesh::mesh_trace_attributes(&HashMap::from([
+        (
+            "mesh.key_private".to_string(),
+            "mesh-key-sentinel".to_string(),
+        ),
+        (
+            "mesh.vault_blob".to_string(),
+            "mesh-key-sentinel".to_string(),
+        ),
+        (
+            "mesh.projectpinopaque".to_string(),
+            "mesh-key-sentinel".to_string(),
+        ),
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+    ]));
+    assert!(
+        attributes
+            .iter()
+            .all(|(_, value)| value != "mesh-key-sentinel"),
+        "{attributes:?}"
+    );
+    assert!(attributes.contains(&("mesh.source.workload".to_string(), "frontend".to_string())));
 }

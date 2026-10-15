@@ -274,6 +274,44 @@ under the `_dedup_` prefix, and the gRPC-Web request-trailer staging container
 `grpc_web.request_trailers`, are **omitted entirely** (not redacted) from every
 summary projection.
 
+### Fail-closed metadata allowlist
+
+Metadata VALUES are redacted by default (issue #6619). Every sink that emits
+metadata (native summaries, nested and flattened schema metadata, the
+transaction debugger's selected metadata, `ai_transcript_audit` records and
+`mesh.*` trace attributes) serializes a value only when its key is on the
+allowlist **and** the deny rules below do not match it. Every other value is
+written as `[REDACTED]`; the key itself stays visible.
+
+The allowlist is:
+
+- the gateway's own reviewed metadata keys: exact names such as
+  `mesh.source.workload`, `grpc_web_mode`, `request_id` or `ai_total_tokens`
+  (the complete list is `BUILTIN_SAFE_METADATA_KEYS` in
+  `src/plugins/utils/metadata_redaction.rs`), plus a few per-instance
+  families with a fixed grammar (`grpc_web.instance.<id>.mode`,
+  `ai_semantic_cache.<id>.cache_status`, `ai_ratelimit_remaining#<id>`, …).
+  Whole namespaces are never allowlisted: a name a plugin invents under a
+  built-in prefix (`mesh.vault_blob`) stays redacted;
+- the operator allowlist `FERRUM_LOG_SAFE_METADATA_KEYS`: comma-separated exact
+  names (case-insensitive) or prefixes ending in `*` (`tenant.*`). Add the
+  names a custom plugin writes, `workload_metrics` custom tag names, and any
+  operator-configured metadata key (for example a custom `model_key`) here to
+  log their values.
+
+`request_body` and `response_body` carry payloads and are never emitted,
+whatever any allowlist says; an operator entry naming them is ignored.
+The deny rules always win. An allowlist entry they match (for example
+`session_id` or `key_private`) is ignored and logged as a startup warning, so a
+credential-shaped name cannot be allowlisted. Because unknown names are
+redacted by default, a credential spelling that the classifiers below do not
+recognize (`gpgpass_phrase`, `key_private`, `hsm_piné`) still never reaches a
+sink: the classifiers are now a second line of defense, not the primary gate.
+
+Operator-chosen OUTPUT names (`static_fields`, `derived_fields`, `rename`
+targets, `workload_metrics` custom tag names) are not values copied from
+metadata, so they are checked only against the deny rules below.
+
 ### Sensitive substrings
 
 The full canonical list (`DEFAULT_SENSITIVE_METADATA_KEYS` in
@@ -310,8 +348,8 @@ replaced with `[REDACTED]` at every log sink. Erroring at compile time
 is louder than letting the operator deploy a field that vanishes from
 logs.
 
-Workaround: rename the field to drop the substring (e.g.
-`secret_count` → `total_credentials` or `credential_count`).
+Workaround: rename the field so it matches neither a substring nor a
+credential class below (e.g. `secret_count` → `vault_entry_count`).
 
 ### Per-segment credential classifiers
 
@@ -324,6 +362,64 @@ outer metadata fields, and explicitly selected `static_fields`:
 |---------|--------------------|--------------------------|
 | Token | `token`, `access_token`, `refreshToken`, `id-token`, `APIToken`, `session_token` | `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `prompt_tokens` |
 | API key | `api_key`, `api-key`, `apikey`, `APIKey`, `x-api-key`, `openai_api_key` | `cache_key`, `routing_key`, `api_response_count`, `ai_total_tokens` |
+| Credential class | `session_id`, `x-session-id`, `userSessionIdentifier`, `sid`, `passwd`, `db_pwd`, `GPG_PASSPHRASE`, `doorPasscode`, `hsm_pin`, `totp_seed`, `credential`, `client_credentials`, `jwt`, `request_signature`, `private_key`, `awsAccessKey`, `signing_key`, `client_assertion`, `samlAssertion`, `x-csrf`, `accesstoken` | `request_id`, `cache_key`, `keyboard_layout`, `spin_count`, `pinned_version`, `auth_method`, `mesh_authz.ignored_baggage.assertion_out_of_scope` |
+
+The credential-class classifier is the deny layer on top of the allowlist
+above. It fails closed on spellings that appear in no list (issue #6619). A key is credential-shaped when one of its segments is a
+credential-class word (`session`, `sessions`, `sess`, `sessid`, `sessionid`,
+`sid`, `jwt`, `jws`, `jwe`, `passwd`, `pwd`, `passphrase`, `passcode`, `pin`,
+`otp`, `totp`, `hotp`, `credential(s)`, `cred(s)`, `signature(s)`, `sig`,
+`csrf`, `xsrf`). It is also credential-shaped when a segment contains a
+credential stem or a qualified compound (`usersession`, `dbpassword`,
+`dbpwd`, `gpgpassphrase`, `idjwt`, `requestsignature`, `assertion`,
+`clientassertion`, `csrfvalue`, `totpseed`, `hsmpin`, `otpcode`, `mfasecret`),
+contains `jws`/`jwe`, contains a short class (`pin`, `sid`, `otp`, `sig`, `cred`)
+inside a qualified compound, meaning followed by a listed trailer word
+(`value`, `code`, `id`, `hash`, `base64`, `hex`, `pem`, …, including composed
+trailers such as `valuehex` or `base64url`) or ending the segment after a
+qualifier of at least one letter, or any representation after an owner word
+such as `db`, `vendor`, `user`, `tenant` or `client` (`xpin`, `dbpin`,
+`dbpinvalue`, `dbpincleartext`, `usersid`,
+`smsotpcode`, `sigbase64`, `vendorcred`; ordinary words such as `spin`,
+`hairpin`, `inside`, `design`, `footprint`, `signal`, `credit`, `sacred` and
+`sidecar` stay visible), or ends in `token` after a qualifier (`accesstoken`). Matching is
+linear in the key length. Key material counts when a
+segment contains a key-material qualifier (`private`, `access`, `secret`,
+`signing`, `session`, `client`, `master`, `encryption`, `decryption`, `ssh`,
+`pgp`, `gpg`, `hmac`, `jwt`) followed by `key` in the same segment
+(`privatekey`, `awsaccesskeyid`, `privateecp256key`), or when a later segment
+of the key contains `key`. Any algorithm, curve, size, encoding or mode
+descriptors in between never close the context (`private_key`,
+`private_rsa_2048_key`, `private_ec_p256_key`, `signing_rsa_pss_key`,
+`private_ec_p256_pkcs8_pem_key`), and so does the reverse order (`key_private`,
+`keyPrivate`, `x-key-signing`), while `cache_key` and `routing_key` stay visible. Lowercase compounds are
+recognized as well as camelCase ones, so a name normalized before
+classification (an HTTP header name such as `x-hsmpin`) is still caught for
+every rule above. An owner word joined to `pass` before a split `phrase`,
+`code` or `word` segment counts too (`gpgpass_phrase`, `x-gpgpass-phrase`),
+while `bypass_code` stays visible. One residual of the classifier is
+documented rather than closed (the allowlist still redacts such values unless
+an operator allowlists the name): a
+delimiter-free lowercase name that joins an unlisted owner word, a short class
+(`pin`, `sid`, `otp`, `sig`, `cred`) and an unlisted representation (for
+example `projectpinopaque`) cannot be told apart from ordinary words such as
+`mapping` or `inside` without a dictionary. Delimit or camel-case such names,
+or add them to `FERRUM_LOG_REDACT_METADATA_KEYS`. Header names are lowercased
+by HTTP, so camelCase only helps where the configured spelling is also
+judged: `workload_metrics` header-tag admission checks both the configured
+and the normalized header name. Mixed-case irregular spellings (`JwT`,
+`HSM_PiN`, `privateKeY`, `ToKeN`, `SIGNING_KeY`) are also judged fully
+lowercased with every rule. This fails closed, so a camelCase name whose
+joined lowercase form is a credential compound counts as one (prefer
+snake_case for ordinary dimensions such as `signal_strength`). The
+only exemption is the complete documented outcome key
+`mesh_authz.ignored_baggage.assertion_out_of_scope`. Any other key, including
+one that merely ends the same way, is classified normally. Ordinary dimensions such as `cache_key`, `routing_key` and
+`ai_total_tokens` stay visible. Values under such keys are redacted on every
+sink, `mesh.*` trace attributes with such names are not exported, and the
+transaction debugger redacts captured body fields with such names. Schema `static_fields`, `derived_fields` names, and `rename` targets
+that match are rejected, and so are `workload_metrics` custom tag names,
+header tags, and environment-variable tags.
 
 Segmentation splits on non-alphanumeric delimiters, camelCase boundaries, and
 acronym→word boundaries (`APIKey` → `API` + `Key`, `APIToken` → `API` +

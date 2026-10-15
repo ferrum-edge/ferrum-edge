@@ -13851,6 +13851,10 @@ fn inject_mesh_global_plugins(
         if !tracing.custom_env_tags.is_empty() {
             workload_metrics_config["custom_env_tags"] = serde_json::json!(tracing.custom_env_tags);
         }
+        if !tracing.safe_tag_sources.is_empty() {
+            workload_metrics_config["safe_tag_sources"] =
+                serde_json::json!(tracing.safe_tag_sources);
+        }
         if tracing.disable_span_reporting.unwrap_or(false) {
             workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
         }
@@ -14071,6 +14075,7 @@ fn merge_tracing_config(
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
         custom_env_tags: HashMap::new(),
+        safe_tag_sources: Vec::new(),
         providers: Vec::new(),
     });
 
@@ -14088,6 +14093,9 @@ fn merge_tracing_config(
         &next.custom_header_tags,
         &next.custom_env_tags,
     );
+    if !next.safe_tag_sources.is_empty() {
+        current.safe_tag_sources.clone_from(&next.safe_tag_sources);
+    }
     if !next.providers.is_empty() {
         current.providers.clone_from(&next.providers);
     }
@@ -30742,6 +30750,7 @@ mod tests {
                             custom_tags: HashMap::new(),
                             custom_header_tags: HashMap::new(),
                             custom_env_tags: HashMap::new(),
+                            safe_tag_sources: Vec::new(),
                             providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
@@ -30767,6 +30776,7 @@ mod tests {
                                 "x-tenant".to_string(),
                             )]),
                             custom_env_tags: HashMap::new(),
+                            safe_tag_sources: Vec::new(),
                             providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
@@ -30832,6 +30842,7 @@ mod tests {
                                 "cluster".to_string(),
                                 "ISTIO_META_CLUSTER_ID".to_string(),
                             )]),
+                            safe_tag_sources: Vec::new(),
                             providers: vec![TracingProvider::Zipkin {
                                 url: "http://zipkin:9411/api/v2/spans".to_string(),
                             }],
@@ -30865,6 +30876,7 @@ mod tests {
                                 "region".to_string(),
                                 "FERRUM_REGION".to_string(),
                             )]),
+                            safe_tag_sources: Vec::new(),
                             providers: vec![TracingProvider::OpenTelemetry {
                                 endpoint: "http://otel:4318/v1/traces".to_string(),
                             }],
@@ -32202,6 +32214,7 @@ mod tests {
                             "cluster".to_string(),
                             "ISTIO_META_CLUSTER_ID".to_string(),
                         )]),
+                        safe_tag_sources: Vec::new(),
                         providers: Vec::new(),
                     }),
                     ..MeshTelemetryConfig::default()
@@ -32238,6 +32251,7 @@ mod tests {
             )]),
             custom_header_tags: HashMap::new(),
             custom_env_tags: HashMap::new(),
+            safe_tag_sources: Vec::new(),
             providers: Vec::new(),
         });
         let updated = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
@@ -32299,6 +32313,7 @@ mod tests {
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
                         custom_env_tags: HashMap::new(),
+                        safe_tag_sources: Vec::new(),
                         providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
                         }],
@@ -32371,6 +32386,7 @@ mod tests {
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
                         custom_env_tags: HashMap::new(),
+                        safe_tag_sources: Vec::new(),
                         providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
                         }],

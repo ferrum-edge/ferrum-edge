@@ -15,7 +15,7 @@ use super::{
     CollisionMode, DerivedKind, FieldSpec, HTTP_FIELDS, MetadataPolicy, STREAM_FIELDS,
     SummarySchema, TimestampFormat,
 };
-use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
+use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, metadata_value_is_redacted};
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
 /// Output keys already claimed by the schema's own fields, consulted by
@@ -662,7 +662,7 @@ where
                 }
             }
         }
-        if is_sensitive_metadata_key(key) {
+        if metadata_value_is_redacted(key) {
             map.serialize_entry(&out_key, REDACTED_PLACEHOLDER)?;
         } else {
             map.serialize_entry(&out_key, value)?;
@@ -814,10 +814,9 @@ mod tests {
                 "metadata": { "mode": "flatten", "on_collision": "skip" }
             }),
         );
-        assert_eq!(
-            v.get("event").and_then(Value::as_str),
-            Some("from-metadata")
-        );
+        // The key survives; its value is redacted because `event` is not an
+        // allowlisted metadata name (fail closed, issue #6619).
+        assert_eq!(v.get("event").and_then(Value::as_str), Some("[REDACTED]"));
         assert_eq!(v.get("direction").and_then(Value::as_str), Some("up"));
         assert_eq!(v.get("io_side").and_then(Value::as_str), Some("read"));
     }
@@ -861,9 +860,10 @@ mod tests {
             }),
         );
         // Stream-only native the HTTP entry does not own → metadata survives.
+        // (Its value is redacted: `protocol` is not an allowlisted name.)
         assert_eq!(
             v.get("protocol").and_then(Value::as_str),
-            Some("from-metadata")
+            Some("[REDACTED]")
         );
         // Owned + emitted native → native value wins, metadata dropped.
         assert_eq!(v.get("namespace").and_then(Value::as_str), Some("ferrum"));

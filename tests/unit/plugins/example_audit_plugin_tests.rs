@@ -573,7 +573,7 @@ fn test_metadata_selection_is_deterministic_with_collision_and_omission_markers(
         "entry-bound overflow must emit an omission marker"
     );
     assert!(
-        source.contains("is_sensitive_metadata_key(key)")
+        source.contains("metadata_value_is_redacted(key)")
             && source.contains("REDACTED_PLACEHOLDER"),
         "redaction must run before persistence"
     );
@@ -758,7 +758,10 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
     let cutoff = rfc3339_millis(now - chrono::Duration::days(30));
     let live_ts = |offset_ms: i64| rfc3339_millis(now + chrono::Duration::milliseconds(offset_ms));
 
-    let metadata_prefix = "k".repeat(128);
+    // An allowlisted per-instance key family (`correlation_id.instance.<id>`),
+    // so the values survive the fail-closed metadata gate and the
+    // truncation-collision rule stays observable.
+    let metadata_prefix = format!("correlation_id.instance.{}", "k".repeat(104));
     plugin
         .log(&TransactionSummary {
             timestamp_received: live_ts(0),
