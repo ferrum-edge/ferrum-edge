@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CI and compose MongoDB fixtures move from 7.0 to 9.0** (issue #6589).
+  docker-library has published `mongo:9` at 9.0.4, whose SERVER-136272 fix
+  starts on the Ubuntu 26.04 runner kernel, so the replica-set, TLS, mTLS,
+  coverage, and scale fixtures and the conditional-live-stores digest pin run
+  9.0; the standalone plaintext fixture stays on 4.4.29 as the supported
+  floor. The `docker-compose.yml` `mongodb` profile moves to `mongo:9` (the
+  9-noble variant still ships 9.0.2, without the kernel fix):
+  a compose volume created by MongoDB 7.0 cannot be opened by 9.0, so remove
+  the old volume (`docker compose down -v`) before upgrading a compose stack.
+
 ### Security
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
@@ -20,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command closed so `redis_failure_policy` governs. **Operator action:**
   Redis ACLs for the rate-limit plugins must now grant `GETRANGE` on the
   configured key prefix (the counter reads no longer use `GET`).
+
+- **`ai_response_guard` structured verification now shares one live-capacity
+  window** (issue #6657). The JSON/SSE/gRPC residual pre-checks cloned the
+  document tree, stripped placeholder markers into fresh scratch strings, and
+  re-serialized the candidate, each bounded independently, so peak resident
+  verification memory was a small constant multiple of the retained ceiling
+  rather than the single documented window. A `LiveCapacityLedger` now charges
+  the cloned tree before it is made (body plus charged redaction growth, in
+  serialized-byte units), and the strip scratch, the residual serialization,
+  the final serialization, and the gRPC decoded-message/re-verify copies must
+  each fit the room the still-live allocations leave; anything that does not
+  fit fails closed exactly like an exhausted redaction budget. A redaction
+  whose output fits the ceiling alone but cannot be built beside its own
+  working tree is therefore now refused during construction.
 
 - **An unencoded `;` in the query is now an ambiguity that fail-closed query
   consumers reject** (issue #6579; query counterpart of GHSA-fcqw-793q-wg5x /

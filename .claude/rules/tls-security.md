@@ -95,9 +95,10 @@ paths:
 - CRL does not apply to DP-to-CP gRPC because that stack does not expose
   compatible CRL config. The shared `PluginHttpClient` reqwest clients apply
   CRLs through `LiveCrlServerVerifier` (preconfigured rustls) and follow the
-  backend `SharedCrlList`; pooled connections are not retired on refresh, and
-  the dedicated `spec_expose` / custom-TLS `api_chargeback_sink` /
-  `load_testing` loopback clients apply none (issue #6651). Skip-verify health
+  backend `SharedCrlList`, rebuilding their clients (retiring pooled
+  connections) when the generation changes. Plugins with their own reqwest
+  client use `PluginHttpClient::dedicated_client` for the same behaviour
+  (issue #6651). Skip-verify health
   probes also skip CRL enforcement, matching the data-path skip-verify
   contract.
 - Backend TLS live reload stores the newly admitted `SharedCrlList`
