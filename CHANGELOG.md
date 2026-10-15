@@ -127,7 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were forwarded. JSON-path rules now parse the raw body and every UTF-16 /
   UTF-32 inspection view the body-text rules already use, and follow every
   occurrence of a duplicated member (including escaped spellings of the same
-  name); the rule matches if any selected value matches.
+  name); the rule matches if any selected value matches. A container value is
+  matched against its last-wins, first-wins and full readings separately.
+  Separately, the wide-text prefix signature (used for every body rule, request
+  and response) now also applies when a non-wide charset such as `utf-8` or an
+  unrecognized label is declared, since a byte-sniffing parser ignores it.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,

@@ -271,12 +271,16 @@ pub(super) fn decode_wide_charset_body_views(
 }
 
 fn wide_charset_body_views(body: &[u8], content_type: Option<&str>) -> WideCharsetViews {
-    // With no declaration or BOM, require the NUL placement of two ASCII
-    // UTF-16 units or one ASCII UTF-32 unit in the first four octets. Do not
-    // infer a charset from arbitrary interior NULs or try every binary body.
-    // The signature selects only a width; retain both endians and raw text,
-    // using the same fixed view cap as a bare declared wide charset.
-    if charset_value(content_type).is_none()
+    // With no wide-charset declaration or BOM, require the NUL placement of
+    // two ASCII UTF-16 units or one ASCII UTF-32 unit in the first four
+    // octets. Do not infer a charset from arbitrary interior NULs or try every
+    // binary body. The signature selects only a width; retain both endians and
+    // raw text, using the same fixed view cap as a bare declared wide charset.
+    // A declared non-wide charset (`utf-8`, an unknown label) does not switch
+    // the sniff off: a parser that detects the encoding from the bytes still
+    // reads such a body as UTF-16 / UTF-32, whatever the header claims.
+    if !charset_declares_utf16_family(content_type)
+        && !charset_declares_utf32_family(content_type)
         && utf32_bom(body).is_none()
         && utf16_bom(body).is_none()
         && let [a, b, c, d, ..] = body
@@ -506,6 +510,10 @@ fn declared_utf32_endian(
 /// `utf-32` or an explicit endianness). A body whose charset says UTF-32 is
 /// read as UTF-32 by any backend honouring the declaration, so its BOM is not
 /// ambiguous; one with no UTF-32 declaration is.
+fn charset_declares_utf16_family(content_type: Option<&str>) -> bool {
+    declared_utf16_endian(content_type, Some(Utf16Endian::Little)).is_some()
+}
+
 fn charset_declares_utf32_family(content_type: Option<&str>) -> bool {
     declared_utf32_endian(content_type, Some(Utf32Endian::Little)).is_some()
 }
