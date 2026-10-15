@@ -9,7 +9,7 @@ Serving modes (database, file, cp, dp, mesh) run these phases **sequentially**, 
 1. **Signal received** — the process publishes its draining verdict *before* anything else: `/health` and `/status` immediately report `{"status": "draining", "ready": false}` with HTTP 503, while `/live` deliberately keeps returning 200 so a Kubernetes livenessProbe cannot SIGKILL the pod mid-drain
 2. **Pre-drain window (optional)** — for `FERRUM_SHUTDOWN_PREDRAIN_SECONDS` (default `0`) every listener keeps accepting normally while readiness already reports not-ready. In `database`/`file`/`dp`/`mesh` that is the proxy **and** admin listeners; in `cp` (the mesh chart's `controlPlane` and `ca` workloads) it is the admin HTTP/HTTPS plus CP gRPC / xDS listeners, all of which close on the same broadcast this window delays. This is the window in which a load balancer or orchestrator can withdraw the replica from its endpoint set before a single new connection is refused. At the default `0` the shutdown broadcast fires immediately
 3. **Shutdown broadcast** — SIGTERM/SIGINT is broadcast to all components
-4. **Accept loops exit** — no new connections are accepted on any listener (HTTP, HTTPS, H3, TCP, UDP). Each open HTTP/1.1 and HTTP/2 connection is told to shut down gracefully on the same broadcast: HTTP/1.1 keep-alive is turned off and HTTP/2 clients receive GOAWAY. The mode then waits for every listener task to return, including the HTTP/3 listener's own bounded GOAWAY drain
+4. **Accept loops exit** — no new connections are accepted on any listener (HTTP, HTTPS, H3, TCP, UDP). Each open HTTP/1.1 and HTTP/2 connection is told to shut down gracefully on the same broadcast: HTTP/1.1 keep-alive is turned off and HTTP/2 clients receive GOAWAY. The mode then waits for every listener task to return, including the HTTP/3 listener's own bounded GOAWAY drain and endpoint close. That HTTP/3 wait and the later in-flight drain share one `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget, so together they never exceed it
 5. **Drain phase begins** — once every listener task has returned, the per-instance `draining` flag is set and database, file, dp and mesh modes log `Shutdown drain begun: Connection: close hint and new-request rejection are active` at `info`. The `cp` mode has no proxy and does not enter this phase. A proxy port that is already closed does **not** mean this step has run. The flag is set after the listener join on purpose: setting it earlier would reject already-accepted H3 streams that have not yet passed admission and end accepted CONNECT-UDP tunnels during the HTTP/3 listener's drain window (see [HTTP/3](http3.md)). Setting the flag causes:
    - All HTTP/1.1 responses include `Connection: close` (clients disconnect after their current request)
    - New requests/streams on existing connections are rejected (503 / gRPC `UNAVAILABLE`); H1/H2 WebSocket sessions end when drain starts
@@ -69,7 +69,7 @@ With `FERRUM_SHUTDOWN_DRAIN_SECONDS=30` and the binary defaults above:
 
 | Phase | Budget |
 |---|---|
-| In-flight drain | 30s |
+| In-flight drain (HTTP/3 listener drain and close + global drain, one shared budget) | 30s |
 | Transport pool tail | 6s |
 | Background tasks | 5s |
 | Audit flush (database/cp) | 30s (`clamp(30, 5, 60)`) |
