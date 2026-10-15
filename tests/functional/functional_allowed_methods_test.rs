@@ -395,6 +395,9 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
         if *status == Some(405) {
             assert_allow_header(response.headers(), &["GET"]);
         }
+        if matches!(status, Some(404 | 405)) {
+            assert_representation_length(response.headers(), path);
+        }
         assert!(
             response.bytes().await.expect("h2 HEAD body").is_empty(),
             "an HTTP/2 HEAD refusal must carry no DATA: {path} {content_type:?}"
@@ -425,6 +428,9 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
         }
         if *status == Some(405) {
             assert_allow_header(&response.headers, &["GET"]);
+        }
+        if matches!(status, Some(404 | 405)) {
+            assert_representation_length(&response.headers, path);
         }
         assert!(
             response.body_bytes.is_empty(),
@@ -458,7 +464,14 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
     // Accounting: a HEAD backend-dispatch error delivers no body bytes, so its
     // transaction summary reports none on HTTP/2 and HTTP/3, while a GET to
     // the same route (the body-bearing control) reports its error body.
-    for method in [reqwest::Method::HEAD, reqwest::Method::GET] {
+    // Methods are case-sensitive: the extension method `head` is not HEAD, so
+    // its body is delivered and accounted.
+    let lowercase_head = reqwest::Method::from_bytes(b"head").expect("extension method");
+    for method in [
+        reqwest::Method::HEAD,
+        reqwest::Method::GET,
+        lowercase_head.clone(),
+    ] {
         let response = h2
             .request(method.clone(), gateway.proxy_url("/down"))
             .header("user-agent", H2_HEAD_TEST_AGENT)
@@ -472,6 +485,19 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
             "h2 {method}"
         );
     }
+    let lower_h3 = client
+        .get_with_options(
+            &format!("https://localhost:{https_port}/down"),
+            GetOptions::default()
+                .method(Method::from_bytes(b"head").expect("extension method"))
+                .header("user-agent", H3_HEAD_TEST_AGENT),
+        )
+        .await
+        .expect("H3 head /down");
+    assert!(
+        !lower_h3.body_bytes.is_empty(),
+        "the extension method `head` keeps its body on HTTP/3"
+    );
     let get_down = client
         .get_with_options(
             &format!("https://localhost:{https_port}/down"),
@@ -492,8 +518,8 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
     let stdout = gateway
         .wait_for_captured_output(
             |raw| {
-                down_entries(raw, H2_HEAD_TEST_AGENT).len() >= 2
-                    && down_entries(raw, H3_HEAD_TEST_AGENT).len() >= 2
+                down_entries(raw, H2_HEAD_TEST_AGENT).len() >= 3
+                    && down_entries(raw, H3_HEAD_TEST_AGENT).len() >= 3
             },
             Duration::from_secs(10),
         )
@@ -517,12 +543,26 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
             "{agent}: a suppressed HEAD body is not delivered"
         );
         assert!(
+            bytes_for("head") > 0,
+            "{agent}: the extension method `head` reports its delivered body"
+        );
+        assert!(
             bytes_for("GET") > 0,
             "{agent}: the control GET reports its error body"
         );
     }
     drop(refused);
     gateway.shutdown();
+}
+
+/// A refused HEAD keeps a non-zero representation `Content-Length`.
+fn assert_representation_length(headers: &HeaderMap, path: &str) {
+    let length = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("{path}: HEAD refusal must keep Content-Length: {headers:?}"));
+    assert!(length > 0, "{path}: representation length must not be zero");
 }
 
 const H2_HEAD_TEST_AGENT: &str = "ferrum-h2-head-test";

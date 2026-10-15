@@ -9111,7 +9111,10 @@ pub async fn log_with_mirror(
     // frontend omits them at its final boundary, which can run after a path
     // built this summary from the representation it was about to send. Decide
     // delivered bytes here, from the trusted client method, for every path.
-    let stamp_head_bytes = summary.bytes_received != 0 && ctx.method.eq_ignore_ascii_case("HEAD");
+    // Exact match: methods are case-sensitive (RFC 9110 §9.1), and the wire
+    // boundaries omit the body only for exactly `HEAD`; an extension method
+    // such as `head` still delivers its body and keeps its accounting.
+    let stamp_head_bytes = summary.bytes_received != 0 && ctx.method == "HEAD";
     let mut stamped = if stamp_triggers || stamp_websocket || stamp_policy || stamp_head_bytes {
         Some(Box::new(summary.clone()))
     } else {
