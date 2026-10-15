@@ -520,18 +520,26 @@ impl RecordingBackend {
                 };
                 let recorded = Arc::clone(&recorded);
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 8192];
-                    let n =
+                    // Read through the end of the header block, bounded in
+                    // size and time, so a fragmented head is recorded whole.
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        if head.len() > 64 * 1024 || Instant::now() >= deadline {
+                            return;
+                        }
                         match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
                             .await
                         {
-                            Ok(Ok(n)) if n > 0 => n,
+                            Ok(Ok(n)) if n > 0 => head.extend_from_slice(&buf[..n]),
                             _ => return,
-                        };
+                        }
+                    }
                     recorded
                         .lock()
                         .expect("backend log")
-                        .push(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+                        .push(String::from_utf8_lossy(&head).to_ascii_lowercase());
                     let response = "HTTP/1.1 200 OK\r\n\
                                     Content-Length: 2\r\n\
                                     Content-Type: text/plain\r\n\
@@ -568,6 +576,13 @@ impl Drop for RecordingBackend {
 /// `/nq`: a `request_transformer` gated on a `path` trigger only.
 fn build_query_trigger_config(backend_port: u16) -> String {
     let proxy = |id: &str, plugins: &[&str]| {
+        // `/qterm` also limits methods, so a request violating both gates
+        // shows that method admission answers first on every protocol.
+        let allowed_methods = if id == "qterm" {
+            "    allowed_methods: [\"GET\", \"HEAD\"]\n"
+        } else {
+            ""
+        };
         let plugin_refs = plugins
             .iter()
             .map(|plugin| format!("      - plugin_config_id: \"{plugin}\"\n"))
@@ -580,7 +595,7 @@ fn build_query_trigger_config(backend_port: u16) -> String {
     backend_port: {backend_port}
     strip_listen_path: false
     pool_enable_http2: false
-    plugins:
+{allowed_methods}    plugins:
 {plugin_refs}"#
         )
     };
@@ -682,6 +697,17 @@ async fn functional_query_trigger_refuses_unencoded_semicolon_on_h1_and_h2() {
         .expect("h1 HEAD");
     assert_eq!(head.status(), reqwest::StatusCode::BAD_REQUEST);
     assert!(head.bytes().await.expect("HEAD body").is_empty());
+
+    let both = h1
+        .post(gateway.proxy_url("/qterm?x=;action=delete"))
+        .send()
+        .await
+        .expect("h1 POST");
+    assert_eq!(
+        both.status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED,
+        "method admission answers before the query refusal"
+    );
 
     // Control: without a ';' the untriggered request_termination hook runs.
     let hook = h1
@@ -825,6 +851,18 @@ async fn functional_query_trigger_refuses_unencoded_semicolon_on_h3() {
     assert!(
         backend.requests().is_empty(),
         "a refused request must not reach the backend"
+    );
+
+    let both = h3_send(
+        &client,
+        &url("/qterm?x=;action=delete"),
+        GetOptions::default().method(Method::POST),
+    )
+    .await;
+    assert_eq!(
+        both.status,
+        http::StatusCode::METHOD_NOT_ALLOWED,
+        "method admission answers before the query refusal"
     );
 
     let hook = h3_send(&client, &url("/qterm?action=delete"), GetOptions::default()).await;

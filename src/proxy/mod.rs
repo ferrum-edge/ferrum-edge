@@ -34769,58 +34769,6 @@ async fn handle_proxy_request_inner(
         return Ok(build_response_from_normalized_reject(reject));
     }
 
-    // A plugin execution trigger on this view reads `query`, and the raw query
-    // carries an unencoded `;`. Trigger predicates split pairs only on `&`, so
-    // refuse before any plugin phase runs instead of deciding the instance on
-    // a reading a `;`-splitting backend does not share (issue #6655).
-    if query_trigger_refuses_request(caps, ctx.raw_query_string()) {
-        debug!(
-            proxy_id = %proxy.id,
-            reason = "semicolon_separator",
-            "Rejected request: unencoded ';' in the query on a chain with a query-reading plugin trigger"
-        );
-        let mut reject = normalize_reject_response(
-            StatusCode::BAD_REQUEST,
-            Bytes::from_static(QUERY_TRIGGER_SEMICOLON_BODY.as_bytes()),
-            &EMPTY_HEADERS,
-            is_grpc_request,
-        );
-        finalize_synthesized_reject_headers(
-            &mut reject,
-            request_protocol,
-            initial_response_header_policy_plugins.as_ref(),
-        );
-        // Same bookkeeping as a plugin rejection: native gRPC and gRPC-Web
-        // carry `grpc_status`/`grpc_message` metadata, and metrics, the
-        // transaction log and the diagnostic reference record the status the
-        // wire carries (`200` for both gRPC shapes). Empty plugin list: no
-        // request hook runs for a refused request.
-        apply_grpc_reject_metadata(&mut ctx, &reject);
-        let grpc_web_response =
-            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
-                .await;
-        let wire_status = if grpc_web_response.is_some() {
-            StatusCode::OK.as_u16()
-        } else {
-            reject.http_status.as_u16()
-        };
-        record_request(&state, wire_status);
-        let logging_plugins = plugin_cache_view.plugins();
-        log_pre_backend_rejected_request(
-            &logging_plugins,
-            &ctx,
-            wire_status,
-            start_time,
-            crate::diagnostic_ref::QUERY_TRIGGER_ADMISSION_PHASE,
-            0,
-        )
-        .await;
-        if let Some(response) = grpc_web_response {
-            return Ok(response);
-        }
-        return Ok(build_response_from_normalized_reject(reject));
-    }
-
     // Per-proxy HTTP method filtering (checked before plugins to save work).
     // Ordinary request hooks stay skipped, but terminal transaction logging
     // still runs from the protocol-filtered plugin-cache view so sinks can
@@ -34896,6 +34844,59 @@ async fn handle_proxy_request_inner(
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
         record_status(&state, reject.http_status.as_u16());
+        if let Some(response) = grpc_web_response {
+            return Ok(response);
+        }
+        return Ok(build_response_from_normalized_reject(reject));
+    }
+
+    // Checked after method admission, in the same order as the H3 dispatcher.
+    // A plugin execution trigger on this view reads `query`, and the raw query
+    // carries an unencoded `;`. Trigger predicates split pairs only on `&`, so
+    // refuse before any plugin phase runs instead of deciding the instance on
+    // a reading a `;`-splitting backend does not share (issue #6655).
+    if query_trigger_refuses_request(caps, ctx.raw_query_string()) {
+        debug!(
+            proxy_id = %proxy.id,
+            reason = "semicolon_separator",
+            "Rejected request: unencoded ';' in the query on a chain with a query-reading plugin trigger"
+        );
+        let mut reject = normalize_reject_response(
+            StatusCode::BAD_REQUEST,
+            Bytes::from_static(QUERY_TRIGGER_SEMICOLON_BODY.as_bytes()),
+            &EMPTY_HEADERS,
+            is_grpc_request,
+        );
+        finalize_synthesized_reject_headers(
+            &mut reject,
+            request_protocol,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        // Same bookkeeping as a plugin rejection: native gRPC and gRPC-Web
+        // carry `grpc_status`/`grpc_message` metadata, and metrics, the
+        // transaction log and the diagnostic reference record the status the
+        // wire carries (`200` for both gRPC shapes). Empty plugin list: no
+        // request hook runs for a refused request.
+        apply_grpc_reject_metadata(&mut ctx, &reject);
+        let grpc_web_response =
+            build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
+                .await;
+        let wire_status = if grpc_web_response.is_some() {
+            StatusCode::OK.as_u16()
+        } else {
+            reject.http_status.as_u16()
+        };
+        record_request(&state, wire_status);
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            wire_status,
+            start_time,
+            crate::diagnostic_ref::QUERY_TRIGGER_ADMISSION_PHASE,
+            0,
+        )
+        .await;
         if let Some(response) = grpc_web_response {
             return Ok(response);
         }
