@@ -4104,7 +4104,10 @@ mod tests {
             "jwt-req",
             json!({
                 "selector": { "matchLabels": { "app": "api" } },
-                "jwtRules": [ { "issuer": "https://issuer.example.com" } ]
+                "jwtRules": [ {
+                    "issuer": "https://issuer.example.com",
+                    "jwksUri": "https://issuer.example.com/jwks"
+                } ]
             }),
         );
         let updates = plan_istio_status_updates(&[obj], options());
@@ -4123,6 +4126,31 @@ mod tests {
         assert_eq!(
             detail["translation"]["enforcement"].as_str(),
             Some("permissive")
+        );
+    }
+
+    #[test]
+    fn request_authentication_without_jwks_source_is_refused() {
+        // Ferrum has no OIDC discovery: an issuer-only rule cannot be enforced,
+        // so it is refused (fail closed) rather than reported Accepted and then
+        // rejected by mesh admission, which would veto the whole reload.
+        let obj = object(
+            "security.istio.io/v1",
+            "RequestAuthentication",
+            "issuer-only",
+            json!({ "jwtRules": [ { "issuer": "https://issuer.example.com" } ] }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        let detail = updates[0].ferrum_detail.as_ref().unwrap();
+        assert_eq!(
+            detail["translation"]["enforcement"].as_str(),
+            Some("refuse_all")
         );
     }
 

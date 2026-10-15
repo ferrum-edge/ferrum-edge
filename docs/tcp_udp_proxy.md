@@ -433,7 +433,7 @@ The gateway uses separate trust stores for TCP and UDP encryption:
 
 | Trust Store | Env Variable | Scope | Purpose |
 |-------------|-------------|-------|---------|
-| Backend server CA (TCP + UDP) | `backend_tls_server_ca_cert_path` | Per-proxy | Verify backend's certificate. Falls back to system roots for TCP if unset. |
+| Backend server CA (TCP + UDP) | `backend_tls_server_ca_cert_path` | Per-proxy | Verify backend's certificate. If unset, TCP+TLS and DTLS both fall back to the global `FERRUM_TLS_CA_BUNDLE_PATH`, then to the bundled Mozilla `webpki-roots` set (not the OS trust store). `system://` pins that bundled set. |
 | Backend client cert (TCP + UDP) | `backend_tls_client_cert_path` + `backend_tls_client_key_path` | Per-proxy | Gateway presents this cert to the backend (mTLS). |
 | Frontend TLS client CA (TCP) | `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` | Gateway-wide | Verify TCP client certificates (frontend mTLS). |
 | Frontend DTLS client CA (UDP) | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | Gateway-wide | Verify DTLS client certificates (frontend mTLS). |

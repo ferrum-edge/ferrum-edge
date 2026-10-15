@@ -271,36 +271,59 @@ const REFERRER_POLICY_TOKENS: [&str; 8] = [
 /// case-insensitively and may carry surrounding spaces or tabs, as browsers
 /// parse them. `Referrer-Policy` accepts a comma-separated list of known tokens.
 fn validate_builtin_tokens(key: &str, value: &str) -> Result<(), String> {
+    match builtin_token_expectation(key, value) {
+        None => Ok(()),
+        Some(expected) => Err(format!(
+            "security_headers: `{key}` must be {expected}; browsers ignore any other value"
+        )),
+    }
+}
+
+/// The same check for a `set` entry that names one of those three headers, so
+/// `set` cannot reintroduce a value the built-in option would refuse.
+/// `name` is the lowercased `HeaderName`.
+fn validate_set_builtin_tokens(name: &str, value: &str) -> Result<(), String> {
+    let key = match name {
+        "x-content-type-options" => "content_type_options",
+        "x-frame-options" => "frame_options",
+        "referrer-policy" => "referrer_policy",
+        _ => return Ok(()),
+    };
+    match builtin_token_expectation(key, value) {
+        None => Ok(()),
+        Some(expected) => Err(format!(
+            "security_headers: `set` entry {name:?} must be {expected}; browsers ignore any other value"
+        )),
+    }
+}
+
+/// `None` when `value` is acceptable for the built-in `key`, otherwise a
+/// description of the accepted values.
+fn builtin_token_expectation(key: &str, value: &str) -> Option<&'static str> {
     fn trim(token: &str) -> &str {
         token.trim_matches([' ', '\t'])
     }
-    let valid = match key {
-        "content_type_options" => trim(value).eq_ignore_ascii_case("nosniff"),
+    let (valid, expected) = match key {
+        "content_type_options" => (trim(value).eq_ignore_ascii_case("nosniff"), "`nosniff`"),
         "frame_options" => {
             let token = trim(value);
-            token.eq_ignore_ascii_case("DENY") || token.eq_ignore_ascii_case("SAMEORIGIN")
+            (
+                token.eq_ignore_ascii_case("DENY") || token.eq_ignore_ascii_case("SAMEORIGIN"),
+                "`DENY` or `SAMEORIGIN`",
+            )
         }
-        "referrer_policy" => value.split(',').all(|token| {
-            let token = trim(token);
-            REFERRER_POLICY_TOKENS
-                .iter()
-                .any(|known| token.eq_ignore_ascii_case(known))
-        }),
-        _ => true,
+        "referrer_policy" => (
+            value.split(',').all(|token| {
+                let token = trim(token);
+                REFERRER_POLICY_TOKENS
+                    .iter()
+                    .any(|known| token.eq_ignore_ascii_case(known))
+            }),
+            "a comma-separated list of Referrer-Policy tokens (for example `no-referrer` or `strict-origin-when-cross-origin`)",
+        ),
+        _ => return None,
     };
-    if valid {
-        return Ok(());
-    }
-    let expected = match key {
-        "content_type_options" => "`nosniff`",
-        "frame_options" => "`DENY` or `SAMEORIGIN`",
-        _ => {
-            "a comma-separated list of Referrer-Policy tokens (for example `no-referrer` or `strict-origin-when-cross-origin`)"
-        }
-    };
-    Err(format!(
-        "security_headers: `{key}` must be {expected}; browsers ignore any other value"
-    ))
+    (!valid).then_some(expected)
 }
 
 fn optional_header(
@@ -406,6 +429,7 @@ fn parse_set_map(object: &serde_json::Map<String, Value>) -> Result<Vec<(String,
                     format!("security_headers: `set` entry {name:?} value must be a string")
                 })?;
                 validate_header_value("set", value)?;
+                validate_set_builtin_tokens(&name, value)?;
                 out.push((name, value.to_string()));
             }
             Ok(out)

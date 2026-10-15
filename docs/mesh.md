@@ -2708,7 +2708,8 @@ like `X-Real-IP`, and `X_Tenant_Id` duplicates `X-Tenant-Id`.
 
 **A rejected RequestAuthentication fails closed** (issue #6656). When Ferrum
 refuses a RequestAuthentication (for example a reserved or duplicate claim
-header, a missing issuer, a malformed `fromHeaders`, or an unsupported
+header, a missing issuer, a rule with neither `jwksUri` nor `jwks` (Ferrum does
+not discover keys from the issuer), a malformed `fromHeaders`, or an unsupported
 `targetRef(s)` attachment), it is not dropped: dropping it would leave the
 workloads it selects with no JWT validation, no token stripping and no
 gateway-owned claim headers, so a forged token or a client-supplied claim header
