@@ -14296,8 +14296,26 @@ fn scope_request_auth_refusal_to_inbound_routes(
         // refusal stays on every route (fail closed).
         return;
     }
-    let trigger = serde_json::json!({ "when": { "match": { "proxy_id": inbound } } });
-    match serde_json::from_value(trigger) {
+    // A `proxy_id` leaf holds at most `MAX_TRIGGER_LIST_LEN` ids; a workload
+    // with more inbound routes gets an `any` of chunked leaves. The trigger is
+    // compiled here so one the plugin cache would reject (which would veto the
+    // whole reload and keep the previous, possibly fail-open, configuration)
+    // falls back to the unscoped refusal instead.
+    let leaves: Vec<serde_json::Value> = inbound
+        .chunks(crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN)
+        .map(|chunk| serde_json::json!({ "match": { "proxy_id": chunk } }))
+        .collect();
+    let when = if leaves.len() == 1 {
+        leaves.into_iter().next().unwrap_or_default()
+    } else {
+        serde_json::json!({ "any": leaves })
+    };
+    let trigger = serde_json::from_value::<crate::config::plugin_trigger::PluginTrigger>(
+        serde_json::json!({ "when": when }),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|trigger| trigger.validate().map(|()| trigger));
+    match trigger {
         Ok(trigger) => refusal.trigger = Some(trigger),
         Err(error) => {
             // Fail closed: an unrepresentable trigger leaves the refusal on
@@ -36114,6 +36132,43 @@ mod tests {
         scope_request_auth_refusal_to_inbound_routes(&mut bare, &runtime);
         assert!(bare.plugin_configs[0].trigger.is_none());
         assert!(bare.plugin_configs[0].enabled);
+
+        // More inbound routes than one `proxy_id` leaf may list: the trigger
+        // is an `any` of chunked leaves that the plugin cache accepts.
+        let mut wide = GatewayConfig::default();
+        let route_count = crate::config::plugin_trigger::MAX_TRIGGER_LIST_LEN + 5;
+        for index in 0..route_count {
+            wide.proxies.push(node_waypoint_udp_listener_proxy(
+                &format!("__mesh-inbound-api-{index}"),
+                &runtime.namespace,
+                "upstream",
+                18080,
+                false,
+                "udp",
+                now,
+            ));
+        }
+        force_ensure_global_plugin(
+            &mut wide,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut wide, &runtime);
+        let trigger = wide.plugin_configs[0]
+            .trigger
+            .as_ref()
+            .expect("chunked scoped trigger");
+        trigger.validate().expect("chunked trigger compiles");
+        let trigger = serde_json::to_value(trigger).expect("trigger serializes");
+        let leaves = trigger["when"]["any"].as_array().expect("any of leaves");
+        assert_eq!(leaves.len(), 2);
+        let listed: usize = leaves
+            .iter()
+            .map(|leaf| leaf["match"]["proxy_id"].as_array().expect("ids").len())
+            .sum();
+        assert_eq!(listed, route_count);
     }
 
     #[tokio::test]
