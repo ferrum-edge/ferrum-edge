@@ -131,9 +131,10 @@ cargo run --release -- run
 ```
 
 `FERRUM_ADMIN_HTTP_PORT=9001` keeps the DP's admin listener from colliding with
-a CP on the same host. A remote CP needs an `https://` URL plus
-`FERRUM_DP_GRPC_TLS_CA_CERT_PATH`; a non-loopback `http://` URL is refused unless
-`FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`.
+a CP on the same host. A remote CP needs an `https://` URL: a non-loopback
+`http://` URL is refused unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`. Set
+`FERRUM_DP_GRPC_TLS_CA_CERT_PATH` when the CP certificate is not signed by a
+public CA in the bundled Mozilla/webpki roots (see [cp_dp_mode.md](cp_dp_mode.md)).
 
 ### Database Mode with Read-Only
 ```bash
