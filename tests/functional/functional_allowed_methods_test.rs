@@ -39,8 +39,12 @@ async fn start_counting_http1_backend(
                 _ => return,
             };
             let request = String::from_utf8_lossy(&buf[..n]);
-            let target_prefix = format!("GET {target_path} ");
-            if !request.starts_with(&target_prefix) {
+            // HEAD counts too, so a HEAD that wrongly reached the backend is
+            // visible to the "no backend request" assertions.
+            let is_target = ["GET", "HEAD"]
+                .iter()
+                .any(|method| request.starts_with(&format!("{method} {target_path} ")));
+            if !is_target {
                 let _ = stream.shutdown().await;
                 return;
             }
@@ -305,11 +309,13 @@ async fn functional_allowed_methods_http3_rejects_before_backend() {
 }
 
 /// A refused `HEAD` keeps its representation `Content-Length` but carries no
-/// body bytes. Hyper drops a HEAD body on HTTP/1.1 itself, so HTTP/2 and
-/// HTTP/3 are the protocols that would otherwise send DATA.
+/// body bytes, whichever pre-plugin path refused it: `allowed_methods` (JSON
+/// and gRPC-Web shapes), a route miss, or a path-parameter refusal. Hyper drops
+/// a HEAD body on HTTP/1.1 itself, so HTTP/2 and HTTP/3 are the protocols that
+/// would otherwise send DATA.
 #[ignore]
 #[tokio::test]
-async fn functional_allowed_methods_head_refusal_has_no_body_on_h2_and_h3() {
+async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
     let backend = CountingBackend::start().await;
     let gateway = TestGateway::builder()
         .mode_file(build_config(backend.port, &["GET"]))
@@ -329,45 +335,95 @@ async fn functional_allowed_methods_head_refusal_has_no_body_on_h2_and_h3() {
         .env_port("FERRUM_PROXY_HTTPS_PORT")
         .expect("harness-allocated HTTPS port");
 
+    // (path, content-type, exact expected status). gRPC-Web refusals are
+    // answered `200` with the status in a trailer frame; a path-parameter
+    // spelling is refused `400`, or `404` if no route claims it. Either way the
+    // body must be absent.
+    let cases: &[(&str, Option<&str>, Option<u16>)] = &[
+        ("/allowed", None, Some(405)),
+        ("/allowed", Some("application/grpc-web"), None),
+        ("/allowed", Some("application/grpc-web-text"), None),
+        ("/no-such-route", None, Some(404)),
+        ("/allowed;v=1", None, None),
+    ];
+
     let h2 = reqwest::Client::builder()
         .http2_prior_knowledge()
         .timeout(Duration::from_secs(10))
         .build()
         .expect("h2c client");
-    let h2_head = h2
-        .head(gateway.proxy_url("/allowed"))
-        .send()
-        .await
-        .expect("h2 HEAD");
-    assert_eq!(h2_head.version(), reqwest::Version::HTTP_2);
-    assert_eq!(h2_head.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
-    assert_allow_header(h2_head.headers(), &["GET"]);
-    assert!(
-        h2_head.bytes().await.expect("h2 HEAD body").is_empty(),
-        "an HTTP/2 HEAD refusal must carry no DATA"
-    );
+    for (path, content_type, status) in cases {
+        let mut request = h2.head(gateway.proxy_url(path));
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", *content_type);
+        }
+        let response = request.send().await.expect("h2 HEAD");
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        let got = response.status().as_u16();
+        match status {
+            Some(expected) => assert_eq!(got, *expected, "{path} {content_type:?}"),
+            None => assert!(
+                got == 200 || (400..500).contains(&got),
+                "{path} {content_type:?}: unexpected {got}"
+            ),
+        }
+        if *status == Some(405) {
+            assert_allow_header(response.headers(), &["GET"]);
+        }
+        assert!(
+            response.bytes().await.expect("h2 HEAD body").is_empty(),
+            "an HTTP/2 HEAD refusal must carry no DATA: {path} {content_type:?}"
+        );
+    }
 
     let client = Http3Client::insecure().expect("h3 client");
-    let url = format!("https://localhost:{https_port}/allowed");
-    let options = GetOptions::default().method(Method::HEAD);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let h3_head = loop {
-        match client.get_with_options(&url, options.clone()).await {
-            Ok(response) => break response,
-            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
-            Err(err) => panic!("H3 HEAD did not complete: {err}"),
+    for (path, content_type, status) in cases {
+        let url = format!("https://localhost:{https_port}{path}");
+        let mut options = GetOptions::default().method(Method::HEAD);
+        if let Some(content_type) = content_type {
+            options = options.header("content-type", *content_type);
         }
-    };
-    assert_eq!(h3_head.status, http::StatusCode::METHOD_NOT_ALLOWED);
-    assert_allow_header(&h3_head.headers, &["GET"]);
-    assert!(
-        h3_head.body_bytes.is_empty(),
-        "an HTTP/3 HEAD refusal must carry no DATA"
-    );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let response = loop {
+            match client.get_with_options(&url, options.clone()).await {
+                Ok(response) => break response,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+                Err(err) => panic!("H3 HEAD {path} did not complete: {err}"),
+            }
+        };
+        let got = response.status.as_u16();
+        match status {
+            Some(expected) => assert_eq!(got, *expected, "{path} {content_type:?}"),
+            None => assert!(
+                got == 200 || (400..500).contains(&got),
+                "{path} {content_type:?}: unexpected {got}"
+            ),
+        }
+        if *status == Some(405) {
+            assert_allow_header(&response.headers, &["GET"]);
+        }
+        assert!(
+            response.body_bytes.is_empty(),
+            "an HTTP/3 HEAD refusal must carry no DATA: {path} {content_type:?}"
+        );
+    }
     assert_eq!(
         backend.hits(),
         0,
         "a refused HEAD must not reach the backend"
+    );
+
+    // Positive control: the counter sees an admitted request.
+    let admitted = h2
+        .get(gateway.proxy_url("/allowed"))
+        .send()
+        .await
+        .expect("h2 GET");
+    assert_eq!(admitted.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend.hits(),
+        1,
+        "the backend counter must see admitted requests"
     );
 }
 
