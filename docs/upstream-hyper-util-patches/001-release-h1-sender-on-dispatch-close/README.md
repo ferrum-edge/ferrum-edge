@@ -207,10 +207,10 @@ the response wait after its dispatcher closes, or when a hyper release stops
 stranding a racing send (for example, the dispatcher drains the channel until
 in-progress sends publish). Then:
 
-1. Remove the `hyper-util` line from `[patch.crates-io]` in `Cargo.toml` and
-   `tests/performance/mesh/Cargo.toml`.
-2. `git rm -r vendor/hyper-util-0.1.21-ferrum-patched/`, and restore the
-   registry `source`/`checksum` lines in `Cargo.lock` and
-   `tests/performance/mesh/Cargo.lock` with a normal lockfile update.
+1. Remove the `hyper-util` line from `[patch.crates-io]` in `Cargo.toml`,
+   `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`.
+2. Restore the registry `source`/`checksum` lines in `Cargo.lock`,
+   `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock` with a normal
+   lockfile update, then `git rm -r vendor/hyper-util-0.1.21-ferrum-patched/`.
 3. Remove the inventory row and the lifecycle entry, drop the CI step, and
    regenerate `vendor/VENDOR_INTEGRITY.sha256`.

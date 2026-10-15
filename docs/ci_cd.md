@@ -204,19 +204,23 @@ under `pull_request_target` and rejects any change to
   against its own base before being queued, which is what keeps the payload
   base usable as a trusted baseline.
 
-**Live main-branch settings (read-only API snapshot, 2026-10-04 10:01 UTC):**
-ruleset `20208307` is active and requires all nine GitHub Actions checks above,
-including `FIPS Build & Test`, with integration id `15368` for each check and
-`strict_required_status_checks_policy=false`. Its rules are `deletion`,
-`non_fast_forward`, and `required_status_checks`; it has no pull-request
-approval or merge-queue rule. The ruleset currently has two bypass actors:
-`OrganizationAdmin` and `RepositoryRole` id `5`, both with
-`bypass_mode: always`. It is therefore not a no-bypass ruleset.
+**Live main-branch settings (read-only API snapshot, 2026-10-15 07:24 UTC).**
+Sources: `GET /repos/ferrum-edge/ferrum-edge/rules/branches/main` (the
+effective rules), the individual repository and organization rulesets, and
+`GET /repos/ferrum-edge/ferrum-edge/branches/main/protection`.
 
-The classic branch-protection API was available for this snapshot. It reports
-the same nine required checks, each bound to GitHub Actions app id `15368`,
-`strict=false`, and `enforce_admins=false`; it also disallows force pushes and
-deletion. Its response did not include a required pull-request reviews rule.
+| Source | Rules on `main` | Bypass actors |
+|---|---|---|
+| Org ruleset `24977662` (A: trusted required workflows) | `workflows` (the nine required workflow files, run from `main`), `deletion`, `non_fast_forward` | `OrganizationAdmin`, `bypass_mode: pull_request` |
+| Org ruleset `24979476` (B: PR required, 0 approvals) | `pull_request` with `required_approving_review_count=0`, `dismiss_stale_reviews_on_push=false`, `required_review_thread_resolution=false`, `require_last_push_approval=false`, no code-owner review; merge methods `merge` and `squash` | `OrganizationAdmin`, `bypass_mode: pull_request` |
+| Repo ruleset `20208307` (Main merge queue and root review gate) | `deletion`, `non_fast_forward`, `required_status_checks` (all nine checks above, integration id `15368`, `strict_required_status_checks_policy=false`) | `OrganizationAdmin` and `RepositoryRole` id `5`, both `bypass_mode: always` |
+| Classic branch protection | The same nine checks bound to app id `15368`, `strict=false`, `enforce_admins=false`, force pushes and deletion disallowed, no required pull-request reviews | — |
+
+So a change must reach `main` through a pull request whose nine required
+checks pass, but no approving review, stale-review dismissal, review-thread
+resolution, or `merge_queue` rule is enforced, and none of the rulesets is a
+no-bypass ruleset. The repository setting `can_approve_pull_request_reviews`
+read `true` at the same time.
 These API observations describe only the settings returned at the read time.
 Re-query both APIs after any settings change and before claiming administrator
 enforcement, bypass behavior, approval requirements, or merge-queue enforcement.
@@ -224,7 +228,8 @@ enforcement, bypass behavior, approval requirements, or merge-queue enforcement.
 **Historical record:** the 2026-09-01 note for issue #4445 recorded that
 administrator enforcement was enabled and the ruleset bypass list was empty.
 That is a record of the earlier observation, not a statement of current
-settings. The 2026-09-26 ruleset observation likewise predates this snapshot.
+settings. The 2026-09-26 and 2026-10-04 ruleset observations likewise predate
+this snapshot.
 
 `.github/scripts/verify_required_ci.py` statically enforces merge_group
 triggers, unfiltered `pull_request` / `pull_request_target` triggers,
@@ -3093,46 +3098,69 @@ Existing Docker Hub credentials remain necessary only for production publishing.
 
 ### Alternative: Manual Release Creation
 
-If automatic release fails:
+**Prefer the canonical pipeline.** Fix the cause and re-run the failed jobs of
+the tag's `release.yml` run (or re-run the whole run). That rebuilds every
+asset in the pinned environments and repeats the GNU ABI and baseline-smoke
+gates. Assemble a release by hand only when the workflow itself cannot run, and
+then reproduce its contract exactly: a successful `cargo build` plus a matching
+checksum does **not** prove the advertised glibc floor, because a Linux binary
+built directly on a newer host can require a newer glibc than Ferrum supports.
 
 Before building on each host, complete the
 [one-time bootstrap](../CONTRIBUTING.md#one-time-local-bootstrap), including its platform
-requirements or explicit wrapper/system-linker fallback.
+requirements or explicit wrapper/system-linker fallback, and check out the
+exact release commit:
 
 ```bash
-# Build binaries manually with the same release features as CI. Install protoc
-# for every host first. Linux hosts also need cmake and libcurl4-openssl-dev
-# (or libcurl-devel on Fedora/RHEL) so rdkafka-sys can compile librdkafka;
-# Windows MSVC builds need NASM in PATH. For Linux ARM64, install the pinned Cross 0.2.5
-# binary and copy the exact `env -i` invocation from build-release-arm64-cross;
-# do not substitute an unpinned `cargo install cross` or inherited environment.
-# On a Linux host:
-cargo build --features cloud-secrets --release --target x86_64-unknown-linux-gnu
-# Then run the complete pinned ARM64 command from build-release-arm64-cross in
-# .github/workflows/release.yml (including its revalidation and `env -i` block).
+git fetch --tags origin
+git checkout --detach v0.2.0
+git rev-parse 'v0.2.0^{commit}'   # must equal the commit the tag workflow validated
 
-# On a macOS host:
+# Linux x86_64 (x86_64 Linux host with Docker): build ferrum-edge AND ferrum-cni
+# inside the digest-pinned GNU sysroot, never with a plain host `cargo build`.
+# Copy LINUX_GNU_SYSROOT_IMAGE and LINUX_GNU_PROTOC_SHA256 from the `env:` block
+# of build-release-binaries in .github/workflows/release.yml at this commit.
+python3 -I .github/scripts/verify_linux_gnu_abi.py --self-test
+python3 -I .github/scripts/verify_linux_gnu_abi.py --check-contract
+python3 -I .github/scripts/smoke_linux_gnu_baseline.py --self-test
+LINUX_GNU_TARGET=x86_64-unknown-linux-gnu \
+LINUX_GNU_FEATURES=cloud-secrets \
+LINUX_GNU_PROFILE=release \
+LINUX_GNU_SYSROOT_IMAGE='<from release.yml>' \
+LINUX_GNU_PROTOC_SHA256='<from release.yml>' \
+  bash .github/scripts/build_linux_gnu_sysroot.sh
+
+# Linux ARM64: install the pinned Cross 0.2.5 binary and run the complete
+# command from build-release-arm64-cross in .github/workflows/release.yml
+# (including its revalidation and `env -i` block). Do not substitute an
+# unpinned `cargo install cross` or an inherited environment. It produces both
+# target/aarch64-unknown-linux-gnu/release/ferrum-edge and .../ferrum-cni.
+
+# On a macOS host (install protoc first):
 cargo build --features cloud-secrets --release --target x86_64-apple-darwin
 cargo build --features cloud-secrets --release --target aarch64-apple-darwin
 
-# On a Windows host:
+# On a Windows host (protoc and NASM in PATH):
 cargo build --features cloud-secrets --release --target x86_64-pc-windows-msvc
 
-# Stage platform-suffixed assets before checksums/upload, matching CI asset names.
-# Run these POSIX staging commands from one checkout after copying in the built
-# artifacts from the Linux, macOS, and Windows hosts. On Windows-only recovery,
-# use equivalent PowerShell commands or copy the .exe back to a POSIX shell.
+# Stage all seven platform-suffixed assets, matching CI asset names. Run these
+# POSIX staging commands from one checkout after copying in the built
+# artifacts from the Linux, macOS, and Windows hosts.
 mkdir -p dist
 cp target/x86_64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-x86_64
+cp target/x86_64-unknown-linux-gnu/release/ferrum-cni dist/ferrum-cni-linux-x86_64
 cp target/aarch64-unknown-linux-gnu/release/ferrum-edge dist/ferrum-edge-linux-aarch64
+cp target/aarch64-unknown-linux-gnu/release/ferrum-cni dist/ferrum-cni-linux-aarch64
 cp target/x86_64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-x86_64
 cp target/aarch64-apple-darwin/release/ferrum-edge dist/ferrum-edge-macos-aarch64
 cp target/x86_64-pc-windows-msvc/release/ferrum-edge.exe dist/ferrum-edge-windows-x86_64.exe
 
-# Generate per-asset checksums, matching CI release assets.
+# Generate the seven per-asset checksums, matching CI release assets.
 (cd dist && for asset in \
   ferrum-edge-linux-x86_64 \
+  ferrum-cni-linux-x86_64 \
   ferrum-edge-linux-aarch64 \
+  ferrum-cni-linux-aarch64 \
   ferrum-edge-macos-x86_64 \
   ferrum-edge-macos-aarch64 \
   ferrum-edge-windows-x86_64.exe
@@ -3144,10 +3172,26 @@ do
   fi
 done)
 
-# Create release in GitHub UI or via gh:
-# The glob matches both binaries and their .sha256 sidecars.
+# Gate the exact staged Linux bytes the way the workflow does, before upload.
+# x86_64 on an x86_64 Linux host with Docker (copy the LINUX_GNU_SMOKE_* image
+# pins from release.yml into the environment, as for the build step):
+(cd dist && sha256sum -c ferrum-edge-linux-x86_64.sha256 ferrum-cni-linux-x86_64.sha256)
+python3 -I .github/scripts/verify_linux_gnu_abi.py \
+  dist/ferrum-edge-linux-x86_64 dist/ferrum-cni-linux-x86_64
+bash .github/scripts/smoke_linux_gnu_baseline.sh \
+  --edge dist/ferrum-edge-linux-x86_64 --cni dist/ferrum-cni-linux-x86_64
+# ARM64 on an arm64 Linux host with Docker (the workflow uses ubuntu-26.04-arm):
+(cd dist && sha256sum -c ferrum-edge-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256)
+python3 -I .github/scripts/verify_linux_gnu_abi.py \
+  dist/ferrum-edge-linux-aarch64 dist/ferrum-cni-linux-aarch64
+bash .github/scripts/smoke_linux_gnu_baseline.sh \
+  --edge dist/ferrum-edge-linux-aarch64 --cni dist/ferrum-cni-linux-aarch64
+
+# Upload only after every gate above passed and dist/ holds 14 files
+# (7 binaries + 7 .sha256 sidecars). The glob matches both.
+ls dist | wc -l   # expect 14
 gh release create v0.2.0 \
-  dist/ferrum-edge-* \
+  dist/ferrum-edge-* dist/ferrum-cni-* \
   --title "Release v0.2.0" \
   --generate-notes
 ```
@@ -3778,25 +3822,27 @@ gh secret set DOCKERHUB_TOKEN --body "your-token"
 
 ## Root Merge Gate Attestation
 
-`root-merge-gate-attestation.yml` supplies the approval for the active no-bypass
-`main` ruleset. The repository currently has a single human administrator, so the
-ruleset's one-approval requirement is satisfied only after that human has
-independently reviewed one exact PR head and then dispatches this workflow with
-matching inputs.
+`root-merge-gate-attestation.yml` lets the single human administrator record
+that they independently reviewed one exact PR head: after that review they
+dispatch the workflow with matching inputs, and it submits an `APPROVE` review
+bound to that head SHA.
 
-This workflow is **not** a ruleset bypass. The active ruleset has **no
-bypass actors**. The workflow only supplies the required approval for **one
-exact root-reviewed head SHA**. All other protections still apply:
+**What the live settings enforce today.** The workflow was designed for a
+no-bypass `main` ruleset that requires one approval, dismisses stale approvals
+on push, requires every review thread to be resolved, and validates the
+combined result in a merge queue. The current settings do **not** impose any of
+those (see the dated snapshot under
+[Required checks and merge queue](#required-checks-and-merge-queue)): the
+effective `pull_request` rule requires 0 approvals with stale-review dismissal
+and thread resolution off, there is no `merge_queue` rule, and the rulesets have
+bypass actors. What is enforced is a pull request plus the nine required hosted
+checks. The attestation review is therefore an audit record, not a gate a merge
+currently has to pass. The design intent above becomes enforcement only after a
+separately reviewed settings change; re-query the APIs before claiming it.
 
-- required hosted CI checks (including coverage and release-critical live checks)
-- every review thread resolved
-- stale approvals dismissed on material pushes
-- merge-queue validation of the combined result before landing
-
-`require_last_push_approval` is intentionally `false`: the owner removed the
-separate requirement that the latest reviewable push be approved by someone
-other than its pusher. Exact-head attestation, stale-review dismissal, hosted CI,
-thread resolution, and merge-queue checks remain mandatory.
+The workflow is not a ruleset bypass either way: it only submits an approval for
+**one exact root-reviewed head SHA** and changes no other protection.
+`require_last_push_approval` is `false` in the live `pull_request` rule.
 
 ### Security and audit contract
 
@@ -3811,7 +3857,7 @@ thread resolution, and merge-queue checks remain mandatory.
 | PR eligibility | PR must be open, non-draft, target `main`, originate from this repository (not a fork), and its live head SHA must equal `expected_head_sha` |
 | Review threads | All review threads are fetched with GraphQL pagination; any unresolved thread, query error, or malformed/missing field fails closed |
 | Race safety | Approval is submitted with an explicit `commit_id`; the full PR eligibility validation (open, non-draft, base `main`, same repository, exact head SHA) is re-run immediately before submission so a push or state change between validation and approval cannot approve a newer or ineligible head |
-| Actions approval setting | Repository setting `can_approve_pull_request_reviews` (“Allow GitHub Actions to create and approve pull requests”) must remain enabled and is audited before the no-bypass ruleset is activated. GitHub’s documented behavior counts enabled Actions reviews toward required approvals; this repository was independently verified as enabled. The live #3040 merge-queue exercise will prove that an attestation approval satisfies the actual ruleset |
+| Actions approval setting | Repository setting `can_approve_pull_request_reviews` (“Allow GitHub Actions to create and approve pull requests”) must remain enabled (it read `true` in the 2026-10-15 snapshot). GitHub’s documented behavior counts enabled Actions reviews toward required approvals, so an attestation would satisfy a future one-approval rule; no such rule is active now, and the #3040 merge-queue exercise that was to prove it against a live queue has no live `merge_queue` rule to run against |
 | Concurrency | `root-merge-gate-attestation-<pr_number>` with `cancel-in-progress: false` so overlapping dispatches do not cancel an in-flight attestation |
 
 ### Operator inputs

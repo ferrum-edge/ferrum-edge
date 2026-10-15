@@ -161,8 +161,9 @@ Retire the vendor copy only after a compatible upstream release:
    endpoint, is not required to erase it); and
 4. preserves Ferrum's supported ECDSA P-256/P-384 and constructor APIs.
 
-Then remove the `[patch.crates-io]` rows (root `Cargo.toml` and
-`tests/performance/mesh/Cargo.toml`), the vendor directory, its
+Then remove the `[patch.crates-io]` rows (root `Cargo.toml`, `fuzz/Cargo.toml`
+and `tests/performance/mesh/Cargo.toml`), regenerate the three lockfiles while
+the vendor copy still exists, then remove the vendor directory, its
 `vendor/VENDOR_INTEGRITY.sha256` entries and `GOVERNED_VENDOR_LOCKFILES`
 allowlist entry, the `Vendored Patch Regressions` CI step, the inventory row in
 `docs/dependency-policy.md`, and the entry in

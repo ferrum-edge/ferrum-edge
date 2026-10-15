@@ -154,7 +154,9 @@ read is in flight:
 2. Keep the vendored crate until patch 002 is also retired (they share one vendor directory).
 3. When both active h3-quinn patches are available upstream, remove the
    `h3-quinn` `[patch.crates-io]` entry from `Cargo.toml` and the
-   mirrored entry in `tests/performance/mesh/Cargo.toml`.
+   mirrored entries in `fuzz/Cargo.toml` and
+   `tests/performance/mesh/Cargo.toml`, then regenerate `Cargo.lock`,
+   `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock`.
 4. Delete `vendor/h3-quinn-0.0.10-ferrum-patched/` and regenerate
    `vendor/VENDOR_INTEGRITY.sha256` with `scripts/update_vendor_integrity.sh`.
 5. Drop this patch's row from `docs/dependency-policy.md` and its entry from

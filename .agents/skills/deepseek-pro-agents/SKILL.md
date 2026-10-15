@@ -1,9 +1,9 @@
 ---
 name: deepseek-pro-agents
-description: Dispatch and orchestrate local opencode DeepSeek V4 Pro agents via the opencode CLI harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. DeepSeek V4 Pro is the deep-reasoning tier, suited to invariant-heavy, security, protocol, and concurrency work. Use when the user asks GPT, Codex, or Claude to delegate to DeepSeek Pro or deepseek-v4-pro workers, run multiple DeepSeek Pro agents, resume interrupted runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
+description: Dispatch and orchestrate local opencode workers pinned to alibaba-token-plan/deepseek-v4.1-flash (DeepSeek V4.1 Flash; the skill keeps its legacy deepseek-pro-agents name and no longer dispatches any V4 Pro model) via the opencode CLI harness for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. This lane is used for invariant-heavy, security, protocol, and concurrency work. Use when the user asks GPT, Codex, or Claude to delegate to DeepSeek Pro or deepseek-pro-agents workers (they get the pinned V4.1 Flash model; say so), run multiple DeepSeek Pro agents, resume interrupted runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents, Claude Code workers, or ordinary single-agent edits.
 ---
 
-# DeepSeek V4 Pro agents
+# DeepSeek agents (legacy "Pro" name, pinned to V4.1 Flash)
 
 Act as the orchestrator. Treat local opencode processes running
 `alibaba-token-plan/deepseek-v4.1-flash` as implementation workers. Own task decomposition,
@@ -11,15 +11,21 @@ worktree isolation, liveness, independent diff review, and the final merge recom
 each worker to carry its assigned scope through the stopping point in the prompt. Never accept a
 worker's report without checking the repository and GitHub state yourself.
 
-DeepSeek V4 Pro is the deep-reasoning tier of this fleet. Prefer it for tasks that need careful
-invariant reasoning — fail-closed security paths, protocol correctness, concurrency and ordering
+**Model, not name.** Despite the skill name, every worker runs
+`alibaba-token-plan/deepseek-v4.1-flash`. The skill was switched from `deepseek-v4-pro-0813` to that
+model in #5770 and kept its `deepseek-pro-agents` name so existing invocations still resolve; it
+dispatches no DeepSeek V4 Pro model. It differs from `deepseek-flash-agents`, which pins
+`alibaba-token-plan/deepseek-v4-flash-0731`. When a user asks for "DeepSeek Pro" workers, tell them
+which model they will get before dispatching.
+
+The fleet uses this lane for tasks that need careful invariant reasoning — fail-closed security paths, protocol correctness, concurrency and ordering
 fences, and review rounds where a finding has to be either fixed properly or rebutted with
 file-and-line evidence.
 
 **Guard: do not use this skill when you are yourself a dispatched worker.** If the session prompt
 references this skill's `agent-brief.md` or `continuation-brief.md`, says "YOU are the implementer,"
 or assigns an existing worktree and findings to fix, implement directly in the current session.
-Do not recursively dispatch another DeepSeek V4 Pro, opencode, Grok, Sol, Opus, Fable, or Composer
+Do not recursively dispatch another DeepSeek, opencode, Grok, Sol, Opus, Fable, or Composer
 worker. The orchestrator selected this session's model deliberately.
 
 ## Remote CI validation
@@ -65,7 +71,8 @@ prompt, including continuation prompts and any permitted nested delegation.
    launcher refuses `--model` (exit 2) unless it names exactly that model, so no other
    Qwen/DeepSeek variant and no rolling alias is dispatchable from this skill. Do not
    substitute a different provider or model.
-6. The pin is deliberate: it is not the rolling `deepseek-v4-pro` alias. To change or retire it,
+6. The pin is deliberate (#5770): it is not the rolling `deepseek-v4-pro` alias, and the skill's
+   "Pro" name is a legacy label, not a model claim. To change or retire it,
    re-pin here, in `scripts/dispatch-agent.sh`, and in `references/agent-brief.md` together, then
    re-validate.
 

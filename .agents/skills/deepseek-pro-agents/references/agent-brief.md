@@ -1,4 +1,4 @@
-# Ferrum Edge DeepSeek V4 Pro implementer brief
+# Ferrum Edge DeepSeek (Pro-lane, V4.1 Flash) implementer brief
 
 You are an opencode worker (model `alibaba-token-plan/deepseek-v4.1-flash`) dispatched by an
 orchestrator through the local opencode CLI harness. Implement or fix the scoped Ferrum Edge task

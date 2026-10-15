@@ -168,8 +168,8 @@ error code (the API in hyperium/hyper#4210, whose text is in
    upstream API.
 2. Remove the `hyper` line from `[patch.crates-io]` in `Cargo.toml`,
    `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`.
-3. `git rm -r vendor/hyper-1.10.0-ferrum-patched/`, and restore the registry
-   `source`/`checksum` lines in `Cargo.lock`, `fuzz/Cargo.lock` and
-   `tests/performance/mesh/Cargo.lock` with a normal lockfile update.
+3. Restore the registry `source`/`checksum` lines in `Cargo.lock`,
+   `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock` with a normal
+   lockfile update, then `git rm -r vendor/hyper-1.10.0-ferrum-patched/`.
 4. Remove the inventory row and the lifecycle entry, drop the CI step, and
    regenerate `vendor/VENDOR_INTEGRITY.sha256`.
