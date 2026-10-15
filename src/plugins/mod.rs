@@ -9094,7 +9094,8 @@ pub async fn log_with_mirror(
     // upgrade summary — so no call site has to remember to carry it.
     //
     // Clone only to stamp a missing trigger carrier, detected WebSocket flavor,
-    // or a gateway output-policy refusal. Ordinary HTTP stays allocation-free.
+    // a gateway output-policy refusal, or the delivered bytes of a `HEAD`
+    // response. Ordinary HTTP stays allocation-free.
     // Keep the conditional clone out of this async future's inline state. A
     // `TransactionSummary` is deliberately broad; storing it inline here grows
     // every request future (including the allocation-free, untriggered case)
@@ -9106,13 +9107,21 @@ pub async fn log_with_mirror(
     let stamp_websocket = matches!(ctx.request_http_flavor(), HttpFlavor::WebSocket);
     let policy_error_class = ctx.response_policy_error_class(summary.error_class);
     let stamp_policy = policy_error_class != summary.error_class;
-    let mut stamped = if stamp_triggers || stamp_websocket || stamp_policy {
+    // A response to `HEAD` delivers no body bytes (RFC 9110 §9.3.2): every
+    // frontend omits them at its final boundary, which can run after a path
+    // built this summary from the representation it was about to send. Decide
+    // delivered bytes here, from the trusted client method, for every path.
+    let stamp_head_bytes = summary.bytes_received != 0 && ctx.method.eq_ignore_ascii_case("HEAD");
+    let mut stamped = if stamp_triggers || stamp_websocket || stamp_policy || stamp_head_bytes {
         Some(Box::new(summary.clone()))
     } else {
         None
     };
     if let Some(stamped) = stamped.as_deref_mut() {
         stamped.error_class = policy_error_class;
+        if stamp_head_bytes {
+            stamped.bytes_received = 0;
+        }
         if stamp_triggers {
             stamped.plugin_trigger_decisions = ctx.plugin_trigger_decisions();
         }

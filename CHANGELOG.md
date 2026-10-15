@@ -624,7 +624,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/2 and HTTP/3; HTTP/1.1 was unaffected because Hyper drops it. The
   HTTP/1.1 and HTTP/2 response boundary and the HTTP/3 gateway response
   writers (native and cross-protocol bridge) now omit the bytes of a buffered
-  body for `HEAD`, keeping the representation `Content-Length`.
+  body for `HEAD`, keeping the representation `Content-Length`. Transaction
+  summaries (and so logging sinks and `api_chargeback`) report no delivered
+  response bytes for a `HEAD` request, on every protocol.
 
 - **AI token metering counts prompt-cache, thinking and tool-use tokens**
   (issue #6623). Anthropic `cache_creation_input_tokens` and
