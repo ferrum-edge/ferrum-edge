@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`body_validator` rejects compressed gRPC frames with extra gzip data.**
+  Native gRPC protobuf validation inflated only the first gzip member of a
+  compressed frame and ignored anything after it, while the whole frame was
+  forwarded; a peer that decodes concatenated members could therefore receive
+  fields (or a decoded size) the validator never checked, on the request and
+  the response path. A compressed payload must now be exactly one fully
+  consumed gzip member, and a compression flag other than 0 or 1 is rejected.
+
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,
   and the paired counter read previously fetched counters with a plain
