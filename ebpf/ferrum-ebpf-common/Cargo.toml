@@ -17,4 +17,4 @@ default = []
 userspace = ["dep:aya"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
-aya = { version = "0.13", optional = true }
+aya = { version = "0.14", optional = true }
