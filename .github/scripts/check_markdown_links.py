@@ -83,14 +83,26 @@ def is_excluded(rel_posix: str) -> bool:
     return any(rel_posix == prefix.rstrip("/") or rel_posix.startswith(prefix) for prefix in EXCLUDE_PREFIXES)
 
 
+def is_nested_git_root(directory: Path) -> bool:
+    """Return True when `directory` is the root of another Git checkout.
+
+    A nested clone has a `.git/` directory; a linked worktree (for example an
+    agent worktree under `.claude/worktrees/<name>/`) or a submodule has a
+    `.git` file. Either way its contents belong to a different working tree,
+    and the root-anchored `EXCLUDE_PREFIXES` no longer match inside it.
+    """
+    marker = directory / ".git"
+    return marker.is_symlink() or marker.exists()
+
+
 def first_party_markdown_files(root: Path = REPO_ROOT) -> list[Path]:
     """List first-party `*.md` files under root without process execution.
 
     Repository automation avoids dynamic process argv (for example
     `git -C <computed-root> ls-files`), so discovery walks the tree with
     explicit exclusions instead of shelling out. On a clean CI checkout this
-    matches the tracked first-party Markdown set. Excluded directories are
-    pruned rather than descended into.
+    matches the tracked first-party Markdown set. Excluded directories and
+    nested Git checkouts/worktrees are pruned rather than descended into.
     """
 
     root = root.resolve()
@@ -112,7 +124,8 @@ def first_party_markdown_files(root: Path = REPO_ROOT) -> list[Path]:
             if entry.is_symlink():
                 continue
             if entry.is_dir():
-                stack.append(entry)
+                if not is_nested_git_root(entry):
+                    stack.append(entry)
                 continue
             if entry.is_file() and entry.suffix.lower() == ".md":
                 files.append(entry)
@@ -373,6 +386,35 @@ def run_self_test(root: Path = REPO_ROOT) -> None:
         else:
             via_alias = first_party_markdown_files(alias)
             assert via_alias == via_canonical, (via_alias, via_canonical)
+
+    # Nested Git checkouts are not first-party documentation. A linked
+    # worktree (`.git` file) or nested clone (`.git/` directory) inside the
+    # checkout is pruned, including its `vendor/`/`target/` trees, which the
+    # root-anchored exclusions would otherwise miss.
+    with tempfile.TemporaryDirectory(prefix="md-link-nested-") as tmp:
+        repo = Path(tmp).resolve()
+        main_readme = repo / "README.md"
+        main_readme.write_text("# Main repository\n", encoding="utf-8")
+        broken = "# Vendored\n[missing](./not-in-vendored-package.md)\n"
+        worktree = repo / ".claude" / "worktrees" / "worker"
+        (worktree / "vendor" / "package").mkdir(parents=True)
+        (worktree / ".git").write_text(
+            "gitdir: /unused/common/git/worktrees/worker\n", encoding="utf-8"
+        )
+        (worktree / "README.md").write_text(broken, encoding="utf-8")
+        (worktree / "vendor" / "package" / "README.md").write_text(broken, encoding="utf-8")
+        clone = repo / "scratch" / "clone"
+        (clone / ".git").mkdir(parents=True)
+        (clone / "target").mkdir()
+        (clone / "target" / "doc.md").write_text(broken, encoding="utf-8")
+        # A first-party directory without a `.git` marker is still scanned.
+        (repo / "docs").mkdir()
+        docs_page = repo / "docs" / "page.md"
+        docs_page.write_text("# Page\n[home](../README.md)\n", encoding="utf-8")
+        nested_discovered = first_party_markdown_files(repo)
+        nested_errors = check_repository(repo)
+    assert nested_discovered == sorted([main_readme, docs_page]), nested_discovered
+    assert nested_errors == [], [err.format() for err in nested_errors]
     print("markdown link-check self-test passed")
 
 
