@@ -3177,8 +3177,9 @@ do
 done)
 
 # Gate the exact staged Linux bytes the way the workflow does, before upload.
-# Each block runs under `set -euo pipefail`, so any failed check stops it;
-# do not upload unless BOTH blocks finished with "passed".
+# Each block runs under `set -euo pipefail`, so any failed check stops it, and
+# only a fully passing block writes its marker file under gates/. Copy both
+# marker files to the publishing checkout; the upload step refuses without them.
 # x86_64 on an x86_64 Linux host with Docker (copy the LINUX_GNU_SMOKE_* image
 # pins from release.yml into the environment, as for the build step):
 bash -euo pipefail -c '
@@ -3187,7 +3188,7 @@ bash -euo pipefail -c '
     dist/ferrum-edge-linux-x86_64 dist/ferrum-cni-linux-x86_64
   bash .github/scripts/smoke_linux_gnu_baseline.sh \
     --edge dist/ferrum-edge-linux-x86_64 --cni dist/ferrum-cni-linux-x86_64
-  echo "x86_64 gates passed"'
+  mkdir -p gates && sha256sum dist/ferrum-edge-linux-x86_64 dist/ferrum-cni-linux-x86_64 > gates/x86_64.ok'
 # ARM64 on an arm64 Linux host with Docker (the workflow uses ubuntu-26.04-arm):
 bash -euo pipefail -c '
   (cd dist && sha256sum -c ferrum-edge-linux-aarch64.sha256 ferrum-cni-linux-aarch64.sha256)
@@ -3195,11 +3196,14 @@ bash -euo pipefail -c '
     dist/ferrum-edge-linux-aarch64 dist/ferrum-cni-linux-aarch64
   bash .github/scripts/smoke_linux_gnu_baseline.sh \
     --edge dist/ferrum-edge-linux-aarch64 --cni dist/ferrum-cni-linux-aarch64
-  echo "aarch64 gates passed"'
+  mkdir -p gates && sha256sum dist/ferrum-edge-linux-aarch64 dist/ferrum-cni-linux-aarch64 > gates/aarch64.ok'
 
-# Upload from the publishing checkout only when dist/ holds exactly the seven
-# binaries and their seven verified .sha256 sidecars.
+# Upload from the publishing checkout. This one shell verifies both gate
+# markers against the staged bytes, requires dist/ to hold exactly the seven
+# binaries and their seven verified .sha256 sidecars, and only then uploads,
+# so any failed check exits before `gh release create` runs.
 bash -euo pipefail -c '
+  sha256sum -c gates/x86_64.ok gates/aarch64.ok
   cd dist
   expected="ferrum-cni-linux-aarch64 ferrum-cni-linux-x86_64 ferrum-edge-linux-aarch64 ferrum-edge-linux-x86_64 ferrum-edge-macos-aarch64 ferrum-edge-macos-x86_64 ferrum-edge-windows-x86_64.exe"
   want=$(for a in $expected; do printf "%s\n%s.sha256\n" "$a" "$a"; done | LC_ALL=C sort)
@@ -3207,11 +3211,12 @@ bash -euo pipefail -c '
   [ "$want" = "$have" ] || { echo "dist/ does not hold exactly the 14 release files" >&2; exit 1; }
   for a in $expected; do
     if command -v sha256sum >/dev/null 2>&1; then sha256sum -c "$a.sha256"; else shasum -a 256 -c "$a.sha256"; fi
-  done'
-gh release create v0.2.0 \
-  dist/ferrum-edge-* dist/ferrum-cni-* \
-  --title "Release v0.2.0" \
-  --generate-notes
+  done
+  cd ..
+  gh release create v0.2.0 \
+    dist/ferrum-edge-* dist/ferrum-cni-* \
+    --title "Release v0.2.0" \
+    --generate-notes'
 ```
 
 This manual GitHub Release fallback only recreates release assets. If the tag workflow also failed before Docker publishing completed, rerun/fix the release workflow or manually publish the Docker Hub and GHCR images before treating the version release as complete.
