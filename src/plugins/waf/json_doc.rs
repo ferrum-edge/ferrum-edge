@@ -13,6 +13,8 @@
 //! is the same member as its literal spelling) and 128-level recursion limit
 //! are unchanged.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -71,28 +73,122 @@ pub(super) fn select<'a>(root: &'a JsonNode, path: &[JsonPathSegment]) -> Vec<&'
     current
 }
 
-/// The string a JSON-path matcher inspects: a string's unescaped value, the
-/// canonical text of a number / boolean / null, or the compact JSON of a
-/// container (every duplicated member included).
-pub(super) fn scan_text<'a>(
-    node: &'a JsonNode,
-    scratch: &'a mut Option<String>,
-) -> Option<&'a str> {
+/// The strings a JSON-path matcher inspects for one selected node, each a
+/// separate target (its own match and its own false-positive filtering).
+///
+/// A scalar yields one: a string's unescaped value or the canonical text of a
+/// number / boolean / null. A container yields its compact JSON as a
+/// last-wins parser reads it (the reading `serde_json::Value` gives, so a
+/// rule that matched before still matches); when the subtree holds duplicated
+/// members, also the first-wins reading and the duplicate-preserving text.
+/// A rule hits if any reading matches, so a benign duplicate can neither break
+/// an `equals` match nor let a filter suppress the reading that carries the
+/// forbidden value.
+pub(super) fn scan_texts(node: &JsonNode) -> Vec<Cow<'_, str>> {
     match node {
-        JsonNode::Scalar(Value::String(value)) => Some(value.as_str()),
-        JsonNode::Scalar(Value::Bool(value)) => Some(if *value { "true" } else { "false" }),
-        JsonNode::Scalar(Value::Null) => Some("null"),
-        JsonNode::Scalar(Value::Number(value)) => {
-            *scratch = Some(value.to_string());
-            scratch.as_deref()
+        JsonNode::Scalar(Value::String(value)) => vec![Cow::Borrowed(value.as_str())],
+        JsonNode::Scalar(Value::Bool(value)) => {
+            vec![Cow::Borrowed(if *value { "true" } else { "false" })]
         }
-        JsonNode::Scalar(other) => {
-            *scratch = Some(other.to_string());
-            scratch.as_deref()
-        }
+        JsonNode::Scalar(Value::Null) => vec![Cow::Borrowed("null")],
+        JsonNode::Scalar(other) => vec![Cow::Owned(other.to_string())],
         JsonNode::Array(_) | JsonNode::Object(_) => {
-            *scratch = serde_json::to_string(node).ok();
-            scratch.as_deref()
+            let render = |mode| serde_json::to_string(&Reading { node, mode }).ok();
+            let Some(last) = render(Duplicates::KeepLast) else {
+                return Vec::new();
+            };
+            let Some(all) = render(Duplicates::KeepAll) else {
+                return vec![Cow::Owned(last)];
+            };
+            // Equal only when the subtree has no duplicated member.
+            if all == last {
+                return vec![Cow::Owned(last)];
+            }
+            let mut texts = vec![Cow::Owned(last)];
+            if let Some(first) = render(Duplicates::KeepFirst)
+                && !texts.iter().any(|text| *text == first)
+            {
+                texts.push(Cow::Owned(first));
+            }
+            texts.push(Cow::Owned(all));
+            texts
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Duplicates {
+    /// One member per name at its first position with its last value —
+    /// `serde_json::Value` with `preserve_order`.
+    KeepLast,
+    /// One member per name at its first position with its first value.
+    KeepFirst,
+    /// Every member in source order.
+    KeepAll,
+}
+
+/// Serializes `node` as one reading of its duplicated members, applied at
+/// every depth (including objects nested inside arrays).
+struct Reading<'a> {
+    node: &'a JsonNode,
+    mode: Duplicates,
+}
+
+impl Serialize for Reading<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.node {
+            JsonNode::Scalar(value) => value.serialize(serializer),
+            JsonNode::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for node in items {
+                    seq.serialize_element(&Reading {
+                        node,
+                        mode: self.mode,
+                    })?;
+                }
+                seq.end()
+            }
+            JsonNode::Object(members) if self.mode == Duplicates::KeepAll => {
+                let mut map = serializer.serialize_map(Some(members.len()))?;
+                for (name, node) in members {
+                    map.serialize_entry(
+                        name,
+                        &Reading {
+                            node,
+                            mode: self.mode,
+                        },
+                    )?;
+                }
+                map.end()
+            }
+            JsonNode::Object(members) => {
+                let mut kept: Vec<(&str, &JsonNode)> = Vec::with_capacity(members.len());
+                let mut slots: HashMap<&str, usize> = HashMap::with_capacity(members.len());
+                for (name, node) in members {
+                    match slots.get(name.as_str()) {
+                        Some(&slot) => {
+                            if self.mode == Duplicates::KeepLast {
+                                kept[slot].1 = node;
+                            }
+                        }
+                        None => {
+                            slots.insert(name.as_str(), kept.len());
+                            kept.push((name.as_str(), node));
+                        }
+                    }
+                }
+                let mut map = serializer.serialize_map(Some(kept.len()))?;
+                for (name, node) in kept {
+                    map.serialize_entry(
+                        name,
+                        &Reading {
+                            node,
+                            mode: self.mode,
+                        },
+                    )?;
+                }
+                map.end()
+            }
         }
     }
 }
@@ -168,40 +264,15 @@ impl<'de> Visitor<'de> for NodeVisitor {
     }
 }
 
-impl Serialize for JsonNode {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            JsonNode::Scalar(value) => value.serialize(serializer),
-            JsonNode::Array(items) => {
-                let mut seq = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    seq.serialize_element(item)?;
-                }
-                seq.end()
-            }
-            JsonNode::Object(members) => {
-                let mut map = serializer.serialize_map(Some(members.len()))?;
-                for (name, value) in members {
-                    map.serialize_entry(name, value)?;
-                }
-                map.end()
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn texts(body: &[u8], path: &[JsonPathSegment]) -> Vec<String> {
+    fn texts(body: &[u8], path: &[JsonPathSegment]) -> Vec<Vec<String>> {
         let doc = parse(body).expect("valid JSON");
         select(&doc, path)
             .into_iter()
-            .map(|node| {
-                let mut scratch = None;
-                scan_text(node, &mut scratch).unwrap().to_string()
-            })
+            .map(|node| scan_texts(node).into_iter().map(Cow::into_owned).collect())
             .collect()
     }
 
@@ -212,27 +283,44 @@ mod tests {
     #[test]
     fn duplicate_leaf_and_enclosing_members_are_all_selected() {
         let leaf = br#"{"user":{"bio":"first","bio":"last"}}"#;
-        assert_eq!(texts(leaf, &[key("user"), key("bio")]), ["first", "last"]);
+        assert_eq!(
+            texts(leaf, &[key("user"), key("bio")]),
+            [["first"], ["last"]]
+        );
 
         let enclosing = br#"{"user":{"bio":"first"},"user":{"bio":"last"}}"#;
         assert_eq!(
             texts(enclosing, &[key("user"), key("bio")]),
-            ["first", "last"]
+            [["first"], ["last"]]
         );
 
-        let escaped = br#"{"user":{"bio":"first","bio":"last"}}"#;
+        // `b\u0069o` and `\u0075ser` are escaped spellings of `bio` / `user`.
+        let escaped = br#"{"\u0075ser":{"b\u0069o":"first","bio":"last"}}"#;
         assert_eq!(
             texts(escaped, &[key("user"), key("bio")]),
-            ["first", "last"]
+            [["first"], ["last"]]
         );
     }
 
     #[test]
-    fn container_text_keeps_every_member_in_source_order() {
-        let body = br#"{"a":{"z":1,"y":[true,null,2.5],"z":"x"}}"#;
+    fn container_without_duplicates_has_one_reading() {
+        let body = br#"{"a":{"z":1,"y":[true,null,2.5]}}"#;
         assert_eq!(
             texts(body, &[key("a")]),
-            [r#"{"z":1,"y":[true,null,2.5],"z":"x"}"#]
+            [[r#"{"z":1,"y":[true,null,2.5]}"#]]
+        );
+    }
+
+    #[test]
+    fn container_with_duplicates_has_last_first_and_full_readings() {
+        let body = br#"{"a":{"z":1,"y":[{"k":"p","k":"q"}],"z":"x"}}"#;
+        assert_eq!(
+            texts(body, &[key("a")]),
+            [[
+                r#"{"z":"x","y":[{"k":"q"}]}"#,
+                r#"{"z":1,"y":[{"k":"p"}]}"#,
+                r#"{"z":1,"y":[{"k":"p","k":"q"}],"z":"x"}"#,
+            ]]
         );
     }
 
@@ -241,7 +329,7 @@ mod tests {
         let body = br#"{"m":[{"c":"zero"},{"c":"one"}],"s":"text"}"#;
         assert_eq!(
             texts(body, &[key("m"), JsonPathSegment::Index(1), key("c")]),
-            ["one"]
+            [["one"]]
         );
         assert!(texts(body, &[key("s"), key("x")]).is_empty());
         assert!(texts(body, &[key("m"), key("c")]).is_empty());
@@ -249,7 +337,7 @@ mod tests {
 
     #[test]
     fn byte_order_mark_is_skipped_and_malformed_input_is_rejected() {
-        assert_eq!(texts(b"\xEF\xBB\xBF{\"k\":\"v\"}", &[key("k")]), ["v"]);
+        assert_eq!(texts(b"\xEF\xBB\xBF{\"k\":\"v\"}", &[key("k")]), [["v"]]);
         assert!(parse(b"{\"k\":").is_none());
         assert!(parse(b"{\"k\":1} trailing").is_none());
     }

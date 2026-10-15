@@ -523,15 +523,16 @@ impl Waf {
         };
         for path_rule in &self.compiled.body_json_paths {
             for value in json_doc::select(&json, &path_rule.path) {
-                let mut scratch = None;
-                let Some(text) = json_doc::scan_text(value, &mut scratch) else {
-                    continue;
-                };
-                self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
-                // `text` is already JSON-unescaped; its single-character
-                // escapes are not resolved a second time.
-                for variant in normalize::decoded_json_value_variants(text) {
-                    self.push_json_path_hit_if_matched(outcome, path_rule, &variant, text, subject);
+                for text in json_doc::scan_texts(value) {
+                    let text = text.as_ref();
+                    self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject);
+                    // `text` is already JSON-unescaped; its single-character
+                    // escapes are not resolved a second time.
+                    for variant in normalize::decoded_json_value_variants(text) {
+                        self.push_json_path_hit_if_matched(
+                            outcome, path_rule, &variant, text, subject,
+                        );
+                    }
                 }
             }
         }
