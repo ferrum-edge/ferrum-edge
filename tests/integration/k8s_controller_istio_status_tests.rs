@@ -104,7 +104,10 @@ fn mixed_istio_snapshot_emits_update_per_supported_kind() {
             "security.istio.io/v1",
             "RequestAuthentication",
             "jwt",
-            json!({ "jwtRules": [{ "issuer": "https://issuer.example.com" }] }),
+            json!({ "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks"
+            }] }),
         ),
         object(
             "networking.istio.io/v1",
@@ -205,7 +208,10 @@ fn newly_covered_kinds_report_accepted_on_valid_input() {
             "security.istio.io/v1",
             "RequestAuthentication",
             "ra-ok",
-            json!({ "jwtRules": [{ "issuer": "https://issuer.example.com" }] }),
+            json!({ "jwtRules": [{
+                "issuer": "https://issuer.example.com",
+                "jwksUri": "https://issuer.example.com/jwks"
+            }] }),
         ),
         object(
             "networking.istio.io/v1",

@@ -590,7 +590,9 @@ impl IpCidr {
     /// Whether `addr` lies in this network. An IPv4-mapped IPv6 address
     /// (`::ffff:a.b.c.d`) is compared as the IPv4 address it carries, so
     /// spelling an address in its mapped form cannot step around an IPv4 rule;
-    /// an IPv6 network that covers the mapped range still matches it.
+    /// an IPv6 network that covers the mapped range still matches it. A native
+    /// IPv4 address never matches an IPv6 network: `::/0` in an IP exemption
+    /// covers IPv6 callers only and must not exempt every IPv4 caller.
     pub(super) fn matches(self, addr: IpAddr) -> bool {
         fn v4_in(network: Ipv4Addr, prefix: u8, addr: Ipv4Addr) -> bool {
             let mask = if prefix == 0 {
@@ -608,13 +610,13 @@ impl IpCidr {
             };
             u128::from(network) & mask == u128::from(addr) & mask
         }
-        match (self.network, addr.to_canonical()) {
+        match (self.network, addr) {
             (IpAddr::V4(network), IpAddr::V4(addr)) => v4_in(network, self.prefix, addr),
+            (IpAddr::V4(network), IpAddr::V6(addr)) => addr
+                .to_ipv4_mapped()
+                .is_some_and(|addr| v4_in(network, self.prefix, addr)),
             (IpAddr::V6(network), IpAddr::V6(addr)) => v6_in(network, self.prefix, addr),
-            (IpAddr::V6(network), IpAddr::V4(addr)) => {
-                v6_in(network, self.prefix, addr.to_ipv6_mapped())
-            }
-            (IpAddr::V4(_), IpAddr::V6(_)) => false,
+            (IpAddr::V6(_), IpAddr::V4(_)) => false,
         }
     }
 }
@@ -1657,9 +1659,15 @@ mod tests {
         assert!(mapped_host.matches("10.2.3.4".parse().unwrap()));
         assert!(!mapped_host.matches("10.2.3.5".parse().unwrap()));
 
+        // A generic IPv6 network keeps its address family: it covers the
+        // mapped spelling (an IPv6 token) but never a native IPv4 address.
         let all_v6 = IpCidr::parse("::/0").unwrap();
-        assert!(all_v6.matches("10.2.3.4".parse().unwrap()));
+        assert!(!all_v6.matches("10.2.3.4".parse().unwrap()));
+        assert!(all_v6.matches("::ffff:10.2.3.4".parse().unwrap()));
         assert!(all_v6.matches("2001:db8::1".parse().unwrap()));
+        let mapped_range_v6 = IpCidr::parse("::ffff:0:0/95").unwrap();
+        assert!(mapped_range_v6.matches("::ffff:10.2.3.4".parse().unwrap()));
+        assert!(!mapped_range_v6.matches("10.2.3.4".parse().unwrap()));
 
         let v6_rule = IpCidr::parse("2001:db8::/32").unwrap();
         assert!(!v6_rule.matches("10.2.3.4".parse().unwrap()));

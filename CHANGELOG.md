@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **WAF `cidr` rules and IP exemptions match IPv4-mapped IPv6 spellings,
+  and IPv6 exemptions no longer cover IPv4 callers** (PR #6684 and its
+  follow-up). An IPv4 network (or a `::ffff:a.b.c.d/96`-or-longer mapped
+  network) now matches both `10.0.0.1` and `::ffff:10.0.0.1`, so the mapped
+  spelling cannot step around an IPv4 rule. Any other IPv6 network, including
+  `::/0`, matches IPv6 addresses only: a `global_exemptions.ips: ["::/0"]`
+  entry exempts IPv6 callers, never native IPv4 ones.
+- **An issuer-only mesh RequestAuthentication is refused** (follow-up to
+  PR #6668). A `jwtRules[]` entry with neither `jwksUri` nor `jwks` (or a
+  blank issuer) used to translate and report `FerrumAccepted=True`, then fail
+  mesh admission, which rejected the whole reload and kept the previous
+  configuration, including one without a pending refusal. Translation now
+  refuses it, so it fails closed like any other rejected RequestAuthentication
+  (`refuse_all`). Ferrum does not discover keys from the issuer; add
+  `jwksUri` or `jwks`.
+- The shared HTTP batch-response helper renders a transport error without its
+  request URL (PR #6684), so an endpoint credential in the path or query is
+  never echoed into a sink diagnostic.
+
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,
   and the paired counter read previously fetched counters with a plain
@@ -182,7 +201,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `on_unlisted_response_content_type` (`allow` / `fail_closed` /
     `block`, default `fail_closed`) gives response bodies the same control,
     so an origin cannot stream a disclosure past an enforcing response-body
-    rule by labelling it with an unscanned type. Unlisted bodies now record
+    rule by labelling it with an unscanned type. `text/event-stream`
+    responses, bodiless responses (`HEAD`, 1xx, 204, 304) and exempt requests
+    are not governed. Unlisted bodies now record
     `waf.body_uninspected_target`.
   - A body rule that neither enforces nor adds to the anomaly score (for
     example `score: 0`) no longer makes a body policy "enforcing" for the
@@ -487,6 +508,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `security_headers` rejects built-in header values browsers
+  ignore** (PR #6685 and its follow-up). Custom `content_type_options` must be
+  `nosniff`, `frame_options` must be `DENY` or `SAMEORIGIN`, and
+  `referrer_policy` must be a comma-separated list of Referrer-Policy tokens
+  (ASCII case-insensitive, surrounding spaces and tabs allowed). A `set` entry
+  for `X-Content-Type-Options`, `X-Frame-Options` or `Referrer-Policy` (any
+  case) is held to the same values, and an empty value there is refused. A
+  typo such as `SAMEORGIN` used to load and silently drop the protection; it
+  now fails config admission. `false`/`null`/`""` still disable a built-in
+  header.
+- `a2a_gateway` stream-observation maps and the `proxy_alerts` window,
+  cooldown and recovery maps honour `FERRUM_POOL_SHARD_AMOUNT` (PR #6684), like
+  the other hot-path plugin maps.
 - **BREAKING — `output_claim_headers` and mesh `outputClaimToHeaders` compare
   destinations with `_` treated as `-`** (issue #6656, follow-up to #6620), like
   `claim_headers`: `X_Real_IP` is reserved like `X-Real-IP`, and `X_Tenant_Id`

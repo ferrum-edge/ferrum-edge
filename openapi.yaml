@@ -29911,10 +29911,20 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             not:
               pattern: "^(?:[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$"
+          patternProperties:
+            '^[Xx]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]-[Oo][Pp][Tt][Ii][Oo][Nn][Ss]$':
+              type: string
+              pattern: '^[\t ]*[Nn][Oo][Ss][Nn][Ii][Ff][Ff][\t ]*$'
+            '^[Xx]-[Ff][Rr][Aa][Mm][Ee]-[Oo][Pp][Tt][Ii][Oo][Nn][Ss]$':
+              type: string
+              pattern: '^[\t ]*(?:[Dd][Ee][Nn][Yy]|[Ss][Aa][Mm][Ee][Oo][Rr][Ii][Gg][Ii][Nn])[\t ]*$'
+            '^[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Pp][Oo][Ll][Ii][Cc][Yy]$':
+              type: string
+              pattern: '^[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*(?:,[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*)*$'
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
-          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
+          description: "Arbitrary response headers to set (name -> value). An entry for X-Content-Type-Options, X-Frame-Options or Referrer-Policy (case-insensitive name) must carry a value the matching built-in option accepts (`nosniff`; `DENY` or `SAMEORIGIN`; a comma-separated list of Referrer-Policy tokens), since browsers ignore any other value; an empty value is rejected. Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:
