@@ -294,6 +294,24 @@ async fn k8s_psat_accepts_service_account_longer_than_a_label() {
 }
 
 #[tokio::test]
+async fn k8s_psat_accepts_undotted_names_up_to_the_subdomain_limit() {
+    // Kubernetes caps a subdomain at 253 characters in total; a single
+    // component may exceed the 63-character label limit.
+    for len in [64, 253] {
+        let name = "a".repeat(len);
+        let attestor = psat_attestor(psat_review(&name, Some(&name)), None);
+        let identity = attestor
+            .attest(&psat_peer())
+            .await
+            .unwrap_or_else(|e| panic!("{len}-char ServiceAccount and Pod names pass: {e:?}"));
+        assert_eq!(
+            identity.spiffe_id.as_str(),
+            format!("spiffe://cluster.local/ns/production/sa/{name}")
+        );
+    }
+}
+
+#[tokio::test]
 async fn k8s_psat_accepts_dotted_pod_name() {
     let attestor = psat_attestor(
         psat_review("app", Some("web.canary-0")),
@@ -311,7 +329,8 @@ async fn k8s_psat_accepts_dotted_pod_name() {
 
 #[tokio::test]
 async fn k8s_psat_rejects_malformed_service_account_and_pod_names() {
-    let too_long = format!("{}.{}", "a".repeat(200), "b".repeat(53)); // 254 chars
+    let too_long = "a".repeat(254);
+    let too_long_dotted = format!("{}.{}", "a".repeat(200), "b".repeat(53)); // 254 chars
     let bad_names = [
         "evil/sa/admin",
         "a..b",
@@ -325,6 +344,7 @@ async fn k8s_psat_rejects_malformed_service_account_and_pod_names() {
         "Build.bot",
         "",
         too_long.as_str(),
+        too_long_dotted.as_str(),
     ];
     for bad in bad_names {
         let attestor = psat_attestor(psat_review(bad, None), None);

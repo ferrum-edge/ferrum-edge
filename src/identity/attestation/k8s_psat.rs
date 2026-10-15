@@ -97,9 +97,10 @@ impl K8sPsatAttestor {
         //
         // - Namespaces are DNS-1123 labels
         //   (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, max 63 chars).
-        // - ServiceAccount and Pod names are DNS-1123 subdomains: one or more
-        //   such labels joined by `.`, max 253 chars (so `build.bot` is a
-        //   legitimate ServiceAccount).
+        // - ServiceAccount and Pod names are DNS-1123 subdomains: dot-joined
+        //   alphanumeric/hyphen components, max 253 chars in total with no
+        //   per-component cap (so `build.bot` and a 64-char name are
+        //   legitimate ServiceAccounts).
         //
         // Neither grammar admits `/`, `%`, `:`, uppercase or a bare `.`/`..`
         // segment, so no accepted value can add or reshape a SPIFFE ID path
@@ -150,11 +151,22 @@ fn is_dns1123_label(s: &str) -> bool {
     bytes.iter().all(|b| valid_alnum(*b) || *b == b'-')
 }
 
-/// DNS-1123 subdomain per Kubernetes API conventions: one or more DNS-1123
-/// labels separated by `.`, max 253 characters. Used for ServiceAccount and
-/// Pod names.
+/// DNS-1123 subdomain per Kubernetes API conventions (`IsDNS1123Subdomain`):
+/// `[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*`, max 253
+/// characters in total. Unlike a label, a dot-separated component has no
+/// 63-character cap of its own. Used for ServiceAccount and Pod names.
 fn is_dns1123_subdomain(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 253 && s.split('.').all(is_dns1123_label)
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(|component| {
+        let bytes = component.as_bytes();
+        let valid_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        !bytes.is_empty()
+            && valid_alnum(bytes[0])
+            && valid_alnum(bytes[bytes.len() - 1])
+            && bytes.iter().all(|b| valid_alnum(*b) || *b == b'-')
+    })
 }
 
 #[async_trait]
