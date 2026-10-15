@@ -3238,10 +3238,16 @@ where
         crate::http3::stream_util::abort_response_stream(stream);
         return (0, false);
     };
-    let bytes = translated.body.len() as u64;
+    // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2), so none are
+    // delivered or accounted.
+    let omit_body = crate::http3::server::h3_request_is_head();
+    let bytes = if omit_body {
+        0
+    } else {
+        translated.body.len() as u64
+    };
     let write = async {
-        // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2).
-        if !translated.body.is_empty() && !crate::http3::server::h3_request_is_head() {
+        if !translated.body.is_empty() && !omit_body {
             stream.send_data(Bytes::from(translated.body)).await?;
         }
         stream.finish().await
@@ -6463,7 +6469,13 @@ where
             outcome.error_class = terminal_error_class;
             return Ok(outcome);
         }
-        let bytes_streamed = response_body.len() as u64;
+        // A `HEAD` response delivers no body bytes, so none are accounted.
+        let omit_body = crate::http3::server::h3_request_is_head();
+        let bytes_streamed = if omit_body {
+            0
+        } else {
+            response_body.len() as u64
+        };
         // Read before the body moves into the write: a pass-through gRPC-Web
         // response carries its status in the backend's own trailer frame.
         let passthrough_grpc_status = if ctx.request_is_grpc_web() {
@@ -6476,8 +6488,7 @@ where
             None
         };
         let buffered_write = async {
-            // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2).
-            if !response_body.is_empty() && !crate::http3::server::h3_request_is_head() {
+            if !response_body.is_empty() && !omit_body {
                 stream.send_data(response_body).await?;
             }
             stream.finish().await
@@ -12125,7 +12136,7 @@ where
     let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
     let bytes = Bytes::from_static(body.as_bytes());
-    let len = bytes.len() as u64;
+    let len = if omit_body { 0 } else { bytes.len() as u64 };
     if !omit_body {
         let _ = stream.send_data(bytes).await;
     }
@@ -12637,10 +12648,11 @@ where
         .map_err(|e| anyhow::anyhow!("Failed to build H3 reject response: {}", e))?;
     let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
-    let len = body.len() as u64;
     // A `HEAD` response keeps the `Content-Length` the framing above set and
-    // carries no body bytes (RFC 9110 §9.3.2).
-    if !body.is_empty() && !crate::http3::server::h3_request_is_head() {
+    // carries no body bytes (RFC 9110 §9.3.2), so none are accounted.
+    let omit_body = crate::http3::server::h3_request_is_head();
+    let len = if omit_body { 0 } else { body.len() as u64 };
+    if !body.is_empty() && !omit_body {
         let _ = stream.send_data(body).await;
     }
     let _ = stream.finish().await;
@@ -13589,9 +13601,15 @@ where
         ) {
             crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, policy, None);
             send_response_headers(stream, "POST", 200, &translated.headers).await?;
-            let body_len = translated.body.len() as u64;
-            // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2).
-            if !crate::http3::server::h3_request_is_head() {
+            // A `HEAD` response carries no body bytes (RFC 9110 §9.3.2), so
+            // none are accounted.
+            let omit_body = crate::http3::server::h3_request_is_head();
+            let body_len = if omit_body {
+                0
+            } else {
+                translated.body.len() as u64
+            };
+            if !omit_body {
                 stream.send_data(Bytes::from(translated.body)).await?;
             }
             stream.finish().await?;

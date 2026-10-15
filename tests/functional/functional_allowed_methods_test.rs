@@ -332,10 +332,11 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
             "proxies:\n  - id: \"down\"\n    listen_path: \"/down\"\n    backend_scheme: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {closed_port}\n    strip_listen_path: false\n    pool_enable_http2: false\n"
         ),
         1,
-    );
-    let gateway = TestGateway::builder()
+    ) + "  - id: \"head-stdout-log\"\n    plugin_name: stdout_logging\n    scope: global\n    enabled: true\n    config: {}\n";
+    let mut gateway = TestGateway::builder()
         .mode_file(config)
         .log_level("warn")
+        .capture_output()
         .env("FERRUM_ENABLE_HTTP3", "true")
         .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
         .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
@@ -396,7 +397,9 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
     let client = Http3Client::insecure().expect("h3 client");
     for (path, content_type, status) in cases {
         let url = format!("https://localhost:{https_port}{path}");
-        let mut options = GetOptions::default().method(Method::HEAD);
+        let mut options = GetOptions::default()
+            .method(Method::HEAD)
+            .header("user-agent", H3_HEAD_TEST_AGENT);
         if let Some(content_type) = content_type {
             options = options.header("content-type", *content_type);
         }
@@ -447,7 +450,57 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
         1,
         "the backend counter must see admitted requests"
     );
+
+    // Accounting: the HTTP/3 HEAD backend-dispatch error delivered no body
+    // bytes, so its transaction summary reports none, while a GET to the same
+    // route (the body-bearing control) reports its error body.
+    let get_down = client
+        .get_with_options(
+            &format!("https://localhost:{https_port}/down"),
+            GetOptions::default().header("user-agent", H3_HEAD_TEST_AGENT),
+        )
+        .await
+        .expect("H3 GET /down");
+    assert_eq!(get_down.status, http::StatusCode::BAD_GATEWAY);
+    assert!(!get_down.body_bytes.is_empty());
+    let down_entries = |raw: &str| -> Vec<serde_json::Value> {
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| {
+                entry.get("request_path").and_then(|v| v.as_str()) == Some("/down")
+                    && entry.get("request_user_agent").and_then(|v| v.as_str())
+                        == Some(H3_HEAD_TEST_AGENT)
+            })
+            .collect()
+    };
+    let stdout = gateway
+        .wait_for_captured_output(|raw| down_entries(raw).len() >= 2, Duration::from_secs(10))
+        .await
+        .expect("read stdout capture");
+    let entries = down_entries(&stdout);
+    let bytes_for = |method: &str| {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.get("http_method").and_then(|v| v.as_str()) == Some(method))
+            .unwrap_or_else(|| panic!("missing H3 {method} /down summary in {entries:?}"));
+        entry
+            .get("bytes_received")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        bytes_for("HEAD"),
+        0,
+        "a suppressed HEAD body is not delivered"
+    );
+    assert!(
+        bytes_for("GET") > 0,
+        "the control GET reports its error body"
+    );
+    gateway.shutdown();
 }
+
+const H3_HEAD_TEST_AGENT: &str = "ferrum-h3-head-test";
 
 // ---------------------------------------------------------------------------
 // Client-selected flavors that cannot run the route's admission policy
