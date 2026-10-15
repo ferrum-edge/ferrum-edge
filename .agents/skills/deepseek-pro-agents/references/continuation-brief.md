@@ -1,4 +1,4 @@
-# Ferrum Edge DeepSeek V4 Pro continuation brief
+# Ferrum Edge DeepSeek (Pro-lane, V4.1 Flash) continuation brief
 
 Resume the existing worktree and branch named in the dispatch prompt. Follow every rule in
 `agent-brief.md`, especially isolation, direct implementation, the

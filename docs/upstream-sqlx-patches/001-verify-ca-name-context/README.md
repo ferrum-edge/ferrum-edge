@@ -109,8 +109,8 @@ variants (or verifies chains separately from names), treats a configured root
 CA as exclusive, and passes the same handshake controls. Retain the vendor copy
 and its patch entries while [patch 002](../002-typed-float-null-bindings/README.md)
 still needs them. Once both patches can retire, remove both
-`[patch.crates-io]` entries (root `Cargo.toml` and
-`tests/performance/mesh/Cargo.toml`), the vendor copy, the inventory row in
+`[patch.crates-io]` entries (root `Cargo.toml`, `fuzz/Cargo.toml` and
+`tests/performance/mesh/Cargo.toml`) and update the three lockfiles while the
+vendor copy still exists; then remove the vendor copy, the inventory row in
 `docs/dependency-policy.md`, and the entry in
-`docs/vendored-patch-lifecycle.json`; update both lockfiles and the drift
-manifest. Keep all Ferrum unit and service-integration regressions.
+`docs/vendored-patch-lifecycle.json`, and update the drift manifest. Keep all Ferrum unit and service-integration regressions.

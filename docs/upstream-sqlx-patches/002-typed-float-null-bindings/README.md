@@ -71,8 +71,8 @@ an error category, and a validated SQLSTATE if the read fails.
 Retire this correction when a compatible SQLx release preserves native
 REAL/DOUBLE typed-NULL parameter types and passes the same hosted PostgreSQL
 regression. Keep that behavioral regression after retirement. Retain the vendor
-copy and its root/mesh `[patch.crates-io]` entries while patch 001 still needs
-them. Once both patches can retire, update both lockfiles, remove the vendor
-copy and patch entries, and update the integrity manifest, policy inventory,
-and lifecycle inventory together. No SQLx version or dependency graph changes
+copy and its root, fuzz and mesh `[patch.crates-io]` entries while patch 001
+still needs them. Once both patches can retire, remove the patch entries and
+update the three lockfiles, then remove the vendor copy and update the
+integrity manifest, policy inventory, and lifecycle inventory together. No SQLx version or dependency graph changes
 are part of this correction.

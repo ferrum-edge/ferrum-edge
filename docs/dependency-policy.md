@@ -573,17 +573,31 @@ co-vendored patches such as `h3`, `h3-quinn`, and tungstenite, *every* patch in
 the group must be ready — see the `Removal trigger` column).
 
 1. Bump the registry version in `Cargo.toml` `[dependencies]` to the release
-   containing the fix; update `Cargo.lock`.
-2. Remove the crate's line from the `[patch.crates-io]` block.
-3. `git rm -r vendor/<crate>-<ver>-ferrum-patched/` (and `vendor/` if empty).
-4. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
+   containing the fix.
+2. Remove the crate's line from **every** `[patch.crates-io]` table that
+   points at the vendor directory. Standalone workspaces do not inherit the
+   root table, so each keeps its own mirror: the root `Cargo.toml`,
+   `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`. Find them all
+   with `git grep -n '<crate>-<ver>-ferrum-patched' -- '*Cargo.toml'`.
+3. Regenerate every affected lockfile while the vendor directory still exists
+   — `Cargo.lock`, `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock`
+   (for example `cargo update -p <crate>` and
+   `cargo update --manifest-path fuzz/Cargo.toml -p <crate>`). Confirm the root
+   and fuzz tables still agree with
+   `cargo test --test unit_gateway_core_tests fuzz_workspace_patches_every_vendored_crate_the_root_patches`
+   (`tests/unit/gateway_core/fuzz_target_schedule_parity_tests.rs`), which CI
+   also runs.
+4. `git rm -r vendor/<crate>-<ver>-ferrum-patched/` (and `vendor/` if empty),
+   then `git grep '<crate>-<ver>-ferrum-patched'` for remaining references
+   (CI steps in `.github/workflows/ci.yml`, `.github/scripts/`, `Dockerfile.test`).
+5. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
    `STATUS.md` (merge commit + registry version), or delete per that crate's
    README.
-5. Remove the inventory row (Lifecycle ID) and the matching `docs/vendored-patch-lifecycle.json`
+6. Remove the inventory row (Lifecycle ID) and the matching `docs/vendored-patch-lifecycle.json`
    entry.
-6. Regenerate the drift manifest (now smaller) and keep the gateway call sites —
+7. Regenerate the drift manifest (now smaller) and keep the gateway call sites —
    they use the upstream API by design.
-7. Run the behavioral regression tests; they must still pass.
+8. Run the behavioral regression tests; they must still pass.
 
 ### Emergency security update for a vendored crate
 
