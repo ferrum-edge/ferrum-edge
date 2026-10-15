@@ -287,8 +287,10 @@ already set on workload pods.
 
 #### 4c. Verify issuance
 
-The published Ferrum images are distroless. They contain the Ferrum binaries
-only: no shell, no `ls`/`stat`/`curl`, and no `spire-agent` CLI. So
+The default published Ferrum images (and the `-ebpf` variant) are distroless.
+They contain the Ferrum binaries only: no shell, no `ls`/`stat`/`curl`, and no
+`spire-agent` CLI. The tools-capable `-ebpf-tools` variant adds a shell and
+networking tools, but it does not include `spire-agent` either. So
 `kubectl exec ... spire-agent api fetch` inside a Ferrum container cannot work.
 Verify issuance on the SPIRE side, then through Ferrum's own diagnostics on the
 target pod:
@@ -307,13 +309,17 @@ curl -fsS -H "Authorization: Bearer $FERRUM_ADMIN_JWT" http://127.0.0.1:9000/met
 
 These are the signals that prove the **target workload** was attested:
 
-- **Mesh pods** (`FERRUM_MESH_CA_BACKEND=spire`): the pod reaching Ready is
-  itself evidence. Ferrum refuses to bind mesh listeners until the first SVID
-  arrives from the agent, and exits after 30s without one (see
-  [Mesh-mode pods](#mesh-mode-pods-sidecar-ambient-waypoint-egress)). On the
-  running pod, `ferrum_mesh_cert_expiry_seconds{source="spire_agent"}` carries
-  the issued `spiffe_id` and a positive remaining lifetime, and
-  `ferrum_mesh_ca_health{ca_type="spire_agent"}` is `1`.
+- **Mesh pods** (`FERRUM_MESH_CA_BACKEND=spire`, with **no**
+  `FERRUM_GATEWAY_SVID_*` material configured): Ferrum refuses to bind mesh
+  listeners until the first SVID arrives from the agent, and exits after 30s
+  without one (see
+  [Mesh-mode pods](#mesh-mode-pods-sidecar-ambient-waypoint-egress)). Explicit
+  `FERRUM_GATEWAY_SVID_*` material takes precedence and skips SPIRE issuance
+  entirely, so a pod with that override can be Ready while the agent is
+  unreachable. Readiness alone is therefore not the evidence. The evidence is
+  `ferrum_mesh_cert_expiry_seconds{source="spire_agent"}` carrying the
+  expected `spiffe_id` with a positive remaining lifetime, together with
+  `ferrum_mesh_ca_health{ca_type="spire_agent"}` at `1`.
 - **Gateway pods** (file SVIDs written by a helper): the helper container runs
   in the same pod under the same ServiceAccount, so its logs are the
   attestation evidence. Check them with `kubectl logs <ferrum-pod> -c <helper>`
@@ -682,7 +688,7 @@ described above aborts startup before mesh listeners bind.
 **Recovery**:
 
 1. Check the agent pod on the same node — `kubectl get pod -n spire-system -l app=spire-agent --field-selector spec.nodeName=<node>`.
-2. Check the socket mount of the Ferrum pod. The distroless container has no `ls`, so inspect it from Kubernetes: `kubectl describe pod <ferrum-pod>` shows volume/CSI mount events and errors, and `kubectl get pod <ferrum-pod> -o jsonpath='{.spec.volumes}'` shows the `spire-agent-socket` source. A missing socket file surfaces in Ferrum's own logs as `failed to connect to Workload API agent`.
+2. Check the socket mount of the Ferrum pod. The default and `-ebpf` images are distroless and have no `ls`, so inspect it from Kubernetes: `kubectl describe pod <ferrum-pod>` shows volume/CSI mount events and errors, and `kubectl get pod <ferrum-pod> -o jsonpath='{.spec.volumes}'` shows the `spire-agent-socket` source. A missing socket file surfaces in Ferrum's own logs as `failed to connect to Workload API agent`.
 3. Verify the registration entry is still present — `spire-server entry show -spiffeID <ferrum-spiffe-id>`. If a recent SPIRE Server failover dropped the entry, recreate via your controller-manager `ClusterSPIFFEID` or CLI.
 4. Watch `ferrum_mesh_ca_health` flip back to `1` once the stream re-establishes.
 
@@ -750,7 +756,7 @@ expired chain).
    server-side rate limiting can stall rotation.
 3. For the gateway file path: confirm whatever process writes the SVID files
    (`spiffe-helper` sidecar, init job, custom controller) is still running and
-   logging successful renewals (`kubectl logs <gateway-pod> -c <helper>`). The Ferrum container is distroless and has no `stat`, so read freshness from Ferrum instead. `GET /admin/tls/events?surface=gateway_svid` is the evidence that Ferrum **installed** a renewal: each accepted renewal records a successful rotation event with a new revision, roughly every `ttl/2`, while a refused candidate (for example a renewed certificate with a mismatched key) records a rebuild error and Ferrum keeps serving the previous SVID. `GET /admin/tls/inventory` and `ferrum_tls_cert_expiry_seconds` only describe what the source files currently hold. They can show a renewed validity window even when Ferrum refused that candidate, so do not treat them alone as proof that rotation recovered.
+   logging successful renewals (`kubectl logs <gateway-pod> -c <helper>`). The default and `-ebpf` Ferrum images are distroless and have no `stat`, and file mtimes would not show what Ferrum installed anyway, so read freshness from Ferrum instead. `GET /admin/tls/events?surface=gateway_svid` is the evidence that Ferrum **installed** a renewal: each accepted renewal records a successful rotation event with a new revision, roughly every `ttl/2`, while a refused candidate (for example a renewed certificate with a mismatched key) records a rebuild error and Ferrum keeps serving the previous SVID. `GET /admin/tls/inventory` and `ferrum_tls_cert_expiry_seconds` only describe what the source files currently hold. They can show a renewed validity window even when Ferrum refused that candidate, so do not treat them alone as proof that rotation recovered.
 
 ## Alerting reference
 
@@ -790,7 +796,7 @@ Before declaring a cluster ready for production mesh traffic:
       match your inventory.
 - [ ] **SVID issuance verified** for at least one pod of each Ferrum role,
       using the target-pod signals in [Verify issuance](#4c-verify-issuance)
-      (Ready mesh pods with `ferrum_mesh_cert_expiry_seconds{source="spire_agent"}`,
+      (`ferrum_mesh_cert_expiry_seconds{source="spire_agent"}` for mesh pods,
       helper logs plus a `gateway_svid` rotation event for gateway pods), not a
       separate debug pod.
 - [ ] **Ferrum env vars** set: `FERRUM_MESH_CA_BACKEND=spire`,

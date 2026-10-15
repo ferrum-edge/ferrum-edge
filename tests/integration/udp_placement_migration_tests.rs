@@ -731,74 +731,89 @@ fn documented_abort_recovery_is_accepted_only_for_its_intended_target() {
     }
 }
 
+/// The documented producer-abort procedure from docs/mesh.md (issue #6703).
+fn documented_producer_abort_procedure() -> &'static str {
+    const MESH_DOC: &str = include_str!("../../docs/mesh.md");
+    MESH_DOC
+        .split("**Abort back to `pod-netns` or `host-netns`.**")
+        .nth(1)
+        .and_then(|tail| tail.split("**Corrupt or unknown ownership.**").next())
+        .expect("docs/mesh.md documents the producer abort procedure")
+}
+
 #[test]
 fn documented_producer_abort_recovers_through_quarantine_cleanup_and_finalize() {
-    // docs/mesh.md: abort back to pod-netns after a pod-netns -> host-netns
-    // cleanup was persisted. Quarantine the state, leave a tombstone, then run a
-    // fresh cleanup adoption FROM the aborted target TO the restored placement.
-    let registry = tempfile::tempdir().expect("registry");
-    let node = identity(NODE_A, BOOT_1);
-    let aborted = on_node(
-        transition(
-            UdpMigrationPhase::Cleanup,
-            "forward-1",
-            UdpPlacement::PodNetns,
-            UdpPlacement::HostNetns,
-        ),
-        &node,
-    );
-    let _ = cleanup_context(registry.path(), &aborted);
+    // The documented procedure must never prescribe a hand-written record (the
+    // shape stable startup refuses), and must name the quarantine + cleanup
+    // tuple + finalize sequence this test then replays.
+    let procedure = documented_producer_abort_procedure();
+    assert!(!procedure.contains("```json"), "{procedure}");
+    assert!(!procedure.contains("\"active\""), "{procedure}");
+    for required in [
+        "Quarantine the state",
+        "tombstone",
+        "`FROM=<the aborted target>`",
+        "`TO=<the placement you are returning to>`",
+        "run `finalize` with the same",
+    ] {
+        assert!(
+            procedure.contains(required),
+            "docs/mesh.md producer abort procedure must say {required:?}"
+        );
+    }
 
-    let state_path = registry.path().join(".udp-placement-state-v1.json");
-    let quarantine = tempfile::tempdir().expect("quarantine");
-    std::fs::rename(&state_path, quarantine.path().join("rejected.json"))
-        .expect("quarantine state outside the registry");
-    std::fs::write(registry.path().join(".udp-placement-quarantined"), b"")
-        .expect("quarantine tombstone");
+    // Replay it for BOTH producer placements: a persisted forward cleanup
+    // `restored -> aborted` is abandoned and the node returns to `restored`.
+    for (restored, aborted) in [
+        (UdpPlacement::PodNetns, UdpPlacement::HostNetns),
+        (UdpPlacement::HostNetns, UdpPlacement::PodNetns),
+    ] {
+        let registry = tempfile::tempdir().expect("registry");
+        let node = identity(NODE_A, BOOT_1);
+        let forward = on_node(
+            transition(UdpMigrationPhase::Cleanup, "forward-1", restored, aborted),
+            &node,
+        );
+        let _ = cleanup_context(registry.path(), &forward);
 
-    // Restarting the restored producer before the cleanup proof is refused.
-    assert!(
-        prepare_placement(
-            registry.path(),
-            &stable_on_node(UdpPlacement::PodNetns, &node)
-        )
-        .is_err()
-    );
+        // Quarantine the state outside the registry and leave the tombstone.
+        let state_path = registry.path().join(".udp-placement-state-v1.json");
+        let quarantine = tempfile::tempdir().expect("quarantine");
+        std::fs::rename(&state_path, quarantine.path().join("rejected.json"))
+            .expect("quarantine state outside the registry");
+        std::fs::write(registry.path().join(".udp-placement-quarantined"), b"")
+            .expect("quarantine tombstone");
 
-    let cleanup = on_node(
-        transition(
-            UdpMigrationPhase::Cleanup,
-            "abort-1",
-            UdpPlacement::HostNetns,
-            UdpPlacement::PodNetns,
-        ),
-        &node,
-    );
-    let context = cleanup_context(registry.path(), &cleanup);
-    complete_cleanup(&context);
-    assert!(matches!(
-        prepare_placement(
-            registry.path(),
-            &on_node(
-                transition(
-                    UdpMigrationPhase::Finalize,
-                    "abort-1",
-                    UdpPlacement::HostNetns,
-                    UdpPlacement::PodNetns,
+        // Restarting the restored producer before the cleanup proof is refused.
+        assert!(
+            prepare_placement(registry.path(), &stable_on_node(restored, &node)).is_err(),
+            "{restored:?} must not start before cleanup/finalize"
+        );
+
+        // Cleanup adoption FROM the aborted target TO the restored placement,
+        // then finalize with the same tuple.
+        let cleanup = on_node(
+            transition(UdpMigrationPhase::Cleanup, "abort-1", aborted, restored),
+            &node,
+        );
+        let context = cleanup_context(registry.path(), &cleanup);
+        complete_cleanup(&context);
+        assert!(matches!(
+            prepare_placement(
+                registry.path(),
+                &on_node(
+                    transition(UdpMigrationPhase::Finalize, "abort-1", aborted, restored),
+                    &node,
                 ),
-                &node,
             ),
-        ),
-        Ok(UdpPlacementDecision::RunStable)
-    ));
-    assert!(!registry.path().join(".udp-placement-quarantined").exists());
-    assert!(matches!(
-        prepare_placement(
-            registry.path(),
-            &stable_on_node(UdpPlacement::PodNetns, &node)
-        ),
-        Ok(UdpPlacementDecision::RunStable)
-    ));
+            Ok(UdpPlacementDecision::RunStable)
+        ));
+        assert!(!registry.path().join(".udp-placement-quarantined").exists());
+        assert!(matches!(
+            prepare_placement(registry.path(), &stable_on_node(restored, &node)),
+            Ok(UdpPlacementDecision::RunStable)
+        ));
+    }
 }
 
 #[test]
