@@ -86,7 +86,7 @@ orchestration:
   the gateway available.
 - MongoDB standalone behavior is covered by functional CI against the
   `mongo:4.4.29` standalone fixture (the supported floor; the Coverage
-  workflow's standalone fixture is `mongo:7`) and intentionally forces database-mode pollers to full
+  workflow's standalone fixture is `mongo:9`) and intentionally forces database-mode pollers to full
   reloads instead of accepting non-transactional incremental cursors. MongoDB
   replica-set transaction/incremental behavior requires a replica-set topology
   and is tracked here as a backend-specific coverage boundary for remote CI

@@ -384,8 +384,8 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 # eBPF program loader (optional, behind `ebpf` feature)
-aya = { version = "0.13", optional = true }
-aya-log = { version = "0.2", optional = true }
+aya = { version = "0.14", optional = true }
+aya-log = { version = "0.3", optional = true }
 
 # ── Feature flags ──────────────────────────────────────────────────────────
 # Cloud secret backends are optional.  Disabling them saves ~1,900 transitive
