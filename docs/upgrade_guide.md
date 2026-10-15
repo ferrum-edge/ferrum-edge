@@ -2267,12 +2267,15 @@ CRD=udpresponseamplificationpolicies.gateway.ferrum.io
 kubectl get crd "$CRD" -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}{" "}{.metadata.annotations.meta\.helm\.sh/release-namespace}{"\n"}'
 ```
 
-Continue only if that prints nothing, which means the CRD is unmanaged, or
-prints exactly `<release> <namespace>`. If it names another release, that
-release already owns this cluster-scoped CRD. Leave it alone: this chart then
-skips the CRD and does not need adoption. Otherwise, mark the CRD as owned by
-your release without `--overwrite`, so a concurrent owner is never displaced,
-then upgrade without the flag:
+How to proceed depends on what that prints:
+
+- Exactly `<release> <namespace>`: your release already owns the CRD. Run the
+  plain `helm upgrade`; no adoption is needed.
+- Another release: that release owns this cluster-scoped CRD. Leave it alone.
+  This chart then skips the CRD and does not need adoption.
+- Nothing: the CRD is unmanaged. Mark it as owned by your release, without
+  `--overwrite`, so a concurrent owner is never displaced (`kubectl` fails if
+  one appeared in the meantime), then upgrade without the flag:
 
 ```bash
 kubectl label crd "$CRD" app.kubernetes.io/managed-by=Helm
