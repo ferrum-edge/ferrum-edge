@@ -852,7 +852,7 @@ type BodyEncoder = fn(&str) -> Vec<u8>;
 async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
     let forbidden = r#"{"user":{"bio":"forbidden-canary"}}"#;
     let benign = r#"{"user":{"bio":"ordinary"}}"#;
-    let cases: [(&str, &str, BodyEncoder); 16] = [
+    let cases: [(&str, &str, BodyEncoder); 20] = [
         ("utf-8", "application/json", |t| t.as_bytes().to_vec()),
         ("utf-8 bom", "application/json", |t| {
             with_bom(&[0xEF, 0xBB, 0xBF], t.as_bytes())
@@ -904,6 +904,27 @@ async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
         ("utf-32be undeclared", "application/json", |t| {
             encode_utf32(t, true)
         }),
+        // A misleading or unknown non-wide charset over BOMless wide text.
+        (
+            "utf-16le declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf16(t, false),
+        ),
+        (
+            "utf-16be declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf16(t, true),
+        ),
+        (
+            "utf-32le unknown label",
+            "application/json; charset=x-unknown",
+            |t| encode_utf32(t, false),
+        ),
+        (
+            "utf-32be declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf32(t, true),
+        ),
         // A declared endianness that disagrees with the BOM: both readings
         // are inspected.
         (
@@ -8541,10 +8562,22 @@ async fn wide_body_inference_preserves_benign_binary_and_explicit_charset_contro
             assert!(matches!(result, PluginResult::Continue));
         }
         for (_, _, body) in wide_encodings("inspection-marker") {
-            // A declaration is not overridden by signature inference. Binary
-            // and multipart eligibility still precedes charset decoding.
+            // A non-wide charset declaration does not switch signature
+            // inference off: a byte-sniffing parser still reads the body as
+            // wide text whatever the header claims.
             for content_type in [
                 "application/json; charset=utf-8",
+                "application/json; charset=x-unknown-label",
+                "text/plain; charset=iso-8859-1",
+            ] {
+                let (result, _) = scan_wide_direction(&plugin, response, content_type, &body).await;
+                assert!(
+                    matches!(result, PluginResult::Reject { .. }),
+                    "{content_type} (response: {response})"
+                );
+            }
+            // Binary and multipart eligibility still precedes charset decoding.
+            for content_type in [
                 "application/octet-stream",
                 "multipart/form-data; boundary=fixture",
             ] {

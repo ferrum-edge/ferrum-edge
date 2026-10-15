@@ -228,8 +228,10 @@ matching request and response bodies, the WAF also scans **decoded variants**:
 
 - UTF-16LE / UTF-16BE and UTF-32LE / UTF-32BE request and response bodies
   admitted by the direction's body content-type gates, using an explicit
-  `charset`, a byte-order mark, or an undeclared wide-text prefix signature
-  (bare `utf-16` / `utf-32` without a BOM tries both endiannesses)
+  `charset`, a byte-order mark, or a wide-text prefix signature when no
+  UTF-16 / UTF-32 charset is declared (a `utf-8` or unrecognized label does not
+  switch the signature off; bare `utf-16` / `utf-32` without a BOM tries both
+  endiannesses)
 - JSON / JavaScript string escapes — `\uXXXX`, `\u{...}`, `\xXX`, and the
   single-character escapes `\n`, `\t`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`,
   `\'`, `\\`. A JSON parser resolves these before the application sees the
