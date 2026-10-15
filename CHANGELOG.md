@@ -616,6 +616,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The K8s PSAT attestor accepts dotted ServiceAccount and Pod names**
+  (issue #6697). TokenReview ServiceAccount and Pod names were checked as
+  63-character DNS-1123 labels, so a valid ServiceAccount such as
+  `build.bot` failed attestation. They are now checked as DNS-1123
+  subdomains (dot-separated labels, max 253 characters), as Kubernetes
+  defines them. Namespaces stay DNS-1123 labels, and `/`, `%`, `:`,
+  uppercase and empty or `.`/`..` segments are still rejected before
+  SPIFFE ID rendering.
 - **AI token metering counts prompt-cache, thinking and tool-use tokens**
   (issue #6623). Anthropic `cache_creation_input_tokens` and
   `cache_read_input_tokens` and Bedrock Converse `cacheReadInputTokens` and

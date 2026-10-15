@@ -92,29 +92,36 @@ impl K8sPsatAttestor {
         // namespace value like `evil/sa/admin` would otherwise produce a
         // perfectly valid — but wrong-shaped — SPIFFE ID after substitution.
         //
-        // Validate each substituent against the DNS-1123 label grammar
-        // (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, max 63 chars) before they reach
-        // the template. K8s namespaces, ServiceAccounts and Pod names are
-        // all DNS-1123 labels per the Kubernetes API conventions, so this
-        // is a tight upper bound that does not reject any legitimate input.
+        // Validate each substituent against the Kubernetes name grammar for
+        // its resource before it reaches the template:
+        //
+        // - Namespaces are DNS-1123 labels
+        //   (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, max 63 chars).
+        // - ServiceAccount and Pod names are DNS-1123 subdomains: one or more
+        //   such labels joined by `.`, max 253 chars (so `build.bot` is a
+        //   legitimate ServiceAccount).
+        //
+        // Neither grammar admits `/`, `%`, `:`, uppercase or a bare `.`/`..`
+        // segment, so no accepted value can add or reshape a SPIFFE ID path
+        // segment, and no legitimate name is rejected.
         if !is_dns1123_label(&review.namespace) {
             return Err(AttestError::Failed(format!(
                 "TokenReview namespace '{}' is not a valid DNS-1123 label",
                 review.namespace
             )));
         }
-        if !is_dns1123_label(&review.service_account) {
+        if !is_dns1123_subdomain(&review.service_account) {
             return Err(AttestError::Failed(format!(
-                "TokenReview service_account '{}' is not a valid DNS-1123 label",
+                "TokenReview service_account '{}' is not a valid DNS-1123 subdomain",
                 review.service_account
             )));
         }
         if let Some(ref pod) = review.pod_name
             && !pod.is_empty()
-            && !is_dns1123_label(pod)
+            && !is_dns1123_subdomain(pod)
         {
             return Err(AttestError::Failed(format!(
-                "TokenReview pod_name '{}' is not a valid DNS-1123 label",
+                "TokenReview pod_name '{}' is not a valid DNS-1123 subdomain",
                 pod
             )));
         }
@@ -141,6 +148,13 @@ fn is_dns1123_label(s: &str) -> bool {
         return false;
     }
     bytes.iter().all(|b| valid_alnum(*b) || *b == b'-')
+}
+
+/// DNS-1123 subdomain per Kubernetes API conventions: one or more DNS-1123
+/// labels separated by `.`, max 253 characters. Used for ServiceAccount and
+/// Pod names.
+fn is_dns1123_subdomain(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 253 && s.split('.').all(is_dns1123_label)
 }
 
 #[async_trait]

@@ -231,6 +231,132 @@ async fn k8s_psat_accepts_realistic_pod_name() {
     );
 }
 
+fn psat_review(service_account: &str, pod_name: Option<&str>) -> TokenReviewResult {
+    TokenReviewResult {
+        authenticated: true,
+        namespace: "production".into(),
+        service_account: service_account.into(),
+        pod_name: pod_name.map(Into::into),
+        pod_uid: None,
+    }
+}
+
+fn psat_attestor(review: TokenReviewResult, template: Option<&str>) -> K8sPsatAttestor {
+    let trust_domain = TrustDomain::new("cluster.local").unwrap();
+    let reviewer = Arc::new(MockReviewer { result: Ok(review) });
+    let mut config = K8sPsatAttestorConfig::istio_default(trust_domain, reviewer);
+    if let Some(template) = template {
+        config.spiffe_id_template = template.to_string();
+    }
+    K8sPsatAttestor::new(config).unwrap()
+}
+
+fn psat_peer() -> PeerInfo {
+    PeerInfo {
+        bearer_token: Some("t".into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn k8s_psat_accepts_dotted_service_account_name() {
+    // ServiceAccount names are DNS-1123 subdomains, so dots are legal.
+    let attestor = psat_attestor(psat_review("build.bot", None), None);
+    let identity = attestor
+        .attest(&psat_peer())
+        .await
+        .expect("dotted ServiceAccount name passes");
+    assert_eq!(
+        identity.spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/production/sa/build.bot"
+    );
+    assert_eq!(
+        identity.selectors.get("k8s:serviceaccount"),
+        Some(&"build.bot".to_string())
+    );
+}
+
+#[tokio::test]
+async fn k8s_psat_accepts_service_account_longer_than_a_label() {
+    // 3 x 63-char labels + 2 dots = 191 chars: over the 63-char label cap,
+    // under the 253-char subdomain cap.
+    let label = "a".repeat(63);
+    let name = format!("{label}.{label}.{label}");
+    let attestor = psat_attestor(psat_review(&name, None), None);
+    let identity = attestor
+        .attest(&psat_peer())
+        .await
+        .expect("long dotted ServiceAccount name passes");
+    assert_eq!(
+        identity.spiffe_id.as_str(),
+        format!("spiffe://cluster.local/ns/production/sa/{name}")
+    );
+}
+
+#[tokio::test]
+async fn k8s_psat_accepts_dotted_pod_name() {
+    let attestor = psat_attestor(
+        psat_review("app", Some("web.canary-0")),
+        Some("spiffe://{trust_domain}/ns/{namespace}/sa/{serviceaccount}/pod/{pod}"),
+    );
+    let identity = attestor
+        .attest(&psat_peer())
+        .await
+        .expect("dotted Pod name passes");
+    assert_eq!(
+        identity.spiffe_id.as_str(),
+        "spiffe://cluster.local/ns/production/sa/app/pod/web.canary-0"
+    );
+}
+
+#[tokio::test]
+async fn k8s_psat_rejects_malformed_service_account_and_pod_names() {
+    let too_long = format!("{}.{}", "a".repeat(200), "b".repeat(53)); // 254 chars
+    let bad_names = [
+        "evil/sa/admin",
+        "a..b",
+        ".lead",
+        "trail.",
+        ".",
+        "..",
+        "a.-b",
+        "a%2Fb",
+        "a:b",
+        "Build.bot",
+        "",
+        too_long.as_str(),
+    ];
+    for bad in bad_names {
+        let attestor = psat_attestor(psat_review(bad, None), None);
+        let err = attestor.attest(&psat_peer()).await.unwrap_err();
+        assert!(
+            matches!(err, AttestError::Failed(ref msg) if msg.contains("service_account")),
+            "service_account {bad:?} must be rejected, got {err:?}"
+        );
+        if bad.is_empty() {
+            continue; // an empty pod name means "no pod"
+        }
+        let attestor = psat_attestor(psat_review("app", Some(bad)), None);
+        let err = attestor.attest(&psat_peer()).await.unwrap_err();
+        assert!(
+            matches!(err, AttestError::Failed(ref msg) if msg.contains("pod_name")),
+            "pod_name {bad:?} must be rejected, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn k8s_psat_namespace_stays_a_dns_label() {
+    // Namespaces are DNS-1123 labels: dots stay rejected.
+    let mut review = psat_review("app", None);
+    review.namespace = "team.prod".into();
+    let err = psat_attestor(review, None)
+        .attest(&psat_peer())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AttestError::Failed(ref msg) if msg.contains("namespace")));
+}
+
 // ── Static ────────────────────────────────────────────────────────────────
 
 #[test]
