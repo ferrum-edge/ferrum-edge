@@ -675,8 +675,11 @@ spec:
             {{- . | nindent 12 }}
             {{- end }}
             {{- if $nodeWaypointRegistryEnabled }}
+            {{- /* Fixed in-container mount: the orig-dst bridge opens the
+                   node-agent's pins at constant /sys/fs/bpf/ferrum paths.
+                   nodeAgent.bpfFsPath only selects the host bpffs. */}}
             - name: bpf-fs
-              mountPath: {{ .Values.nodeAgent.bpfFsPath }}
+              mountPath: /sys/fs/bpf
               readOnly: true
             {{- end }}
             {{- if $ambientInNetnsCapture }}

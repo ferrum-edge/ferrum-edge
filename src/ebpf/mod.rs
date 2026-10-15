@@ -122,6 +122,18 @@ pub const BPF_MAP_ACCEPT_FIRST_BYTE_SOCKETS: &str = "FERRUM_ACCEPT_FIRST_BYTE_SO
 /// Accept timestamp/correlation phase keyed by accepted socket cookie.
 pub const BPF_MAP_ACCEPT_FIRST_BYTE_STATE: &str = "FERRUM_ACCEPT_FIRST_BYTE_STATE";
 
+/// bpffs mount point every Ferrum pin lives under, inside the container.
+///
+/// The pin paths below are fixed constants shared by the node-agent (writer)
+/// and the mesh proxy / NodeWaypoint (readers), so the in-container bpffs
+/// mount point is fixed too. The Helm chart relocates the *host* bpffs via
+/// `nodeAgent.bpfFsPath` (hostPath) and always mounts it here; the node-agent
+/// refuses a `FERRUM_NODE_AGENT_BPF_FS_PATH` that names any other directory.
+pub const BPF_FS_MOUNT_PATH: &str = "/sys/fs/bpf";
+
+/// Directory under [`BPF_FS_MOUNT_PATH`] holding every Ferrum pin.
+pub const BPF_PIN_DIR: &str = "/sys/fs/bpf/ferrum";
+
 /// Pinned path for the SOCK_OPS event ringbuf. Node-agent loads + pins;
 /// mesh-proxy opens by path. Both sides agree on the constant so no IPC is
 /// required.

@@ -447,8 +447,12 @@ spec:
               value: {{ .Values.nodeAgent.fallbackMode | quote }}
             - name: FERRUM_NODE_AGENT_CGROUP_ROOT
               value: {{ .Values.nodeAgent.cgroupRoot | quote }}
+            {{- /* Pins live at fixed /sys/fs/bpf/ferrum paths shared with the
+                   ambient/NodeWaypoint readers, so the in-container bpffs
+                   mount point is fixed; nodeAgent.bpfFsPath only selects the
+                   host bpffs (hostPath below). */}}
             - name: FERRUM_NODE_AGENT_BPF_FS_PATH
-              value: {{ .Values.nodeAgent.bpfFsPath | quote }}
+              value: "/sys/fs/bpf"
             {{- if $nodeAgentPublishesRegistry }}
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ .Values.nodeAgent.podRegistryDir | quote }}
@@ -578,7 +582,7 @@ spec:
             {{- end }}
           volumeMounts:
             - name: bpf-fs
-              mountPath: {{ .Values.nodeAgent.bpfFsPath }}
+              mountPath: /sys/fs/bpf
             - name: cgroup
               mountPath: {{ .Values.nodeAgent.cgroupRoot }}
               readOnly: true

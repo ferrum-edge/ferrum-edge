@@ -658,6 +658,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A custom bpffs path keeps node-agent pins and their readers together**
+  (issue #6698). Helm `nodeAgent.bpfFsPath` changed the bpffs mount point
+  inside the node-agent and ambient containers and was passed through as
+  `FERRUM_NODE_AGENT_BPF_FS_PATH`. Ferrum still pinned and opened its maps at
+  fixed `/sys/fs/bpf/ferrum/*` paths, so the startup probe could pass on the
+  custom mount while pins went to (or were missing from) `/sys/fs/bpf`. The
+  chart now uses `nodeAgent.bpfFsPath` only for the host bpffs (hostPath) and
+  always mounts it at `/sys/fs/bpf` in both containers. The node-agent refuses
+  a `FERRUM_NODE_AGENT_BPF_FS_PATH` other than `/sys/fs/bpf` at startup
+  instead of probing a mount it never pins to. **Operator action:** a
+  non-chart deployment that set a different value must mount its bpffs at
+  `/sys/fs/bpf` inside the container and unset or reset the variable.
 - **The K8s PSAT attestor accepts dotted ServiceAccount and Pod names**
   (issue #6697). TokenReview ServiceAccount and Pod names were checked as
   63-character DNS-1123 labels, so a valid ServiceAccount such as
