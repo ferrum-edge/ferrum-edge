@@ -4166,35 +4166,77 @@ async fn handle_h3_request(
     }
 
     // Same refusal as the H1/H2 dispatcher: a query-reading plugin trigger on
-    // this view and an unencoded `;` in the raw query (issue #6655).
+    // this view and an unencoded `;` in the raw query (issue #6655). No plugin
+    // hook runs. The rejection is recorded (metrics, transaction log,
+    // diagnostic reference) with the status the wire carries before the head
+    // is written, and the body is omitted for `HEAD`.
     if crate::proxy::query_trigger_refuses_request(caps, ctx.raw_query_string()) {
         debug!(
             proxy_id = %proxy.id,
             reason = "semicolon_separator",
             "Rejected HTTP/3 request: unencoded ';' in the query on a chain with a query-reading plugin trigger"
         );
-        record_h3_flavor_aware_reject(&state, http_flavor, 400);
-        send_h3_error_flavor_aware_with_policy(
-            &mut stream,
+        let reject_body = Bytes::from_static(crate::proxy::QUERY_TRIGGER_SEMICOLON_BODY.as_bytes());
+        let mut headers = HashMap::new();
+        finalize_h3_gateway_error_headers(
             http_flavor,
-            grpc_web_response_content_type,
             StatusCode::BAD_REQUEST,
-            crate::proxy::QUERY_TRIGGER_SEMICOLON_BODY,
-            crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
-            "ambiguous query parameters",
+            &reject_body,
+            &mut headers,
             initial_response_header_policy_plugins.as_ref(),
-        )
-        .await?;
+        );
+        let log_status_code = if grpc_web_response_content_type.is_some() {
+            // gRPC-Web is answered `200` with the status in its trailer frame.
+            let (grpc_status, grpc_message) =
+                h3_grpc_reject_signal(StatusCode::BAD_REQUEST, &reject_body, &headers);
+            crate::proxy::insert_grpc_error_metadata(
+                &mut ctx.metadata,
+                grpc_status,
+                grpc_message.as_ref(),
+            );
+            StatusCode::OK.as_u16()
+        } else {
+            h3_reject_log_status_and_metadata(
+                &mut ctx,
+                http_flavor,
+                StatusCode::BAD_REQUEST,
+                &reject_body,
+                &headers,
+            )
+        };
+        record_request(&state, log_status_code);
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
             &logging_plugins,
             &ctx,
-            StatusCode::BAD_REQUEST.as_u16(),
+            log_status_code,
             start_time,
             crate::diagnostic_ref::QUERY_TRIGGER_ADMISSION_PHASE,
             0,
         )
         .await;
+        if let Some(content_type) = grpc_web_response_content_type {
+            send_h3_grpc_web_reject(
+                &mut stream,
+                &[],
+                &mut ctx,
+                content_type,
+                StatusCode::BAD_REQUEST,
+                reject_body,
+                &headers,
+            )
+            .await?;
+        } else {
+            send_h3_finalized_reject_flavor_aware(
+                &mut stream,
+                http_flavor,
+                StatusCode::BAD_REQUEST,
+                reject_body,
+                &headers,
+                RejectBodyDisposition::for_request(&ctx.method, StatusCode::BAD_REQUEST.as_u16()),
+            )
+            .await?;
+        }
         return Ok(());
     }
 

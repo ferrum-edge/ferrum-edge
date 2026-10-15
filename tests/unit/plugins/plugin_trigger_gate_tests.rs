@@ -2008,6 +2008,9 @@ async fn a_skipped_auth_instance_cannot_supply_an_inapplicable_challenge() {
 // ---------------------------------------------------------------------------
 // Unencoded `;` with a query-reading trigger (issue #6655)
 // ---------------------------------------------------------------------------
+// Capability and predicate only. The dispatcher refusal itself (no hook runs,
+// no backend request, gRPC shaping, HEAD) is exercised end to end in
+// `tests/functional/functional_allowed_methods_test.rs`.
 
 fn query_trigger_capabilities(trigger: Option<serde_json::Value>) -> PluginCapabilities {
     let mut stamp = header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp");
@@ -2023,7 +2026,7 @@ fn query_trigger_capabilities(trigger: Option<serde_json::Value>) -> PluginCapab
 }
 
 #[test]
-fn a_query_reading_trigger_refuses_an_unencoded_semicolon_before_any_phase() {
+fn a_query_reading_trigger_marks_an_unencoded_semicolon_for_refusal() {
     for trigger in [
         json!({"when": {"match": {"query": {"name": "action"}}}}),
         // Nested under a combinator and `not`, beside a non-query leaf.

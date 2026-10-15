@@ -34774,7 +34774,6 @@ async fn handle_proxy_request_inner(
     // refuse before any plugin phase runs instead of deciding the instance on
     // a reading a `;`-splitting backend does not share (issue #6655).
     if query_trigger_refuses_request(caps, ctx.raw_query_string()) {
-        state.request_count.fetch_add(1, Ordering::Relaxed);
         debug!(
             proxy_id = %proxy.id,
             reason = "semicolon_separator",
@@ -34791,16 +34790,26 @@ async fn handle_proxy_request_inner(
             request_protocol,
             initial_response_header_policy_plugins.as_ref(),
         );
-        // Empty plugin list: no request hook may run for a refused request.
+        // Same bookkeeping as a plugin rejection: native gRPC and gRPC-Web
+        // carry `grpc_status`/`grpc_message` metadata, and metrics, the
+        // transaction log and the diagnostic reference record the status the
+        // wire carries (`200` for both gRPC shapes). Empty plugin list: no
+        // request hook runs for a refused request.
+        apply_grpc_reject_metadata(&mut ctx, &reject);
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
-        record_status(&state, StatusCode::BAD_REQUEST.as_u16());
+        let wire_status = if grpc_web_response.is_some() {
+            StatusCode::OK.as_u16()
+        } else {
+            reject.http_status.as_u16()
+        };
+        record_request(&state, wire_status);
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
             &logging_plugins,
             &ctx,
-            StatusCode::BAD_REQUEST.as_u16(),
+            wire_status,
             start_time,
             crate::diagnostic_ref::QUERY_TRIGGER_ADMISSION_PHASE,
             0,
