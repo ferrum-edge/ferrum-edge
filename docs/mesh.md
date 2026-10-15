@@ -6395,34 +6395,71 @@ non-regular, multiply-linked, foreign-UID, or unreadable
    running on any affected node. This is the proof that neither the pod-netns
    nor host-netns producer can start while ownership is repaired.
 3. Repair the Helm artifact first. Set
-   `ferrum-mesh-udp-placement-<release>` back to the known predecessor
-   (`target=<from>`, `phase=stable`, and empty `generation/from/to`) for a true
-   abort, or to the new cleanup-adoption tuple for corrupt/unknown ownership.
+   `ferrum-mesh-udp-placement-<release>` to the release state that step 4 will
+   make true on the nodes:
+   - for a true abort back to `disabled`: the known predecessor
+     (`target=disabled`, `phase=stable`, and empty `generation/from/to`);
+   - for a true abort back to `pod-netns` or `host-netns`, and for
+     corrupt/unknown ownership: the new cleanup-adoption tuple (a fresh
+     `generation`, `phase=cleanup`, `to=<the placement you are returning to>`).
+
    This ordering prevents the next Helm operation from authorizing a producer
    before node-local state is repaired.
 4. On **every** node in the DaemonSet scope, repair the registry hostPath named
-   by `nodeAgent.podRegistryDir`. For a true abort, atomically replace
-   `.udp-placement-state-v1.json` with
-   `{"version":1,"active":"<from>","pending":null,"completed":null}`;
-   create the temp file in the same directory, use the mesh container's
-   effective UID and a single link, fsync the file, rename it, then fsync the
-   directory. Retract `.udp-registry-synced` while both processes are stopped.
-   For corrupt or unknown ownership, quarantine the rejected state outside the
-   registry, leave the state path absent, create an empty
-   `.udp-placement-quarantined` tombstone beside it, and then run a fresh
-   explicit cleanup adoption release; absent state makes cleanup probe **both**
-   ownership domains. The tombstone is load-bearing, not a note: while it is
-   present, **every** stable bootstrap from an absent record is refused —
-   including a release-attested adoption — so a proxy that restarts between the
-   quarantine and the cleanup release cannot silently adopt a placement instead
-   of proving cleanup. A successful finalize removes it. Never guess ownership, chown a live file, follow a symlink, or
-   repair only a subset of nodes.
-5. Verify both artifacts and their tuple on every node before resuming the
-   DaemonSets. Apply the matching Helm values only after that verification so
-   the repaired ConfigMap becomes the release contract rather than a transient
-   manual edit. Keep nodes drained until the node-agent has completed its
-   relist, the intended Ambient producer is ready, and authenticated health
-   shows the expected phase. Then uncordon nodes under the normal rollout
+   by `nodeAgent.podRegistryDir`. Retract `.udp-registry-synced` while both
+   processes are stopped, then:
+   - **Abort back to `disabled`.** Atomically replace
+     `.udp-placement-state-v1.json` with this record:
+
+     ```json
+     {"version":1,"active":"disabled","pending":null,"completed":null}
+     ```
+
+     Create the temp file in the same directory, use the mesh container's
+     effective UID and a single link, fsync the file, rename it, then fsync the
+     directory. This record names no owning node. That is accepted only
+     because `disabled` runs no producer, and the first start that can resolve
+     this node's identity binds it.
+   - **Abort back to `pod-netns` or `host-netns`.** Do **not** hand-write a
+     record. A hand-written record cannot carry the node identity binding
+     (`incarnation`) that only cleanup/finalize writes, and stable startup
+     refuses any producer placement whose existing record names no owning node
+     (`migration_required`), even when the current node identity is resolvable.
+     An unbound record is not proof that this node owns the placement. Instead,
+     recover through the same explicit cleanup/finalize path as corrupt
+     ownership:
+     1. Quarantine the state outside the registry and create the tombstone,
+        exactly as in the next bullet.
+     2. Run a cleanup adoption release with a fresh generation,
+        `FROM=<the aborted target>`, and `TO=<the placement you are returning to>`.
+     3. Once every node reports `cleanup_complete` (step 5 resumes the
+        DaemonSets for this), run `finalize` with the same tuple. Finalize is what writes the node-bound record for the restored
+        placement.
+   - **Corrupt or unknown ownership.** Quarantine the rejected state outside the
+     registry, leave the state path absent, create an empty
+     `.udp-placement-quarantined` tombstone beside it, and then run a fresh
+     explicit cleanup adoption release. Absent state makes cleanup probe
+     **both** ownership domains, whatever `FROM` names. The tombstone is
+     load-bearing, not a note: while it is present, **every** stable bootstrap
+     from an absent record is refused — including a release-attested adoption —
+     so a proxy that restarts between the quarantine and the cleanup release
+     cannot silently adopt a placement instead of proving cleanup. A successful
+     finalize removes it.
+
+   Never guess ownership, chown a live file, follow a symlink, or repair only a
+   subset of nodes.
+5. Verify both artifacts and their tuple on every node **while both
+   DaemonSets are still stopped**. Then apply the matching Helm values and
+   resume the DaemonSets, so the repaired ConfigMap becomes the release
+   contract rather than a transient manual edit. For the cleanup paths
+   (producer abort, corrupt/unknown ownership), the cleanup release can only
+   complete once both DaemonSets run again: the node-agent republishes
+   `.udp-registry-synced`, and the Ambient process performs the cleanup. Keep
+   the nodes cordoned and drained, wait until every node reports
+   `cleanup_complete`, and only then apply the `finalize` release. Keep nodes
+   drained until the node-agent has completed its relist, the intended Ambient
+   producer is ready, and authenticated health shows the expected phase
+   (`stable` after finalize). Then uncordon nodes under the normal rollout
    policy.
 
 A planned `securityContext` UID change must use the same stopped-and-drained
