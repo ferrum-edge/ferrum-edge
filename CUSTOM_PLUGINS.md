@@ -633,11 +633,13 @@ For auth plugins that verify external identities (e.g., OIDC/JWKS tokens) withou
 ```rust
 // When the token is valid but no Consumer mapping exists:
 ctx.authenticated_identity = Some("user@example.com".to_string());
-// Optionally set a display name for the X-Consumer-Username backend header:
+// Optionally set a display name for the X-Authenticated-Identity backend header:
 ctx.authenticated_identity_header = Some("Jane Doe".to_string());
 ```
 
 The `authenticated_identity` is treated as a first-class principal across rate-limit keys, cache keys, log summaries, and backend identity-header injection on all protocol paths.
+
+With no Consumer mapped, the backend receives `X-Authenticated-Identity: Jane Doe` (or `user@example.com` when `authenticated_identity_header` is unset or blank) and no `X-Consumer-Username`. `X-Consumer-Username` and `X-Consumer-Custom-Id` are written only when `ctx.identified_consumer` is set, and in that case `X-Authenticated-Identity` is not sent.
 
 ## Writing a Request Body Plugin
 
@@ -1192,8 +1194,9 @@ pub struct RequestContext {
     /// External identity set by JWKS/OIDC auth plugins when no Consumer mapping exists.
     /// Used as rate-limit key, cache key, and in transaction logs.
     pub authenticated_identity: Option<String>,
-    /// Display name for the X-Consumer-Username backend header.
-    /// Falls back to authenticated_identity when not set.
+    /// Display name for the X-Authenticated-Identity backend header, sent only
+    /// when no Consumer was identified. Falls back to authenticated_identity
+    /// when unset or blank.
     pub authenticated_identity_header: Option<String>,
     /// Authentication mechanism that succeeded (e.g., "jwt_auth", "key_auth").
     /// None when no auth plugin identified the client.
@@ -1228,12 +1231,13 @@ when `first_ambiguity()` is `Some`, as the built-in OPA and
 
 **Helper methods:**
 - `effective_identity()` — returns the stable identity (Consumer username preferred over external identity)
-- `backend_consumer_username()` — returns the identity for the `X-Consumer-Username` backend header
+- `backend_consumer_username()` — returns the mapped Consumer's username for the `X-Consumer-Username` backend header; `None` when no Consumer was identified
+- `backend_authenticated_identity()` — returns the external identity for the `X-Authenticated-Identity` backend header (`authenticated_identity_header`, falling back to `authenticated_identity`); `None` when a Consumer was identified
 - `backend_consumer_custom_id()` — returns the Consumer custom ID, if a gateway Consumer was resolved
 - `apply_route_overrides(proxy)` — returns an `Arc<Proxy>` with direct route overrides applied. This helper cannot re-resolve upstream TLS for `route_override_upstream_id`.
 - `apply_route_overrides_with_upstreams(proxy, upstreams)` — use this in custom dispatch paths that honor `route_override_upstream_id`; it re-resolves `resolved_tls` from the effective upstream snapshot and rebinds the precomputed H1 `pending_limit_scope` (clearing it on a direct-backend override).
 
-The `x-consumer-*` request-header namespace is gateway-owned. Client-supplied names beneath it never reach `ctx.headers`, and any `x-consumer-*` header a custom plugin writes into the outbound header map is scrubbed before dispatch; the gateway then writes only `X-Consumer-Username` / `X-Consumer-Custom-Id` from the values above. To pass additional consumer attributes to a backend, use a header name outside that namespace.
+The `x-consumer-*` request-header namespace is gateway-owned. Client-supplied names beneath it never reach `ctx.headers`, and any `x-consumer-*` header a custom plugin writes into the outbound header map is scrubbed before dispatch; the gateway then writes only `X-Consumer-Username` / `X-Consumer-Custom-Id` (mapped Consumer) or `X-Authenticated-Identity` (external identity) from the values above. All three are skipped when a plugin marks the request to suppress backend identity headers (for example, routing to a third-party AI provider). To pass additional consumer attributes to a backend, use a header name outside that namespace.
 
 ### Inter-Plugin Communication
 
