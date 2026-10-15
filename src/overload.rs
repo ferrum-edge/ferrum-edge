@@ -152,6 +152,10 @@ pub struct OverloadState {
     /// Notified each time `active_connections` or `active_requests` reaches zero
     /// during drain. The drain waiter re-checks both counters in a loop.
     pub drain_complete: tokio::sync::Notify,
+    /// Start of the one shared `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget, set by
+    /// the first drain phase that asks for it (issue #6714). See
+    /// [`Self::shutdown_drain_remaining`].
+    shutdown_drain_clock: OnceLock<tokio::time::Instant>,
 
     /// Edge-triggered publication of the binary keepalive-pressure flag
     /// (issue #4542).
@@ -216,6 +220,25 @@ impl Default for OverloadState {
 }
 
 impl OverloadState {
+    /// What is left of the shared shutdown drain `budget`
+    /// (`FERRUM_SHUTDOWN_DRAIN_SECONDS`) for the calling phase (issue #6714).
+    ///
+    /// Shutdown waits for peers in sequential phases: the HTTP/3 listener's
+    /// GOAWAY drain and endpoint close run before its listener handle returns,
+    /// and only then does the serving mode start the global
+    /// [`wait_for_drain`]. Each phase used to take a fresh full budget, so a
+    /// stalled H3 connection plus other long-lived work could spend the budget
+    /// twice, past what the Helm grace-period validation and
+    /// `docs/graceful_shutdown.md` account for. The first call starts one
+    /// clock; every phase gets only the remainder, so all of them together
+    /// stay within one budget.
+    pub fn shutdown_drain_remaining(&self, budget: Duration) -> Duration {
+        let started = *self
+            .shutdown_drain_clock
+            .get_or_init(tokio::time::Instant::now);
+        budget.saturating_sub(started.elapsed())
+    }
+
     pub fn new() -> Self {
         Self {
             disable_keepalive: CachePadded::new(AtomicBool::new(false)),
@@ -226,6 +249,7 @@ impl OverloadState {
             active_connections: CachePadded::new(AtomicU64::new(0)),
             active_requests: CachePadded::new(AtomicU64::new(0)),
             drain_complete: tokio::sync::Notify::new(),
+            shutdown_drain_clock: OnceLock::new(),
             keepalive_pressure_tx: tokio::sync::watch::channel(false).0,
             red_drop_probability: CachePadded::new(AtomicU32::new(0)),
             red_request_counter: CachePadded::new(AtomicU64::new(0)),
@@ -1622,6 +1646,11 @@ pub const SHUTDOWN_DRAIN_BEGUN_LOG: &str =
 /// been invoked. Returns `true` if all connections and requests drained within
 /// the timeout, `false` if the timeout expired.
 ///
+/// `timeout` is the whole shutdown drain budget, not a fresh allowance: the
+/// wait is bounded by [`OverloadState::shutdown_drain_remaining`], so time an
+/// earlier phase (the HTTP/3 listener drain) already spent is not granted
+/// again.
+///
 /// This function does NOT toggle `draining` / `reject_new_requests` — that is
 /// [`begin_drain`]'s job, run unconditionally on shutdown so the close hint
 /// fires even when the operator has set `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` to
@@ -1640,6 +1669,7 @@ pub async fn wait_for_drain_with_escalation(
     timeout: Duration,
     escalation: CancellationToken,
 ) -> bool {
+    let timeout = state.shutdown_drain_remaining(timeout);
     let active_conns = state.active_connections.load(Ordering::Relaxed);
     let active_reqs = state.active_requests.load(Ordering::Relaxed);
     if active_conns == 0 && active_reqs == 0 {
