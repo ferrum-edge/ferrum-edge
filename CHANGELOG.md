@@ -623,7 +623,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain. A stalled H3 peer plus other long-lived work could therefore take two
   budgets, beyond the grace period the Helm charts validate. The H3 drain, the
   H3 endpoint close and the global drain now share one budget: the first phase
-  starts the clock and later phases get only the remainder. The H3 waits also
+  starts the clock and later phases get only the remainder. A Gateway API
+  listener retired during a reconcile keeps a budget of its own and does not
+  start that clock. The H3 waits also
   stop on a repeated SIGTERM/SIGINT, like the global drain. With
   `FERRUM_SHUTDOWN_DRAIN_SECONDS=0` the H3 close no longer waits for peers.
 - **AI token metering counts prompt-cache, thinking and tool-use tokens**
