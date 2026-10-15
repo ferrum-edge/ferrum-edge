@@ -1355,8 +1355,8 @@ fn request_transformer_rule_values_are_secret_for_every_target() {
         }),
     );
     let rules = projected["rules"].as_array().expect("rules stay an array");
-    for index in 0..4 {
-        assert_eq!(rules[index]["value"], REDACTED, "rule {index}");
+    for (index, rule) in rules.iter().take(4).enumerate() {
+        assert_eq!(rule["value"], REDACTED, "rule {index}");
     }
     // Operations, targets, header names and rename destinations stay visible.
     assert_eq!(rules[0]["operation"], "update");
