@@ -23,8 +23,8 @@ so the practical floor is **4.4.2**.
 
 | Server | Status |
 |---|---|
-| MongoDB 9.0 | Supported and recommended. |
-| MongoDB 5.0 – 8.x | Supported. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 9.0. |
+| MongoDB 9.0 | Supported and recommended. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 9.0 (9.0.4 or later; see the kernel note below). |
+| MongoDB 5.0 – 8.x | Supported. |
 | MongoDB 4.4.2+ | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
 | MongoDB 4.4.0 – 4.4.1, 4.2 and older | Not supported (no `hello` command, or wire version 8 or lower). |
 | MongoDB Atlas | Supported on any Atlas-offered version. |
