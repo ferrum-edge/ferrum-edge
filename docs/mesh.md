@@ -6431,8 +6431,8 @@ non-regular, multiply-linked, foreign-UID, or unreadable
         exactly as in the next bullet.
      2. Run a cleanup adoption release with a fresh generation,
         `FROM=<the aborted target>`, and `TO=<the placement you are returning to>`.
-     3. Once every node reports `cleanup_complete`, run `finalize` with the same
-        tuple. Finalize is what writes the node-bound record for the restored
+     3. Once every node reports `cleanup_complete` (step 5 resumes the
+        DaemonSets for this), run `finalize` with the same tuple. Finalize is what writes the node-bound record for the restored
         placement.
    - **Corrupt or unknown ownership.** Quarantine the rejected state outside the
      registry, leave the state path absent, create an empty
@@ -6447,12 +6447,18 @@ non-regular, multiply-linked, foreign-UID, or unreadable
 
    Never guess ownership, chown a live file, follow a symlink, or repair only a
    subset of nodes.
-5. Verify both artifacts and their tuple on every node before resuming the
-   DaemonSets. Apply the matching Helm values only after that verification so
-   the repaired ConfigMap becomes the release contract rather than a transient
-   manual edit. Keep nodes drained until the node-agent has completed its
-   relist, the intended Ambient producer is ready, and authenticated health
-   shows the expected phase. Then uncordon nodes under the normal rollout
+5. Verify both artifacts and their tuple on every node **while both
+   DaemonSets are still stopped**. Then apply the matching Helm values and
+   resume the DaemonSets, so the repaired ConfigMap becomes the release
+   contract rather than a transient manual edit. For the cleanup paths
+   (producer abort, corrupt/unknown ownership), the cleanup release can only
+   complete once both DaemonSets run again: the node-agent republishes
+   `.udp-registry-synced`, and the Ambient process performs the cleanup. Keep
+   the nodes cordoned and drained, wait until every node reports
+   `cleanup_complete`, and only then apply the `finalize` release. Keep nodes
+   drained until the node-agent has completed its relist, the intended Ambient
+   producer is ready, and authenticated health shows the expected phase
+   (`stable` after finalize). Then uncordon nodes under the normal rollout
    policy.
 
 A planned `securityContext` UID change must use the same stopped-and-drained
