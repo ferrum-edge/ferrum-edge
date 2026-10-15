@@ -426,9 +426,14 @@ impl EbpfBackend for AyaEbpfBackend {
         for PodTcLink { iface, link } in links.tc_links {
             // Capture the netlink filter identity before `detach` consumes the
             // link, so a failure can be retried.
-            let rebuild = match (link.attach_type(), link.priority(), link.handle()) {
-                (Ok(attach_type), Ok(priority), Ok(handle)) => {
-                    Some((attach_type, priority, handle))
+            let rebuild = match (
+                link.attach_type(),
+                link.priority(),
+                link.handle(),
+                link.classid(),
+            ) {
+                (Ok(attach_type), Ok(priority), Ok(handle), Ok(classid)) => {
+                    Some((attach_type, priority, handle, classid))
                 }
                 // A TCX fd link, whose detach is infallible.
                 _ => None,
@@ -439,8 +444,8 @@ impl EbpfBackend for AyaEbpfBackend {
             // Rebuilding fails when the interface no longer exists, and the
             // kernel removed its filters with the device. Anything that still
             // resolves keeps a handle and is reported, so the removal retries.
-            let rebuilt = rebuild.and_then(|(attach_type, priority, handle)| {
-                SchedClassifierLink::attached(&iface, attach_type, priority, handle).ok()
+            let rebuilt = rebuild.and_then(|(attach_type, priority, handle, classid)| {
+                SchedClassifierLink::attached(&iface, attach_type, priority, handle, classid).ok()
             });
             if let Some(link) = rebuilt {
                 errors.push(format!("{iface}: {e}"));
@@ -589,9 +594,14 @@ impl EbpfBackend for AyaEbpfBackend {
             // Capture the netlink filter identity BEFORE `detach` consumes the
             // link. `Link::detach` takes `self`, so without this the handle is
             // gone the moment the netlink delete fails.
-            let rebuild = match (link.attach_type(), link.priority(), link.handle()) {
-                (Ok(attach_type), Ok(priority), Ok(handle)) => {
-                    Some((attach_type, priority, handle))
+            let rebuild = match (
+                link.attach_type(),
+                link.priority(),
+                link.handle(),
+                link.classid(),
+            ) {
+                (Ok(attach_type), Ok(priority), Ok(handle), Ok(classid)) => {
+                    Some((attach_type, priority, handle, classid))
                 }
                 // A TCX fd link, whose detach is infallible — it can never reach
                 // the rebuild path below.
@@ -604,8 +614,15 @@ impl EbpfBackend for AyaEbpfBackend {
                 ),
                 Err(e) => {
                     errors.push(format!("{iface}: {e}"));
-                    let rebuilt = rebuild.and_then(|(attach_type, priority, handle)| {
-                        SchedClassifierLink::attached(&iface, attach_type, priority, handle).ok()
+                    let rebuilt = rebuild.and_then(|(attach_type, priority, handle, classid)| {
+                        SchedClassifierLink::attached(
+                            &iface,
+                            attach_type,
+                            priority,
+                            handle,
+                            classid,
+                        )
+                        .ok()
                     });
                     if rebuilt.is_none() {
                         warn!(
