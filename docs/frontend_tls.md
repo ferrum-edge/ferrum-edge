@@ -419,8 +419,11 @@ openssl genrsa -out server.key 2048
 # Generate server CSR
 openssl req -new -key server.key -out server.csr -subj "/CN=localhost"
 
-# Sign server certificate with CA
-openssl x509 -req -days 365 -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt
+# Sign server certificate with CA. The subjectAltName is what TLS clients
+# (curl, rustls) check the hostname against; CN alone is not enough.
+printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > server.ext
+openssl x509 -req -days 365 -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -extfile server.ext -out server.crt
 
 # Generate client private key
 openssl genrsa -out client.key 2048
@@ -429,7 +432,9 @@ openssl genrsa -out client.key 2048
 openssl req -new -key client.key -out client.csr -subj "/CN=Test Client"
 
 # Sign client certificate with CA
-openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt
+printf 'extendedKeyUsage=clientAuth\n' > client.ext
+openssl x509 -req -days 365 -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -extfile client.ext -out client.crt
 
 # Create client CA bundle (same as CA cert for self-signed)
 cp ca.crt client-ca-bundle.pem
@@ -447,12 +452,21 @@ export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="./client-ca-bundle.pem"
 
 ### Test with Client Certificate
 
-```bash
-# Test with client certificate
-curl --cert client.crt --key client.key https://localhost:8443/api/v1
+Both requests trust the test CA with `--cacert ca.crt`, so server-certificate
+verification succeeds in each and the only difference is the client
+certificate. Do not substitute `-k`/`--insecure`: that skips server
+verification and no longer tests the TLS setup you configured.
 
-# Test without client certificate (should fail)
-curl https://localhost:8443/api/v1
+```bash
+# With a client certificate: the TLS handshake succeeds and the request
+# reaches the gateway
+curl --cacert ca.crt --cert client.crt --key client.key https://localhost:8443/api/v1
+
+# Without a client certificate: the server trusts the CA, but the gateway
+# refuses the handshake because no client certificate was presented
+# (curl reports a TLS alert such as "certificate required", not a
+# server-verification error)
+curl --cacert ca.crt https://localhost:8443/api/v1
 ```
 
 ## CRL Policy

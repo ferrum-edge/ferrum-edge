@@ -164,6 +164,53 @@ fn documented_file_mode_configuration_loads_and_validates() {
 }
 
 #[test]
+fn documented_backend_mtls_mixed_configuration_loads_and_validates() {
+    // docs/backend_mtls.md "Example 2: Mixed Configuration" writes a complete
+    // file-mode config with a heredoc and starts the gateway on it unchanged.
+    let docs = include_str!("../../../docs/backend_mtls.md");
+    let section = docs
+        .split("### Example 2: Mixed Configuration")
+        .nth(1)
+        .expect("Example 2: Mixed Configuration section exists");
+    let yaml = section
+        .split("cat > config.yaml << EOF\n")
+        .nth(1)
+        .and_then(|tail| tail.split("\nEOF\n").next())
+        .expect("section writes config.yaml with a heredoc");
+    // Point the documented certificate paths at real test material so source
+    // validation runs against readable files.
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt").unwrap();
+    let key_path = std::fs::canonicalize("tests/certs/server.key").unwrap();
+    let yaml = yaml
+        .replace(
+            "/etc/ssl/certs/secure-client.pem",
+            cert_path.to_str().unwrap(),
+        )
+        .replace(
+            "/etc/ssl/private/secure-client-key.pem",
+            key_path.to_str().unwrap(),
+        );
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("the documented backend mTLS mixed configuration loads and validates");
+    assert_eq!(config.proxies.len(), 2);
+    let secure = config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == "secure-api")
+        .expect("secure-api proxy loads");
+    assert!(secure.backend_tls_client_cert_path.is_some());
+    assert!(secure.backend_tls_client_key_path.is_some());
+}
+
+#[test]
 fn test_load_yaml_config() {
     let yaml = r#"
 version: "1"
