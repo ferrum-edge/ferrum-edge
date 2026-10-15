@@ -1418,17 +1418,22 @@ async fn test_json_schema_multiple_of_large_integral_value_uses_exact_modulo() {
     assert_reject(plugin.before_proxy(&mut bad, &mut headers).await, Some(400));
 }
 
-// Beyond 2^53 an integer instance is no longer exactly representable as f64.
-// The compiled validator resolves that conservatively — u64::MAX is a true
-// multiple of 3 but is reported as a violation — which is fail-closed and is
-// the documented trade-off of standards-compliant compilation.
+// Beyond 2^53 an integer instance is no longer exactly representable as f64,
+// but jsonschema 0.49 judges u64 instances with exact integer arithmetic, so
+// a true multiple is accepted and a true non-multiple is still rejected.
+// (0.46 resolved this range conservatively as a violation.)
 #[tokio::test]
-async fn test_json_schema_multiple_of_beyond_f64_precision_fails_closed() {
+async fn test_json_schema_multiple_of_beyond_f64_precision_uses_exact_modulo() {
     let plugin = json_schema_plugin(serde_json::json!({"type": "integer", "multipleOf": 3}));
     // u64::MAX = 18446744073709551615 = 3 * 6148914691236517205.
-    let mut ctx = make_json_ctx("18446744073709551615");
+    let mut ok = make_json_ctx("18446744073709551615");
     let mut headers = make_json_headers();
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    assert_continue(plugin.before_proxy(&mut ok, &mut headers).await);
+
+    // u64::MAX - 1 is 2 mod 3, so exact arithmetic must still reject it.
+    let mut bad = make_json_ctx("18446744073709551614");
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut bad, &mut headers).await, Some(400));
 }
 
 // Large integral non-multiple is rejected.
