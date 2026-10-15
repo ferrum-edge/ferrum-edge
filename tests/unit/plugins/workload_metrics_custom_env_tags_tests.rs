@@ -28,7 +28,8 @@ async fn custom_env_tags_present_overrides_literal_default() {
     let plugin = workload_metrics_new_with_env_lookup_for_test(
         &json!({
             "custom_tags": {"cluster": "fallback"},
-            "custom_env_tags": {"cluster": ENV_VAR}
+            "custom_env_tags": {"cluster": ENV_VAR},
+            "safe_tag_sources": [ENV_VAR]
         }),
         |name| {
             if name == ENV_VAR {
@@ -78,7 +79,8 @@ async fn custom_env_tags_empty_present_is_resolved_value() {
     let plugin = workload_metrics_new_with_env_lookup_for_test(
         &json!({
             "custom_tags": {"cluster": "fallback"},
-            "custom_env_tags": {"cluster": ENV_VAR}
+            "custom_env_tags": {"cluster": ENV_VAR},
+            "safe_tag_sources": [ENV_VAR]
         }),
         |name| {
             if name == ENV_VAR {
@@ -179,6 +181,91 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "CACHE_REQUEST_HEADERS_SNAPSHOT",
         "CLAIM_HEADER_SUBJECT",
         "LAST_EVENT_ID",
+        // Credential classes outside every exact list (issue #6619).
+        "GPG_PASSPHRASE",
+        "HSM_PIN",
+        "USER_SESSION_ID",
+        "SESSIONIDENTIFIER",
+        "TOTP_SEED",
+        "DB_PWD",
+        "SIGNING_KEY",
+        "WEBHOOK_SIGNATURE",
+        "CLIENT_ASSERTION",
+        "ID_JWT",
+        "ASSERTION_VALUE",
+        "PRIVATEKEY",
+        "ENCRYPTIONKEY",
+        "HSMPIN",
+        "TOTPSEED",
+        "PRIVATE_RSA_KEY",
+        "HSM_PIN_ASSERTION_OUT_OF_SCOPE",
+        "PRIVATEECCKEY",
+        "PRIVATEPKCS12KEY",
+        "AWSACCESS_KEY",
+        "VENDORPIN",
+        "VENDORPINVALUE",
+        "USERSID",
+        "IDJWS",
+        "SIGVALUE",
+        "CREDVALUE",
+        "PRIVATE_RSA_2048_KEY",
+        "ENCRYPTION_AES256_KEY",
+        "DBPIN",
+        "SIGBASE64",
+        "PRIVATE_EC_P256_KEY",
+        "SIGBASE64URL",
+        "DBPINVALUEHEX",
+        "DBPINUTF8",
+        "SIGNINGKEYBASE64URL",
+        "SIGNINGKEY1",
+        "SIGNINGKEYENCODED",
+        "SIGNINGKEYSTRING",
+        "SIGNINGKEYJWK",
+        "PINCLEARTEXT",
+        "SESSVALUE",
+        "PINENCRYPTED",
+        "PINTEXT",
+        "CREDOPAQUE",
+        "DBCREDSVALUE",
+        "VENDORTOKENVALUE",
+        "APIKEYVALUE",
+        "GPG_PASS_PHRASE",
+        "DOOR_PASS_CODE",
+        "VENDORTOKENSEED",
+        "VENDORTOKENSTRING",
+        "GPG_PASS_PHRASE1",
+        "TOKENOPAQUE",
+        "TOKENSIGNED",
+        "PASSKEY",
+        "TOKENSINGLEUSE",
+        "MFA_SEED",
+        "MFAKEY",
+        "REDISINTEGRITYKEY",
+        "VENDORTOKENOPAQUE",
+        "MFA_RECOVERY_CODE",
+        "DBPINCLEARTEXT",
+        "XPIN",
+        "TENANTPINOPAQUE",
+        "HSM_PiN",
+        "JwT",
+        "SIGNING_KeY",
+        "ToKeN",
+        "HSM_PiNs",
+        "GPG_PaSs_Phrase",
+        "GPGPASS_PHRASE",
+        "gpgpass_phrase",
+        "KEY_PRIVATE",
+        "KEY_SIGNING",
+        "MfA_RECOVERY_CODE",
+        "PiN1",
+        "mFaRecoveryCode",
+        "ACCESS_TOKENS",
+        "REFRESH_V2_TOKENS",
+        "REFRESHOPAQUETOKENS",
+        "OAUTH2_TOKENS",
+        "SIGNINGKEYUTF8",
+        "signingkey1base64url",
+        "PRIVATE_EC_P256_PKCS8_PEM_KEY",
     ];
 
     for env_var in cases {
@@ -234,6 +321,8 @@ fn custom_env_tags_do_not_reject_incidental_benign_fragments() {
         "CLUSTER_ID",
         "CLIENT_NAME",
         "CLIENTIDENTITY_MODE",
+        "DATA_RESIDENCY",
+        "CLIENT_KEYBOARD_LAYOUT",
         "REDIS_HOST",
         "DATABASE_NAME",
     ] {
@@ -287,4 +376,130 @@ fn custom_env_tags_credential_shaped_invalid_syntax_prefers_credential_diagnosti
     );
     assert!(!error.contains("AWS_SECRET-KEY"));
     assert!(!error.contains("invalid environment variable name"));
+}
+
+#[test]
+fn custom_header_tags_reject_credential_class_header_names() {
+    for header in [
+        "x-session-id",
+        "x-csrf",
+        "x-privatekey",
+        "x-client-assertion",
+        "x-hsm-pin",
+        // Header names are normalized to lowercase before classification.
+        "x-hsmPin",
+        "x-totpSeed",
+        "x-private-rsa-key",
+        "x-csrfValue",
+        "x-vendorPin",
+        "x-awsaccess-key",
+        "x-private-rsapem-key",
+        "x-privateecckey",
+        "x-vendorPinValue",
+        "x-userSid",
+        "x-idJws",
+        "x-sigValue",
+        "x-vendorCred",
+        "x-dbPinValue",
+        "x-private-rsa2048-key",
+        "x-dbPin",
+        "x-sigBase64",
+        "x-private-ec-p256-key",
+        "x-sigBase64Url",
+        "x-dbPinValueHex",
+        "x-dbPinUtf8",
+        "x-pin1",
+        "x-signingKeyBase64Url",
+        "x-signingKey1Base64Url",
+        "x-dbPin1Value",
+        "x-signingKeyEncoded",
+        "x-signingKeyString",
+        "x-signingKeyJwk",
+        "x-pass-phrase",
+        "x-gpgpass-phrase",
+        "x-gpgPass-phrase",
+        "x-key-private",
+        "x-keyPrivate",
+        "x-key-signing",
+        "x-vendorTokenString",
+        "x-pass-phrase1",
+        "x-tokenOpaque",
+        "x-tokenSigned",
+        "x-passKey",
+        "x-tokenSingleUse",
+        "x-mfa-code",
+        "x-mfaKey",
+        "x-integrity-key",
+        "x-vendorTokenOpaque",
+        "x-mfa-recovery-code",
+        "x-aes-key",
+        "x-crypto-key",
+        "x-dbPinCleartext",
+        // Unlisted owner and representation: only the configured camelCase
+        // spelling reveals the `Pin` segment.
+        "x-projectPinOpaque",
+        "x-vendorSigHeader",
+        "x-pinCleartext",
+        // The metadata-only outcome-key exemption never covers a header.
+        "mesh_authz.ignored_baggage.assertion_out_of_scope",
+        "x-private-ec-p256-pkcs8-pem-key",
+    ] {
+        let error = workload_metrics_new_with_env_lookup_for_test(
+            &json!({
+                "custom_header_tags": {"dimension": header}
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected sensitive-header rejection for {header}"));
+        assert!(
+            error.contains("cannot copy sensitive header"),
+            "expected sensitive-header rejection for {header}, got {error}"
+        );
+    }
+}
+
+#[test]
+fn credential_class_tag_destinations_are_rejected_separately_from_sources() {
+    let error = workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_env_tags": {"session_id": "ISTIO_META_ZONE"}
+        }),
+        |_| Err(std::env::VarError::NotPresent),
+    )
+    .err()
+    .expect("a credential-class tag name must be refused");
+    assert!(error.contains("reserved or sensitive"), "{error}");
+}
+
+#[test]
+fn ordinary_dimension_tag_names_remain_admitted() {
+    for tag in ["residency", "client_keyboard_layout"] {
+        workload_metrics_new_with_env_lookup_for_test(
+            &json!({
+                "custom_env_tags": {tag: "ISTIO_META_ZONE"}
+            }),
+            |_| Err(std::env::VarError::NotPresent),
+        )
+        .unwrap_or_else(|error| panic!("tag name {tag} must be admitted, got {error}"));
+    }
+}
+
+/// Issue #6619: an environment source the operator has not declared in
+/// `safe_tag_sources` is copied as the redaction marker even when no name
+/// heuristic recognizes it as credential-bearing.
+#[tokio::test]
+async fn undeclared_env_sources_are_redacted_by_default() {
+    let plugin = workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_env_tags": {"cluster": "VAULT_UNSEAL_BLOB"}
+        }),
+        |_| Ok("unseal-sentinel".to_string()),
+    )
+    .expect("undeclared source constructs");
+    let metadata = metadata_after_before_proxy(&plugin).await;
+    assert_eq!(
+        metadata.get("cluster").map(String::as_str),
+        Some("[REDACTED]")
+    );
 }

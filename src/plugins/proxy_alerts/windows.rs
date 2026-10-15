@@ -347,7 +347,15 @@ pub struct WindowStore {
 
 impl WindowStore {
     pub fn new(rule_specs: HashMap<u32, RuleWindowSpec>) -> Self {
-        let shard_amount = pool_shard_amount(0);
+        Self::with_shard_amount(rule_specs, pool_shard_amount(0))
+    }
+
+    /// `shard_amount` must already be normalized (a power of two >= 2), as
+    /// `PluginHttpClient::pool_shard_amount()` returns it.
+    pub fn with_shard_amount(
+        rule_specs: HashMap<u32, RuleWindowSpec>,
+        shard_amount: usize,
+    ) -> Self {
         Self {
             by_rule: DashMap::with_shard_amount(shard_amount),
             rule_specs,

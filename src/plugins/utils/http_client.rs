@@ -273,6 +273,15 @@ pub struct PluginHttpClient {
     /// Plugin-egress CRL verifier when gateway CRLs were configured at
     /// construction; [`Self::with_live_crls`] points it at the live list.
     live_crl_verifier: Option<Arc<LiveCrlServerVerifier>>,
+    /// Per-CRL-generation client sets when gateway CRLs are enforced (issue
+    /// #6651). When the live CRL generation changes, the next accessor call
+    /// builds fresh clients, so connections pooled under the previous
+    /// generation are retired with their old client instead of being reused.
+    crl_rotation: Option<Arc<CrlClientRotation>>,
+    /// Gateway CRLs were configured with verification on, whether or not the
+    /// CRL posture could be built (`live_crl_verifier` is `None` when it
+    /// failed closed).
+    crl_enforcement_configured: bool,
     /// The gateway's namespace (`FERRUM_NAMESPACE`). Used by plugins that store
     /// state in external systems (Redis, Prometheus, StatsD) to prevent key/metric
     /// collisions when multiple gateway instances with different namespaces share
@@ -316,7 +325,10 @@ pub struct PluginHttpClient {
 impl std::fmt::Debug for PluginHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginHttpClient")
-            .field("has_shared_client", &self.client.is_some())
+            .field(
+                "has_shared_client",
+                &(self.client.is_some() || self.crl_rotation.is_some()),
+            )
             .field("has_http2_client", &self.http2_client.is_some())
             .field("has_http1_client", &self.http1_client.is_some())
             .field("slow_threshold", &self.slow_threshold)
@@ -401,6 +413,23 @@ impl LiveCrlServerVerifier {
     /// Read CRL generations from the gateway's shared list from now on.
     fn follow(&self, crls: crate::tls::SharedCrlList) {
         self.source.store(crls);
+    }
+
+    /// The CRL generation currently published on the followed list.
+    fn live_generation(&self) -> CrlList {
+        self.source.load().load_full()
+    }
+
+    /// A verifier over different trust anchors that follows the same CRL
+    /// list as `self` (dedicated plugin clients with their own CA).
+    fn with_roots(&self, roots: rustls::RootCertStore) -> Result<Self, anyhow::Error> {
+        let crls = self.live_generation();
+        let verifier = generation_verifier(&roots, &crls)?;
+        Ok(Self {
+            roots: Arc::new(roots),
+            source: arc_swap::ArcSwap::new(self.source.load_full()),
+            current: arc_swap::ArcSwap::from_pointee(CrlGenerationVerifier { crls, verifier }),
+        })
     }
 
     /// The verifier for the current CRL generation, rebuilt when it changed.
@@ -528,6 +557,230 @@ fn crl_enforced_rustls_config(
     crate::tls::apply_crl_enforced_client_resumption(&mut tls, &startup_crls);
     tls.resumption = rustls::client::Resumption::disabled();
     Ok(tls)
+}
+
+/// The three shared clients built for one CRL generation.
+struct ClientGeneration {
+    crls: CrlList,
+    shared: Option<reqwest::Client>,
+    http2: Option<reqwest::Client>,
+    http1: Option<reqwest::Client>,
+}
+
+/// Rebuilds the shared plugin clients when the live CRL generation changes
+/// (issue #6651), mirroring the backend pools that backend TLS reload drains.
+/// A request already holding a previous generation's client finishes on it;
+/// the old pool closes once the last such clone is dropped.
+struct CrlClientRotation {
+    verifier: Arc<LiveCrlServerVerifier>,
+    pool_config: PoolConfig,
+    dns_cache: DnsCache,
+    posture: PluginTlsPosture,
+    current: arc_swap::ArcSwap<ClientGeneration>,
+    rebuild: std::sync::Mutex<()>,
+}
+
+impl CrlClientRotation {
+    fn current(&self) -> Arc<ClientGeneration> {
+        let live = self.verifier.live_generation();
+        let current = self.current.load_full();
+        if Arc::ptr_eq(&current.crls, &live) {
+            return current;
+        }
+        let _guard = self
+            .rebuild
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.current.load_full();
+        if Arc::ptr_eq(&current.crls, &live) {
+            return current;
+        }
+        let dns = Some(self.dns_cache.clone());
+        let next = Arc::new(ClientGeneration {
+            crls: live,
+            shared: accept_plugin_http_client(
+                build_configured_plugin_client(
+                    &self.pool_config,
+                    dns.clone(),
+                    &self.posture,
+                    false,
+                ),
+                "Failed to rebuild the shared plugin HTTP client for a new CRL generation",
+            )
+            .map(|client| (*client).clone()),
+            http2: accept_plugin_http_client(
+                build_configured_plugin_client(&self.pool_config, dns.clone(), &self.posture, true),
+                "Failed to rebuild the HTTP/2 plugin HTTP companion for a new CRL generation",
+            )
+            .map(|client| (*client).clone()),
+            http1: accept_plugin_http_client(
+                build_http1_only_plugin_client(&self.pool_config, dns, &self.posture),
+                "Failed to rebuild the HTTP/1.1 plugin HTTP companion for a new CRL generation",
+            )
+            .map(|client| (*client).clone()),
+        });
+        self.current.store(Arc::clone(&next));
+        next
+    }
+}
+
+/// Builds a dedicated plugin `reqwest::Client`. Receives the gateway-CRL
+/// rustls config to install with `use_preconfigured_tls`, or `None` when no
+/// gateway CRL applies (the plugin keeps its own TLS settings).
+type DedicatedClientBuild =
+    dyn Fn(Option<rustls::ClientConfig>) -> Result<reqwest::Client, String> + Send + Sync;
+
+/// HTTP versions a dedicated plugin client speaks over TLS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DedicatedClientAlpn {
+    Negotiated,
+    Http1Only,
+}
+
+struct DedicatedGeneration {
+    crls: CrlList,
+    /// `None` after a failed rebuild: requests are refused until the next
+    /// rebuild succeeds.
+    client: Option<reqwest::Client>,
+}
+
+struct DedicatedRotation {
+    verifier: Arc<LiveCrlServerVerifier>,
+    alpn: PluginAlpn,
+    client_auth: Option<DedicatedClientAuth>,
+    build: Box<DedicatedClientBuild>,
+    current: arc_swap::ArcSwap<DedicatedGeneration>,
+    rebuild: std::sync::Mutex<()>,
+}
+
+pub(crate) type DedicatedClientAuth = (
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+);
+
+/// rustls config for a dedicated plugin client: the live-CRL verifier, the
+/// plugin's client identity, its ALPN, and resumption disabled so every new
+/// connection reaches the CRL checks.
+fn dedicated_tls_config(
+    verifier: &Arc<LiveCrlServerVerifier>,
+    alpn: PluginAlpn,
+    client_auth: Option<&DedicatedClientAuth>,
+) -> Result<rustls::ClientConfig, String> {
+    let startup_crls = Arc::clone(&verifier.current.load().crls);
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = verifier.clone();
+    let builder = crate::tls::backend_client_config_builder(None)
+        .map_err(|_| "plugin TLS configuration failed".to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    let mut tls = match client_auth {
+        Some((certs, key)) => builder
+            .with_client_auth_cert(certs.clone(), key.clone_key())
+            .map_err(|_| "plugin TLS client identity was refused".to_string())?,
+        None => builder.with_no_client_auth(),
+    };
+    tls.alpn_protocols = alpn.protocols();
+    crate::tls::apply_crl_enforced_client_resumption(&mut tls, &startup_crls);
+    tls.resumption = rustls::client::Resumption::disabled();
+    Ok(tls)
+}
+
+impl DedicatedRotation {
+    fn build_for(&self, crls: CrlList) -> Result<Arc<DedicatedGeneration>, String> {
+        let tls = dedicated_tls_config(&self.verifier, self.alpn, self.client_auth.as_ref())?;
+        let client = (self.build)(Some(tls))?;
+        Ok(Arc::new(DedicatedGeneration {
+            crls,
+            client: Some(client),
+        }))
+    }
+
+    fn current(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
+        let live = self.verifier.live_generation();
+        let current = self.current.load_full();
+        if Arc::ptr_eq(&current.crls, &live) {
+            return current.client.clone().ok_or(PluginHttpClientUnavailable);
+        }
+        let _guard = self
+            .rebuild
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.current.load_full();
+        if Arc::ptr_eq(&current.crls, &live) {
+            return current.client.clone().ok_or(PluginHttpClientUnavailable);
+        }
+        let next = match self.build_for(Arc::clone(&live)) {
+            Ok(next) => next,
+            Err(error) => {
+                // Fail closed: the previous generation's pool may hold a
+                // connection to a now-revoked peer, so it must not carry new
+                // requests. The next call retries the rebuild.
+                tracing::warn!(
+                    error = %sanitize_startup_cause(&error, &[]),
+                    "Failed to rebuild a dedicated plugin HTTP client for a new CRL generation; \
+                     refusing requests until it can be rebuilt"
+                );
+                self.current.store(Arc::new(DedicatedGeneration {
+                    crls: current.crls.clone(),
+                    client: None,
+                }));
+                return Err(PluginHttpClientUnavailable);
+            }
+        };
+        let client = next.client.clone();
+        self.current.store(next);
+        client.ok_or(PluginHttpClientUnavailable)
+    }
+}
+
+/// A plugin-owned `reqwest::Client` (`spec_expose`, custom-TLS
+/// `api_chargeback_sink`, `load_testing`) that applies the gateway CRLs when
+/// they are enforced (issue #6651). Built by
+/// [`PluginHttpClient::dedicated_client`]. Call [`Self::current`] per request:
+/// after a CRL refresh it returns a freshly built client, retiring the
+/// previous generation's pooled connections.
+#[derive(Clone)]
+pub(crate) struct DedicatedPluginClient {
+    inner: DedicatedPluginClientInner,
+}
+
+#[derive(Clone)]
+enum DedicatedPluginClientInner {
+    Fixed(reqwest::Client),
+    CrlRotating(Arc<DedicatedRotation>),
+}
+
+impl DedicatedPluginClient {
+    /// A client that applies no gateway CRL (verification disabled by the
+    /// plugin, or none configured).
+    pub(crate) fn fixed(client: reqwest::Client) -> Self {
+        Self {
+            inner: DedicatedPluginClientInner::Fixed(client),
+        }
+    }
+
+    /// The client for the current CRL generation. `Err` when a rebuild for a
+    /// new generation failed: callers must fail closed rather than reuse the
+    /// previous generation's pool.
+    pub(crate) fn current(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
+        match &self.inner {
+            DedicatedPluginClientInner::Fixed(client) => Ok(client.clone()),
+            DedicatedPluginClientInner::CrlRotating(rotation) => rotation.current(),
+        }
+    }
+
+    /// Whether this client enforces the gateway CRLs.
+    #[allow(dead_code)] // exercised via external tests through the lib target
+    pub(crate) fn enforces_gateway_crls(&self) -> bool {
+        matches!(self.inner, DedicatedPluginClientInner::CrlRotating(_))
+    }
+}
+
+impl std::fmt::Debug for DedicatedPluginClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DedicatedPluginClient")
+            .field("enforces_gateway_crls", &self.enforces_gateway_crls())
+            .finish()
+    }
 }
 
 impl PluginTlsPosture {
@@ -1171,6 +1424,7 @@ impl PluginHttpClient {
         let dns_cache_clone = dns_cache.clone();
         let tls_posture =
             PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path, &tls_crls);
+        let crl_enforcement_configured = !tls_no_verify && !tls_crls.is_empty();
 
         let client = accept_plugin_http_client(
             build_configured_plugin_client(
@@ -1191,9 +1445,33 @@ impl PluginHttpClient {
             "Failed to build the HTTP/2 plugin HTTP companion client",
         );
         let http1_client = accept_plugin_http_client(
-            build_http1_only_plugin_client(pool_config, Some(dns_cache), &tls_posture),
+            build_http1_only_plugin_client(pool_config, Some(dns_cache.clone()), &tls_posture),
             "Failed to build the HTTP/1.1 plugin HTTP companion client",
         );
+        // With CRLs enforced the rotating generations own the clients: the
+        // fixed fields stay empty so a retired generation's pools close once
+        // its last in-flight user finishes.
+        let (client, http2_client, http1_client, crl_rotation) = match &tls_posture {
+            PluginTlsPosture::CrlEnforced(verifier) => (
+                None,
+                None,
+                None,
+                Some(Arc::new(CrlClientRotation {
+                    verifier: Arc::clone(verifier),
+                    pool_config: pool_config.clone(),
+                    dns_cache,
+                    posture: tls_posture.clone(),
+                    current: arc_swap::ArcSwap::from_pointee(ClientGeneration {
+                        crls: verifier.live_generation(),
+                        shared: client.map(Arc::unwrap_or_clone),
+                        http2: http2_client.map(Arc::unwrap_or_clone),
+                        http1: http1_client.map(Arc::unwrap_or_clone),
+                    }),
+                    rebuild: std::sync::Mutex::new(()),
+                })),
+            ),
+            _ => (client, http2_client, http1_client, None),
+        };
 
         Self {
             client,
@@ -1212,6 +1490,8 @@ impl PluginHttpClient {
                 PluginTlsPosture::CrlEnforced(verifier) => Some(Arc::clone(verifier)),
                 _ => None,
             },
+            crl_rotation,
+            crl_enforcement_configured,
             namespace: namespace.to_string(),
             real_ip_header: None,
             backend_allow_ips,
@@ -1280,6 +1560,8 @@ impl PluginHttpClient {
             tls_crl_file_path: None,
             tls_crl_source_configured: false,
             live_crl_verifier: None,
+            crl_rotation: None,
+            crl_enforcement_configured: false,
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
             real_ip_header: None,
             backend_allow_ips: BackendEgressPolicy::unrestricted(),
@@ -1569,8 +1851,117 @@ impl PluginHttpClient {
     ///
     /// For native gRPC / cleartext HTTP/2 destinations, use [`get_http2`]
     /// instead so the request is built on the HTTP/2-prior-knowledge companion.
-    pub fn get(&self) -> Result<&reqwest::Client, PluginHttpClientUnavailable> {
-        self.client.as_deref().ok_or(PluginHttpClientUnavailable)
+    ///
+    /// Returns an owned handle (a cheap `Arc` clone). With gateway CRLs
+    /// enforced it is the client for the current CRL generation (issue
+    /// #6651), so call it per request rather than caching the result.
+    pub fn get(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
+        self.shared_client().ok_or(PluginHttpClientUnavailable)
+    }
+
+    fn shared_client(&self) -> Option<reqwest::Client> {
+        match &self.crl_rotation {
+            Some(rotation) => rotation.current().shared.clone(),
+            None => self.client.as_deref().cloned(),
+        }
+    }
+
+    fn http2_companion(&self) -> Option<reqwest::Client> {
+        match &self.crl_rotation {
+            Some(rotation) => rotation.current().http2.clone(),
+            None => self.http2_client.as_deref().cloned(),
+        }
+    }
+
+    fn http1_companion(&self) -> Option<reqwest::Client> {
+        match &self.crl_rotation {
+            Some(rotation) => rotation.current().http1.clone(),
+            None => self.http1_client.as_deref().cloned(),
+        }
+    }
+
+    /// Whether the gateway CRLs are enforced on plugin egress (configured at
+    /// startup with verification on).
+    pub(crate) fn enforces_gateway_crls(&self) -> bool {
+        self.crl_enforcement_configured
+    }
+
+    /// Build a plugin-owned `reqwest::Client` that applies the gateway CRLs
+    /// when they are enforced (issue #6651).
+    ///
+    /// `build` makes the client from the plugin's own builder settings. It is
+    /// called with `None` when no gateway CRL applies (no CRL configured at
+    /// startup, gateway `FERRUM_TLS_NO_VERIFY`, or `verify` false because the
+    /// plugin disabled verification), and the plugin keeps its own trust
+    /// settings. Otherwise it receives a rustls config to install with
+    /// `use_preconfigured_tls`: a verifier that follows the live CRL list over
+    /// `custom_ca_pem` (exclusively), else the gateway CA bundle, else the
+    /// bundled webpki roots, with `client_auth` presented when given. After a
+    /// CRL refresh the client is rebuilt on next use.
+    pub(crate) fn dedicated_client(
+        &self,
+        verify: bool,
+        custom_ca_pem: Option<&[u8]>,
+        client_auth: Option<DedicatedClientAuth>,
+        alpn: DedicatedClientAlpn,
+        build: impl Fn(Option<rustls::ClientConfig>) -> Result<reqwest::Client, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<DedicatedPluginClient, String> {
+        if !verify || !self.crl_enforcement_configured {
+            return build(None).map(DedicatedPluginClient::fixed);
+        }
+        // CRLs are configured and verification is on, but the shared CRL
+        // posture could not be built (its trust store or verifier failed):
+        // refuse rather than build a client that silently ignores the CRLs.
+        let Some(shared_verifier) = self.live_crl_verifier.as_ref() else {
+            return Err(
+                "gateway CRLs are configured but could not be applied; refusing to build a \
+                 client without revocation checks"
+                    .to_string(),
+            );
+        };
+        let verifier = match custom_ca_pem {
+            Some(pem) => {
+                let roots = crate::tls::root_cert_store_from_pem_bundle(
+                    pem,
+                    "plugin CA bundle",
+                    "plugin CA bundle",
+                )
+                .map_err(|_| "plugin CA bundle failed trust-store admission".to_string())?;
+                Arc::new(
+                    shared_verifier
+                        .with_roots(roots)
+                        .map_err(|_| "gateway CRLs could not be applied".to_string())?,
+                )
+            }
+            None => Arc::clone(shared_verifier),
+        };
+        let alpn = match alpn {
+            DedicatedClientAlpn::Negotiated => PluginAlpn::Negotiated,
+            DedicatedClientAlpn::Http1Only => PluginAlpn::Http1Only,
+        };
+        let crls = verifier.live_generation();
+        let first = build(Some(dedicated_tls_config(
+            &verifier,
+            alpn,
+            client_auth.as_ref(),
+        )?))?;
+        let rotation = DedicatedRotation {
+            current: arc_swap::ArcSwap::from_pointee(DedicatedGeneration {
+                crls,
+                client: Some(first),
+            }),
+            verifier,
+            alpn,
+            client_auth,
+            build: Box::new(build),
+            rebuild: std::sync::Mutex::new(()),
+        };
+        Ok(DedicatedPluginClient {
+            inner: DedicatedPluginClientInner::CrlRotating(Arc::new(rotation)),
+        })
     }
 
     /// Get the HTTP/2-prior-knowledge companion client.
@@ -1584,10 +1975,8 @@ impl PluginHttpClient {
     /// [`execute_http2_redacted`] so redaction and egress screening still run.
     /// The ordinary execute helpers deliberately remain pinned to the default
     /// shared client.
-    pub fn get_http2(&self) -> Result<&reqwest::Client, PluginHttpClientUnavailable> {
-        self.http2_client
-            .as_deref()
-            .ok_or(PluginHttpClientUnavailable)
+    pub fn get_http2(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
+        self.http2_companion().ok_or(PluginHttpClientUnavailable)
     }
 
     /// Get the HTTP/1.1-pinned companion client.
@@ -1600,10 +1989,8 @@ impl PluginHttpClient {
     /// authority. Shares DNS, TLS posture, pool/keepalive, redirect, and
     /// no-proxy invariants with [`get`]. Pass builders from this client through
     /// [`execute_http1_redacted`] so redaction and egress screening still run.
-    pub fn get_http1(&self) -> Result<&reqwest::Client, PluginHttpClientUnavailable> {
-        self.http1_client
-            .as_deref()
-            .ok_or(PluginHttpClientUnavailable)
+    pub fn get_http1(&self) -> Result<reqwest::Client, PluginHttpClientUnavailable> {
+        self.http1_companion().ok_or(PluginHttpClientUnavailable)
     }
 
     /// Send a pre-built request with automatic slow-call logging.
@@ -1698,14 +2085,14 @@ impl PluginHttpClient {
             let error_class = classify_reqwest_error(&e);
             format!("{error_class} building request to {redacted_url}")
         })?;
-        let Some(client) = self.http2_client.as_ref() else {
+        let Some(client) = self.http2_companion() else {
             return Err(format!(
                 "{} calling {redacted_url}",
                 ErrorClass::ConnectionPoolError
             ));
         };
         self.execute_request_with_client(
-            client,
+            &client,
             request,
             label,
             None,
@@ -1737,14 +2124,14 @@ impl PluginHttpClient {
             let error_class = classify_reqwest_error(&e);
             format!("{error_class} building request to {redacted_url}")
         })?;
-        let Some(client) = self.http1_client.as_ref() else {
+        let Some(client) = self.http1_companion() else {
             return Err(format!(
                 "{} calling {redacted_url}",
                 ErrorClass::ConnectionPoolError
             ));
         };
         self.execute_request_with_client(
-            client,
+            &client,
             request,
             label,
             None,
@@ -1840,7 +2227,7 @@ impl PluginHttpClient {
         // caller's non-success handling is identical whether the refusal came
         // from terminal client construction, from the egress policy, or from
         // the endpoint itself.
-        let Some(client) = self.client.as_ref() else {
+        let Some(client) = self.shared_client() else {
             return Ok(consume(unavailable_response()).await);
         };
         if let Some(reason) = self.denied_literal_ip_reason(&request) {
@@ -1856,7 +2243,7 @@ impl PluginHttpClient {
         let total_start = std::time::Instant::now();
         let result = self
             .run_request_attempts(
-                client,
+                &client,
                 request,
                 label,
                 Some(accumulator),
@@ -1893,7 +2280,7 @@ impl PluginHttpClient {
             error_class: classify_reqwest_error(&error),
             request_reached_wire: false,
         })?;
-        if self.client.is_none() {
+        if self.shared_client().is_none() {
             return Err(unavailable_plugin_http_failure());
         }
         if let Some(reason) = self.denied_literal_ip_reason(&request) {
@@ -1942,7 +2329,7 @@ impl PluginHttpClient {
             error_class: classify_reqwest_error(&error),
             request_reached_wire: false,
         })?;
-        let Some(client) = self.client.as_ref() else {
+        let Some(client) = self.shared_client() else {
             return Err(unavailable_plugin_http_failure());
         };
         if let Some(reason) = self.denied_literal_ip_reason(&request) {
@@ -1958,7 +2345,7 @@ impl PluginHttpClient {
             });
         }
         self.execute_request_with_client(
-            client,
+            &client,
             request,
             label,
             Some(accumulator),
@@ -1976,11 +2363,11 @@ impl PluginHttpClient {
         accumulator: Option<&AtomicU64>,
         log_url_override: Option<&str>,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        let Some(client) = self.client.as_ref() else {
+        let Some(client) = self.shared_client() else {
             return unavailable_reqwest_execute_result();
         };
         self.execute_request_with_client(
-            client,
+            &client,
             request,
             label,
             accumulator,

@@ -8,7 +8,7 @@ use crate::fips::backend::rand::{SecureRandom, SystemRandom};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::identity::{SpiffeId, TrustDomain};
@@ -38,7 +38,8 @@ use crate::plugins::otel_tracing::{
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::{
-    is_operator_sensitive_metadata_key, is_sensitive_metadata_key,
+    REDACTED_PLACEHOLDER, is_credential_class_metadata_key, is_operator_sensitive_metadata_key,
+    is_sensitive_header_name, is_sensitive_metadata_key,
 };
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
@@ -192,6 +193,7 @@ pub const WORKLOAD_METRICS_CONFIG_KEYS: &[&str] = &[
     "custom_tags",
     "custom_header_tags",
     "custom_env_tags",
+    "safe_tag_sources",
     "metrics",
     "tracing_provider",
     "tracing_providers",
@@ -338,6 +340,9 @@ pub struct WorkloadMetrics {
     custom_tags: HashMap<String, String>,
     /// Custom tags populated from request headers.
     custom_header_tags: HashMap<String, String>,
+    /// Header-backed tags whose source header is not declared in
+    /// `safe_tag_sources`: their values are emitted as `[REDACTED]`.
+    redacted_header_tags: HashSet<String>,
     /// Per-family self-contained compact tag-override plans. Each plan carries
     /// its immutable CEL input requirements in a fixed header.
     tag_override_plans: Vec<(MeshMetricFamily, String)>,
@@ -477,16 +482,29 @@ impl WorkloadMetrics {
         let custom_tags = string_map_config(config, "custom_tags")?;
         let custom_header_tags = string_map_config(config, "custom_header_tags")?;
         let custom_env_tags = string_map_config(config, "custom_env_tags")?;
+        let safe_tag_sources = safe_tag_sources_config(config)?;
         let ValidatedCustomTags {
             mut custom_tags,
             custom_header_tags,
             custom_env_tags,
             custom_trace_attributes_marker,
-        } = validate_custom_tags(custom_tags, custom_header_tags, custom_env_tags)?;
+            redacted_header_tags,
+            redacted_env_tags,
+        } = validate_custom_tags(
+            custom_tags,
+            custom_header_tags,
+            custom_env_tags,
+            &safe_tag_sources,
+        )?;
         // Resolve Istio environment custom tags from *this* data-plane process
         // environment at construction/reload — never on the request hot path
         // and never from a controller-host translation.
-        resolve_custom_env_tags_with(&mut custom_tags, &custom_env_tags, env_lookup)?;
+        resolve_custom_env_tags_with(
+            &mut custom_tags,
+            &custom_env_tags,
+            &redacted_env_tags,
+            env_lookup,
+        )?;
         let ParsedMetricConfig {
             tag_override_plans,
             disabled_metrics_marker,
@@ -535,6 +553,7 @@ impl WorkloadMetrics {
             sampling_percentage,
             custom_tags,
             custom_header_tags,
+            redacted_header_tags,
             tag_override_plans,
             disabled_metrics_marker,
             custom_trace_attributes_marker,
@@ -903,7 +922,14 @@ impl WorkloadMetrics {
             if let Some(value) = header_value(headers, header_name)
                 && value.len() <= MAX_CUSTOM_TAG_VALUE_BYTES
             {
-                metadata.insert(key.clone(), value.to_string());
+                // Fail closed: a header the operator has not declared safe is
+                // copied as the redaction marker, never verbatim.
+                let value = if self.redacted_header_tags.contains(key) {
+                    REDACTED_PLACEHOLDER.to_string()
+                } else {
+                    value.to_string()
+                };
+                metadata.insert(key.clone(), value);
             }
         }
         if let Some(marker) = self.custom_trace_attributes_marker.as_ref() {
@@ -1936,6 +1962,7 @@ pub(crate) fn validate_istio_telemetry_config(
             tracing.custom_tags.clone(),
             tracing.custom_header_tags.clone(),
             tracing.custom_env_tags.clone(),
+            &tracing.safe_tag_sources,
         )?;
         // Mesh injection always writes `allow_plaintext: true` beside
         // providers it emits with a cleartext collector URL (see
@@ -1958,13 +1985,75 @@ struct ValidatedCustomTags {
     custom_header_tags: HashMap<String, String>,
     custom_env_tags: HashMap<String, String>,
     custom_trace_attributes_marker: Option<String>,
+    redacted_header_tags: HashSet<String>,
+    redacted_env_tags: HashSet<String>,
+}
+
+/// Maximum entries in `safe_tag_sources`.
+const MAX_SAFE_TAG_SOURCES: usize = 64;
+
+/// Parse `safe_tag_sources`: the header and environment-variable names whose
+/// values custom header / env tags may copy verbatim (issue #6619).
+fn safe_tag_sources_config(config: &Value) -> Result<Vec<String>, String> {
+    let Some(value) = config.get("safe_tag_sources") else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "workload_metrics: `safe_tag_sources` must be an array".to_string())?;
+    if entries.len() > MAX_SAFE_TAG_SOURCES {
+        return Err(format!(
+            "workload_metrics: `safe_tag_sources` exceeds {MAX_SAFE_TAG_SOURCES} entries"
+        ));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            entry
+                .as_str()
+                .filter(|name| !name.is_empty() && name.len() <= MAX_CUSTOM_ENV_VAR_NAME_BYTES)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!(
+                        "workload_metrics: `safe_tag_sources[{index}]` must be a non-empty string of at most {MAX_CUSTOM_ENV_VAR_NAME_BYTES} bytes"
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Validate `safe_tag_sources` against the deny layer: a credential-shaped
+/// header or environment-variable name cannot be declared safe. Diagnostics
+/// name the index only, never the (possibly credential-bearing) entry.
+fn validate_safe_tag_sources(safe_tag_sources: &[String]) -> Result<(), String> {
+    if safe_tag_sources.len() > MAX_SAFE_TAG_SOURCES {
+        return Err(format!(
+            "workload_metrics: `safe_tag_sources` exceeds {MAX_SAFE_TAG_SOURCES} entries"
+        ));
+    }
+    for (index, source) in safe_tag_sources.iter().enumerate() {
+        if source.is_empty()
+            || source.len() > MAX_CUSTOM_ENV_VAR_NAME_BYTES
+            || is_sensitive_header_name(source)
+            || is_sensitive_header_name(&source.to_ascii_lowercase())
+            || is_sensitive_environment_variable_name(source)
+        {
+            return Err(format!(
+                "workload_metrics: `safe_tag_sources[{index}]` is empty, oversized, or names a credential-bearing source and cannot be declared safe"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_custom_tags(
     custom_tags: HashMap<String, String>,
     custom_header_tags: HashMap<String, String>,
     custom_env_tags: HashMap<String, String>,
+    safe_tag_sources: &[String],
 ) -> Result<ValidatedCustomTags, String> {
+    validate_safe_tag_sources(safe_tag_sources)?;
     let mut names: Vec<String> = custom_tags
         .keys()
         .chain(custom_header_tags.keys())
@@ -1990,22 +2079,36 @@ fn validate_custom_tags(
     }
 
     let mut normalized_header_tags = HashMap::with_capacity(custom_header_tags.len());
+    let mut redacted_header_tags = HashSet::new();
     for (name, header) in custom_header_tags {
         let header_name =
             http::header::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                 format!("workload_metrics: custom tag {name:?} has invalid header name {header:?}")
             })?;
-        if is_sensitive_metadata_key(header_name.as_str()) {
+        // Judge the configured spelling as well as the normalized one:
+        // normalization lowercases away camelCase boundaries (`x-projectPin`).
+        if is_sensitive_header_name(&header) || is_sensitive_header_name(header_name.as_str()) {
             return Err(format!(
                 "workload_metrics: custom tag {name:?} cannot copy sensitive header {header:?}"
             ));
+        }
+        if !safe_tag_sources
+            .iter()
+            .any(|safe| safe.eq_ignore_ascii_case(header_name.as_str()))
+        {
+            redacted_header_tags.insert(name.clone());
         }
         normalized_header_tags.insert(name, header_name.as_str().to_string());
     }
 
     let mut normalized_env_tags = HashMap::with_capacity(custom_env_tags.len());
+    let mut redacted_env_tags = HashSet::new();
     for (name, env_var) in custom_env_tags {
         validate_env_var_name(&name, &env_var)?;
+        // Environment variable names are case-sensitive.
+        if !safe_tag_sources.contains(&env_var) {
+            redacted_env_tags.insert(name.clone());
+        }
         normalized_env_tags.insert(name, env_var);
     }
 
@@ -2015,6 +2118,8 @@ fn validate_custom_tags(
         custom_header_tags: normalized_header_tags,
         custom_env_tags: normalized_env_tags,
         custom_trace_attributes_marker: marker,
+        redacted_header_tags,
+        redacted_env_tags,
     })
 }
 
@@ -2031,6 +2136,7 @@ fn validate_custom_tags(
 fn resolve_custom_env_tags_with<F>(
     custom_tags: &mut HashMap<String, String>,
     custom_env_tags: &HashMap<String, String>,
+    redacted_env_tags: &HashSet<String>,
     mut lookup: F,
 ) -> Result<(), String>
 where
@@ -2044,6 +2150,13 @@ where
                         "workload_metrics: custom env tag {tag:?} resolved value exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
                     ));
                 }
+                // Fail closed: a variable the operator has not declared in
+                // `safe_tag_sources` is emitted as the redaction marker.
+                let value = if redacted_env_tags.contains(tag) {
+                    REDACTED_PLACEHOLDER.to_string()
+                } else {
+                    value
+                };
                 custom_tags.insert(tag.clone(), value);
             }
             Err(std::env::VarError::NotPresent) => {
@@ -2106,10 +2219,14 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
 /// spellings. Most credential names use bounded token / known-compound
 /// matching; HTTP credential-state stems (`authorization`, `bearer`, `cookie`,
 /// and `csrf`) deliberately retain substring matching so concatenated names
-/// cannot bypass the telemetry boundary. Ordinary names such as
-/// `ISTIO_META_CLUSTER_ID` and `FERRUM_REGION` remain allowed.
+/// cannot bypass the telemetry boundary. Every credential class the metadata
+/// redactor recognizes (session identifiers, passphrases and passcodes, PINs
+/// and one-time codes, JWTs, signatures, private/access/signing keys, bearer
+/// assertions; issue #6619) is also refused here, so `GPG_PASSPHRASE`,
+/// `HSM_PIN` or `USER_SESSION_ID` cannot be copied into telemetry. Ordinary
+/// names such as `ISTIO_META_CLUSTER_ID` and `FERRUM_REGION` remain allowed.
 fn is_sensitive_environment_variable_name(name: &str) -> bool {
-    if is_operator_sensitive_metadata_key(name) {
+    if is_operator_sensitive_metadata_key(name) || is_credential_class_metadata_key(name) {
         return true;
     }
 
@@ -2819,7 +2936,8 @@ mod tests {
             },
             "custom_header_tags": {
                 "tenant": "x-tenant"
-            }
+            },
+            "safe_tag_sources": ["X-Tenant"]
         }))
         .expect("metrics config");
         let headers = HashMap::from([("X-Tenant".to_string(), "acme".to_string())]);
@@ -2885,7 +3003,8 @@ mod tests {
         let present = WorkloadMetrics::new_with_env_lookup_for_test(
             &json!({
                 "custom_tags": {"cluster": "fallback"},
-                "custom_env_tags": {"cluster": ENV_VAR}
+                "custom_env_tags": {"cluster": ENV_VAR},
+                "safe_tag_sources": [ENV_VAR]
             }),
             |name| {
                 if name == ENV_VAR {
@@ -2932,7 +3051,7 @@ mod tests {
         ] {
             let sensitive = WorkloadMetrics::new_with_env_lookup_for_test(
                 &json!({
-                    "custom_env_tags": {"credential": env_var}
+                    "custom_env_tags": {"dimension": env_var}
                 }),
                 |_| Err(std::env::VarError::NotPresent),
             );
@@ -2992,6 +3111,54 @@ mod tests {
         assert!(reserved_error.contains("reserved or sensitive"));
     }
 
+    /// Issue #6619: a header or environment source the operator has not
+    /// declared in `safe_tag_sources` is copied as the redaction marker, and
+    /// a credential-shaped source cannot be declared safe.
+    #[test]
+    fn undeclared_tag_sources_are_redacted_and_credential_sources_cannot_be_declared() {
+        let metrics = WorkloadMetrics::new_with_env_lookup_for_test(
+            &json!({
+                "custom_header_tags": {"tenant": "x-tenant", "zone": "x-zone"},
+                "custom_env_tags": {"cluster": "ISTIO_META_CLUSTER_ID", "region": "FERRUM_REGION"},
+                "safe_tag_sources": ["x-zone", "FERRUM_REGION"]
+            }),
+            |name| Ok(format!("{name}-value")),
+        )
+        .expect("metrics config");
+        let headers = HashMap::from([
+            ("x-tenant".to_string(), "tenant-sentinel".to_string()),
+            ("x-zone".to_string(), "zone-a".to_string()),
+        ]);
+        let mut metadata = HashMap::new();
+        metrics.apply_telemetry_metadata(&mut metadata, &headers);
+        assert_eq!(
+            metadata.get("tenant").map(String::as_str),
+            Some(REDACTED_PLACEHOLDER)
+        );
+        assert_eq!(metadata.get("zone").map(String::as_str), Some("zone-a"));
+        assert_eq!(
+            metadata.get("cluster").map(String::as_str),
+            Some(REDACTED_PLACEHOLDER)
+        );
+        assert_eq!(
+            metadata.get("region").map(String::as_str),
+            Some("FERRUM_REGION-value")
+        );
+
+        for source in [
+            "x-key-private",
+            "GPGPASS_PHRASE",
+            "x-hsm-pin",
+            "AWS_SESSION_TOKEN",
+        ] {
+            let error = WorkloadMetrics::new(&json!({ "safe_tag_sources": [source] }))
+                .err()
+                .expect("credential-shaped source rejected");
+            assert!(error.contains("safe_tag_sources[0]"), "{error}");
+            assert!(!error.contains(source), "{error}");
+        }
+    }
+
     #[test]
     fn custom_header_tag_values_are_bounded() {
         let metrics = WorkloadMetrics::new(&json!({
@@ -3015,7 +3182,8 @@ mod tests {
         let mut metrics = WorkloadMetrics::new(&json!({
             "sampling_percentage": 100.0,
             "custom_tags": {"region": "east"},
-            "custom_header_tags": {"tenant": "x-tenant"}
+            "custom_header_tags": {"tenant": "x-tenant"},
+            "safe_tag_sources": ["x-tenant"]
         }))
         .expect("metrics config");
         metrics.trace_exporters = vec![Arc::new(CapturingExporter {

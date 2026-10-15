@@ -3497,6 +3497,7 @@ mod tests {
                     port_overrides: Default::default(),
                 }],
                 request_authentications: vec![MeshRequestAuthentication {
+                    refused: false,
                     name: "root-ra".to_string(),
                     namespace: "istio-system".to_string(),
                     scope: PolicyScope::MeshWide,

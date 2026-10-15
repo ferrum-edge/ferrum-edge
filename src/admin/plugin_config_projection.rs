@@ -62,7 +62,7 @@ use std::collections::HashSet;
 use crate::config::types::{PlaceholderRendering, RedactionRendering, push_json_pointer_segment};
 
 use crate::plugins::utils::metadata_redaction::{
-    REDACTED_PLACEHOLDER, REDACTED_USERINFO_PLACEHOLDER, is_sensitive_metadata_key,
+    REDACTED_PLACEHOLDER, REDACTED_USERINFO_PLACEHOLDER, is_sensitive_name_by_listed_rules,
 };
 use crate::plugins::utils::redis_rate_limiter;
 
@@ -907,7 +907,9 @@ pub fn redact_sensitive_plugin_config_fields(value: &mut Value) {
 /// [`normalize_config_key`], so `apiKey`, `api-key`, `API_KEY`, `api.key`,
 /// and `apikey` all match one pattern.
 pub fn is_sensitive_plugin_config_key(key: &str) -> bool {
-    if is_sensitive_metadata_key(key) {
+    // Config field names, not metadata keys: the listed rules only, so
+    // vocabulary such as `session_ttl_seconds` stays visible (issue #6619).
+    if is_sensitive_name_by_listed_rules(key) {
         return true;
     }
 

@@ -606,6 +606,7 @@ async fn k8s_telemetry_header_default_is_fallback_and_present_header_wins() {
     let plugin = WorkloadMetrics::new(&json!({
         "custom_tags": tracing.custom_tags,
         "custom_header_tags": tracing.custom_header_tags,
+        "safe_tag_sources": ["x-tenant"],
     }))
     .expect("translated custom tags construct workload_metrics");
 
@@ -721,6 +722,7 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
             "custom_env_tags": {
                 "cluster": ENV_VAR
             },
+            "safe_tag_sources": [ENV_VAR],
         }),
         |name| {
             if name == ENV_VAR {
@@ -753,6 +755,7 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
             "custom_env_tags": {
                 "cluster": ENV_VAR
             },
+            "safe_tag_sources": [ENV_VAR],
         }),
         |name| {
             if name == ENV_VAR {
@@ -781,6 +784,7 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
             "custom_env_tags": {
                 "cluster": ENV_VAR
             },
+            "safe_tag_sources": [ENV_VAR],
         }),
         |name| {
             if name == ENV_VAR {

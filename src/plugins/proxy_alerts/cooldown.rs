@@ -55,7 +55,12 @@ impl Default for CooldownGate {
 
 impl CooldownGate {
     pub fn new() -> Self {
-        let shard_amount = pool_shard_amount(0);
+        Self::with_shard_amount(pool_shard_amount(0))
+    }
+
+    /// `shard_amount` must already be normalized (a power of two >= 2), as
+    /// `PluginHttpClient::pool_shard_amount()` returns it.
+    pub fn with_shard_amount(shard_amount: usize) -> Self {
         Self {
             last_sent: DashMap::with_shard_amount(shard_amount),
             inner_shard_amount: shard_amount,
@@ -307,7 +312,12 @@ impl Default for RecoveryGate {
 
 impl RecoveryGate {
     pub fn new() -> Self {
-        let shard_amount = pool_shard_amount(0);
+        Self::with_shard_amount(pool_shard_amount(0))
+    }
+
+    /// `shard_amount` must already be normalized (a power of two >= 2), as
+    /// `PluginHttpClient::pool_shard_amount()` returns it.
+    pub fn with_shard_amount(shard_amount: usize) -> Self {
         Self {
             state: DashMap::with_shard_amount(shard_amount),
             inner_shard_amount: shard_amount,

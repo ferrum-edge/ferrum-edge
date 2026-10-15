@@ -102,7 +102,9 @@ use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::byte_budget::{ByteBudget, ByteLease};
 use super::utils::mcp_jsonrpc;
-use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
+use super::utils::metadata_redaction::{
+    REDACTED_PLACEHOLDER, is_sensitive_header_name, metadata_value_is_redacted,
+};
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, read_response_body_bounded,
 };
@@ -4316,7 +4318,7 @@ impl AiTranscriptAudit {
             // Audit records bypass the transaction-log redaction layer, so apply
             // the same key predicate defensively before copying any value out.
             let safe = |raw: &String| {
-                if is_sensitive_metadata_key(key) {
+                if metadata_value_is_redacted(key) {
                     REDACTED_PLACEHOLDER.to_string()
                 } else {
                     raw.clone()
@@ -4723,7 +4725,7 @@ impl AiTranscriptAudit {
             let Some(value) = metadata.get(*key) else {
                 continue;
             };
-            let value = if is_sensitive_metadata_key(key) {
+            let value = if metadata_value_is_redacted(key) {
                 REDACTED_PLACEHOLDER.to_string()
             } else if MCP_GATEWAY_NAME_METADATA_KEYS.contains(key) {
                 let bounded = bound_model_str(value, &self.redactor, redact_names);
@@ -7408,7 +7410,9 @@ fn redact_json_value_strings_at_depth(
 }
 
 fn sensitive_json_field(key: &str) -> bool {
-    if is_sensitive_metadata_key(key) {
+    // A body field name is caller data, never a gateway outcome signal, so the
+    // metadata-only outcome-key exemption does not apply.
+    if is_sensitive_header_name(key) {
         return true;
     }
     // Collapse case and separators, including zero-width/non-ASCII separators,
@@ -7535,7 +7539,8 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
     headers
         .iter()
         .map(|(name, value)| {
-            let value = if is_sensitive_metadata_key(name) {
+            // Header names are caller/upstream data: no metadata exemption.
+            let value = if is_sensitive_header_name(name) {
                 REDACTED_PLACEHOLDER.to_string()
             } else {
                 value.clone()

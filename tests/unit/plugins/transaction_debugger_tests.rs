@@ -2264,3 +2264,220 @@ fn startup_diagnostics_withhold_debugger_keys_and_capture_budgets() {
         assert!(!rendered.contains(hidden), "{rendered}");
     }
 }
+
+/// Issue #6619: camelCase credential-class field names redact in captured
+/// bodies, so the classifier must see the original spelling, not a lowercased
+/// copy that has lost its segment boundaries.
+#[test]
+fn test_camel_case_credential_class_body_fields_are_redacted() {
+    let plugin = capture_plugin();
+    let json_body = br#"{"hsmPin":"735102","userSessionId":"sess-748215","keep":"visible"}"#;
+    let json = plugin.render_captured_body(json_body, BodyKind::Json, 512);
+    assert!(!json.rendered.contains("735102"), "{}", json.rendered);
+    assert!(!json.rendered.contains("sess-748215"), "{}", json.rendered);
+    assert!(json.rendered.contains("visible"), "{}", json.rendered);
+
+    let form_body = b"totpSeed=482913&note=fine";
+    let form = plugin.render_captured_body(form_body, BodyKind::Form, 512);
+    assert!(!form.rendered.contains("482913"), "{}", form.rendered);
+    assert!(form.rendered.contains("note=fine"), "{}", form.rendered);
+}
+
+/// Issue #6619: credential-class header names are redacted in the request and
+/// response trace records, not only names on the exact built-in list.
+#[tokio::test(flavor = "current_thread")]
+async fn test_transaction_debugger_redacts_credential_class_headers_in_both_directions() {
+    let (writer, _guard) = capture_debug_logs();
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "x-session-id".to_string(),
+        "request-session-519".to_string(),
+    );
+    ctx.headers
+        .insert("x-csrf".to_string(), "request-csrf-519".to_string());
+    ctx.headers.insert(
+        "x-safe-header".to_string(),
+        "safe-request-value".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let mut response_headers = HashMap::from([
+        ("x-private-key".to_string(), "response-key-519".to_string()),
+        (
+            "x-session-id".to_string(),
+            "response-session-519".to_string(),
+        ),
+        (
+            "x-safe-response".to_string(),
+            "safe-response-value".to_string(),
+        ),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+
+    let logs = writer.contents();
+    for secret in [
+        "request-session-519",
+        "request-csrf-519",
+        "response-key-519",
+        "response-session-519",
+    ] {
+        assert!(!logs.contains(secret), "debugger leaked {secret}: {logs}");
+    }
+    assert!(logs.contains("safe-request-value"), "{logs}");
+    assert!(logs.contains("safe-response-value"), "{logs}");
+}
+
+fn text_capture_plugin(safe_text_fields: &[&str]) -> TransactionDebugger {
+    TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "log_response_body": true,
+        "max_request_body_bytes": 512,
+        "max_response_body_bytes": 512,
+        "safe_text_fields": safe_text_fields,
+    }))
+    .unwrap()
+}
+
+/// Issue #6619: text bodies drop `name=value` / `name: value` lines whose
+/// field name is credential-shaped, keeping declared-safe assignment lines.
+#[test]
+fn test_text_body_drops_credential_class_field_lines() {
+    let plugin = text_capture_plugin(&["auth_method"]);
+    let body = b"hsm_pin=735102\ntotp_seed=482913\ncsrf: opaque-value\nauth_method=jwt_auth hsm_pin=600114\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body, BodyKind::Text, 512);
+    for secret in ["735102", "482913", "opaque-value", "600114"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}
+
+/// Assignments with spacing, and debugger body-field names (`code`, `key`).
+#[test]
+fn test_text_body_drops_spaced_and_body_policy_field_lines() {
+    let plugin = text_capture_plugin(&["auth_method", "note"]);
+    let body = b"hsm_pin = 735103\ntotp_seed\t: 482914\nnote=fine code=482915\nkey=opaque-signing-material\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body, BodyKind::Text, 512);
+    for secret in ["735103", "482914", "482915", "opaque-signing-material"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}
+
+/// Multi-byte characters around assignments never split a character, and
+/// quoted or non-ASCII names fail closed.
+#[test]
+fn test_text_body_assignment_parsing_handles_utf8_and_quotes() {
+    let plugin = text_capture_plugin(&["auth_method", "note"]);
+    let body = "caf\u{e9}=cafe-sentinel\n\u{1f511}hsm_pin=735104\nnote=\u{e9}t\u{e9}\n\"hsm_pin\": \"735105\"\n'totp_seed' = 482916\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in ["735104", "735105", "482916", "cafe-sentinel"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}
+
+/// Issue #6619: assignment lines fail closed. Names the classifier does not
+/// recognize, names that do not parse cleanly (Unicode or punctuation), and
+/// names that are simply not declared are all dropped; only declared names
+/// survive.
+#[test]
+fn test_text_body_assignment_lines_fail_closed_unless_declared_safe() {
+    let plugin = text_capture_plugin(&["note"]);
+    let body = "hsm_pin\u{e9}=735107\nhsm_pin/opaque=735108\nx-key-private=735109\n/cb?code=735110\ngpgpass_phrase=735111\nkey_private=735112\nprivateKeY=735113\nvault_blob=735114\nnote=visible-note\nline without assignment\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in [
+        "735107", "735108", "735109", "735110", "735111", "735112", "735113", "735114",
+    ] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("note=visible-note"),
+        "{}",
+        text.rendered
+    );
+    assert!(
+        text.rendered.contains("line without assignment"),
+        "{}",
+        text.rendered
+    );
+}
+
+/// Every delimiter must follow a declared name: a missing, empty, or quoted
+/// name, or one valid assignment mixed with an invalid one, drops the line.
+#[test]
+fn test_text_body_unparseable_or_quoted_names_drop_the_line() {
+    let plugin = text_capture_plugin(&["note"]);
+    let body = "(hsm_pin): 600114\n\"note\": 600115\n\"\": 600116\nnote=ok (hsm_pin): 600117\nnote=ok :600118\nnote==600119\nnote=kept-line\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in ["600114", "600115", "600116", "600117", "600118", "600119"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("note=kept-line"),
+        "{}",
+        text.rendered
+    );
+}
+
+/// A credential-shaped or unparseable name cannot be declared safe.
+#[test]
+fn test_safe_text_fields_reject_credential_and_unclean_names() {
+    for name in [
+        "hsm_pin",
+        "key_private",
+        "gpgpass_phrase",
+        "session_id",
+        "caf\u{e9}",
+        "a b",
+    ] {
+        let error = TransactionDebugger::new(&json!({
+            "log_request_body": true,
+            "safe_text_fields": [name],
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("{name} must be rejected"));
+        assert!(error.contains("safe_text_fields[0]"), "{error}");
+    }
+    let error = TransactionDebugger::new(&json!({ "safe_text_fields": ["note"] }))
+        .err()
+        .expect("inert safe_text_fields rejected");
+    assert!(error.contains("requires"), "{error}");
+}
+
+/// Quoted field names are never declared safe, so their lines are dropped
+/// whole (spaces, brackets, escapes).
+#[test]
+fn test_text_body_quoted_field_names_are_classified_whole() {
+    let plugin = text_capture_plugin(&["auth_method"]);
+    let body = "\"totp seed\": \"482917\"\n\"hsm_pin[]\": \"735106\"\n\"display name\": \"display-sentinel\"\nauth_method=jwt_auth\n";
+    let text = plugin.render_captured_body(body.as_bytes(), BodyKind::Text, 1024);
+    for secret in ["482917", "735106", "display-sentinel"] {
+        assert!(!text.rendered.contains(secret), "{}", text.rendered);
+    }
+    assert!(
+        text.rendered.contains("auth_method=jwt_auth"),
+        "{}",
+        text.rendered
+    );
+}

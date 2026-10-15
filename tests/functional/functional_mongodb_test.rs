@@ -11,7 +11,7 @@
 //!
 //! Prerequisites:
 //!   1. MongoDB running on localhost:27017 (plaintext test)
-//!      - Docker: `docker run -d --name mongo-test -p 127.0.0.1:27017:27017 mongo:9`
+//!      - Docker: `docker run -d --name mongo-test -p 127.0.0.1:27017:27017 mongo:7`
 //!   2. For TLS/mTLS tests: TLS-enabled MongoDB with certs under
 //!      `FERRUM_TEST_MONGO_CERT_DIR` (defaults to `/tmp/ferrum-mongo-tls-certs`)
 //!      listening on 27018 (TLS) / 27019 (mTLS). Hosted data-plane CI
@@ -1114,7 +1114,7 @@ async fn test_mongodb_batch_atomicity_refused_on_standalone() {
 ///
 /// Requires a replica set. Set `FERRUM_TEST_MONGO_REPLICA_SET` (and optionally
 /// `FERRUM_TEST_MONGO_REPLICA_SET_URL`) to run it; skipped otherwise, because a
-/// plain `mongo:9` container cannot start a transaction.
+/// plain `mongo:7` container cannot start a transaction.
 #[tokio::test]
 #[ignore]
 async fn test_mongodb_batch_atomicity_all_or_nothing_on_replica_set() {
@@ -2072,7 +2072,7 @@ const CHANGE_STREAM_TEST_DROP_JOIN_BUDGET: Duration = Duration::from_secs(12);
 ///
 /// Requires a replica set. Set `FERRUM_TEST_MONGO_REPLICA_SET` (and optionally
 /// `FERRUM_TEST_MONGO_REPLICA_SET_URL`) to run it; skipped otherwise, because a
-/// plain `mongo:9` container cannot serve change streams.
+/// plain `mongo:7` container cannot serve change streams.
 #[tokio::test]
 #[ignore]
 async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {

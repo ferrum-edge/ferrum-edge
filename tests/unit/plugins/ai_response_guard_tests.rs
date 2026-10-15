@@ -6252,6 +6252,57 @@ async fn test_completed_redaction_discharges_the_final_seam() {
     );
 }
 
+/// Issue #6657: the JSON verification copies (cloned tree, strip scratch,
+/// residual serialization) and the final serialization share ONE
+/// live-capacity window. A body whose redacted form fits the ceiling alone
+/// but cannot fit beside its own working tree must be refused during
+/// construction, not built at a multiple of the ceiling.
+#[tokio::test]
+async fn test_json_redaction_refused_when_copies_exceed_one_window() {
+    let plugin = make_plugin(json!({
+        "pii_patterns": ["email"],
+        "scan_fields": "all",
+        "action": "redact"
+    }));
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let body = format!("{{\"text\":\"{} user@example.com\"}}", "a".repeat(600));
+
+    // Tight ceiling: the redacted bytes alone would fit, but the working
+    // tree plus its serialization cannot share one window of this size.
+    let mut tight = ctx_with_content_type("POST", "application/json");
+    tight.max_response_body_size_bytes = body.len() + 128;
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut tight,
+                body.as_bytes(),
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .is_none(),
+        "a redaction whose copies cannot share one window must be refused"
+    );
+
+    // Control: an ample ceiling still redacts the same body.
+    let mut roomy = ctx_with_content_type("POST", "application/json");
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut roomy,
+            body.as_bytes(),
+            Some("application/json"),
+            &headers,
+        )
+        .await
+        .expect("the same body is rewritten under an ordinary ceiling");
+    assert!(
+        !String::from_utf8(redacted)
+            .unwrap()
+            .contains("user@example.com")
+    );
+}
+
 #[tokio::test]
 async fn test_clean_and_warn_responses_never_arm_the_final_seam() {
     // A clean body detects nothing, so nothing is promised.
