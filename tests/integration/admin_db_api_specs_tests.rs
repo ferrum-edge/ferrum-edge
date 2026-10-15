@@ -5311,7 +5311,7 @@ async fn delete_proxy_removes_drifted_spec_owned_upstream() {
 //   Automated MongoDB tests require a live Mongo instance and are NOT part
 //   of CI. To run them locally:
 //
-//     1. Start a replica set: docker run --rm -p 27017:27017 mongo:7 \
+//     1. Start a replica set: docker run --rm -p 27017:27017 mongo:9 \
 //          mongod --replSet rs0 --bind_ip_all
 //        Then: mongo --eval "rs.initiate()"
 //     2. Set MONGO_URL=mongodb://localhost:27017/ferrum_test?replicaSet=rs0

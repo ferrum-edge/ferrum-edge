@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **CI and compose MongoDB fixtures move from 7.0 to 9.0** (issue #6589).
+  docker-library has published `mongo:9` at 9.0.4, whose SERVER-136272 fix
+  starts on the Ubuntu 26.04 runner kernel, so the replica-set, TLS, mTLS,
+  coverage, and scale fixtures and the conditional-live-stores digest pin run
+  9.0; the standalone plaintext fixture stays on 4.4.29 as the supported
+  floor. The `docker-compose.yml` `mongodb` profile moves to `mongo:9` (the
+  9-noble variant still ships 9.0.2, without the kernel fix):
+  a compose volume created by MongoDB 7.0 cannot be opened by 9.0, so remove
+  the old volume (`docker compose down -v`) before upgrading a compose stack.
+
 ### Security
 
 - **An unencoded `;` in the query is now an ambiguity that fail-closed query
