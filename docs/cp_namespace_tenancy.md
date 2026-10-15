@@ -503,8 +503,9 @@ forged claim to reach, and the scope check refuses everything else anyway.
 
 ### Data-plane side
 
-Two client-side options, both applying equally to DP ConfigSync, native
-`MeshSubscribe`, and xDS ADS:
+Two client-side options for DP ConfigSync, native `MeshSubscribe`, and xDS
+ADS. The external-token option currently does not work for stock DP
+ConfigSync; see the limitation note under it:
 
 - **Externally issued token (preferred)** — `FERRUM_DP_CP_GRPC_TOKEN_FILE`
   points at a token minted by a trusted issuer. The node presents it and holds

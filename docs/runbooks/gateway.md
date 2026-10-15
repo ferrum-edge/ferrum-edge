@@ -500,21 +500,25 @@ deltas until a fenced full snapshot reconciles it.
    category and validation category.
 
 **Likely causes.** A configuration mutation that is valid at the CP but invalid
-under the DP's local validation (for example a TLS reference the DP cannot
-resolve); a delta that fails the DP's freshness or authority checks (for
+under the DP's local validation (for example a plugin the DP image does not
+have, or a TLS reference the DP cannot resolve); a delta that fails the DP's freshness or authority checks (for
 example a stale delta from a lagging failover CP); a delta applied against a
 snapshot the DP had already fenced.
 
-CP/DP image skew is **not** a cause of this alert. The ConfigSync
-build-identity gate requires the exact same build on both sides and refuses a
-mismatched peer at subscribe, before any snapshot or delta is sent, so a skewed
-DP never receives a delta to reject. That is a connection-admission failure
-instead. The CP returns `FAILED_PRECONDITION` with a message starting
+A **ConfigSync build-identity mismatch** is not a cause of this alert. The
+identity is the crate version plus the ConfigSync protocol revision, and the
+gate refuses a peer whose identity differs at subscribe, before any snapshot or
+delta is sent, so that DP never receives a delta to reject. That is a
+connection-admission failure instead. The CP returns `FAILED_PRECONDITION` with a message starting
 `ConfigSync build mismatch` and records a failed subscription audit event. The
 DP logs the refusal and backs off, and it shows up as stale config
 ([FerrumGatewayDpConfigStale](#ferrumgatewaydpconfigstale)), not as divergence. Fix it by running the same
 build on CP and DP (see
-[upgrade_guide.md](../upgrade_guide.md#build-identity-gate)).
+[upgrade_guide.md](../upgrade_guide.md#build-identity-gate)). Images that share
+one identity can still differ, for example in the compiled-in custom plugin
+selection (`FERRUM_CUSTOM_PLUGINS`). Such a DP is admitted and can then reject
+a delta that enables a plugin only the CP image has. That **is** divergence, so
+compare the CP and DP plugin inventories as part of the remediation.
 
 **Remediation.** Divergence is designed to be safe: the DP keeps serving its
 last known-good configuration rather than applying a bad delta. Identify the
