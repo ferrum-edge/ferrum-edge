@@ -932,6 +932,83 @@ async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
     }
 }
 
+fn container_json_path_waf(
+    path: &str,
+    match_kind: &str,
+    pattern: &str,
+    fp_filters: &[&str],
+) -> Waf {
+    let mut rule = json!({
+        "id": "CUSTOM-JSON-CANARY",
+        "category": "custom",
+        "severity": "high",
+        "target": { "type": "body_json_path", "path": path },
+        "match_kind": match_kind,
+        "pattern": pattern,
+        "action": "enforce"
+    });
+    if !fp_filters.is_empty() {
+        rule["fp_filters"] = json!(fp_filters);
+    }
+    waf(json!({ "include_default_rules": false, "custom_rules": [rule] })).unwrap()
+}
+
+#[tokio::test]
+async fn body_json_path_container_rules_see_each_duplicate_reading() {
+    // `equals` on a container keeps matching the last-wins reading it matched
+    // before duplicates were preserved, and also matches the first-wins one.
+    let plugin = container_json_path_waf("user", "equals", r#"{"bio":"forbidden-canary"}"#, &[]);
+    for body in [
+        br#"{"user":{"bio":"forbidden-canary"}}"#.as_slice(),
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#,
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // Duplicates nested inside an array are collapsed per reading too.
+    let plugin = container_json_path_waf("items", "equals", r#"[{"k":"forbidden-canary"}]"#, &[]);
+    for body in [
+        br#"{"items":[{"k":"ordinary","k":"forbidden-canary"}]}"#.as_slice(),
+        br#"{"items":[{"k":"forbidden-canary","k":"ordinary"}]}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // A false-positive filter is evaluated per reading: a benign duplicate
+    // cannot suppress the reading that carries the forbidden value.
+    let plugin = container_json_path_waf("user", "contains", "forbidden-canary", &["ordinary"]);
+    for body in [
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#.as_slice(),
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+    // Control: the filter still suppresses a single reading it matches.
+    let (result, _) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"forbidden-canary, ordinary"}}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
 #[tokio::test]
 async fn body_json_path_rule_inspects_every_duplicate_member() {
     let plugin = enforcing_json_path_waf(false);
@@ -944,8 +1021,8 @@ async fn body_json_path_rule_inspects_every_duplicate_member() {
         br#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
         br#"{"user":{"bio":"ordinary"},"user":{"bio":"forbidden-canary"}}"#,
         // An escaped spelling of a member name is the same member.
-        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
-        br#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
+        br#"{"user":{"b\u0069o":"forbidden-canary","bio":"ordinary"}}"#,
+        br#"{"u\u0073er":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
     ];
     for body in forbidden_bodies {
         let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
