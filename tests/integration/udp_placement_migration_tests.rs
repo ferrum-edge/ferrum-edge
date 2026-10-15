@@ -671,6 +671,136 @@ fn write_unbound_state(registry: &std::path::Path, active: UdpPlacement) {
     .expect("write unbound durable state");
 }
 
+/// The durable record docs/mesh.md tells an operator to write for a true abort
+/// back to `disabled` (issue #6703), extracted verbatim so the documented
+/// artifact and the runtime acceptance rule cannot drift apart.
+fn documented_disabled_abort_record() -> &'static str {
+    const MESH_DOC: &str = include_str!("../../docs/mesh.md");
+    MESH_DOC
+        .split("**Abort back to `disabled`.**")
+        .nth(1)
+        .and_then(|tail| tail.split("```json").nth(1))
+        .and_then(|tail| tail.split("```").next())
+        .map(str::trim)
+        .expect("docs/mesh.md documents the disabled abort record")
+}
+
+#[test]
+fn documented_abort_recovery_is_accepted_only_for_its_intended_target() {
+    let record = documented_disabled_abort_record();
+    let document: serde_json::Value =
+        serde_json::from_str(record).expect("documented abort record is JSON");
+    assert_eq!(document["active"], "disabled");
+
+    // The documented artifact is accepted for `disabled`, with or without a
+    // resolvable identity, and is bound once an identity resolves.
+    let registry = tempfile::tempdir().expect("registry");
+    std::fs::write(registry.path().join(".udp-placement-state-v1.json"), record)
+        .expect("write documented record");
+    assert!(matches!(
+        prepare_placement(registry.path(), &stable(UdpPlacement::Disabled)),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    let node = identity(NODE_A, BOOT_1);
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::Disabled, &node)
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+
+    // The same hand-written shape naming a producer placement is exactly what
+    // the docs no longer prescribe: it is refused even with a resolvable
+    // identity, because an unbound record is not proof of node ownership.
+    for producer in [UdpPlacement::PodNetns, UdpPlacement::HostNetns] {
+        let registry = tempfile::tempdir().expect("registry");
+        let hand_written = record.replace("\"disabled\"", &format!("\"{}\"", producer.as_str()));
+        std::fs::write(
+            registry.path().join(".udp-placement-state-v1.json"),
+            hand_written,
+        )
+        .expect("write hand-written producer record");
+        let error = prepare_placement(registry.path(), &stable_on_node(producer, &node))
+            .err()
+            .expect("an unbound producer record must not start a producer");
+        assert!(
+            error.contains("names no owning Kubernetes node UID"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn documented_producer_abort_recovers_through_quarantine_cleanup_and_finalize() {
+    // docs/mesh.md: abort back to pod-netns after a pod-netns -> host-netns
+    // cleanup was persisted. Quarantine the state, leave a tombstone, then run a
+    // fresh cleanup adoption FROM the aborted target TO the restored placement.
+    let registry = tempfile::tempdir().expect("registry");
+    let node = identity(NODE_A, BOOT_1);
+    let aborted = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "forward-1",
+            UdpPlacement::PodNetns,
+            UdpPlacement::HostNetns,
+        ),
+        &node,
+    );
+    let _ = cleanup_context(registry.path(), &aborted);
+
+    let state_path = registry.path().join(".udp-placement-state-v1.json");
+    let quarantine = tempfile::tempdir().expect("quarantine");
+    std::fs::rename(&state_path, quarantine.path().join("rejected.json"))
+        .expect("quarantine state outside the registry");
+    std::fs::write(registry.path().join(".udp-placement-quarantined"), b"")
+        .expect("quarantine tombstone");
+
+    // Restarting the restored producer before the cleanup proof is refused.
+    assert!(
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::PodNetns, &node)
+        )
+        .is_err()
+    );
+
+    let cleanup = on_node(
+        transition(
+            UdpMigrationPhase::Cleanup,
+            "abort-1",
+            UdpPlacement::HostNetns,
+            UdpPlacement::PodNetns,
+        ),
+        &node,
+    );
+    let context = cleanup_context(registry.path(), &cleanup);
+    complete_cleanup(&context);
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &on_node(
+                transition(
+                    UdpMigrationPhase::Finalize,
+                    "abort-1",
+                    UdpPlacement::HostNetns,
+                    UdpPlacement::PodNetns,
+                ),
+                &node,
+            ),
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+    assert!(!registry.path().join(".udp-placement-quarantined").exists());
+    assert!(matches!(
+        prepare_placement(
+            registry.path(),
+            &stable_on_node(UdpPlacement::PodNetns, &node)
+        ),
+        Ok(UdpPlacementDecision::RunStable)
+    ));
+}
+
 #[test]
 fn a_stale_same_boot_node_identity_publication_would_inherit_the_predecessor_proof() {
     // The hazard the retraction closes, stated as a live fact: a publication
