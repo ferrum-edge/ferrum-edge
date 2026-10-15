@@ -356,10 +356,13 @@ than applying part of a graph. Individual resource endpoints
 (`POST /proxies`, `POST /consumers`, …) are unaffected. See
 [docs/admin_batch_api.md](admin_batch_api.md#atomicity-guarantee).
 
-A batch transaction is bounded by the server's oplog entry size (16 MB by
-default) and `transactionLifetimeLimitSeconds`; a request that exceeds either
-fails atomically (nothing applied), so split very large imports into several
-`POST /batch` requests.
+A batch is bounded by Ferrum's 1 MiB admin request-body limit, by MongoDB's
+16 MiB per-document / per-oplog-entry limit (a transaction spans as many oplog
+entries as it needs, so this is not a cap on the whole transaction), and by
+`transactionLifetimeLimitSeconds`. A request that exceeds any of them fails
+atomically (nothing applied); split very large imports into several
+`POST /batch` requests, each atomic on its own. See
+[docs/admin_batch_api.md](admin_batch_api.md#atomicity-guarantee).
 
 Without a replica set, hand-managed proxies still use a fail-safe sequential
 ordering: the proxy document is deleted **before** its plugin configs, so a
