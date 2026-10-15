@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`body_validator` rejects compressed gRPC frames with extra gzip data.**
+  Native gRPC protobuf validation inflated only the first gzip member of a
+  compressed frame and ignored anything after it, while the whole frame was
+  forwarded; a peer that decodes concatenated members could therefore receive
+  fields (or a decoded size) the validator never checked, on the request and
+  the response path. A compressed payload must now be exactly one fully
+  consumed gzip member, and a compression flag other than 0 or 1 is rejected.
+
 - **WAF `cidr` rules and IP exemptions match IPv4-mapped IPv6 spellings,
   and IPv6 exemptions no longer cover IPv4 callers** (PR #6684 and its
   follow-up). An IPv4 network (or a `::ffff:a.b.c.d/96`-or-longer mapped

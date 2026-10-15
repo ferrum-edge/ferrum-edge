@@ -2600,6 +2600,144 @@ async fn test_protobuf_compressed_gzip_response_valid() {
     );
 }
 
+fn gzip_member(data: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn compressed_grpc_frame(compressed: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(compressed);
+    frame
+}
+
+/// Valid first gzip member followed by a second member carrying an unknown
+/// field (number 99): a multistream peer decodes both members, so the frame
+/// must not pass validation that only inspected the first.
+fn frame_with_appended_unknown_field_member(first_message: &[u8]) -> Vec<u8> {
+    let mut compressed = gzip_member(first_message);
+    compressed.extend_from_slice(&gzip_member(&[0x98, 0x06, 42]));
+    compressed_grpc_frame(&compressed)
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_frame_rejects_appended_gzip_member_request() {
+    let plugin = protobuf_plugin_reject_unknown();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+
+    // Control: the first member alone is valid.
+    let single = compressed_grpc_frame(&gzip_member(&encode_hello_request("Bob", 25)));
+    assert_continue(plugin.on_final_request_body(&headers, &single).await);
+
+    let appended = frame_with_appended_unknown_field_member(&encode_hello_request("Bob", 25));
+    assert_reject(
+        plugin.on_final_request_body(&headers, &appended).await,
+        Some(400),
+    );
+
+    // An appended valid member is rejected too: the frame is one message.
+    let mut two_valid = gzip_member(&encode_hello_request("Bob", 25));
+    two_valid.extend_from_slice(&gzip_member(&encode_hello_request("Eve", 30)));
+    assert_reject(
+        protobuf_plugin()
+            .on_final_request_body(&headers, &compressed_grpc_frame(&two_valid))
+            .await,
+        Some(400),
+    );
+
+    // Trailing non-gzip bytes after the member.
+    let mut trailing = gzip_member(&encode_hello_request("Bob", 25));
+    trailing.extend_from_slice(b"\x00\x01trailing");
+    assert_reject(
+        plugin
+            .on_final_request_body(&headers, &compressed_grpc_frame(&trailing))
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_frame_rejects_oversize_appended_gzip_member() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_request_type": "test.HelloRequest",
+        "grpc_max_decompressed_size_bytes": 64
+    }))
+    .unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+
+    // The first member fits the cap; the second alone exceeds it.
+    let mut compressed = gzip_member(&encode_hello_request("Bob", 25));
+    compressed.extend_from_slice(&gzip_member(&vec![0u8; 4096]));
+    assert_reject(
+        plugin
+            .on_final_request_body(&headers, &compressed_grpc_frame(&compressed))
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_frame_rejects_undefined_compressed_flag() {
+    let plugin = protobuf_plugin();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(":path".to_string(), "/test.Greeter/SayHello".to_string());
+    // A valid gzip payload passes with flag 1 and is refused with flag 2.
+    let mut frame = compressed_grpc_frame(&gzip_member(&encode_hello_request("Bob", 25)));
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+    frame[0] = 2;
+    assert_reject(
+        plugin.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn test_protobuf_compressed_frame_rejects_appended_gzip_member_response() {
+    let plugin = BodyValidator::new(&serde_json::json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_response_type": "test.HelloResponse",
+        "protobuf_reject_unknown_fields": true
+    }))
+    .unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    let new_ctx = || {
+        RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/test.Greeter/SayHello".to_string(),
+        )
+    };
+
+    let single = compressed_grpc_frame(&gzip_member(&encode_hello_response("Hi", true)));
+    assert_continue(
+        plugin
+            .finalize_client_visible_response_body(&mut new_ctx(), 200, &headers, &single)
+            .await,
+    );
+
+    let appended = frame_with_appended_unknown_field_member(&encode_hello_response("Hi", true));
+    assert_reject(
+        plugin
+            .finalize_client_visible_response_body(&mut new_ctx(), 200, &headers, &appended)
+            .await,
+        Some(502),
+    );
+}
+
 #[tokio::test]
 async fn test_protobuf_empty_or_short_request_transport_body_fails_closed() {
     // GHSA-2vmr-ww8r-mww3: a zero-length native-gRPC transport body is not a
