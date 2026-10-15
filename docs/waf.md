@@ -417,6 +417,15 @@ Runtime aliases map onto those targets: `request_headers` → `header_values`,
 `request_body` → `body_text`. `path` is valid only on `body_json_path`;
 `names` is valid only on `header_values` / `request_headers`.
 
+A `body_json_path` rule parses every reading of the body the WAF inspects: the
+raw bytes (a leading UTF-8 byte-order mark is skipped) and each UTF-16 / UTF-32
+view described under decoded variants below, so a JSON body re-encoded in a
+wide charset is matched like its UTF-8 form. Duplicated object members are not
+collapsed: the path follows every occurrence of each member name (including a
+`\u`-escaped spelling of the same name), at the leaf and on enclosing objects,
+and the rule matches if any selected value matches. A backend that keeps the
+first, the last, or every occurrence is therefore covered by the same verdict.
+
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
 Semantics:

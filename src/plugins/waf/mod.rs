@@ -18,6 +18,7 @@
 mod decode;
 mod defaults;
 mod exemptions;
+mod json_doc;
 mod normalize;
 mod rules;
 mod scan;
