@@ -56,13 +56,20 @@ to the origin.
 The gateway's own HTTP/1.1 server (hyper) writes the interim `100 Continue`
 response when the request body is first polled. On most paths that is at
 backend dispatch, or when a `before_proxy` body plugin buffers the body — both
-after the authentication and authorization plugin phases have run. The
-exception is an authentication plugin that verifies the request body at
-authenticate time (for example `hmac_auth` or `soap_ws_security`): the
-body is buffered *before* the authentication phase so the plugin can read it,
-so `100 Continue` goes out before the request is authenticated. A client must
-therefore not treat `100 Continue` as proof that authentication succeeded; the
-final status is the only answer. `expect` is therefore part of the canonical backend-request strip set
+after the authentication and authorization plugin phases have run. Two
+earlier collection points exist:
+
+- an authentication plugin that verifies the request body at authenticate
+  time (for example `hmac_auth` or `soap_ws_security`) has the body buffered
+  *before* the authentication phase, so `100 Continue` goes out before the
+  request is authenticated;
+- an authorization plugin that reads the body (for example `opa` with
+  `include_body: true`) has it buffered after authentication but *before*
+  authorization, so `100 Continue` goes out before the authorization
+  decision.
+
+A client must therefore not treat `100 Continue` as proof that authentication
+or authorization succeeded; the final status is the only answer. `expect` is therefore part of the canonical backend-request strip set
 (`is_backend_request_strip_header` in `src/proxy/headers.rs`), so it is removed
 on every backend transport: reqwest HTTP/1.1, direct HTTP/2, gRPC, native
 HTTP/3, and HBONE.

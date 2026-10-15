@@ -170,8 +170,9 @@ response_body_mode = buffer?
                        (HTTP/1.1 and HTTP/2 frontends; retry decides from
                        headers alone; a retryable attempt drops its undrained
                        body before client commit). Buffer only when
-                       response_body_mode/plugins force buffering. The native
-                       HTTP/3 frontend's retry path buffers each attempt (see
+                       response_body_mode/plugins force buffering. H3
+                       cross-protocol bridges behave the same; only the
+                       native H3-to-H3 retry path buffers its attempts (see
                        Interaction with Retry Logic).
                     └─ No → continue
                 Response size limit enabled?
@@ -1000,7 +1001,7 @@ When retry is configured on a proxy, the gateway must be able to inspect the res
 
 - **Every attempt (HTTP/1.1 and HTTP/2 frontends)**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
 - **Buffered proxies**: When `response_body_mode: buffer` or a plugin forces buffering, attempts are buffered instead. Inherently streaming responses may still be released to stream after headers through the all-plugin opt-in described above; a retryable status is discarded before any bytes reach the client.
-- **Native HTTP/3 frontend**: A proxy with retries configured buffers each attempt's response (and replays a buffered request) on the native H3 retry path, so an H3 client does not get first-byte streaming on a retried route. The only exception is the same all-plugin opt-in: when every plugin allows an inherently streaming response to be released after headers, the H3 path decides from headers and can stream it.
+- **HTTP/3 frontend**: The H3 cross-protocol bridges (an H3 client to an HTTP/1.1, HTTP/2 or gRPC backend) decide every attempt from headers and stream like the H1/H2 frontends. Only the native H3-to-H3 path (backend dispatched on the native QUIC pool) differs: with retries configured it buffers each attempt's response. Its one exception is the **initial** attempt, which may still stream an inherently streaming response when every plugin opts in to releasing it after headers; every retry attempt after that is buffered.
 - **After streaming begins**: On any attempt, a failure that occurs once response bytes have been committed downstream cannot be retried.
 
 ```
