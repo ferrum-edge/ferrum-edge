@@ -1499,6 +1499,13 @@ jobs:
             trap - EXIT
             if [ "$status" -ne 0 ]; then
               echo "::error::conditional live stores failed while $fixture_phase"
+              # The MongoDB fixture is unauthenticated, so its state and log
+              # tail carry no credentials and show why a probe never passed.
+              echo "kernel: $(uname -r)"
+              timeout 10s docker inspect --format \
+                'conditional-mongo: status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' \
+                conditional-mongo 2>&1 || true
+              timeout 10s docker logs --tail 60 conditional-mongo 2>&1 || true
               timeout --kill-after=5s 20s docker rm -f -v \
                 conditional-postgres conditional-mysql conditional-mongo \
                 conditional-postgres-client conditional-mysql-client >/dev/null 2>&1 \
