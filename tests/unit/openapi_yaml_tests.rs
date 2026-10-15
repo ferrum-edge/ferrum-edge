@@ -14395,6 +14395,12 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({"override_existing": null}),
         json!({"hsts": {"max_age": null, "include_subdomains": null, "preload": null}}),
         json!({"hsts": {"max_age": u64::MAX}}),
+        json!({"content_type_options": " NoSniff\t"}),
+        json!({"frame_options": "deny"}),
+        json!({"frame_options": "SAMEORIGIN"}),
+        json!({"referrer_policy": "no-referrer, Strict-Origin-When-Cross-Origin"}),
+        json!({"referrer_policy": "no-referrer-when-downgrade"}),
+        json!({"referrer_policy": "origin-when-cross-origin,unsafe-url"}),
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &valid, true);
         SecurityHeaders::new(&valid).unwrap_or_else(|error| {
@@ -14412,6 +14418,13 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({"set": {"Trailer": "X-Checksum"}}),
         json!({"set": {"Transfer-Encoding": "chunked"}}),
         json!({"set": {"Upgrade": "websocket"}}),
+        json!({"content_type_options": "nosnif"}),
+        json!({"content_type_options": " "}),
+        json!({"frame_options": "SAMEORGIN"}),
+        json!({"frame_options": "ALLOW-FROM https://example.com"}),
+        json!({"referrer_policy": "strict-origin-when-cross-orign"}),
+        json!({"referrer_policy": "no-referrer,"}),
+        json!({"referrer_policy": "no-referrer-when"}),
         json!({
             "content_type_options": false,
             "frame_options": false,

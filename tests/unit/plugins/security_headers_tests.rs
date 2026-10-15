@@ -644,3 +644,37 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn builtin_header_strings_must_be_tokens_browsers_recognize() {
+    for valid in [
+        json!({ "content_type_options": "nosniff" }),
+        json!({ "content_type_options": " NoSniff\t" }),
+        json!({ "frame_options": "DENY" }),
+        json!({ "frame_options": "sameorigin" }),
+        json!({ "referrer_policy": "no-referrer" }),
+        json!({ "referrer_policy": "Strict-Origin-When-Cross-Origin" }),
+        json!({ "referrer_policy": "no-referrer, strict-origin-when-cross-origin" }),
+    ] {
+        SecurityHeaders::new(&valid)
+            .unwrap_or_else(|error| panic!("{valid} must be accepted: {error}"));
+    }
+
+    for invalid in [
+        json!({ "content_type_options": "nosnif" }),
+        json!({ "content_type_options": " " }),
+        json!({ "frame_options": "SAMEORGIN" }),
+        json!({ "frame_options": "ALLOW-FROM https://example.com" }),
+        json!({ "frame_options": "DENY, SAMEORIGIN" }),
+        json!({ "referrer_policy": "strict-origin-when-cross-orign" }),
+        json!({ "referrer_policy": "no-referrer," }),
+        json!({ "referrer_policy": "no-referrer; origin" }),
+    ] {
+        let error =
+            SecurityHeaders::new(&invalid).expect_err(&format!("{invalid} must be rejected"));
+        assert!(
+            error.contains("browsers ignore any other value"),
+            "unexpected error for {invalid}: {error}"
+        );
+    }
+}

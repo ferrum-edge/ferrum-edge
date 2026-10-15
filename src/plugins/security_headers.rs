@@ -240,6 +240,7 @@ fn header_value(
                 return Ok(None);
             }
             validate_header_value(key, value)?;
+            validate_builtin_tokens(key, value)?;
             Ok(Some(value.clone()))
         }
         Some(other) => Err(format!(
@@ -247,6 +248,58 @@ fn header_value(
             other = other.to_string()
         )),
     }
+}
+
+/// `Referrer-Policy` tokens from the W3C Referrer Policy specification.
+const REFERRER_POLICY_TOKENS: [&str; 8] = [
+    "no-referrer",
+    "no-referrer-when-downgrade",
+    "origin",
+    "origin-when-cross-origin",
+    "same-origin",
+    "strict-origin",
+    "strict-origin-when-cross-origin",
+    "unsafe-url",
+];
+
+/// Reject a custom value for a built-in header that browsers would ignore.
+///
+/// A browser drops an unrecognized `X-Content-Type-Options`, `X-Frame-Options`
+/// or `Referrer-Policy` value, so a typo such as `SAMEORGIN` would silently
+/// remove the protection the operator configured. Tokens compare ASCII
+/// case-insensitively and may carry surrounding spaces or tabs, as browsers
+/// parse them. `Referrer-Policy` accepts a comma-separated list of known tokens.
+fn validate_builtin_tokens(key: &str, value: &str) -> Result<(), String> {
+    fn trim(token: &str) -> &str {
+        token.trim_matches([' ', '\t'])
+    }
+    let valid = match key {
+        "content_type_options" => trim(value).eq_ignore_ascii_case("nosniff"),
+        "frame_options" => {
+            let token = trim(value);
+            token.eq_ignore_ascii_case("DENY") || token.eq_ignore_ascii_case("SAMEORIGIN")
+        }
+        "referrer_policy" => value.split(',').all(|token| {
+            let token = trim(token);
+            REFERRER_POLICY_TOKENS
+                .iter()
+                .any(|known| token.eq_ignore_ascii_case(known))
+        }),
+        _ => true,
+    };
+    if valid {
+        return Ok(());
+    }
+    let expected = match key {
+        "content_type_options" => "`nosniff`",
+        "frame_options" => "`DENY` or `SAMEORIGIN`",
+        _ => {
+            "a comma-separated list of Referrer-Policy tokens (for example `no-referrer` or `strict-origin-when-cross-origin`)"
+        }
+    };
+    Err(format!(
+        "security_headers: `{key}` must be {expected}; browsers ignore any other value"
+    ))
 }
 
 fn optional_header(
