@@ -283,21 +283,26 @@ export FERRUM_BACKEND_TLS_CLIENT_CERT_PATH="/etc/ssl/certs/default-client.pem"
 export FERRUM_BACKEND_TLS_CLIENT_KEY_PATH="/etc/ssl/private/default-client-key.pem"
 
 # Configure specific proxy with different certificates
+# A complete file-mode config: `version` and `plugin_configs` are required
 cat > config.yaml << EOF
+version: "1"
 proxies:
   - id: "public-api"
     listen_path: "/public"
+    backend_scheme: "https"
     backend_host: "public-api.example.com"
     backend_port: 443
     # Uses global mTLS settings
-    
-  - id: "secure-api"  
+
+  - id: "secure-api"
     listen_path: "/secure"
+    backend_scheme: "https"
     backend_host: "secure-api.example.com"
     backend_port: 443
     # Override with specific certificates
     backend_tls_client_cert_path: "/etc/ssl/certs/secure-client.pem"
     backend_tls_client_key_path: "/etc/ssl/private/secure-client-key.pem"
+plugin_configs: []
 EOF
 
 ./ferrum-edge run --mode file --spec config.yaml

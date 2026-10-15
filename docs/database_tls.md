@@ -366,11 +366,14 @@ docker run -d \
   -e FERRUM_MODE=database \
   -e FERRUM_DB_TYPE=mysql \
   -e FERRUM_DB_TLS_MODE=verify-full \
-  -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.crt \
+  -e FERRUM_DB_TLS_CA_CERT_PATH=/certs/ca.pem \
   -e FERRUM_ADMIN_JWT_SECRET=change-me-to-a-32-character-admin-secret \
   -v $(pwd)/certs:/certs:ro \
   ferrum-edge
 ```
+
+The gateway trusts the same `certs/ca.pem` that MySQL loads with `--ssl-ca`;
+that CA must be the one that signed `server-cert.pem`.
 
 ## MongoDB
 

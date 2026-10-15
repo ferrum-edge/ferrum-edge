@@ -503,8 +503,9 @@ forged claim to reach, and the scope check refuses everything else anyway.
 
 ### Data-plane side
 
-Two client-side options, both applying equally to DP ConfigSync, native
-`MeshSubscribe`, and xDS ADS:
+Two client-side options for DP ConfigSync, native `MeshSubscribe`, and xDS
+ADS. The external-token option currently does not work for stock DP
+ConfigSync; see the limitation note under it:
 
 - **Externally issued token (preferred)** — `FERRUM_DP_CP_GRPC_TOKEN_FILE`
   points at a token minted by a trusted issuer. The node presents it and holds
@@ -513,13 +514,26 @@ Two client-side options, both applying equally to DP ConfigSync, native
   short-lived rotated token needs no restart.
 
   The issuer — not the node — decides what the token asserts, so it must mint
-  to Ferrum's CP/DP token contract exactly. The CP requires:
+  to Ferrum's CP/DP token contract exactly. The CP requires the claims in the
+  table below.
+
+  > **Current limitation for DP ConfigSync.** A stock DP (`FERRUM_MODE=dp`)
+  > generates a random per-process `node_id` at startup and sends it in
+  > `ConfigSync.Subscribe`. It does not derive that ID from an external
+  > token's `sub`, and there is no setting to pin it. Because the CP requires
+  > `sub` to equal `node_id`, an externally issued token is refused with
+  > `PERMISSION_DENIED`, and that DP never receives config. Until DP node
+  > identity can be bound to the token, give each DP its own per-tenant secret
+  > plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID`, the second option below. A
+  > self-minted token always carries the DP's own `node_id` as `sub`. Mesh
+  > `MeshSubscribe` and xDS clients send their configured node ID, so an issuer
+  > can mint `sub` to match it.
 
   | Claim | Requirement |
   |---|---|
   | `kid` (JWS header) | the trust-bundle credential to verify under; required on a trust-bundle CP |
   | `iss` | exactly one string, equal to `FERRUM_CP_DP_GRPC_JWT_ISSUER` (default `ferrum-edge-cp-dp`); arrays and other non-string shapes are rejected |
-  | `sub` | required (present; the node id by convention) |
+  | `sub` | required; must equal the `node_id` the node sends (surrounding whitespace trimmed from `node_id`). Enforced on `ConfigSync.Subscribe`, unary `GetFullConfig`, and native `MeshSubscribe`, which refuse a mismatch with `PERMISSION_DENIED` before allocating any subscription state |
   | `iat` | required |
   | `exp` | required; accepted until `exp` + 60 s clock-skew allowance, which is also the effective stream lease (the maximum stream lifetime can end a stream earlier) |
   | `nbf` | optional; when present, accepted from `nbf` − 60 s |
@@ -573,7 +587,9 @@ distributed.
 4. **Point data planes at their credential**: give each DP/mesh node either
    `FERRUM_DP_CP_GRPC_TOKEN_FILE` (an externally issued short-lived token, so
    the node holds no signing key) or its own per-tenant secret plus
-   `FERRUM_CP_DP_GRPC_JWT_KEY_ID`. A token with no `kid` is rejected by a
+   `FERRUM_CP_DP_GRPC_JWT_KEY_ID`. For stock DPs (`FERRUM_MODE=dp`) use the
+   per-tenant secret for now: see the
+   [DP ConfigSync limitation](#data-plane-side) on external tokens. A token with no `kid` is rejected by a
    trust-bundle CP, so roll data planes before flipping CP scope.
 
 5. **Expand scope incrementally**: set `FERRUM_CP_NAMESPACES="ns-a,ns-b"`

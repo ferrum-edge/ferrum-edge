@@ -88,8 +88,13 @@ All gRPC calls are authenticated with bearer JWTs:
 - Alternatively the CP verifies against `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`
   (multiple keys, asymmetric algorithms, per-key namespace ceilings — see
   [cp_namespace_tenancy.md](cp_namespace_tenancy.md#trust-binding-ghsa-3f2j-wwqw-grmg)),
-  and a DP can present an externally issued token from
-  `FERRUM_DP_CP_GRPC_TOKEN_FILE` instead of minting one
+  and a node can present an externally issued token from
+  `FERRUM_DP_CP_GRPC_TOKEN_FILE` instead of minting one. **Stock DPs cannot
+  use this yet.** The DP sends a random per-process `node_id`, and the CP
+  requires `sub == node_id` (below), so an issuer-minted token is refused with
+  `PERMISSION_DENIED`. Give each DP its own per-tenant secret plus
+  `FERRUM_CP_DP_GRPC_JWT_KEY_ID` instead (see
+  [cp_namespace_tenancy.md](cp_namespace_tenancy.md#data-plane-side))
 
 The `iss` claim must be a single JSON string equal to
 `FERRUM_CP_DP_GRPC_JWT_ISSUER` (RFC 7519 §4.1.1); arrays and other non-string
@@ -1126,7 +1131,7 @@ in a failover set must use the same value.
 | `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT` | No | Permit a non-loopback `http://` (plaintext) CP URL (default `false`). Loopback URLs are always allowed; even when permitted, plaintext logs a high-severity warning |
 | `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` | No | Retry primary CP interval when on fallback (default: 300) |
 | `FERRUM_CP_DP_GRPC_JWT_SECRET` | Unless token file set | Shared JWT secret for CP/DP gRPC auth (same value as CP) |
-| `FERRUM_DP_CP_GRPC_TOKEN_FILE` | No | Path to an externally issued bearer token, re-read on each connect attempt, used instead of minting one |
+| `FERRUM_DP_CP_GRPC_TOKEN_FILE` | No | Path to an externally issued bearer token, re-read on each connect attempt, used instead of minting one. Not usable by stock DPs today: their random per-process `node_id` cannot match the token's `sub`, so `ConfigSync.Subscribe` is refused. Use a per-tenant secret plus `FERRUM_CP_DP_GRPC_JWT_KEY_ID` for DPs |
 | `FERRUM_NAMESPACE` | No | Namespace this DP subscribes to; the CP must serve it (default `ferrum`) |
 | `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` | No | Maximum age of the last applied CP snapshot while no CP is authoritative (default `3600`; `0` = unbounded, unsafe). See [Bounded last-known-good configuration age](#bounded-last-known-good-configuration-age) |
 | `FERRUM_DP_CONFIG_STALE_ACTION` | No | `fail_closed` (default) or `readiness_only` at the staleness bound |

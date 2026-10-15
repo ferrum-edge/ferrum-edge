@@ -369,7 +369,7 @@ acknowledgement fails `helm template` / `helm upgrade`.
 
 Existing clusters that installed this CRD from the former
 `charts/ferrum-mesh/crds/` directory must adopt it once so Helm can update it.
-**Operator action:**
+**Operator action** (`--take-ownership` needs a Helm 3.17+ client):
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
@@ -576,7 +576,8 @@ dependency-aware readiness.
 | Workload | Liveness / startup default | Readiness default |
 | --- | --- | --- |
 | `controlPlane`, `ca` | `ferrum-edge health --live` against the admin listener | `ferrum-edge health` (503 while starting/unavailable; ready-but-degraded stays HTTP 200 with JSON `status: "degraded"`) |
-| `ambient`, `nodeAgent` | same admin `--live` exec when admin is enabled and port ≠ `0` | same admin `/health` exec; omitted when admin is disabled or port is `0` (NodeWaypoint still requires a non-zero ambient admin port) |
+| `ambient` | same admin `--live` exec against the ambient admin port | same admin `/health` exec. With the ambient admin HTTP port set to `0` there is no computed handler, so every **enabled** ambient probe fails render: supply `ambient.probes.<probe>.override` or set `ambient.probes.<probe>.enabled=false`. NodeWaypoint additionally refuses a `0` ambient admin port outright |
+| `nodeAgent` | same admin `--live` exec when `nodeAgent.admin.enabled` and an admin port is available (the plaintext port, or the HTTPS port with `--tls` when plaintext is `0`) | same admin `/health` exec. The computed probe is omitted (not refused) when node-agent admin is disabled or has no usable port, unless an `override` handler is set. An HTTPS-only admin that requires client certificates (`tls.clientCaKey`) fails render while any enabled probe still uses the computed handler |
 | `injector` | `tcpSocket` on the `webhook` port | `tcpSocket` on the `webhook` port |
 | `eastWest` | `ferrum-edge health --live` against the east-west admin listener | `ferrum-edge health` (drain-aware `/health`; `tcpSocket` on `tls-passthru` is not used because it stays ready after SIGTERM) |
 

@@ -53,7 +53,7 @@
 //! disclosure.
 
 use async_trait::async_trait;
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use prost_reflect::{
     Cardinality, DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Syntax,
     Value as ProtobufValue,
@@ -931,9 +931,18 @@ fn parse_grpc_frame(
             payload.len()
         ));
     }
+    if compressed > 1 {
+        // The gRPC wire format defines only 0 (identity) and 1 (compressed
+        // with the `grpc-encoding` codec); any other flag is malformed.
+        return Err(format!(
+            "gRPC frame has invalid compressed flag {compressed}"
+        ));
+    }
     if compressed != 0 {
         // gRPC compression uses gzip (deflate) by default per the gRPC spec.
-        // Bounded read to prevent compression-bomb DoS.
+        // Bounded read to prevent compression-bomb DoS. `bufread::GzDecoder`
+        // (not `read::GzDecoder`, whose internal `BufReader` may pull past the
+        // first member) leaves the exact unconsumed input for the check below.
         let mut decoder = GzDecoder::new(payload);
         let initial_capacity = payload.len().min(max_decompressed_size_bytes);
         let mut decompressed = Vec::with_capacity(initial_capacity);
@@ -951,6 +960,15 @@ fn parse_grpc_frame(
                 ));
             }
             decompressed.extend_from_slice(&buf[..n]);
+        }
+        // The payload must be exactly one fully consumed gzip member. A
+        // multistream peer would also decode a concatenated member (or treat
+        // trailing bytes its own way) that this validator never inspected,
+        // while the original frame is forwarded unchanged.
+        if !decoder.into_inner().is_empty() {
+            return Err(
+                "gRPC compressed payload contains trailing or concatenated gzip data".to_string(),
+            );
         }
         Ok(Cow::Owned(decompressed))
     } else {

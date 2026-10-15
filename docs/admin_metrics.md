@@ -166,12 +166,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
       "max_idle_per_host": 32,
       "idle_timeout_seconds": 90,
       "entries_per_host": {
-        "api-users.internal:8080:false": 1,
-        "api-users.internal:8080:true": 1,
-        "api-orders.internal:8080:true": 1,
-        "api-payments.internal:443:true": 1,
-        "auth-service.internal:443:true": 1,
-        "search-cluster.internal:9200:true": 1
+        "d=api-users.internal:8080|0||||…|rcfg=…": 1,
+        "d=api-users.internal:8443|1||||…|rcfg=…": 1,
+        "u=orders-upstream|1||||…|rcfg=…": 1,
+        "u=payments-upstream|1|h1|||…|rcfg=…": 1
       }
     },
     "grpc": {
@@ -312,11 +310,11 @@ Top-level gateway info and throughput counters.
 
 ### `connection_pools`
 
-Connection pool sizes for all four protocol pools. Each pool reuses connections to avoid TCP/TLS handshake overhead per request.
+Sizes of the backend client and connection pools. Each pool reuses clients or connections to avoid TCP/TLS handshake overhead per request. The four entries are not one complete count of backend connections: `http` counts cached client entries rather than sockets, and some transports (the direct HTTP/1.1 pool, HBONE inner pools, Unix-socket backends) are not reported here at all.
 
 | Pool | Description |
 |------|-------------|
-| `http` | HTTP/1.1 connection pool (reqwest-based). Handles both plaintext HTTP and HTTPS backends. The `entries_per_host` map shows pool keys in `host:port:tls` format |
+| `http` | The shared reqwest **client cache** used for HTTP-family backends that are not dispatched on a dedicated pool. Each entry is one cached `reqwest::Client`, which owns its own internal socket pool; the live socket count inside each client is not exposed. With `FERRUM_POOL_HTTP1_DIRECT=true` (the default), eligible HTTP/1.1 requests go to the separate direct HTTP/1.1 pool instead, so this map does not describe all HTTP/1.1 connections |
 | `grpc` | gRPC HTTP/2 connection pool with trailer support. Uses sharded connections per backend for concurrency |
 | `http2` | HTTP/2 connection pool for HTTPS backends with proper stream multiplexing |
 | `http3` | HTTP/3 (QUIC) connection pool. Distributes across multiple QUIC connections per backend |
@@ -325,10 +323,10 @@ The `http` pool has additional detail fields:
 
 | Field | Description |
 |-------|-------------|
-| `total_pools` | Distinct backend pool entries |
-| `max_idle_per_host` | Max idle connections kept per host (`FERRUM_POOL_MAX_IDLE_PER_HOST`) |
+| `total_pools` | Number of resident cached client entries (one per distinct pool key) |
+| `max_idle_per_host` | Max idle connections each cached client keeps per host (`FERRUM_POOL_MAX_IDLE_PER_HOST`) |
 | `idle_timeout_seconds` | Seconds before idle connections are evicted (`FERRUM_POOL_IDLE_TIMEOUT_SECONDS`) |
-| `entries_per_host` | Map of pool key to connection count |
+| `entries_per_host` | Map of pool key to `1` for every resident client entry. The value is always `1`: it marks that the entry exists and is **not** a connection count. Keys are pipe-separated and start with `d=<host>:<port>` (direct backend) or `u=<upstream_id>` (upstream); the remaining fields carry the backend scheme, a forced-HTTP/1.1 marker, DNS override, upstream subset, backend TLS identity and an `rcfg=` client-behavior suffix. Several keys can share one destination when those settings differ. The key layout is internal and can change between releases, so do not parse it in dashboards |
 
 ### `circuit_breakers`
 
@@ -473,7 +471,7 @@ Present only in `database` and `cp` modes, once the database poll loop has regis
 
 4. **`health_check.unhealthy_target_count`** — Alert when this rises above zero. Cross-reference with `unhealthy_targets` to identify which backends are down.
 
-5. **`connection_pools.http.total_pools`** — Should be stable. Rapid growth may indicate pool key fragmentation or misconfigured backends.
+5. **`connection_pools.http.total_pools`** — Should be stable. Rapid growth may indicate pool key fragmentation or misconfigured backends. It counts cached clients, not open connections.
 
 6. **`caches.router.prefix_eviction_count`** — Should stay low. Rapid increase indicates cache thrashing from high-cardinality traffic.
 

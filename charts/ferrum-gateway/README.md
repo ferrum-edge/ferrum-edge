@@ -15,7 +15,7 @@ Job and gateway pins on the same build.
 | Database | `database` | yes | read/write | `database.*`, `admin.jwtSecret` (>=32) |
 | File | `file` | yes | read-only | `file.inlineConfig` or `file.existingConfigMap` |
 | Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `cp.trustBundlePath` |
-| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) or `dp.cpGrpcTokenFile`; optional `dp.configMaxStaleSeconds` / `dp.configStaleAction` |
+| Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32, plus `grpc.jwtKeyId` against a trust-bundle CP); `dp.cpGrpcTokenFile` is not usable by stock DPs yet (see `docs/cp_namespace_tenancy.md`); optional `dp.configMaxStaleSeconds` / `dp.configStaleAction` |
 
 ### Multi-tenant control planes
 

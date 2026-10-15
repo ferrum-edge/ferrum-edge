@@ -19226,16 +19226,22 @@ components:
     AdminMetricsConnectionPools:
       type: object
       description: |
-        Connection pool sizes for all four protocol pools. Each pool reuses
-        connections to backend services to avoid TCP/TLS handshake overhead.
+        Sizes of the backend client and connection pools. `http` counts cached
+        reqwest client entries rather than sockets, and some transports (the
+        direct HTTP/1.1 pool, HBONE inner pools, Unix-socket backends) are not
+        reported here.
       properties:
         http:
           type: object
-          description: HTTP/1.1 connection pool (reqwest-based, supports HTTP and HTTPS backends)
+          description: |
+            Shared reqwest client cache. Each entry is one cached client that owns
+            its own internal socket pool; live socket counts are not exposed.
+            Eligible HTTP/1.1 traffic uses the separate direct HTTP/1.1 pool
+            (FERRUM_POOL_HTTP1_DIRECT, default true) and is not counted here.
           properties:
             total_pools:
               type: integer
-              description: Number of distinct backend host:port:protocol pool entries
+              description: Number of resident cached client entries (one per distinct pool key)
             max_idle_per_host:
               type: integer
               description: Maximum idle connections kept per host (from FERRUM_POOL_MAX_IDLE_PER_HOST)
@@ -19246,7 +19252,11 @@ components:
               type: object
               additionalProperties:
                 type: integer
-              description: Map of pool key (host:port:tls) to connection count
+              description: |
+                Map of opaque, pipe-separated pool key (starting `d=<host>:<port>`
+                or `u=<upstream_id>`) to `1` for each resident client entry. The
+                value is always 1 and is not a connection count; the key layout
+                is internal and may change between releases.
         grpc:
           type: object
           description: gRPC HTTP/2 connection pool (h2c + h2 with trailer support)
