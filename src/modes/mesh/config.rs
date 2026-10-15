@@ -2376,6 +2376,15 @@ pub struct MeshRequestAuthentication {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub jwt_rules: Vec<MeshJwtRule>,
+    /// Set by Kubernetes translation when Ferrum refused this
+    /// RequestAuthentication (issue #6656). A refused resource cannot be
+    /// enforced faithfully (its JWT providers, token locations or
+    /// gateway-owned claim headers are unknown), so instead of being dropped,
+    /// which would leave the selected workloads with no JWT validation at
+    /// all, it is carried with no rules and the data plane refuses every
+    /// HTTP request to those workloads until the resource is fixed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
 }
 
 /// A single JWT validation rule within a [`MeshRequestAuthentication`].
@@ -2491,7 +2500,9 @@ pub fn validate_mesh_jwt_output_claim_headers(
     let mut seen: Vec<String> = Vec::with_capacity(entries.len());
     for entry in entries {
         let (header, _claim) = validate_mesh_jwt_claim_header(&entry.header, &entry.claim)?;
-        if seen.contains(&header) {
+        if seen.iter().any(|existing| {
+            crate::proxy::headers::field_names_equivalent_for_backends(existing, &header)
+        }) {
             return Err(format!(
                 "outputClaimToHeaders declares header {header:?} more than once; a destination may be asserted from exactly one claim"
             ));

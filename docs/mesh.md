@@ -2702,7 +2702,27 @@ destination headers, reserved or credential-bearing destinations
 (`authorization`, `host`, hop-by-hop/framing fields, `x-ferrum-*`,
 `x-forwarded-*`), malformed header names, and malformed claim paths are rejected
 at translation with `FerrumAccepted=False` / `Invalid` — a dropped mapping would
-leave the header unowned and client-forgeable.
+leave the header unowned and client-forgeable. Header names are compared as a
+CGI-style backend reads them, with `_` treated as `-`: `X_Real_IP` is reserved
+like `X-Real-IP`, and `X_Tenant_Id` duplicates `X-Tenant-Id`.
+
+**A rejected RequestAuthentication fails closed** (issue #6656). When Ferrum
+refuses a RequestAuthentication (for example a reserved or duplicate claim
+header, a missing issuer, a malformed `fromHeaders`, or an unsupported
+`targetRef(s)` attachment), it is not dropped: dropping it would leave the
+workloads it selects with no JWT validation, no token stripping and no
+gateway-owned claim headers, so a forged token or a client-supplied claim header
+would reach the backend. The resource is instead published as a rule-less
+refusal marker with its own selector scope (a `targetRef(s)` resource covers its
+namespace, or the mesh in the Istio root namespace, because the attachment cannot
+be resolved), and the data plane installs a forced `request_termination`
+instance (`__mesh_request_auth_refused`) that answers every HTTP request to those
+workloads with `503` until the resource is fixed. This deliberately differs from
+Istio, whose validating webhook would never admit such a resource; Ferrum
+accepts some resources Istio admits but Ferrum cannot enforce faithfully, and
+for those it chooses refusal over running without validation. The status reports
+`FerrumAccepted=False` / `Invalid` and `status.ferrum.translation.enforcement:
+refuse_all`.
 
 **Deferred JWT-rule fields**: `outputPayloadToHeader` and `fromCookies` are
 recognized but not enforced. Both are surfaced in

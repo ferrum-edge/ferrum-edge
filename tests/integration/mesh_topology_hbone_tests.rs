@@ -277,6 +277,7 @@ fn request_authentication_plugin_only_injected_when_jwt_rules_present() {
         let mut mesh = mesh_config_with(vec![workload], Vec::new(), Vec::new());
         mesh.request_authentications
             .push(MeshRequestAuthentication {
+                refused: false,
                 name: "issuer".to_string(),
                 namespace: "default".to_string(),
                 scope: PolicyScope::MeshWide,

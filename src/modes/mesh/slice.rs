@@ -4890,6 +4890,7 @@ mod tests {
         scope: PolicyScope,
     ) -> MeshRequestAuthentication {
         MeshRequestAuthentication {
+            refused: false,
             name: name.into(),
             namespace: namespace.into(),
             scope,
