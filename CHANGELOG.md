@@ -509,7 +509,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **BREAKING — `security_headers` rejects built-in header values browsers
-  ignore** (PR #6685 and its follow-up). Custom `content_type_options` must be
+  ignore** (issue #6617, PR #6685 and its follow-up). Custom `content_type_options` must be
   `nosniff`, `frame_options` must be `DENY` or `SAMEORIGIN`, and
   `referrer_policy` must be a comma-separated list of Referrer-Policy tokens
   (ASCII case-insensitive, surrounding spaces and tabs allowed). A `set` entry

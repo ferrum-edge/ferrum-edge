@@ -28,7 +28,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `security_headers` values browsers ignore are refused (PR #6685)
+### `security_headers` values browsers ignore are refused (#6617, PR #6685)
 
 Custom `content_type_options`, `frame_options` and `referrer_policy` strings,
 and `set` entries for `X-Content-Type-Options`, `X-Frame-Options` and
