@@ -428,7 +428,7 @@ Semantics:
 | `contains` | Case-insensitive substring (same substring semantics as `literal`, but folded). |
 | `equals` | Case-insensitive full-value match (anchored; does not prefix-match). |
 | `luhn` | Valid credit-card Luhn checksum on digit runs (body targets only). |
-| `cidr` | IP membership test. |
+| `cidr` | IP membership test. An IPv4-mapped IPv6 address (`::ffff:10.0.0.1`) is tested as the IPv4 address it carries, so an IPv4 network matches both spellings. |
 
 ## Built-in rule pack
 

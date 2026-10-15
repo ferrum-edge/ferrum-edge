@@ -354,3 +354,28 @@ async fn shared_helper_transport_failure_is_classified_without_logging_body() {
     );
     server.abort();
 }
+
+/// A transport error must not echo the endpoint URL, which can carry a
+/// credential in its path or query.
+#[tokio::test]
+async fn transport_error_does_not_echo_endpoint_url() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let result = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/ingest/path-secret?api_key=query-secret"
+        ))
+        .body("[]")
+        .send()
+        .await;
+    assert!(result.is_err(), "closed port must fail to connect");
+
+    let err = handle_http_batch_response("http_batch_url_redaction", "", 1, result)
+        .await
+        .expect_err("transport error must be reported");
+    assert!(err.contains("batch failed"), "{err}");
+    assert!(!err.contains("path-secret"), "{err}");
+    assert!(!err.contains("query-secret"), "{err}");
+}

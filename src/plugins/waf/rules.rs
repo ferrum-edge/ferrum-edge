@@ -555,14 +555,17 @@ pub(super) struct IpCidr {
 }
 
 impl IpCidr {
+    /// Parse `addr` or `addr/prefix`. An IPv4-mapped IPv6 network
+    /// (`::ffff:a.b.c.d/p` with `p >= 96`) is stored as the IPv4 network it
+    /// denotes, so it matches both spellings of an address in that range.
     pub(super) fn parse(raw: &str) -> Option<Self> {
-        if let Some((addr, prefix)) = raw.split_once('/') {
+        let (network, prefix) = if let Some((addr, prefix)) = raw.split_once('/') {
             let network: IpAddr = addr.parse().ok()?;
             let prefix: u8 = prefix.parse().ok()?;
             match network {
-                IpAddr::V4(_) if prefix <= 32 => Some(Self { network, prefix }),
-                IpAddr::V6(_) if prefix <= 128 => Some(Self { network, prefix }),
-                _ => None,
+                IpAddr::V4(_) if prefix <= 32 => (network, prefix),
+                IpAddr::V6(_) if prefix <= 128 => (network, prefix),
+                _ => return None,
             }
         } else {
             let network: IpAddr = raw.parse().ok()?;
@@ -570,29 +573,48 @@ impl IpCidr {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
             };
-            Some(Self { network, prefix })
+            (network, prefix)
+        };
+        if let IpAddr::V6(v6) = network
+            && prefix >= 96
+            && let Some(v4) = v6.to_ipv4_mapped()
+        {
+            return Some(Self {
+                network: IpAddr::V4(v4),
+                prefix: prefix - 96,
+            });
         }
+        Some(Self { network, prefix })
     }
 
+    /// Whether `addr` lies in this network. An IPv4-mapped IPv6 address
+    /// (`::ffff:a.b.c.d`) is compared as the IPv4 address it carries, so
+    /// spelling an address in its mapped form cannot step around an IPv4 rule;
+    /// an IPv6 network that covers the mapped range still matches it.
     pub(super) fn matches(self, addr: IpAddr) -> bool {
-        match (self.network, addr) {
-            (IpAddr::V4(network), IpAddr::V4(addr)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u32::MAX << (32 - self.prefix)
-                };
-                u32::from(network) & mask == u32::from(addr) & mask
+        fn v4_in(network: Ipv4Addr, prefix: u8, addr: Ipv4Addr) -> bool {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(network) & mask == u32::from(addr) & mask
+        }
+        fn v6_in(network: Ipv6Addr, prefix: u8, addr: Ipv6Addr) -> bool {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(network) & mask == u128::from(addr) & mask
+        }
+        match (self.network, addr.to_canonical()) {
+            (IpAddr::V4(network), IpAddr::V4(addr)) => v4_in(network, self.prefix, addr),
+            (IpAddr::V6(network), IpAddr::V6(addr)) => v6_in(network, self.prefix, addr),
+            (IpAddr::V6(network), IpAddr::V4(addr)) => {
+                v6_in(network, self.prefix, addr.to_ipv6_mapped())
             }
-            (IpAddr::V6(network), IpAddr::V6(addr)) => {
-                let mask = if self.prefix == 0 {
-                    0
-                } else {
-                    u128::MAX << (128 - self.prefix)
-                };
-                u128::from(network) & mask == u128::from(addr) & mask
-            }
-            _ => false,
+            (IpAddr::V4(_), IpAddr::V6(_)) => false,
         }
     }
 }
@@ -1615,6 +1637,33 @@ mod tests {
         let cidr = IpCidr::parse("10.0.0.0/8").unwrap();
         assert!(cidr.matches("10.2.3.4".parse().unwrap()));
         assert!(!cidr.matches("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_matches_ipv4_mapped_ipv6_spellings() {
+        let v4_rule = IpCidr::parse("10.0.0.0/8").unwrap();
+        assert!(v4_rule.matches("::ffff:10.2.3.4".parse().unwrap()));
+        assert!(v4_rule.matches("::ffff:a02:304".parse().unwrap()));
+        assert!(!v4_rule.matches("::ffff:192.168.1.1".parse().unwrap()));
+        // A non-mapped IPv6 address never matches an IPv4 network.
+        assert!(!v4_rule.matches("::a02:304".parse().unwrap()));
+
+        let mapped_rule = IpCidr::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(mapped_rule.matches("10.2.3.4".parse().unwrap()));
+        assert!(mapped_rule.matches("::ffff:10.2.3.4".parse().unwrap()));
+        assert!(!mapped_rule.matches("11.0.0.1".parse().unwrap()));
+
+        let mapped_host = IpCidr::parse("::ffff:10.2.3.4").unwrap();
+        assert!(mapped_host.matches("10.2.3.4".parse().unwrap()));
+        assert!(!mapped_host.matches("10.2.3.5".parse().unwrap()));
+
+        let all_v6 = IpCidr::parse("::/0").unwrap();
+        assert!(all_v6.matches("10.2.3.4".parse().unwrap()));
+        assert!(all_v6.matches("2001:db8::1".parse().unwrap()));
+
+        let v6_rule = IpCidr::parse("2001:db8::/32").unwrap();
+        assert!(!v6_rule.matches("10.2.3.4".parse().unwrap()));
+        assert!(v6_rule.matches("2001:db8::1".parse().unwrap()));
     }
 
     #[test]

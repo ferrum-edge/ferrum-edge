@@ -13176,7 +13176,12 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.clone(),
         )?))),
-        "a2a_gateway" => Ok(Some(Arc::new(a2a_gateway::A2aGateway::new(config)?))),
+        "a2a_gateway" => Ok(Some(Arc::new(
+            a2a_gateway::A2aGateway::new_with_shard_amount(
+                config,
+                http_client.pool_shard_amount(),
+            )?,
+        ))),
         "ws_message_size_limiting" => Ok(Some(Arc::new(
             ws_message_size_limiting::WsMessageSizeLimiting::new(config)?,
         ))),
