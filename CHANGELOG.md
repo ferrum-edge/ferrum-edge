@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`request_transformer` rule values are redacted from non-admin plugin
+  reads.** Viewer and operator plugin-config reads, admin audit diffs and the
+  fingerprinted `GET /config/export` echoed every `request_transformer`
+  `rules[].value` verbatim, including a backend credential an operator injects
+  as an `Authorization` header, API-key header, or query/body value. Every rule
+  value is now `[REDACTED]` (fingerprinted in the export), as are the
+  `mesh_route_dispatch` `rules[].request_transform[].value` route-level header
+  writes; `operation`, `target` and `new_key` stay visible (`key` was already
+  masked by the name heuristic). Admin reads and
+  `GET /backup` stay raw. **Operator action:** an `operator` read-modify-write
+  of these plugins must resend the real values, since a write that echoes a
+  `[REDACTED]` placeholder back is refused with `400`.
+
 - **`body_validator` rejects compressed gRPC frames with extra gzip data.**
   Native gRPC protobuf validation inflated only the first gzip member of a
   compressed frame and ignored anything after it, while the whole frame was

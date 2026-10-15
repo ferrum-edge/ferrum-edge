@@ -558,3 +558,24 @@ fn legacy_single_object_credentials_use_the_emitted_index() {
     let exported = export_consumer(&consumer, &key);
     assert_eq!(exported["credentials"]["jwt"][0]["secret"], expected);
 }
+
+#[test]
+fn export_fingerprints_request_transformer_rule_values() {
+    let key = key(ADMIN_SECRET);
+    let rendering = FingerprintRendering::new(&key, "plugin_config", "ferrum", "rt");
+    let mut config = json!({
+        "rules": [
+            {"operation": "update", "target": "header", "key": "Authorization",
+             "value": "Bearer rt-export-canary"},
+            {"operation": "add", "target": "query", "key": "token",
+             "value": "rt-export-query-canary"}
+        ]
+    });
+    project_plugin_config_with("request_transformer", &mut config, "/config", &rendering);
+    let text = config.to_string();
+    assert!(!text.contains("rt-export-canary"), "{text}");
+    assert!(!text.contains("rt-export-query-canary"), "{text}");
+    assert!(is_fingerprint(&config["rules"][0]["value"]));
+    assert!(is_fingerprint(&config["rules"][1]["value"]));
+    assert_eq!(config["rules"][1]["target"], "query");
+}
