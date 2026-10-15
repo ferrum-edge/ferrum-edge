@@ -616,6 +616,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A custom bpffs path keeps node-agent pins and their readers together**
+  (issue #6698). Helm `nodeAgent.bpfFsPath` changed the bpffs mount point
+  inside the node-agent and ambient containers and was passed through as
+  `FERRUM_NODE_AGENT_BPF_FS_PATH`. Ferrum still pinned and opened its maps at
+  fixed `/sys/fs/bpf/ferrum/*` paths, so the startup probe could pass on the
+  custom mount while pins went to (or were missing from) `/sys/fs/bpf`. The
+  chart now uses `nodeAgent.bpfFsPath` only for the host bpffs (hostPath) and
+  always mounts it at `/sys/fs/bpf` in both containers. The node-agent refuses
+  a `FERRUM_NODE_AGENT_BPF_FS_PATH` other than `/sys/fs/bpf` at startup
+  instead of probing a mount it never pins to. **Operator action:** a
+  non-chart deployment that set a different value must mount its bpffs at
+  `/sys/fs/bpf` inside the container and unset or reset the variable.
 - **AI token metering counts prompt-cache, thinking and tool-use tokens**
   (issue #6623). Anthropic `cache_creation_input_tokens` and
   `cache_read_input_tokens` and Bedrock Converse `cacheReadInputTokens` and

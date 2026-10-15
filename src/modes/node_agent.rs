@@ -70,7 +70,7 @@ use crate::modes::node_agent_cni_server::{
 use crate::proxy::node_waypoint_udp_reply_source::ReplySourceGeneration;
 
 const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
-const DEFAULT_BPF_FS_PATH: &str = "/sys/fs/bpf";
+const DEFAULT_BPF_FS_PATH: &str = crate::ebpf::BPF_FS_MOUNT_PATH;
 const DEFAULT_FALLBACK_MODE: &str = "fail";
 const CNI_METADATA_FETCH_TIMEOUT: Duration = Duration::from_millis(750);
 /// Live Kubernetes ADD-dependency probe budget for CNI STATUS.
@@ -282,6 +282,36 @@ impl CniListenerConfig {
     }
 }
 
+/// Validate `FERRUM_NODE_AGENT_BPF_FS_PATH` against the fixed pin contract.
+///
+/// Every pinned map lives at a constant path under
+/// [`crate::ebpf::BPF_PIN_DIR`], shared with the mesh-proxy / NodeWaypoint
+/// readers, so the in-container bpffs mount point cannot move. A different
+/// value would let the capability probe pass on one mount while pins are
+/// written to (and read from) another, so it is refused at startup. To use a
+/// non-default *host* bpffs, mount it at `/sys/fs/bpf` inside the container
+/// (the Helm chart does this for `nodeAgent.bpfFsPath`).
+fn validate_bpf_fs_path(raw: Option<String>) -> Result<String, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_BPF_FS_PATH.to_string());
+    };
+    let trimmed = raw.trim();
+    let normalized = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() || normalized == DEFAULT_BPF_FS_PATH {
+        return Ok(DEFAULT_BPF_FS_PATH.to_string());
+    }
+    Err(format!(
+        "FERRUM_NODE_AGENT_BPF_FS_PATH={} is not supported: Ferrum pins its BPF maps at \
+         fixed paths under {} that the mesh proxy also opens, so bpffs must be mounted at \
+         {} inside the container. Mount a non-default host bpffs at {} instead \
+         (the Helm chart does this for nodeAgent.bpfFsPath)",
+        crate::startup::sanitize_startup_scalar(trimmed),
+        crate::ebpf::BPF_PIN_DIR,
+        DEFAULT_BPF_FS_PATH,
+        DEFAULT_BPF_FS_PATH,
+    ))
+}
+
 impl NodeAgentConfig {
     pub fn from_env_config(env_config: &EnvConfig) -> Result<Self, String> {
         let node_name = resolve_ferrum_var("FERRUM_NODE_AGENT_NODE_NAME").ok_or(
@@ -325,8 +355,8 @@ impl NodeAgentConfig {
         capture_config.ensure_exclude_port(env_config.node_agent_hbone_redirect_port);
         let cgroup_root = resolve_ferrum_var("FERRUM_NODE_AGENT_CGROUP_ROOT")
             .unwrap_or_else(|| DEFAULT_CGROUP_ROOT.to_string());
-        let bpf_fs_path = resolve_ferrum_var("FERRUM_NODE_AGENT_BPF_FS_PATH")
-            .unwrap_or_else(|| DEFAULT_BPF_FS_PATH.to_string());
+        let bpf_fs_path =
+            validate_bpf_fs_path(resolve_ferrum_var("FERRUM_NODE_AGENT_BPF_FS_PATH"))?;
         let fallback_mode = FallbackMode::parse(
             &resolve_ferrum_var("FERRUM_NODE_AGENT_FALLBACK_MODE")
                 .unwrap_or_else(|| DEFAULT_FALLBACK_MODE.to_string()),
@@ -10896,6 +10926,70 @@ mod tests {
             node_probe_ports: Vec::new(),
             inbound_redirect_ports: Vec::new(),
             host_network: false,
+        }
+    }
+
+    #[test]
+    fn from_env_config_refuses_bpf_fs_path_that_would_split_pins() {
+        // Pins live at fixed /sys/fs/bpf/ferrum paths shared with the mesh
+        // proxy readers, so a different in-container bpffs mount point would
+        // pass the probe on one mount while pins go to another (issue #6698).
+        for custom in ["/mnt/ferrum-bpffs", "/sys/fs/bpf/ferrum", "/sys/fs"] {
+            with_env_vars(
+                &[
+                    ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                    ("FERRUM_NODE_AGENT_BPF_FS_PATH", custom),
+                ],
+                || {
+                    let err = NodeAgentConfig::from_env_config(&EnvConfig::default())
+                        .err()
+                        .unwrap_or_else(|| panic!("{custom} must be refused"));
+                    assert!(
+                        err.contains("FERRUM_NODE_AGENT_BPF_FS_PATH")
+                            && err.contains(crate::ebpf::BPF_PIN_DIR),
+                        "refusal must name the setting and the fixed pin root: {err}"
+                    );
+                },
+            );
+        }
+        for accepted in ["/sys/fs/bpf", "/sys/fs/bpf/", " /sys/fs/bpf "] {
+            with_env_vars(
+                &[
+                    ("FERRUM_NODE_AGENT_NODE_NAME", "node-a"),
+                    ("FERRUM_NODE_AGENT_BPF_FS_PATH", accepted),
+                ],
+                || {
+                    let config = NodeAgentConfig::from_env_config(&EnvConfig::default())
+                        .unwrap_or_else(|e| panic!("{accepted:?} must be accepted: {e}"));
+                    assert_eq!(config.bpf_fs_path, crate::ebpf::BPF_FS_MOUNT_PATH);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn bpf_pin_paths_live_under_the_fixed_bpffs_mount() {
+        use crate::ebpf::{
+            BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH, BPF_FS_MOUNT_PATH, BPF_ORIG_DST4_PIN_PATH,
+            BPF_ORIG_DST6_PIN_PATH, BPF_PIN_DIR, BPF_SOCK_OPS_EVENTS_PIN_PATH,
+            BPF_SOCK_OPS_STATS_PIN_PATH,
+        };
+        assert_eq!(
+            std::path::Path::new(BPF_PIN_DIR).parent(),
+            Some(std::path::Path::new(BPF_FS_MOUNT_PATH))
+        );
+        for pin in [
+            BPF_SOCK_OPS_EVENTS_PIN_PATH,
+            BPF_SOCK_OPS_STATS_PIN_PATH,
+            BPF_ACCEPT_FIRST_BYTE_SOCKETS_PIN_PATH,
+            BPF_ORIG_DST4_PIN_PATH,
+            BPF_ORIG_DST6_PIN_PATH,
+        ] {
+            assert_eq!(
+                std::path::Path::new(pin).parent(),
+                Some(std::path::Path::new(BPF_PIN_DIR)),
+                "{pin} must live directly under {BPF_PIN_DIR}"
+            );
         }
     }
 
