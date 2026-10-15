@@ -178,17 +178,21 @@ fn documented_backend_mtls_mixed_configuration_loads_and_validates() {
         .and_then(|tail| tail.split("\nEOF\n").next())
         .expect("section writes config.yaml with a heredoc");
     // Point the documented certificate paths at real test material so source
-    // validation runs against readable files.
-    let cert_path = std::fs::canonicalize("tests/certs/server.crt").unwrap();
-    let key_path = std::fs::canonicalize("tests/certs/server.key").unwrap();
+    // validation runs against readable files. Each documented double-quoted
+    // scalar is replaced with a single-quoted one, which YAML reads without
+    // backslash escapes (Windows canonical paths contain backslashes).
+    let single_quoted = |path: &str| {
+        let path = std::fs::canonicalize(path).unwrap();
+        format!("'{}'", path.to_str().unwrap().replace('\'', "''"))
+    };
     let yaml = yaml
         .replace(
-            "/etc/ssl/certs/secure-client.pem",
-            cert_path.to_str().unwrap(),
+            "\"/etc/ssl/certs/secure-client.pem\"",
+            &single_quoted("tests/certs/server.crt"),
         )
         .replace(
-            "/etc/ssl/private/secure-client-key.pem",
-            key_path.to_str().unwrap(),
+            "\"/etc/ssl/private/secure-client-key.pem\"",
+            &single_quoted("tests/certs/server.key"),
         );
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
     write!(file, "{}", yaml).unwrap();
