@@ -500,16 +500,26 @@ deltas until a fenced full snapshot reconciles it.
    category and validation category.
 
 **Likely causes.** A configuration mutation that is valid at the CP but invalid
-under the DP's local validation (for example a plugin the DP build does not
-have, or a TLS reference the DP cannot resolve); a version skew between CP and
-DP images; a delta applied against a snapshot the DP had already fenced.
+under the DP's local validation (for example a TLS reference the DP cannot
+resolve); a delta that fails the DP's freshness or authority checks (for
+example a stale delta from a lagging failover CP); a delta applied against a
+snapshot the DP had already fenced.
+
+CP/DP image skew is **not** a cause of this alert. The ConfigSync
+build-identity gate requires the exact same build on both sides and refuses a
+mismatched peer at subscribe, before any snapshot or delta is sent, so a skewed
+DP never receives a delta to reject. That is a connection-admission failure
+instead. The CP returns `FAILED_PRECONDITION` with a message starting
+`ConfigSync build mismatch` and records a failed subscription audit event. The
+DP logs the refusal and backs off, and it shows up as stale config
+([FerrumGatewayDpConfigStale](#ferrumgatewaydpconfigstale)), not as divergence. Fix it by running the same
+build on CP and DP (see
+[upgrade_guide.md](../upgrade_guide.md#build-identity-gate)).
 
 **Remediation.** Divergence is designed to be safe: the DP keeps serving its
 last known-good configuration rather than applying a bad delta. Identify the
 rejected resource from the CP logs and repair it at the source, then let the CP
-issue a fenced full snapshot. If the cause is CP/DP version skew, align the
-images — a DP older than the configuration it is being sent will keep
-diverging.
+issue a fenced full snapshot.
 
 **Escalation.** Page the control-plane owner. Escalate to the gateway on-call
 if a fenced full snapshot is issued and the DP still refuses it, which points

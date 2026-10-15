@@ -369,7 +369,9 @@ acknowledgement fails `helm template` / `helm upgrade`.
 
 Existing clusters that installed this CRD from the former
 `charts/ferrum-mesh/crds/` directory must adopt it once so Helm can update it.
-**Operator action:**
+**Operator action** (`--take-ownership` needs a Helm 3.17+ client; see
+[upgrade_guide.md](upgrade_guide.md) for the manual ownership-annotation path
+on older clients):
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \

@@ -519,7 +519,7 @@ Two client-side options, both applying equally to DP ConfigSync, native
   |---|---|
   | `kid` (JWS header) | the trust-bundle credential to verify under; required on a trust-bundle CP |
   | `iss` | exactly one string, equal to `FERRUM_CP_DP_GRPC_JWT_ISSUER` (default `ferrum-edge-cp-dp`); arrays and other non-string shapes are rejected |
-  | `sub` | required (present; the node id by convention) |
+  | `sub` | required; must equal the `node_id` the node sends (surrounding whitespace trimmed from `node_id`). Enforced on `ConfigSync.Subscribe`, unary `GetFullConfig`, and native `MeshSubscribe`, which refuse a mismatch with `PERMISSION_DENIED` before allocating any subscription state |
   | `iat` | required |
   | `exp` | required; accepted until `exp` + 60 s clock-skew allowance, which is also the effective stream lease (the maximum stream lifetime can end a stream earlier) |
   | `nbf` | optional; when present, accepted from `nbf` − 60 s |
