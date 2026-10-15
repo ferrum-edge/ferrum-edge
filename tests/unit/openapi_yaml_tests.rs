@@ -14433,6 +14433,10 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({"referrer_policy": "no-referrer, Strict-Origin-When-Cross-Origin"}),
         json!({"referrer_policy": "no-referrer-when-downgrade"}),
         json!({"referrer_policy": "origin-when-cross-origin,unsafe-url"}),
+        json!({"set": {"X-Frame-Options": " deny "}}),
+        json!({"set": {"x-content-type-options": "NOSNIFF"}}),
+        json!({"set": {"REFERRER-POLICY": "no-referrer, same-origin"}}),
+        json!({"frame_options": "DENY", "set": {"X-Frame-Options": "SAMEORIGIN"}}),
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &valid, true);
         SecurityHeaders::new(&valid).unwrap_or_else(|error| {
@@ -14457,6 +14461,12 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({"referrer_policy": "strict-origin-when-cross-orign"}),
         json!({"referrer_policy": "no-referrer,"}),
         json!({"referrer_policy": "no-referrer-when"}),
+        json!({"frame_options": "DENY", "set": {"X-Frame-Options": "SAMEORGIN"}}),
+        json!({"set": {"x-FRAME-options": "ALLOW-FROM https://example.com"}}),
+        json!({"set": {"X-Frame-Options": ""}}),
+        json!({"set": {"X-Content-Type-Options": "nosnif"}}),
+        json!({"set": {"Referrer-Policy": "strict-origin-when-cross-orign"}}),
+        json!({"set": {"referrer-policy": "no-referrer,"}}),
         json!({
             "content_type_options": false,
             "frame_options": false,

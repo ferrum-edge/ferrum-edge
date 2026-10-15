@@ -1416,14 +1416,37 @@ fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K
         })?
         .to_string();
 
+    if issuer.trim().is_empty() {
+        return Err(invalid_resource(
+            object,
+            "RequestAuthentication jwtRules[].issuer must not be empty",
+        ));
+    }
+
     let audiences = optional_string_array(
         object,
         rule,
         "audiences",
         "RequestAuthentication jwtRules[].audiences",
     )?;
-    let jwks_uri = string_field(rule, "jwksUri").map(ToOwned::to_owned);
-    let jwks = string_field(rule, "jwks").map(ToOwned::to_owned);
+    // Ferrum has no OIDC discovery, so a rule needs `jwksUri` or inline
+    // `jwks`. Native mesh admission (`validate_mesh_fields`) requires one too;
+    // refusing here makes an issuer-only rule a fail-closed refusal (issue
+    // #6656) instead of a published rule that vetoes the whole reload and
+    // keeps the previous configuration in force.
+    let jwks_uri = string_field(rule, "jwksUri")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    let jwks = string_field(rule, "jwks")
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    if jwks_uri.is_none() && jwks.is_none() {
+        return Err(invalid_resource(
+            object,
+            "RequestAuthentication jwtRules[] needs jwksUri or jwks; Ferrum does not discover \
+             keys from the issuer",
+        ));
+    }
 
     let from_headers = jwt_from_headers(object, rule)?;
 
