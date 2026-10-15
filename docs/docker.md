@@ -587,21 +587,31 @@ services:
 docker run -d \
   --network <project>_ferrum-network \
   -p 80:80 \
-  -v /path/to/nginx.conf:/etc/nginx/nginx.conf \
+  -v /path/to/nginx.conf:/etc/nginx/nginx.conf:ro \
   nginx:latest
 ```
 
-**nginx.conf Example**:
-```nginx
-upstream ferrum {
-    server ferrum-dp-1:8000;
-    server ferrum-dp-2:8000;
-}
+**nginx.conf Example**: this is a complete file, not a fragment, because the
+command above mounts it over the image's main `/etc/nginx/nginx.conf`, where
+`upstream` and `server` must sit inside an `http` block. Check it with
+`nginx -t` before starting the load balancer. The check resolves the upstream
+names, so run it on the Compose network while the DP containers are up:
+`docker run --rm --network <project>_ferrum-network -v /path/to/nginx.conf:/etc/nginx/nginx.conf:ro nginx:latest nginx -t`.
 
-server {
-    listen 80;
-    location / {
-        proxy_pass http://ferrum;
+```nginx
+events {}
+
+http {
+    upstream ferrum {
+        server ferrum-dp-1:8000;
+        server ferrum-dp-2:8000;
+    }
+
+    server {
+        listen 80;
+        location / {
+            proxy_pass http://ferrum;
+        }
     }
 }
 ```

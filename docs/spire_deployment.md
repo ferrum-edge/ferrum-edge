@@ -48,7 +48,7 @@ Ferrum supports two CA backends selected by [`FERRUM_MESH_CA_BACKEND`](configura
 
 | Backend | Use it for | What it does |
 |---|---|---|
-| `internal` | **Development, single-node tests, demos.** Ferrum self-issues SVIDs from a root key on disk. | Holds the CA private key locally, signs SVIDs in-process. Convenient because there are no external dependencies, but the operator owns the root key and has no rotation story beyond restarting Ferrum with new files. |
+| `internal` | **Development, single-process tests, demos.** Ferrum generates a throwaway self-signed root at startup (`bootstrap_dev_root`) and self-issues SVIDs from it. | Gated behind `FERRUM_MESH_CA_BOOTSTRAP_DEV=true` and refused under `FERRUM_MESH_PRODUCTION_MODE=true`. The root key and certificate exist only in that process's memory. They are never read from or written to disk, so every restart mints a **new** root, and two `internal` processes never share trust and cannot mTLS each other. There is no operator-supplied root and no rotation beyond the restart that replaces it. For a multi-process local mesh use [file-based SVIDs](mesh.md#file-based-svids-two-process-local-mesh). |
 | `spire` (aliases `spire_agent`, `spire-agent`) | **Production.** | Delegates issuance and rotation to a separately-operated SPIRE Agent over its Workload API UDS. Ferrum never sees a CA private key. |
 
 Production deployments should always use `spire`. The wired mesh runtime path
@@ -287,21 +287,63 @@ already set on workload pods.
 
 #### 4c. Verify issuance
 
+The default published Ferrum images (and the `-ebpf` variant) are distroless.
+They contain the Ferrum binaries only: no shell, no `ls`/`stat`/`curl`, and no
+`spire-agent` CLI. The tools-capable `-ebpf-tools` variant adds a shell and
+networking tools, but it does not include `spire-agent` either. So
+`kubectl exec ... spire-agent api fetch` inside a Ferrum container cannot work.
+Verify issuance on the SPIRE side, then through Ferrum's own diagnostics on the
+target pod:
+
 ```bash
-# Confirm the entry is present
+# 1. The registration entry exists (runs in the SPIRE Server image, which ships its CLI)
 kubectl exec -n spire-system spire-server-0 -- \
   spire-server entry show -spiffeID spiffe://us-east-1.prod.example.com/ns/gateway/sa/ferrum-edge
 
-# From a pod that should have an SVID, ask the local agent
-kubectl exec -n gateway deploy/ferrum-edge -- \
-  /opt/spire/bin/spire-agent api fetch x509 \
-    -socketPath /run/spire/sockets/agent.sock
+# 2. The target mesh pod received its SVID. Ferrum's admin listener binds
+#    loopback by default, and kubectl port-forward reaches the pod's loopback.
+kubectl port-forward -n <namespace> pod/<ferrum-pod> 9000:<admin-port> &
+curl -fsS -H "Authorization: Bearer $FERRUM_ADMIN_JWT" http://127.0.0.1:9000/metrics \
+  | grep -E 'ferrum_mesh_(cert_expiry_seconds|ca_health)'
 ```
 
-The `api fetch` command should print one or more `Received N svid after Xs`
-lines. If it hangs, the pod is not being attested — check that the
-ServiceAccount and namespace labels line up with the `ClusterSPIFFEID`
-selectors and that the SPIRE Agent on that node is healthy.
+These are the signals that prove the **target workload** was attested:
+
+- **Mesh pods** (`FERRUM_MESH_CA_BACKEND=spire`, with **no**
+  `FERRUM_GATEWAY_SVID_*` material configured): Ferrum refuses to bind mesh
+  listeners until the first SVID arrives from the agent, and exits after 30s
+  without one (see
+  [Mesh-mode pods](#mesh-mode-pods-sidecar-ambient-waypoint-egress)). Explicit
+  `FERRUM_GATEWAY_SVID_*` material takes precedence and skips SPIRE issuance
+  entirely, so a pod with that override can be Ready while the agent is
+  unreachable. Readiness alone is therefore not the evidence. The evidence is
+  `ferrum_mesh_cert_expiry_seconds{source="spire_agent"}` carrying the
+  expected `spiffe_id` with a positive remaining lifetime, together with
+  `ferrum_mesh_ca_health{ca_type="spire_agent"}` at `1`.
+- **Gateway pods** (file SVIDs written by a helper): the helper container runs
+  in the same pod under the same ServiceAccount, so its logs are the
+  attestation evidence. Check them with `kubectl logs <ferrum-pod> -c <helper>`
+  for successful fetch/renewal. On the Ferrum side, Ferrum refuses to start
+  with incomplete or invalid SVID material, so a running gateway has installed
+  a complete SVID. `GET /admin/tls/inventory` (operator/admin token, through
+  the same port-forward) shows the URI SANs and validity window of what the
+  configured **source files** currently hold. That is source metadata, not
+  proof of what Ferrum is serving.
+
+If the pod never becomes Ready and logs `failed to connect to Workload API
+agent` or a first-SVID timeout, or the helper never writes files, the workload
+is not being attested. Check that the ServiceAccount and namespace labels line
+up with the `ClusterSPIFFEID` selectors and that the SPIRE Agent on that node is
+healthy.
+
+To run `spire-agent api fetch` by hand, run it from a container **inside the
+target pod**: a debugging sidecar built from an image that actually contains
+the `spire-agent` binary (such as the SPIRE Agent image), with the same agent
+socket volume mounted. The SPIFFE Helper image does not ship the `spire-agent`
+CLI, so it cannot run this command. The agent then attests that pod's own
+namespace, ServiceAccount, and pod identity. A separate debug pod
+receives the SVID for *its* own identity (or none), so its output proves nothing
+about the Ferrum workload. Do not use it as issuance evidence.
 
 ## Ferrum configuration
 
@@ -646,7 +688,7 @@ described above aborts startup before mesh listeners bind.
 **Recovery**:
 
 1. Check the agent pod on the same node — `kubectl get pod -n spire-system -l app=spire-agent --field-selector spec.nodeName=<node>`.
-2. Check the socket mount inside the Ferrum pod — `kubectl exec <ferrum-pod> -- ls -l /run/spire/sockets/agent.sock`. A missing file means the volume mount or CSI driver failed.
+2. Check the socket mount of the Ferrum pod. The default and `-ebpf` images are distroless and have no `ls`, so inspect it from Kubernetes: `kubectl describe pod <ferrum-pod>` shows volume/CSI mount events and errors, and `kubectl get pod <ferrum-pod> -o jsonpath='{.spec.volumes}'` shows the `spire-agent-socket` source. A missing socket file surfaces in Ferrum's own logs as `failed to connect to Workload API agent`.
 3. Verify the registration entry is still present — `spire-server entry show -spiffeID <ferrum-spiffe-id>`. If a recent SPIRE Server failover dropped the entry, recreate via your controller-manager `ClusterSPIFFEID` or CLI.
 4. Watch `ferrum_mesh_ca_health` flip back to `1` once the stream re-establishes.
 
@@ -672,8 +714,20 @@ until the bundle refreshes. Same-cluster traffic is unaffected.
 
 1. For local bundle staleness: chase the same SPIRE-Agent path as above —
    the Workload API stream delivers bundle updates inline with SVID updates.
-2. For federated bundle staleness: hit the remote endpoint from inside the
-   consuming cluster — `kubectl exec <ferrum-pod> -- curl -fsS https://spire-server.eu-west-1.example.com/.well-known/spiffe`. Expect a JSON body containing `keys` or `x509_svid` material.
+2. For federated bundle staleness: check what Ferrum itself observed with
+   `GET /mesh/federation` (see [Verify](#4-verify)) and the
+   `ferrum_mesh_federation_poll_failures_total{trust_domain}` counter. The
+   Ferrum image has no `curl`, and this check needs no workload identity. To
+   test whether the remote endpoint is reachable at all from the consuming
+   cluster, use a throwaway pod, for example
+   `kubectl run -n <namespace> fed-check --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- -fsS https://spire-server.eu-west-1.example.com/.well-known/spiffe`.
+   Expect a JSON body containing `keys` or `x509_svid` material. A separate pod
+   does not carry the Ferrum pod's labels, so NetworkPolicies that select
+   Ferrum's pods may not apply to it. A success there does not prove the
+   Ferrum pod can reach the endpoint. To test the Ferrum pod's own effective
+   egress, attach an ephemeral debug container to it, which shares the pod's
+   network namespace:
+   `kubectl debug -n <namespace> <ferrum-pod> -it --image=curlimages/curl:8.10.1 -- curl -fsS https://spire-server.eu-west-1.example.com/.well-known/spiffe`.
 3. If the endpoint is reachable but returns a malformed body, the poller logs
    a structured warning naming the offending field and rejects the bundle (the
    last-good snapshot stays in service).
@@ -702,7 +756,7 @@ expired chain).
    server-side rate limiting can stall rotation.
 3. For the gateway file path: confirm whatever process writes the SVID files
    (`spiffe-helper` sidecar, init job, custom controller) is still running and
-   logging successful renewals. Check `kubectl exec <gateway> -- stat -c '%Y' /etc/ferrum/svid/gateway-chain.pem` — the mtime should advance roughly every `ttl/2`.
+   logging successful renewals (`kubectl logs <gateway-pod> -c <helper>`). The default and `-ebpf` Ferrum images are distroless and have no `stat`, and file mtimes would not show what Ferrum installed anyway, so read freshness from Ferrum instead. `GET /admin/tls/events?surface=gateway_svid` is the evidence that Ferrum **installed** a renewal: each accepted renewal records a successful rotation event with a new revision, roughly every `ttl/2`, while a refused candidate (for example a renewed certificate with a mismatched key) records a rebuild error and Ferrum keeps serving the previous SVID. `GET /admin/tls/inventory` and `ferrum_tls_cert_expiry_seconds` only describe what the source files currently hold. They can show a renewed validity window even when Ferrum refused that candidate, so do not treat them alone as proof that rotation recovered.
 
 ## Alerting reference
 
@@ -740,8 +794,11 @@ Before declaring a cluster ready for production mesh traffic:
       mesh ServiceAccounts the injector covers, and every ambient
       node-agent / waypoint ServiceAccount. `spire-server entry count` should
       match your inventory.
-- [ ] **SVID issuance verified** with `spire-agent api fetch x509` from inside
-      at least one pod of each Ferrum role.
+- [ ] **SVID issuance verified** for at least one pod of each Ferrum role,
+      using the target-pod signals in [Verify issuance](#4c-verify-issuance)
+      (`ferrum_mesh_cert_expiry_seconds{source="spire_agent"}` for mesh pods,
+      helper logs plus a `gateway_svid` rotation event for gateway pods), not a
+      separate debug pod.
 - [ ] **Ferrum env vars** set: `FERRUM_MESH_CA_BACKEND=spire`,
       `FERRUM_MESH_SPIRE_AGENT_SOCKET` matches the Agent's socket path,
       `FERRUM_MESH_CERT_TTL_SECONDS` aligned with SPIRE entry TTLs. For

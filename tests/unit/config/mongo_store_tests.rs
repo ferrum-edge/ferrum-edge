@@ -2413,3 +2413,36 @@ fn unknown_resource_type_still_decodes_so_the_cursor_can_advance() {
     assert_eq!(change.sequence, 8);
     assert_eq!(change.resource_type, "api_spec");
 }
+
+#[test]
+fn documented_kubernetes_deployment_has_selector_matching_pod_labels() {
+    // apps/v1 Deployments require spec.selector, and the API server rejects a
+    // selector that does not match spec.template.metadata.labels.
+    let section = MONGODB_DOC
+        .split("### MongoDB with Ferrum Edge on Kubernetes")
+        .nth(1)
+        .expect("Kubernetes deployment section exists");
+    let yaml = section
+        .split("```yaml")
+        .nth(1)
+        .and_then(|tail| tail.split("```").next())
+        .expect("section contains a YAML manifest");
+    let manifest: serde_yaml::Value =
+        serde_yaml::from_str(yaml).expect("documented Deployment parses as YAML");
+    assert_eq!(manifest["apiVersion"].as_str(), Some("apps/v1"));
+    assert_eq!(manifest["kind"].as_str(), Some("Deployment"));
+    let match_labels = manifest["spec"]["selector"]["matchLabels"]
+        .as_mapping()
+        .expect("Deployment declares spec.selector.matchLabels");
+    assert!(!match_labels.is_empty(), "selector must not be empty");
+    let pod_labels = manifest["spec"]["template"]["metadata"]["labels"]
+        .as_mapping()
+        .expect("Deployment declares spec.template.metadata.labels");
+    for (key, value) in match_labels {
+        assert_eq!(
+            pod_labels.get(key),
+            Some(value),
+            "selector label {key:?} must match the Pod template labels"
+        );
+    }
+}

@@ -365,9 +365,15 @@ dp:
   # In-container path to an externally issued CP/DP bearer token
   # (FERRUM_DP_CP_GRPC_TOKEN_FILE). When set, this DP presents that token instead
   # of minting one, so it holds no signing key and cannot forge an authorization
-  # for any namespace — the preferred posture under GHSA-3f2j-wwqw-grmg. The file
-  # is re-read on every connection attempt, so a projected short-lived token
-  # rotates without a restart. Setting this makes grpc.jwtSecret optional.
+  # for any namespace. The file is re-read on every connection attempt, so a
+  # short-lived token rotates without a restart. Setting this makes
+  # grpc.jwtSecret optional.
+  # NOT usable by a stock DP today: the DP sends a random per-process node_id
+  # and ConfigSync.Subscribe requires the token's sub to equal it, so the CP
+  # refuses the subscription with PERMISSION_DENIED and the DP never receives
+  # config. For chart-deployed DPs use a per-tenant grpc.jwtSecret plus
+  # grpc.jwtKeyId, bound to a tenant credential in the CP trust bundle. See
+  # docs/cp_namespace_tenancy.md#data-plane-side.
   cpGrpcTokenFile: ""
 
 # -----------------------------------------------------------------------------

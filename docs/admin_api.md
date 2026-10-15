@@ -3506,10 +3506,14 @@ labels column for PostgreSQL, MySQL and SQLite; initialize/rebuild the developme
 database from that baseline when deploying it. MongoDB stores labels through its
 existing BSON resource serialization. Upgrade the gateway and file validator
 before upgrading clients that emit labels in resource bodies. In control-plane
-deployments, upgrade every data plane before the control plane: `config_json`
-is parsed with `deny_unknown_fields`, so a data plane that predates this field
-rejects a namespace snapshot as soon as any resource in it carries a non-empty
-`labels` map, and it does not converge until it is upgraded.
+deployments the CP and every DP must run the same build: the ConfigSync
+build-identity gate refuses a mismatched peer before any config is streamed.
+Upgrade them together, CP first and then every DP, as described in
+[upgrade_guide.md](upgrade_guide.md#upgrade-order). Until a DP is replaced, the
+new CP refuses its subscription. The DP keeps serving its last applied config,
+bounded by `FERRUM_DP_CONFIG_MAX_STALE_SECONDS`, so it never receives a
+`labels`-bearing snapshot that it could not parse (`config_json` is parsed with
+`deny_unknown_fields`).
 
 Diagnostic builds with the default-off `bench-h1-profile` feature append fixed
 `ferrum_h1_profile_*` metrics to the existing authenticated `/metrics` response.

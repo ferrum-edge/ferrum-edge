@@ -257,7 +257,7 @@ SQLite is a single-file embedded database with no built-in replication. It is id
 
 - No network protocol — all access is via local filesystem
 - No replication — a single file on one machine
-- `FERRUM_DB_FAILOVER_URLS` has no effect (all URLs would point to the same file)
+- `FERRUM_DB_FAILOVER_URLS` can list other, distinct SQLite files, and the gateway fails over to one when the primary is unavailable with a transient error. This is a local fallback between independent files, not replication: nothing copies data between them. Admin writes are refused while a failover file is active unless `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` (see [configuration.md](configuration.md)), so the fallback file is not silently diverged from the primary
 
 **Use SQLite for**: development, testing, and single-instance database-mode deployments.
 

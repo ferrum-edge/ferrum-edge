@@ -2280,9 +2280,16 @@ helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
   --take-ownership --set crds.adoptExisting=true
 ```
 
-Helm 3.14+ is required for `--take-ownership`. After adoption, leave
-`crds.install=true` and drop `crds.adoptExisting`. Do not set
-`crds.install=false` to silence the error.
+`--take-ownership` was added in Helm 3.17.0, so this adoption step needs a
+Helm 3.17+ client; older clients reject the flag. Upgrade the Helm client
+before this upgrade rather than editing Helm ownership metadata on the CRD by
+hand.
+
+Adoption keeps the CRD in the cluster and leaves its existing policy
+objects untouched. The chart renders the CRD with
+`helm.sh/resource-policy: keep`, so a later uninstall still does not delete
+it. After adoption, leave `crds.install=true` and drop `crds.adoptExisting`.
+Do not set `crds.install=false` to silence the error.
 
 ### Enabled mesh injector requires a webhook CA trust source (issue [#4433](https://github.com/ferrum-edge/ferrum-edge/issues/4433))
 
@@ -3267,17 +3274,34 @@ FERRUM_MODE=dp \
 
 #### 5. Rollback path
 
-- **DP rollback**: Stop the new DP binary, restart the old one. It reconnects to
-  the CP and gets the current config via gRPC. DPs are stateless — rollback is
-  instant when the CP still serves a compatible config generation.
+Rollback is a coordinated, matching-build operation, like the upgrade. The
+[Build Identity Gate](#build-identity-gate) has no compatibility window. A DP
+on the old build is refused by a CP on the new build, and the reverse, whatever
+config generation either side holds. Binary or config-shape compatibility
+does not admit a mismatched peer.
+
 - **CP rollback**: Stop the new CP, repoint the **old** CP binary at the
   **original, untouched CP database** (the one exported in step 1), and restart.
-  Do not point the old CP at the fresh `ferrum_db_new` database. During the CP
-  restart, DPs serve cached config.
+  Do not point the old CP at the fresh `ferrum_db_new` database. In a multi-CP
+  deployment, roll back every CP.
+- **DP rollback**: Replace every DP with the old binary as well. A DP rolled
+  back on its own, while the CP still runs the new build, is refused at
+  subscribe and receives no config. Any upgraded DP left running is refused by
+  the rolled-back CP in the same way.
 
-> **Note**: DPs always overwrite their cache from the CP on reconnect. Rolling
-> back the CP database to the pre-upgrade instance therefore pushes the prior
-> config shape to DPs again; that is the supported rollback path during
+While builds differ, a refused DP that is still running keeps serving the
+config it last applied, but that config only lasts so long. Its age keeps
+growing, and once it passes `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` the DP
+degrades readiness. With the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`
+it also refuses new traffic (see
+[cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age)).
+Finish the rollback inside that window.
+
+> **Note**: A DP holds no on-disk config cache. A DP restarted on the old build
+> starts empty, stays not-ready until it applies its first snapshot, and takes
+> that snapshot from the rolled-back CP once both run the same build. Rolling
+> back the CP database to the pre-upgrade instance therefore re-establishes the
+> prior config shape on the DP fleet. That is the supported rollback path during
 > build-out, not binary-only rollback against a changed baseline.
 
 ---

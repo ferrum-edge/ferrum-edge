@@ -81,7 +81,8 @@ next upgrade applies the template, or apply that YAML with
 `crds.install=false` without that acknowledgement fails render.
 
 Existing clusters that installed this CRD from the former `crds/` directory
-must adopt it once. **Operator action:**
+must adopt it once. **Operator action** (`--take-ownership` needs a Helm
+3.17+ client):
 
 ```bash
 helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
