@@ -277,7 +277,10 @@ fn effective_custom_tag_union_is_bounded_even_for_triggered_instances() {
 #[tokio::test]
 async fn custom_tags_compose_across_sources_hooks_and_skipped_instances() {
     let env = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
-        &json!({"custom_env_tags": {"region": "FERRUM_TEST_REGION"}}),
+        &json!({
+            "custom_env_tags": {"region": "FERRUM_TEST_REGION"},
+            "safe_tag_sources": ["FERRUM_TEST_REGION"]
+        }),
         |_| Ok("environment".into()),
     )
     .unwrap();
@@ -295,7 +298,8 @@ async fn custom_tags_compose_across_sources_hooks_and_skipped_instances() {
         Arc::new(
             WorkloadMetrics::new(&json!({
                 "custom_tags": {"first": "later"},
-                "custom_header_tags": {"region": "x-region"}
+                "custom_header_tags": {"region": "x-region"},
+                "safe_tag_sources": ["x-region"]
             }))
             .unwrap(),
         ),

@@ -1369,6 +1369,11 @@ pub struct McpGateway {
     supported_protocol_versions: Vec<String>,
     discovery: McpDiscoveryConfig,
     sessions: McpSessionConfig,
+    /// Lowercased, deduplicated downstream and upstream session header names.
+    /// Session IDs are bearer-like, so these names join the route's
+    /// credential-header registry (redaction, secondary egress such as
+    /// `request_mirror`), whatever the operator calls them.
+    session_header_names: Vec<String>,
     capabilities: McpCapabilitiesConfig,
     servers: HashMap<String, McpServerConfig>,
     primary_server_id: String,
@@ -1623,6 +1628,14 @@ impl McpGateway {
         // public-URI mapping this plugin writes into response bodies comes from
         // the live per-session `McpCatalog`, not from `config`; see
         // `response_presentation_policy`.
+        let mut session_header_names =
+            vec![sessions.downstream_session_header.to_ascii_lowercase()];
+        let upstream_session_header = sessions.upstream_session_header.to_ascii_lowercase();
+        if !session_header_names.contains(&upstream_session_header) {
+            session_header_names.push(upstream_session_header);
+        }
+        session_header_names.retain(|name| !name.is_empty());
+
         Ok(Self {
             instance_id: MCP_GATEWAY_INSTANCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
             enabled,
@@ -1631,6 +1644,7 @@ impl McpGateway {
             supported_protocol_versions,
             discovery,
             sessions,
+            session_header_names,
             capabilities,
             servers,
             primary_server_id,
@@ -7030,6 +7044,12 @@ fn admin_group_names(set: &McpGroupSet, group_names: &[&str]) -> Vec<String> {
 impl Plugin for McpGateway {
     fn name(&self) -> &str {
         "mcp_gateway"
+    }
+
+    /// MCP session IDs are bearer-like: report the configured session header
+    /// names so they are redacted and withheld from secondary egress.
+    fn request_headers_to_redact(&self) -> &[String] {
+        &self.session_header_names
     }
 
     fn mcp_gateway(&self) -> Option<&McpGateway> {

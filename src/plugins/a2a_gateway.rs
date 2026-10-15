@@ -516,7 +516,16 @@ impl ResponseStreamInspector for A2aSseStreamInspector {
 }
 
 impl A2aGateway {
+    /// Build with the auto-sized shard count (`FERRUM_POOL_SHARD_AMOUNT=0`).
+    /// The registry uses [`Self::new_with_shard_amount`] so the operator
+    /// override reaches the per-instance stream-observation map.
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_shard_amount(config, crate::util::sharding::pool_shard_amount(0))
+    }
+
+    /// `shard_amount` must already be normalized (a power of two >= 2), as
+    /// `PluginHttpClient::pool_shard_amount()` returns it.
+    pub fn new_with_shard_amount(config: &Value, shard_amount: usize) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "a2a_gateway: `config` must be an object".to_string())?;
@@ -551,9 +560,7 @@ impl A2aGateway {
             observability,
             policy,
             static_policy_digest,
-            pending_stream_observations: Arc::new(DashMap::with_shard_amount(
-                crate::util::sharding::pool_shard_amount(0),
-            )),
+            pending_stream_observations: Arc::new(DashMap::with_shard_amount(shard_amount)),
         })
     }
 

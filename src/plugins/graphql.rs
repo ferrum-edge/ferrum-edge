@@ -1703,7 +1703,8 @@ impl Plugin for GraphqlPlugin {
         // here.
         let decoded_view = ctx.inspectable_final_request_body_owned();
         let envelope: &[u8] = decoded_view.as_deref().unwrap_or(body);
-        if graphql_envelope_digest(envelope) == previous {
+        let digest = graphql_envelope_digest(envelope);
+        if digest == previous {
             return PluginResult::Continue;
         }
 
@@ -1728,7 +1729,7 @@ impl Plugin for GraphqlPlugin {
         }
         ctx.plugin_state_mut()
             .graphql_request_envelope_hashes
-            .insert(self.instance_id, graphql_envelope_digest(envelope));
+            .insert(self.instance_id, digest);
         self.enforce_graphql_envelope(ctx, envelope).await
     }
 

@@ -1046,6 +1046,7 @@ fn peer_authentication_rejects_client_side_port_override_mtls_mode() {
 #[test]
 fn request_authentication_accepts_inline_jwks_multi_audience_and_custom_locations() {
     let ra = MeshRequestAuthentication {
+        refused: false,
         name: "jwt".into(),
         namespace: "default".into(),
         scope: PolicyScope::MeshWide,
@@ -3056,6 +3057,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
                     custom_env_tags: HashMap::new(),
+                    safe_tag_sources: Vec::new(),
                     providers: Vec::new(),
                 }),
                 ..MeshTelemetryConfig::default()

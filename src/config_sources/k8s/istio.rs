@@ -1365,11 +1365,45 @@ fn request_authentication(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(MeshRequestAuthentication {
+        refused: false,
         name: object.metadata.name.clone(),
         namespace: object.metadata.namespace.clone(),
         scope,
         jwt_rules,
     })
+}
+
+/// Fail-closed stand-in for a RequestAuthentication that translation refused
+/// (issue #6656).
+///
+/// A refused resource used to be dropped from the published configuration,
+/// which removes JWT validation, token stripping and gateway-owned claim
+/// headers from every workload it selects: a forged or invalid token, or a
+/// client-supplied claim header, then reached the backend. Ferrum cannot
+/// enforce the resource faithfully, so it is published with no JWT rules and
+/// `refused: true`; the data plane refuses every HTTP request to the selected
+/// workloads until the resource is fixed.
+///
+/// The scope is the resource's own selector scope. A `targetRef(s)` attachment
+/// is not supported for RequestAuthentication, so its target cannot be
+/// resolved; the refusal then covers the namespace (mesh-wide in the Istio
+/// root namespace), the narrowest scope that still contains the target.
+pub(crate) fn refused_request_authentication(
+    options: &K8sTranslationOptions,
+    object: &K8sObject,
+) -> MeshRequestAuthentication {
+    let selector = if has_istio_target_refs(&object.spec) {
+        None
+    } else {
+        object.spec.get("selector")
+    };
+    MeshRequestAuthentication {
+        refused: true,
+        name: object.metadata.name.clone(),
+        namespace: object.metadata.namespace.clone(),
+        scope: istio_policy_scope(options, object, selector),
+        jwt_rules: Vec::new(),
+    }
 }
 
 fn translate_jwt_rule(object: &K8sObject, rule: &Value) -> Result<MeshJwtRule, K8sTranslateError> {
@@ -1497,7 +1531,12 @@ fn jwt_output_claim_to_headers(
         let (header, claim) =
             crate::modes::mesh::config::validate_mesh_jwt_claim_header(header, claim)
                 .map_err(|error| invalid_resource(object, format!("{path}: {error}")))?;
-        if out.iter().any(|existing| existing.header == header) {
+        // Backend-equivalent spellings (`X_Tenant_Id` / `x-tenant-id`) are one
+        // destination, matching the injected `jwks_auth` admission. A refused
+        // RequestAuthentication fails closed (issue #6656).
+        if out.iter().any(|existing| {
+            crate::proxy::headers::field_names_equivalent_for_backends(&existing.header, &header)
+        }) {
             return Err(invalid_resource(
                 object,
                 format!(
@@ -7134,6 +7173,7 @@ fn telemetry(
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
                 custom_env_tags: HashMap::new(),
+                safe_tag_sources: Vec::new(),
                 providers: Vec::new(),
             };
             let mut emits_server = false;
@@ -11186,7 +11226,7 @@ mod tests {
                 serde_json::json!({
                     "tracing": [{
                         "customTags": {
-                            "credential": {
+                            "env_tag": {
                                 "environment": {
                                     "name": "FERRUM_ADMIN_JWT_SECRET"
                                 }

@@ -255,7 +255,7 @@ const JWT_RULE: &str = "issuer audiences jwks_uri jwks from_headers from_params 
     forward_original_token output_claim_to_headers";
 const TELEMETRY: &str = "name namespace scope config";
 const TRACING: &str = "mode sampling_percentage disable_span_reporting disableSpanReporting custom_tags \
-    custom_header_tags custom_env_tags providers provider";
+    custom_header_tags custom_env_tags safe_tag_sources providers provider";
 const CEL: &str = "op value name attribute then_expr else_expr";
 const ACCESS_FILTER: &str = "status_code_min status_code_max min_latency_ms errors_only expression";
 const PROXY_CONFIG: &str = "name namespace scope concurrency image environment tracing_sampling";

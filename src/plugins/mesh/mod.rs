@@ -23,10 +23,20 @@ fn observability_shard_amount() -> usize {
 
 /// Extract mesh-prefixed metadata entries as OpenTelemetry attribute pairs,
 /// sorted by key for deterministic span output.
+///
+/// `mesh.*` keys go through the primary metadata gate, so a `mesh.*` key that
+/// names a credential (`mesh.session_id`, `mesh.private_key`) is never
+/// exported to a trace even though it carries the mesh prefix (issue #6619).
+/// Custom attribute names are an explicit operator declaration in
+/// `workload_metrics` config, so they take only the deny layer.
 pub fn mesh_trace_attributes(metadata: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut attributes: Vec<_> = metadata
         .iter()
-        .filter(|(key, _)| key.starts_with("mesh.") && !key.starts_with("mesh.metrics."))
+        .filter(|(key, _)| {
+            key.starts_with("mesh.")
+                && !key.starts_with("mesh.metrics.")
+                && !crate::plugins::utils::metadata_redaction::metadata_value_is_redacted(key)
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     if let Some(custom_names) = metadata.get(CUSTOM_TRACE_ATTRIBUTES_METADATA) {
@@ -81,6 +91,40 @@ mod tests {
         assert_eq!(shards, crate::util::sharding::pool_shard_amount(0));
         assert!(shards.is_power_of_two());
         assert!(shards >= 64);
+    }
+
+    #[test]
+    fn trace_attributes_never_export_credential_shaped_keys() {
+        let metadata = HashMap::from([
+            ("mesh.source.workload".to_string(), "frontend".to_string()),
+            ("mesh.session_id".to_string(), "session-secret".to_string()),
+            ("mesh.private_key".to_string(), "key-secret".to_string()),
+            (
+                "mesh.private_rsa2048_key".to_string(),
+                "sized-key-secret".to_string(),
+            ),
+            (
+                "mesh.private_ec_p256_pkcs8_pem_key".to_string(),
+                "long-key-secret".to_string(),
+            ),
+            ("tenant".to_string(), "acme".to_string()),
+            (
+                "x-session-id".to_string(),
+                "custom-session-secret".to_string(),
+            ),
+            (
+                super::CUSTOM_TRACE_ATTRIBUTES_METADATA.to_string(),
+                "tenant,x-session-id".to_string(),
+            ),
+        ]);
+
+        assert_eq!(
+            super::mesh_trace_attributes(&metadata),
+            vec![
+                ("mesh.source.workload".to_string(), "frontend".to_string()),
+                ("tenant".to_string(), "acme".to_string()),
+            ]
+        );
     }
 
     #[test]

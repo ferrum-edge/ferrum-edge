@@ -219,6 +219,7 @@ transform sees different input. See
 | Keep TLS private keys non-extractable where an HSM exists | `pkcs11://` key sources | frontend/admin server keys, backend client keys | [PKCS#11 TLS keys](pkcs11_tls.md) |
 | Source Kubernetes TLS material from Secrets, not files baked into images | `k8s://` sources | cert-manager-managed Secrets | [Kubernetes Secret TLS sources](k8s_cert_manager.md) |
 | Redact anything sensitive your backends echo into logs | `FERRUM_LOG_REDACT_METADATA_KEYS` | your sensitive metadata keys | [Core Settings](configuration.md#core-settings) |
+| Keep metadata values redacted unless you have reviewed the name | `FERRUM_LOG_SAFE_METADATA_KEYS` | only the custom metadata names you have reviewed as non-secret | [Core Settings](configuration.md#core-settings) |
 | Bound the size of any material accepted from a source | `FERRUM_TLS_MAX_MATERIAL_SIZE_BYTES` | leave at the default 4 MiB | [Core Settings](configuration.md#core-settings) |
 
 A provider conflict for one base key (two suffixes on the same variable) is a

@@ -680,6 +680,12 @@ impl Plugin for RequestTransformer {
                             rule.key, new_key
                         );
                         headers.insert(new_key.clone(), val);
+                        // Record the rename so secondary egress
+                        // (request_mirror) can carry credential provenance to
+                        // the new name under its own classifiers.
+                        ctx.plugin_state_mut()
+                            .request_header_rename_lineage
+                            .push((rule.key.clone(), new_key.clone()));
                     }
                 }
             }
@@ -782,6 +788,10 @@ fn apply_query_rules(plugin: &RequestTransformer, ctx: &mut RequestContext) {
                             "request_transformer: renamed query param {} -> {}",
                             rule.key, new_key
                         );
+                        // Record the rename for credential provenance.
+                        ctx.plugin_state_mut()
+                            .request_query_rename_lineage
+                            .push((rule.key.clone(), new_key.clone()));
                     }
                     query_mutated |= changed;
                 }

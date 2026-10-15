@@ -768,6 +768,7 @@ fn target_refs_rejected_on_shared_scope_consumers() {
             port_overrides: HashMap::new(),
         }],
         request_authentications: vec![MeshRequestAuthentication {
+            refused: false,
             name: "ra".to_string(),
             namespace: WAYPOINT_NS.to_string(),
             scope: scope.clone(),

@@ -556,7 +556,9 @@ fn test_flatten_collision_semantics_are_unchanged_by_precomputation() {
             "metadata": { "mode": "flatten", "on_collision": "overwrite" }
         }),
     );
-    assert_eq!(text_at(&overwritten, "client_ip"), Some("from-metadata"));
+    // The overwriting value is the redaction marker: `client_ip` is not an
+    // allowlisted metadata name (fail closed, issue #6619).
+    assert_eq!(text_at(&overwritten, "client_ip"), Some("[REDACTED]"));
 
     // A derived value that was NOT emitted does not reserve its key, so a
     // metadata entry of the same name still lands.
@@ -571,7 +573,7 @@ fn test_flatten_collision_semantics_are_unchanged_by_precomputation() {
         ..grpc_summary()
     };
     let projected = project(&no_backend, derived_flatten.clone());
-    assert_eq!(text_at(&projected, "edge"), Some("from-metadata"));
+    assert_eq!(text_at(&projected, "edge"), Some("[REDACTED]"));
 
     // ...and when it IS emitted, it wins.
     let with_backend = TransactionSummary {

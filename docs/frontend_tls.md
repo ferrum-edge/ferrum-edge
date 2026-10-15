@@ -575,14 +575,18 @@ the bundled webpki roots (not the OS trust store), refuse revoked chains,
 disable session resumption, and follow the backend CRL generation that backend
 TLS live reload publishes. A CA bundle or verifier that cannot be built fails
 closed with an empty trust store. Whether plugin egress enforces CRLs is
-decided at startup: a CRL source first configured later needs a restart. A
-refreshed CRL applies to every **new** plugin connection; a pooled keep-alive
-connection established before the refresh is reused until it closes, unlike
-backend pools, which backend TLS reload drains. Three plugins build dedicated
-reqwest clients and do not apply CRLs: `spec_expose` spec fetches,
-`api_chargeback_sink` when ClickHouse custom TLS (`clickhouse.tls.*`) is
-configured, and `load_testing` loopback traffic with `gateway_tls: true`. All
-three are tracked in issue #6651. The CP gRPC server does enforce the configured
+decided at startup: a CRL source first configured later needs a restart. When
+the CRL generation changes, the plugin clients are rebuilt on their next use,
+so keep-alive connections pooled under the previous generation are retired
+rather than reused, like the backend pools backend TLS reload drains (issue
+#6651); a request already in flight finishes on its connection. The plugins
+that build their own reqwest clients apply the same verifier and retirement
+while they verify the server: `spec_expose` (unless its `tls_no_verify` is
+set), `api_chargeback_sink` with ClickHouse custom TLS (`clickhouse.tls.*`,
+unless `insecure_skip_verify` or `verify_hostname: false`; a configured
+`ca_file` and client identity are kept), and `load_testing` loopback traffic
+with `gateway_tls: true` and `gateway_tls_no_verify: false`. A `load_testing`
+run keeps the client generation it started with. The CP gRPC server does enforce the configured
 CRL when verifying DP client certificates, including on live reload.
 `kafka_logging` uses librdkafka/OpenSSL and maps the CRL source to `ssl.crl.location` instead.
 Skip-verify health probes (`backend_tls_verify_server_cert: false` or

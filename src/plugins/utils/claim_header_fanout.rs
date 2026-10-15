@@ -125,20 +125,8 @@ pub fn parse_claim_headers(
         let raw_header = header_value.as_str().ok_or_else(|| {
             format!("{plugin}: `{field}[{index}].header` must be a header name string")
         })?;
-        let header_name = normalize_bounded_destination(
-            raw_header,
-            field,
-            index,
-            plugin,
-            DestinationMatching::BackendEquivalent,
-        )?;
-        reject_duplicate_destination(
-            &mappings,
-            &header_name,
-            field,
-            plugin,
-            DestinationMatching::BackendEquivalent,
-        )?;
+        let header_name = normalize_bounded_destination(raw_header, field, index, plugin)?;
+        reject_duplicate_destination(&mappings, &header_name, field, plugin)?;
         let metadata_key = format!("{metadata_prefix}{header_name}");
         mappings.push(ClaimHeaderMapping {
             claim_path: parsed_claim_path,
@@ -168,21 +156,6 @@ fn validate_claim_path_bounds(
     Ok(())
 }
 
-/// How strictly a mapping form compares destination names at admission.
-#[derive(Clone, Copy)]
-enum DestinationMatching {
-    /// Exact lowercase names. `output_claim_headers` keeps this: it is also the
-    /// shape mesh translation admits for Istio `outputClaimToHeaders`, and a
-    /// RequestAuthentication refused there is dropped from the published
-    /// configuration rather than failing closed, so its admission must not
-    /// tighten here alone.
-    Exact,
-    /// Also as a CGI-style backend reads the name (`_` folded to `-`), so
-    /// `X_Real_IP` is reserved like `X-Real-IP` and `X_Tenant_Id` duplicates
-    /// `X-Tenant-Id`. Used by `claim_headers` (issue #6620).
-    BackendEquivalent,
-}
-
 /// Normalize a destination header and apply the shared length and strict
 /// reserved-target gates both mapping forms enforce.
 fn normalize_bounded_destination(
@@ -190,7 +163,6 @@ fn normalize_bounded_destination(
     field: &str,
     index: usize,
     plugin: &str,
-    matching: DestinationMatching,
 ) -> Result<String, String> {
     let header_name =
         normalize_allowed_header(raw_header, plugin, &format!("{field}[{index}].header"))?;
@@ -200,13 +172,7 @@ fn normalize_bounded_destination(
              {MAX_OUTPUT_CLAIM_HEADER_NAME_LEN} bytes"
         ));
     }
-    let reserved = match matching {
-        DestinationMatching::Exact => is_output_claim_reserved_header(&header_name),
-        DestinationMatching::BackendEquivalent => {
-            is_output_claim_reserved_header(&backend_equivalence_key(&header_name))
-        }
-    };
-    if reserved {
+    if is_output_claim_reserved_header(&header_name) {
         return Err(format!(
             "{plugin}: `{field}` cannot target framing, provenance, credential-bearing, \
              or gateway-reserved header {header_name:?}"
@@ -223,16 +189,14 @@ fn reject_duplicate_destination(
     header_name: &str,
     field: &str,
     plugin: &str,
-    matching: DestinationMatching,
 ) -> Result<(), String> {
-    if mappings.iter().any(|mapping| match matching {
-        DestinationMatching::Exact => mapping.destination_header == header_name,
-        DestinationMatching::BackendEquivalent => {
-            crate::proxy::headers::field_names_equivalent_for_backends(
-                &mapping.destination_header,
-                header_name,
-            )
-        }
+    // Compare as a CGI-style backend reads the names: `X_Tenant_Id` and
+    // `x-tenant-id` collapse into one variable there.
+    if mappings.iter().any(|mapping| {
+        crate::proxy::headers::field_names_equivalent_for_backends(
+            &mapping.destination_header,
+            header_name,
+        )
     }) {
         return Err(format!(
             "{plugin}: `{field}` declares header {header_name:?} more than once; \
@@ -297,20 +261,8 @@ pub fn parse_claim_header_list(
             .get("header")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("{plugin}: `{field}[{index}].header` must be a string"))?;
-        let header_name = normalize_bounded_destination(
-            raw_header,
-            field,
-            index,
-            plugin,
-            DestinationMatching::Exact,
-        )?;
-        reject_duplicate_destination(
-            &mappings,
-            &header_name,
-            field,
-            plugin,
-            DestinationMatching::Exact,
-        )?;
+        let header_name = normalize_bounded_destination(raw_header, field, index, plugin)?;
+        reject_duplicate_destination(&mappings, &header_name, field, plugin)?;
         mappings.push(ClaimHeaderMapping {
             metadata_key: format!("{metadata_prefix}{header_name}"),
             claim_path,
@@ -619,10 +571,12 @@ pub fn is_reserved_header(name: &str) -> bool {
 /// Both `claim_headers` (object form) and `output_claim_headers` (list form)
 /// enforce this list (issue #6620). It is stricter than [`is_reserved_header`],
 /// which still decides which names the legacy error message calls "reserved".
-/// `claim_headers` also checks the `_`-folded spelling; see
-/// `DestinationMatching`.
+/// Names are compared as a CGI-style backend reads them: `X_Real_IP` is
+/// reserved like `X-Real-IP` (`field_names_equivalent_for_backends`). Mesh
+/// `outputClaimToHeaders` admission uses the same predicate; a
+/// RequestAuthentication it refuses fails closed (issue #6656).
 pub fn is_output_claim_reserved_header(name: &str) -> bool {
-    let lowercase = name.to_ascii_lowercase();
+    let lowercase = backend_equivalence_key(name);
     is_reserved_header(&lowercase)
         || matches!(
             lowercase.as_str(),
@@ -781,22 +735,27 @@ mod tests {
     }
 
     #[test]
-    fn list_form_keeps_exact_destination_matching() {
-        // `output_claim_headers` mirrors mesh `outputClaimToHeaders` admission,
-        // which compares exact names; see `DestinationMatching::Exact`.
-        let mappings = parse_claim_header_list(
-            json!({"output_claim_headers": [
-                {"header": "X-Tenant-Id", "claim": "tenant"},
-                {"header": "X_Tenant_Id", "claim": "role"}
-            ]})
-            .as_object()
-            .expect("object"),
-            "output_claim_headers",
-            "test",
-            "test.",
-        )
-        .expect("exact matching admits distinct spellings");
-        assert_eq!(mappings.len(), 2);
+    fn list_form_folds_underscores_for_reserved_and_duplicate_destinations() {
+        let parse_list = |config: serde_json::Value| {
+            parse_claim_header_list(
+                config.as_object().expect("object"),
+                "output_claim_headers",
+                "test",
+                "test.",
+            )
+        };
+        for reserved in ["X_Real_IP", "X_Forwarded_For", "X_Ferrum_Anything"] {
+            let error =
+                parse_list(json!({"output_claim_headers": [{"header": reserved, "claim": "sub"}]}))
+                    .expect_err("underscore spelling of a reserved destination");
+            assert!(error.contains("reserved"), "{reserved}: {error}");
+        }
+        let error = parse_list(json!({"output_claim_headers": [
+            {"header": "X-Tenant-Id", "claim": "tenant"},
+            {"header": "X_Tenant_Id", "claim": "role"}
+        ]}))
+        .expect_err("underscore-equivalent duplicate destination");
+        assert!(error.contains("more than once"), "{error}");
     }
 
     #[test]
