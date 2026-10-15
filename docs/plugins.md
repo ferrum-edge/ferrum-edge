@@ -5374,13 +5374,13 @@ strip; use it when the intent is to drop the field rather than author one.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, `false`/`null`/`""` disables, or an object may set `max_age` (non-negative unsigned 64-bit integer, default `31536000`; `null` selects the default), `include_subdomains` (bool, default `true`; `null` selects the default), and `preload` (bool, default `false`; `null` selects the default). |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar except protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive), which are rejected at construction. Values must pass downstream HTTP header-value validation. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar except protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive), which are rejected at construction. Values must pass downstream HTTP header-value validation. A `set` entry for `X-Content-Type-Options`, `X-Frame-Options` or `Referrer-Policy` (any case) must use a value the matching built-in option accepts; an empty value is rejected. |
 | `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool or null | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. `null` selects `true`. |
 
 `config` must be an object. Disabling the three built-in headers (`false`/`null`/`""`) while leaving HSTS/CSP/Permissions-Policy unset, `set` empty, and `remove` `[]` or `null` is rejected — the plugin would set and remove nothing.
 
-Custom `content_type_options`, `frame_options` and `referrer_policy` strings are checked against the tokens browsers recognize (ASCII case-insensitive, surrounding spaces and tabs allowed). A browser ignores any other value, so a typo such as `SAMEORGIN` would otherwise drop the protection without any error.
+Custom `content_type_options`, `frame_options` and `referrer_policy` strings, and `set` entries for the same three headers, are checked against the tokens browsers recognize (ASCII case-insensitive, surrounding spaces and tabs allowed). A browser ignores any other value, so a typo such as `SAMEORGIN` would otherwise drop the protection without any error.
 
 ```yaml
 config:

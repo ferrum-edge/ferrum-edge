@@ -678,3 +678,37 @@ fn builtin_header_strings_must_be_tokens_browsers_recognize() {
         );
     }
 }
+
+#[test]
+fn set_entries_for_builtin_headers_use_the_same_token_checks() {
+    for valid in [
+        json!({ "set": { "X-Frame-Options": "deny" } }),
+        json!({ "set": { "x-content-type-options": " nosniff" } }),
+        json!({ "set": { "Referrer-Policy": "no-referrer, strict-origin" } }),
+        json!({ "frame_options": "DENY", "set": { "X-FRAME-OPTIONS": "SAMEORIGIN" } }),
+        json!({ "set": { "X-Other": "SAMEORGIN" } }),
+    ] {
+        SecurityHeaders::new(&valid)
+            .unwrap_or_else(|error| panic!("{valid} must be accepted: {error}"));
+    }
+
+    for invalid in [
+        json!({ "frame_options": "DENY", "set": { "X-Frame-Options": "SAMEORGIN" } }),
+        json!({ "set": { "x-FRAME-options": "ALLOW-FROM https://example.com" } }),
+        json!({ "set": { "X-Frame-Options": "" } }),
+        json!({ "set": { "X-Content-Type-Options": "nosnif" } }),
+        json!({ "content_type_options": false, "set": { "x-content-type-options": " " } }),
+        json!({ "set": { "Referrer-Policy": "strict-origin-when-cross-orign" } }),
+        json!({ "set": { "referrer-policy": "no-referrer; origin" } }),
+    ] {
+        let error =
+            SecurityHeaders::new(&invalid).expect_err(&format!("{invalid} must be rejected"));
+        assert!(
+            error.contains("`set` entry") && error.contains("browsers ignore any other value"),
+            "unexpected error for {invalid}: {error}"
+        );
+        for leaked in ["SAMEORGIN", "ALLOW-FROM", "nosnif\"", "orign"] {
+            assert!(!error.contains(leaked), "error echoes the value: {error}");
+        }
+    }
+}
