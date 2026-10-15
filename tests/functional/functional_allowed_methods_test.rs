@@ -353,15 +353,15 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
         .expect("harness-allocated HTTPS port");
 
     // (path, content-type, exact expected status). gRPC-Web refusals are
-    // answered `200` with the status in a trailer frame; a path-parameter
-    // spelling is refused `400`, or `404` if no route claims it. Either way the
-    // body must be absent.
+    // answered `200` with the status in a trailer frame and keep the
+    // authoritative `Allow`; a path parameter under a routed prefix is refused
+    // `400` (`path_parameter`). The body must be absent in every case.
     let cases: &[(&str, Option<&str>, Option<u16>)] = &[
         ("/allowed", None, Some(405)),
-        ("/allowed", Some("application/grpc-web"), None),
-        ("/allowed", Some("application/grpc-web-text"), None),
+        ("/allowed", Some("application/grpc-web"), Some(200)),
+        ("/allowed", Some("application/grpc-web-text"), Some(200)),
         ("/no-such-route", None, Some(404)),
-        ("/allowed;v=1", None, None),
+        ("/allowed/x;v=1", None, Some(400)),
         // Linux refuses the reserved port at once (502); other hosts drop the
         // SYN until the connect timeout, so only the body is checked there.
         (
@@ -392,7 +392,7 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
             Some(expected) => assert_eq!(got, *expected, "{path} {content_type:?}"),
             None => assert!(got >= 200, "{path} {content_type:?}: unexpected {got}"),
         }
-        if *status == Some(405) {
+        if *status == Some(405) || content_type.is_some() {
             assert_allow_header(response.headers(), &["GET"]);
         }
         if matches!(status, Some(404 | 405)) {
@@ -426,7 +426,7 @@ async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
             Some(expected) => assert_eq!(got, *expected, "{path} {content_type:?}"),
             None => assert!(got >= 200, "{path} {content_type:?}: unexpected {got}"),
         }
-        if *status == Some(405) {
+        if *status == Some(405) || content_type.is_some() {
             assert_allow_header(&response.headers, &["GET"]);
         }
         if matches!(status, Some(404 | 405)) {
