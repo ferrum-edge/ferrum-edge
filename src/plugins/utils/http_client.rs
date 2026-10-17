@@ -273,6 +273,12 @@ pub struct PluginHttpClient {
     /// Plugin-egress CRL verifier when gateway CRLs were configured at
     /// construction; [`Self::with_live_crls`] points it at the live list.
     live_crl_verifier: Option<Arc<LiveCrlServerVerifier>>,
+    /// The gateway's live CRL list as handed to [`Self::with_live_crls`],
+    /// retained even when no shared verifier exists (gateway
+    /// `FERRUM_TLS_NO_VERIFY`, or the shared posture failed to build) so
+    /// always-verifying sinks (SMTP, DTLS) can still follow generations
+    /// with a verifier over their own roots.
+    live_crl_source: Option<crate::tls::SharedCrlList>,
     /// Per-CRL-generation client sets when gateway CRLs are enforced (issue
     /// #6651). When the live CRL generation changes, the next accessor call
     /// builds fresh clients, so connections pooled under the previous
@@ -1486,6 +1492,7 @@ impl PluginHttpClient {
             tls_crls,
             tls_crl_file_path: None,
             tls_crl_source_configured: false,
+            live_crl_source: None,
             live_crl_verifier: match &tls_posture {
                 PluginTlsPosture::CrlEnforced(verifier) => Some(Arc::clone(verifier)),
                 _ => None,
@@ -1563,6 +1570,7 @@ impl PluginHttpClient {
             tls_crl_file_path: None,
             tls_crl_source_configured: false,
             live_crl_verifier: None,
+            live_crl_source: None,
             crl_rotation: None,
             crl_enforcement_configured: false,
             namespace: crate::config::types::DEFAULT_NAMESPACE.to_string(),
@@ -1693,13 +1701,15 @@ impl PluginHttpClient {
     /// until this is called; afterwards each new handshake uses the CRL
     /// generation currently published in `crls`, so a backend TLS live reload
     /// of `FERRUM_TLS_CRL_FILE_PATH` reaches plugin egress too. Clones share
-    /// the verifier, so calling it on any clone applies to all of them. A
-    /// no-op when no CRL was configured at construction or verification is
-    /// disabled.
-    pub fn with_live_crls(self, crls: crate::tls::SharedCrlList) -> Self {
+    /// the verifier, so calling it on any clone applies to all of them. The
+    /// list is retained even when no shared verifier exists (verification
+    /// disabled at construction), so always-verifying sinks can still
+    /// follow it through [`Self::crl_server_verifier`].
+    pub fn with_live_crls(mut self, crls: crate::tls::SharedCrlList) -> Self {
         if let Some(verifier) = &self.live_crl_verifier {
-            verifier.follow(crls);
+            verifier.follow(crls.clone());
         }
+        self.live_crl_source = Some(crls);
         self
     }
 
@@ -1778,6 +1788,42 @@ impl PluginHttpClient {
     /// through a preconfigured rustls verifier (issue #6621).
     pub fn tls_crls(&self) -> &[rustls::pki_types::CertificateRevocationListDer<'static>] {
         &self.tls_crls
+    }
+
+    /// A server verifier over `roots` for a non-HTTP rustls sink (tcp/ws/udp
+    /// logging, LDAP, SMTP) that follows the gateway's live CRL generation
+    /// when one is being followed, instead of freezing the startup snapshot
+    /// [`Self::tls_crls`] into the sink's connector (#6651 item 4). Without a
+    /// live verifier this is exactly the static snapshot verifier the sinks
+    /// built before. Resumption must stay disabled whenever
+    /// [`Self::enforces_gateway_crls`] holds so a resumed handshake cannot
+    /// skip the current generation's `nextUpdate` check.
+    pub fn crl_server_verifier(
+        &self,
+        roots: rustls::RootCertStore,
+    ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, anyhow::Error> {
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match (
+            &self.live_crl_verifier,
+            &self.live_crl_source,
+        ) {
+            (Some(live), _) => Arc::new(live.with_roots(roots)?),
+            (None, Some(source)) => {
+                let verifier = LiveCrlServerVerifier::new(roots, &source.load_full())?;
+                verifier.follow(source.clone());
+                Arc::new(verifier)
+            }
+            (None, None) if !self.tls_crls.is_empty() => {
+                // CRLs were configured at construction but neither a live
+                // verifier nor a live source is available (the shared
+                // posture failed closed): a static snapshot verifier
+                // would silently strand the sink on stale revocations.
+                anyhow::bail!(
+                    "gateway CRLs are configured but no live CRL verifier is available; refusing to build a sink verifier on the static snapshot"
+                );
+            }
+            (None, None) => crate::tls::build_server_verifier_with_crls(roots, &self.tls_crls)?,
+        };
+        Ok(verifier)
     }
 
     /// Filesystem path for `FERRUM_TLS_CRL_FILE_PATH` when a gateway CRL was

@@ -969,6 +969,7 @@ fn build_tls_connector(
         http_client.tls_no_verify(),
         http_client.tls_ca_bundle_path(),
         http_client.tls_crls(),
+        Some(http_client),
     )?;
     Ok(tokio_tungstenite::Connector::Rustls(Arc::new(
         client_config,
@@ -980,6 +981,7 @@ pub(crate) fn build_tls_client_config(
     tls_no_verify: bool,
     ca_bundle_path: Option<&str>,
     crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+    live_source: Option<&PluginHttpClient>,
 ) -> Result<rustls::ClientConfig, String> {
     // Build root certificate store following the gateway's CA trust chain:
     // - Custom CA configured → empty store + only that CA (CA exclusivity)
@@ -1011,16 +1013,35 @@ pub(crate) fn build_tls_client_config(
             .with_no_client_auth()
     } else {
         // Apply gateway CRL list via `build_server_verifier_with_crls`, which
-        // applies the shared `tls::crl_policy`.
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
-            .map_err(|_| "ws_logging: failed to build TLS verifier".to_string())?;
-        let mut config = rustls::ClientConfig::builder()
-            .with_webpki_verifier(verifier)
-            .with_no_client_auth();
-        // The connector is reused across reconnects; resumption would skip the
-        // CRL expiration check on a resumed handshake.
-        crate::tls::apply_crl_enforced_client_resumption(&mut config, crls);
-        config
+        // applies the shared `tls::crl_policy`. With a live source the
+        // verifier follows CRL generations after a backend TLS reload
+        // (#6651) instead of freezing the snapshot list.
+        match live_source {
+            Some(client) => {
+                let verifier = client
+                    .crl_server_verifier(root_store)
+                    .map_err(|_| "ws_logging: failed to build TLS verifier".to_string())?;
+                let mut config = rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_no_client_auth();
+                if client.enforces_gateway_crls() {
+                    config.resumption = rustls::client::Resumption::disabled();
+                }
+                config
+            }
+            None => {
+                let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
+                    .map_err(|_| "ws_logging: failed to build TLS verifier".to_string())?;
+                let mut config = rustls::ClientConfig::builder()
+                    .with_webpki_verifier(verifier)
+                    .with_no_client_auth();
+                // The connector is reused across reconnects; resumption would skip the
+                // CRL expiration check on a resumed handshake.
+                crate::tls::apply_crl_enforced_client_resumption(&mut config, crls);
+                config
+            }
+        }
     };
 
     if tls_no_verify {

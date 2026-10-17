@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Rustls log/LDAP/SMTP sinks now follow live CRL generations** (issue
+  #6651, item 4). `tcp_logging`, `ws_logging`, `udp_logging` (DTLS),
+  `ldap_auth` and the email notification channel built their verifiers
+  from the startup CRL snapshot, so a backend TLS live reload of
+  `FERRUM_TLS_CRL_FILE_PATH` never reached them and an expired snapshot
+  `nextUpdate` stranded their handshakes until restart. They now install
+  `PluginHttpClient::crl_server_verifier`, which follows the same live
+  CRL list as the shared plugin HTTP clients (resumption stays disabled
+  while CRLs are enforced). Without a live verifier the previous static
+  snapshot behavior is unchanged.
+
 - **Validation plugin-construction clients now resolve through the
   screened DNS resolver** (issue #6651, item 2). The CP admission sweep,
   transaction-log schema graph validation, plugin security-composition

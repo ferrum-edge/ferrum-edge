@@ -822,12 +822,15 @@ impl EmailChannel {
     async fn tls_connector(&self, http: &PluginHttpClient) -> Result<TlsConnector, SmtpFailure> {
         let ca_bundle_path = http.tls_ca_bundle_path().map(str::to_string);
         let crls: Vec<CertificateRevocationListDer<'static>> = http.tls_crls().to_vec();
+        let live_source = http.clone();
         let config = self
             .tls_config
             .get_or_try_init(move || async move {
-                tokio::task::spawn_blocking(move || build_client_config(ca_bundle_path, crls))
-                    .await
-                    .map_err(|_| SmtpFailure::TlsSetup)?
+                tokio::task::spawn_blocking(move || {
+                    build_client_config(ca_bundle_path, crls, Some(live_source))
+                })
+                .await
+                .map_err(|_| SmtpFailure::TlsSetup)?
             })
             .await?;
         Ok(TlsConnector::from(Arc::clone(config)))
@@ -843,6 +846,7 @@ impl EmailChannel {
 pub(crate) fn build_client_config(
     ca_bundle_path: Option<String>,
     crls: Vec<CertificateRevocationListDer<'static>>,
+    live_source: Option<PluginHttpClient>,
 ) -> Result<Arc<rustls::ClientConfig>, SmtpFailure> {
     let root_store = match ca_bundle_path.as_deref() {
         Some(path) => {
@@ -865,19 +869,42 @@ pub(crate) fn build_client_config(
         None => rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
     };
 
-    let verifier = crate::tls::build_server_verifier_with_crls(root_store, &crls)
-        .map_err(|_| SmtpFailure::TlsSetup)?;
     // Pin the build-selected provider explicitly so the channel does not depend
     // on a globally installed default (unit tests build channels without startup).
-    let mut config =
+    let builder =
         rustls::ClientConfig::builder_with_provider(Arc::new(crate::fips::base_crypto_provider()))
             .with_safe_default_protocol_versions()
-            .map_err(|_| SmtpFailure::TlsSetup)?
-            .with_webpki_verifier(verifier)
-            .with_no_client_auth();
-    // The config is cached across sends; resumption would skip the CRL
-    // expiration check on a resumed handshake.
-    crate::tls::apply_crl_enforced_client_resumption(&mut config, &crls);
+            .map_err(|_| SmtpFailure::TlsSetup)?;
+    // With a live source the verifier follows CRL generations after a
+    // backend TLS reload (#6651) instead of freezing the snapshot list; the
+    // cached config still serves every later send through that verifier.
+    let config = match &live_source {
+        Some(client) => {
+            let verifier = client
+                .crl_server_verifier(root_store)
+                .map_err(|_| SmtpFailure::TlsSetup)?;
+            let mut config = builder
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+            // SMTP always verifies, even under gateway FERRUM_TLS_NO_VERIFY,
+            // so its resumption posture follows the CRLs it actually
+            // enforces here, not the shared client's enforcement flag.
+            if client.enforces_gateway_crls() || !crls.is_empty() {
+                config.resumption = rustls::client::Resumption::disabled();
+            }
+            config
+        }
+        None => {
+            let verifier = crate::tls::build_server_verifier_with_crls(root_store, &crls)
+                .map_err(|_| SmtpFailure::TlsSetup)?;
+            let mut config = builder.with_webpki_verifier(verifier).with_no_client_auth();
+            // The config is cached across sends; resumption would skip the CRL
+            // expiration check on a resumed handshake.
+            crate::tls::apply_crl_enforced_client_resumption(&mut config, &crls);
+            config
+        }
+    };
     Ok(Arc::new(config))
 }
 

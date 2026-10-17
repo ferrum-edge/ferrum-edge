@@ -239,13 +239,16 @@ pub mod _test_support {
 
         let config = match surface {
             "tcp_logging" => {
-                let connector = tcp_logging::build_tls_connector(no_verify, ca, crls)?;
+                let connector = tcp_logging::build_tls_connector(no_verify, ca, crls, None)?;
                 Arc::clone(connector.config())
             }
-            "ws_logging" => Arc::new(ws_logging::build_tls_client_config(no_verify, ca, crls)?),
-            "ldap_auth" => ldap_auth::build_ldap_tls_config(no_verify, ca, crls)?,
+            "ws_logging" => Arc::new(ws_logging::build_tls_client_config(
+                no_verify, ca, crls, None,
+            )?),
+            "ldap_auth" => ldap_auth::build_ldap_tls_config(no_verify, ca, crls, None)?,
             "email" if !no_verify => {
-                let config = email::build_client_config(ca.map(str::to_string), crls.to_vec());
+                let config =
+                    email::build_client_config(ca.map(str::to_string), crls.to_vec(), None);
                 config.map_err(|error| format!("{error:?}"))?
             }
             other => return Err(format!("unsupported CRL-enforcing surface {other:?}")),

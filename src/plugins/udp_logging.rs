@@ -322,6 +322,7 @@ fn parse_udp_logging_config(
             dtls_ca_cert_path.as_deref(),
             dtls_no_verify,
             http_client.tls_crls(),
+            Some(http_client),
         )?))
     } else {
         None
@@ -350,6 +351,7 @@ pub(crate) fn materialize_dtls_material(
     ca_path: Option<&str>,
     no_verify: bool,
     crls: &[CertificateRevocationListDer<'static>],
+    live_source: Option<&PluginHttpClient>,
 ) -> Result<CachedDtlsMaterial, String> {
     let certificate = if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
         crate::dtls::load_dtls_certificate(cert_path, key_path).map_err(|error| {
@@ -390,12 +392,16 @@ pub(crate) fn materialize_dtls_material(
         };
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|_| format!("udp_logging: invalid DTLS server name for `host`: {host:?}"))?;
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
-            .map_err(|_| "udp_logging: DTLS verifier build failed".to_string())?;
-        (
-            Some(server_name),
-            Some(verifier as Arc<dyn rustls::client::danger::ServerCertVerifier>),
-        )
+        // With a live source the verifier follows CRL generations after a
+        // backend TLS reload (#6651) instead of freezing the snapshot list.
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match live_source {
+            Some(client) => client
+                .crl_server_verifier(root_store)
+                .map_err(|_| "udp_logging: DTLS verifier build failed".to_string())?,
+            None => crate::tls::build_server_verifier_with_crls(root_store, crls)
+                .map_err(|_| "udp_logging: DTLS verifier build failed".to_string())?,
+        };
+        (Some(server_name), Some(verifier))
     };
 
     Ok(CachedDtlsMaterial {
@@ -491,6 +497,7 @@ pub(crate) fn validate_dtls_file_dependencies(config: &Map<String, Value>) -> Re
         key.ca_path.as_deref(),
         key.no_verify,
         &[],
+        None,
     )
     .map(|_| ())
 }
@@ -509,6 +516,7 @@ pub(crate) fn validate_dtls_file_dependencies_cached(
             key.ca_path.as_deref(),
             key.no_verify,
             &[],
+            None,
         )
         .map(|_| ())
     };
@@ -552,6 +560,7 @@ pub(crate) fn duplicate_dtls_materialization_probe_for_test(
                 key.ca_path.as_deref(),
                 key.no_verify,
                 &[],
+                None,
             )
             .map(|_| ())
         };
