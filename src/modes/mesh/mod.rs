@@ -14309,7 +14309,14 @@ fn scope_request_auth_refusal_to_inbound_routes(
     let mut inbound: Vec<String> = config
         .proxies
         .iter()
-        .filter(|proxy| proxy.namespace == runtime.namespace && is_mesh_inbound_route_id(&proxy.id))
+        .filter(|proxy| {
+            proxy.namespace == runtime.namespace
+                && (is_mesh_inbound_route_id(&proxy.id)
+                    // An EgressGateway's materialized `mesh-egress-*` HTTP
+                    // proxies are its inbound HTTP execution routes.
+                    || (runtime.topology == MeshTopology::EgressGateway
+                        && proxy.id.starts_with("mesh-egress-")))
+        })
         .map(|proxy| proxy.id.clone())
         .collect();
     if runtime.topology.has_inbound_tls_termination_listener() {
@@ -36180,8 +36187,20 @@ mod tests {
             &runtime.namespace,
         );
         scope_request_auth_refusal_to_inbound_routes(&mut bare, &runtime);
-        assert!(bare.plugin_configs[0].trigger.is_none());
+        // Even with no materialized inbound route, a Sidecar still serves
+        // inbound HBONE through the synthesized relays, so the refusal is
+        // scoped to exactly those ids rather than left unscoped.
         assert!(bare.plugin_configs[0].enabled);
+        let trigger =
+            serde_json::to_value(bare.plugin_configs[0].trigger.as_ref().expect("scoped trigger"))
+                .expect("trigger serializes");
+        assert_eq!(
+            trigger["when"]["match"]["proxy_id"],
+            serde_json::json!([
+                MESH_INBOUND_HBONE_RELAY_PROXY_ID,
+                MESH_INGRESS_HBONE_RELAY_PROXY_ID,
+            ])
+        );
 
         // More inbound routes than one `proxy_id` leaf may list: the trigger
         // is an `any` of chunked leaves that the plugin cache accepts.
@@ -36251,6 +36270,19 @@ mod tests {
                 "udp",
                 now,
             ));
+            if topology == MeshTopology::EgressGateway {
+                // Its materialized HTTP proxies are its inbound execution
+                // routes and must carry the refusal too.
+                config.proxies.push(node_waypoint_udp_listener_proxy(
+                    "mesh-egress-default-ext-api_dot_example_dot_com-443",
+                    &runtime.namespace,
+                    "upstream",
+                    18080,
+                    false,
+                    "tcp",
+                    now,
+                ));
+            }
             force_ensure_global_plugin(
                 &mut config,
                 MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
@@ -36281,6 +36313,12 @@ mod tests {
                     && !ids.contains(&"__mesh-outbound-reviews-9080"),
                 "{topology:?}: {ids:?}"
             );
+            if topology == MeshTopology::EgressGateway {
+                assert!(
+                    ids.contains(&"mesh-egress-default-ext-api_dot_example_dot_com-443"),
+                    "{ids:?}"
+                );
+            }
         }
 
         let runtime = MeshRuntimeConfig {

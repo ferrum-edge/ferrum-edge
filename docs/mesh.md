@@ -2720,7 +2720,8 @@ be resolved), and the data plane installs a forced `request_termination`
 instance (`__mesh_request_auth_refused`) that answers every HTTP request to those
 workloads with `503` until the resource is fixed. The refusal is scoped to the
 workload's inbound execution routes, so its outbound requests keep flowing:
-the materialized Sidecar inbound routes plus the synthesized HBONE relay
+the materialized Sidecar inbound routes, an EgressGateway's `mesh-egress-*`
+HTTP proxies, plus the synthesized HBONE relay
 proxies (`__mesh-inbound-hbone-relay` / `__mesh-ingress-connect-relay`), whose
 CONNECT admission runs the global HTTP plugin chain before the tunnel opens.
 On Ambient (and NodeWaypoint/ServiceWaypoint) no inbound HTTP route
