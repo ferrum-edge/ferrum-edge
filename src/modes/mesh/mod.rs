@@ -14288,8 +14288,20 @@ fn inject_mesh_request_auth_plugin(
 /// entering this workload. RequestAuthentication governs requests to the
 /// selected workload, so its outbound requests to healthy peers must keep
 /// flowing. Runs after inbound and outbound routes are materialized: the
-/// refusal is gated by a trigger on exactly the mesh inbound route ids, and
-/// with no inbound route it matches nothing.
+/// refusal is gated by a trigger on exactly the inbound execution ids.
+///
+/// Inbound execution is wider than the materialized Sidecar inbound
+/// routes: on Ambient, NodeWaypoint, and ServiceWaypoint (and Sidecar
+/// ingress remaps), inbound HTTP arrives as an HBONE CONNECT whose
+/// route miss synthesizes a relay proxy with a fixed id
+/// ([`MESH_INBOUND_HBONE_RELAY_PROXY_ID`] /
+/// [`MESH_INGRESS_HBONE_RELAY_PROXY_ID`]) and runs the global HTTP
+/// plugin chain before opening the tunnel, so `request_termination`
+/// refuses the CONNECT there. Those synthesized ids are therefore part
+/// of the inbound set on every topology with an HBONE inbound listener
+/// (all but EastWestGateway's SNI passthrough). Without them the
+/// refusal fell back to unscoped on Ambient and refused the workload's
+/// *outbound* requests instead (issue #6736).
 fn scope_request_auth_refusal_to_inbound_routes(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -14297,9 +14309,20 @@ fn scope_request_auth_refusal_to_inbound_routes(
     let mut inbound: Vec<String> = config
         .proxies
         .iter()
-        .filter(|proxy| proxy.namespace == runtime.namespace && is_mesh_inbound_route_id(&proxy.id))
+        .filter(|proxy| {
+            proxy.namespace == runtime.namespace
+                && (is_mesh_inbound_route_id(&proxy.id)
+                    // An EgressGateway's materialized `mesh-egress-*` HTTP
+                    // proxies are its inbound HTTP execution routes.
+                    || (runtime.topology == MeshTopology::EgressGateway
+                        && proxy.id.starts_with("mesh-egress-")))
+        })
         .map(|proxy| proxy.id.clone())
         .collect();
+    if runtime.topology.has_inbound_tls_termination_listener() {
+        inbound.push(MESH_INBOUND_HBONE_RELAY_PROXY_ID.to_string());
+        inbound.push(MESH_INGRESS_HBONE_RELAY_PROXY_ID.to_string());
+    }
     inbound.sort();
     inbound.dedup();
     let Some(refusal) = config.plugin_configs.iter_mut().find(|plugin| {
@@ -36146,7 +36169,11 @@ mod tests {
             .expect("trigger serializes");
         assert_eq!(
             trigger["when"]["match"]["proxy_id"],
-            serde_json::json!(["__mesh-inbound-api-8080"])
+            serde_json::json!([
+                "__mesh-inbound-api-8080",
+                MESH_INBOUND_HBONE_RELAY_PROXY_ID,
+                MESH_INGRESS_HBONE_RELAY_PROXY_ID,
+            ])
         );
         assert!(refusal.enabled);
 
@@ -36160,8 +36187,24 @@ mod tests {
             &runtime.namespace,
         );
         scope_request_auth_refusal_to_inbound_routes(&mut bare, &runtime);
-        assert!(bare.plugin_configs[0].trigger.is_none());
+        // Even with no materialized inbound route, a Sidecar still serves
+        // inbound HBONE through the synthesized relays, so the refusal is
+        // scoped to exactly those ids rather than left unscoped.
         assert!(bare.plugin_configs[0].enabled);
+        let trigger = serde_json::to_value(
+            bare.plugin_configs[0]
+                .trigger
+                .as_ref()
+                .expect("scoped trigger"),
+        )
+        .expect("trigger serializes");
+        assert_eq!(
+            trigger["when"]["match"]["proxy_id"],
+            serde_json::json!([
+                MESH_INBOUND_HBONE_RELAY_PROXY_ID,
+                MESH_INGRESS_HBONE_RELAY_PROXY_ID,
+            ])
+        );
 
         // More inbound routes than one `proxy_id` leaf may list: the trigger
         // is an `any` of chunked leaves that the plugin cache accepts.
@@ -36198,7 +36241,105 @@ mod tests {
             .iter()
             .map(|leaf| leaf["match"]["proxy_id"].as_array().expect("ids").len())
             .sum();
-        assert_eq!(listed, route_count);
+        assert_eq!(listed, route_count + 2);
+    }
+
+    /// Issue #6736: Ambient and the other HBONE-relay topologies
+    /// materialize no inbound HTTP routes, but their inbound CONNECTs
+    /// synthesize a relay proxy and run the global HTTP chain, so the
+    /// refusal scopes to the synthesized relay ids there — refusing
+    /// inbound CONNECTs without touching the workload's outbound routes.
+    /// EastWestGateway (SNI passthrough, no HBONE listener) keeps the
+    /// unscoped fail-closed fallback.
+    #[test]
+    fn request_auth_refusal_scopes_to_synthesized_hbone_relays() {
+        let now = chrono::Utc::now();
+        for topology in [
+            MeshTopology::Ambient,
+            MeshTopology::NodeWaypoint,
+            MeshTopology::ServiceWaypoint,
+            MeshTopology::EgressGateway,
+        ] {
+            let runtime = MeshRuntimeConfig {
+                topology,
+                ..test_mesh_runtime_config()
+            };
+            let mut config = GatewayConfig::default();
+            config.proxies.push(node_waypoint_udp_listener_proxy(
+                "__mesh-outbound-reviews-9080",
+                &runtime.namespace,
+                "upstream",
+                18080,
+                false,
+                "udp",
+                now,
+            ));
+            if topology == MeshTopology::EgressGateway {
+                // Its materialized HTTP proxies are its inbound execution
+                // routes and must carry the refusal too.
+                config.proxies.push(node_waypoint_udp_listener_proxy(
+                    "mesh-egress-default-ext-api_dot_example_dot_com-443",
+                    &runtime.namespace,
+                    "upstream",
+                    18080,
+                    false,
+                    "tcp",
+                    now,
+                ));
+            }
+            force_ensure_global_plugin(
+                &mut config,
+                MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+                "request_termination",
+                serde_json::json!({"status_code": 503}),
+                &runtime.namespace,
+            );
+            scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+            let refusal = config
+                .plugin_configs
+                .iter()
+                .find(|plugin| plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID)
+                .unwrap_or_else(|| panic!("{topology:?} keeps the refusal"));
+            let trigger = serde_json::to_value(
+                refusal
+                    .trigger
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{topology:?} scopes the refusal")),
+            )
+            .expect("trigger serializes");
+            let ids = trigger["when"]["match"]["proxy_id"]
+                .as_array()
+                .expect("proxy_id leaf");
+            let ids: Vec<&str> = ids.iter().filter_map(|id| id.as_str()).collect();
+            assert!(
+                ids.contains(&MESH_INBOUND_HBONE_RELAY_PROXY_ID)
+                    && ids.contains(&MESH_INGRESS_HBONE_RELAY_PROXY_ID)
+                    && !ids.contains(&"__mesh-outbound-reviews-9080"),
+                "{topology:?}: {ids:?}"
+            );
+            if topology == MeshTopology::EgressGateway {
+                assert!(
+                    ids.contains(&"mesh-egress-default-ext-api_dot_example_dot_com-443"),
+                    "{ids:?}"
+                );
+            }
+        }
+
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::EastWestGateway,
+            ..test_mesh_runtime_config()
+        };
+        let mut config = GatewayConfig::default();
+        force_ensure_global_plugin(
+            &mut config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+        assert!(config.plugin_configs[0].enabled);
+        assert!(config.plugin_configs[0].trigger.is_none());
     }
 
     #[tokio::test]

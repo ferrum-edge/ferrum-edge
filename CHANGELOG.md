@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A refused `RequestAuthentication` is now scoped to synthesized HBONE
+  relay routes on Ambient and the other relay topologies** (issue #6736).
+  Only Sidecar materializes inbound HTTP routes, so on Ambient the
+  inbound-route trigger found nothing and the `__mesh_request_auth_refused`
+  fallback stayed unscoped, refusing the workload's *outbound* requests.
+  Inbound HBONE CONNECTs synthesize a relay proxy and run the global HTTP
+  plugin chain before the tunnel opens; the refusal trigger now includes
+  those fixed relay proxy ids on every topology with an HBONE inbound
+  listener, so it refuses inbound CONNECTs without touching outbound
+  routes. EastWestGateway keeps the unscoped fail-closed fallback.
+
 ### Security
 
 - **Plugin execution triggers that read `query` now refuse an unencoded `;`**
