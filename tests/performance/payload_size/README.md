@@ -346,20 +346,26 @@ The backend echoes each request body back with the same `Content-Type` header an
 
 ## Analysis
 
-### Scorecard: Ferrum Edge wins vs Envoy wins (94 test points)
+### Scorecard: Ferrum Edge wins vs Envoy wins (86 result rows, 85 comparable)
+
+Counts are taken from the Winner column of the tables above. The UDP 4KB row is
+excluded from the comparable total: Envoy completed no requests there (0 RPS),
+which the current harness would mark `INVALID` rather than score (see
+[Run validity](#run-validity)). Each row is a single 10 s run on one macOS
+host, so small deltas are within run-to-run noise.
 
 | Protocol | Ferrum Wins | Envoy Wins | Tie | Key Pattern |
 |---|---|---|---|---|
 | HTTP/1.1 JSON | 3 | 3 | 0 | Ferrum wins 10KB, 1MB (+47.5%), 9MB (+20.5%); Envoy wins 50KB-100KB, 5MB |
 | HTTP/1.1 octet-stream | 2 | 4 | 0 | Ferrum wins 10KB, 9MB (+16.0%); Envoy wins 50KB-1MB, 5MB |
 | HTTP/1.1 ndjson | 2 | 4 | 0 | Ferrum wins 10KB, 9MB (+29.2%); Envoy wins 50KB-1MB, 5MB |
-| HTTP/1.1 (tier 2+3: multipart, form, xml, soap, graphql) | 10 | 8 | 0 | Ferrum wins 10KB + 9MB; some 1MB wins (SOAP +34.4%) |
-| HTTP/2 (3 content types) | 10 | 7 | 1 | Ferrum dominates >=100KB (+10-24%); Envoy dominates 10KB-50KB |
+| HTTP/1.1 (tier 2+3: multipart, form, xml, soap, graphql) | 12 | 18 | 0 | Ferrum wins 10KB and 9MB on all five, plus 1MB multipart (+2.3%) and SOAP (+34.4%); Envoy wins every 50KB, 100KB and 5MB row and the other 1MB rows |
+| HTTP/2 (3 content types) | 10 | 7 | 1 | Ferrum wins every 1MB-9MB row (+17.8% to +23.5%) and JSON 100KB (+10.3%); 100KB is a tie for octet-stream and an Envoy win for ndjson (-2.7%); Envoy wins every 10KB-50KB row |
 | gRPC | 3 | 3 | 0 | Ferrum wins 100KB, 1MB, 5MB (H2 response coalescing); Envoy wins 10KB, 50KB, 9MB |
 | WebSocket | 5 | 1 | 0 | Ferrum dominates: 10KB, 100KB, 1MB (+62.8%), 5MB, 9MB; Envoy only wins 50KB |
 | TCP | 1 | 3 | 0 | Ferrum wins 10KB (+8.1%); splice(2) on Linux for additional gains on plaintext paths |
-| UDP | 1 | 3 | 0 | Envoy 61-67% faster at small datagrams; fails at 4KB |
-| **Total** | **37** | **36** | **1** | |
+| UDP | 0 | 3 | 0 | Envoy 61-67% faster at 64B-1KB. 4KB not scored: Envoy completed no requests (Ferrum 78,802 RPS) |
+| **Total** | **38** | **46** | **1** | 85 comparable rows; UDP 4KB excluded |
 
 ### Where Ferrum Edge Wins
 
@@ -373,11 +379,11 @@ The backend echoes each request body back with the same `Content-Type` header an
 
 5. **TCP 10KB (+8.1%)** — Ferrum's raw TCP proxy with adaptive buffer sizing and `TCP_NODELAY` achieves sub-millisecond P50 (1.01ms) and excellent P99 (1.31ms vs Envoy's 1.75ms). TCP 1MB shifted to a near-tie with Envoy winning by 0.7%.
 
-6. **UDP 4KB** — Envoy still fails to proxy 4KB datagrams (0 RPS), while Ferrum handles them at 79K RPS.
+6. **UDP 4KB (not scored)** — Envoy completed no requests in this run (0 RPS) while Ferrum handled 79K RPS. A zero-success run is invalid under the current harness, so this row shows that the Envoy configuration did not proxy 4KB datagrams here, not a measured throughput comparison.
 
 ### Where Envoy Wins
 
-1. **HTTP/1.1 50KB-100KB** — Envoy maintains a 8-30% throughput advantage at these mid-range sizes. Envoy's `writev`/scatter-gather I/O moves buffer slices through the proxy pipeline without data copying, while Ferrum's reqwest-to-hyper streaming path has per-chunk async iteration overhead. The adaptive buffering threshold (256 KB minimum) intentionally does not buffer these smaller bodies because streaming's read-write pipelining benefits outweigh the iteration cost at this size.
+1. **HTTP/1.1 50KB-100KB** — Envoy maintains a 8-30% throughput advantage at these mid-range sizes. Envoy's `writev`/scatter-gather I/O moves buffer slices through the proxy pipeline without data copying, while Ferrum's HTTP/1.1 backend dispatch at this revision (2026-04-10) was the reqwest-to-hyper streaming path, with per-chunk async iteration overhead. Current builds dispatch eligible HTTP/1.1 requests on the direct HTTP/1.1 pool instead (`FERRUM_POOL_HTTP1_DIRECT`, default `true`, #5961), which these results predate. The adaptive buffering threshold (256 KB minimum) intentionally does not buffer these smaller bodies because streaming's read-write pipelining benefits outweigh the iteration cost at this size.
 
 2. **UDP small datagrams (61-67%)** — Envoy uses GRO (Generic Receive Offload) for kernel-level datagram batching. The gap widened slightly from 53-55% in the previous baseline. Ferrum's `recvmmsg(2)` batched recv is Linux-only; macOS falls back to per-datagram `try_recv_from`. Re-benchmark on Linux to measure gap closure.
 
@@ -396,7 +402,7 @@ While Envoy often wins on raw RPS at 50KB-100KB, **Ferrum consistently delivers 
 - WebSocket 10KB: Ferrum P99 = 1.53ms vs Envoy P99 = 6.83ms (4.5x better)
 - WebSocket 1MB: Ferrum P99 = 117.18ms vs Envoy P99 = 70.21ms (Envoy better, but Ferrum 63% higher RPS)
 
-The P99 advantage is most pronounced on HTTP/1.1 across all content types, where Ferrum delivers 2-5x tighter tail latency. This means Ferrum provides more predictable latency under load — critical for SLA-sensitive API traffic where P99 matters more than peak throughput.
+The P99 advantage is most pronounced on HTTP/1.1 at 10KB-100KB, where Ferrum delivers 2-5x tighter tail latency. At 1MB and above the picture is mixed (for example JSON 1MB and 5MB, where Envoy's P99 is lower). This means Ferrum provides more predictable latency under load — critical for SLA-sensitive API traffic where P99 matters more than peak throughput.
 
 ### Optimization History
 
@@ -419,10 +425,28 @@ The P99 advantage is most pronounced on HTTP/1.1 across all content types, where
 - ~~UDP datagram batching (60% gap)~~ — `recvmmsg(2)` on Linux via `FERRUM_UDP_RECVMMSG_BATCH_SIZE=64`
 
 **Remaining optimization targets**:
-1. **HTTP/1.1 body forwarding at 50KB-100KB** — reqwest's buffer copying still adds overhead vs Envoy's `writev`. A direct hyper H1 client bypass could close this gap
+1. **HTTP/1.1 body forwarding at 50KB-100KB** — at this revision reqwest's buffer copying added overhead vs Envoy's `writev`. The direct hyper H1 pool has since shipped (#5961, default on); re-run these sizes to measure whether it closes the gap
 2. **gRPC small payloads (10KB-50KB)** — gRPC 10KB regressed to -9.1% vs Envoy; the per-request overhead of new optimizations may need profiling at small payload sizes
 3. **UDP small datagrams on macOS** — gap widened to 61-67%; Linux `recvmmsg` benchmarks needed to validate the optimization
 
 ### Content Type Independence
 
-A key positive finding: **Ferrum's proxy is truly content-type agnostic**. JSON, XML, SOAP+XML, GraphQL, multipart, form-urlencoded, octet-stream, and NDJSON all perform within 5% of each other at every payload size. The gateway does not parse, buffer differently, or add overhead based on Content-Type. This confirms the design principle that the proxy hot path treats all content as opaque bytes.
+Ferrum's proxy hot path does not parse or buffer differently by `Content-Type`:
+the benchmark configs set `plugins: []`, so every content type rides the same
+opaque-bytes path. The measured throughput is **not** uniform across content
+types, though. Across the eight HTTP/1.1 content types (tiers 1-3):
+
+| Size | Lowest RPS | Highest RPS | Spread |
+|---|---|---|---|
+| 10KB | 77,863 (multipart) | 90,503 (JSON) | 16% |
+| 50KB | 37,903 (form) | 48,476 (JSON) | 28% |
+| 100KB | 20,944 (form) | 23,900 (JSON) | 14% |
+| 1MB | 1,717 (XML) | 2,635 (JSON) | 53% |
+| 5MB | 238 (GraphQL) | 254 (JSON) | 7% |
+| 9MB | 101 (SOAP) | 136 (JSON, multipart) | 35% |
+
+Spread is (highest - lowest) / lowest. Because each row is one 10 s run, these
+differences mix payload-shape effects (for example multipart boundaries and
+backend echo cost) with run-to-run noise; they are not evidence of
+content-type-specific gateway processing, but the results also do not support
+a "within 5%" claim.
