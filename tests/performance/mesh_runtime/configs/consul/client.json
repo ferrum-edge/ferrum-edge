@@ -1,0 +1,1 @@
+{"service": {"name": "client", "id": "client-1", "port": 18081, "connect": {"sidecar_service": {"port": 21001, "proxy": {"upstreams": [{"destination_name": "svc", "local_bind_port": 15101}]}}}}}

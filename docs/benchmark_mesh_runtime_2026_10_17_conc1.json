@@ -1,0 +1,155 @@
+{
+  "arm_status": {
+    "consul": {
+      "detail": "echo probe passed",
+      "mesh": "consul",
+      "status": "ready"
+    },
+    "direct": {
+      "detail": "echo probe passed",
+      "mesh": "direct",
+      "status": "ready"
+    },
+    "envoy": {
+      "detail": "echo probe passed",
+      "mesh": "envoy",
+      "status": "ready"
+    },
+    "ferrum": {
+      "detail": "echo probe passed",
+      "mesh": "ferrum",
+      "status": "ready"
+    }
+  },
+  "meshes": {
+    "consul": {
+      "1024": {
+        "latency_avg_us": 120,
+        "median_rps": 8232.0,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/conc1-summary/consul/run_1/consul_http1_1024.json",
+        "median_run_rps": 8232.0,
+        "p50_us": 120,
+        "p95_us": 131,
+        "p99_us": 139,
+        "publishable_runs": 1,
+        "rps_max": 8232.0,
+        "rps_min": 8232.0,
+        "runs": [
+          {
+            "concurrency": 1,
+            "duration_secs": 3,
+            "latency_avg_us": 120,
+            "p50_us": 120,
+            "p95_us": 131,
+            "p99_us": 139,
+            "publishable": true,
+            "resources": null,
+            "rps": 8232.0,
+            "source_file": "/Users/jeremyjustus/mesh-results/conc1-summary/consul/run_1/consul_http1_1024.json",
+            "total_bytes": 25288704,
+            "total_errors": 0,
+            "total_requests": 24696
+          }
+        ],
+        "throughput_mbps_median": 8.43
+      }
+    },
+    "direct": {
+      "1024": {
+        "latency_avg_us": 36,
+        "median_rps": 26775.666666666668,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/conc1-summary/direct/run_1/direct_http1_1024.json",
+        "median_run_rps": 26775.666666666668,
+        "p50_us": 38,
+        "p95_us": 42,
+        "p99_us": 45,
+        "publishable_runs": 1,
+        "rps_max": 26775.666666666668,
+        "rps_min": 26775.666666666668,
+        "runs": [
+          {
+            "concurrency": 1,
+            "duration_secs": 3,
+            "latency_avg_us": 36,
+            "p50_us": 38,
+            "p95_us": 42,
+            "p99_us": 45,
+            "publishable": true,
+            "resources": null,
+            "rps": 26775.666666666668,
+            "source_file": "/Users/jeremyjustus/mesh-results/conc1-summary/direct/run_1/direct_http1_1024.json",
+            "total_bytes": 82254848,
+            "total_errors": 0,
+            "total_requests": 80327
+          }
+        ],
+        "throughput_mbps_median": 27.42
+      }
+    },
+    "envoy": {
+      "1024": {
+        "latency_avg_us": 168,
+        "median_rps": 5890.666666666667,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/conc1-summary/envoy/run_1/envoy_http1_1024.json",
+        "median_run_rps": 5890.666666666667,
+        "p50_us": 171,
+        "p95_us": 198,
+        "p99_us": 215,
+        "publishable_runs": 1,
+        "rps_max": 5890.666666666667,
+        "rps_min": 5890.666666666667,
+        "runs": [
+          {
+            "concurrency": 1,
+            "duration_secs": 3,
+            "latency_avg_us": 168,
+            "p50_us": 171,
+            "p95_us": 198,
+            "p99_us": 215,
+            "publishable": true,
+            "resources": null,
+            "rps": 5890.666666666667,
+            "source_file": "/Users/jeremyjustus/mesh-results/conc1-summary/envoy/run_1/envoy_http1_1024.json",
+            "total_bytes": 18096128,
+            "total_errors": 0,
+            "total_requests": 17672
+          }
+        ],
+        "throughput_mbps_median": 6.03
+      }
+    },
+    "ferrum": {
+      "1024": {
+        "latency_avg_us": 243,
+        "median_rps": 4091.0,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/conc1-summary/ferrum/run_1/ferrum_http1_1024.json",
+        "median_run_rps": 4091.0,
+        "p50_us": 244,
+        "p95_us": 261,
+        "p99_us": 280,
+        "publishable_runs": 1,
+        "rps_max": 4091.0,
+        "rps_min": 4091.0,
+        "runs": [
+          {
+            "concurrency": 1,
+            "duration_secs": 3,
+            "latency_avg_us": 243,
+            "p50_us": 244,
+            "p95_us": 261,
+            "p99_us": 280,
+            "publishable": true,
+            "resources": null,
+            "rps": 4091.0,
+            "source_file": "/Users/jeremyjustus/mesh-results/conc1-summary/ferrum/run_1/ferrum_http1_1024.json",
+            "total_bytes": 12567552,
+            "total_errors": 0,
+            "total_requests": 12273
+          }
+        ],
+        "throughput_mbps_median": 4.19
+      }
+    }
+  },
+  "warnings": []
+}

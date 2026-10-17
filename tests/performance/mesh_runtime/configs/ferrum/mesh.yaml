@@ -1,0 +1,44 @@
+# Shared localized mesh document for the Ferrum arm (docs/mesh.md,
+# "File-Based SVIDs: Two-Process Local Mesh"). Both Ferrum processes read
+# this file with FERRUM_MESH_CONFIG_PROTOCOL=file; each recognizes its own
+# SPIFFE ID as local and materializes inbound vs egress routes accordingly.
+mesh:
+  workloads:
+    - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/svc
+      service_name: svc
+      namespace: ferrum
+      trust_domain: cluster.local
+      service_account: svc
+      addresses:
+        - 127.0.0.1
+      ports:
+        - port: 18080
+          protocol: http
+          name: http
+      selector:
+        labels:
+          app: svc
+        namespace: ferrum
+  services:
+    - name: svc
+      namespace: ferrum
+      ports:
+        - port: 18080
+          protocol: http
+          name: http
+      workloads:
+        - spiffe_id: spiffe://cluster.local/ns/ferrum/sa/svc
+  peer_authentications:
+    - name: mesh-strict
+      namespace: ferrum
+      mtls_mode: strict
+  # Access logging is disabled in EVERY arm (Envoy access_log: [] too) so
+  # the benchmark measures mesh data-plane cost, not per-request log
+  # serialization. FERRUM_LOG_LEVEL does not control the injected
+  # stdout_logging plugin; this Telemetry switch does.
+  telemetry_resources:
+    - name: bench-no-access-log
+      namespace: ferrum
+      config:
+        access_logging:
+          enabled: false
