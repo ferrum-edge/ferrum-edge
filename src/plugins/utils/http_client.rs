@@ -1847,8 +1847,14 @@ impl PluginHttpClient {
     /// unapproved crypto provider.
     ///
     /// The returned client uses pooled connections - no per-call overhead.
-    /// Prefer [`execute`] over calling `.send()` directly so that slow
-    /// outbound calls are automatically logged with the destination URL.
+    /// Pass builders from this client through [`execute`] /
+    /// [`execute_redacted`] rather than calling `.send()` directly: reqwest
+    /// skips the `DnsCacheResolver` for IP-literal hosts, so the literal-IP
+    /// egress screen, slow-call logging and retry policy live in those
+    /// helpers. The only sanctioned direct `.send()` paths are dedicated
+    /// clients whose immutable destination was screened at admission
+    /// (`screen_url_host_egress`), with redirects disabled and the screened
+    /// resolver wired (issue #6651 item 1 premise audit).
     /// Use [`execute_redacted`] instead when the URL itself contains a secret
     /// token, such as incoming-webhook URLs.
     ///
