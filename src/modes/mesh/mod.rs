@@ -36191,9 +36191,13 @@ mod tests {
         // inbound HBONE through the synthesized relays, so the refusal is
         // scoped to exactly those ids rather than left unscoped.
         assert!(bare.plugin_configs[0].enabled);
-        let trigger =
-            serde_json::to_value(bare.plugin_configs[0].trigger.as_ref().expect("scoped trigger"))
-                .expect("trigger serializes");
+        let trigger = serde_json::to_value(
+            bare.plugin_configs[0]
+                .trigger
+                .as_ref()
+                .expect("scoped trigger"),
+        )
+        .expect("trigger serializes");
         assert_eq!(
             trigger["when"]["match"]["proxy_id"],
             serde_json::json!([
