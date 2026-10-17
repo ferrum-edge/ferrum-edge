@@ -120,7 +120,7 @@ jobs:
           for m in $all_meshes; do
             case " $BENCH_SKIP_MESHES " in
               *" $m "*) ;;
-              *) meshes="$meshes $m" ;;
+              *) meshes="${meshes:+$meshes }$m" ;;
             esac
           done
           all_sizes="1024 10240 71680 512000 1048576 5242880"
@@ -128,11 +128,9 @@ jobs:
           for sz in $all_sizes; do
             case " $BENCH_SKIP_PAYLOAD_SIZES " in
               *" $sz "*) ;;
-              *) sizes="$sizes $sz" ;;
+              *) sizes="${sizes:+$sizes }$sz" ;;
             esac
           done
-          meshes=$(echo "$meshes" | xargs)
-          sizes=$(echo "$sizes" | xargs)
           echo "meshes=$meshes" >> "$GITHUB_OUTPUT"
           echo "payload_sizes=$sizes" >> "$GITHUB_OUTPUT"
           echo "Arms: $meshes"
@@ -186,7 +184,8 @@ jobs:
       - name: Force-cleanup any leaked containers
         if: always()
         run: |
-          docker ps -aq --filter "name=meshbench-" | xargs -r docker rm -f 2>/dev/null || true
+          leaked=$(docker ps -aq --filter "name=meshbench-")
+          if [ -n "$leaked" ]; then docker rm -f $leaked 2>/dev/null || true; fi
 
       - name: Render combined summary
         if: always()
