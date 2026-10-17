@@ -122,7 +122,7 @@ contains hyperium/h2#965 and #956.) To retire the crate after both patches are
 superseded:
 
 1. Remove the `h2` line from `[patch.crates-io]` in `Cargo.toml`, `tests/performance/mesh/Cargo.toml` and `fuzz/Cargo.toml`.
-2. Drop `vendor/h2-0.4.20-ferrum-patched/` and update the three lockfiles.
+2. Update the three lockfiles (`Cargo.lock`, `fuzz/Cargo.lock`, `tests/performance/mesh/Cargo.lock`), then drop `vendor/h2-0.4.20-ferrum-patched/`.
 3. Point the H2 guard lane (`tests/performance/multi_protocol/h2_guard/prepare.py`) back at the registry h2.
 4. Remove the inventory row and the `docs/vendored-patch-lifecycle.json` entry.
 5. Regenerate the drift manifest.

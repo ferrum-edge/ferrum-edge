@@ -356,10 +356,13 @@ than applying part of a graph. Individual resource endpoints
 (`POST /proxies`, `POST /consumers`, …) are unaffected. See
 [docs/admin_batch_api.md](admin_batch_api.md#atomicity-guarantee).
 
-A batch transaction is bounded by the server's oplog entry size (16 MB by
-default) and `transactionLifetimeLimitSeconds`; a request that exceeds either
-fails atomically (nothing applied), so split very large imports into several
-`POST /batch` requests.
+A batch is bounded by Ferrum's 1 MiB admin request-body limit, by MongoDB's
+16 MiB per-document / per-oplog-entry limit (a transaction spans as many oplog
+entries as it needs, so this is not a cap on the whole transaction), and by
+`transactionLifetimeLimitSeconds`. A request that exceeds any of them fails
+atomically (nothing applied); split very large imports into several
+`POST /batch` requests, each atomic on its own. See
+[docs/admin_batch_api.md](admin_batch_api.md#atomicity-guarantee).
 
 Without a replica set, hand-managed proxies still use a fail-safe sequential
 ordering: the proxy document is deleted **before** its plugin configs, so a
@@ -440,12 +443,34 @@ available.
 ```bash
 # Start a single-node replica set for development
 docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0
-docker exec mongo-rs mongosh --eval "rs.initiate()"
 
-# Configure Ferrum Edge
+# Wait for mongod to accept connections
+until docker exec mongo-rs mongosh --quiet --eval "db.adminCommand('ping').ok" >/dev/null 2>&1; do sleep 1; done
+
+# Initiate with an explicit member address the HOST can reach. A bare
+# rs.initiate() advertises the container hostname, which a client on the host
+# cannot resolve, so replica-set discovery from the host would fail even
+# though the seed localhost:27017 connects.
+docker exec mongo-rs mongosh --quiet --eval \
+  'rs.initiate({_id: "rs0", members: [{_id: 0, host: "localhost:27017"}]})'
+
+# Wait until the member has been elected primary
+until docker exec mongo-rs mongosh --quiet --eval "db.hello().isWritablePrimary" | grep -q true; do sleep 1; done
+
+# Configure Ferrum Edge (running on the host)
 FERRUM_DB_URL="mongodb://localhost:27017/ferrum?replicaSet=rs0"
 FERRUM_MONGO_REPLICA_SET=rs0
 ```
+
+`localhost:27017` works as the member address here because it resolves to the
+same mongod both inside the container and, through the published port, on the
+host. This only suits a single-node development set with Ferrum on the same
+host. If Ferrum runs in another container, use a member hostname both sides
+can resolve, such as a shared Docker network alias. Alternatively, for this
+single-endpoint development case only, append `&directConnection=true` to the
+URL to skip discovery. Do not use `directConnection=true` for the production
+replica set below, where the driver must discover and fail over between
+members.
 
 ### Production Replica Set
 
@@ -597,7 +622,13 @@ metadata:
   name: ferrum-edge
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-edge
   template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-edge
     spec:
       containers:
         - name: ferrum-edge

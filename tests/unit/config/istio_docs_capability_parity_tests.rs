@@ -292,6 +292,8 @@ fn configuration_md_rejects_stale_istio_capability_claims() {
         "what is missing is the Kubernetes watcher/RBAC/status path",
         "but it is not in `ISTIO_CRDS` and the status writer does not patch it",
         "all nine watched/translated Istio kinds",
+        "wildcard `notPorts` patterns fail closed at translation",
+        "literal `notPorts` only",
     ];
     for phrase in stale {
         assert!(

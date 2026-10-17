@@ -875,6 +875,12 @@ nodeAgent:
   # it when UDP capture is enabled.
   podRegistryDir: /run/ferrum/node-waypoint-pods
   cgroupRoot: /sys/fs/cgroup
+  # Host bpffs mount (hostPath) shared by the node-agent and the ambient
+  # NodeWaypoint proxy. Inside both containers it is always mounted at
+  # /sys/fs/bpf, because Ferrum's pinned maps live at fixed
+  # /sys/fs/bpf/ferrum/* paths that the node-agent writes and the proxy reads.
+  # Override this only when the node mounts bpffs somewhere other than
+  # /sys/fs/bpf.
   bpfFsPath: /sys/fs/bpf
   admin:
     # Enables the read-only node-agent admin listener for /health and /metrics.

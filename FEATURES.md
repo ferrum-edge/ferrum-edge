@@ -501,7 +501,7 @@ cargo build --release --features secrets-vault,secrets-aws
 
 ### TLS and Trust
 
-**Cloud backends (AWS, GCP, Azure)** use **rustls** (pure-Rust TLS) with the compile-time Mozilla CA bundle (`webpki-roots`) and the OS certificate store (`rustls-native-certs`). No OpenSSL or system-specific TLS libraries are required. These SDKs connect to public cloud API endpoints whose certificates are already trusted by the Mozilla CA bundle — no additional TLS configuration is needed.
+**Cloud backends (AWS, GCP, Azure)** use **rustls** (pure-Rust TLS); no OpenSSL is required. Ferrum does not install its own trust store into the AWS or GCP clients — each uses its SDK's default HTTPS client, so the root source is whatever that SDK selects. The Azure Key Vault client, when `FERRUM_TLS_CA_BUNDLE_PATH` is unset, likewise uses the Azure SDK's default `reqwest` client, which verifies against the platform trust store (the OS keychain on macOS/Windows, the host CA bundle on Linux); on Linux a missing or empty host CA bundle fails closed rather than falling back to a bundled root set. Public cloud API endpoints chain to widely trusted public CAs, so no extra TLS configuration is needed as long as the image ships CA certificates (the published distroless images do).
 
 **HashiCorp Vault** also uses rustls, but since Vault is often deployed on-premises with a private CA, the gateway respects `FERRUM_TLS_CA_BUNDLE_PATH`. If this variable points to a PEM-encoded CA bundle, the Vault client will trust certificates signed by those CAs in addition to the default trust store. This is the same CA bundle variable used by the gateway's backend proxy connections.
 

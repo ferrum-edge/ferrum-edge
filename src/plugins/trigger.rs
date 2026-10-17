@@ -184,6 +184,12 @@ impl PluginTriggerGate {
         self.compiled.http_only_field()
     }
 
+    /// Whether the compiled predicate reads a `query` field. The plugin cache
+    /// folds this into `PluginCapabilities::HAS_QUERY_READING_TRIGGER`.
+    pub fn reads_query(&self) -> bool {
+        self.compiled.reads_query()
+    }
+
     /// Decide whether this instance runs for `ctx`, memoizing the outcome.
     ///
     /// Returns `true` to run. An identity-reading trigger asked at

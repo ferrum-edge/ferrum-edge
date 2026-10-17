@@ -4889,6 +4889,8 @@ paths:
         structural `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]`
         markers, with userinfo replaced by `redacted@`. All values of arbitrary
         header maps and webhook body templates are replaced by `[REDACTED]`, as are
+        every `request_transformer` `rules[].value`, every
+        `mesh_route_dispatch` `rules[].request_transform[].value`,
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
@@ -10523,7 +10525,10 @@ components:
             `headers`, proxy_alerts channel `headers`,
             api_chargeback_sink `clickhouse.insert_query_params`) is replaced
             by `[REDACTED]`, as are `serverless_function.azure_function_key`,
-            proxy_alerts channel `body_template`, and every
+            proxy_alerts channel `body_template`, every request_transformer
+            `rules[].value` and mesh_route_dispatch
+            `rules[].request_transform[].value` (written into the upstream
+            request, so they may carry a backend credential), and every
             `kafka_logging.producer_config` property outside the safe-tuning
             allow-list. Mesh `workload_metrics` tracing-provider collector
             URLs receive the same structural projection. `redis_integrity_key`
@@ -19221,16 +19226,22 @@ components:
     AdminMetricsConnectionPools:
       type: object
       description: |
-        Connection pool sizes for all four protocol pools. Each pool reuses
-        connections to backend services to avoid TCP/TLS handshake overhead.
+        Sizes of the backend client and connection pools. `http` counts cached
+        reqwest client entries rather than sockets, and some transports (the
+        direct HTTP/1.1 pool, HBONE inner pools, Unix-socket backends) are not
+        reported here.
       properties:
         http:
           type: object
-          description: HTTP/1.1 connection pool (reqwest-based, supports HTTP and HTTPS backends)
+          description: |
+            Shared reqwest client cache. Each entry is one cached client that owns
+            its own internal socket pool; live socket counts are not exposed.
+            Eligible HTTP/1.1 traffic uses the separate direct HTTP/1.1 pool
+            (FERRUM_POOL_HTTP1_DIRECT, default true) and is not counted here.
           properties:
             total_pools:
               type: integer
-              description: Number of distinct backend host:port:protocol pool entries
+              description: Number of resident cached client entries (one per distinct pool key)
             max_idle_per_host:
               type: integer
               description: Maximum idle connections kept per host (from FERRUM_POOL_MAX_IDLE_PER_HOST)
@@ -19241,7 +19252,11 @@ components:
               type: object
               additionalProperties:
                 type: integer
-              description: Map of pool key (host:port:tls) to connection count
+              description: |
+                Map of opaque, pipe-separated pool key (starting `d=<host>:<port>`
+                or `u=<upstream_id>`) to `1` for each resident client entry. The
+                value is always 1 and is not a connection count; the key layout
+                is internal and may change between releases.
         grpc:
           type: object
           description: gRPC HTTP/2 connection pool (h2c + h2 with trailer support)
@@ -29911,10 +29926,20 @@ components:
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             not:
               pattern: "^(?:[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]|[Kk][Ee][Ee][Pp]-[Aa][Ll][Ii][Vv][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]-[Cc][Oo][Nn][Nn][Ee][Cc][Tt][Ii][Oo][Nn]|[Tt][Ee]|[Tt][Rr][Aa][Ii][Ll][Ee][Rr]|[Tt][Rr][Aa][Nn][Ss][Ff][Ee][Rr]-[Ee][Nn][Cc][Oo][Dd][Ii][Nn][Gg]|[Uu][Pp][Gg][Rr][Aa][Dd][Ee])$"
+          patternProperties:
+            '^[Xx]-[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]-[Oo][Pp][Tt][Ii][Oo][Nn][Ss]$':
+              type: string
+              pattern: '^[\t ]*[Nn][Oo][Ss][Nn][Ii][Ff][Ff][\t ]*$'
+            '^[Xx]-[Ff][Rr][Aa][Mm][Ee]-[Oo][Pp][Tt][Ii][Oo][Nn][Ss]$':
+              type: string
+              pattern: '^[\t ]*(?:[Dd][Ee][Nn][Yy]|[Ss][Aa][Mm][Ee][Oo][Rr][Ii][Gg][Ii][Nn])[\t ]*$'
+            '^[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Pp][Oo][Ll][Ii][Cc][Yy]$':
+              type: string
+              pattern: '^[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*(?:,[\t ]*(?:[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]-[Ww][Hh][Ee][Nn]-[Dd][Oo][Ww][Nn][Gg][Rr][Aa][Dd][Ee]|[Nn][Oo]-[Rr][Ee][Ff][Ee][Rr][Rr][Ee][Rr]|[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Aa][Mm][Ee]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]-[Ww][Hh][Ee][Nn]-[Cc][Rr][Oo][Ss][Ss]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Ss][Tt][Rr][Ii][Cc][Tt]-[Oo][Rr][Ii][Gg][Ii][Nn]|[Uu][Nn][Ss][Aa][Ff][Ee]-[Uu][Rr][Ll])[\t ]*)*$'
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
-          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
+          description: "Arbitrary response headers to set (name -> value). An entry for X-Content-Type-Options, X-Frame-Options or Referrer-Policy (case-insensitive name) must carry a value the matching built-in option accepts (`nosniff`; `DENY` or `SAMEORIGIN`; a comma-separated list of Referrer-Policy tokens), since browsers ignore any other value; an empty value is rejected. Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:

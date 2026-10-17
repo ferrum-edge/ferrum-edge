@@ -64,16 +64,18 @@ When `response_body_mode: stream` is active and no plugin requires buffering, th
 
 This means the client sees the first byte of the response as soon as the backend sends it, rather than waiting for the entire response to be collected — unless adaptive buffering applies.
 
-The H1/H2 frontend and routing handler store boxed concrete futures. Routing
-also boxes each selected backend attempt; generic dispatch boxes its selected
-large transport child. These boxes keep child state out of enclosing coroutine
-poll frames and add heap allocations: one
-frontend box per request beyond the existing routing box, one per attempt,
-and one per selected generic transport. They run in the original request task,
-preserving task-local affinity, cancellation, and request/response/body/backend
-guards. Coroutine-size checks complement
-real default-stack listener tests; a boxed async trampoline alone would still
-embed its awaited child and would not establish a small poll frame.
+The frontend admission wrapper, ordinary HTTP backend attempts (initial and
+retry), and the direct H1/H2 dispatch children are constructed out of line
+without a per-request heap box. The large routing handler keeps its box, as do
+the remaining large children — gRPC attempts, HBONE / mesh-mTLS attempts and
+other large transport and connection-setup futures — so only those add an
+allocation per request or attempt. Every one of them runs in the original
+request task, preserving task-local affinity, cancellation, and
+request/response/body/backend guards. See
+[request_lifetime_dispatch.md](request_lifetime_dispatch.md#request-future-stack-boundaries)
+for the canonical boundary list. Coroutine-size checks complement real
+default-stack listener tests; a boxed async trampoline alone would still embed
+its awaited child and would not establish a small poll frame.
 
 ### Small Response Buffering
 
@@ -165,9 +167,17 @@ response_body_mode = buffer?
             └─ No →
                 Retries configured?
                     └─ Yes → stream on every attempt when the proxy streams
-                       (retry decides from headers alone; a retryable attempt
-                       drops its undrained body before client commit). Buffer
-                       only when response_body_mode/plugins force buffering.
+                       (HTTP/1.1 and HTTP/2 frontends; retry decides from
+                       headers alone; a retryable attempt drops its undrained
+                       body before client commit). Buffer only when
+                       response_body_mode/plugins force buffering. The H3
+                       cross-protocol bridge behaves the same; when the
+                       initial attempt uses the native QUIC pool (plain HTTP
+                       to a non-mesh H3 target, not reqwest-forced), the
+                       native handler's retry loop
+                       buffers its attempts, even ones rotated onto non-H3
+                       targets, and plain-HTTP mesh attempts from H3 are
+                       always buffered (see Interaction with Retry Logic).
                     └─ No → continue
                 Response size limit enabled?
                     └─ Yes →
@@ -993,8 +1003,9 @@ once.
 
 When retry is configured on a proxy, the gateway must be able to inspect the response status code before deciding whether to retry. That decision is made entirely at response-header time — `retry::should_retry` consults only the status code, the connection-error flag, the error class, and the request method — so retry does not require reading a response body:
 
-- **Every attempt**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
+- **Every attempt (HTTP/1.1 and HTTP/2 frontends)**: When the proxy is configured for streaming (and no plugin forces buffering), the streaming decision is preserved on the initial attempt *and on every retry attempt*. An attempt whose headers select a retry drops its undrained backend response before a single byte reaches the client, and the next attempt is dispatched with the same streaming intent. A response that succeeds on an earlier attempt — an SSE stream served after one retryable `503`, say — therefore still streams (issue #2949).
 - **Buffered proxies**: When `response_body_mode: buffer` or a plugin forces buffering, attempts are buffered instead. Inherently streaming responses may still be released to stream after headers through the all-plugin opt-in described above; a retryable status is discarded before any bytes reach the client.
+- **HTTP/3 frontend**: Which retry loop runs is decided by how the **initial** attempt is dispatched. Unless the H3 handler dispatches the initial attempt on the native QUIC pool (a plain-HTTP request to an H3-capable, non-mesh target that is not deadline-bound gRPC-Web and that no plugin forces onto reqwest), the H3 cross-protocol bridge (`http3/cross_protocol.rs`) runs the retry loop — this includes gRPC, reqwest-forced requests and non-H3 targets, even when the target also supports H3 — decides every attempt from headers, and streams like the H1/H2 frontends — for its reqwest (HTTP/1.1, HTTP/2) and gRPC response paths. Plain-HTTP attempts to mesh targets (HBONE or sidecar mesh-mTLS) are the exception: the bridge sends them through a buffered mesh dispatch, so their responses are collected whole whether or not retries are configured. When the initial attempt is dispatched on the native QUIC pool, the native H3 handler's retry loop runs instead and, with retries configured, buffers each attempt's response — including attempts that rotate onto a non-H3 target, which it sends through the buffered reqwest retry path (or the buffered mesh dispatch for a mesh target). Its one exception is the **initial** attempt, which may still stream an inherently streaming response when every plugin opts in to releasing it after headers; every retry attempt after that is buffered.
 - **After streaming begins**: On any attempt, a failure that occurs once response bytes have been committed downstream cannot be retried.
 
 ```
@@ -1067,7 +1078,7 @@ HTTP/3 responses support **streaming** across three distinct paths. See [docs/ht
 - **Request body** — streamed via a bounded `tokio::sync::mpsc` bridge into `reqwest::Body::wrap_stream` for `Plain` flavor. Mirrors the H1/H2 plugin-driven policy: stream by default, buffer only when a plugin pre-collected the body. Bridge capacity is `FERRUM_HTTP3_REQUEST_BODY_CHANNEL_CAPACITY` (default 32). `Grpc` flavor streams request DATA and trailers through a bounded channel into `GrpcBody::Channel` when no retry, body plugin, or pre-buffered body requires replay; otherwise it keeps the buffered representation.
 - **Response body** — streamed frame-by-frame with the same `http3_coalesce_*` window as the native H3 writer, so QUIC frame cadence is identical across dispatch kinds. `Plain` polls `reqwest::Response::chunk()`; `Grpc` polls hyper `Incoming::frame()` so trailer frames split off for `RequestStream::send_trailers()`.
 
-On the H3 frontend, when plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`) or retries are configured, responses fall back to **buffered** mode with full `on_response_body` and `transform_response_body` plugin hook support (subject to the after-headers release described in [Response-Header-Aware Downgrade](#response-header-aware-downgrade-after-response-headers)).
+On the H3 frontend, when plugins require response body access (e.g., `ai_token_metrics`, `response_transformer`), or when retries are configured and the initial attempt runs on the native H3 handler's retry loop (native QUIC pool), responses fall back to **buffered** mode with full `on_response_body` and `transform_response_body` plugin hook support (subject to the after-headers release described in [Response-Header-Aware Downgrade](#response-header-aware-downgrade-after-response-headers)).
 
 ### gRPC
 

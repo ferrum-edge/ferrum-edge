@@ -180,7 +180,7 @@ bash -n .github/scripts/run_h1_tls_post_comparison.sh
 Issue [#5537](https://github.com/ferrum-edge/ferrum-edge/issues/5537) item 4
 asks what the gateway-owned request-upload relay costs on this workload, and
 whether a fully buffered upload can be handed to the backend transport without
-it. This section records the answer, derived by static inspection of
+it. This section records the answer as of 2026-09-16, derived by static inspection of
 `src/proxy/mod.rs`, `src/proxy/body.rs`, `src/proxy/upload_pump.rs` and the
 harness, so a later attribution round does not have to re-derive it.
 
@@ -192,8 +192,17 @@ The workload's POST body is **streamed**, not buffered. Four facts decide it:
   `requires_request_body_buffering` and `has_effective_http_retries` are both
   false and `stream_request_body` is true.
 - `proto_backend`'s HTTPS listener on port 3447 advertises only `http/1.1` in
-  ALPN, so the backend capability registry can never mark it direct-H2 or H3;
-  the dispatch runs through the reqwest pool.
+  ALPN, so the backend capability registry can never mark it direct-H2 or H3.
+  When this analysis was written (2026-09-16) the dispatch therefore ran
+  through the reqwest pool. Since the direct HTTP/1.1 pool landed
+  ([#5961](https://github.com/ferrum-edge/ferrum-edge/pull/5961), on by
+  default via `FERRUM_POOL_HTTP1_DIRECT=true`, which the harness does not
+  override), a streamed request to this backend is dispatched on the direct
+  HTTP/1.1 pool once the capability registry records that the backend lacks
+  TLS HTTP/2; only requests sent before that record exists still use the
+  reqwest pool. The direct pool wraps the upload in the same `CountingIncoming`
+  and `install_counting_upload_authorization` relay, so the conclusions below
+  about the bridged relay hold for both.
 - `.github/scripts/h1_tls_post_comparison.py` sets
   `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`, so that dispatch takes the
   `CountingIncoming` arm rather than `SizeLimitedIncoming`.
@@ -258,8 +267,8 @@ request:
   `Incoming`, both optional `Sleep`s and the `select!` state.
 - **Per DATA frame: one task hand-off the direct body does not have.** The
   relay is polled by the frontend connection task (inline, through the
-  dispatcher's header race) while the body is polled by reqwest's connection
-  task, so every frame crosses a semaphore acquire/release pair, an
+  dispatcher's header race) while the body is polled by the backend
+  connection task (reqwest's, or the direct HTTP/1.1 pool's hyper connection), so every frame crosses a semaphore acquire/release pair, an
   intrusive-list push and pop, and both wakers.
 - **Per relay-loop iteration while the watermark is armed:** one clock read and
   one `Sleep::reset()` — a timer-wheel deregistration and reinsertion — plus one

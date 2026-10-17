@@ -254,6 +254,16 @@ intentionally public. For `response_caching`, the default
 therefore incompatible with a trigger; set it to `false` for a triggered cache
 instance.
 
+A `query` predicate splits pairs only on `&`. When any instance on a request's
+plugin chain carries a trigger that reads `query` (at any depth, including under
+`not`), a request whose raw query contains an unencoded `;` is refused with
+`400` (`semicolon_separator`; native gRPC: `INVALID_ARGUMENT`) before any plugin
+phase runs, because backends that also split on `;` (Rack before 3.0, Go before
+1.17, Python before 3.9.2) would read parameters the trigger never evaluated.
+`%3B` is an unambiguous literal `;` and is accepted. Chains whose triggers read
+no `query` field are unaffected. This matches the `mesh_route_dispatch`
+`match.query_params` rule.
+
 See [Per-Instance Execution Triggers](plugin_execution_order.md#per-instance-execution-triggers)
 for the full predicate table, the deterministic absent/multi-value/case rules,
 the decide-once phase model, the fail-closed composition rules, and the bounds.
@@ -1503,7 +1513,7 @@ latency fields remain `-1.0`; a configured target in such a record is not proof
 that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
 phase or gateway admission gate that rejected the request. Possible values
 include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
-`route_protocol_admission`, `grpc_backend_error`, and
+`route_protocol_admission`, `query_trigger_admission`, `grpc_backend_error`, and
 `websocket_backend_error`. Gateway-generated gRPC
 errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
 sinks can distinguish gRPC failures even though the downstream HTTP status is
@@ -1518,6 +1528,7 @@ Terminal transaction logging is independent of ordinary request hooks:
 | Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
 | Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
 | Matched proxy whose native-gRPC or WebSocket plugin view omits an HTTP-only authentication or admission plugin, a plain HTTP or WebSocket request (other than a bodiless CORS preflight that the route's `cors` plugin answers) to a gRPC-intended route whose own chain carries a gRPC-only admission plugin such as `grpc_method_router`, or a gRPC-Web request whose composed view cannot run a gRPC-only admission plugin (see [Protocol Support](plugin_execution_order.md#protocol-support)) | 403 (native gRPC: trailers-only `PERMISSION_DENIED`) | Emitted once with `rejection_phase: "route_protocol_admission"` | Not run |
+| Matched proxy whose plugin chain carries an execution trigger that reads `query`, and whose raw query contains an unencoded `;` (`%3B` is accepted) | 400 (native gRPC: trailers-only `INVALID_ARGUMENT`) | Emitted once with `rejection_phase: "query_trigger_admission"` | Not run |
 | Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
@@ -5374,13 +5385,13 @@ strip; use it when the intent is to drop the field rather than author one.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, `false`/`null`/`""` disables, or an object may set `max_age` (non-negative unsigned 64-bit integer, default `31536000`; `null` selects the default), `include_subdomains` (bool, default `true`; `null` selects the default), and `preload` (bool, default `false`; `null` selects the default). |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar except protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive), which are rejected at construction. Values must pass downstream HTTP header-value validation. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar except protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive), which are rejected at construction. Values must pass downstream HTTP header-value validation. A `set` entry for `X-Content-Type-Options`, `X-Frame-Options` or `Referrer-Policy` (any case) must use a value the matching built-in option accepts; an empty value is rejected. |
 | `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool or null | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. `null` selects `true`. |
 
 `config` must be an object. Disabling the three built-in headers (`false`/`null`/`""`) while leaving HSTS/CSP/Permissions-Policy unset, `set` empty, and `remove` `[]` or `null` is rejected — the plugin would set and remove nothing.
 
-Custom `content_type_options`, `frame_options` and `referrer_policy` strings are checked against the tokens browsers recognize (ASCII case-insensitive, surrounding spaces and tabs allowed). A browser ignores any other value, so a typo such as `SAMEORGIN` would otherwise drop the protection without any error.
+Custom `content_type_options`, `frame_options` and `referrer_policy` strings, and `set` entries for the same three headers, are checked against the tokens browsers recognize (ASCII case-insensitive, surrounding spaces and tabs allowed). A browser ignores any other value, so a typo such as `SAMEORGIN` would otherwise drop the protection without any error.
 
 ```yaml
 config:
@@ -5937,7 +5948,7 @@ Media types outside `content_types` / `response_content_types`, and allowlisted 
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor (independent of required-field initialization, which is always enforced) |
 | `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Positive maximum decompressed gRPC protobuf payload size for request and response validation; zero is rejected so compressed input is always bounded. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer greater than zero; otherwise falls back to 10 MiB (10485760). Hard ceiling 67108864 (64 MiB): a larger configured value is rejected, and an environment-inherited value above it is clamped. |
 
-**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
+**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`. The compressed payload must be exactly one gzip member: trailing bytes or a second concatenated member (which a multistream decoder downstream would also read) fail validation, as does a compression flag other than 0 or 1.
 
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
@@ -7260,7 +7271,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 
 **Metadata and metrics:** `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`, and `ai_federation_provider` use the same transaction keys as `ai_token_metrics`. Prometheus authorization for token and cost series is carried separately in private typed request state, so backend, serverless, workload-tag, and custom-header metadata cannot mint trusted usage. Federation provider types are normalized to the bounded OpenAI, Anthropic, Google, Cohere, Mistral, or Bedrock metric families without changing the raw `ai_provider` metadata consumed by logs and policy plugins. Circuit observations use `ai_federation_circuit_last_provider`, `ai_federation_circuit_last_state`, `ai_federation_circuit_open_skips`, and `ai_federation_circuit_half_open_probes`. `/metrics` exposes the provider-name-free `ferrum_ai_federation_circuits_open` gauge and `ferrum_ai_federation_circuits_{opened,closed}_total`, `ferrum_ai_federation_circuit_half_open_probes_total`, and `ferrum_ai_federation_circuit_open_skips_total` counters. Removing/reloading an open configured circuit decrements the gauge; transition/probe logs carry only the restricted provider name, never an endpoint or credential. When `multimodal_mode: text_only_with_warning` drops non-text parts, the plugin also writes `ai_federation_multimodal_mode`, `ai_federation_multimodal_dropped_parts`, `ai_federation_multimodal_dropped_types`, `ai_federation_multimodal_dropped_roles`, and `ai_federation_multimodal_provider`.
 
-**TLS trust chain:** Because this plugin bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`, it uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY` and `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) do not apply. With a gateway CRL configured and verification on, provider certificates are checked against it and trust comes from `FERRUM_TLS_CA_BUNDLE_PATH` or, without it, the bundled webpki roots rather than the OS store; a refreshed CRL also retires pooled connections (see [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach)). For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
+**TLS trust chain:** Buffered (non-streaming) federation bypasses the normal proxy dispatch and makes outbound HTTP calls via the shared `PluginHttpClient`. An eligible `stream: true` request with the `streaming` block enabled instead commits the selected provider as a route override — scheme, host, port, absolute path, authority, a cleared upstream and DNS override, and a default-verify TLS override with no client certificate or per-proxy CA — and is then sent by the **normal proxy dispatch path**. Either way federation uses **global TLS settings only** — `FERRUM_TLS_CA_BUNDLE_PATH`, `FERRUM_TLS_NO_VERIFY` and `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE`. Per-proxy backend TLS overrides (`backend_tls_server_ca_cert_path`, `backend_tls_client_cert_path`, `backend_tls_verify_server_cert`) do not apply. With a gateway CRL configured and verification on, provider certificates are checked against it and trust comes from `FERRUM_TLS_CA_BUNDLE_PATH` or, without it, the bundled webpki roots rather than the OS store; a refreshed CRL also retires pooled connections (see [Surfaces CRLs do not reach](frontend_tls.md#surfaces-crls-do-not-reach)). For providers behind private endpoints (e.g., Azure Private Link, VPC endpoints), add the internal CA to the global CA bundle PEM file. Note that when `FERRUM_TLS_CA_BUNDLE_PATH` is set, webpki/system roots are excluded (CA exclusivity) — include public root CAs in the bundle if some providers are public and others use internal CAs.
 
 `base_url` requires HTTPS by default. Set `allow_plaintext: true` only for an explicitly trusted cleartext endpoint; this does not enable redirect following. URL userinfo, queries, and fragments are rejected so credentials remain in dedicated fields. Azure resource/deployment/API-version, Vertex region/project, AWS region, and request-selected path models use strict component grammars. Google service-account OAuth is pinned to `https://oauth2.googleapis.com/token`. Logs use redacted endpoint placeholders, and every shared-client construction path disables ambient HTTP proxy discovery, including the policy-preserving fallback builders. The repository-wide ambient-proxy advisory remains open for dedicated plugin clients outside this shared client.
 

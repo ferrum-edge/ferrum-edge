@@ -4174,6 +4174,91 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Same refusal as the H1/H2 dispatcher: a query-reading plugin trigger on
+    // this view and an unencoded `;` in the raw query (issue #6655). No plugin
+    // hook runs. The rejection is recorded (metrics, transaction log,
+    // diagnostic reference) with the status the wire carries before the head
+    // is written, and the body is omitted for `HEAD`.
+    if crate::proxy::query_trigger_refuses_request(caps, ctx.raw_query_string()) {
+        debug!(
+            proxy_id = %proxy.id,
+            reason = "semicolon_separator",
+            "Rejected HTTP/3 request: unencoded ';' in the query on a chain with a query-reading plugin trigger"
+        );
+        let reject_body = Bytes::from_static(crate::proxy::QUERY_TRIGGER_SEMICOLON_BODY.as_bytes());
+        let mut headers = HashMap::new();
+        finalize_h3_gateway_error_headers(
+            http_flavor,
+            StatusCode::BAD_REQUEST,
+            &reject_body,
+            &mut headers,
+            initial_response_header_policy_plugins.as_ref(),
+        );
+        let log_status_code = if grpc_web_response_content_type.is_some() {
+            // gRPC-Web is answered `200` with the status in its trailer frame.
+            let (grpc_status, grpc_message) =
+                h3_grpc_reject_signal(StatusCode::BAD_REQUEST, &reject_body, &headers);
+            crate::proxy::insert_grpc_error_metadata(
+                &mut ctx.metadata,
+                grpc_status,
+                grpc_message.as_ref(),
+            );
+            StatusCode::OK.as_u16()
+        } else {
+            h3_reject_log_status_and_metadata(
+                &mut ctx,
+                http_flavor,
+                StatusCode::BAD_REQUEST,
+                &reject_body,
+                &headers,
+            )
+        };
+        record_request(&state, log_status_code);
+        let logging_plugins = plugin_cache_view.plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            log_status_code,
+            start_time,
+            crate::diagnostic_ref::QUERY_TRIGGER_ADMISSION_PHASE,
+            0,
+        )
+        .await;
+        if let Some(content_type) = grpc_web_response_content_type {
+            send_h3_grpc_web_reject(
+                &mut stream,
+                &[],
+                &mut ctx,
+                content_type,
+                StatusCode::BAD_REQUEST,
+                reject_body,
+                &headers,
+            )
+            .await?;
+        } else {
+            // HEAD keeps the representation `Content-Length` but sends no DATA.
+            let mut reject_body = reject_body;
+            if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+                &ctx.method,
+                StatusCode::BAD_REQUEST.as_u16(),
+                &mut headers,
+                reject_body.len(),
+            ) {
+                reject_body = Bytes::new();
+            }
+            send_h3_finalized_reject_flavor_aware(
+                &mut stream,
+                http_flavor,
+                StatusCode::BAD_REQUEST,
+                reject_body,
+                &headers,
+                RejectBodyDisposition::for_request(&ctx.method, StatusCode::BAD_REQUEST.as_u16()),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
     let plugins = plugin_cache_view.plugins();
     // Publish this route's client-facing body ceilings before any request DATA

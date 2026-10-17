@@ -457,9 +457,13 @@ config. As a second guard, the runtime keeps stripping the offer whenever the
 proxy's live plugin chain requires framing. Stream proxies (`tcp`/`tcps`/`udp`/
 `dtls`) must keep `strip`.
 
-In CP/DP deployments, upgrade every DP before enabling passthrough on the CP. A
-proxy rejects unknown fields, so a DP that predates `websocket_permessage_deflate`
-rejects the whole namespace snapshot from a CP that sends it.
+In CP/DP deployments, CP and DPs must run the same build (the ConfigSync
+build-identity gate refuses a mismatched peer at subscribe), so roll the CP and
+every DP to a build that has `websocket_permessage_deflate` together, CP first,
+before enabling passthrough. During the rollout a not-yet-upgraded DP is
+refused at subscribe and keeps serving its last applied config, bounded by
+`FERRUM_DP_CONFIG_MAX_STALE_SECONDS`, so it never receives the field. See
+[upgrade_guide.md](upgrade_guide.md#upgrade-order).
 
 ### Gateway-terminated compression (`terminate`)
 
@@ -530,9 +534,11 @@ fragmentation is preserved. Terminate costs CPU on both legs; a session whose
 peers both decline compression uses the ordinary relay (including
 `FERRUM_WEBSOCKET_TUNNEL_MODE`), while a negotiated session always uses the parsed
 relay. Byte counters and `ws_frame_logging` sizes are decompressed sizes. As with
-`passthrough`, upgrade every DP, and every database-mode node sharing the DB,
-before enabling `terminate`: a DP that predates the value rejects the namespace
-snapshot, and a database-mode node that predates it rejects the proxy row.
+`passthrough`, finish the matching-build CP/DP rollout, and upgrade every
+database-mode node sharing the DB, before enabling `terminate`: a DP on an
+older build is refused at subscribe and keeps its last applied config until
+replaced, and a database-mode node that predates the value rejects the proxy
+row.
 
 ```yaml
 proxies:

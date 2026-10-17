@@ -157,6 +157,7 @@ mod native_grpc_dispatch_auth_lifetime_tests;
 mod native_unary_response_admission_tests;
 mod node_agent_admin_https_helm_tests;
 mod node_agent_admin_https_tests;
+mod node_agent_bpffs_helm_tests;
 mod node_agent_identity_tests;
 mod node_agent_ingress_topology_tests;
 mod node_agent_pod_watch_backoff_tests;

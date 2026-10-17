@@ -28,6 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `security_headers` values browsers ignore are refused (#6617, PR #6685)
+
+Custom `content_type_options`, `frame_options` and `referrer_policy` strings,
+and `set` entries for `X-Content-Type-Options`, `X-Frame-Options` and
+`Referrer-Policy`, must now be values browsers recognize: `nosniff`; `DENY` or
+`SAMEORIGIN`; a comma-separated list of Referrer-Policy tokens. Matching is
+ASCII case-insensitive. Any other value, including `ALLOW-FROM` and an empty
+`set` value, fails config admission. Before upgrading, correct such values or
+disable the header with `false`.
+
+### Mesh RequestAuthentication needs `jwksUri` or `jwks` (follow-up to PR #6668)
+
+A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
+`jwksUri` nor `jwks` is now refused at translation, and its selected workloads
+answer inbound HTTP with `503` (see the fail-closed note under Security in the
+CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
+source to each rule before upgrading.
+
 ### Custom plugins: `PluginHttpClient` accessors return an owned client (#6651, PR #6669)
 
 `PluginHttpClient::get()`, `get_http1()` and `get_http2()` now return
@@ -85,9 +103,11 @@ validation time where it previously loaded:
   `x-session-id` or `x-key-private`, and environment-variable tag sources
   such as `GPG_PASSPHRASE`, `HSM_PIN` or `KEY_PRIVATE`.
 
-Rename such fields or tags to a non-credential name before upgrading. Values
-logged under these names were already secrets, so dropping them is the
-intended behaviour.
+Before upgrading, remove each such field or tag, or replace its value with a
+fixed placeholder. Values logged under these names are treated as secrets, so
+renaming a field that still carries one (for example `session_id` to
+`correlation`) would log the same secret under the new name. Rename only a
+field whose value you have confirmed is not a secret.
 
 ### Cleartext OPA, serverless and tracing endpoints need an opt-in (issue #6617)
 
@@ -179,7 +199,9 @@ An omitted `body_validator` value inherited from a larger `FERRUM_MAX_REQUEST_BO
   safe alone).
 - `on_unlisted_content_type` and the new `on_unlisted_response_content_type`
   default to `fail_closed`. Under enforcing body rules, a non-empty body whose
-  `Content-Type` is not in the scan scope is now refused (`403`). Before
+  `Content-Type` is not in the scan scope is now refused (`403`).
+  `text/event-stream` responses, bodiless responses (`HEAD`, 1xx, 204, 304)
+  and exempt requests are not governed by the response option. Before
   upgrading, add the types your routes legitimately carry to
   `body_content_types`, enable `inspect_multipart` / `inspect_binary_body`,
   exempt upload/download routes, or set the option to `allow` explicitly.
@@ -2258,9 +2280,16 @@ helm upgrade <release> ./charts/ferrum-mesh -n <namespace> \
   --take-ownership --set crds.adoptExisting=true
 ```
 
-Helm 3.14+ is required for `--take-ownership`. After adoption, leave
-`crds.install=true` and drop `crds.adoptExisting`. Do not set
-`crds.install=false` to silence the error.
+`--take-ownership` was added in Helm 3.17.0, so this adoption step needs a
+Helm 3.17+ client; older clients reject the flag. Upgrade the Helm client
+before this upgrade rather than editing Helm ownership metadata on the CRD by
+hand.
+
+Adoption keeps the CRD in the cluster and leaves its existing policy
+objects untouched. The chart renders the CRD with
+`helm.sh/resource-policy: keep`, so a later uninstall still does not delete
+it. After adoption, leave `crds.install=true` and drop `crds.adoptExisting`.
+Do not set `crds.install=false` to silence the error.
 
 ### Enabled mesh injector requires a webhook CA trust source (issue [#4433](https://github.com/ferrum-edge/ferrum-edge/issues/4433))
 
@@ -3245,17 +3274,34 @@ FERRUM_MODE=dp \
 
 #### 5. Rollback path
 
-- **DP rollback**: Stop the new DP binary, restart the old one. It reconnects to
-  the CP and gets the current config via gRPC. DPs are stateless — rollback is
-  instant when the CP still serves a compatible config generation.
+Rollback is a coordinated, matching-build operation, like the upgrade. The
+[Build Identity Gate](#build-identity-gate) has no compatibility window. A DP
+on the old build is refused by a CP on the new build, and the reverse, whatever
+config generation either side holds. Binary or config-shape compatibility
+does not admit a mismatched peer.
+
 - **CP rollback**: Stop the new CP, repoint the **old** CP binary at the
   **original, untouched CP database** (the one exported in step 1), and restart.
-  Do not point the old CP at the fresh `ferrum_db_new` database. During the CP
-  restart, DPs serve cached config.
+  Do not point the old CP at the fresh `ferrum_db_new` database. In a multi-CP
+  deployment, roll back every CP.
+- **DP rollback**: Replace every DP with the old binary as well. A DP rolled
+  back on its own, while the CP still runs the new build, is refused at
+  subscribe and receives no config. Any upgraded DP left running is refused by
+  the rolled-back CP in the same way.
 
-> **Note**: DPs always overwrite their cache from the CP on reconnect. Rolling
-> back the CP database to the pre-upgrade instance therefore pushes the prior
-> config shape to DPs again; that is the supported rollback path during
+While builds differ, a refused DP that is still running keeps serving the
+config it last applied, but that config only lasts so long. Its age keeps
+growing, and once it passes `FERRUM_DP_CONFIG_MAX_STALE_SECONDS` the DP
+degrades readiness. With the default `FERRUM_DP_CONFIG_STALE_ACTION=fail_closed`
+it also refuses new traffic (see
+[cp_dp_mode.md](cp_dp_mode.md#bounded-last-known-good-configuration-age)).
+Finish the rollback inside that window.
+
+> **Note**: A DP holds no on-disk config cache. A DP restarted on the old build
+> starts empty, stays not-ready until it applies its first snapshot, and takes
+> that snapshot from the rolled-back CP once both run the same build. Rolling
+> back the CP database to the pre-upgrade instance therefore re-establishes the
+> prior config shape on the DP fleet. That is the supported rollback path during
 > build-out, not binary-only rollback against a changed baseline.
 
 ---

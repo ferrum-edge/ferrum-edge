@@ -109,7 +109,9 @@ Once `hyperium/h3` releases a version with the variant:
    have also been retired and the vendored copy contains no other Ferrum-only
    changes:
    - Remove the `h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }` line
-     from the `[patch.crates-io]` block in `Cargo.toml`.
+     from the `[patch.crates-io]` block in `Cargo.toml` and its mirrors in
+     `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`, and
+     regenerate the three lockfiles before deleting the vendor copy.
    - `git rm -r vendor/h3-0.0.8-ferrum-patched`.
    - `cargo build` — confirm we're now pulling `h3` from crates.io.
    - Run `tests/unit/gateway_core/http3_websocket_tests.rs`. It calls

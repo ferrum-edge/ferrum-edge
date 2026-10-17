@@ -104,8 +104,9 @@ Once such a release exists:
 2. Keep the vendored h3 crate until patches 001, 002, 003, and 004 are also
    retired (co-retirement group `h3-all`).
 3. When all active h3 patches are available upstream, remove the h3
-   `[patch.crates-io]` entry (root and `tests/performance/mesh/Cargo.toml`)
-   and delete `vendor/h3-0.0.8-ferrum-patched`.
+   `[patch.crates-io]` entry (root, `fuzz/Cargo.toml` and
+   `tests/performance/mesh/Cargo.toml`), regenerate the three lockfiles, and
+   then delete `vendor/h3-0.0.8-ferrum-patched`.
 4. Move this directory under
    `docs/upstream-h3-patches/_retired/005-max-buffered-frame-len/` with a
    `STATUS.md` noting the upstream merge and release.

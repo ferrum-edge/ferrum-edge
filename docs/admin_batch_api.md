@@ -61,10 +61,24 @@ Set `FERRUM_MONGO_REPLICA_SET` (or a `?replicaSet=` option on `FERRUM_DB_URL`) t
 enable the endpoint. Individual resource endpoints (`POST /proxies`,
 `POST /consumers`, …) are unaffected and continue to work on standalone MongoDB.
 
-Because a MongoDB transaction is bounded by the server's oplog entry size (16 MB
-by default) and `transactionLifetimeLimitSeconds`, very large single requests can
-exceed those limits. That failure is still atomic — nothing is applied — but
-split such imports into several smaller `POST /batch` requests.
+Three separate limits bound one batch, and none of them is a 16 MB cap on the
+whole transaction:
+
+- **Ferrum's request-body cap.** `POST /batch` uses the standard 1 MiB admin
+  request-body limit, on every backend. This is the limit a large import hits
+  first.
+- **BSON document / oplog entry size.** MongoDB caps each document, and each
+  oplog entry, at 16 MiB. On every supported server version (4.4.2+) a
+  transaction's writes are spread across as many oplog entries as needed, so
+  this bounds individual documents, not the transaction's total size.
+- **Transaction lifetime and resources.** A transaction that runs longer than
+  `transactionLifetimeLimitSeconds` (60 s by default) is aborted, and a large
+  transaction also holds locks and cache for its whole duration.
+
+Exceeding any of them still fails atomically — nothing is applied. For large
+imports, send several smaller `POST /batch` requests (see
+[Chunking Strategy](#chunking-strategy)); each one is atomic on its own, not across
+requests.
 
 ## Endpoint
 

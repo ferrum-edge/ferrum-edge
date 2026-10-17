@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Plugin execution triggers that read `query` now refuse an unencoded `;`**
+  (issue #6655; follow-up to #6579). Trigger `query` predicates split pairs
+  only on `&`, so a backend that also splits on `;` (Rack before 3.0, Go
+  before 1.17, Python before 3.9.2) could read a parameter the trigger never
+  evaluated and run an action the trigger was meant to gate. When any
+  instance on a request's plugin chain has a trigger that reads `query`, a
+  request whose raw query contains an unencoded `;` is now answered `400`
+  (`semicolon_separator`; native gRPC `INVALID_ARGUMENT`) before any plugin
+  phase runs, on HTTP/1.1, HTTP/2, and HTTP/3, and logged with
+  `rejection_phase: "query_trigger_admission"`. `%3B` stays an unambiguous
+  literal semicolon. Chains without a query-reading trigger are unaffected.
+- **`request_transformer` rule values are redacted from non-admin plugin
+  reads.** Viewer and operator plugin-config reads, admin audit diffs and the
+  fingerprinted `GET /config/export` echoed every `request_transformer`
+  `rules[].value` verbatim, including a backend credential an operator injects
+  as an `Authorization` header, API-key header, or query/body value. Every rule
+  value is now `[REDACTED]` (fingerprinted in the export), as are the
+  `mesh_route_dispatch` `rules[].request_transform[].value` route-level header
+  writes; `operation`, `target` and `new_key` stay visible (`key` was already
+  masked by the name heuristic). Admin reads and
+  `GET /backup` stay raw. **Operator action:** an `operator` read-modify-write
+  of these plugins must resend the real values, since a write that echoes a
+  `[REDACTED]` placeholder back is refused with `400`.
+
+- **`body_validator` rejects compressed gRPC frames with extra gzip data.**
+  Native gRPC protobuf validation inflated only the first gzip member of a
+  compressed frame and ignored anything after it, while the whole frame was
+  forwarded; a peer that decodes concatenated members could therefore receive
+  fields (or a decoded size) the validator never checked, on the request and
+  the response path. A compressed payload must now be exactly one fully
+  consumed gzip member, and a compression flag other than 0 or 1 is rejected.
+
+- **WAF `cidr` rules and IP exemptions match IPv4-mapped IPv6 spellings,
+  and IPv6 exemptions no longer cover IPv4 callers** (PR #6684 and its
+  follow-up). An IPv4 network (or a `::ffff:a.b.c.d/96`-or-longer mapped
+  network) now matches both `10.0.0.1` and `::ffff:10.0.0.1`, so the mapped
+  spelling cannot step around an IPv4 rule. Any other IPv6 network, including
+  `::/0`, matches IPv6 addresses only: a `global_exemptions.ips: ["::/0"]`
+  entry exempts IPv6 callers, never native IPv4 ones.
+- **An issuer-only mesh RequestAuthentication is refused** (follow-up to
+  PR #6668). A `jwtRules[]` entry with neither `jwksUri` nor `jwks` (or a
+  blank issuer) used to translate and report `FerrumAccepted=True`, then fail
+  mesh admission, which rejected the whole reload and kept the previous
+  configuration, including one without a pending refusal. Translation now
+  refuses it, so it fails closed like any other rejected RequestAuthentication
+  (`refuse_all`). Ferrum does not discover keys from the issuer; add
+  `jwksUri` or `jwks`.
+- The shared HTTP batch-response helper renders a transport error without its
+  request URL (PR #6684), so an endpoint credential in the path or query is
+  never echoed into a sink diagnostic.
+
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,
   and the paired counter read previously fetched counters with a plain
@@ -182,7 +233,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `on_unlisted_response_content_type` (`allow` / `fail_closed` /
     `block`, default `fail_closed`) gives response bodies the same control,
     so an origin cannot stream a disclosure past an enforcing response-body
-    rule by labelling it with an unscanned type. Unlisted bodies now record
+    rule by labelling it with an unscanned type. `text/event-stream`
+    responses, bodiless responses (`HEAD`, 1xx, 204, 304) and exempt requests
+    are not governed. Unlisted bodies now record
     `waf.body_uninspected_target`.
   - A body rule that neither enforces nor adds to the anomaly score (for
     example `score: 0`) no longer makes a body policy "enforcing" for the
@@ -487,6 +540,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING — `security_headers` rejects built-in header values browsers
+  ignore** (issue #6617, PR #6685 and its follow-up). Custom `content_type_options` must be
+  `nosniff`, `frame_options` must be `DENY` or `SAMEORIGIN`, and
+  `referrer_policy` must be a comma-separated list of Referrer-Policy tokens
+  (ASCII case-insensitive, surrounding spaces and tabs allowed). A `set` entry
+  for `X-Content-Type-Options`, `X-Frame-Options` or `Referrer-Policy` (any
+  case) is held to the same values, and an empty value there is refused. A
+  typo such as `SAMEORGIN` used to load and silently drop the protection; it
+  now fails config admission. `false`/`null`/`""` still disable a built-in
+  header.
+- `a2a_gateway` stream-observation maps and the `proxy_alerts` window,
+  cooldown and recovery maps honour `FERRUM_POOL_SHARD_AMOUNT` (PR #6684), like
+  the other hot-path plugin maps.
 - **BREAKING — `output_claim_headers` and mesh `outputClaimToHeaders` compare
   destinations with `_` treated as `-`** (issue #6656, follow-up to #6620), like
   `claim_headers`: `X_Real_IP` is reserved like `X-Real-IP`, and `X_Tenant_Id`
@@ -628,6 +694,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   summaries (and so logging sinks and `api_chargeback`) report no delivered
   response bytes for a `HEAD` request, on every protocol.
 
+- **A custom bpffs path keeps node-agent pins and their readers together**
+  (issue #6698). Helm `nodeAgent.bpfFsPath` changed the bpffs mount point
+  inside the node-agent and ambient containers and was passed through as
+  `FERRUM_NODE_AGENT_BPF_FS_PATH`. Ferrum still pinned and opened its maps at
+  fixed `/sys/fs/bpf/ferrum/*` paths, so the startup probe could pass on the
+  custom mount while pins went to (or were missing from) `/sys/fs/bpf`. The
+  chart now uses `nodeAgent.bpfFsPath` only for the host bpffs (hostPath) and
+  always mounts it at `/sys/fs/bpf` in both containers. The node-agent refuses
+  a `FERRUM_NODE_AGENT_BPF_FS_PATH` other than `/sys/fs/bpf` at startup
+  instead of probing a mount it never pins to. **Operator action:** a
+  non-chart deployment that set a different value must mount its bpffs at
+  `/sys/fs/bpf` inside the container and unset or reset the variable.
+- **The K8s PSAT attestor accepts dotted ServiceAccount and Pod names**
+  (issue #6697). TokenReview ServiceAccount and Pod names were checked as
+  63-character DNS-1123 labels, so a valid ServiceAccount such as
+  `build.bot`, or one longer than 63 characters, failed attestation. They are
+  now checked as DNS-1123 subdomains (dot-separated components, max 253
+  characters in total), as Kubernetes defines them. Namespaces stay DNS-1123 labels, and `/`, `%`, `:`,
+  uppercase and empty or `.`/`..` segments are still rejected before
+  SPIFFE ID rendering.
 - **AI token metering counts prompt-cache, thinking and tool-use tokens**
   (issue #6623). Anthropic `cache_creation_input_tokens` and
   `cache_read_input_tokens` and Bedrock Converse `cacheReadInputTokens` and

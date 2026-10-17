@@ -275,7 +275,7 @@
         "cpGrpcUrls": { "type": "string" },
         "cpGrpcTokenFile": {
           "type": "string",
-          "description": "In-container path to an externally issued CP/DP bearer token (FERRUM_DP_CP_GRPC_TOKEN_FILE). When set the DP presents that token instead of minting one, holds no signing key, and grpc.jwtSecret becomes optional."
+          "description": "In-container path to an externally issued CP/DP bearer token (FERRUM_DP_CP_GRPC_TOKEN_FILE). When set the DP presents that token instead of minting one, holds no signing key, and grpc.jwtSecret becomes optional. Not usable by a stock DP today: its random per-process node_id cannot match the token sub, so Subscribe is refused; use grpc.jwtSecret plus grpc.jwtKeyId."
         },
         "failoverPrimaryRetrySeconds": {
           "oneOf": [

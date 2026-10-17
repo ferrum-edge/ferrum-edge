@@ -95,31 +95,54 @@ windows, while monitoring dashboards and health checks keep working.
 
 ## Examples
 
+Each example is self-contained: it sets every variable that startup validation
+requires for that mode, so it runs without an ambient `ferrum.conf` or exported
+`FERRUM_*` settings. Both JWT secrets must be at least 32 characters, and the
+admin and CP/DP gRPC secrets must differ. The plaintext gRPC addresses are
+loopback-only, which is what plaintext CP/DP sync allows by default; for a
+networked deployment configure gRPC TLS as described in
+[cp_dp_mode.md](cp_dp_mode.md).
+
 ### Enable Read-Only Mode
 ```bash
-# Control Plane with read-only Admin API
+# Control Plane with read-only Admin API (loopback plaintext gRPC — local only)
 FERRUM_MODE=cp \
 FERRUM_ADMIN_READ_ONLY=true \
+FERRUM_DB_TYPE=postgres \
 FERRUM_DB_URL="postgres://user:pass@localhost/ferrum" \
 FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
-cargo run --release -- run
-```
-
-### Data Plane (Always Read-Only)
-```bash
-# Data Plane - Admin API is always read-only
-FERRUM_MODE=dp \
-FERRUM_DP_CP_GRPC_URLS="http://control-plane:50051" \
+FERRUM_CP_GRPC_LISTEN_ADDR="127.0.0.1:50051" \
 FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-to-a-32-character-grpc-secret" \
 cargo run --release -- run
 ```
+
+A CP that authenticates DPs with a trust bundle can set
+`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` instead of `FERRUM_CP_DP_GRPC_JWT_SECRET`.
+
+### Data Plane (Always Read-Only)
+```bash
+# Data Plane - Admin API is always read-only (loopback CP — local only)
+FERRUM_MODE=dp \
+FERRUM_DP_CP_GRPC_URLS="http://127.0.0.1:50051" \
+FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
+FERRUM_ADMIN_HTTP_PORT=9001 \
+FERRUM_CP_DP_GRPC_JWT_SECRET="change-me-to-a-32-character-grpc-secret" \
+cargo run --release -- run
+```
+
+`FERRUM_ADMIN_HTTP_PORT=9001` keeps the DP's admin listener from colliding with
+a CP on the same host. A remote CP needs an `https://` URL: a non-loopback
+`http://` URL is refused unless `FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true`. Set
+`FERRUM_DP_GRPC_TLS_CA_CERT_PATH` when the CP certificate is not signed by a
+public CA in the bundled Mozilla/webpki roots (see [cp_dp_mode.md](cp_dp_mode.md)).
 
 ### Database Mode with Read-Only
 ```bash
 # Database mode with read-only Admin API
 FERRUM_MODE=database \
 FERRUM_ADMIN_READ_ONLY=true \
-FERRUM_DB_URL="sqlite://ferrum.db" \
+FERRUM_DB_TYPE=sqlite \
+FERRUM_DB_URL="sqlite://ferrum.db?mode=rwc" \
 FERRUM_ADMIN_JWT_SECRET="change-me-to-a-32-character-admin-secret" \
 cargo run --release -- run
 ```
