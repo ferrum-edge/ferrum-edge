@@ -138,20 +138,10 @@ jobs:
           echo "Arms: $meshes"
           echo "Payload sizes: $sizes"
 
-      - name: Set up Docker Buildx
-        if: contains(steps.plan.outputs.meshes, 'ferrum')
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Build Ferrum Docker image
-        if: contains(steps.plan.outputs.meshes, 'ferrum')
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: Dockerfile
-          tags: ferrum-edge:bench
-          load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # No docker/buildx actions here by design: a new workflow may not
+      # add Cross executable surfaces (Trusted Cross Build Policy). The
+      # harness builds the Ferrum image with a literal `docker build`
+      # on first use, exactly as it builds its tools image.
 
       - name: Run benchmark (all arms, sequential, same runner)
         timeout-minutes: 150
