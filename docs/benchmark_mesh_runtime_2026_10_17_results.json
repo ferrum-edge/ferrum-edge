@@ -1,0 +1,675 @@
+{
+  "arm_status": {
+    "direct": {
+      "detail": "echo probe passed",
+      "mesh": "direct",
+      "status": "ready"
+    },
+    "envoy": {
+      "detail": "echo probe passed",
+      "mesh": "envoy",
+      "status": "ready"
+    },
+    "ferrum": {
+      "detail": "echo probe passed",
+      "mesh": "ferrum",
+      "status": "ready"
+    },
+    "linkerd": {
+      "detail": "linkerd2-proxy (ghcr.io/linkerd/proxy:edge-25.11.1) did not pass the standalone echo probe in this attempt; see runtime/logs",
+      "mesh": "linkerd",
+      "status": "unsupported-standalone"
+    }
+  },
+  "meshes": {
+    "direct": {
+      "1024": {
+        "latency_avg_us": 228,
+        "median_rps": 435921.1,
+        "p50_us": 208,
+        "p95_us": 412,
+        "p99_us": 528,
+        "publishable_runs": 1,
+        "rps_max": 435921.1,
+        "rps_min": 435921.1,
+        "runs": [
+          {
+            "latency_avg_us": 228,
+            "p50_us": 208,
+            "p95_us": 412,
+            "p99_us": 528,
+            "publishable": true,
+            "resources": null,
+            "rps": 435921.1,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 446.38
+      },
+      "10240": {
+        "latency_avg_us": 284,
+        "median_rps": 349384.9,
+        "p50_us": 257,
+        "p95_us": 531,
+        "p99_us": 674,
+        "publishable_runs": 1,
+        "rps_max": 349384.9,
+        "rps_min": 349384.9,
+        "runs": [
+          {
+            "latency_avg_us": 284,
+            "p50_us": 257,
+            "p95_us": 531,
+            "p99_us": 674,
+            "publishable": true,
+            "resources": null,
+            "rps": 349384.9,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 3577.7
+      },
+      "1048576": {
+        "latency_avg_us": 9494,
+        "median_rps": 5262.6,
+        "p50_us": 9207,
+        "p95_us": 15231,
+        "p99_us": 18223,
+        "publishable_runs": 1,
+        "rps_max": 5262.6,
+        "rps_min": 5262.6,
+        "runs": [
+          {
+            "latency_avg_us": 9494,
+            "p50_us": 9207,
+            "p95_us": 15231,
+            "p99_us": 18223,
+            "publishable": true,
+            "resources": null,
+            "rps": 5262.6,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 5518.24
+      },
+      "512000": {
+        "latency_avg_us": 8363,
+        "median_rps": 11939.0,
+        "p50_us": 8043,
+        "p95_us": 13863,
+        "p99_us": 16735,
+        "publishable_runs": 1,
+        "rps_max": 11939.0,
+        "rps_min": 11939.0,
+        "runs": [
+          {
+            "latency_avg_us": 8363,
+            "p50_us": 8043,
+            "p95_us": 13863,
+            "p99_us": 16735,
+            "publishable": true,
+            "resources": null,
+            "rps": 11939.0,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 6112.77
+      },
+      "5242880": {
+        "latency_avg_us": 29405,
+        "median_rps": 849.4,
+        "p50_us": 28895,
+        "p95_us": 43807,
+        "p99_us": 51359,
+        "publishable_runs": 1,
+        "rps_max": 849.4,
+        "rps_min": 849.4,
+        "runs": [
+          {
+            "latency_avg_us": 29405,
+            "p50_us": 28895,
+            "p95_us": 43807,
+            "p99_us": 51359,
+            "publishable": true,
+            "resources": null,
+            "rps": 849.4,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 4453.3
+      },
+      "71680": {
+        "latency_avg_us": 997,
+        "median_rps": 99526.0,
+        "p50_us": 928,
+        "p95_us": 1772,
+        "p99_us": 2237,
+        "publishable_runs": 1,
+        "rps_max": 99526.0,
+        "rps_min": 99526.0,
+        "runs": [
+          {
+            "latency_avg_us": 997,
+            "p50_us": 928,
+            "p95_us": 1772,
+            "p99_us": 2237,
+            "publishable": true,
+            "resources": null,
+            "rps": 99526.0,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 7134.02
+      }
+    },
+    "envoy": {
+      "1024": {
+        "latency_avg_us": 1729,
+        "median_rps": 57736.2,
+        "p50_us": 1568,
+        "p95_us": 3299,
+        "p99_us": 4407,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-envoy-client",
+            "meshbench-envoy-server"
+          ],
+          "proxy_cpu_percent_mean": 406.6,
+          "proxy_cpu_percent_peak": 412.8,
+          "proxy_rss_bytes_mean": 51537510,
+          "proxy_rss_bytes_peak": 51652853
+        },
+        "rps_max": 57736.2,
+        "rps_min": 57736.2,
+        "runs": [
+          {
+            "latency_avg_us": 1729,
+            "p50_us": 1568,
+            "p95_us": 3299,
+            "p99_us": 4407,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-envoy-client",
+                "meshbench-envoy-server"
+              ],
+              "proxy_cpu_percent_mean": 406.6,
+              "proxy_cpu_percent_peak": 412.8,
+              "proxy_rss_bytes_mean": 51537510,
+              "proxy_rss_bytes_peak": 51652853
+            },
+            "rps": 57736.2,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 59.12
+      },
+      "10240": {
+        "latency_avg_us": 2134,
+        "median_rps": 46750.3,
+        "p50_us": 1984,
+        "p95_us": 3881,
+        "p99_us": 5159,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-envoy-client",
+            "meshbench-envoy-server"
+          ],
+          "proxy_cpu_percent_mean": 410.5,
+          "proxy_cpu_percent_peak": 418.2,
+          "proxy_rss_bytes_mean": 55777252,
+          "proxy_rss_bytes_peak": 56224645
+        },
+        "rps_max": 46750.3,
+        "rps_min": 46750.3,
+        "runs": [
+          {
+            "latency_avg_us": 2134,
+            "p50_us": 1984,
+            "p95_us": 3881,
+            "p99_us": 5159,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-envoy-client",
+                "meshbench-envoy-server"
+              ],
+              "proxy_cpu_percent_mean": 410.5,
+              "proxy_cpu_percent_peak": 418.2,
+              "proxy_rss_bytes_mean": 55777252,
+              "proxy_rss_bytes_peak": 56224645
+            },
+            "rps": 46750.3,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 478.72
+      },
+      "1048576": {
+        "latency_avg_us": 33209,
+        "median_rps": 1506.6,
+        "p50_us": 31951,
+        "p95_us": 57919,
+        "p99_us": 66367,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-envoy-client",
+            "meshbench-envoy-server"
+          ],
+          "proxy_cpu_percent_mean": 427.2,
+          "proxy_cpu_percent_peak": 432.0,
+          "proxy_rss_bytes_mean": 210159097,
+          "proxy_rss_bytes_peak": 223661260
+        },
+        "rps_max": 1506.6,
+        "rps_min": 1506.6,
+        "runs": [
+          {
+            "latency_avg_us": 33209,
+            "p50_us": 31951,
+            "p95_us": 57919,
+            "p99_us": 66367,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-envoy-client",
+                "meshbench-envoy-server"
+              ],
+              "proxy_cpu_percent_mean": 427.2,
+              "proxy_cpu_percent_peak": 432.0,
+              "proxy_rss_bytes_mean": 210159097,
+              "proxy_rss_bytes_peak": 223661260
+            },
+            "rps": 1506.6,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 1579.78
+      },
+      "512000": {
+        "latency_avg_us": 35074,
+        "median_rps": 2850.7,
+        "p50_us": 34143,
+        "p95_us": 56159,
+        "p99_us": 65791,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-envoy-client",
+            "meshbench-envoy-server"
+          ],
+          "proxy_cpu_percent_mean": 446.4,
+          "proxy_cpu_percent_peak": 453.6,
+          "proxy_rss_bytes_mean": 195608357,
+          "proxy_rss_bytes_peak": 201557278
+        },
+        "rps_max": 2850.7,
+        "rps_min": 2850.7,
+        "runs": [
+          {
+            "latency_avg_us": 35074,
+            "p50_us": 34143,
+            "p95_us": 56159,
+            "p99_us": 65791,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-envoy-client",
+                "meshbench-envoy-server"
+              ],
+              "proxy_cpu_percent_mean": 446.4,
+              "proxy_cpu_percent_peak": 453.6,
+              "proxy_rss_bytes_mean": 195608357,
+              "proxy_rss_bytes_peak": 201557278
+            },
+            "rps": 2850.7,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 1459.56
+      },
+      "5242880": {
+        "latency_avg_us": 82247,
+        "median_rps": 304.6,
+        "p50_us": 85183,
+        "p95_us": 135551,
+        "p99_us": 158975,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-envoy-client",
+            "meshbench-envoy-server"
+          ],
+          "proxy_cpu_percent_mean": 409.2,
+          "proxy_cpu_percent_peak": 416.1,
+          "proxy_rss_bytes_mean": 235185111,
+          "proxy_rss_bytes_peak": 259941990
+        },
+        "rps_max": 304.6,
+        "rps_min": 304.6,
+        "runs": [
+          {
+            "latency_avg_us": 82247,
+            "p50_us": 85183,
+            "p95_us": 135551,
+            "p99_us": 158975,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-envoy-client",
+                "meshbench-envoy-server"
+              ],
+              "proxy_cpu_percent_mean": 409.2,
+              "proxy_cpu_percent_peak": 416.1,
+              "proxy_rss_bytes_mean": 235185111,
+              "proxy_rss_bytes_peak": 259941990
+            },
+            "rps": 304.6,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 1596.98
+      },
+      "71680": {
+        "latency_avg_us": 6141,
+        "median_rps": 16260.7,
+        "p50_us": 5903,
+        "p95_us": 10359,
+        "p99_us": 12799,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-envoy-client",
+            "meshbench-envoy-server"
+          ],
+          "proxy_cpu_percent_mean": 428.2,
+          "proxy_cpu_percent_peak": 437.1,
+          "proxy_rss_bytes_mean": 87189094,
+          "proxy_rss_bytes_peak": 90880081
+        },
+        "rps_max": 16260.7,
+        "rps_min": 16260.7,
+        "runs": [
+          {
+            "latency_avg_us": 6141,
+            "p50_us": 5903,
+            "p95_us": 10359,
+            "p99_us": 12799,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-envoy-client",
+                "meshbench-envoy-server"
+              ],
+              "proxy_cpu_percent_mean": 428.2,
+              "proxy_cpu_percent_peak": 437.1,
+              "proxy_rss_bytes_mean": 87189094,
+              "proxy_rss_bytes_peak": 90880081
+            },
+            "rps": 16260.7,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 1165.57
+      }
+    },
+    "ferrum": {
+      "1024": {
+        "latency_avg_us": 3167,
+        "median_rps": 31530.6,
+        "p50_us": 3077,
+        "p95_us": 4963,
+        "p99_us": 5903,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-ferrum-client",
+            "meshbench-ferrum-server"
+          ],
+          "proxy_cpu_percent_mean": 425.6,
+          "proxy_cpu_percent_peak": 438.5,
+          "proxy_rss_bytes_mean": 123475066,
+          "proxy_rss_bytes_peak": 129950023
+        },
+        "rps_max": 31530.6,
+        "rps_min": 31530.6,
+        "runs": [
+          {
+            "latency_avg_us": 3167,
+            "p50_us": 3077,
+            "p95_us": 4963,
+            "p99_us": 5903,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-ferrum-client",
+                "meshbench-ferrum-server"
+              ],
+              "proxy_cpu_percent_mean": 425.6,
+              "proxy_cpu_percent_peak": 438.5,
+              "proxy_rss_bytes_mean": 123475066,
+              "proxy_rss_bytes_peak": 129950023
+            },
+            "rps": 31530.6,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 32.29
+      },
+      "10240": {
+        "latency_avg_us": 3693,
+        "median_rps": 27044.5,
+        "p50_us": 3587,
+        "p95_us": 5779,
+        "p99_us": 6819,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-ferrum-client",
+            "meshbench-ferrum-server"
+          ],
+          "proxy_cpu_percent_mean": 434.7,
+          "proxy_cpu_percent_peak": 444.7,
+          "proxy_rss_bytes_mean": 145749442,
+          "proxy_rss_bytes_peak": 175279964
+        },
+        "rps_max": 27044.5,
+        "rps_min": 27044.5,
+        "runs": [
+          {
+            "latency_avg_us": 3693,
+            "p50_us": 3587,
+            "p95_us": 5779,
+            "p99_us": 6819,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-ferrum-client",
+                "meshbench-ferrum-server"
+              ],
+              "proxy_cpu_percent_mean": 434.7,
+              "proxy_cpu_percent_peak": 444.7,
+              "proxy_rss_bytes_mean": 145749442,
+              "proxy_rss_bytes_peak": 175279964
+            },
+            "rps": 27044.5,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 276.94
+      },
+      "1048576": {
+        "latency_avg_us": 35492,
+        "median_rps": 1410.1,
+        "p50_us": 35103,
+        "p95_us": 47903,
+        "p99_us": 54015,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-ferrum-client",
+            "meshbench-ferrum-server"
+          ],
+          "proxy_cpu_percent_mean": 428.7,
+          "proxy_cpu_percent_peak": 435.8,
+          "proxy_rss_bytes_mean": 236768460,
+          "proxy_rss_bytes_peak": 247684136
+        },
+        "rps_max": 1410.1,
+        "rps_min": 1410.1,
+        "runs": [
+          {
+            "latency_avg_us": 35492,
+            "p50_us": 35103,
+            "p95_us": 47903,
+            "p99_us": 54015,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-ferrum-client",
+                "meshbench-ferrum-server"
+              ],
+              "proxy_cpu_percent_mean": 428.7,
+              "proxy_cpu_percent_peak": 435.8,
+              "proxy_rss_bytes_mean": 236768460,
+              "proxy_rss_bytes_peak": 247684136
+            },
+            "rps": 1410.1,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 1478.6
+      },
+      "512000": {
+        "latency_avg_us": 36424,
+        "median_rps": 2743.8,
+        "p50_us": 35999,
+        "p95_us": 52223,
+        "p99_us": 60031,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-ferrum-client",
+            "meshbench-ferrum-server"
+          ],
+          "proxy_cpu_percent_mean": 442.1,
+          "proxy_cpu_percent_peak": 452.0,
+          "proxy_rss_bytes_mean": 315166993,
+          "proxy_rss_bytes_peak": 326107136
+        },
+        "rps_max": 2743.8,
+        "rps_min": 2743.8,
+        "runs": [
+          {
+            "latency_avg_us": 36424,
+            "p50_us": 35999,
+            "p95_us": 52223,
+            "p99_us": 60031,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-ferrum-client",
+                "meshbench-ferrum-server"
+              ],
+              "proxy_cpu_percent_mean": 442.1,
+              "proxy_cpu_percent_peak": 452.0,
+              "proxy_rss_bytes_mean": 315166993,
+              "proxy_rss_bytes_peak": 326107136
+            },
+            "rps": 2743.8,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 1404.83
+      },
+      "5242880": {
+        "latency_avg_us": 86393,
+        "median_rps": 290.2,
+        "p50_us": 85951,
+        "p95_us": 103039,
+        "p99_us": 111103,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-ferrum-client",
+            "meshbench-ferrum-server"
+          ],
+          "proxy_cpu_percent_mean": 411.6,
+          "proxy_cpu_percent_peak": 417.6,
+          "proxy_rss_bytes_mean": 236978176,
+          "proxy_rss_bytes_peak": 252077670
+        },
+        "rps_max": 290.2,
+        "rps_min": 290.2,
+        "runs": [
+          {
+            "latency_avg_us": 86393,
+            "p50_us": 85951,
+            "p95_us": 103039,
+            "p99_us": 111103,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-ferrum-client",
+                "meshbench-ferrum-server"
+              ],
+              "proxy_cpu_percent_mean": 411.6,
+              "proxy_cpu_percent_peak": 417.6,
+              "proxy_rss_bytes_mean": 236978176,
+              "proxy_rss_bytes_peak": 252077670
+            },
+            "rps": 290.2,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 1521.48
+      },
+      "71680": {
+        "latency_avg_us": 7603,
+        "median_rps": 13131.9,
+        "p50_us": 7527,
+        "p95_us": 11327,
+        "p99_us": 13207,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-ferrum-client",
+            "meshbench-ferrum-server"
+          ],
+          "proxy_cpu_percent_mean": 444.5,
+          "proxy_cpu_percent_peak": 447.2,
+          "proxy_rss_bytes_mean": 181805602,
+          "proxy_rss_bytes_peak": 189446225
+        },
+        "rps_max": 13131.9,
+        "rps_min": 13131.9,
+        "runs": [
+          {
+            "latency_avg_us": 7603,
+            "p50_us": 7527,
+            "p95_us": 11327,
+            "p99_us": 13207,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-ferrum-client",
+                "meshbench-ferrum-server"
+              ],
+              "proxy_cpu_percent_mean": 444.5,
+              "proxy_cpu_percent_peak": 447.2,
+              "proxy_rss_bytes_mean": 181805602,
+              "proxy_rss_bytes_peak": 189446225
+            },
+            "rps": 13131.9,
+            "total_errors": 0
+          }
+        ],
+        "throughput_mbps_median": 941.29
+      }
+    }
+  },
+  "warnings": []
+}

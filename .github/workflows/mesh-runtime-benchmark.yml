@@ -1,0 +1,267 @@
+# Mesh runtime head-to-head benchmark: Ferrum Edge running as a service-mesh
+# data plane vs other mesh data planes in the same environment.
+#
+# For every mesh arm, runs an HTTP/1.1 echo workload through a
+# client-proxy -> mTLS -> server-proxy pair at 6 payload sizes
+# (1KB, 10KB, 70KB, 500KB, 1MB, 5MB), mirroring the payload sweep of
+# gateways-protocol-benchmark.yml plus a 1KB small-message size where
+# per-request mesh overhead dominates. Each arm runs in its own
+# ubuntu-26.04 runner (strategy.matrix); a final aggregate job renders the
+# combined summary.
+#
+# Arms:
+#   direct  : no proxies (same-runner overhead baseline)
+#   ferrum  : 2x ferrum-edge FERRUM_MODE=mesh Sidecar, localized file
+#             config + file SVIDs, STRICT PeerAuthentication (real mesh
+#             runtime, no control plane needed)
+#   envoy   : 2x envoyproxy/envoy hand-configured mTLS pair (the Istio
+#             sidecar data-plane proxy; labeled Envoy, not full Istio:
+#             no istiod, telemetry, or Wasm in the measurement)
+#   linkerd : 2x ghcr.io/linkerd/proxy standalone probe. linkerd2-proxy
+#             requires the Destination control-plane service, so this arm
+#             records `unsupported-standalone` with logs unless the echo
+#             probe passes; it never fabricates numbers. Full-mesh
+#             (kind) comparison is the documented Tier-2 follow-up in
+#             docs/mesh_runtime_benchmark.md.
+#
+# Every computation beyond a literal command lives in
+# .github/scripts/summarize_mesh_runtime_results.py; keep inline
+# interpreter bodies out of this file (trusted Cross build policy).
+
+name: Mesh Runtime Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Load duration per payload size (seconds)"
+        required: false
+        default: "10"
+        type: string
+      concurrency:
+        description: "Concurrent keep-alive connections"
+        required: false
+        default: "100"
+        type: string
+      iterations:
+        description: "Iterations per (mesh, payload) — median reported"
+        required: false
+        default: "1"
+        type: choice
+        options: ["1", "2", "3"]
+      skip_meshes:
+        description: "Space-separated arms to skip (direct ferrum envoy linkerd)"
+        required: false
+        default: ""
+        type: string
+      skip_payload_sizes:
+        description: "Space-separated payload sizes (bytes) to skip"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mesh-runtime-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: bench / ${{ matrix.mesh }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        mesh:
+          - direct
+          - ferrum
+          - envoy
+          - linkerd
+
+    steps:
+      - name: Skip arm?
+        id: skip_check
+        run: |
+          skip_list="${{ inputs.skip_meshes }}"
+          if echo " $skip_list " | grep -qw "${{ matrix.mesh }}"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Arm ${{ matrix.mesh }} is in skip list — ending job."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+        if: steps.skip_check.outputs.skip != 'true'
+
+      - name: Verify summarizer contract (static)
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          python3 .github/scripts/summarize_mesh_runtime_results.py --self-test
+          python3 -m py_compile .github/scripts/summarize_mesh_runtime_results.py
+
+      - name: Install system dependencies
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl sysstat
+
+      - name: Runner health check
+        if: steps.skip_check.outputs.skip != 'true'
+        run: |
+          echo "=== CPU ==="
+          nproc
+          lscpu | grep -E 'Model name|Socket|MHz|Hypervisor' || true
+          echo ""
+          echo "=== CPU steal (5s) ==="
+          vmstat 1 6 | tail -n 5
+          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
+          echo "avg steal=${AVG_STEAL}%"
+          if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
+            echo "::warning::CPU steal is ${AVG_STEAL}% for ${{ matrix.mesh }} — results may be noisy"
+          fi
+          echo ""
+          echo "=== Memory ==="
+          free -h
+          echo ""
+          echo "=== Docker ==="
+          docker version --format '{{.Server.Version}}' || true
+
+      - name: Compute payload sizes
+        if: steps.skip_check.outputs.skip != 'true'
+        id: sizes
+        run: |
+          all_sizes="1024 10240 71680 512000 1048576 5242880"
+          skip="${{ inputs.skip_payload_sizes }}"
+          sizes=""
+          for s in $all_sizes; do
+            if ! echo " $skip " | grep -qw "$s"; then
+              sizes="$sizes $s"
+            fi
+          done
+          sizes=$(echo "$sizes" | xargs)
+          echo "payload_sizes=$sizes" >> "$GITHUB_OUTPUT"
+          echo "Payload sizes: $sizes"
+
+      - name: Set up Docker Buildx
+        if: steps.skip_check.outputs.skip != 'true' && matrix.mesh == 'ferrum'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build Ferrum Docker image
+        if: steps.skip_check.outputs.skip != 'true' && matrix.mesh == 'ferrum'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          tags: ferrum-edge:bench
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run benchmark
+        if: steps.skip_check.outputs.skip != 'true'
+        timeout-minutes: 90
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+          FERRUM_IMAGE: ferrum-edge:bench
+        run: |
+          mkdir -p results/${{ matrix.mesh }}
+          {
+            echo "mesh=${{ matrix.mesh }}"
+            echo "sha=${GITHUB_SHA}"
+            echo "runner=ubuntu-26.04"
+            date -u +%Y-%m-%dT%H:%M:%SZ
+            nproc
+            uname -a
+            docker version --format '{{.Server.Version}}' || true
+          } > results/${{ matrix.mesh }}/host-facts.txt
+          for run in $(seq 1 "$ITERATIONS"); do
+            echo ""
+            echo "============================================"
+            echo "  RUN ${run}/${ITERATIONS} — ${{ matrix.mesh }}"
+            echo "============================================"
+            run_dir="results/${{ matrix.mesh }}/run_${run}"
+            mkdir -p "$run_dir"
+            extra_flags=""
+            if [ "$run" -gt 1 ]; then extra_flags="--skip-build"; fi
+            bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh \
+              "${{ matrix.mesh }}" \
+              --payload-sizes "${{ steps.sizes.outputs.payload_sizes }}" \
+              --duration "${{ inputs.duration }}" \
+              --concurrency "${{ inputs.concurrency }}" \
+              --output-dir "$run_dir" \
+              $extra_flags \
+              2>&1 | tee "$run_dir/run.log"
+          done
+
+      - name: Force-cleanup any leaked containers
+        if: steps.skip_check.outputs.skip != 'true' && always()
+        run: |
+          docker ps -q --filter "name=meshbench-" | xargs -r docker rm -f 2>/dev/null || true
+
+      - name: Render per-arm summary
+        if: steps.skip_check.outputs.skip != 'true' && always()
+        run: |
+          python3 .github/scripts/summarize_mesh_runtime_results.py \
+            --results-root "results/${{ matrix.mesh }}" \
+            --output "results/${{ matrix.mesh }}/summary.json" \
+            --summary-md "results/${{ matrix.mesh }}/summary.md" \
+            >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload per-arm artifact
+        if: steps.skip_check.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-runtime-bench-${{ matrix.mesh }}-${{ github.sha }}
+          # Runtime dirs hold single-run throwaway private keys generated
+          # by the harness; keep them out of artifacts.
+          path: |
+            results/${{ matrix.mesh }}
+            !results/${{ matrix.mesh }}/**/runtime/**
+          retention-days: 90
+
+  aggregate:
+    name: Aggregate summary
+    needs: benchmark
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Download all arm artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: mesh-runtime-bench-*-${{ github.sha }}
+          path: downloaded
+        continue-on-error: true
+
+      - name: Render combined summary
+        run: |
+          mkdir -p combined
+          for mesh in direct ferrum envoy linkerd; do
+            src="downloaded/mesh-runtime-bench-${mesh}-${GITHUB_SHA}"
+            if [ -d "$src" ]; then
+              mkdir -p "combined/${mesh}"
+              cp -a "$src/." "combined/${mesh}/"
+            fi
+          done
+          python3 .github/scripts/summarize_mesh_runtime_results.py \
+            --results-root combined \
+            --output combined/summary.json \
+            --summary-md combined/summary.md \
+            >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload combined summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-runtime-bench-combined-${{ github.sha }}
+          path: combined/summary.json
+          retention-days: 90

@@ -1,0 +1,14 @@
+# Harness tools image: mesh_loadgen + mesh_backend.
+# Client and backend run in containers on the host network in every
+# environment (Linux CI and local container VMs behave identically);
+# only the proxy pair under test differs between arms.
+FROM rust:1-slim-bookworm AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --locked --release --bins
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /build/target/release/mesh_loadgen /usr/local/bin/mesh_loadgen
+COPY --from=builder /build/target/release/mesh_backend /usr/local/bin/mesh_backend
+ENTRYPOINT ["/usr/local/bin/mesh_loadgen"]
