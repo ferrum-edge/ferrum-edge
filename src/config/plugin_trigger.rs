@@ -285,6 +285,8 @@ pub struct CompiledPluginTrigger {
     reads_authenticated_identity: bool,
     /// First HTTP-only field name the predicate reads, if any.
     http_only_field: Option<&'static str>,
+    /// Whether any leaf reads a `query` field.
+    reads_query: bool,
 }
 
 #[derive(Debug)]
@@ -410,13 +412,23 @@ impl CompiledPluginTrigger {
             nodes: 0,
             reads_authenticated_identity: false,
             http_only_field: None,
+            reads_query: false,
         };
         let root = compile_node(&trigger.when, 1, &mut budget)?;
         Ok(Self {
             root,
             reads_authenticated_identity: budget.reads_authenticated_identity,
             http_only_field: budget.http_only_field,
+            reads_query: budget.reads_query,
         })
+    }
+
+    /// Whether any leaf, at any depth and under any combinator, reads a
+    /// `query` field. Query predicates split pairs only on `&`, so a request
+    /// carrying an unencoded `;` is refused before any phase runs on a chain
+    /// that carries such a trigger (issue #6655).
+    pub fn reads_query(&self) -> bool {
+        self.reads_query
     }
 
     /// Whether any leaf reads authenticated identity (`consumer`,
@@ -458,6 +470,7 @@ struct CompileBudget {
     nodes: usize,
     reads_authenticated_identity: bool,
     http_only_field: Option<&'static str>,
+    reads_query: bool,
 }
 
 fn compile_node(
@@ -591,6 +604,7 @@ fn compile_match(
     }
     if let Some(field) = &leaf.query {
         note_http_only_field(budget, "query");
+        budget.reads_query = true;
         return Ok(CompiledMatch::Query(compile_field_match(
             field, "query", false,
         )?));

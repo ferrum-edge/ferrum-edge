@@ -26,7 +26,7 @@ use ferrum_edge::plugins::{
     Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     StreamFrontendTransport, StreamTransactionSummary,
 };
-use ferrum_edge::proxy::run_authentication_phase;
+use ferrum_edge::proxy::{query_trigger_refuses_request, run_authentication_phase};
 use ferrum_edge::{PluginCache, PluginCapabilities};
 use serde_json::json;
 use std::collections::HashMap;
@@ -2002,5 +2002,101 @@ async fn a_skipped_auth_instance_cannot_supply_an_inapplicable_challenge() {
         rejection.2.get("WWW-Authenticate").map(String::as_str),
         Some("Bearer"),
         "challenge selection must ignore the trigger-skipped Basic mechanism"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unencoded `;` with a query-reading trigger (issue #6655)
+// ---------------------------------------------------------------------------
+// Capability and predicate only. The dispatcher refusal itself (no hook runs,
+// no backend request, gRPC shaping, HEAD) is exercised end to end in
+// `tests/functional/functional_allowed_methods_test.rs`.
+
+fn query_trigger_capabilities(trigger: Option<serde_json::Value>) -> PluginCapabilities {
+    let mut stamp = header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp");
+    if let Some(trigger) = trigger {
+        stamp = with_trigger(stamp, trigger);
+    }
+    let cache = PluginCache::new(&config(
+        vec![make_proxy("api", "/api", vec!["stamp"])],
+        vec![stamp],
+    ))
+    .expect("plugin cache builds");
+    cache.get_capabilities(NS, "api", ProxyProtocol::Http)
+}
+
+#[test]
+fn a_query_reading_trigger_marks_an_unencoded_semicolon_for_refusal() {
+    for trigger in [
+        json!({"when": {"match": {"query": {"name": "action"}}}}),
+        // Nested under a combinator and `not`, beside a non-query leaf.
+        json!({"when": {"all": [
+            {"match": {"path": {"prefix": ["/api"]}}},
+            {"not": {"match": {"query": {"name": "action", "value": {"exact": ["delete"]}}}}}
+        ]}}),
+    ] {
+        let caps = query_trigger_capabilities(Some(trigger));
+        assert!(caps.has(PluginCapabilities::HAS_QUERY_READING_TRIGGER));
+        for raw in ["x=;action=delete", "a=1;b=2", ";", "action=delete;"] {
+            assert!(
+                query_trigger_refuses_request(caps, Some(raw)),
+                "an unencoded ';' must be refused: {raw:?}"
+            );
+        }
+        assert!(!query_trigger_refuses_request(
+            caps,
+            Some("action=delete&x=1")
+        ));
+        assert!(!query_trigger_refuses_request(caps, None));
+    }
+}
+
+#[test]
+fn a_chain_without_a_query_reading_trigger_passes_an_unencoded_semicolon() {
+    for trigger in [
+        None,
+        Some(json!({"when": {"match": {"path": {"prefix": ["/api"]}}}})),
+        Some(json!({"when": {"match": {"header": {"name": "x-debug"}}}})),
+    ] {
+        let caps = query_trigger_capabilities(trigger);
+        assert!(!caps.has(PluginCapabilities::HAS_QUERY_READING_TRIGGER));
+        assert!(!query_trigger_refuses_request(
+            caps,
+            Some("x=;action=delete")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn an_encoded_semicolon_is_accepted_and_read_as_a_literal() {
+    let trigger = json!({"when": {"match": {"query": {"name": "q", "value": {"exact": ["a;b"]}}}}});
+    let caps = query_trigger_capabilities(Some(trigger.clone()));
+    assert!(caps.has(PluginCapabilities::HAS_QUERY_READING_TRIGGER));
+    assert!(!query_trigger_refuses_request(caps, Some("q=a%3Bb")));
+    assert!(!query_trigger_refuses_request(
+        caps,
+        Some("x=%3Baction%3Ddelete")
+    ));
+
+    // The accepted request reaches the trigger, which reads `%3B` as one
+    // literal `;` inside a single value.
+    let plugins = published(
+        &config(
+            vec![make_proxy("api", "/api", vec!["stamp"])],
+            vec![with_trigger(
+                header_stamper("stamp", PluginScope::Proxy, Some("api"), "x-stamp"),
+                trigger,
+            )],
+        ),
+        "api",
+    );
+    let mut ctx = request("GET", "/api");
+    ctx.set_raw_query_string("q=a%3Bb".to_string());
+    assert_eq!(
+        run_request(&plugins, &mut ctx)
+            .await
+            .get("x-stamp")
+            .map(String::as_str),
+        Some("1")
     );
 }

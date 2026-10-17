@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Plugin execution triggers that read `query` now refuse an unencoded `;`**
+  (issue #6655; follow-up to #6579). Trigger `query` predicates split pairs
+  only on `&`, so a backend that also splits on `;` (Rack before 3.0, Go
+  before 1.17, Python before 3.9.2) could read a parameter the trigger never
+  evaluated and run an action the trigger was meant to gate. When any
+  instance on a request's plugin chain has a trigger that reads `query`, a
+  request whose raw query contains an unencoded `;` is now answered `400`
+  (`semicolon_separator`; native gRPC `INVALID_ARGUMENT`) before any plugin
+  phase runs, on HTTP/1.1, HTTP/2, and HTTP/3, and logged with
+  `rejection_phase: "query_trigger_admission"`. `%3B` stays an unambiguous
+  literal semicolon. Chains without a query-reading trigger are unaffected.
 - **`request_transformer` rule values are redacted from non-admin plugin
   reads.** Viewer and operator plugin-config reads, admin audit diffs and the
   fingerprinted `GET /config/export` echoed every `request_transformer`
