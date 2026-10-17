@@ -2718,7 +2718,16 @@ refusal marker with its own selector scope (a `targetRef(s)` resource covers its
 namespace, or the mesh in the Istio root namespace, because the attachment cannot
 be resolved), and the data plane installs a forced `request_termination`
 instance (`__mesh_request_auth_refused`) that answers every HTTP request to those
-workloads with `503` until the resource is fixed. This deliberately differs from
+workloads with `503` until the resource is fixed. The refusal is scoped to the
+workload's materialized inbound routes, so its outbound requests keep flowing.
+On topologies whose inbound path is a transparent HBONE relay that never enters
+the HTTP plugin chain (Ambient, NodeWaypoint, EastWestGateway, EgressGateway —
+inbound HTTP via HBONE does **not** pass the plugin chain there; issue #6736),
+the refusal is not installed: unscoped, it could only block the proxy's outbound
+routes without refusing any inbound request. The data plane logs this once per
+apply; inbound JWT enforcement for such workloads requires a Sidecar or a
+ServiceWaypoint, whose routes do enter the HTTP chain, and fixing the refused
+resource is required regardless. This deliberately differs from
 Istio, whose validating webhook would never admit such a resource; Ferrum
 accepts some resources Istio admits but Ferrum cannot enforce faithfully, and
 for those it chooses refusal over running without validation. The status reports

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A refused `RequestAuthentication` no longer blocks outbound traffic on
+  transparent-inbound mesh topologies** (issue #6736). On Ambient (and equally
+  NodeWaypoint, EastWestGateway, EgressGateway) inbound HTTP arrives as a
+  transparent HBONE relay that never enters the HTTP plugin chain and no
+  inbound HTTP route materializes, so the unscoped `__mesh_request_auth_refused`
+  fallback refused the workload's *outbound* requests while refusing no inbound
+  request at all. The refusal is now removed on those topologies with a
+  warning; inbound JWT enforcement there requires a Sidecar or ServiceWaypoint.
+  Sidecar behavior (inbound-scoped trigger, unscoped fail-closed fallback) and
+  ServiceWaypoint behavior are unchanged.
+
 ### Security
 
 - **Plugin execution triggers that read `query` now refuse an unencoded `;`**

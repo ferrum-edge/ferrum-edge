@@ -14288,8 +14288,18 @@ fn inject_mesh_request_auth_plugin(
 /// entering this workload. RequestAuthentication governs requests to the
 /// selected workload, so its outbound requests to healthy peers must keep
 /// flowing. Runs after inbound and outbound routes are materialized: the
-/// refusal is gated by a trigger on exactly the mesh inbound route ids, and
-/// with no inbound route it matches nothing.
+/// refusal is gated by a trigger on exactly the mesh inbound route ids.
+///
+/// On topologies whose inbound path is a transparent HBONE relay with no
+/// HTTP plugin chain (Ambient, NodeWaypoint, EastWestGateway,
+/// EgressGateway), no inbound HTTP route ever materializes, so an
+/// unscoped refusal could only fire on this proxy's *outbound* routes —
+/// it cannot refuse inbound traffic to the selected workload and would
+/// only break that workload's egress (issue #6736). The refusal is
+/// removed there instead, with a warning: refused-RequestAuthentication
+/// enforcement on those topologies requires a destination-side L7
+/// enforcement point (a Sidecar, or a ServiceWaypoint whose routes do
+/// enter the HTTP chain and keep the refusal).
 fn scope_request_auth_refusal_to_inbound_routes(
     config: &mut GatewayConfig,
     runtime: &MeshRuntimeConfig,
@@ -14302,6 +14312,37 @@ fn scope_request_auth_refusal_to_inbound_routes(
         .collect();
     inbound.sort();
     inbound.dedup();
+    if inbound.is_empty()
+        && matches!(
+            runtime.topology,
+            MeshTopology::Ambient
+                | MeshTopology::NodeWaypoint
+                | MeshTopology::EastWestGateway
+                | MeshTopology::EgressGateway
+        )
+    {
+        let had_refusal = config.plugin_configs.iter().any(|plugin| {
+            plugin.namespace == runtime.namespace
+                && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
+        });
+        if had_refusal {
+            remove_mesh_managed_plugin(
+                config,
+                MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+                &runtime.namespace,
+            );
+            warn!(
+                topology = runtime.topology.as_str(),
+                "mesh RequestAuthentication refusal is not installed on this topology: \
+                 inbound traffic is a transparent HBONE relay that never enters the HTTP \
+                 plugin chain, so the refusal could only block this proxy's outbound \
+                 routes. Inbound JWT enforcement for the selected workload requires a \
+                 Sidecar or a ServiceWaypoint; fix the refused RequestAuthentication \
+                 (see its FerrumAccepted status) regardless"
+            );
+        }
+        return;
+    }
     let Some(refusal) = config.plugin_configs.iter_mut().find(|plugin| {
         plugin.namespace == runtime.namespace && plugin.id == MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID
     }) else {
@@ -36199,6 +36240,68 @@ mod tests {
             .map(|leaf| leaf["match"]["proxy_id"].as_array().expect("ids").len())
             .sum();
         assert_eq!(listed, route_count);
+    }
+
+    /// Issue #6736: on topologies whose inbound is a transparent HBONE
+    /// relay (Ambient et al.), no inbound HTTP route materializes and
+    /// inbound requests never enter the HTTP plugin chain, so the
+    /// refusal is removed rather than left unscoped on outbound routes.
+    /// ServiceWaypoint routes do enter the chain, so it stays there.
+    #[test]
+    fn request_auth_refusal_is_not_left_unscoped_on_transparent_inbound_topologies() {
+        let now = chrono::Utc::now();
+        for topology in [
+            MeshTopology::Ambient,
+            MeshTopology::NodeWaypoint,
+            MeshTopology::EastWestGateway,
+            MeshTopology::EgressGateway,
+        ] {
+            let runtime = MeshRuntimeConfig {
+                topology,
+                ..test_mesh_runtime_config()
+            };
+            let mut config = GatewayConfig::default();
+            config.proxies.push(node_waypoint_udp_listener_proxy(
+                "__mesh-outbound-reviews-9080",
+                &runtime.namespace,
+                "upstream",
+                18080,
+                false,
+                "udp",
+                now,
+            ));
+            force_ensure_global_plugin(
+                &mut config,
+                MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+                "request_termination",
+                serde_json::json!({"status_code": 503}),
+                &runtime.namespace,
+            );
+            scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+            assert!(
+                config
+                    .plugin_configs
+                    .iter()
+                    .all(|plugin| plugin.id != MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID),
+                "{topology:?} must not keep an unscoped refusal on outbound routes"
+            );
+        }
+
+        let runtime = MeshRuntimeConfig {
+            topology: MeshTopology::ServiceWaypoint,
+            ..test_mesh_runtime_config()
+        };
+        let mut config = GatewayConfig::default();
+        force_ensure_global_plugin(
+            &mut config,
+            MESH_REQUEST_AUTH_REFUSED_PLUGIN_ID,
+            "request_termination",
+            serde_json::json!({"status_code": 503}),
+            &runtime.namespace,
+        );
+        scope_request_auth_refusal_to_inbound_routes(&mut config, &runtime);
+        assert!(config.plugin_configs[0].enabled);
+        assert!(config.plugin_configs[0].trigger.is_none());
     }
 
     #[tokio::test]
