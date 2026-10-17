@@ -1536,8 +1536,11 @@ impl PluginHttpClient {
 
     /// Build a plugin HTTP client from pool config without a DNS cache.
     ///
-    /// Uses reqwest's default DNS resolution. Prefer `new()` in production
-    /// to share the gateway's DNS cache across all plugins.
+    /// Uses reqwest's default DNS resolution and unrestricted egress, so it
+    /// is for tests and last-resort fallbacks only. Production paths use
+    /// `new()` (serving) or `default_with_backend_allow_ips` (validation),
+    /// which route resolution through the screened `DnsCacheResolver`
+    /// (#6651).
     pub fn from_pool_config(config: &PoolConfig) -> Self {
         let tls_posture = PluginTlsPosture::PlatformRoots;
         let client = accept_plugin_http_client(
@@ -1890,8 +1893,14 @@ impl PluginHttpClient {
     /// unapproved crypto provider.
     ///
     /// The returned client uses pooled connections - no per-call overhead.
-    /// Prefer [`execute`] over calling `.send()` directly so that slow
-    /// outbound calls are automatically logged with the destination URL.
+    /// Pass builders from this client through [`execute`] /
+    /// [`execute_redacted`] rather than calling `.send()` directly: reqwest
+    /// skips the `DnsCacheResolver` for IP-literal hosts, so the literal-IP
+    /// egress screen, slow-call logging and retry policy live in those
+    /// helpers. The only sanctioned direct `.send()` paths are dedicated
+    /// clients whose immutable destination was screened at admission
+    /// (`screen_url_host_egress`), with redirects disabled and the screened
+    /// resolver wired (issue #6651 item 1 premise audit).
     /// Use [`execute_redacted`] instead when the URL itself contains a secret
     /// token, such as incoming-webhook URLs.
     ///

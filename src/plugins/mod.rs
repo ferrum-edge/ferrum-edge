@@ -12853,7 +12853,10 @@ pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin
     create_plugin_with_http_client(
         name,
         config,
-        PluginHttpClient::default().with_process_compression_admission_policy(),
+        PluginHttpClient::default_with_backend_allow_ips(
+            crate::config::BackendEgressPolicy::unrestricted(),
+        )
+        .with_process_compression_admission_policy(),
     )
 }
 
@@ -13318,7 +13321,10 @@ pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> 
     validate_plugin_config_with_http_client(
         name,
         config,
-        PluginHttpClient::default().with_process_compression_admission_policy(),
+        PluginHttpClient::default_with_backend_allow_ips(
+            crate::config::BackendEgressPolicy::unrestricted(),
+        )
+        .with_process_compression_admission_policy(),
     )
 }
 
