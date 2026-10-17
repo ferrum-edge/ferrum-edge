@@ -2719,15 +2719,15 @@ namespace, or the mesh in the Istio root namespace, because the attachment canno
 be resolved), and the data plane installs a forced `request_termination`
 instance (`__mesh_request_auth_refused`) that answers every HTTP request to those
 workloads with `503` until the resource is fixed. The refusal is scoped to the
-workload's materialized inbound routes, so its outbound requests keep flowing.
-On topologies whose inbound path is a transparent HBONE relay that never enters
-the HTTP plugin chain (Ambient, NodeWaypoint, EastWestGateway, EgressGateway —
-inbound HTTP via HBONE does **not** pass the plugin chain there; issue #6736),
-the refusal is not installed: unscoped, it could only block the proxy's outbound
-routes without refusing any inbound request. The data plane logs this once per
-apply; inbound JWT enforcement for such workloads requires a Sidecar or a
-ServiceWaypoint, whose routes do enter the HTTP chain, and fixing the refused
-resource is required regardless. This deliberately differs from
+workload's inbound execution routes, so its outbound requests keep flowing:
+the materialized Sidecar inbound routes plus the synthesized HBONE relay
+proxies (`__mesh-inbound-hbone-relay` / `__mesh-ingress-connect-relay`), whose
+CONNECT admission runs the global HTTP plugin chain before the tunnel opens.
+On Ambient (and NodeWaypoint/ServiceWaypoint) no inbound HTTP route
+materializes, so those relay ids are what makes the refusal refuse inbound
+CONNECTs there instead of falling back to unscoped and refusing the workload's
+outbound requests (issue #6736). EastWestGateway (SNI passthrough, no HBONE
+listener) keeps the unscoped fail-closed fallback. This deliberately differs from
 Istio, whose validating webhook would never admit such a resource; Ferrum
 accepts some resources Istio admits but Ferrum cannot enforce faithfully, and
 for those it chooses refusal over running without validation. The status reports
