@@ -50,11 +50,11 @@ produces a successful echo.
 | `direct` | loadgen → echo backend | — |
 | `ferrum` | the real Ferrum mesh runtime: two `FERRUM_MODE=mesh` Sidecar processes, localized file config (`FERRUM_MESH_CONFIG_PROTOCOL=file`), file SVIDs, STRICT PeerAuthentication, SPIFFE-ID pinning, full proxy/plugin chain | not a stripped proxy fixture |
 | `envoy` | two hand-configured `envoyproxy/envoy:v1.39.1` proxies as a static HTTP/2-over-mTLS sidecar pair (client-cert required, SAN pinning both directions, session resumption off) | **not full Istio** — no istiod-generated config, telemetry filters, Wasm, or capture iptables. An Envoy proxy control, labeled “Envoy” in every output |
+| `consul` | a real Consul control plane (`hashicorp/consul:1.21.4` dev agent) generating two Envoy sidecars via `consul connect envoy` + xDS, Consul Connect CA mTLS, `protocol: http` service (generated east-west is HTTP/1.1-over-mTLS). Bootstrap adapted only for admin ports and the loopback agent xDS channel (`prepare_consul_bootstrap.py`) | a single dev agent on loopback, not a Consul cluster; intentions default-allow except during the deny probe; agent excluded from pair CPU/memory like other control planes |
 | `linkerd` | standalone probe of `ghcr.io/linkerd/proxy` | cannot run without the Linkerd Destination/Identity control plane (`Invalid configuration: no destination service configured` with static identity); the arm records `unsupported-standalone` with logs instead of numbers |
 
-Cilium service mesh and Consul Connect use Envoy as the L7 data plane.
-Consul's differentiator here (control-plane-generated Envoy config) does
-not require Kubernetes and is the next Tier-1 candidate; Cilium's eBPF
+Cilium service mesh also uses Envoy as the L7 data plane. Consul
+Connect (above) is included as the second real mesh; Cilium's eBPF
 datapath does require a Kubernetes/linux-node environment and is Tier-2
 scope, below. Neither is silently represented by the `envoy` arm.
 
@@ -69,9 +69,11 @@ scope, below. Neither is silently represented by the `envoy` arm.
 2. **Control planes are out of the data path** in every arm, including
    Ferrum (localized file slices). Config-push latency and control-plane
    resource use are not measured.
-3. **Same certificates everywhere.** One EC P-256 CA; each arm's proxies
-   present the same two workload certificates, so TLS handshake cost is
-   not confounded by key type.
+3. **Same certificates where the product allows it.** One EC P-256 CA;
+   the ferrum/envoy proxies present the same two workload certificates.
+   Consul issues its own Connect CA leaves (same EC P-256 issuance
+   profile, different files) — that is the product's real identity
+   path, not a harness shortcut.
 4. **Ferrum runs its full mesh stack** (slice materialization, routing,
    plugin chain, SPIFFE verification). Envoy runs a minimal static
    config: no telemetry/authz filter chain equivalent to a stock Istio
@@ -103,9 +105,7 @@ scope, below. Neither is silently represented by the `envoy` arm.
 
 ## Tier-2 follow-up: full meshes in Kubernetes (design, not yet built)
 
-First candidate, before any kind work: **Consul** (`consul connect
-envoy` + local agent) adds a real mesh control plane with an Envoy data
-plane without requiring Kubernetes, and can join the Tier-1 topology.
+Consul has joined Tier-1 (above). Next candidates, in order:
 **ztunnel** has a dedicated local-XDS/fake-CA development mode, so
 “Istio ambient requires Kubernetes” is too strong — but ztunnel is an
 L4/HBONE data plane (it does not terminate user HTTP), so it belongs in

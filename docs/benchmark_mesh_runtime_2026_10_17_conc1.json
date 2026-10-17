@@ -1,5 +1,10 @@
 {
   "arm_status": {
+    "consul": {
+      "detail": "echo probe passed",
+      "mesh": "consul",
+      "status": "ready"
+    },
     "direct": {
       "detail": "echo probe passed",
       "mesh": "direct",
@@ -17,6 +22,38 @@
     }
   },
   "meshes": {
+    "consul": {
+      "1024": {
+        "latency_avg_us": 120,
+        "median_rps": 8232.0,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/conc1-summary/consul/run_1/consul_http1_1024.json",
+        "median_run_rps": 8232.0,
+        "p50_us": 120,
+        "p95_us": 131,
+        "p99_us": 139,
+        "publishable_runs": 1,
+        "rps_max": 8232.0,
+        "rps_min": 8232.0,
+        "runs": [
+          {
+            "concurrency": 1,
+            "duration_secs": 3,
+            "latency_avg_us": 120,
+            "p50_us": 120,
+            "p95_us": 131,
+            "p99_us": 139,
+            "publishable": true,
+            "resources": null,
+            "rps": 8232.0,
+            "source_file": "/Users/jeremyjustus/mesh-results/conc1-summary/consul/run_1/consul_http1_1024.json",
+            "total_bytes": 25288704,
+            "total_errors": 0,
+            "total_requests": 24696
+          }
+        ],
+        "throughput_mbps_median": 8.43
+      }
+    },
     "direct": {
       "1024": {
         "latency_avg_us": 36,

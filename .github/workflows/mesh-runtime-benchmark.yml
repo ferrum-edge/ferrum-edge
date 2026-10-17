@@ -4,7 +4,7 @@
 # Every arm runs an HTTP/1.1 echo workload (H1 -> HTTP/2-over-mTLS -> H1
 # through the proxy pair) at 6 payload sizes (1KiB, 10KiB, 70KiB, 500KiB,
 # 1MiB, 5MiB). All arms run sequentially on ONE ubuntu-26.04 runner in the
-# fixed order direct -> ferrum -> envoy -> linkerd, so overhead is computed
+# fixed order direct -> ferrum -> envoy -> consul -> linkerd, so overhead is computed
 # against a same-runner direct baseline (per-arm runners would make the
 # direct denominator a different machine).
 #
@@ -13,6 +13,9 @@
 #   ferrum  : 2x ferrum-edge FERRUM_MODE=mesh Sidecar, localized file
 #             config + file SVIDs, STRICT PeerAuthentication (real mesh
 #             runtime, no control plane needed)
+#   consul  : Consul dev agent + 2x Envoy sidecars bootstrapped by
+#             `consul connect envoy` (real control plane + xDS,
+#             Consul Connect CA mTLS)
 #   envoy   : 2x envoyproxy/envoy hand-configured H2/mTLS pair (the Istio
 #             sidecar data-plane proxy; a static proxy control labeled
 #             Envoy, not full Istio: no istiod, telemetry, or Wasm)
@@ -52,7 +55,7 @@ on:
         type: choice
         options: ["1", "3"]
       skip_meshes:
-        description: "Space-separated arms to skip (direct ferrum envoy linkerd)"
+        description: "Space-separated arms to skip (direct ferrum envoy consul linkerd)"
         required: false
         default: ""
         type: string
@@ -115,7 +118,7 @@ jobs:
       - name: Compute mesh + payload lists
         id: plan
         run: |
-          all_meshes="direct ferrum envoy linkerd"
+          all_meshes="direct ferrum envoy consul linkerd"
           meshes=""
           for m in $all_meshes; do
             case " $BENCH_SKIP_MESHES " in

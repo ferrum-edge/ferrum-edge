@@ -30,7 +30,7 @@ import statistics
 import sys
 from pathlib import Path
 
-MESH_ORDER = ("direct", "ferrum", "envoy", "linkerd")
+MESH_ORDER = ("direct", "ferrum", "envoy", "consul", "linkerd")
 CELL_RE = re.compile(r"^(?P<mesh>[a-z]+)_http1_(?P<payload>[0-9]+)\.json$")
 MEM_RE = re.compile(r"^([0-9.]+)\s*([KMGT]?i?B)")
 

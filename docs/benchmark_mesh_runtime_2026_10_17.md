@@ -1,7 +1,8 @@
 # Mesh Runtime Benchmark — First Local Results (2026-10-17, exploratory)
 
 First head-to-head measurement of Ferrum Edge as a service-mesh data
-plane against a static Envoy control pair in the same environment,
+plane against a static Envoy control pair and a Consul Connect pair
+(real control plane) in the same environment,
 using the harness in `tests/performance/mesh_runtime/` and workflow
 `.github/workflows/mesh-runtime-benchmark.yml`. Methodology and caveats:
 [`docs/mesh_runtime_benchmark.md`](mesh_runtime_benchmark.md). Results:
@@ -13,19 +14,27 @@ using the harness in `tests/performance/mesh_runtime/` and workflow
 **Evidence status:** one exploratory 10-second observation per cell on
 a shared six-vCPU Colima arm64 VM (all arms sequential on that host).
 Quote as: “the configured Ferrum run had lower small-payload throughput
-than the static Envoy control, and bulk RPS was closer.” These are not
+than the static Envoy control and the Consul-generated pair, and bulk
+RPS was closer.” These are not
 validated mesh-product rankings; the hosted `ubuntu-26.04` collection
 (first dispatch after the workflow lands on `main`, 30s × 3 iterations
 recommended) is the publishable artifact and will supersede this page.
 
 ## Exploratory observation
 
-At 1KiB the Ferrum pair reached 37,089 RPS vs the Envoy pair's 74,254
-on this VM; estimated sampled CPU per request (docker-stats pair CPU ÷
-RPS, an unbracketed sampled estimate, not measured service demand) was
-≈113µs vs ≈54µs. At 500KiB and above, RPS differed by 3–7% and sampled
-CPU/request was similar. At concurrency 1 the pairs added ≈207µs
-(Ferrum) and ≈132µs (Envoy) over the 36µs direct path at 1KiB. The
+At 1KiB the Ferrum pair reached 37,089 RPS on this VM, vs 74,254 for
+the static Envoy pair and 132,324 for the Consul-generated pair;
+estimated sampled CPU per request (docker-stats pair CPU ÷ RPS, an
+unbracketed sampled estimate, not measured service demand) was ≈113µs
+(Ferrum) vs ≈54µs (Envoy) vs ≈29µs (Consul). At 500KiB Ferrum was
+within 4% of Envoy and 25% below Consul; at 5MiB all three were within
+13%. At concurrency 1 the pairs added ≈207µs (Ferrum), ≈132µs
+(Envoy), and ≈84µs (Consul) over the 36µs direct path at 1KiB. Wire
+shapes differ as each product generates them: Ferrum and the static
+Envoy control run H1 → HTTP/2-over-mTLS → H1, while Consul's generated
+config for a `protocol: http` service runs H1 → HTTP/1.1-over-mTLS →
+H1 — the comparison is each mesh's default generated data path, not a
+normalized-transport study. The
 pattern is *consistent with* a larger fixed per-request cost on the
 Ferrum path; it does not by itself identify which component (plugin
 chain, H2 stream handling, pool behavior, scheduling) accounts for it.
@@ -40,46 +49,48 @@ established by this run.
 | Placement | arms sequential on the same host; load generator + backend share the VM (headroom not isolated) |
 | Ferrum | published image `ferrumedge/ferrum-edge:main-ee8c0e590155e3b6fd6ab5381d5d42e35fcbbd74`, digest `sha256:c53396671a71d6bddf1156bcd913ec523d6ff8b41c1c8dbe910a27b5eb85319a` (benchmark-branch base SHA) |
 | Envoy | `envoyproxy/envoy:v1.39.1`, static TLS-1.3 H2/mTLS pair (not full Istio) |
+| Consul | `hashicorp/consul:1.21.4` dev agent + `envoyproxy/envoy:v1.39.1` sidecars bootstrapped by `consul connect envoy` (Consul Connect CA; bootstrap adapted only for admin ports + loopback xDS channel, see harness) |
 | Linkerd | `ghcr.io/linkerd/proxy:edge-25.11.1` — `unsupported-standalone` (Destination service required; log evidence in the run artifact) |
-| Workload | HTTP/1.1 POST echo, H1 → H2-over-mTLS (TLS 1.3 both arms) → H1, 10s/cell, conc 100 (50 @1MiB, 25 @5MiB), 1 iteration, byte-exact echo verification |
-| Auth probes | plaintext refused; valid client cert accepted; no-cert and rogue-CA handshakes refused (both mesh arms) |
+| Workload | HTTP/1.1 POST echo; ferrum/envoy H1 → H2-over-mTLS (TLS 1.3) → H1, consul H1 → H1.1-over-mTLS → H1 (as generated); 10s/cell, conc 100 (50 @1MiB, 25 @5MiB), 1 iteration, byte-exact echo verification |
+| Auth probes | plaintext refused; valid client cert accepted; no-cert and rogue-CA handshakes refused (ferrum/envoy); plaintext refused + deny intention breaks/restores echo (consul) |
 | Collected | 2026-10-17 |
 
 ## Results (single observation per cell)
 
 ### Throughput (RPS) and loss vs same-host direct
 
-| Payload | direct | ferrum | envoy | ferrum loss | envoy loss |
-|---:|---:|---:|---:|---:|---:|
-| 1KiB | 418,179 | 37,089 | 74,254 | 91.1% | 82.2% |
-| 10KiB | 328,822 | 30,478 | 49,737 | 90.7% | 84.9% |
-| 70KiB | 92,694 | 13,170 | 16,060 | 85.8% | 82.7% |
-| 500KiB | 12,314 | 2,739 | 2,921 | 77.8% | 76.3% |
-| 1MiB | 5,844 | 1,424 | 1,492 | 75.6% | 74.5% |
-| 5MiB | 865 | 286 | 294 | 66.9% | 66.0% |
+| Payload | direct | ferrum | envoy | consul | ferrum loss | envoy loss | consul loss |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1KiB | 418,179 | 37,089 | 74,254 | 132,324 | 91.1% | 82.2% | 68.4% |
+| 10KiB | 328,822 | 30,478 | 49,737 | 94,821 | 90.7% | 84.9% | 71.2% |
+| 70KiB | 92,694 | 13,170 | 16,060 | 23,932 | 85.8% | 82.7% | 74.2% |
+| 500KiB | 12,314 | 2,739 | 2,921 | 3,672 | 77.8% | 76.3% | 70.2% |
+| 1MiB | 5,844 | 1,424 | 1,492 | 1,777 | 75.6% | 74.5% | 69.6% |
+| 5MiB | 865 | 286 | 294 | 328 | 66.9% | 66.0% | 62.1% |
 
 ### Latency p50 at offered load (closed-loop)
 
-| Payload | direct | ferrum | envoy |
-|---:|---:|---:|---:|
-| 1KiB | 213µs | 2.63ms | 1.22ms |
-| 10KiB | 270µs | 3.21ms | 1.87ms |
-| 70KiB | 993µs | 7.50ms | 5.88ms |
-| 500KiB | 7.79ms | 35.9ms | 25.5ms |
-| 1MiB | 8.27ms | 34.8ms | 27.3ms |
-| 5MiB | 28.4ms | 87.3ms | 82.7ms |
+| Payload | direct | ferrum | envoy | consul |
+|---:|---:|---:|---:|---:|
+| 1KiB | 213µs | 2.63ms | 1.22ms | 685µs |
+| 10KiB | 270µs | 3.21ms | 1.87ms | 962µs |
+| 70KiB | 993µs | 7.50ms | 5.88ms | 3.89ms |
+| 500KiB | 7.79ms | 35.9ms | 25.5ms | 26.1ms |
+| 1MiB | 8.27ms | 34.8ms | 27.3ms | 27.3ms |
+| 5MiB | 28.4ms | 87.3ms | 82.7ms | 70.9ms |
 
 Concurrency-1 average latency at 1KiB (diagnostic file above):
-direct 36µs, envoy 168µs, ferrum 243µs.
+direct 36µs, consul 120µs, envoy 168µs, ferrum 243µs.
 
 ### Proxy-pair CPU / memory (docker-stats cgroup usage, sampled)
 
-Pair CPU was ≈400–450% for both arms at all sizes on this VM (the
-load generator and backend compete for the same 6 vCPUs, so these are
-shared-host capacity samples, not isolated proxy cost). Sampled
-CPU/request at 1KiB: ferrum ≈113µs, envoy ≈54µs; at 5MiB: ≈14.1ms vs
-≈13.6ms. Pair memory (mean / sum-of-peaks): ferrum 120–295MiB /
-122–308MiB; envoy 49–226MiB / 49–255MiB across payload sizes.
+Pair CPU was ≈380–450% for every mesh arm at all sizes on this VM
+(the load generator and backend compete for the same 6 vCPUs, so these
+are shared-host capacity samples, not isolated proxy cost). Sampled
+CPU/request at 1KiB: ferrum ≈113µs, envoy ≈54µs, consul ≈29µs; at
+5MiB: ≈14.1ms vs ≈13.6ms vs ≈11.8ms. Pair memory mean ranges: ferrum
+120–295MiB, envoy 49–226MiB, consul 45–202MiB (sidecars only; the
+Consul agent itself is excluded, like other control planes).
 
 ## Fairness fixes found during bring-up (diagnostics, not archived cells)
 

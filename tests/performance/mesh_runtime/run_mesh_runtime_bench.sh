@@ -9,7 +9,7 @@
 # containers) to the output directory.
 #
 # Usage: ./run_mesh_runtime_bench.sh <mesh> [options]
-#   Mesh: direct | ferrum | envoy | linkerd
+#   Mesh: direct | ferrum | envoy | consul | linkerd
 #
 # Options:
 #   --payload-sizes "1024 10240 71680 512000 1048576 5242880"
@@ -24,6 +24,7 @@
 #                    env var natively; used for local container VMs)
 #   FERRUM_IMAGE     Ferrum image (default: ferrum-edge:bench)
 #   ENVOY_IMAGE      Envoy image (default: envoyproxy/envoy:v1.39.1)
+#   CONSUL_IMAGE     Consul image (default: hashicorp/consul:1.21.4)
 #   LINKERD_IMAGE    Linkerd proxy image (default: ghcr.io/linkerd/proxy:edge-25.11.1)
 #   TOOLS_IMAGE      Harness tools image (default: mesh-bench-tools:local)
 #
@@ -38,10 +39,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
 MESH="${1:-}"
-[ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|linkerd> [options]" >&2; exit 2; }
+[ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|linkerd> [options]" >&2; exit 2; }
 shift
 case "$MESH" in
-    direct|ferrum|envoy|linkerd) ;;
+    direct|ferrum|envoy|consul|linkerd) ;;
     *) echo "unknown mesh arm: $MESH" >&2; exit 2 ;;
 esac
 
@@ -75,6 +76,7 @@ done
 
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
 ENVOY_IMAGE="${ENVOY_IMAGE:-envoyproxy/envoy:v1.39.1}"
+CONSUL_IMAGE="${CONSUL_IMAGE:-hashicorp/consul:1.21.4}"
 LINKERD_IMAGE="${LINKERD_IMAGE:-ghcr.io/linkerd/proxy:edge-25.11.1}"
 TOOLS_IMAGE="${TOOLS_IMAGE:-mesh-bench-tools:local}"
 
@@ -85,6 +87,7 @@ RUN_ID="$$-${RANDOM:-0}"
 BACKEND_NAME="meshbench-${MESH}-${RUN_ID}-backend"
 CLIENT_NAME="meshbench-${MESH}-${RUN_ID}-client"
 SERVER_NAME="meshbench-${MESH}-${RUN_ID}-server"
+AGENT_NAME="meshbench-${MESH}-${RUN_ID}-agent"
 
 mkdir -p "$OUTPUT_DIR"
 # Docker -v sources must be absolute (a relative results/... source is a
@@ -107,7 +110,7 @@ write_arm_status() {
 }
 
 cleanup() {
-    docker rm -f "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" "$AGENT_NAME" >/dev/null 2>&1 || true
     # Single-run private keys never outlive the run (certificates and
     # public bundles remain as provenance under runtime/).
     rm -f "$CERT_DIR"/*/svid.key "$CERT_DIR"/*/key.p8 \
@@ -190,6 +193,10 @@ prepare_images() {
             fi
             ;;
         envoy) docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true ;;
+        consul)
+            docker pull "$CONSUL_IMAGE" > "$OUTPUT_DIR/logs/consul-pull.log" 2>&1 || true
+            docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true
+            ;;
         linkerd) docker pull "$LINKERD_IMAGE" > "$OUTPUT_DIR/logs/linkerd-pull.log" 2>&1 || true ;;
     esac
 }
@@ -225,7 +232,7 @@ wait_ready() {
 }
 
 dump_logs() {
-    for c in "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"; do
+    for c in "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" "$AGENT_NAME"; do
         docker logs "$c" > "$OUTPUT_DIR/logs/${c}.log" 2>&1 || true
     done
 }
@@ -306,6 +313,74 @@ start_envoy() {
         -v "$RUNTIME_DIR/envoy/client.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/client:/etc/mesh-certs/client:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 1 -l error >/dev/null
+}
+
+start_consul() {
+    # Real Consul control plane (single dev agent) generating real
+    # Envoy sidecar config over xDS; east-west mTLS uses Consul's own
+    # Connect CA (EC P-256 issuance profile, Consul-issued leaves, so
+    # this arm shares the cert *profile* but not the literal cert files
+    # of the ferrum/envoy arms). Proxy admin ports and the loopback
+    # agent channel are adapted by prepare_consul_bootstrap.py.
+    mkdir -p "$RUNTIME_DIR/consul"
+    cp "$SCRIPT_DIR/configs/consul/svc.json" "$RUNTIME_DIR/consul/svc.json"
+    cp "$SCRIPT_DIR/configs/consul/client.json" "$RUNTIME_DIR/consul/client.json"
+    cp "$SCRIPT_DIR/configs/consul/intention-deny.json" "$RUNTIME_DIR/consul/intention-deny.json"
+    docker run -d --network host --name "$AGENT_NAME" \
+        "$CONSUL_IMAGE" agent -dev -client=127.0.0.1 -bind=127.0.0.1 >/dev/null
+    local attempt
+    for attempt in $(seq 1 60); do
+        docker exec "$AGENT_NAME" consul members >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+    docker cp "$RUNTIME_DIR/consul/svc.json" "$AGENT_NAME:/tmp/svc.json"
+    docker cp "$RUNTIME_DIR/consul/client.json" "$AGENT_NAME:/tmp/client.json"
+    docker cp "$RUNTIME_DIR/consul/intention-deny.json" "$AGENT_NAME:/tmp/intention-deny.json"
+    docker exec "$AGENT_NAME" consul services register /tmp/svc.json >/dev/null
+    docker exec "$AGENT_NAME" consul services register /tmp/client.json >/dev/null
+    docker exec "$AGENT_NAME" consul connect envoy -sidecar-for svc-1 -bootstrap \
+        > "$RUNTIME_DIR/consul/svc-bootstrap.json"
+    docker exec "$AGENT_NAME" consul connect envoy -sidecar-for client-1 -bootstrap \
+        > "$RUNTIME_DIR/consul/client-bootstrap.json"
+    python3 "$SCRIPT_DIR/prepare_consul_bootstrap.py" "$RUNTIME_DIR/consul/svc-bootstrap.json" 19002
+    python3 "$SCRIPT_DIR/prepare_consul_bootstrap.py" "$RUNTIME_DIR/consul/client-bootstrap.json" 19001
+    # Distinct --base-id: two Envoy processes sharing one host netns
+    # otherwise collide on the base-id domain socket.
+    docker run -d --network host --name "$SERVER_NAME" \
+        -v "$RUNTIME_DIR/consul/svc-bootstrap.json:/bootstrap.json:ro" \
+        "$ENVOY_IMAGE" -c /bootstrap.json --base-id 0 -l error >/dev/null
+    docker run -d --network host --name "$CLIENT_NAME" \
+        -v "$RUNTIME_DIR/consul/client-bootstrap.json:/bootstrap.json:ro" \
+        "$ENVOY_IMAGE" -c /bootstrap.json --base-id 1 -l error >/dev/null
+}
+
+# Consul-native authorization probe: a deny intention for client->svc
+# must break the echo path, and deleting it must restore it. This is
+# the Consul equivalent of the cert-matrix probes (identity material is
+# Consul-issued and agent-held, not files this harness can present).
+consul_intention_probe() {
+    local evidence="$OUTPUT_DIR/logs/auth_probes.log"
+    : > "$evidence"
+    if probe_loadgen "http://127.0.0.1:21000/echo"; then
+        echo "[auth-probe] FAIL: plaintext echo succeeded on Consul public listener :21000" | tee -a "$evidence" >&2
+        return 1
+    fi
+    echo "[auth-probe] ok: plaintext refused on public listener" | tee -a "$evidence"
+    docker exec "$AGENT_NAME" consul config write /tmp/intention-deny.json >> "$evidence" 2>&1
+    local attempt denied=false
+    for attempt in $(seq 1 20); do
+        if ! probe_loadgen "http://127.0.0.1:$OUTBOUND_PORT/echo"; then
+            denied=true; break
+        fi
+        sleep 0.5
+    done
+    docker exec "$AGENT_NAME" consul config delete -kind service-intentions -name svc >> "$evidence" 2>&1
+    if [ "$denied" != true ]; then
+        echo "[auth-probe] FAIL: deny intention did not break the echo path" | tee -a "$evidence" >&2
+        return 1
+    fi
+    echo "[auth-probe] ok: deny intention broke echo; restoring" | tee -a "$evidence"
+    wait_ready "http://127.0.0.1:$OUTBOUND_PORT/echo" consul-pair-restored 60
 }
 
 start_linkerd() {
@@ -505,6 +580,20 @@ case "$MESH" in
         fi
         if ! auth_probes 15006; then
             dump_logs; write_arm_status failed "auth probe failed on envoy inbound"; exit 1
+        fi
+        ;;
+    consul)
+        if ! docker image inspect "$CONSUL_IMAGE" >/dev/null 2>&1; then
+            write_arm_status failed "consul image $CONSUL_IMAGE unavailable (pull failed)"
+            exit 1
+        fi
+        start_consul
+        TARGET="http://127.0.0.1:$OUTBOUND_PORT/echo"
+        if ! wait_ready "$TARGET" consul-pair 120; then
+            dump_logs; write_arm_status failed "consul pair did not become ready"; exit 1
+        fi
+        if ! consul_intention_probe; then
+            dump_logs; write_arm_status failed "auth probe failed on consul pair"; exit 1
         fi
         ;;
     linkerd)

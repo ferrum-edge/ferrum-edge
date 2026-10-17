@@ -1,5 +1,10 @@
 {
   "arm_status": {
+    "consul": {
+      "detail": "echo probe passed",
+      "mesh": "consul",
+      "status": "ready"
+    },
     "direct": {
       "detail": "echo probe passed",
       "mesh": "direct",
@@ -22,6 +27,350 @@
     }
   },
   "meshes": {
+    "consul": {
+      "1024": {
+        "latency_avg_us": 754,
+        "median_rps": 132323.8,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1024.json",
+        "median_run_rps": 132323.8,
+        "p50_us": 685,
+        "p95_us": 1450,
+        "p99_us": 1959,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-consul-18350-4143-client",
+            "meshbench-consul-18350-4143-server"
+          ],
+          "proxy_cpu_percent_mean": 384.2,
+          "proxy_cpu_percent_peak": 389.5,
+          "proxy_mem_bytes_mean": 47339711,
+          "proxy_mem_bytes_peak_sum": 47531950,
+          "samples_per_container": {
+            "meshbench-consul-18350-4143-client": 3,
+            "meshbench-consul-18350-4143-server": 3
+          }
+        },
+        "rps_max": 132323.8,
+        "rps_min": 132323.8,
+        "runs": [
+          {
+            "concurrency": 100,
+            "duration_secs": 10,
+            "latency_avg_us": 754,
+            "p50_us": 685,
+            "p95_us": 1450,
+            "p99_us": 1959,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-consul-18350-4143-client",
+                "meshbench-consul-18350-4143-server"
+              ],
+              "proxy_cpu_percent_mean": 384.2,
+              "proxy_cpu_percent_peak": 389.5,
+              "proxy_mem_bytes_mean": 47339711,
+              "proxy_mem_bytes_peak_sum": 47531950,
+              "samples_per_container": {
+                "meshbench-consul-18350-4143-client": 3,
+                "meshbench-consul-18350-4143-server": 3
+              }
+            },
+            "rps": 132323.8,
+            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1024.json",
+            "total_bytes": 1354995712,
+            "total_errors": 0,
+            "total_requests": 1323238
+          }
+        ],
+        "throughput_mbps_median": 135.5
+      },
+      "10240": {
+        "latency_avg_us": 1053,
+        "median_rps": 94820.7,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_10240.json",
+        "median_run_rps": 94820.7,
+        "p50_us": 962,
+        "p95_us": 2009,
+        "p99_us": 2655,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-consul-18350-4143-client",
+            "meshbench-consul-18350-4143-server"
+          ],
+          "proxy_cpu_percent_mean": 386.0,
+          "proxy_cpu_percent_peak": 393.4,
+          "proxy_mem_bytes_mean": 51799654,
+          "proxy_mem_bytes_peak_sum": 51988398,
+          "samples_per_container": {
+            "meshbench-consul-18350-4143-client": 3,
+            "meshbench-consul-18350-4143-server": 3
+          }
+        },
+        "rps_max": 94820.7,
+        "rps_min": 94820.7,
+        "runs": [
+          {
+            "concurrency": 100,
+            "duration_secs": 10,
+            "latency_avg_us": 1053,
+            "p50_us": 962,
+            "p95_us": 2009,
+            "p99_us": 2655,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-consul-18350-4143-client",
+                "meshbench-consul-18350-4143-server"
+              ],
+              "proxy_cpu_percent_mean": 386.0,
+              "proxy_cpu_percent_peak": 393.4,
+              "proxy_mem_bytes_mean": 51799654,
+              "proxy_mem_bytes_peak_sum": 51988398,
+              "samples_per_container": {
+                "meshbench-consul-18350-4143-client": 3,
+                "meshbench-consul-18350-4143-server": 3
+              }
+            },
+            "rps": 94820.7,
+            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_10240.json",
+            "total_bytes": 9709639680,
+            "total_errors": 0,
+            "total_requests": 948207
+          }
+        ],
+        "throughput_mbps_median": 970.96
+      },
+      "1048576": {
+        "latency_avg_us": 28153,
+        "median_rps": 1776.6,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1048576.json",
+        "median_run_rps": 1776.6,
+        "p50_us": 27263,
+        "p95_us": 48063,
+        "p99_us": 57183,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-consul-18350-4143-client",
+            "meshbench-consul-18350-4143-server"
+          ],
+          "proxy_cpu_percent_mean": 425.0,
+          "proxy_cpu_percent_peak": 430.3,
+          "proxy_mem_bytes_mean": 188285801,
+          "proxy_mem_bytes_peak_sum": 201892823,
+          "samples_per_container": {
+            "meshbench-consul-18350-4143-client": 3,
+            "meshbench-consul-18350-4143-server": 3
+          }
+        },
+        "rps_max": 1776.6,
+        "rps_min": 1776.6,
+        "runs": [
+          {
+            "concurrency": 50,
+            "duration_secs": 10,
+            "latency_avg_us": 28153,
+            "p50_us": 27263,
+            "p95_us": 48063,
+            "p99_us": 57183,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-consul-18350-4143-client",
+                "meshbench-consul-18350-4143-server"
+              ],
+              "proxy_cpu_percent_mean": 425.0,
+              "proxy_cpu_percent_peak": 430.3,
+              "proxy_mem_bytes_mean": 188285801,
+              "proxy_mem_bytes_peak_sum": 201892823,
+              "samples_per_container": {
+                "meshbench-consul-18350-4143-client": 3,
+                "meshbench-consul-18350-4143-server": 3
+              }
+            },
+            "rps": 1776.6,
+            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_1048576.json",
+            "total_bytes": 18629001216,
+            "total_errors": 0,
+            "total_requests": 17766
+          }
+        ],
+        "throughput_mbps_median": 1862.9
+      },
+      "512000": {
+        "latency_avg_us": 27257,
+        "median_rps": 3672.3,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_512000.json",
+        "median_run_rps": 3672.3,
+        "p50_us": 26143,
+        "p95_us": 46751,
+        "p99_us": 56063,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-consul-18350-4143-client",
+            "meshbench-consul-18350-4143-server"
+          ],
+          "proxy_cpu_percent_mean": 430.2,
+          "proxy_cpu_percent_peak": 436.9,
+          "proxy_mem_bytes_mean": 182826216,
+          "proxy_mem_bytes_peak_sum": 196817715,
+          "samples_per_container": {
+            "meshbench-consul-18350-4143-client": 3,
+            "meshbench-consul-18350-4143-server": 3
+          }
+        },
+        "rps_max": 3672.3,
+        "rps_min": 3672.3,
+        "runs": [
+          {
+            "concurrency": 100,
+            "duration_secs": 10,
+            "latency_avg_us": 27257,
+            "p50_us": 26143,
+            "p95_us": 46751,
+            "p99_us": 56063,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-consul-18350-4143-client",
+                "meshbench-consul-18350-4143-server"
+              ],
+              "proxy_cpu_percent_mean": 430.2,
+              "proxy_cpu_percent_peak": 436.9,
+              "proxy_mem_bytes_mean": 182826216,
+              "proxy_mem_bytes_peak_sum": 196817715,
+              "samples_per_container": {
+                "meshbench-consul-18350-4143-client": 3,
+                "meshbench-consul-18350-4143-server": 3
+              }
+            },
+            "rps": 3672.3,
+            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_512000.json",
+            "total_bytes": 18802176000,
+            "total_errors": 0,
+            "total_requests": 36723
+          }
+        ],
+        "throughput_mbps_median": 1880.22
+      },
+      "5242880": {
+        "latency_avg_us": 76349,
+        "median_rps": 328.3,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_5242880.json",
+        "median_run_rps": 328.3,
+        "p50_us": 70911,
+        "p95_us": 130559,
+        "p99_us": 155903,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-consul-18350-4143-client",
+            "meshbench-consul-18350-4143-server"
+          ],
+          "proxy_cpu_percent_mean": 389.0,
+          "proxy_cpu_percent_peak": 395.8,
+          "proxy_mem_bytes_mean": 211840314,
+          "proxy_mem_bytes_peak_sum": 233937305,
+          "samples_per_container": {
+            "meshbench-consul-18350-4143-client": 3,
+            "meshbench-consul-18350-4143-server": 3
+          }
+        },
+        "rps_max": 328.3,
+        "rps_min": 328.3,
+        "runs": [
+          {
+            "concurrency": 25,
+            "duration_secs": 10,
+            "latency_avg_us": 76349,
+            "p50_us": 70911,
+            "p95_us": 130559,
+            "p99_us": 155903,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-consul-18350-4143-client",
+                "meshbench-consul-18350-4143-server"
+              ],
+              "proxy_cpu_percent_mean": 389.0,
+              "proxy_cpu_percent_peak": 395.8,
+              "proxy_mem_bytes_mean": 211840314,
+              "proxy_mem_bytes_peak_sum": 233937305,
+              "samples_per_container": {
+                "meshbench-consul-18350-4143-client": 3,
+                "meshbench-consul-18350-4143-server": 3
+              }
+            },
+            "rps": 328.3,
+            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_5242880.json",
+            "total_bytes": 17212375040,
+            "total_errors": 0,
+            "total_requests": 3283
+          }
+        ],
+        "throughput_mbps_median": 1721.24
+      },
+      "71680": {
+        "latency_avg_us": 4175,
+        "median_rps": 23932.3,
+        "median_run_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_71680.json",
+        "median_run_rps": 23932.3,
+        "p50_us": 3893,
+        "p95_us": 7695,
+        "p99_us": 9839,
+        "publishable_runs": 1,
+        "resources": {
+          "containers": [
+            "meshbench-consul-18350-4143-client",
+            "meshbench-consul-18350-4143-server"
+          ],
+          "proxy_cpu_percent_mean": 417.5,
+          "proxy_cpu_percent_peak": 421.5,
+          "proxy_mem_bytes_mean": 70978109,
+          "proxy_mem_bytes_peak_sum": 73725378,
+          "samples_per_container": {
+            "meshbench-consul-18350-4143-client": 3,
+            "meshbench-consul-18350-4143-server": 3
+          }
+        },
+        "rps_max": 23932.3,
+        "rps_min": 23932.3,
+        "runs": [
+          {
+            "concurrency": 100,
+            "duration_secs": 10,
+            "latency_avg_us": 4175,
+            "p50_us": 3893,
+            "p95_us": 7695,
+            "p99_us": 9839,
+            "publishable": true,
+            "resources": {
+              "containers": [
+                "meshbench-consul-18350-4143-client",
+                "meshbench-consul-18350-4143-server"
+              ],
+              "proxy_cpu_percent_mean": 417.5,
+              "proxy_cpu_percent_peak": 421.5,
+              "proxy_mem_bytes_mean": 70978109,
+              "proxy_mem_bytes_peak_sum": 73725378,
+              "samples_per_container": {
+                "meshbench-consul-18350-4143-client": 3,
+                "meshbench-consul-18350-4143-server": 3
+              }
+            },
+            "rps": 23932.3,
+            "source_file": "/Users/jeremyjustus/mesh-results/full/consul/run_1/consul_http1_71680.json",
+            "total_bytes": 17154672640,
+            "total_errors": 0,
+            "total_requests": 239323
+          }
+        ],
+        "throughput_mbps_median": 1715.47
+      }
+    },
     "direct": {
       "1024": {
         "latency_avg_us": 238,
