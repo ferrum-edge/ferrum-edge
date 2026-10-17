@@ -2892,6 +2892,7 @@ async fn handle_h3_connection(
                     };
                     match resolved {
                         Ok((req, stream)) => {
+                            let request_is_head = req.method() == http::Method::HEAD;
                             let request = handle_h3_request(
                                 req,
                                 stream,
@@ -2916,7 +2917,15 @@ async fn handle_h3_connection(
                             // request task carries its slot so every response
                             // head written deep inside it is stamped. A
                             // pass-through when the store is off (the default).
-                            let result = crate::diagnostic_ref::run_h3_request(request).await;
+                            // A `HEAD` request also carries a marker so every
+                            // gateway-authored writer omits DATA.
+                            let result = if request_is_head {
+                                H3_HEAD_REQUEST
+                                    .scope((), crate::diagnostic_ref::run_h3_request(request))
+                                    .await
+                            } else {
+                                crate::diagnostic_ref::run_h3_request(request).await
+                            };
                             if let Err(e) = result {
                                 error!("HTTP/3 request error: {}", e);
                             }
@@ -18505,22 +18514,45 @@ async fn send_h3_response(
     send_h3_response_with_recv_halt(stream, status, body, true).await
 }
 
+tokio::task_local! {
+    /// Set for the request task of an HTTP/3 `HEAD` request. Gateway-authored
+    /// responses are written from many helpers deep inside the task, so the
+    /// marker rides the task (like the diagnostic slot) instead of every
+    /// writer signature. Absent for every other method: no per-poll cost.
+    static H3_HEAD_REQUEST: ();
+}
+
+/// Whether the current HTTP/3 request is `HEAD`, whose response carries no
+/// body bytes (RFC 9110 §9.3.2).
+pub(crate) fn h3_request_is_head() -> bool {
+    H3_HEAD_REQUEST.try_with(|_| ()).is_ok()
+}
+
 async fn send_h3_response_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
     body: &str,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
-    let resp = Response::builder()
+    let omit_body = h3_request_is_head() && !body.is_empty();
+    let mut builder = Response::builder()
         .status(status)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    if omit_body
+        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status.as_u16())
+    {
+        builder = builder.header("content-length", body.len());
+    }
+    let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 response: {}", e))?;
     let resp = crate::diagnostic_ref::stamp_h3_response(resp);
     stream.send_response(resp).await?;
-    stream
-        .send_data(Bytes::copy_from_slice(body.as_bytes()))
-        .await?;
+    if !omit_body {
+        stream
+            .send_data(Bytes::copy_from_slice(body.as_bytes()))
+            .await?;
+    }
     stream.finish().await?;
     if halt_recv {
         crate::http3::stream_util::halt_request_body(stream);
@@ -18755,8 +18787,21 @@ async fn send_h3_pre_sanitized_reject_response_with_recv_halt(
     headers: &HashMap<String, String>,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
+    // `HEAD`: keep the representation `Content-Length` (already set by the
+    // wire sanitizer for a buffered body) and send no DATA, whatever path
+    // built the rejection (pre-plugin refusals, route misses, gRPC-Web).
+    let omit_body = h3_request_is_head() && !body.is_empty();
     let mut builder = Response::builder().status(status);
     builder = apply_response_headers(builder, headers);
+    if omit_body
+        && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status.as_u16())
+        && !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length"))
+    {
+        builder = builder.header("content-length", body.len());
+    }
+    let body = if omit_body { Bytes::new() } else { body };
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;

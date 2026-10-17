@@ -33108,6 +33108,7 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     mut connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    let request_is_head = req.method() == hyper::Method::HEAD;
     let diagnostic = crate::diagnostic_ref::RequestDiagnostic::begin(
         crate::diagnostic_ref::DiagnosticProtocol::from_http_version(req.version()),
     );
@@ -33124,6 +33125,9 @@ async fn handle_proxy_request_on_frontend_port(
     )
     .await;
     response.map(|mut resp| {
+        if request_is_head {
+            omit_head_response_body(&mut resp);
+        }
         match &diagnostic {
             Some(diagnostic) => {
                 let status = resp.status().as_u16();
@@ -33133,6 +33137,26 @@ async fn handle_proxy_request_on_frontend_port(
         }
         resp
     })
+}
+
+/// A response to `HEAD` carries no body bytes (RFC 9110 §9.3.2). Hyper drops
+/// them on HTTP/1.1 but sends them as DATA on HTTP/2, so gateway-authored
+/// buffered bodies that never passed the shared synthetic-response finalizer
+/// (pre-plugin refusals, route misses, gRPC-Web error frames) are emptied
+/// here, keeping the representation `Content-Length`.
+fn omit_head_response_body(resp: &mut Response<ProxyBody>) {
+    let Some(len) = resp.body_mut().take_buffered_head_body() else {
+        return;
+    };
+    if !crate::plugins::utils::synthetic_response::status_forbids_response_body(
+        resp.status().as_u16(),
+    ) && !resp.headers().contains_key(hyper::header::CONTENT_LENGTH)
+    {
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from(len),
+        );
+    }
 }
 
 /// HTTP status of an admission fence's response head, recorded with the

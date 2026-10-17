@@ -682,6 +682,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gateway-authored `HEAD` responses carry no body on HTTP/2 and HTTP/3.**
+  Responses built outside the shared synthetic-response finalizer (the
+  `allowed_methods` `405`, the route-protocol admission `403`, route misses,
+  path-parameter refusals, gRPC-Web error frames, and the HTTP/3 bridge's
+  backend-dispatch errors) sent their body as DATA to a `HEAD` request on
+  HTTP/2 and HTTP/3; HTTP/1.1 was unaffected because Hyper drops it. The
+  HTTP/1.1 and HTTP/2 response boundary and the HTTP/3 gateway response
+  writers (native and cross-protocol bridge) now omit the bytes of a buffered
+  body for `HEAD`, keeping the representation `Content-Length`. Transaction
+  summaries (and so logging sinks and `api_chargeback`) report no delivered
+  response bytes for a `HEAD` request, on every protocol.
+
 - **A custom bpffs path keeps node-agent pins and their readers together**
   (issue #6698). Helm `nodeAgent.bpfFsPath` changed the bpffs mount point
   inside the node-agent and ambient containers and was passed through as

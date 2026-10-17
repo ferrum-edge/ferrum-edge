@@ -875,6 +875,21 @@ impl ProxyBody {
         Self::full(Bytes::from(s.to_string()))
     }
 
+    /// `HEAD` wire contract at the frontend response boundary: drop the bytes
+    /// of a buffered, non-empty body and return their length, so the caller
+    /// can keep the representation `Content-Length`. Every guard the body
+    /// carries is kept. Streaming bodies are untouched; a backend's `HEAD`
+    /// response is already empty.
+    pub(crate) fn take_buffered_head_body(&mut self) -> Option<u64> {
+        use http_body::Body as _;
+        let ProxyBodyKind::Full(body) = &self.kind else {
+            return None;
+        };
+        let len = body.size_hint().exact().filter(|len| *len > 0)?;
+        self.kind = ProxyBodyKind::Full(Full::default());
+        Some(len)
+    }
+
     /// Create an empty body.
     pub fn empty() -> Self {
         Self {

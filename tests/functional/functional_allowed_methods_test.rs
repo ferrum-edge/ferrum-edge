@@ -9,6 +9,9 @@
 //! requests before backend dispatch.
 
 use crate::scaffolding::port_registry::TestSocket;
+use crate::scaffolding::ports::{
+    REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY, reserve_refused_tcp_port,
+};
 
 use crate::common::TestGateway;
 use crate::scaffolding::clients::{GetOptions, Http3Client};
@@ -41,8 +44,12 @@ async fn start_counting_http1_backend(
                 _ => return,
             };
             let request = String::from_utf8_lossy(&buf[..n]);
-            let target_prefix = format!("GET {target_path} ");
-            if !request.starts_with(&target_prefix) {
+            // HEAD counts too, so a HEAD that wrongly reached the backend is
+            // visible to the "no backend request" assertions.
+            let is_target = ["GET", "HEAD"]
+                .iter()
+                .any(|method| request.starts_with(&format!("{method} {target_path} ")));
+            if !is_target {
                 let _ = stream.shutdown().await;
                 return;
             }
@@ -305,6 +312,263 @@ async fn functional_allowed_methods_http3_rejects_before_backend() {
         "blocked HTTP/3 POST must not reach backend"
     );
 }
+
+/// A refused `HEAD` keeps its representation `Content-Length` but carries no
+/// body bytes, whichever gateway path answered it: `allowed_methods` (JSON
+/// and gRPC-Web shapes), a route miss, a path-parameter refusal, or a
+/// backend-dispatch error. Hyper drops
+/// a HEAD body on HTTP/1.1 itself, so HTTP/2 and HTTP/3 are the protocols that
+/// would otherwise send DATA.
+#[ignore]
+#[tokio::test]
+async fn functional_head_refusals_carry_no_body_on_h2_and_h3() {
+    let backend = CountingBackend::start().await;
+    // `/down` admits HEAD but its backend port is closed, so the gateway
+    // answers with its own backend-dispatch error.
+    // Held for the whole scenario so no other process can take the port.
+    let refused = reserve_refused_tcp_port().expect("reserve refused backend port");
+    let closed_port = refused.port;
+    let config = build_config(backend.port, &["GET"]).replacen(
+        "proxies:\n",
+        &format!(
+            "proxies:\n  - id: \"down\"\n    listen_path: \"/down\"\n    backend_scheme: http\n    backend_host: \"127.0.0.1\"\n    backend_port: {closed_port}\n    backend_connect_timeout_ms: 1000\n    strip_listen_path: false\n    pool_enable_http2: false\n"
+        ),
+        1,
+    ) + "  - id: \"head-stdout-log\"\n    plugin_name: stdout_logging\n    scope: global\n    enabled: true\n    config: {}\n";
+    let mut gateway = TestGateway::builder()
+        .mode_file(config)
+        .log_level("warn")
+        .capture_output()
+        .env("FERRUM_ENABLE_HTTP3", "true")
+        .env_ephemeral_port("FERRUM_PROXY_HTTPS_PORT")
+        .env("FERRUM_FRONTEND_TLS_CERT_PATH", "tests/certs/server.crt")
+        .env("FERRUM_FRONTEND_TLS_KEY_PATH", "tests/certs/server.key")
+        .spawn()
+        .await
+        .expect("start gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
+    let https_port = gateway
+        .env_port("FERRUM_PROXY_HTTPS_PORT")
+        .expect("harness-allocated HTTPS port");
+
+    // (path, content-type, exact expected status). gRPC-Web refusals are
+    // answered `200` with the status in a trailer frame and keep the
+    // authoritative `Allow`; a path parameter under a routed prefix is refused
+    // `400` (`path_parameter`). The body must be absent in every case.
+    let cases: &[(&str, Option<&str>, Option<u16>)] = &[
+        ("/allowed", None, Some(405)),
+        ("/allowed", Some("application/grpc-web"), Some(200)),
+        ("/allowed", Some("application/grpc-web-text"), Some(200)),
+        ("/no-such-route", None, Some(404)),
+        ("/allowed/x;v=1", None, Some(400)),
+        // Linux refuses the reserved port at once (502); other hosts drop the
+        // SYN until the connect timeout, so only the body is checked there.
+        (
+            "/down",
+            None,
+            if REFUSED_TCP_PORT_REFUSES_CONNECT_IMMEDIATELY {
+                Some(502)
+            } else {
+                None
+            },
+        ),
+    ];
+
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("h2c client");
+    for (path, content_type, status) in cases {
+        let mut request = h2.head(gateway.proxy_url(path));
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", *content_type);
+        }
+        let response = request.send().await.expect("h2 HEAD");
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        let got = response.status().as_u16();
+        match status {
+            Some(expected) => assert_eq!(got, *expected, "{path} {content_type:?}"),
+            None => assert!(got >= 200, "{path} {content_type:?}: unexpected {got}"),
+        }
+        if *status == Some(405) || content_type.is_some() {
+            assert_allow_header(response.headers(), &["GET"]);
+        }
+        if matches!(status, Some(404 | 405)) {
+            assert_representation_length(response.headers(), path);
+        }
+        assert!(
+            response.bytes().await.expect("h2 HEAD body").is_empty(),
+            "an HTTP/2 HEAD refusal must carry no DATA: {path} {content_type:?}"
+        );
+    }
+
+    let client = Http3Client::insecure().expect("h3 client");
+    for (path, content_type, status) in cases {
+        let url = format!("https://localhost:{https_port}{path}");
+        let mut options = GetOptions::default()
+            .method(Method::HEAD)
+            .header("user-agent", H3_HEAD_TEST_AGENT);
+        if let Some(content_type) = content_type {
+            options = options.header("content-type", *content_type);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let response = loop {
+            match client.get_with_options(&url, options.clone()).await {
+                Ok(response) => break response,
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(100)).await,
+                Err(err) => panic!("H3 HEAD {path} did not complete: {err}"),
+            }
+        };
+        let got = response.status.as_u16();
+        match status {
+            Some(expected) => assert_eq!(got, *expected, "{path} {content_type:?}"),
+            None => assert!(got >= 200, "{path} {content_type:?}: unexpected {got}"),
+        }
+        if *status == Some(405) || content_type.is_some() {
+            assert_allow_header(&response.headers, &["GET"]);
+        }
+        if matches!(status, Some(404 | 405)) {
+            assert_representation_length(&response.headers, path);
+        }
+        assert!(
+            response.body_bytes.is_empty(),
+            "an HTTP/3 HEAD refusal must carry no DATA: {path} {content_type:?}"
+        );
+        assert!(
+            response.body_error.is_none(),
+            "an HTTP/3 HEAD refusal must complete cleanly: {path} {content_type:?}: {:?}",
+            response.body_error
+        );
+    }
+    assert_eq!(
+        backend.hits(),
+        0,
+        "a refused HEAD must not reach the backend"
+    );
+
+    // Positive control: the counter sees an admitted request.
+    let admitted = h2
+        .get(gateway.proxy_url("/allowed"))
+        .send()
+        .await
+        .expect("h2 GET");
+    assert_eq!(admitted.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend.hits(),
+        1,
+        "the backend counter must see admitted requests"
+    );
+
+    // Accounting: a HEAD backend-dispatch error delivers no body bytes, so its
+    // transaction summary reports none on HTTP/2 and HTTP/3, while a GET to
+    // the same route (the body-bearing control) reports its error body.
+    // Methods are case-sensitive: the extension method `head` is not HEAD, so
+    // its body is delivered and accounted.
+    let lowercase_head = reqwest::Method::from_bytes(b"head").expect("extension method");
+    for method in [
+        reqwest::Method::HEAD,
+        reqwest::Method::GET,
+        lowercase_head.clone(),
+    ] {
+        let response = h2
+            .request(method.clone(), gateway.proxy_url("/down"))
+            .header("user-agent", H2_HEAD_TEST_AGENT)
+            .send()
+            .await
+            .expect("h2 /down");
+        let body = response.bytes().await.expect("h2 /down body");
+        assert_eq!(
+            body.is_empty(),
+            method == reqwest::Method::HEAD,
+            "h2 {method}"
+        );
+    }
+    let lower_h3 = client
+        .get_with_options(
+            &format!("https://localhost:{https_port}/down"),
+            GetOptions::default()
+                .method(Method::from_bytes(b"head").expect("extension method"))
+                .header("user-agent", H3_HEAD_TEST_AGENT),
+        )
+        .await
+        .expect("H3 head /down");
+    assert!(
+        !lower_h3.body_bytes.is_empty(),
+        "the extension method `head` keeps its body on HTTP/3"
+    );
+    let get_down = client
+        .get_with_options(
+            &format!("https://localhost:{https_port}/down"),
+            GetOptions::default().header("user-agent", H3_HEAD_TEST_AGENT),
+        )
+        .await
+        .expect("H3 GET /down");
+    assert!(!get_down.body_bytes.is_empty());
+    let down_entries = |raw: &str, agent: &str| -> Vec<serde_json::Value> {
+        raw.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| {
+                entry.get("request_path").and_then(|v| v.as_str()) == Some("/down")
+                    && entry.get("request_user_agent").and_then(|v| v.as_str()) == Some(agent)
+            })
+            .collect()
+    };
+    let stdout = gateway
+        .wait_for_captured_output(
+            |raw| {
+                down_entries(raw, H2_HEAD_TEST_AGENT).len() >= 3
+                    && down_entries(raw, H3_HEAD_TEST_AGENT).len() >= 3
+            },
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("read stdout capture");
+    for agent in [H2_HEAD_TEST_AGENT, H3_HEAD_TEST_AGENT] {
+        let entries = down_entries(&stdout, agent);
+        let bytes_for = |method: &str| {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.get("http_method").and_then(|v| v.as_str()) == Some(method))
+                .unwrap_or_else(|| panic!("missing {agent} {method} /down summary in {entries:?}"));
+            entry
+                .get("bytes_received")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            bytes_for("HEAD"),
+            0,
+            "{agent}: a suppressed HEAD body is not delivered"
+        );
+        assert!(
+            bytes_for("head") > 0,
+            "{agent}: the extension method `head` reports its delivered body"
+        );
+        assert!(
+            bytes_for("GET") > 0,
+            "{agent}: the control GET reports its error body"
+        );
+    }
+    drop(refused);
+    gateway.shutdown();
+}
+
+/// A refused HEAD keeps a non-zero representation `Content-Length`.
+fn assert_representation_length(headers: &HeaderMap, path: &str) {
+    let length = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("{path}: HEAD refusal must keep Content-Length: {headers:?}"));
+    assert!(length > 0, "{path}: representation length must not be zero");
+}
+
+const H2_HEAD_TEST_AGENT: &str = "ferrum-h2-head-test";
+const H3_HEAD_TEST_AGENT: &str = "ferrum-h3-head-test";
 
 // ---------------------------------------------------------------------------
 // Client-selected flavors that cannot run the route's admission policy
