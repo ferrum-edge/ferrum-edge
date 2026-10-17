@@ -322,7 +322,7 @@ fn parse_udp_logging_config(
             dtls_ca_cert_path.as_deref(),
             dtls_no_verify,
             http_client.tls_crls(),
-            Some(&http_client),
+            Some(http_client),
         )?))
     } else {
         None

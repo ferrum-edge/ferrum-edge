@@ -449,7 +449,7 @@ pub(crate) fn build_tls_connector(
         // shared `tls::crl_policy` (applied inside
         // `build_server_verifier_with_crls`) decides the posture over the
         // snapshot list.
-        let mut config = match live_source {
+        match live_source {
             Some(client) => {
                 let verifier = client
                     .crl_server_verifier(root_store)
@@ -474,8 +474,7 @@ pub(crate) fn build_tls_connector(
                 crate::tls::apply_crl_enforced_client_resumption(&mut config, tls_crls);
                 config
             }
-        };
-        config
+        }
     };
 
     Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))

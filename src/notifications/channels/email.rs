@@ -878,7 +878,7 @@ pub(crate) fn build_client_config(
     // With a live source the verifier follows CRL generations after a
     // backend TLS reload (#6651) instead of freezing the snapshot list; the
     // cached config still serves every later send through that verifier.
-    let mut config = match &live_source {
+    let config = match &live_source {
         Some(client) => {
             let verifier = client
                 .crl_server_verifier(root_store)
@@ -887,7 +887,10 @@ pub(crate) fn build_client_config(
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth();
-            if client.enforces_gateway_crls() {
+            // SMTP always verifies, even under gateway FERRUM_TLS_NO_VERIFY,
+            // so its resumption posture follows the CRLs it actually
+            // enforces here, not the shared client's enforcement flag.
+            if client.enforces_gateway_crls() || !crls.is_empty() {
                 config.resumption = rustls::client::Resumption::disabled();
             }
             config
