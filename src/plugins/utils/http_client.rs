@@ -1799,26 +1799,27 @@ impl PluginHttpClient {
         &self,
         roots: rustls::RootCertStore,
     ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, anyhow::Error> {
-        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-            match (&self.live_crl_verifier, &self.live_crl_source) {
-                (Some(live), _) => Arc::new(live.with_roots(roots)?),
-                (None, Some(source)) => {
-                    let verifier = LiveCrlServerVerifier::new(roots, &source.load_full())?;
-                    verifier.follow(source.clone());
-                    Arc::new(verifier)
-                }
-                (None, None) if !self.tls_crls.is_empty() => {
-                    // CRLs were configured at construction but neither a live
-                    // verifier nor a live source is available (the shared
-                    // posture failed closed): a static snapshot verifier
-                    // would silently strand the sink on stale revocations.
-                    anyhow::bail!(
-                        "gateway CRLs are configured but no live CRL verifier is available; "
-                        "refusing to build a sink verifier on the static snapshot"
-                    );
-                }
-                (None, None) => crate::tls::build_server_verifier_with_crls(roots, &self.tls_crls)?,
-            };
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match (
+            &self.live_crl_verifier,
+            &self.live_crl_source,
+        ) {
+            (Some(live), _) => Arc::new(live.with_roots(roots)?),
+            (None, Some(source)) => {
+                let verifier = LiveCrlServerVerifier::new(roots, &source.load_full())?;
+                verifier.follow(source.clone());
+                Arc::new(verifier)
+            }
+            (None, None) if !self.tls_crls.is_empty() => {
+                // CRLs were configured at construction but neither a live
+                // verifier nor a live source is available (the shared
+                // posture failed closed): a static snapshot verifier
+                // would silently strand the sink on stale revocations.
+                anyhow::bail!(
+                    "gateway CRLs are configured but no live CRL verifier is available; refusing to build a sink verifier on the static snapshot"
+                );
+            }
+            (None, None) => crate::tls::build_server_verifier_with_crls(roots, &self.tls_crls)?,
+        };
         Ok(verifier)
     }
 
