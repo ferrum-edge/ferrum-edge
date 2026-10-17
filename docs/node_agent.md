@@ -1010,7 +1010,7 @@ The node agent probes the kernel once at startup (see `KernelProbeResult::suppor
 
 1. Linux kernel version >= 5.7 (required for cgroup_sockaddr BPF programs).
 2. cgroup v2 mounted at `FERRUM_NODE_AGENT_CGROUP_ROOT` (default `/sys/fs/cgroup`).
-3. bpffs mounted at `FERRUM_NODE_AGENT_BPF_FS_PATH` (default `/sys/fs/bpf`).
+3. bpffs mounted at `FERRUM_NODE_AGENT_BPF_FS_PATH` (`/sys/fs/bpf`; any other value is refused at startup because pins live at fixed `/sys/fs/bpf/ferrum/*` paths).
 
 If any prerequisite is missing, the node agent fails fast by default. It logs the first-failing prerequisite as `degradation_reason`, sets `ferrum_mesh_node_topology_degraded{reason="<...>"}` to `1`, sets `ferrum_node_agent_capture_state{state="unavailable"}` to `1`, and exits. `FERRUM_NODE_AGENT_FALLBACK_MODE` controls the behaviour:
 
@@ -1025,7 +1025,7 @@ Suggested remediations by reason label:
 |---|---|
 | `kernel_too_old` | Upgrade the node to a kernel >= 5.7. Most modern distributions (RHEL 9 / Ubuntu 22.04 / Debian 12 / Amazon Linux 2023) already satisfy this. |
 | `cgroup_v1` | Mount the unified cgroup v2 hierarchy (`systemd.unified_cgroup_hierarchy=1` on systemd hosts). cgroup_sockaddr BPF programs require cgroup v2 and cannot attach to the v1 hierarchy. |
-| `bpffs_missing` | Mount `bpffs` at the configured `FERRUM_NODE_AGENT_BPF_FS_PATH`: `mount -t bpf bpffs /sys/fs/bpf`. The DaemonSet manifest in `charts/ferrum-mesh/` mounts this automatically when configured. |
+| `bpffs_missing` | Mount `bpffs` at `/sys/fs/bpf` inside the node-agent container: `mount -t bpf bpffs /sys/fs/bpf`. The DaemonSet manifest in `charts/ferrum-mesh/` mounts this automatically when configured. |
 
 ### Mixed-kernel clusters
 

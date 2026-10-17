@@ -105,7 +105,7 @@ inventory's `Removal trigger` column in
 
 1. **Update the registry floor.** Bump `h3 = "X.Y.Z"` in `Cargo.toml` `[dependencies]` to the version that includes the fix.
 2. **Drop the vendored crate:**
-   - Remove the `h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }` line from the `[patch.crates-io]` block in `Cargo.toml` and its mirror in `tests/performance/mesh/Cargo.toml`. If the block becomes empty (every other vendored crate already retired), drop the block and its comment header too.
+   - Remove the `h3 = { path = "vendor/h3-0.0.8-ferrum-patched" }` line from the `[patch.crates-io]` block in `Cargo.toml` and its mirrors in `fuzz/Cargo.toml` and `tests/performance/mesh/Cargo.toml`, then regenerate `Cargo.lock`, `fuzz/Cargo.lock` and `tests/performance/mesh/Cargo.lock`. If a block becomes empty (every other vendored crate already retired), drop the block and its comment header too.
    - `git rm -r vendor/h3-0.0.8-ferrum-patched`. If `vendor/` becomes empty, delete it too.
    - `cargo build` — confirm we're now pulling h3 from crates.io and the registry version is being resolved.
    - `cargo test --test unit_tests && cargo test --test integration_tests && cargo build --bin ferrum-edge && cargo test --test functional_tests -- --ignored` — confirm the registry version still passes regression tests for the graceful-close race (the inline regression tests we added live in the vendored frame.rs and disappear with it; the upstream version is expected to carry equivalents).

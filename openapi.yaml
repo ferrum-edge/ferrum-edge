@@ -4889,6 +4889,8 @@ paths:
         structural `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]`
         markers, with userinfo replaced by `redacted@`. All values of arbitrary
         header maps and webhook body templates are replaced by `[REDACTED]`, as are
+        every `request_transformer` `rules[].value`, every
+        `mesh_route_dispatch` `rules[].request_transform[].value`,
         `serverless_function.azure_function_key` and every
         `kafka_logging.producer_config` property outside the safe-tuning
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
@@ -10523,7 +10525,10 @@ components:
             `headers`, proxy_alerts channel `headers`,
             api_chargeback_sink `clickhouse.insert_query_params`) is replaced
             by `[REDACTED]`, as are `serverless_function.azure_function_key`,
-            proxy_alerts channel `body_template`, and every
+            proxy_alerts channel `body_template`, every request_transformer
+            `rules[].value` and mesh_route_dispatch
+            `rules[].request_transform[].value` (written into the upstream
+            request, so they may carry a backend credential), and every
             `kafka_logging.producer_config` property outside the safe-tuning
             allow-list. Mesh `workload_metrics` tracing-provider collector
             URLs receive the same structural projection. `redis_integrity_key`

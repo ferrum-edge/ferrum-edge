@@ -12,12 +12,12 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 
 | Variant | Meaning | `request_reached_wire`? |
 |---|---|---|
-| `ConnectionRefused` | TCP connect refused (port not listening, firewall RST). Includes connect-phase RSTs (functionally indistinguishable from ECONNREFUSED). A TLS handshake that fails *after* TCP connect — including `rustls::Error` wrapped as `io::Error` with `ConnectionReset` — is **not** this class; that is `TlsError`. | `false` (pre-wire) |
+| `ConnectionRefused` | TCP connect refused (port not listening, firewall RST). Includes connect-phase RSTs (functionally indistinguishable from ECONNREFUSED). A TLS handshake failure that a setup-phase caller observes after TCP connect — including `rustls::Error` wrapped as `io::Error` with `ConnectionReset` — is **not** this class; that is `TlsError`. Without independent setup-phase evidence a rustls error is `ConnectionReset` (see the phase rule below). | `false` (pre-wire) |
 | `ConnectionTimeout` | TCP connect did not complete before the configured timeout. | `false` (pre-wire) |
-| `ConnectionReset` | Mid-stream RST received after the connection was established **and** (for TLS) after the handshake completed. A handshake-phase reset that carries a typed rustls handshake/alert/certificate error is `TlsError`, not this class. An origin that RSTs during handshake with **no** rustls error in the chain is indistinguishable from a mid-stream RST and stays here. | `true` (post-wire) |
+| `ConnectionReset` | Mid-stream RST received after the connection was established **and** (for TLS) after the handshake completed. A typed rustls handshake/alert/certificate error is `TlsError` only when the caller independently knows it is still in setup (`phase_is_connect`); otherwise — for example a rustls error surfacing after reqwest's TCP-only connect phase — it is conservatively this class, because the alert kind does not prove the request was never sent. An origin that RSTs during handshake with **no** rustls error in the chain is indistinguishable from a mid-stream RST and stays here. | `true` (post-wire) |
 | `ConnectionClosed` | Peer sent FIN before a response was completed; broken pipe; aborted connection; post-connect `UnexpectedEof` / hyper incomplete message (truncated HTTP body). | `true` (post-wire) |
 | `DnsLookupError` | Hostname could not be resolved. | `false` (pre-wire) |
-| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, handshake alert, rustls error under an `io::Error` after TCP connected) **when a typed `rustls::Error` is in the chain**. Missing `close_notify` is teardown, not this class. | `false` (pre-wire) |
+| `TlsError` | TLS or DTLS handshake failed (certificate, ALPN, handshake alert, rustls error under an `io::Error` after TCP connected) **on independently established setup-phase evidence**: a caller that knows it is still dialing/handshaking, or a typed setup error such as `StreamSetupKind::BackendDtlsHandshake`, which is `TlsError` even with no underlying source. A typed `rustls::Error` found in the chain is `TlsError` only with that setup-phase evidence; without it the same error is `ConnectionReset`. Missing `close_notify` is teardown, not this class. | `false` (pre-wire) |
 | `ReadWriteTimeout` | Backend read or write exceeded the per-direction watermark. | `true` (post-wire) |
 | `ProtocolError` | HTTP/2 or HTTP/3 protocol-level error after a stream is opened (stream reset, GOAWAY, RST_STREAM), or RFC 6455 WebSocket protocol violation. NOTE: gRPC h2c handshake failure classifies as `ConnectionRefused` (pre-wire), NOT `ProtocolError` — see the gRPC kind table below. | `true` (post-wire) |
 | `ResponseBodyTooLarge` | Backend response exceeded the configured maximum size. | `true` (post-wire) |
@@ -754,10 +754,15 @@ Refer to the canonical-taxonomy table above for what each class means. A few cla
 - **`TlsError`** — for self-signed certs in development, set
   `FERRUM_TLS_NO_VERIFY=true`. For mTLS backends, verify the client certificate
   and CA chain. An origin that **requires** a client certificate when the
-  gateway presents none is this class **when a typed rustls handshake error
-  is in the chain**; on the reqwest HTTP/1 path that error is often missing
-  and the class is `connection_pool_error` instead (issue #4406). Neither
-  is `connection_reset`. The typed `StreamSetupKind::FrontendTlsHandshake` vs
+  gateway presents none is this class only when a setup-phase caller sees the
+  typed rustls error (the H2, gRPC, H3 and HBONE pool connects, the WebSocket
+  dial, or reqwest's own `is_connect()` branch). On the reqwest HTTP/1 path
+  the rejection usually surfaces as a pool cancellation with no rustls error
+  (`connection_pool_error`, issue #4406), and a typed rustls error that
+  surfaces only after reqwest's TCP-only connect phase is deliberately
+  `connection_reset`: the alert alone cannot prove the request was never
+  sent (issue #4536). So check for all three classes when diagnosing a
+  backend-mTLS misconfiguration. The typed `StreamSetupKind::FrontendTlsHandshake` vs
   `BackendTlsHandshake`/`BackendDtlsHandshake` tells you which side failed
   without inspecting the message. Do **not** key alerts on `tls_error` for
   omitted `close_notify`: userspace rustls reports that as `UnexpectedEof`

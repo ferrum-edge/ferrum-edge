@@ -9,8 +9,8 @@ usage() {
     '                         [--effort medium|high|xhigh|max]' \
     '' \
     'Pinned to alibaba-token-plan/deepseek-v4.1-flash. --model is accepted only when' \
-    'it names that exact model; any other value is refused. The dated snapshot' \
-    'is the only variant this skill dispatches.' \
+    'it names that exact model; any other value is refused. That model is the' \
+    'only variant this skill dispatches, despite the legacy "pro" skill name.' \
     '' \
     'Requires ALIBABA_TOKEN_PLAN_API_KEY (or ALIBABA_TOKEN_PLAN_API_KEY_FILE naming' \
     'a readable file holding it); the provider block in opencode.json resolves the' \
