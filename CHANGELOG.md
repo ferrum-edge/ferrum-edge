@@ -17,8 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolver the runtime client uses. They now build
   `default_with_backend_allow_ips` — the same deliberately unrestricted
   policy where it was already documented, but through the policy-carrying
-  `DnsCacheResolver`. Remaining `Default`/`from_pool_config` users are
-  tests and test seams only.
+  `DnsCacheResolver`. The remaining `Default`/`from_pool_config` users
+  are tests, test seams, and the non-networking inline-JWKS store
+  (`refreshable=false` returns before any fetch).
 
 
 - **A refused `RequestAuthentication` is now scoped to synthesized HBONE
