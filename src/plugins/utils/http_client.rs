@@ -1777,6 +1777,26 @@ impl PluginHttpClient {
         &self.tls_crls
     }
 
+    /// A server verifier over `roots` for a non-HTTP rustls sink (tcp/ws/udp
+    /// logging, LDAP, SMTP) that follows the gateway's live CRL generation
+    /// when one is being followed, instead of freezing the startup snapshot
+    /// [`Self::tls_crls`] into the sink's connector (#6651 item 4). Without a
+    /// live verifier this is exactly the static snapshot verifier the sinks
+    /// built before. Resumption must stay disabled whenever
+    /// [`Self::enforces_gateway_crls`] holds so a resumed handshake cannot
+    /// skip the current generation's `nextUpdate` check.
+    pub fn crl_server_verifier(
+        &self,
+        roots: rustls::RootCertStore,
+    ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, anyhow::Error> {
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            match &self.live_crl_verifier {
+                Some(live) => Arc::new(live.with_roots(roots)?),
+                None => crate::tls::build_server_verifier_with_crls(roots, &self.tls_crls)?,
+            };
+        Ok(verifier)
+    }
+
     /// Filesystem path for `FERRUM_TLS_CRL_FILE_PATH` when a gateway CRL was
     /// loaded. Used by librdkafka (`ssl.crl.location`); rustls sinks consume
     /// [`Self::tls_crls`] instead.

@@ -599,6 +599,7 @@ impl LdapAuth {
                 tls_no_verify,
                 http_client.tls_ca_bundle_path(),
                 http_client.tls_crls(),
+                Some(&http_client),
             )?)
         } else {
             None
@@ -1739,6 +1740,7 @@ pub(crate) fn build_ldap_tls_config(
     no_verify: bool,
     ca_bundle_path: Option<&str>,
     crls: &[CertificateRevocationListDer<'static>],
+    live_source: Option<&PluginHttpClient>,
 ) -> Result<Arc<ClientConfig>, String> {
     // ldap3's `tls-rustls-ring` feature forwards `rustls/ring`, which selects
     // the ring crypto provider for TLS primitives but DOES NOT install it as
@@ -1782,13 +1784,32 @@ pub(crate) fn build_ldap_tls_config(
         let root_store = custom_root_store.unwrap_or_else(|| {
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
         });
-        let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
-            .map_err(|_| "ldap_auth: failed to build TLS verifier".to_string())?;
-        let mut config = builder.with_webpki_verifier(verifier).with_no_client_auth();
-        // The config is reused across LDAP reconnects; resumption would skip
-        // the CRL expiration check on a resumed handshake.
-        crate::tls::apply_crl_enforced_client_resumption(&mut config, crls);
-        config
+        // With a live source the verifier follows CRL generations after a
+        // backend TLS reload (#6651) instead of freezing the snapshot list.
+        match live_source {
+            Some(client) => {
+                let verifier = client
+                    .crl_server_verifier(root_store)
+                    .map_err(|_| "ldap_auth: failed to build TLS verifier".to_string())?;
+                let mut config = builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(verifier)
+                    .with_no_client_auth();
+                if client.enforces_gateway_crls() {
+                    config.resumption = rustls::client::Resumption::disabled();
+                }
+                config
+            }
+            None => {
+                let verifier = crate::tls::build_server_verifier_with_crls(root_store, crls)
+                    .map_err(|_| "ldap_auth: failed to build TLS verifier".to_string())?;
+                let mut config = builder.with_webpki_verifier(verifier).with_no_client_auth();
+                // The config is reused across LDAP reconnects; resumption would skip
+                // the CRL expiration check on a resumed handshake.
+                crate::tls::apply_crl_enforced_client_resumption(&mut config, crls);
+                config
+            }
+        }
     };
 
     Ok(Arc::new(config))
@@ -2769,7 +2790,7 @@ mod tests {
     fn no_verify_returns_arc_clientconfig() {
         ensure_crypto_provider();
         let cfg = must(
-            build_ldap_tls_config(true, None, &[]),
+            build_ldap_tls_config(true, None, &[], None),
             "build no-verify config",
         );
         // Cheap structural smoke check: must be an Arc<ClientConfig>.
@@ -2780,7 +2801,7 @@ mod tests {
     fn missing_ca_bundle_path_falls_back_to_webpki() {
         ensure_crypto_provider();
         let cfg = must(
-            build_ldap_tls_config(false, None, &[]),
+            build_ldap_tls_config(false, None, &[], None),
             "build webpki config",
         );
         let _: &ClientConfig = cfg.as_ref();
@@ -2790,7 +2811,7 @@ mod tests {
     fn empty_ca_bundle_rejected() {
         ensure_crypto_provider();
         let f = must(NamedTempFile::new(), "create empty temp CA file");
-        let err = build_ldap_tls_config(false, f.path().to_str(), &[]).unwrap_err();
+        let err = build_ldap_tls_config(false, f.path().to_str(), &[], None).unwrap_err();
         assert!(
             err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission"),
             "unexpected error: {err}"
@@ -2801,7 +2822,7 @@ mod tests {
     fn no_verify_still_rejects_empty_declared_ca_bundle() {
         ensure_crypto_provider();
         let f = must(NamedTempFile::new(), "create empty temp CA file");
-        let err = build_ldap_tls_config(true, f.path().to_str(), &[]).unwrap_err();
+        let err = build_ldap_tls_config(true, f.path().to_str(), &[], None).unwrap_err();
         assert!(
             err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: CA bundle failed trust-store admission"),
             "unexpected error: {err}"
@@ -2811,7 +2832,8 @@ mod tests {
     #[test]
     fn missing_ca_bundle_file_rejected() {
         ensure_crypto_provider();
-        let err = build_ldap_tls_config(false, Some("/nonexistent/path/ca.pem"), &[]).unwrap_err();
+        let err =
+            build_ldap_tls_config(false, Some("/nonexistent/path/ca.pem"), &[], None).unwrap_err();
         assert!(
             err.contains("`FERRUM_TLS_CA_BUNDLE_PATH`: failed to load CA bundle"),
             "unexpected error: {err}"
@@ -2829,7 +2851,7 @@ mod tests {
 
         let ca_file = write_pem_to_temp(&ca_a.cert_pem);
         let client_cfg = must(
-            build_ldap_tls_config(false, ca_file.path().to_str(), &[]),
+            build_ldap_tls_config(false, ca_file.path().to_str(), &[], None),
             "build client config",
         );
 
@@ -2860,7 +2882,7 @@ mod tests {
         // Build config trusting only CA-A; server presents CA-B-signed cert.
         let ca_file = write_pem_to_temp(&ca_a.cert_pem);
         let client_cfg = must(
-            build_ldap_tls_config(false, ca_file.path().to_str(), &[]),
+            build_ldap_tls_config(false, ca_file.path().to_str(), &[], None),
             "build client config",
         );
 
@@ -2972,7 +2994,7 @@ mod tests {
 
         // Without a CRL: the CA-signed cert is trusted, handshake succeeds.
         let cfg_no_crl = must(
-            build_ldap_tls_config(false, ca_file.path().to_str(), &[]),
+            build_ldap_tls_config(false, ca_file.path().to_str(), &[], None),
             "build no-CRL config",
         );
         let server_cfg = build_server_config(&leaf_pem, &leaf_key_pem);
@@ -2985,7 +3007,12 @@ mod tests {
 
         // With the CRL revoking this serial: handshake must fail.
         let cfg_with_crl = must(
-            build_ldap_tls_config(false, ca_file.path().to_str(), std::slice::from_ref(&crl)),
+            build_ldap_tls_config(
+                false,
+                ca_file.path().to_str(),
+                std::slice::from_ref(&crl),
+                None,
+            ),
             "build CRL config",
         );
         let server_cfg = build_server_config(&leaf_pem, &leaf_key_pem);
