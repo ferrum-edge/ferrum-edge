@@ -1529,8 +1529,11 @@ impl PluginHttpClient {
 
     /// Build a plugin HTTP client from pool config without a DNS cache.
     ///
-    /// Uses reqwest's default DNS resolution. Prefer `new()` in production
-    /// to share the gateway's DNS cache across all plugins.
+    /// Uses reqwest's default DNS resolution and unrestricted egress, so it
+    /// is for tests and last-resort fallbacks only. Production paths use
+    /// `new()` (serving) or `default_with_backend_allow_ips` (validation),
+    /// which route resolution through the screened `DnsCacheResolver`
+    /// (#6651).
     pub fn from_pool_config(config: &PoolConfig) -> Self {
         let tls_posture = PluginTlsPosture::PlatformRoots;
         let client = accept_plugin_http_client(
