@@ -40,10 +40,29 @@ EXTERNAL_ACTION_PIN = re.compile(
 )
 PIN_NORMALIZED_SUFFIXES = frozenset({".yml", ".yaml"})
 
+# Unicode line/paragraph separators the GitHub runner's YAML parser
+# (YamlDotNet) treats as line breaks, but Python's `re` and `[^\n]` do
+# not: inside a pin comment they would hide an executable step from
+# every pin-normalized comparison while the runner still parses it as
+# structure (#6689). Governed YAML containing them is refused outright.
+YAML_UNICODE_LINE_BREAKS = ("\u0085", "\u2028", "\u2029")
+
+
+def contains_yaml_unicode_line_breaks(contents: str) -> bool:
+    return any(separator in contents for separator in YAML_UNICODE_LINE_BREAKS)
+
 
 def normalize_action_pins(contents: str) -> str:
-    """Replace every pinned external action commit with the placeholder."""
+    """Replace every pinned external action commit with the placeholder.
 
+    Contents with Unicode line breaks are returned unchanged, so no
+    comparison over normalized text can erase the structure the runner
+    would parse after one; equality then fails closed unless both sides
+    are byte-identical.
+    """
+
+    if contains_yaml_unicode_line_breaks(contents):
+        return contents
     return EXTERNAL_ACTION_PIN.sub(
         lambda match: (
             f"{match['lead']}{match['quote']}{match['action']}"
@@ -56,6 +75,10 @@ def normalize_action_pins(contents: str) -> str:
 def pin_normalized_equal(merge_base: str, proposed: str) -> bool:
     """True when two texts differ in nothing but external action pins."""
 
+    if contains_yaml_unicode_line_breaks(merge_base) or contains_yaml_unicode_line_breaks(
+        proposed
+    ):
+        return False
     return normalize_action_pins(merge_base) == normalize_action_pins(proposed)
 
 
@@ -70,6 +93,11 @@ def pin_normalized_equal_main(merge_base_path: Path, proposed_path: Path) -> int
         if contents is not None:
             if "\x00" in contents:
                 failures.append(f"{path} contains a NUL byte")
+            if contains_yaml_unicode_line_breaks(contents):
+                failures.append(
+                    f"{path} contains a Unicode line break (U+0085/U+2028/U+2029), "
+                    "which YAML parsers read as a line boundary"
+                )
             texts.append(contents)
     if not failures and not pin_normalized_equal(*texts):
         failures.append(
@@ -32690,6 +32718,23 @@ def action_pin_rotation_self_test() -> list[str]:
         failures.append("a pin-only rotation must compare pin-normalized equal")
     if pin_normalized_equal(workflow(old), workflow(old) + "      - run: cross build\n"):
         failures.append("a non-pin edit must not compare pin-normalized equal")
+    # A Unicode line break inside the pin comment is a line boundary to
+    # the runner's YAML parser, so a step hidden after one must never
+    # normalize away (#6689).
+    for separator in YAML_UNICODE_LINE_BREAKS:
+        smuggled = workflow(old, comment=f" # v7{separator}      - run: cross build")
+        if normalize_action_pins(smuggled) != smuggled:
+            failures.append(
+                f"pin normalization must not erase structure after U+{ord(separator):04X}"
+            )
+        if pin_normalized_equal(workflow(old), smuggled):
+            failures.append(
+                f"a step hidden after U+{ord(separator):04X} must not compare pin-normalized equal"
+            )
+        if pin_normalized_equal(smuggled, smuggled):
+            failures.append(
+                f"governed YAML containing U+{ord(separator):04X} must be refused outright"
+            )
     diff = (
         "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
         "index 1111111..2222222 100644\n"
