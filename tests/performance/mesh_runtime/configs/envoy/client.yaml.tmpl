@@ -2,7 +2,7 @@
 # plaintext local listener (15101) -> HTTP/2 over mTLS to the server
 # proxy inbound, matching Ferrum's H1 -> H2/mTLS -> H1 sidecar shape
 # (15006) presenting the client workload certificate and pinning the
-# server identity by DNS SAN. CERT_DIR is substituted by the harness.
+# server identity by SPIFFE URI SAN. CERT_DIR is substituted by the harness.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
@@ -51,6 +51,7 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
           sni: svc.ferrum.svc.cluster.local
           common_tls_context:
+            tls_params: { tls_minimum_protocol_version: TLSv1_3, tls_maximum_protocol_version: TLSv1_3 }
             alpn_protocols: ["h2"]
             tls_certificates:
               - certificate_chain: { filename: CERT_DIR/client/svid.crt }
@@ -59,8 +60,8 @@ static_resources:
               trusted_ca:
                 filename: CERT_DIR/client/bundle.pem
               match_typed_subject_alt_names:
-                - san_type: DNS
-                  matcher: { exact: svc.ferrum.svc.cluster.local }
+                - san_type: URI
+                  matcher: { exact: "spiffe://cluster.local/ns/ferrum/sa/svc" }
       load_assignment:
         cluster_name: svc_mtls
         endpoints:

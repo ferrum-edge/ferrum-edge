@@ -3,7 +3,7 @@
 //! One keep-alive connection per worker, fixed payload, explicit
 //! `--host-header` so mesh outbound (host-routed) listeners can be driven
 //! through an IP-literal dial. A response only counts when the status is
-//! 200 AND the echoed body length equals the request payload length.
+//! 200 AND the echoed body bytes equal the request payload bytes.
 
 use std::time::{Duration, Instant};
 
@@ -52,17 +52,22 @@ async fn main() -> Result<()> {
         url.path().to_string()
     };
 
-    let deadline = Instant::now() + Duration::from_secs(args.duration);
     let payload = Bytes::from(vec![b'x'; args.payload_size]);
 
+    // Ready barrier: every worker establishes its first connection, then
+    // all workers start from a shared epoch so connection setup is never
+    // charged to the measured window and the deadline is common.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(args.concurrency as usize));
+    let duration = Duration::from_secs(args.duration);
     let mut handles = Vec::with_capacity(args.concurrency as usize);
     for _ in 0..args.concurrency {
         let host = host.clone();
         let path = path.clone();
         let host_header = args.host_header.clone();
         let payload = payload.clone();
+        let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            worker(host, port, path, host_header, payload, deadline).await
+            worker(host, port, path, host_header, payload, barrier, duration).await
         }));
     }
 
@@ -125,10 +130,22 @@ async fn worker(
     path: String,
     host_header: String,
     payload: Bytes,
-    deadline: Instant,
+    barrier: std::sync::Arc<tokio::sync::Barrier>,
+    duration: Duration,
 ) -> BenchMetrics {
     let mut metrics = BenchMetrics::new();
-    let mut sender: Option<SendRequest<Full<Bytes>>> = None;
+    // Establish the first connection before the shared start epoch; a
+    // setup failure is recorded once and the worker still joins the
+    // barrier so peers are never blocked by one failed connect.
+    let mut sender: Option<SendRequest<Full<Bytes>>> = match open_conn(&host, port).await {
+        Ok(s) => Some(s),
+        Err(_) => {
+            metrics.record_error();
+            None
+        }
+    };
+    barrier.wait().await;
+    let deadline = Instant::now() + duration;
 
     while Instant::now() < deadline {
         let mut send = match sender.take() {
@@ -158,7 +175,13 @@ async fn worker(
         };
 
         let start = Instant::now();
-        let send_result = send.send_request(req).await;
+        // Bounded request phase: a stalled peer must not let a worker
+        // overrun the measurement epoch or hang the cell forever.
+        let send_result =
+            match tokio::time::timeout(Duration::from_secs(60), send.send_request(req)).await {
+                Ok(result) => result.map_err(|e| e.into()),
+                Err(_) => Err(anyhow::anyhow!("request timed out")),
+            };
 
         match send_result {
             Ok(resp) => {
@@ -166,7 +189,7 @@ async fn worker(
                 match resp.into_body().collect().await {
                     Ok(body) if status == StatusCode::OK => {
                         let bytes = body.to_bytes();
-                        if bytes.len() == payload.len() {
+                        if bytes == payload {
                             let elapsed = start.elapsed().as_micros() as u64;
                             metrics.record(elapsed, bytes.len());
                             sender = Some(send);
@@ -188,7 +211,9 @@ async fn worker(
 }
 
 async fn open_conn(host: &str, port: u16) -> Result<SendRequest<Full<Bytes>>> {
-    let tcp = TcpStream::connect((host, port)).await?;
+    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, port)))
+        .await
+        .context("connect timed out")??;
     let _ = tcp.set_nodelay(true);
     let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
     tokio::spawn(async move {

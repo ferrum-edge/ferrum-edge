@@ -52,10 +52,11 @@ produces a successful echo.
 | `envoy` | two hand-configured `envoyproxy/envoy:v1.39.1` proxies as a static HTTP/2-over-mTLS sidecar pair (client-cert required, SAN pinning both directions, session resumption off) | **not full Istio** — no istiod-generated config, telemetry filters, Wasm, or capture iptables. An Envoy proxy control, labeled “Envoy” in every output |
 | `linkerd` | standalone probe of `ghcr.io/linkerd/proxy` | cannot run without the Linkerd Destination/Identity control plane (`Invalid configuration: no destination service configured` with static identity); the arm records `unsupported-standalone` with logs instead of numbers |
 
-Cilium service mesh and Consul Connect use Envoy as the L7 data plane;
-their differentiators (eBPF datapath, control-plane-generated Envoy
-config) require Kubernetes and are Tier-2 scope, below. They are not
-silently represented by the `envoy` arm.
+Cilium service mesh and Consul Connect use Envoy as the L7 data plane.
+Consul's differentiator here (control-plane-generated Envoy config) does
+not require Kubernetes and is the next Tier-1 candidate; Cilium's eBPF
+datapath does require a Kubernetes/linux-node environment and is Tier-2
+scope, below. Neither is silently represented by the `envoy` arm.
 
 ## Methodology and caveats (read before quoting numbers)
 
@@ -74,16 +75,18 @@ silently represented by the `envoy` arm.
 4. **Ferrum runs its full mesh stack** (slice materialization, routing,
    plugin chain, SPIFFE verification). Envoy runs a minimal static
    config: no telemetry/authz filter chain equivalent to a stock Istio
-   sidecar. If anything, this biases *against* Ferrum; treat an Envoy
-   lead as an upper bound on the gap to a fully-featured Istio sidecar.
+   sidecar. Different filter chains, settings, and placement can change
+   the ranking either way; do not extrapolate an Envoy-control lead or
+   deficit to a fully-featured Istio deployment.
 5. **Closed-loop client.** RPS at high concurrency is
    concurrency/latency; compare arms at the same concurrency, and prefer
    latency + overhead-vs-direct over raw RPS across different runners.
-6. **CI arms run on separate runners** (one matrix job per arm, like the
-   gateway benchmark's per-protocol runners). Cross-arm absolute values
-   carry runner variance; overhead vs the same-runner `direct` arm is the
-   normalized view. Publishable comparisons should use 3 iterations and
-   check the runner steal warning.
+6. **All CI arms run sequentially on one runner** in fixed order
+   (direct → ferrum → envoy → linkerd), so overhead uses a same-runner
+   `direct` denominator. Sequential same-host execution still carries
+   drift/steal variance across the campaign; publishable comparisons
+   should use the 30s × 3-iteration profile. (Balanced-order repetition
+   blocks are a follow-up; order is fixed, not rotated.)
 7. **CPU/memory are container-level samples** (`docker stats`, 1s
    cadence, cgroup usage — not process RSS) summed across the proxy
    pair, with independent per-container peaks. They include idle/runtime

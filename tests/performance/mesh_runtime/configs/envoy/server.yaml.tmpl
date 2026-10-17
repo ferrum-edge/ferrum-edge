@@ -21,7 +21,9 @@ static_resources:
               # Ferrum's SPIFFE inbound disables TLS session
               # resumption; match it so pool churn costs align.
               disable_stateless_session_resumption: true
+              disable_stateful_session_resumption: true
               common_tls_context:
+                tls_params: { tls_minimum_protocol_version: TLSv1_3, tls_maximum_protocol_version: TLSv1_3 }
                 alpn_protocols: ["h2"]
                 tls_certificates:
                   - certificate_chain: { filename: CERT_DIR/svc/svid.crt }

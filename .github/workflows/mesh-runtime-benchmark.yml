@@ -1,32 +1,34 @@
 # Mesh runtime head-to-head benchmark: Ferrum Edge running as a service-mesh
 # data plane vs other mesh data planes in the same environment.
 #
-# For every mesh arm, runs an HTTP/1.1 echo workload through a
-# client-proxy -> mTLS -> server-proxy pair at 6 payload sizes
-# (1KB, 10KB, 70KB, 500KB, 1MB, 5MB), mirroring the payload sweep of
-# gateways-protocol-benchmark.yml plus a 1KB small-message size where
-# per-request mesh overhead dominates. Each arm runs in its own
-# ubuntu-26.04 runner (strategy.matrix); a final aggregate job renders the
-# combined summary.
+# Every arm runs an HTTP/1.1 echo workload (H1 -> HTTP/2-over-mTLS -> H1
+# through the proxy pair) at 6 payload sizes (1KiB, 10KiB, 70KiB, 500KiB,
+# 1MiB, 5MiB). All arms run sequentially on ONE ubuntu-26.04 runner in the
+# fixed order direct -> ferrum -> envoy -> linkerd, so overhead is computed
+# against a same-runner direct baseline (per-arm runners would make the
+# direct denominator a different machine).
 #
 # Arms:
 #   direct  : no proxies (same-runner overhead baseline)
 #   ferrum  : 2x ferrum-edge FERRUM_MODE=mesh Sidecar, localized file
 #             config + file SVIDs, STRICT PeerAuthentication (real mesh
 #             runtime, no control plane needed)
-#   envoy   : 2x envoyproxy/envoy hand-configured mTLS pair (the Istio
-#             sidecar data-plane proxy; labeled Envoy, not full Istio:
-#             no istiod, telemetry, or Wasm in the measurement)
+#   envoy   : 2x envoyproxy/envoy hand-configured H2/mTLS pair (the Istio
+#             sidecar data-plane proxy; a static proxy control labeled
+#             Envoy, not full Istio: no istiod, telemetry, or Wasm)
 #   linkerd : 2x ghcr.io/linkerd/proxy standalone probe. linkerd2-proxy
 #             requires the Destination control-plane service, so this arm
-#             records `unsupported-standalone` with logs unless the echo
-#             probe passes; it never fabricates numbers. Full-mesh
-#             (kind) comparison is the documented Tier-2 follow-up in
+#             records `unsupported-standalone` with logs when that
+#             evidence appears; it never fabricates numbers. Full-mesh
+#             (kind) comparison is the Tier-2 follow-up in
 #             docs/mesh_runtime_benchmark.md.
 #
-# Every computation beyond a literal command lives in
+# Dispatch inputs reach steps only through env (never interpolated into
+# shell source). Every computation beyond a literal command lives in
 # .github/scripts/summarize_mesh_runtime_results.py; keep inline
 # interpreter bodies out of this file (trusted Cross build policy).
+# The default 10s x 1-iteration profile is a smoke run; use
+# duration=30 + iterations=3 for publishable comparisons.
 
 name: Mesh Runtime Benchmark
 
@@ -39,7 +41,7 @@ on:
         default: "10"
         type: string
       concurrency:
-        description: "Concurrent keep-alive connections"
+        description: "Concurrent keep-alive connections (bulk sizes scale down)"
         required: false
         default: "100"
         type: string
@@ -48,7 +50,7 @@ on:
         required: false
         default: "1"
         type: choice
-        options: ["1", "2", "3"]
+        options: ["1", "3"]
       skip_meshes:
         description: "Space-separated arms to skip (direct ferrum envoy linkerd)"
         required: false
@@ -67,51 +69,35 @@ concurrency:
   group: mesh-runtime-benchmark-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  BENCH_DURATION: ${{ inputs.duration }}
+  BENCH_CONCURRENCY: ${{ inputs.concurrency }}
+  BENCH_ITERATIONS: ${{ inputs.iterations }}
+  BENCH_SKIP_MESHES: ${{ inputs.skip_meshes }}
+  BENCH_SKIP_PAYLOAD_SIZES: ${{ inputs.skip_payload_sizes }}
+
 jobs:
   benchmark:
-    name: bench / ${{ matrix.mesh }}
+    name: Mesh runtime benchmark
     runs-on: ubuntu-26.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        mesh:
-          - direct
-          - ferrum
-          - envoy
-          - linkerd
+    timeout-minutes: 180
 
     steps:
-      - name: Skip arm?
-        id: skip_check
-        run: |
-          skip_list="${{ inputs.skip_meshes }}"
-          if echo " $skip_list " | grep -qw "${{ matrix.mesh }}"; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Arm ${{ matrix.mesh }} is in skip list — ending job."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
-        if: steps.skip_check.outputs.skip != 'true'
 
       - name: Verify summarizer contract (static)
-        if: steps.skip_check.outputs.skip != 'true'
         run: |
           python3 .github/scripts/summarize_mesh_runtime_results.py --self-test
           python3 -m py_compile .github/scripts/summarize_mesh_runtime_results.py
 
       - name: Install system dependencies
-        if: steps.skip_check.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends openssl sysstat
 
       - name: Runner health check
-        if: steps.skip_check.outputs.skip != 'true'
         run: |
           echo "=== CPU ==="
           nproc
@@ -119,11 +105,6 @@ jobs:
           echo ""
           echo "=== CPU steal (5s) ==="
           vmstat 1 6 | tail -n 5
-          AVG_STEAL=$(vmstat 1 6 | tail -n 5 | awk '{sum += $17; n++} END {printf "%.1f", sum/n}')
-          echo "avg steal=${AVG_STEAL}%"
-          if (( $(echo "$AVG_STEAL > 5.0" | bc -l) )); then
-            echo "::warning::CPU steal is ${AVG_STEAL}% for ${{ matrix.mesh }} — results may be noisy"
-          fi
           echo ""
           echo "=== Memory ==="
           free -h
@@ -131,28 +112,38 @@ jobs:
           echo "=== Docker ==="
           docker version --format '{{.Server.Version}}' || true
 
-      - name: Compute payload sizes
-        if: steps.skip_check.outputs.skip != 'true'
-        id: sizes
+      - name: Compute mesh + payload lists
+        id: plan
         run: |
-          all_sizes="1024 10240 71680 512000 1048576 5242880"
-          skip="${{ inputs.skip_payload_sizes }}"
-          sizes=""
-          for s in $all_sizes; do
-            if ! echo " $skip " | grep -qw "$s"; then
-              sizes="$sizes $s"
-            fi
+          all_meshes="direct ferrum envoy linkerd"
+          meshes=""
+          for m in $all_meshes; do
+            case " $BENCH_SKIP_MESHES " in
+              *" $m "*) ;;
+              *) meshes="$meshes $m" ;;
+            esac
           done
+          all_sizes="1024 10240 71680 512000 1048576 5242880"
+          sizes=""
+          for sz in $all_sizes; do
+            case " $BENCH_SKIP_PAYLOAD_SIZES " in
+              *" $sz "*) ;;
+              *) sizes="$sizes $sz" ;;
+            esac
+          done
+          meshes=$(echo "$meshes" | xargs)
           sizes=$(echo "$sizes" | xargs)
+          echo "meshes=$meshes" >> "$GITHUB_OUTPUT"
           echo "payload_sizes=$sizes" >> "$GITHUB_OUTPUT"
+          echo "Arms: $meshes"
           echo "Payload sizes: $sizes"
 
       - name: Set up Docker Buildx
-        if: steps.skip_check.outputs.skip != 'true' && matrix.mesh == 'ferrum'
+        if: contains(steps.plan.outputs.meshes, 'ferrum')
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build Ferrum Docker image
-        if: steps.skip_check.outputs.skip != 'true' && matrix.mesh == 'ferrum'
+        if: contains(steps.plan.outputs.meshes, 'ferrum')
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -162,106 +153,77 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Run benchmark
-        if: steps.skip_check.outputs.skip != 'true'
-        timeout-minutes: 90
+      - name: Run benchmark (all arms, sequential, same runner)
+        timeout-minutes: 150
         env:
-          ITERATIONS: ${{ inputs.iterations }}
+          MESHES: ${{ steps.plan.outputs.meshes }}
+          PAYLOAD_SIZES: ${{ steps.plan.outputs.payload_sizes }}
           FERRUM_IMAGE: ferrum-edge:bench
         run: |
-          mkdir -p results/${{ matrix.mesh }}
+          mkdir -p results
           {
-            echo "mesh=${{ matrix.mesh }}"
             echo "sha=${GITHUB_SHA}"
             echo "runner=ubuntu-26.04"
             date -u +%Y-%m-%dT%H:%M:%SZ
             nproc
             uname -a
             docker version --format '{{.Server.Version}}' || true
-          } > results/${{ matrix.mesh }}/host-facts.txt
-          for run in $(seq 1 "$ITERATIONS"); do
-            echo ""
-            echo "============================================"
-            echo "  RUN ${run}/${ITERATIONS} — ${{ matrix.mesh }}"
-            echo "============================================"
-            run_dir="results/${{ matrix.mesh }}/run_${run}"
-            mkdir -p "$run_dir"
-            extra_flags=""
-            if [ "$run" -gt 1 ]; then extra_flags="--skip-build"; fi
-            bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh \
-              "${{ matrix.mesh }}" \
-              --payload-sizes "${{ steps.sizes.outputs.payload_sizes }}" \
-              --duration "${{ inputs.duration }}" \
-              --concurrency "${{ inputs.concurrency }}" \
-              --output-dir "$run_dir" \
-              $extra_flags \
-              2>&1 | tee "$run_dir/run.log"
+            docker image inspect ferrum-edge:bench --format 'ferrum {{.Id}}' || true
+          } > results/host-facts.txt
+          for mesh in $MESHES; do
+            for run in $(seq 1 "$BENCH_ITERATIONS"); do
+              echo ""
+              echo "============================================"
+              echo "  ARM ${mesh} — RUN ${run}/${BENCH_ITERATIONS}"
+              echo "============================================"
+              run_dir="results/${mesh}/run_${run}"
+              mkdir -p "$run_dir"
+              extra_flags=""
+              # Tools + Ferrum images are built by the first arm run.
+              if [ -f results/.tools-built ]; then extra_flags="--skip-build"; fi
+              bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh \
+                "$mesh" \
+                --payload-sizes "$PAYLOAD_SIZES" \
+                --duration "$BENCH_DURATION" \
+                --concurrency "$BENCH_CONCURRENCY" \
+                --output-dir "$run_dir" \
+                $extra_flags \
+                2>&1 | tee "$run_dir/run.log" || true
+              touch results/.tools-built
+            done
           done
 
       - name: Force-cleanup any leaked containers
-        if: steps.skip_check.outputs.skip != 'true' && always()
+        if: always()
         run: |
-          docker ps -q --filter "name=meshbench-" | xargs -r docker rm -f 2>/dev/null || true
-
-      - name: Render per-arm summary
-        if: steps.skip_check.outputs.skip != 'true' && always()
-        run: |
-          python3 .github/scripts/summarize_mesh_runtime_results.py \
-            --results-root "results/${{ matrix.mesh }}" \
-            --output "results/${{ matrix.mesh }}/summary.json" \
-            --summary-md "results/${{ matrix.mesh }}/summary.md" \
-            >> "$GITHUB_STEP_SUMMARY" || true
-
-      - name: Upload per-arm artifact
-        if: steps.skip_check.outputs.skip != 'true' && always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: mesh-runtime-bench-${{ matrix.mesh }}-${{ github.sha }}
-          # Runtime dirs hold single-run throwaway private keys generated
-          # by the harness; keep them out of artifacts.
-          path: |
-            results/${{ matrix.mesh }}
-            !results/${{ matrix.mesh }}/**/runtime/**
-          retention-days: 90
-
-  aggregate:
-    name: Aggregate summary
-    needs: benchmark
-    if: always()
-    runs-on: ubuntu-26.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-        with:
-          persist-credentials: false
-
-      - name: Download all arm artifacts
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          pattern: mesh-runtime-bench-*-${{ github.sha }}
-          path: downloaded
-        continue-on-error: true
+          docker ps -aq --filter "name=meshbench-" | xargs -r docker rm -f 2>/dev/null || true
 
       - name: Render combined summary
+        if: always()
         run: |
-          mkdir -p combined
-          for mesh in direct ferrum envoy linkerd; do
-            src="downloaded/mesh-runtime-bench-${mesh}-${GITHUB_SHA}"
-            if [ -d "$src" ]; then
-              mkdir -p "combined/${mesh}"
-              cp -a "$src/." "combined/${mesh}/"
-            fi
-          done
           python3 .github/scripts/summarize_mesh_runtime_results.py \
-            --results-root combined \
-            --output combined/summary.json \
-            --summary-md combined/summary.md \
+            --results-root results \
+            --output results/summary.json \
+            --summary-md results/summary.md \
             >> "$GITHUB_STEP_SUMMARY" || true
 
-      - name: Upload combined summary
+      - name: Upload benchmark artifacts
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: mesh-runtime-bench-combined-${{ github.sha }}
-          path: combined/summary.json
+          name: mesh-runtime-bench-${{ github.sha }}
+          # Runtime dirs hold single-run throwaway key material generated
+          # by the harness; logs/ and result JSON are uploaded instead.
+          path: |
+            results
+            !results/**/runtime/**
           retention-days: 90
+
+      # Acceptance is independent of rendering/upload: missing or error
+      # cells in any required arm fail the run even though artifacts were
+      # preserved above.
+      - name: Enforce campaign acceptance
+        if: always()
+        run: |
+          python3 .github/scripts/summarize_mesh_runtime_results.py \
+            --check-acceptance --output results/summary.json

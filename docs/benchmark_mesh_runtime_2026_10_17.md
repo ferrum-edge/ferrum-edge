@@ -1,132 +1,138 @@
-# Mesh Runtime Benchmark — First Results (2026-10-17)
+# Mesh Runtime Benchmark — First Local Results (2026-10-17, exploratory)
 
 First head-to-head measurement of Ferrum Edge as a service-mesh data
-plane against another mesh data plane in the same environment, using the
-new harness in `tests/performance/mesh_runtime/` and workflow
-`.github/workflows/mesh-runtime-benchmark.yml`. Methodology, arm
-definitions, and caveats: [`docs/mesh_runtime_benchmark.md`](mesh_runtime_benchmark.md).
-Machine-readable results: [`benchmark_mesh_runtime_2026_10_17_results.json`](benchmark_mesh_runtime_2026_10_17_results.json).
+plane against a static Envoy control pair in the same environment,
+using the harness in `tests/performance/mesh_runtime/` and workflow
+`.github/workflows/mesh-runtime-benchmark.yml`. Methodology and caveats:
+[`docs/mesh_runtime_benchmark.md`](mesh_runtime_benchmark.md). Results:
+[`benchmark_mesh_runtime_2026_10_17_results.json`](benchmark_mesh_runtime_2026_10_17_results.json)
+(concurrency-100 sweep) and
+[`benchmark_mesh_runtime_2026_10_17_conc1.json`](benchmark_mesh_runtime_2026_10_17_conc1.json)
+(concurrency-1 diagnostic).
 
-## Top finding
+**Evidence status:** one exploratory 10-second observation per cell on
+a shared six-vCPU Colima arm64 VM (all arms sequential on that host).
+Quote as: “the configured Ferrum run had lower small-payload throughput
+than the static Envoy control, and bulk RPS was closer.” These are not
+validated mesh-product rankings; the hosted `ubuntu-26.04` collection
+(first dispatch after the workflow lands on `main`, 30s × 3 iterations
+recommended) is the publishable artifact and will supersede this page.
 
-At small payloads Ferrum's sidecar pair spends **≈1.9× the CPU per
-request** of the Envoy pair (135µs vs 70µs CPU/request at 1KB, both
-pairs saturated at ≈4.1–4.3 cores) and reaches 55% of Envoy's RPS
-(31.5k vs 57.7k). At 500KB and above the arms are within **4–7%** of
-each other in both RPS and CPU/request. The gap is a fixed per-request
-cost, not a bulk-transfer cost — confirmed at concurrency 1, where the
-pair adds 189µs (Ferrum) vs 130µs (Envoy) over the 35µs direct path.
-Optimization target #1 is per-request CPU on the mesh sidecar path
-(plugin-chain/identity work and H2 stream handling), not the body path.
+## Exploratory observation
 
-## Environment (local first run — CI collection is the publishable one)
+At 1KiB the Ferrum pair reached 37,089 RPS vs the Envoy pair's 74,254
+on this VM; estimated sampled CPU per request (docker-stats pair CPU ÷
+RPS, an unbracketed sampled estimate, not measured service demand) was
+≈113µs vs ≈54µs. At 500KiB and above, RPS differed by 3–7% and sampled
+CPU/request was similar. At concurrency 1 the pairs added ≈207µs
+(Ferrum) and ≈132µs (Envoy) over the 36µs direct path at 1KiB. The
+pattern is *consistent with* a larger fixed per-request cost on the
+Ferrum path; it does not by itself identify which component (plugin
+chain, H2 stream handling, pool behavior, scheduling) accounts for it.
+Hypotheses and confirming instrumentation are listed below — none is
+established by this run.
+
+## Environment
 
 | Field | Value |
 |---|---|
 | Host | Apple M4 (arm64), macOS; Docker via Colima Linux/arm64 VM, 6 vCPU / 10GiB |
-| Placement | all arms sequential on the **same** host (paired `direct`) |
-| Ferrum | published image `ferrumedge/ferrum-edge:main-ee8c0e590155e3b6fd6ab5381d5d42e35fcbbd74` (`sha256:c5339667…`), exact benchmark-branch base SHA |
-| Envoy | `envoyproxy/envoy:v1.39.1`, static H2/mTLS pair (not full Istio) |
-| Linkerd | `ghcr.io/linkerd/proxy:edge-25.11.1` — `unsupported-standalone` (needs Destination service; see below) |
-| Workload | HTTP/1.1 POST echo, H1 → H2/mTLS → H1, 10s × conc 100 (50 @1MB, 25 @5MB), 1 iteration |
+| Placement | arms sequential on the same host; load generator + backend share the VM (headroom not isolated) |
+| Ferrum | published image `ferrumedge/ferrum-edge:main-ee8c0e590155e3b6fd6ab5381d5d42e35fcbbd74`, digest `sha256:c53396671a71d6bddf1156bcd913ec523d6ff8b41c1c8dbe910a27b5eb85319a` (benchmark-branch base SHA) |
+| Envoy | `envoyproxy/envoy:v1.39.1`, static TLS-1.3 H2/mTLS pair (not full Istio) |
+| Linkerd | `ghcr.io/linkerd/proxy:edge-25.11.1` — `unsupported-standalone` (Destination service required; log evidence in the run artifact) |
+| Workload | HTTP/1.1 POST echo, H1 → H2-over-mTLS (TLS 1.3 both arms) → H1, 10s/cell, conc 100 (50 @1MiB, 25 @5MiB), 1 iteration, byte-exact echo verification |
+| Auth probes | plaintext refused; valid client cert accepted; no-cert and rogue-CA handshakes refused (both mesh arms) |
 | Collected | 2026-10-17 |
 
-Local absolute values are directional (shared laptop-class VM, all
-processes on 6 vCPUs). The workflow's hosted run on `ubuntu-26.04` is
-the artifact to quote; this report will be updated with its run link.
+## Results (single observation per cell)
 
-## Results
+### Throughput (RPS) and loss vs same-host direct
 
-### Throughput (RPS) and overhead vs same-host direct
-
-| Payload | direct | ferrum | envoy | ferrum overhead | envoy overhead |
+| Payload | direct | ferrum | envoy | ferrum loss | envoy loss |
 |---:|---:|---:|---:|---:|---:|
-| 1KB | 435,921 | 31,531 | 57,736 | 92.8% | 86.8% |
-| 10KB | 349,385 | 27,044 | 46,750 | 92.3% | 86.6% |
-| 70KB | 99,526 | 13,132 | 16,261 | 86.8% | 83.7% |
-| 500KB | 11,939 | 2,744 | 2,851 | 77.0% | 76.1% |
-| 1MB | 5,263 | 1,410 | 1,507 | 73.2% | 71.4% |
-| 5MB | 849 | 290 | 305 | 65.8% | 64.1% |
+| 1KiB | 418,179 | 37,089 | 74,254 | 91.1% | 82.2% |
+| 10KiB | 328,822 | 30,478 | 49,737 | 90.7% | 84.9% |
+| 70KiB | 92,694 | 13,170 | 16,060 | 85.8% | 82.7% |
+| 500KiB | 12,314 | 2,739 | 2,921 | 77.8% | 76.3% |
+| 1MiB | 5,844 | 1,424 | 1,492 | 75.6% | 74.5% |
+| 5MiB | 865 | 286 | 294 | 66.9% | 66.0% |
 
-### Latency p50 (concurrency 100; 50 @1MB, 25 @5MB)
+### Latency p50 at offered load (closed-loop)
 
 | Payload | direct | ferrum | envoy |
 |---:|---:|---:|---:|
-| 1KB | 208µs | 3.08ms | 1.57ms |
-| 10KB | 257µs | 3.59ms | 1.98ms |
-| 70KB | 928µs | 7.53ms | 5.90ms |
-| 500KB | 8.04ms | 36.0ms | 34.1ms |
-| 1MB | 9.21ms | 35.1ms | 32.0ms |
-| 5MB | 28.9ms | 86.0ms | 85.2ms |
+| 1KiB | 213µs | 2.63ms | 1.22ms |
+| 10KiB | 270µs | 3.21ms | 1.87ms |
+| 70KiB | 993µs | 7.50ms | 5.88ms |
+| 500KiB | 7.79ms | 35.9ms | 25.5ms |
+| 1MiB | 8.27ms | 34.8ms | 27.3ms |
+| 5MiB | 28.4ms | 87.3ms | 82.7ms |
 
-Closed-loop latency at saturation; the concurrency-1 fixed costs are
-direct 35µs, envoy pair 165µs, ferrum pair 224µs (avg, 1KB).
+Concurrency-1 average latency at 1KiB (diagnostic file above):
+direct 36µs, envoy 168µs, ferrum 243µs.
 
-### Proxy-pair CPU / memory (docker-stats cgroup usage, measured window)
+### Proxy-pair CPU / memory (docker-stats cgroup usage, sampled)
 
-Both pairs saturate ≈4.1–4.5 cores at every size on this 6-vCPU VM
-(load generator and backend share the remainder), so read CPU through
-CPU/request: **1KB — ferrum 135µs/req, envoy 70µs/req; 5MB — 14.2ms vs
-13.4ms/req**. Pair memory is comparable (ferrum 118–311MiB, envoy
-49–248MiB across sizes; Ferrum higher at small sizes, similar at bulk).
+Pair CPU was ≈400–450% for both arms at all sizes on this VM (the
+load generator and backend compete for the same 6 vCPUs, so these are
+shared-host capacity samples, not isolated proxy cost). Sampled
+CPU/request at 1KiB: ferrum ≈113µs, envoy ≈54µs; at 5MiB: ≈14.1ms vs
+≈13.6ms. Pair memory (mean / sum-of-peaks): ferrum 120–295MiB /
+122–308MiB; envoy 49–226MiB / 49–255MiB across payload sizes.
 
-## What the benchmark caught during bring-up (harness fairness fixes)
+## Fairness fixes found during bring-up (diagnostics, not archived cells)
 
-1. **Access logging dominated Ferrum's first numbers.** With mesh
-   Telemetry defaults, Ferrum injected `stdout_logging` per request
-   (≈1.5GB of logs per sweep) and scored 15.0k RPS @1KB. Disabling
-   access logging in *every* arm (Ferrum Telemetry switch; Envoy
-   already `access_log: []`) doubled Ferrum to 31.5k. `FERRUM_LOG_LEVEL`
-   alone does not control that plugin.
-2. **Protocol shape matters.** Ferrum's sidecar east-west transport is
-   pooled HTTP/2 over mTLS. The Envoy pair was reconfigured from H1 to
-   explicit H2 east-west to match (Envoy @1KB moved 69.1k → 57.7k);
-   comparing across different wire protocols would have been a
-   methodology error.
-3. **Authentication is probed.** Each arm must refuse a plaintext echo
-   dialed at its mTLS inbound (:15006) before any cell is measured;
-   both arms pass. Certificates are shared EC P-256 across arms;
-   the CA private key is mounted into no proxy.
+1. **Access logging dominated Ferrum's first (unarchived) diagnostic**
+   — with mesh Telemetry defaults the injected `stdout_logging` plugin
+   more than halved Ferrum's small-payload RPS. All shipped arms now
+   disable access logging explicitly (Ferrum Telemetry switch; Envoy
+   `access_log: []`); `FERRUM_LOG_LEVEL` alone does not control it.
+2. **Wire shape parity matters** — the Envoy pair was moved from H1 to
+   explicit HTTP/2 east-west (and TLS 1.2→1.3 with resumption fully
+   off) to match Ferrum's sidecar transport; cross-protocol rows are
+   not quoted.
+3. **TLS 1.3 probe subtlety** — client-auth rejection surfaces only
+   after the client Finished; the auth probe therefore requires the
+   server's H2 SETTINGS frame, not just a completed handshake.
 
 ## Linkerd outcome
 
-`ghcr.io/linkerd/proxy:edge-25.11.1` exits standalone with
-`Invalid configuration: no destination service configured` (static file
-identity accepted, then the Destination control-plane address is
-required). The arm records `unsupported-standalone` with logs — no
-numbers are fabricated. Measuring Linkerd (and full Istio, Cilium)
-requires the Tier-2 kind environment in
-[`docs/mesh_runtime_benchmark.md`](mesh_runtime_benchmark.md); Consul
-Connect is the recommended next Tier-1 arm (real control plane, no
-Kubernetes needed).
+`ghcr.io/linkerd/proxy:edge-25.11.1` with static file identity exits
+with `Invalid configuration: no destination service configured`; the
+arm records `unsupported-standalone` only on that evidence (image or
+startup failures record `failed` instead). Measuring Linkerd — and
+full Istio/Cilium — requires the Tier-2 kind environment; Consul
+Connect is the recommended next Tier-1 arm. See
+[`docs/mesh_runtime_benchmark.md`](mesh_runtime_benchmark.md).
 
-## Optimization follow-ups (hypotheses with confirming instrumentation)
+## Optimization hypotheses (unproven; confirming instrumentation)
 
-1. **Per-request plugin/identity cost (small payloads).** Ferrum runs
-   its full managed plugin chain per request where the Envoy control
-   runs a minimal HCM+router. Confirm with effective plugin lists,
-   per-request CPU profiling (existing profile workflows), and request
-   duration metrics; do not remove security checks to chase the number.
-2. **H2 pool width / stream concentration.** `MeshMtlsConnectionPool`
-   grows at 8 pending response heads (`src/proxy/mesh_mtls_pool.rs`);
-   record `ferrum_connection_pool_entries{pool="mesh_mtls"}` and pool
-   handshake/eviction counters, and sweep pool width in a labeled
-   diagnostic run.
-3. **Flow-control asymmetry (large payloads).** Mesh pool windows vs
-   frontend defaults differ (`src/proxy/mesh_mtls_pool.rs`,
-   `src/proxy/mod.rs`); retain both peers' H2 SETTINGS and run a
-   declared common-window diagnostic before tuning.
-4. **Backend/client headroom.** Both pairs saturate the shared VM;
-   hosted runs must show loadgen/backend CPU headroom before treating
-   RPS ceilings as proxy ceilings.
+1. **Per-request plugin/identity CPU.** Ferrum executes its managed
+   mesh plugin chain per request vs the control's minimal HCM+router.
+   Confirm: effective plugin lists, CPU profiles
+   (existing profile workflows), per-request metrics. Never remove
+   security checks to chase the number.
+2. **Mesh-mTLS H2 pool width / stream concentration.**
+   `MeshMtlsConnectionPool` growth thresholds
+   (`src/proxy/mesh_mtls_pool.rs`); record
+   `ferrum_connection_pool_entries{pool="mesh_mtls"}` and handshake
+   counters; sweep width in a labeled diagnostic.
+3. **H2 window/frame asymmetry at bulk sizes** (pool 8MiB/32MiB vs
+   frontend 256KiB/2MiB defaults; Envoy ships its own defaults —
+   this run used untuned defaults on both sides). Retain both peers'
+   SETTINGS; run a declared common-window diagnostic.
+4. **Shared-host saturation.** Loadgen/backend CPU headroom must be
+   shown before RPS ceilings are read as proxy ceilings.
 
-## Review
+## Review record
 
-Design and implementation were reviewed by a GPT-6.1 Sol (xhigh)
-reviewer in two rounds (design before implementation; diff + results
-after). Round-1 blockers (client Host/dial gap, H1-vs-H2 protocol
-declaration, telemetry/access-log parity) are fixed in the shipped
-harness; remaining reviewer items (same-runner paired direct in CI,
-`/proc`-grade resource sampling, workload-interval steal gating,
-Consul/kind arms) are recorded as limitations/follow-ups in
+Two GPT-6.1 Sol (xhigh) review rounds: design (pre-implementation) and
+implementation (diff + results). Round-2 blockers — relative
+bind-mount sources on CI, opaque `$DOCKER` dispatch rejected by the
+Cross build policy (confirmed by the PR's CI Policy failure), Envoy
+TLS/runtime mismatch, and success-on-failure acceptance — are fixed in
+the current head; remaining items (paired hosted repetitions beyond
+the single-runner sequential layout, `/proc`-grade resource counters
+on hosted Linux, Consul/kind arms) are tracked as limitations in
 [`docs/mesh_runtime_benchmark.md`](mesh_runtime_benchmark.md).

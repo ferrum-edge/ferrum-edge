@@ -11,4 +11,5 @@ RUN cargo build --locked --release --bins
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /build/target/release/mesh_loadgen /usr/local/bin/mesh_loadgen
 COPY --from=builder /build/target/release/mesh_backend /usr/local/bin/mesh_backend
+COPY --from=builder /build/target/release/mesh_tls_probe /usr/local/bin/mesh_tls_probe
 ENTRYPOINT ["/usr/local/bin/mesh_loadgen"]

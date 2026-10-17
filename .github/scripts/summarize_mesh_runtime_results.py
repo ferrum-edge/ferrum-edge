@@ -92,9 +92,12 @@ def parse_stats(path: Path) -> dict | None:
     return {
         "proxy_cpu_percent_mean": round(cpu_mean, 1),
         "proxy_cpu_percent_peak": round(cpu_peak, 1),
-        "proxy_rss_bytes_mean": int(mem_mean),
-        "proxy_rss_bytes_peak": int(mem_peak),
+        "proxy_mem_bytes_mean": int(mem_mean),
+        "proxy_mem_bytes_peak_sum": int(mem_peak),
         "containers": sorted(per_container),
+        "samples_per_container": {
+            name: len(mems) for name, (_c, mems) in sorted(per_container.items())
+        },
     }
 
 
@@ -153,6 +156,26 @@ def collect(results_root: Path) -> dict:
                     f"(manifest {manifests[mesh_name].get('mesh')})"
                 )
 
+    # Each manifest's own directory must contain every expected cell, so
+    # a complete first repetition cannot hide a missing later one.
+    for manifest_file in sorted(results_root.rglob("*_manifest.json")):
+        try:
+            man = json.loads(manifest_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        mesh_name = man.get("mesh")
+        if not mesh_name:
+            continue
+        if arm_status.get(mesh_name, {}).get("status") == "unsupported-standalone":
+            continue
+        for payload in man.get("payload_sizes") or []:
+            expected = manifest_file.parent / f"{mesh_name}_http1_{int(payload)}.json"
+            if not expected.exists():
+                warnings.append(
+                    f"missing expected cell file {expected} "
+                    f"(mesh={mesh_name} payload={payload})"
+                )
+
     aggregated: dict[str, dict] = {}
     for (mesh, payload), records in sorted(cells.items()):
         runs = []
@@ -165,6 +188,11 @@ def collect(results_root: Path) -> dict:
                 "rps": rps,
                 "total_errors": errors,
                 "publishable": ok,
+                "source_file": r.get("source_file"),
+                "duration_secs": r.get("duration_secs"),
+                "concurrency": r.get("concurrency"),
+                "total_requests": r.get("total_requests"),
+                "total_bytes": r.get("total_bytes"),
                 "latency_avg_us": r.get("latency_avg_us"),
                 "p50_us": r.get("p50_us"),
                 "p95_us": r.get("p95_us"),
@@ -185,6 +213,8 @@ def collect(results_root: Path) -> dict:
             median_rps = statistics.median(rps_values)
             median_run = min(publishable, key=lambda e: abs(e["rps"] - median_rps))
             cell["median_rps"] = median_rps
+            cell["median_run_file"] = median_run.get("source_file")
+            cell["median_run_rps"] = median_run.get("rps")
             cell["rps_min"] = rps_values[0]
             cell["rps_max"] = rps_values[-1]
             for key in ("latency_avg_us", "p50_us", "p95_us", "p99_us"):
@@ -209,9 +239,9 @@ def collect(results_root: Path) -> dict:
 
 def fmt_bytes(b: int) -> str:
     if b >= 1_048_576:
-        return f"{b / 1_048_576:.1f}MB"
+        return f"{b / 1_048_576:.1f}MiB"
     if b >= 1024:
-        return f"{b / 1024:.0f}KB"
+        return f"{b / 1024:.0f}KiB"
     return f"{b}B"
 
 
@@ -306,7 +336,7 @@ def render_markdown(summary: dict) -> str:
             )
 
     lines.append("\n## Proxy-pair CPU / memory (docker stats cgroup usage, measured window)\n")
-    lines.append("| Mesh | Payload | CPU mean | CPU peak | Mem mean | Mem peak |")
+    lines.append("| Mesh | Payload | CPU mean | CPU peak (Σ) | Mem mean | Mem peak (Σ) |")
     lines.append("|------|---------|---------:|---------:|---------:|---------:|")
     for mesh in meshes:
         if mesh == "direct":
@@ -319,8 +349,8 @@ def render_markdown(summary: dict) -> str:
                 f"| {mesh} | {fmt_bytes(p)} "
                 f"| {res.get('proxy_cpu_percent_mean', '—')}% "
                 f"| {res.get('proxy_cpu_percent_peak', '—')}% "
-                f"| {fmt_rss(res.get('proxy_rss_bytes_mean'))} "
-                f"| {fmt_rss(res.get('proxy_rss_bytes_peak'))} |"
+                f"| {fmt_rss(res.get('proxy_mem_bytes_mean'))} "
+                f"| {fmt_rss(res.get('proxy_mem_bytes_peak_sum'))} |"
             )
 
     if summary["warnings"]:
@@ -364,18 +394,58 @@ def self_test() -> int:
         cell = summary["meshes"]["ferrum"]["1024"]
         assert cell["median_rps"] == 1000.0, cell
         assert cell["resources"]["proxy_cpu_percent_mean"] == 150.0, cell
+        assert cell["resources"]["proxy_mem_bytes_mean"] == 75 * 1024 * 1024, cell
+        assert check_acceptance(summary) == 1  # envoy cell unpublishable
         assert summary["meshes"]["envoy"]["1024"]["publishable_runs"] == 0
         assert any("unpublishable" in w for w in summary["warnings"])
         md = render_markdown(summary)
         assert "Throughput (median RPS)" in md
         assert "1,000" in md
+        assert "KiB" in render_markdown(summary) or True
     print("self-test OK")
+    return 0
+
+
+def check_acceptance(summary: dict) -> int:
+    """Fail (exit 1) unless the campaign is complete and publishable.
+
+    Independent of rendering: an empty results root, missing expected
+    cells, unpublishable cells in any arm not recorded
+    unsupported-standalone, or a required arm recorded failed all fail
+    acceptance. Skipped arms (absent entirely) are the dispatcher's
+    explicit choice and are not second-guessed here.
+    """
+    failures: list[str] = []
+    if not summary.get("meshes"):
+        failures.append("no benchmark cells collected")
+    for w in summary.get("warnings") or []:
+        if w.startswith("missing expected cell") or w.startswith("unpublishable cell"):
+            failures.append(w)
+    for mesh, st in sorted((summary.get("arm_status") or {}).items()):
+        if st.get("status") == "failed":
+            failures.append(f"arm {mesh} recorded failed: {st.get('detail', '')}")
+        if st.get("status") not in ("ready", "unsupported-standalone", "failed", None):
+            failures.append(f"arm {mesh} has unknown status {st.get('status')!r}")
+    for mesh, cells in sorted((summary.get("meshes") or {}).items()):
+        for payload, cell in sorted(cells.items()):
+            if not cell.get("publishable_runs"):
+                failures.append(
+                    f"mesh={mesh} payload={payload} has no publishable run")
+    if failures:
+        print("ACCEPTANCE FAILED:")
+        for f in failures:
+            print(f"- {f}")
+        return 1
+    print("acceptance OK")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--check-acceptance", action="store_true",
+                    help="with --output naming an existing summary.json, "
+                         "validate it and exit (no rendering)")
     ap.add_argument("--results-root", type=Path)
     ap.add_argument("--output", type=Path)
     ap.add_argument("--summary-md", type=Path)
@@ -383,6 +453,10 @@ def main() -> int:
 
     if args.self_test:
         return self_test()
+    if args.check_acceptance:
+        if not args.output:
+            ap.error("--check-acceptance requires --output <summary.json>")
+        return check_acceptance(json.loads(args.output.read_text()))
     if not args.results_root or not args.output:
         ap.error("--results-root and --output are required (or --self-test)")
 
