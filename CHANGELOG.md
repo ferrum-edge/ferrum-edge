@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Validation plugin-construction clients now resolve through the
+  screened DNS resolver** (issue #6651, item 2). The CP admission sweep,
+  transaction-log schema graph validation, plugin security-composition
+  validation and the validation-only plugin constructors built the
+  cache-less `PluginHttpClient::default()` (OS DNS, unrestricted egress),
+  so constructor side-effect fetches during validation bypassed the
+  resolver the runtime client uses. They now build
+  `default_with_backend_allow_ips` — the same deliberately unrestricted
+  policy where it was already documented, but through the policy-carrying
+  `DnsCacheResolver`. The remaining `Default`/`from_pool_config` users
+  are tests, test seams, and the non-networking inline-JWKS store
+  (`refreshable=false` returns before any fetch).
+
 
 - **A refused `RequestAuthentication` is now scoped to synthesized HBONE
   relay routes on Ambient and the other relay topologies** (issue #6736).

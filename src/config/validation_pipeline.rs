@@ -141,9 +141,14 @@ fn collect_plugin_config_errors(
     // Built once for the whole sweep: `validate_plugin_config_with_policy`
     // would construct a fresh validation client (and its DNS cache) per plugin
     // config, and CP delta admission runs this on every accepted batch.
-    let http_client = crate::plugins::PluginHttpClient::default()
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-        .with_process_compression_admission_policy();
+    // The policy stays unrestricted for the reason above, but construction
+    // still routes through the policy-carrying DNS resolver instead of the
+    // cache-less OS-DNS client (#6651): constructor side-effect fetches get
+    // the same screened resolution as the runtime client.
+    let http_client =
+        crate::plugins::PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+            .with_process_compression_admission_policy();
 
     let mut rejected = Vec::new();
     for (index, plugin_config) in config.plugin_configs.iter().enumerate() {
@@ -285,7 +290,10 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     }
     if let Err(found) = crate::plugins::transaction_log_schema::validate_config_graph(
         config,
-        &crate::plugins::PluginHttpClient::default().with_process_compression_admission_policy(),
+        &crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
+            BackendEgressPolicy::unrestricted(),
+        )
+        .with_process_compression_admission_policy(),
         false,
     ) {
         errors.extend(found);
@@ -304,9 +312,11 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     );
     if let Err(found) = crate::plugin_cache::validate_plugin_security_composition_candidate(
         config,
-        &crate::plugins::PluginHttpClient::default()
-            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-            .with_process_compression_admission_policy(),
+        &crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
+            BackendEgressPolicy::unrestricted(),
+        )
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+        .with_process_compression_admission_policy(),
     ) {
         errors.push(found);
     }
