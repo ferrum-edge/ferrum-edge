@@ -8557,6 +8557,90 @@ async fn wide_body_view_policy_matches_in_both_directions() {
 }
 
 #[tokio::test]
+async fn wrong_declared_wide_charset_still_scans_signature_readings() {
+    // Follow-up to #6729: a BOM-less body whose declared wide charset is
+    // wrong about width or endianness still gets the readings a
+    // byte-sniffing parser produces, on top of the declared readings.
+    let plugin = wide_parity_waf();
+    let text = r#"{"value":"inspection-marker"}"#;
+    for response in [false, true] {
+        let expected = if response {
+            "WIDE-RESPONSE"
+        } else {
+            "WIDE-REQUEST"
+        };
+        for (label, content_type, bytes) in [
+            // Wrong endianness, same width.
+            (
+                "utf-16be over LE",
+                "application/json; charset=utf-16be",
+                encode_utf16(text, false),
+            ),
+            (
+                "utf-16le over BE",
+                "application/json; charset=utf-16le",
+                encode_utf16(text, true),
+            ),
+            (
+                "utf-32be over LE",
+                "application/json; charset=utf-32be",
+                encode_utf32(text, false),
+            ),
+            (
+                "utf-32le over BE",
+                "application/json; charset=utf-32le",
+                encode_utf32(text, true),
+            ),
+            // Wrong width: declared readings plus the signature pair.
+            (
+                "utf-32le over UTF-16LE",
+                "application/json; charset=utf-32le",
+                encode_utf16(text, false),
+            ),
+            (
+                "utf-16le over UTF-32BE",
+                "application/json; charset=utf-16le",
+                encode_utf32(text, true),
+            ),
+            (
+                "bare utf-16 over UTF-32BE",
+                "application/json; charset=utf-16",
+                encode_utf32(text, true),
+            ),
+            (
+                "bare utf-32 over UTF-16LE",
+                "application/json; charset=utf-32",
+                encode_utf16(text, false),
+            ),
+        ] {
+            let (result, request) =
+                scan_wide_direction(&plugin, response, content_type, &bytes).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "response={response} {label}"
+            );
+            assert_eq!(
+                request.metadata.get("waf.rule_hits").unwrap(),
+                expected,
+                "{label}"
+            );
+        }
+        // Benign wide text under a wrong declaration is not a match either.
+        let (result, _) = scan_wide_direction(
+            &plugin,
+            response,
+            "application/json; charset=utf-16be",
+            &encode_utf16(r#"{"value":"ordinary"}"#, false),
+        )
+        .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "benign response={response}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn undeclared_wide_requests_match_the_default_pack_at_both_paranoia_levels() {
     for level in [1, 4] {
         let plugin = waf(json!({
