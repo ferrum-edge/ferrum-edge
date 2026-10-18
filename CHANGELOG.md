@@ -119,6 +119,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The shared HTTP batch-response helper renders a transport error without its
   request URL (PR #6684), so an endpoint credential in the path or query is
   never echoed into a sink diagnostic.
+- **WAF wide-charset inspection follows a disagreeing BOM-less signature**
+  (follow-up to #6729). A body whose declared wide charset is wrong about
+  width or endianness (for example `charset=utf-16be` over UTF-16LE bytes, or
+  `charset=utf-16` over UTF-32 bytes) now also scans both endiannesses of
+  the signature's width, in addition to the declared readings — at most four
+  wide views, and only on that disagreement. Previously only the declared
+  readings were scanned, so a byte-sniffing backend could read a payload the
+  rules never saw.
+
 - **WAF `body_json_path` rules inspect wide-charset and duplicate-member JSON.**
   A JSON-path rule previously parsed only the raw request bytes with a parser
   that keeps the last of any duplicated object member, so a UTF-16 / UTF-32
