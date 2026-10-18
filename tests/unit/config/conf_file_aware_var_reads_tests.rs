@@ -122,13 +122,17 @@ fn issue_3624_reads_use_conf_aware_resolver_not_std_env_var() {
     let env_config = squeeze(include_str!("../../../src/config/env_config.rs"));
     assert!(
         env_config.contains(&squeeze(
-            "resolve_ferrum_var(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"
+            "resolve(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"
         )),
         "compression gates must resolve through ferrum.conf"
     );
     assert!(
+        env_config.contains(&squeeze("ConfFile::load()?")),
+        "a sticky conf-load failure must refuse, not resolve to defaults"
+    );
+    assert!(
         env_config.contains(&squeeze(
-            "resolve_ferrum_var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"
+            "resolve(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"
         )),
         "validation client body ceiling must resolve through ferrum.conf"
     );
