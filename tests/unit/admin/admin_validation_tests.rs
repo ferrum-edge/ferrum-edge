@@ -1316,7 +1316,8 @@ fn late_api_spec_post_compensation_preserves_intervening_proxy_plugins() {
     assert!(api_spec_source.contains("late_api_spec_create_compensation_safe("));
     assert!(api_spec_source.contains("current_proxy.plugins.len() != expected_associations.len()"));
     assert!(
-        api_spec_source.contains("list_proxy_scoped_plugin_config_ids(&spec.namespace, &bundle.proxy.id)"),
+        api_spec_source
+            .contains("list_proxy_scoped_plugin_config_ids(&spec.namespace, &bundle.proxy.id)"),
         "compensation must check scoped plugins through the authoritative id-only reader"
     );
 }
