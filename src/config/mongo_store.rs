@@ -4043,6 +4043,28 @@ mod inner {
             Ok(attached)
         }
 
+        /// Primary id-only projection of plugin configs scoped to one proxy.
+        async fn proxy_scoped_plugin_config_ids(
+            &self,
+            namespace: &str,
+            proxy_id: &str,
+        ) -> mongodb::error::Result<BTreeSet<String>> {
+            let mut cursor = self
+                .plugin_configs()
+                .find(doc! {
+                    "namespace": namespace,
+                    "proxy_id": proxy_id,
+                })
+                .projection(doc! { "_id": 0, "id": 1 })
+                .await?;
+            let mut ids = BTreeSet::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                ids.insert(Self::attached_plugin_proxy_id(&doc)?);
+            }
+            Ok(ids)
+        }
+
         fn attached_plugin_proxy_id(doc: &Document) -> mongodb::error::Result<String> {
             // Do not skip damaged association-bearing proxies.
             doc.get_str("id").map(str::to_string).map_err(|_| {
@@ -12432,6 +12454,16 @@ mod inner {
         ) -> Result<BTreeSet<String>, anyhow::Error> {
             Ok(self
                 .attached_plugin_proxy_ids(namespace, plugin_id, None)
+                .await?)
+        }
+
+        async fn list_proxy_scoped_plugin_config_ids(
+            &self,
+            namespace: &str,
+            proxy_id: &str,
+        ) -> Result<BTreeSet<String>, anyhow::Error> {
+            Ok(self
+                .proxy_scoped_plugin_config_ids(namespace, proxy_id)
                 .await?)
         }
 

@@ -376,24 +376,14 @@ async fn late_api_spec_create_compensation_safe(
         .iter()
         .map(|plugin| plugin.id.as_str())
         .collect::<HashSet<_>>();
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_plugin_configs_paginated(&spec.namespace, None, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        if page.items.iter().any(|plugin| {
-            plugin.proxy_id.as_deref() == Some(bundle.proxy.id.as_str())
-                && !expected_plugin_ids.contains(plugin.id.as_str())
-        }) {
-            return Ok(false);
-        }
-        if items_len == 0 || offset + items_len >= page.total {
-            return Ok(true);
-        }
-        offset += items_len;
-    }
+    // Authoritative id-only read: a lagging replica must not wave through
+    // compensation over an intervening scoped plugin (forge-ops #569).
+    let scoped = db
+        .list_proxy_scoped_plugin_config_ids(&spec.namespace, &bundle.proxy.id)
+        .await?;
+    Ok(scoped
+        .iter()
+        .all(|plugin_id| expected_plugin_ids.contains(plugin_id.as_str())))
 }
 
 async fn compensate_late_api_spec_replace(

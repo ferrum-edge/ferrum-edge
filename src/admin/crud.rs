@@ -1208,25 +1208,12 @@ async fn proxy_has_scoped_plugin(
     namespace: &str,
     proxy_id: &str,
 ) -> DbResult<bool> {
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_plugin_configs_paginated(namespace, None, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        if page
-            .items
-            .iter()
-            .any(|plugin| plugin.proxy_id.as_deref() == Some(proxy_id))
-        {
-            return Ok(true);
-        }
-        if items_len == 0 || offset + items_len >= page.total {
-            return Ok(false);
-        }
-        offset += items_len;
-    }
+    // Authoritative id-only read: compensation safety must not trust the
+    // replica-backed paginated page (forge-ops #569).
+    Ok(!db
+        .list_proxy_scoped_plugin_config_ids(namespace, proxy_id)
+        .await?
+        .is_empty())
 }
 
 /// Reacquire namespace admission after a successful late write. With no

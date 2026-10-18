@@ -12797,6 +12797,21 @@ impl DatabaseBackend for DatabaseStore {
         Ok(ids.into_iter().collect())
     }
 
+    async fn list_proxy_scoped_plugin_config_ids(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            &self.q("SELECT id FROM plugin_configs WHERE namespace = ? AND proxy_id = ?"),
+        )
+        .bind(namespace)
+        .bind(proxy_id)
+        .fetch_all(&self.pool())
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
     async fn get_plugin_config(
         &self,
         namespace: &str,

@@ -2542,6 +2542,14 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
         namespace: &str,
         plugin_id: &str,
     ) -> Result<BTreeSet<String>, anyhow::Error>;
+    /// Primary id-only read of plugin configs scoped to one proxy
+    /// (`proxy_id` equals `proxy_id`), for compensation-safety checks that
+    /// must not trust a lagging read replica.
+    async fn list_proxy_scoped_plugin_config_ids(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error>;
 
     async fn get_plugin_config(
         &self,
