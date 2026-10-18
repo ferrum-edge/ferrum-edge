@@ -2647,7 +2647,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let (status, _, body) = send_json(
         reqwest::Method::PUT,
         &base,
-        path,
+        write_path,
         &operator,
         Some(&etag),
         Some(&masked),
@@ -2665,7 +2665,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let (status, _, body) = send_json(
         reqwest::Method::PUT,
         &base,
-        path,
+        write_path,
         &admin,
         etag.as_deref(),
         Some(&raw),
