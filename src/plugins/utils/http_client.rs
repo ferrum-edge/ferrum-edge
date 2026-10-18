@@ -1003,28 +1003,6 @@ impl PluginTlsPosture {
     }
 }
 
-/// Parse a `FERRUM_*` boolean gate that defaults to enabled when unset.
-pub fn parse_ferrum_flag_default_true(value: Option<&str>) -> bool {
-    match value {
-        Some(value) => {
-            let normalized = value.trim().to_ascii_lowercase();
-            !matches!(normalized.as_str(), "0" | "false" | "no" | "off")
-        }
-        None => true,
-    }
-}
-
-fn env_flag_default_true(key: &str) -> bool {
-    parse_ferrum_flag_default_true(crate::config::conf_file::resolve_ferrum_var(key).as_deref())
-}
-
-/// Parse `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` from an already-resolved value.
-pub fn parse_max_request_body_size_bytes_from_resolved(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(10_485_760)
-}
-
 #[derive(Debug)]
 struct PluginHttpClientBuildError {
     message: String,
@@ -1665,21 +1643,23 @@ impl PluginHttpClient {
         self
     }
 
-    /// Apply process-wide compression codec gates and the gateway request-body
-    /// ceiling from environment defaults.
+    /// Apply the typed process compression admission policy (codec gates and
+    /// the gateway request-body ceiling).
     ///
     /// Admin/file/CP validation clients that do not inherit a live `ProxyState`
-    /// plugin client must call this so compression admission matches the serving
-    /// plugin cache (including `max_decompressed_request_size` cross-checks).
-    pub(crate) fn with_process_compression_admission_policy(self) -> Self {
-        let gzip_enabled = env_flag_default_true("FERRUM_COMPRESSION_GZIP_ENABLED");
-        let brotli_enabled = env_flag_default_true("FERRUM_COMPRESSION_BROTLI_ENABLED");
-        let max_request_body_size_bytes = parse_max_request_body_size_bytes_from_resolved(
-            crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
-                .as_deref(),
-        );
-        self.with_compression_algorithms(gzip_enabled, brotli_enabled)
-            .with_max_request_body_size_bytes(max_request_body_size_bytes)
+    /// plugin client must carry this so compression admission matches the
+    /// serving plugin cache (including `max_decompressed_request_size`
+    /// cross-checks). The values come from
+    /// [`crate::config::CompressionAdmissionPolicy`] — the parsed
+    /// `EnvConfig` where one exists, or its refusing `from_process_env`
+    /// parse on library/validation paths — never from a local fallback
+    /// re-parse (issue #6651 item 3).
+    pub(crate) fn with_compression_admission_policy(
+        self,
+        policy: crate::config::CompressionAdmissionPolicy,
+    ) -> Self {
+        self.with_compression_algorithms(policy.gzip_enabled, policy.brotli_enabled)
+            .with_max_request_body_size_bytes(policy.max_request_body_size_bytes)
     }
 
     pub(crate) fn compression_gzip_enabled(&self) -> bool {

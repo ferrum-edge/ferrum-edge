@@ -12850,13 +12850,14 @@ pub trait Plugin: Any + Send + Sync {
 /// identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     create_plugin_with_http_client(
         name,
         config,
         PluginHttpClient::default_with_backend_allow_ips(
             crate::config::BackendEgressPolicy::unrestricted(),
         )
-        .with_process_compression_admission_policy(),
+        .with_compression_admission_policy(compression_policy),
     )
 }
 
@@ -13318,13 +13319,14 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
 #[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
     validate_plugin_config_with_http_client(
         name,
         config,
         PluginHttpClient::default_with_backend_allow_ips(
             crate::config::BackendEgressPolicy::unrestricted(),
         )
-        .with_process_compression_admission_policy(),
+        .with_compression_admission_policy(compression_policy),
     )
 }
 
@@ -13398,7 +13400,7 @@ pub fn validate_plugin_config_with_policy(
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
-    let http_client = plugin_config_validation_http_client(backend_allow_ips);
+    let http_client = plugin_config_validation_http_client(backend_allow_ips)?;
     validate_plugin_config_with_policy_and_client(name, config, backend_allow_ips, http_client)
 }
 
@@ -13416,10 +13418,13 @@ pub fn validate_plugin_config_with_policy(
 /// saturated change batch, so the fallback never converged (issue #4116).
 pub(crate) fn plugin_config_validation_http_client(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> PluginHttpClient {
-    PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-        .with_process_compression_admission_policy()
+) -> Result<PluginHttpClient, String> {
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
+    Ok(
+        PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
+            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+            .with_compression_admission_policy(compression_policy),
+    )
 }
 
 /// [`validate_plugin_config_with_policy`] over a caller-built validation

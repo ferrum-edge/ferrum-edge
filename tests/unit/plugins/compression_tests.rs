@@ -6673,19 +6673,19 @@ fn test_validation_and_admin_paths_apply_process_compression_admission_policy() 
     let pipeline = include_str!("../../../src/config/validation_pipeline.rs");
     let http_client = include_str!("../../../src/plugins/utils/http_client.rs");
     assert!(
-        http_client.contains("fn with_process_compression_admission_policy"),
+        http_client.contains("fn with_compression_admission_policy"),
         "PluginHttpClient must expose the shared admission-policy seam"
     );
     assert!(
-        plugins_mod.contains("with_process_compression_admission_policy()"),
+        plugins_mod.contains("with_compression_admission_policy("),
         "validate_plugin_config* must apply process compression admission policy"
     );
     assert!(
-        admin.contains("with_process_compression_admission_policy()"),
+        admin.contains("with_compression_admission_policy("),
         "admin plugin_validation_http_client fallback must apply process policy"
     );
     assert!(
-        pipeline.contains("with_process_compression_admission_policy()"),
+        pipeline.contains("with_compression_admission_policy("),
         "config validation pipeline must apply process compression admission policy"
     );
 }

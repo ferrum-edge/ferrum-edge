@@ -1853,6 +1853,103 @@ impl std::fmt::Display for AutoBool {
     }
 }
 
+/// Process-wide compression admission policy: the gzip/Brotli codec gates
+/// and the gateway request-body ceiling that compression plugin
+/// construction is cross-checked against.
+///
+/// Single typed source for these three values (issue #6651 item 3): serving
+/// paths take them from the parsed [`EnvConfig`]; validation/library paths
+/// that never built an `EnvConfig` use [`Self::from_process_env`], which
+/// parses through the same `EnvValue` implementations and refuses a typo'd
+/// value instead of silently falling back to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionAdmissionPolicy {
+    pub gzip_enabled: bool,
+    pub brotli_enabled: bool,
+    pub max_request_body_size_bytes: usize,
+}
+
+impl Default for CompressionAdmissionPolicy {
+    fn default() -> Self {
+        // Mirror the `EnvConfig` field defaults for the same variables.
+        Self {
+            gzip_enabled: true,
+            brotli_enabled: true,
+            max_request_body_size_bytes: 10_485_760,
+        }
+    }
+}
+
+impl CompressionAdmissionPolicy {
+    pub fn from_env_config(env_config: &EnvConfig) -> Self {
+        Self {
+            gzip_enabled: env_config.compression_gzip_enabled,
+            brotli_enabled: env_config.compression_brotli_enabled,
+            max_request_body_size_bytes: env_config.max_request_body_size_bytes,
+        }
+    }
+
+    /// Resolve the policy from the process environment/conf file without a
+    /// full `EnvConfig` parse (library and validation entry points). An
+    /// unparseable value is an error naming the variable, exactly as
+    /// `EnvConfig::from_env` would refuse it at startup.
+    pub fn from_process_env() -> Result<Self, String> {
+        // Load the conf file fallibly first: `resolve_ferrum_var` resolves a
+        // sticky conf-load failure to `None`, which would silently become
+        // defaults here while `EnvConfig::from_env` refuses the same file.
+        let conf = crate::config::conf_file::ConfFile::load()?;
+        let resolve = |key: &str| -> Option<String> {
+            match std::env::var(key) {
+                Ok(val) => Some(val),
+                Err(_) => conf.get(key).map(str::to_string),
+            }
+        };
+        Self::from_resolved(
+            resolve("FERRUM_COMPRESSION_GZIP_ENABLED").as_deref(),
+            resolve("FERRUM_COMPRESSION_BROTLI_ENABLED").as_deref(),
+            resolve("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES").as_deref(),
+        )
+    }
+
+    /// Build the policy from already-resolved variable values (`None` =
+    /// unset), through the same `EnvValue` parsers `EnvConfig` uses.
+    pub fn from_resolved(
+        gzip_enabled: Option<&str>,
+        brotli_enabled: Option<&str>,
+        max_request_body_size_bytes: Option<&str>,
+    ) -> Result<Self, String> {
+        use env_config_macro::EnvValue;
+        fn parse_or_default<T: EnvValue>(
+            key: &str,
+            raw: Option<&str>,
+            default: T,
+        ) -> Result<T, String> {
+            match raw {
+                Some(raw) => T::parse_env(raw, key),
+                None => Ok(default),
+            }
+        }
+        let defaults = Self::default();
+        Ok(Self {
+            gzip_enabled: parse_or_default(
+                "FERRUM_COMPRESSION_GZIP_ENABLED",
+                gzip_enabled,
+                defaults.gzip_enabled,
+            )?,
+            brotli_enabled: parse_or_default(
+                "FERRUM_COMPRESSION_BROTLI_ENABLED",
+                brotli_enabled,
+                defaults.brotli_enabled,
+            )?,
+            max_request_body_size_bytes: parse_or_default(
+                "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+                max_request_body_size_bytes,
+                defaults.max_request_body_size_bytes,
+            )?,
+        })
+    }
+}
+
 /// All environment-driven configuration.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Some fields are used only in specific modes or feature paths.

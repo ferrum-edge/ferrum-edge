@@ -41,6 +41,17 @@ use scoped_references::ScopedReferenceClass;
 
 pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
+/// Resolve the plugin validation HTTP client, mapping a compression-policy
+/// parse refusal (issue #6651 item 3) to a 500 response in handler context.
+#[allow(clippy::result_large_err)]
+fn validation_http_client_or_500(
+    state: &AdminState,
+) -> Result<crate::plugins::PluginHttpClient, Response<Full<Bytes>>> {
+    super::plugin_validation_http_client(state).map_err(|error| {
+        super::json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": error}))
+    })
+}
+
 pub(crate) struct ValidationCtx<'a> {
     pub reserved_ports: &'a HashSet<u16>,
     pub stream_bind_address: &'a str,
@@ -1801,7 +1812,7 @@ pub(crate) async fn current_transaction_log_schema_graph_is_valid(
     namespace: &str,
 ) -> DbResult<bool> {
     let candidate = db.load_namespace_snapshot(namespace).await?;
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state).map_err(anyhow::Error::msg)?;
     match validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await {
         Ok(()) => Ok(true),
         Err(AfterValidateError::BadRequest(_) | AfterValidateError::Conflict(_)) => Ok(false),
@@ -1918,7 +1929,8 @@ pub(crate) async fn validate_plugin_graph_candidates(
         plugin_graph_admission_candidate(db, namespace, proxies, plugins, removed_plugin_id)
             .await
             .map_err(AfterValidateError::Db)?;
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
@@ -2098,7 +2110,8 @@ pub(crate) async fn validate_plugin_graph_proxy_deletion_candidate(
         plugin.scope != PluginScope::ProxyGroup || remaining_associations.contains(&plugin.id)
     });
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
@@ -2234,7 +2247,8 @@ pub(crate) async fn validate_transaction_log_schema_candidates(
         }
     }
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
@@ -2337,7 +2351,8 @@ pub(crate) async fn validate_plugin_graph_api_spec_replacement_candidate(
         }
     }
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(&candidate, &http_client)
 }
 
@@ -2403,7 +2418,8 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_replacement_candida
         }
     }
 
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
@@ -2475,7 +2491,8 @@ pub(crate) async fn validate_transaction_log_schema_api_spec_deletion_candidate(
     candidate
         .plugin_configs
         .retain(|plugin| !removed_plugin_ids.contains(&plugin.id));
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_transaction_log_schema_graph_on_blocking_pool(candidate, http_client).await
 }
 
@@ -2486,7 +2503,8 @@ pub(crate) fn validate_plugin_graph_restore_candidate(
     state: &AdminState,
     replacement: &GatewayConfig,
 ) -> Result<(), AfterValidateError> {
-    let http_client = super::plugin_validation_http_client(state);
+    let http_client = super::plugin_validation_http_client(state)
+        .map_err(|error| AfterValidateError::Db(anyhow::anyhow!(error)))?;
     validate_candidate_plugin_graph(replacement, &http_client)
 }
 
@@ -3220,6 +3238,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         Err(response) => return Ok(response),
     };
 
+    let validation_http_client = match validation_http_client_or_500(state) {
+        Ok(client) => client,
+        Err(response) => return Ok(response),
+    };
+
     if let Err(message) = validate_resource_id(id) {
         return Ok(super::json_response(
             StatusCode::BAD_REQUEST,
@@ -3247,6 +3270,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
         }
     };
     let db = db_arc.as_ref();
+
     let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
         match lock_namespace_config_admission(db_arc.clone(), namespace).await {
             Ok(guard) => Some(guard),
@@ -3272,7 +3296,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
                         db: db_arc.clone(),
                         namespace: namespace.to_string(),
                         guard: namespace_config_admission_guard.take(),
-                        http_client: super::plugin_validation_http_client(state),
+                        http_client: validation_http_client.clone(),
                         state: state.clone(),
                         actor: actor.clone(),
                     },
@@ -3337,7 +3361,7 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             db: db_arc.clone(),
             namespace: namespace.to_string(),
             guard: namespace_config_admission_guard.take(),
-            http_client: super::plugin_validation_http_client(state),
+            http_client: validation_http_client.clone(),
             state: state.clone(),
             actor: actor.clone(),
         },
@@ -3472,7 +3496,7 @@ pub(crate) fn validate_plugin_config_definition(
     state: &AdminState,
     pc: &PluginConfig,
 ) -> Result<(), String> {
-    super::validate_plugin_config_definition(pc, super::plugin_validation_http_client(state))
+    super::validate_plugin_config_definition(pc, super::plugin_validation_http_client(state)?)
 }
 
 async fn validate_openapi_validator_precondition(
@@ -5958,6 +5982,11 @@ async fn handle_write<R: AdminResource>(
             ));
         }
     };
+
+    let validation_http_client = match validation_http_client_or_500(state) {
+        Ok(client) => client,
+        Err(response) => return Ok(response),
+    };
     let db = db_arc.as_ref();
     let mut namespace_config_admission_guard = if R::SERIALIZE_NAMESPACE_CONFIG_ADMISSION {
         match lock_namespace_config_admission(db_arc.clone(), namespace).await {
@@ -6174,7 +6203,7 @@ async fn handle_write<R: AdminResource>(
                     db: db_arc.clone(),
                     namespace: namespace.to_string(),
                     guard: namespace_config_admission_guard.take(),
-                    http_client: super::plugin_validation_http_client(state),
+                    http_client: validation_http_client.clone(),
                     state: state.clone(),
                     actor: actor.clone(),
                 },
@@ -6200,7 +6229,7 @@ async fn handle_write<R: AdminResource>(
                             db: db_arc.clone(),
                             namespace: namespace.to_string(),
                             guard: namespace_config_admission_guard.take(),
-                            http_client: super::plugin_validation_http_client(state),
+                            http_client: validation_http_client.clone(),
                             state: state.clone(),
                             actor: actor.clone(),
                         },
@@ -6232,7 +6261,7 @@ async fn handle_write<R: AdminResource>(
                             db: db_arc.clone(),
                             namespace: namespace.to_string(),
                             guard: namespace_config_admission_guard.take(),
-                            http_client: super::plugin_validation_http_client(state),
+                            http_client: validation_http_client.clone(),
                             state: state.clone(),
                             actor: actor.clone(),
                         },

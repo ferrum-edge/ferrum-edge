@@ -7453,9 +7453,13 @@ async fn restore_snapshot_after_intervening_clear(
             identity_errors.join("; ")
         )]);
     }
+    let validation_http_client = match plugin_validation_http_client(state) {
+        Ok(client) => client,
+        Err(error) => return Err(vec![error]),
+    };
     match crud::validate_transaction_log_schema_graph_on_blocking_pool(
         candidate,
-        plugin_validation_http_client(state),
+        validation_http_client,
     )
     .await
     {
@@ -8508,29 +8512,29 @@ async fn handle_list_plugin_types() -> Result<Response<Full<Bytes>>, hyper::Erro
     ))
 }
 
-pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::PluginHttpClient {
-    state
-        .proxy_state
-        .as_ref()
-        .map(|proxy_state| proxy_state.plugin_http_client.clone())
-        .unwrap_or_else(|| {
-            // No ProxyState (e.g. control plane): build a validation client that
-            // still carries the configured backend IP policy, so a plugin whose
-            // endpoint resolves to a denied literal IP is rejected at the admin
-            // boundary instead of being accepted here and rejected later by DPs.
-            // The real-IP header is also safe to resolve from this CP: ConfigSync
-            // rejects every DP that does not advertise the same effective value
-            // before any snapshot can be distributed.
-            //
-            // Compression codec gates and the request-body ceiling must also
-            // match serving PluginCache admission so CP cannot accept a
-            // max_decompressed_request_size that DPs later reject.
-            plugins::PluginHttpClient::default_with_backend_allow_ips(
-                state.backend_allow_ips.clone(),
-            )
+pub(crate) fn plugin_validation_http_client(
+    state: &AdminState,
+) -> Result<plugins::PluginHttpClient, String> {
+    if let Some(proxy_state) = state.proxy_state.as_ref() {
+        return Ok(proxy_state.plugin_http_client.clone());
+    }
+    let compression_policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
+    Ok({
+        // No ProxyState (e.g. control plane): build a validation client that
+        // still carries the configured backend IP policy, so a plugin whose
+        // endpoint resolves to a denied literal IP is rejected at the admin
+        // boundary instead of being accepted here and rejected later by DPs.
+        // The real-IP header is also safe to resolve from this CP: ConfigSync
+        // rejects every DP that does not advertise the same effective value
+        // before any snapshot can be distributed.
+        //
+        // Compression codec gates and the request-body ceiling must also
+        // match serving PluginCache admission so CP cannot accept a
+        // max_decompressed_request_size that DPs later reject.
+        plugins::PluginHttpClient::default_with_backend_allow_ips(state.backend_allow_ips.clone())
             .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-            .with_process_compression_admission_policy()
-        })
+            .with_compression_admission_policy(compression_policy)
+    })
 }
 
 /// Collect plugin-name and plugin-definition admission errors for an
@@ -8552,7 +8556,13 @@ pub(crate) fn collect_plugin_config_admission_errors(
     // Built once: on a control plane (no `ProxyState`) this constructs a fresh
     // validation client, and restore admits payloads with far more plugin rows
     // than a batch write.
-    let http_client = plugin_validation_http_client(state);
+    let http_client = match plugin_validation_http_client(state) {
+        Ok(client) => client,
+        Err(error) => {
+            validation_errors.push(error);
+            return;
+        }
+    };
     for plugin_config in plugin_configs {
         if !known_plugins.contains(&plugin_config.plugin_name.as_str()) {
             validation_errors.push(format!(

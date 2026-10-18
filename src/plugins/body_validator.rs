@@ -366,7 +366,7 @@ impl BodyValidator {
                 ));
             }
             Some(limit) => limit,
-            None => default_grpc_max_decompressed_size_bytes(),
+            None => default_grpc_max_decompressed_size_bytes()?,
         };
 
         let has_protobuf_request_validation = protobuf_targets.has_request();
@@ -976,11 +976,16 @@ fn parse_grpc_frame(
     }
 }
 
-fn default_grpc_max_decompressed_size_bytes() -> usize {
-    inherited_grpc_max_decompressed_size_bytes(
-        crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
-            .as_deref(),
-    )
+fn default_grpc_max_decompressed_size_bytes() -> Result<usize, String> {
+    // The inherited ceiling comes from the typed compression admission
+    // policy (issue #6651 item 3): a typo'd
+    // `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` refuses construction instead of
+    // silently defaulting, including on library entry points that never
+    // built an `EnvConfig`. Zero/default/ceiling handling is unchanged.
+    let policy = crate::config::CompressionAdmissionPolicy::from_process_env()?;
+    Ok(inherited_grpc_max_decompressed_size_bytes(Some(
+        &policy.max_request_body_size_bytes.to_string(),
+    )))
 }
 
 /// The omitted-field default resolved from a raw
