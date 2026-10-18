@@ -52,6 +52,25 @@ async fn h3_and_close_tail_and_global_drain_share_broadcast_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn repeat_shutdown_wakes_subscribers_that_attached_after_the_first_broadcast() {
+    let shutdown = ShutdownSender::new(BUDGET);
+    let escalation = CancellationToken::new();
+    shutdown
+        .shutdown_after_predrain(Duration::ZERO, &escalation)
+        .await;
+    // A consumer subscribing after the first broadcast (e.g. the k8s
+    // controller watchers) sees `true` but its `changed()` must still be
+    // woken by the repeat shutdown the teardown path issues.
+    let mut late = shutdown.subscribe();
+    assert!(*late.borrow());
+    shutdown.shutdown();
+    tokio::time::timeout(Duration::from_secs(1), late.changed())
+        .await
+        .expect("repeat shutdown must wake late subscribers")
+        .expect("sender is alive");
+}
+
+#[tokio::test(start_paused = true)]
 async fn global_drain_gets_what_the_h3_drain_left() {
     let shutdown = ShutdownSender::new(BUDGET);
     let state = shutdown_overload_for_test(&shutdown);

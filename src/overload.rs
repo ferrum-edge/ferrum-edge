@@ -1471,7 +1471,7 @@ struct ShutdownBroadcast {
 
 impl ShutdownBroadcast {
     fn shutdown(&self) {
-        self.tx.send_if_modified(|requested| {
+        let first = self.tx.send_if_modified(|requested| {
             if *requested {
                 return false;
             }
@@ -1483,6 +1483,13 @@ impl ShutdownBroadcast {
             *requested = true;
             true
         });
+        if !first {
+            // Repeat notifications must still wake subscribers that attached
+            // after the first transition and await `changed()` (e.g. the
+            // k8s controller watchers subscribed during a racing startup);
+            // the first deadline stands untouched.
+            let _ = self.tx.send(true);
+        }
     }
 }
 
