@@ -426,7 +426,15 @@ async fn finish(
     if guard.hand_off_to_restore_transaction().await.is_err() {
         return unavailable("not_started");
     }
-    let validation_http_client = super::plugin_validation_http_client(&state);
+    let validation_http_client = match super::plugin_validation_http_client(&state) {
+        Ok(client) => client,
+        Err(error) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &json!({"error": error, "durable": "not_started", "live": "unconfirmed", "recovery_cleanup_authorized": false}),
+            );
+        }
+    };
     let precondition = DeploymentPrecondition {
         namespace: &namespace,
         expected,

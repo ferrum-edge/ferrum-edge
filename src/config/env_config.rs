@@ -1894,13 +1894,20 @@ impl CompressionAdmissionPolicy {
     /// unparseable value is an error naming the variable, exactly as
     /// `EnvConfig::from_env` would refuse it at startup.
     pub fn from_process_env() -> Result<Self, String> {
+        // Load the conf file fallibly first: `resolve_ferrum_var` resolves a
+        // sticky conf-load failure to `None`, which would silently become
+        // defaults here while `EnvConfig::from_env` refuses the same file.
+        let conf = crate::config::conf_file::ConfFile::load()?;
+        let resolve = |key: &str| -> Option<String> {
+            match std::env::var(key) {
+                Ok(val) => Some(val),
+                Err(_) => conf.get(key).map(str::to_string),
+            }
+        };
         Self::from_resolved(
-            crate::config::conf_file::resolve_ferrum_var("FERRUM_COMPRESSION_GZIP_ENABLED")
-                .as_deref(),
-            crate::config::conf_file::resolve_ferrum_var("FERRUM_COMPRESSION_BROTLI_ENABLED")
-                .as_deref(),
-            crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES")
-                .as_deref(),
+            resolve("FERRUM_COMPRESSION_GZIP_ENABLED").as_deref(),
+            resolve("FERRUM_COMPRESSION_BROTLI_ENABLED").as_deref(),
+            resolve("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES").as_deref(),
         )
     }
 
