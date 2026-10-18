@@ -814,6 +814,289 @@ async fn custom_body_json_path_fp_filter_suppresses_json_ld_script() {
     assert!(!suppressed.metadata.contains_key("waf.rule_hits"));
 }
 
+fn enforcing_json_path_waf(with_body_text_rule: bool) -> Waf {
+    let mut rules = vec![json!({
+        "id": "CUSTOM-JSON-CANARY",
+        "category": "custom",
+        "severity": "high",
+        "target": { "type": "body_json_path", "path": "user.bio" },
+        "match_kind": "contains",
+        "pattern": "forbidden-canary",
+        "action": "enforce"
+    })];
+    if with_body_text_rule {
+        rules.push(json!({
+            "id": "CUSTOM-TEXT-OTHER",
+            "category": "custom",
+            "severity": "high",
+            "target": "body_text",
+            "match_kind": "contains",
+            "pattern": "unrelated-marker",
+            "action": "enforce"
+        }));
+    }
+    waf(json!({ "include_default_rules": false, "custom_rules": rules })).unwrap()
+}
+
+fn json_path_rule_hit(result: &PluginResult, ctx: &RequestContext) -> bool {
+    matches!(result, PluginResult::Reject { .. })
+        && ctx
+            .metadata
+            .get("waf.rule_hits")
+            .is_some_and(|hits| hits.split(',').any(|hit| hit == "CUSTOM-JSON-CANARY"))
+}
+
+type BodyEncoder = fn(&str) -> Vec<u8>;
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
+    let forbidden = r#"{"user":{"bio":"forbidden-canary"}}"#;
+    let benign = r#"{"user":{"bio":"ordinary"}}"#;
+    let cases: [(&str, &str, BodyEncoder); 20] = [
+        ("utf-8", "application/json", |t| t.as_bytes().to_vec()),
+        ("utf-8 bom", "application/json", |t| {
+            with_bom(&[0xEF, 0xBB, 0xBF], t.as_bytes())
+        }),
+        (
+            "utf-16le declared",
+            "application/json; charset=utf-16le",
+            |t| encode_utf16(t, false),
+        ),
+        (
+            "utf-16be declared",
+            "application/json; charset=utf-16be",
+            |t| encode_utf16(t, true),
+        ),
+        ("utf-16 bare le", "application/json; charset=utf-16", |t| {
+            encode_utf16(t, false)
+        }),
+        ("utf-16 bare be", "application/json; charset=utf-16", |t| {
+            encode_utf16(t, true)
+        }),
+        ("utf-16le bom", "application/json", |t| {
+            with_bom(UTF16_LE_BOM, &encode_utf16(t, false))
+        }),
+        ("utf-16le undeclared", "application/json", |t| {
+            encode_utf16(t, false)
+        }),
+        ("utf-16be undeclared", "application/json", |t| {
+            encode_utf16(t, true)
+        }),
+        (
+            "utf-32le declared",
+            "application/json; charset=utf-32le",
+            |t| encode_utf32(t, false),
+        ),
+        (
+            "utf-32be declared",
+            "application/json; charset=utf-32be",
+            |t| encode_utf32(t, true),
+        ),
+        ("utf-32le bom", "application/json", |t| {
+            with_bom(UTF32_LE_BOM, &encode_utf32(t, false))
+        }),
+        ("utf-32be bom", "application/json", |t| {
+            with_bom(UTF32_BE_BOM, &encode_utf32(t, true))
+        }),
+        ("utf-32le undeclared", "application/json", |t| {
+            encode_utf32(t, false)
+        }),
+        ("utf-32be undeclared", "application/json", |t| {
+            encode_utf32(t, true)
+        }),
+        // A misleading or unknown non-wide charset over BOMless wide text.
+        (
+            "utf-16le declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf16(t, false),
+        ),
+        (
+            "utf-16be declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf16(t, true),
+        ),
+        (
+            "utf-32le unknown label",
+            "application/json; charset=x-unknown",
+            |t| encode_utf32(t, false),
+        ),
+        (
+            "utf-32be declared utf-8",
+            "application/json; charset=utf-8",
+            |t| encode_utf32(t, true),
+        ),
+        // A declared endianness that disagrees with the BOM: both readings
+        // are inspected.
+        (
+            "utf-16be declared with le bom",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+    ];
+    for with_body_text_rule in [false, true] {
+        let plugin = enforcing_json_path_waf(with_body_text_rule);
+        for (label, content_type, encode) in cases {
+            let (result, ctx) =
+                scan_body_with_content_type(&plugin, content_type, &encode(forbidden)).await;
+            assert!(
+                json_path_rule_hit(&result, &ctx),
+                "{label} (body_text rule: {with_body_text_rule}) must be enforced"
+            );
+            let (result, ctx) =
+                scan_body_with_content_type(&plugin, content_type, &encode(benign)).await;
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "{label} (body_text rule: {with_body_text_rule}) benign body must pass"
+            );
+            assert!(!ctx.metadata.contains_key("waf.rule_hits"), "{label}");
+        }
+    }
+}
+
+fn container_json_path_waf(
+    path: &str,
+    match_kind: &str,
+    pattern: &str,
+    fp_filters: &[&str],
+) -> Waf {
+    let mut rule = json!({
+        "id": "CUSTOM-JSON-CANARY",
+        "category": "custom",
+        "severity": "high",
+        "target": { "type": "body_json_path", "path": path },
+        "match_kind": match_kind,
+        "pattern": pattern,
+        "action": "enforce"
+    });
+    if !fp_filters.is_empty() {
+        rule["fp_filters"] = json!(fp_filters);
+    }
+    waf(json!({ "include_default_rules": false, "custom_rules": [rule] })).unwrap()
+}
+
+#[tokio::test]
+async fn body_json_path_rule_with_many_matching_duplicates_records_one_hit() {
+    let plugin = enforcing_json_path_waf(false);
+    let mut body = String::from(r#"{"user":{"#);
+    for index in 0..20_000 {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(r#""bio":"forbidden-canary""#);
+    }
+    body.push_str("}}");
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "application/json", body.as_bytes()).await;
+    assert!(json_path_rule_hit(&result, &ctx));
+    assert_eq!(
+        ctx.metadata.get("waf.rule_hits").map(String::as_str),
+        Some("CUSTOM-JSON-CANARY")
+    );
+}
+
+#[tokio::test]
+async fn body_json_path_container_rules_see_each_duplicate_reading() {
+    // `equals` on a container keeps matching the last-wins reading it matched
+    // before duplicates were preserved, and also matches the first-wins one.
+    let plugin = container_json_path_waf("user", "equals", r#"{"bio":"forbidden-canary"}"#, &[]);
+    for body in [
+        br#"{"user":{"bio":"forbidden-canary"}}"#.as_slice(),
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#,
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // Duplicates nested inside an array are collapsed per reading too.
+    let plugin = container_json_path_waf("items", "equals", r#"[{"k":"forbidden-canary"}]"#, &[]);
+    for body in [
+        br#"{"items":[{"k":"ordinary","k":"forbidden-canary"}]}"#.as_slice(),
+        br#"{"items":[{"k":"forbidden-canary","k":"ordinary"}]}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // A false-positive filter is evaluated per reading: a benign duplicate
+    // cannot suppress the reading that carries the forbidden value.
+    let plugin = container_json_path_waf("user", "contains", "forbidden-canary", &["ordinary"]);
+    for body in [
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#.as_slice(),
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+    ] {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+    // Control: the filter still suppresses a single reading it matches.
+    let (result, _) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"forbidden-canary, ordinary"}}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_every_duplicate_member() {
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden_bodies: [&[u8]; 6] = [
+        // Duplicate leaf, forbidden first (what a first-wins backend reads).
+        br#"{"user":{"bio":"forbidden-canary","bio":"ordinary"}}"#,
+        // Duplicate leaf, forbidden last.
+        br#"{"user":{"bio":"ordinary","bio":"forbidden-canary"}}"#,
+        // Duplicate enclosing object, both orders.
+        br#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
+        br#"{"user":{"bio":"ordinary"},"user":{"bio":"forbidden-canary"}}"#,
+        // An escaped spelling of a member name is the same member.
+        br#"{"user":{"b\u0069o":"forbidden-canary","bio":"ordinary"}}"#,
+        br#"{"u\u0073er":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
+    ];
+    for body in forbidden_bodies {
+        let (result, ctx) = scan_body_with_content_type(&plugin, "application/json", body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+
+    // A wide-charset view gets the same duplicate-aware inspection.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json; charset=utf-16le",
+        &encode_utf16(
+            r#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"}}"#,
+            false,
+        ),
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
+
+    // Duplicates alone are not a hit: only a selected value can match.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"ordinary","bio":"also ordinary"},"user":{"bio":"fine"}}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
 #[tokio::test]
 async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
     let plugin = waf(json!({
@@ -8299,10 +8582,22 @@ async fn wide_body_inference_preserves_benign_binary_and_explicit_charset_contro
             assert!(matches!(result, PluginResult::Continue));
         }
         for (_, _, body) in wide_encodings("inspection-marker") {
-            // A declaration is not overridden by signature inference. Binary
-            // and multipart eligibility still precedes charset decoding.
+            // A non-wide charset declaration does not switch signature
+            // inference off: a byte-sniffing parser still reads the body as
+            // wide text whatever the header claims.
             for content_type in [
                 "application/json; charset=utf-8",
+                "application/json; charset=x-unknown-label",
+                "text/plain; charset=iso-8859-1",
+            ] {
+                let (result, _) = scan_wide_direction(&plugin, response, content_type, &body).await;
+                assert!(
+                    matches!(result, PluginResult::Reject { .. }),
+                    "{content_type} (response: {response})"
+                );
+            }
+            // Binary and multipart eligibility still precedes charset decoding.
+            for content_type in [
                 "application/octet-stream",
                 "multipart/form-data; boundary=fixture",
             ] {

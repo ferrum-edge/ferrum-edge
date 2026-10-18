@@ -119,6 +119,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The shared HTTP batch-response helper renders a transport error without its
   request URL (PR #6684), so an endpoint credential in the path or query is
   never echoed into a sink diagnostic.
+- **WAF `body_json_path` rules inspect wide-charset and duplicate-member JSON.**
+  A JSON-path rule previously parsed only the raw request bytes with a parser
+  that keeps the last of any duplicated object member, so a UTF-16 / UTF-32
+  (or UTF-8 BOM-prefixed) JSON body was never matched, and a value carried by
+  an earlier duplicate member was never inspected, while the original bytes
+  were forwarded. JSON-path rules now parse the raw body and every UTF-16 /
+  UTF-32 inspection view the body-text rules already use, and follow every
+  occurrence of a duplicated member (including escaped spellings of the same
+  name); the rule matches if any selected value matches. A container value is
+  matched against its last-wins, first-wins and full readings separately.
+  Separately, the wide-text prefix signature (used for every body rule, request
+  and response) now also applies when a non-wide charset such as `utf-8` or an
+  unrecognized label is declared, since a byte-sniffing parser ignores it.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,
