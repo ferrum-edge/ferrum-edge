@@ -606,21 +606,38 @@ impl WorkloadMetrics {
         // This method runs before authorization and again after request-header
         // transforms. Rebuild the SPIFFE-derived source identity as one atomic
         // view so a final peer with fewer path segments cannot retain namespace
-        // or service-account labels from early trusted baggage.
-        clear_source_spiffe_labels(&mut ctx.metadata);
-        ctx.metadata.insert(
-            "mesh.connection_security_policy".to_string(),
+        // or service-account labels from early trusted baggage. The clear is
+        // skipped only when the identity this call will stamp (per the
+        // direction match below) already matches the stamped labels exactly,
+        // which is the common repeat-annotate case; any identity change —
+        // including to or from `None` — still clears first.
+        let stamped_source_identity: Option<&SpiffeId> = match ctx.mesh_direction {
+            Some(MeshTrafficDirection::Inbound) => peer_source_identity.as_ref(),
+            Some(MeshTrafficDirection::Outbound) => {
+                if ctx.node_waypoint_pod_uid.is_some() {
+                    ctx.peer_spiffe_id.as_ref()
+                } else {
+                    self.workload_spiffe_id.as_ref()
+                }
+            }
+            None => peer_source_identity
+                .as_ref()
+                .or(self.workload_spiffe_id.as_ref()),
+        };
+        if !source_spiffe_labels_match(&ctx.metadata, stamped_source_identity) {
+            clear_source_spiffe_labels(&mut ctx.metadata);
+        }
+        insert_metadata_if_changed(
+            &mut ctx.metadata,
+            "mesh.connection_security_policy",
             if ctx.peer_spiffe_id.is_some() || ctx.tls_client_cert_der.is_some() {
                 "mutual_tls"
             } else {
                 "none"
-            }
-            .to_string(),
+            },
         );
-        ctx.metadata.insert(
-            "mesh.request_protocol".to_string(),
-            request_protocol(ctx, headers).to_string(),
-        );
+        let protocol = request_protocol(ctx, headers);
+        insert_metadata_if_changed(&mut ctx.metadata, "mesh.request_protocol", protocol);
         // Stamp only attributes required by the active COMPOSED family plans.
         // Several effective instances may contribute different families or
         // replace the same family, so one instance's private requirements are
@@ -678,9 +695,10 @@ impl WorkloadMetrics {
                 .remove(METRIC_TAG_CEL_DESTINATION_PORT_METADATA);
         }
         if let Some(direction) = ctx.mesh_direction {
-            ctx.metadata.insert(
-                MESH_DIRECTION_METADATA.to_string(),
-                mesh_direction_str(direction).to_string(),
+            insert_metadata_if_changed(
+                &mut ctx.metadata,
+                MESH_DIRECTION_METADATA,
+                mesh_direction_str(direction),
             );
         }
 
@@ -883,10 +901,10 @@ impl WorkloadMetrics {
 
     fn insert_common_metadata(&self, metadata: &mut HashMap<String, String>) {
         if let Some(node_id) = self.node_id.as_ref() {
-            metadata.insert("mesh.node_id".to_string(), node_id.clone());
+            insert_metadata_if_changed(metadata, "mesh.node_id", node_id);
         }
         if let Some(topology) = self.topology.as_ref() {
-            metadata.insert("mesh.topology".to_string(), topology.clone());
+            insert_metadata_if_changed(metadata, "mesh.topology", topology);
         }
     }
 
@@ -916,7 +934,7 @@ impl WorkloadMetrics {
             metadata.remove(key);
         }
         for (key, value) in &self.custom_tags {
-            metadata.insert(key.clone(), value.clone());
+            insert_metadata_if_changed(metadata, key, value);
         }
         for (key, header_name) in &self.custom_header_tags {
             if let Some(value) = header_value(headers, header_name)
@@ -1003,12 +1021,12 @@ impl WorkloadMetrics {
 
     fn insert_local_source_workload_labels(&self, metadata: &mut HashMap<String, String>) {
         if let Some(namespace) = self.namespace.as_ref() {
-            metadata.insert("mesh.source.namespace".to_string(), namespace.clone());
+            insert_metadata_if_changed(metadata, "mesh.source.namespace", namespace);
         }
         let (workload, app, service) = self.local_workload_labels();
-        metadata.insert("mesh.source.workload".to_string(), workload.to_string());
-        metadata.insert("mesh.source.app".to_string(), app.to_string());
-        metadata.insert("mesh.source.service".to_string(), service.to_string());
+        insert_metadata_if_changed(metadata, "mesh.source.workload", workload);
+        insert_metadata_if_changed(metadata, "mesh.source.app", app);
+        insert_metadata_if_changed(metadata, "mesh.source.service", service);
     }
 
     fn insert_local_destination_workload_labels(&self, metadata: &mut HashMap<String, String>) {
@@ -1016,15 +1034,12 @@ impl WorkloadMetrics {
             insert_destination_spiffe_labels(metadata, identity);
         }
         if let Some(namespace) = self.namespace.as_ref() {
-            metadata.insert("mesh.destination.namespace".to_string(), namespace.clone());
+            insert_metadata_if_changed(metadata, "mesh.destination.namespace", namespace);
         }
         let (workload, app, service) = self.local_workload_labels();
-        metadata.insert(
-            "mesh.destination.workload".to_string(),
-            workload.to_string(),
-        );
-        metadata.insert("mesh.destination.app".to_string(), app.to_string());
-        metadata.insert("mesh.destination.service".to_string(), service.to_string());
+        insert_metadata_if_changed(metadata, "mesh.destination.workload", workload);
+        insert_metadata_if_changed(metadata, "mesh.destination.app", app);
+        insert_metadata_if_changed(metadata, "mesh.destination.service", service);
     }
 
     fn insert_remote_source_workload_labels(
@@ -1035,9 +1050,9 @@ impl WorkloadMetrics {
         let workload = identity
             .and_then(SpiffeId::service_account)
             .unwrap_or("unknown");
-        metadata.insert("mesh.source.workload".to_string(), workload.to_string());
-        metadata.insert("mesh.source.app".to_string(), workload.to_string());
-        metadata.insert("mesh.source.service".to_string(), workload.to_string());
+        insert_metadata_if_changed(metadata, "mesh.source.workload", workload);
+        insert_metadata_if_changed(metadata, "mesh.source.app", workload);
+        insert_metadata_if_changed(metadata, "mesh.source.service", workload);
     }
 
     fn insert_proxy_destination_labels(
@@ -1046,19 +1061,10 @@ impl WorkloadMetrics {
         namespace: &str,
         destination: &str,
     ) {
-        metadata.insert(
-            "mesh.destination.namespace".to_string(),
-            namespace.to_string(),
-        );
-        metadata.insert(
-            "mesh.destination.workload".to_string(),
-            destination.to_string(),
-        );
-        metadata.insert("mesh.destination.app".to_string(), destination.to_string());
-        metadata.insert(
-            "mesh.destination.service".to_string(),
-            destination.to_string(),
-        );
+        insert_metadata_if_changed(metadata, "mesh.destination.namespace", namespace);
+        insert_metadata_if_changed(metadata, "mesh.destination.workload", destination);
+        insert_metadata_if_changed(metadata, "mesh.destination.app", destination);
+        insert_metadata_if_changed(metadata, "mesh.destination.service", destination);
     }
 
     fn export_span(&self, span: Option<SpanData>) {
@@ -2840,6 +2846,52 @@ fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
         .is_some()
 }
 
+/// Insert `key -> value` only when the current value differs.
+///
+/// `annotate_http_context` runs twice per request (request-received and
+/// before-proxy) and most stamped values are identical across both calls;
+/// the plain `insert` form paid a key hash plus two `String` allocations
+/// per key per call to rewrite the same value. The borrowed `get` first
+/// keeps the repeat stamp allocation-free while preserving the final map
+/// exactly (a changed value still takes the insert path).
+fn insert_metadata_if_changed(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+    match metadata.get(key) {
+        Some(existing) if existing == value => {}
+        _ => {
+            metadata.insert(key.to_string(), value.to_string());
+        }
+    }
+}
+
+/// Whether the SPIFFE-derived source labels already in `metadata` are
+/// exactly the labels `identity` would stamp (including key absence for
+/// a missing namespace / service account, and all-absent for `None`).
+fn source_spiffe_labels_match(
+    metadata: &HashMap<String, String>,
+    identity: Option<&SpiffeId>,
+) -> bool {
+    let principal = metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str);
+    let trust_domain = metadata.get(MESH_SOURCE_TRUST_DOMAIN).map(String::as_str);
+    let namespace = metadata.get(MESH_SOURCE_NAMESPACE).map(String::as_str);
+    let service_account = metadata
+        .get(MESH_SOURCE_SERVICE_ACCOUNT)
+        .map(String::as_str);
+    match identity {
+        None => {
+            principal.is_none()
+                && trust_domain.is_none()
+                && namespace.is_none()
+                && service_account.is_none()
+        }
+        Some(identity) => {
+            principal == Some(identity.as_str())
+                && trust_domain == Some(identity.trust_domain().as_str())
+                && namespace == identity.namespace()
+                && service_account == identity.service_account()
+        }
+    }
+}
+
 fn clear_source_spiffe_labels(metadata: &mut HashMap<String, String>) {
     for key in [
         MESH_SOURCE_PRINCIPAL,
@@ -2852,32 +2904,24 @@ fn clear_source_spiffe_labels(metadata: &mut HashMap<String, String>) {
 }
 
 fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
-    metadata.insert(MESH_SOURCE_PRINCIPAL.to_string(), identity.to_string());
-    metadata.insert(
-        MESH_SOURCE_TRUST_DOMAIN.to_string(),
-        identity.trust_domain().as_str().to_string(),
+    insert_metadata_if_changed(metadata, MESH_SOURCE_PRINCIPAL, identity.as_str());
+    insert_metadata_if_changed(
+        metadata,
+        MESH_SOURCE_TRUST_DOMAIN,
+        identity.trust_domain().as_str(),
     );
     if let Some(namespace) = identity.namespace() {
-        metadata.insert(MESH_SOURCE_NAMESPACE.to_string(), namespace.to_string());
+        insert_metadata_if_changed(metadata, MESH_SOURCE_NAMESPACE, namespace);
     }
     if let Some(service_account) = identity.service_account() {
-        metadata.insert(
-            MESH_SOURCE_SERVICE_ACCOUNT.to_string(),
-            service_account.to_string(),
-        );
+        insert_metadata_if_changed(metadata, MESH_SOURCE_SERVICE_ACCOUNT, service_account);
     }
 }
 
 fn insert_destination_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
-    metadata.insert(
-        "mesh.destination.principal".to_string(),
-        identity.to_string(),
-    );
+    insert_metadata_if_changed(metadata, "mesh.destination.principal", identity.as_str());
     if let Some(namespace) = identity.namespace() {
-        metadata.insert(
-            "mesh.destination.namespace".to_string(),
-            namespace.to_string(),
-        );
+        insert_metadata_if_changed(metadata, "mesh.destination.namespace", namespace);
     }
 }
 
@@ -2926,6 +2970,49 @@ mod tests {
         ctx.authenticated_identity = authenticated_identity.map(str::to_owned);
         ctx.mesh_direction = Some(direction);
         ctx
+    }
+
+    #[test]
+    fn source_spiffe_labels_match_gates_clear_and_restamp() {
+        // The repeat-annotate fast path must preserve clear-then-restamp
+        // semantics exactly: identical identity = labels already current
+        // (clear may be skipped); any identity change — including loss of
+        // namespace/service-account segments or to `None` — must not match,
+        // so stale segments can never survive.
+        let full = SpiffeId::new("spiffe://cluster.local/ns/payments/sa/api")
+            .expect("valid workload SPIFFE ID");
+        let no_segments =
+            SpiffeId::new("spiffe://cluster.local/workload/api").expect("valid SPIFFE ID");
+        let other = SpiffeId::new("spiffe://cluster.local/ns/orders/sa/web")
+            .expect("valid workload SPIFFE ID");
+
+        let mut metadata = HashMap::new();
+        assert!(source_spiffe_labels_match(&metadata, None));
+        assert!(!source_spiffe_labels_match(&metadata, Some(&full)));
+
+        insert_source_spiffe_labels(&mut metadata, &full);
+        assert!(source_spiffe_labels_match(&metadata, Some(&full)));
+        assert!(!source_spiffe_labels_match(&metadata, Some(&other)));
+        assert!(!source_spiffe_labels_match(&metadata, Some(&no_segments)));
+        assert!(!source_spiffe_labels_match(&metadata, None));
+
+        // Re-stamping the same identity is a no-op on the final map.
+        let before = metadata.clone();
+        insert_source_spiffe_labels(&mut metadata, &full);
+        assert_eq!(metadata, before);
+
+        // Identity change still clears the segments the new identity lacks.
+        clear_source_spiffe_labels(&mut metadata);
+        insert_source_spiffe_labels(&mut metadata, &no_segments);
+        assert!(source_spiffe_labels_match(&metadata, Some(&no_segments)));
+        assert!(!metadata.contains_key(MESH_SOURCE_NAMESPACE));
+        assert!(!metadata.contains_key(MESH_SOURCE_SERVICE_ACCOUNT));
+
+        // insert-if-changed overwrites differing values and keeps equal ones.
+        insert_metadata_if_changed(&mut metadata, "mesh.test", "alpha");
+        assert_eq!(metadata.get("mesh.test").map(String::as_str), Some("alpha"));
+        insert_metadata_if_changed(&mut metadata, "mesh.test", "beta");
+        assert_eq!(metadata.get("mesh.test").map(String::as_str), Some("beta"));
     }
 
     #[test]
