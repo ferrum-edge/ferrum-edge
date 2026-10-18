@@ -2431,12 +2431,22 @@ async fn transaction_log_schema_crud_validates_the_prospective_database_graph() 
 
     let mut renamed = schema.clone();
     renamed["config"] = json!({"schemas": {"renamed": {}}});
-    let (status, body) =
-        admin_put(&base_url, "/plugins/config/schema-owner", &token, &renamed).await;
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/schema-owner?expected_proxy_ids=",
+        &token,
+        &renamed,
+    )
+    .await;
     assert_eq!(status, 400, "dangling rename was admitted: {body:?}");
     assert!(body.to_string().contains(r#"unknown schema \"audit\""#));
 
-    let (status, body) = admin_delete(&base_url, "/plugins/config/schema-owner", &token).await;
+    let (status, body) = admin_delete(
+        &base_url,
+        "/plugins/config/schema-owner?expected_proxy_ids=",
+        &token,
+    )
+    .await;
     assert_eq!(status, 400, "dangling delete was admitted: {body:?}");
     assert!(body.to_string().contains(r#"unknown schema \"audit\""#));
 }
@@ -2859,7 +2869,7 @@ async fn prometheus_plugin_crud_rejects_a_second_enabled_registry_owner() {
 
     let (status, body) = admin_put(
         &base_url,
-        "/plugins/config/prometheus-owner",
+        "/plugins/config/prometheus-owner?expected_proxy_ids=",
         &token,
         &first,
     )
@@ -2886,7 +2896,7 @@ async fn prometheus_plugin_crud_rejects_a_second_enabled_registry_owner() {
     enabled["enabled"] = json!(true);
     let (status, body) = admin_put(
         &base_url,
-        "/plugins/config/prometheus-disabled",
+        "/plugins/config/prometheus-disabled?expected_proxy_ids=",
         &token,
         &enabled,
     )
@@ -4487,7 +4497,7 @@ async fn plugin_delete_rejects_revealing_global_body_transformer_beside_hmac() {
 
     let (status, body) = admin_delete(
         &base_url,
-        "/plugins/config/delete-shadow-scoped-transformer",
+        "/plugins/config/delete-shadow-scoped-transformer?expected_proxy_ids=delete-shadow-proxy",
         &token,
     )
     .await;
@@ -7679,7 +7689,13 @@ async fn test_consumer_delete_referenced_by_access_control_returns_409() {
         "enabled": true,
         "config": {"disallowed_consumers": ["acluser"]}
     });
-    let (status, body) = admin_put(&base_url, "/plugins/config/acl-pc", &token, &deny_only).await;
+    let (status, body) = admin_put(
+        &base_url,
+        "/plugins/config/acl-pc?expected_proxy_ids=",
+        &token,
+        &deny_only,
+    )
+    .await;
     assert_eq!(
         status, 200,
         "Updating access_control to a deny-list must succeed: {:?}",
@@ -10497,7 +10513,7 @@ async fn plugin_config_put_without_enabled_is_rejected_and_row_stays_disabled() 
 
     let (status, body) = admin_put(
         &base_url,
-        "/plugins/config/put-presence-pc",
+        "/plugins/config/put-presence-pc?expected_proxy_ids=",
         &token,
         &json!({
             "plugin_name": "key_auth",

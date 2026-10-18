@@ -1845,8 +1845,8 @@ async fn run_admin_mutation_phase(
                 cycle,
                 client
                     .delete(format!(
-                        "{}/plugins/config/temp-plugin-{}",
-                        admin_url_owned, cycle
+                        "{}/plugins/config/temp-plugin-{}?expected_proxy_ids={}",
+                        admin_url_owned, cycle, temp_id
                     ))
                     .header("Authorization", &admin_auth_owned),
             )

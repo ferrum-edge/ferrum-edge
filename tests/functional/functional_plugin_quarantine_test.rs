@@ -665,7 +665,9 @@ async fn hot_reload_preserves_fail_closed_plugin_and_quarantines_only_optional_r
 
     // ── In-band repair through the admin API ───────────────────────────────
     let response = reqwest::Client::new()
-        .put(gateway.admin_url(&format!("/plugins/config/{KEY_AUTH_PLUGIN_ID}")))
+        .put(gateway.admin_url(&format!(
+            "/plugins/config/{KEY_AUTH_PLUGIN_ID}?expected_proxy_ids="
+        )))
         .header("Authorization", gateway.auth_header())
         .json(&key_auth_plugin_body(VALID_KEY_AUTH))
         .send()

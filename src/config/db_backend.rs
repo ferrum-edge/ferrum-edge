@@ -22,7 +22,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use percent_encoding::percent_decode_str;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{info, warn};
@@ -1188,6 +1188,58 @@ pub fn proxy_delete_atomicity_unsupported(
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ProxyDeleteAtomicityUnsupported>())
+}
+
+/// A plugin write would detach a proxy the caller did not account for.
+#[derive(Debug, Clone)]
+pub struct PluginAssociationPreconditionFailed {
+    pub plugin_id: String,
+    pub unexpected: Vec<String>,
+}
+
+impl PluginAssociationPreconditionFailed {
+    pub(crate) fn check(
+        plugin_id: &str,
+        current: &BTreeSet<String>,
+        expected: &BTreeSet<String>,
+        kept: Option<&str>,
+    ) -> Result<(), Self> {
+        let unexpected: Vec<String> = current
+            .iter()
+            .filter(|proxy| Some(proxy.as_str()) != kept && !expected.contains(*proxy))
+            .cloned()
+            .collect();
+        if unexpected.is_empty() {
+            Ok(())
+        } else {
+            Err(Self {
+                plugin_id: plugin_id.to_string(),
+                unexpected,
+            })
+        }
+    }
+}
+
+impl std::fmt::Display for PluginAssociationPreconditionFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "plugin config '{}' is referenced by proxies outside expected_proxy_ids: {}; re-read the namespace and retry with the current referencing set",
+            self.plugin_id,
+            self.unexpected.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for PluginAssociationPreconditionFailed {}
+
+/// Find the refusal without exposing surrounding database-driver context.
+pub fn plugin_association_precondition_failed(
+    error: &anyhow::Error,
+) -> Option<&PluginAssociationPreconditionFailed> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<PluginAssociationPreconditionFailed>())
 }
 
 /// Operator-facing message for a lost optimistic-concurrency race on a gateway
@@ -2471,6 +2523,34 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     async fn create_plugin_config(&self, pc: &PluginConfig) -> Result<(), anyhow::Error>;
     async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error>;
     async fn delete_plugin_config(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error>;
+    /// Request-facing writes recheck associations before mutating stored state.
+    /// The plain methods remain available to whole-graph writers and recovery.
+    async fn update_plugin_config_expected(
+        &self,
+        pc: &PluginConfig,
+        expected: &BTreeSet<String>,
+    ) -> Result<bool, anyhow::Error>;
+    async fn delete_plugin_config_expected(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: &BTreeSet<String>,
+    ) -> Result<bool, anyhow::Error>;
+    /// Primary association-only read, independent of plugin-config decoding.
+    async fn list_plugin_config_referencing_proxy_ids(
+        &self,
+        namespace: &str,
+        plugin_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error>;
+    /// Primary id-only read of plugin configs scoped to one proxy
+    /// (`proxy_id` equals `proxy_id`), for compensation-safety checks that
+    /// must not trust a lagging read replica.
+    async fn list_proxy_scoped_plugin_config_ids(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error>;
+
     async fn get_plugin_config(
         &self,
         namespace: &str,

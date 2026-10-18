@@ -7,7 +7,10 @@
 use crate::scaffolding::port_registry::TestSocket;
 
 use chrono::Utc;
+use ferrum_edge::config::db_backend::{DatabaseBackend, plugin_association_precondition_failed};
 use ferrum_edge::config::db_loader::{DatabaseStore, DbPoolConfig};
+use ferrum_edge::config::types::PluginScope;
+use std::collections::BTreeSet;
 use tempfile::TempDir;
 
 async fn sqlite_store() -> (DatabaseStore, TempDir) {
@@ -856,7 +859,7 @@ async fn proxy_scoped_plugin_update_rehomes_the_association() {
     let (status, body) = admin_call(
         reqwest::Method::PUT,
         &base_url,
-        "/plugins/config/pc-attach-1",
+        "/plugins/config/pc-attach-1?expected_proxy_ids=proxy-attach-1",
         Some(&attach_plugin_payload(
             "pc-attach-1",
             Some("proxy-attach-2"),
@@ -902,7 +905,7 @@ async fn plugin_scope_change_away_from_proxy_detaches_the_association() {
     let (status, body) = admin_call(
         reqwest::Method::PUT,
         &base_url,
-        "/plugins/config/pc-attach-1",
+        "/plugins/config/pc-attach-1?expected_proxy_ids=proxy-attach-1",
         Some(&attach_plugin_payload("pc-attach-1", None)),
     )
     .await;
@@ -938,7 +941,7 @@ async fn plugin_config_delete_detaches_the_association() {
     let (status, body) = admin_call(
         reqwest::Method::DELETE,
         &base_url,
-        "/plugins/config/pc-attach-1",
+        "/plugins/config/pc-attach-1?expected_proxy_ids=proxy-attach-1",
         None,
     )
     .await;
@@ -979,5 +982,287 @@ async fn proxy_scoped_plugin_for_a_missing_proxy_is_still_rejected() {
             .contains("does not exist in namespace"),
         "existing diagnostic shape must be preserved: {:?}",
         body
+    );
+}
+
+/// Direct store calls bypass admin admission, modeling a write that reaches
+/// persistence after its original lease-held precheck became stale.
+async fn seed_shared_plugin(store: &DatabaseStore) {
+    seed_proxy_with_plugin(store).await;
+    let mut plugin = store
+        .get_plugin_config("ferrum", "plugin-1")
+        .await
+        .unwrap()
+        .unwrap();
+    plugin.scope = PluginScope::ProxyGroup;
+    plugin.proxy_id = None;
+    assert!(store.update_plugin_config(&plugin).await.unwrap());
+    let mut second = store.get_proxy("ferrum", "proxy-1").await.unwrap().unwrap();
+    second.id = "proxy-2".to_string();
+    second.name = Some("edge-2".to_string());
+    second.listen_path = Some("/second".to_string());
+    store.create_proxy(&second).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backend_plugin_update_expected_refuses_stale_set_without_mutation() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_shared_plugin(&store).await;
+    let before = store.load_full_config("ferrum").await.unwrap();
+    let cursor = store.latest_change_sequence("ferrum").await.unwrap();
+    let mut plugin = store
+        .get_plugin_config("ferrum", "plugin-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let incomplete = BTreeSet::from(["proxy-1".to_string()]);
+    // Even proxy_group writes that keep the graph must enforce the expected set.
+    for scope in [PluginScope::ProxyGroup, PluginScope::Global] {
+        plugin.scope = scope;
+        let error = store
+            .update_plugin_config_expected(&plugin, &incomplete)
+            .await
+            .unwrap_err();
+        let wrapped = error.context("outer database context must not change the refusal");
+        let refusal = plugin_association_precondition_failed(&wrapped).unwrap();
+        assert_eq!(refusal.plugin_id, "plugin-1");
+        assert_eq!(refusal.unexpected, ["proxy-2"]);
+        assert_eq!(
+            refusal.to_string(),
+            "plugin config 'plugin-1' is referenced by proxies outside expected_proxy_ids: proxy-2; re-read the namespace and retry with the current referencing set"
+        );
+        let after = store.load_full_config("ferrum").await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&before.proxies).unwrap(),
+            serde_json::to_value(&after.proxies).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&before.plugin_configs).unwrap(),
+            serde_json::to_value(&after.plugin_configs).unwrap()
+        );
+        assert_eq!(
+            store.latest_change_sequence("ferrum").await.unwrap(),
+            cursor
+        );
+    }
+    let complete = BTreeSet::from(["proxy-1".to_string(), "proxy-2".to_string()]);
+    assert!(
+        store
+            .update_plugin_config_expected(&plugin, &complete)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .list_plugin_config_referencing_proxy_ids("ferrum", "plugin-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_plugin_config("ferrum", "plugin-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .scope,
+        PluginScope::Global
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backend_plugin_update_expected_allows_the_kept_proxy_target() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_proxy_with_plugin(&store).await;
+    let mut plugin = store
+        .get_plugin_config("ferrum", "plugin-1")
+        .await
+        .unwrap()
+        .unwrap();
+    plugin.enabled = false;
+    assert!(
+        store
+            .update_plugin_config_expected(&plugin, &BTreeSet::new())
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .list_plugin_config_referencing_proxy_ids("ferrum", "plugin-1")
+            .await
+            .unwrap(),
+        BTreeSet::from(["proxy-1".to_string()])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backend_plugin_delete_expected_refuses_stale_set_without_mutation() {
+    let (store, _temp_dir) = sqlite_store().await;
+    seed_shared_plugin(&store).await;
+    let before = store.load_full_config("ferrum").await.unwrap();
+    let cursor = store.latest_change_sequence("ferrum").await.unwrap();
+    let error = store
+        .delete_plugin_config_expected(
+            "ferrum",
+            "plugin-1",
+            &BTreeSet::from(["proxy-1".to_string()]),
+        )
+        .await
+        .unwrap_err();
+    let refusal = plugin_association_precondition_failed(&error).unwrap();
+    assert_eq!(refusal.plugin_id, "plugin-1");
+    assert_eq!(refusal.unexpected, ["proxy-2"]);
+    let after = store.load_full_config("ferrum").await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&before.proxies).unwrap(),
+        serde_json::to_value(&after.proxies).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&before.plugin_configs).unwrap(),
+        serde_json::to_value(&after.plugin_configs).unwrap()
+    );
+    assert_eq!(
+        store.latest_change_sequence("ferrum").await.unwrap(),
+        cursor
+    );
+    let complete = BTreeSet::from(["proxy-1".to_string(), "proxy-2".to_string()]);
+    assert!(
+        store
+            .delete_plugin_config_expected("ferrum", "plugin-1", &complete)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", "plugin-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_full_config("ferrum")
+            .await
+            .unwrap()
+            .proxies
+            .iter()
+            .all(|proxy| proxy.plugins.is_empty())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_association_ids_use_primary_and_do_not_decode_plugin_rows() {
+    let (mut store, _primary_dir) = sqlite_store().await;
+    let (_replica, replica_dir) = sqlite_store().await;
+    let replica_url = format!(
+        "sqlite:{}?mode=rwc",
+        replica_dir
+            .path()
+            .join("proxy_plugin_assoc_test.db")
+            .to_string_lossy()
+    );
+    store.connect_read_replica(&replica_url).await.unwrap();
+    seed_proxy_with_plugin(&store).await;
+    assert!(
+        store
+            .list_proxies_paginated("ferrum", 100, 0)
+            .await
+            .unwrap()
+            .items
+            .is_empty(),
+        "fixture replica must be stale"
+    );
+    // A broken scope makes both the plugin row and paginated proxy hydration fail.
+    sqlx::query(
+        "UPDATE plugin_configs SET scope = x'80' WHERE namespace = 'ferrum' AND id = 'plugin-1'",
+    )
+    .execute(&store.pool())
+    .await
+    .unwrap();
+    assert!(store.get_plugin_config("ferrum", "plugin-1").await.is_err());
+    assert_eq!(
+        store
+            .list_plugin_config_referencing_proxy_ids("ferrum", "plugin-1")
+            .await
+            .unwrap(),
+        BTreeSet::from(["proxy-1".to_string()])
+    );
+    assert!(
+        store
+            .list_plugin_config_referencing_proxy_ids("other", "plugin-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_delete_expected_repairs_an_undecodable_attached_plugin() {
+    let (store, _temp_dir, base_url, _shutdown) = attach_fixture().await;
+    let (status, body) = admin_call(
+        reqwest::Method::POST,
+        &base_url,
+        "/plugins/config",
+        Some(&attach_plugin_payload(
+            "pc-attach-1",
+            Some("proxy-attach-1"),
+        )),
+    )
+    .await;
+    assert_eq!(status, 201, "{body:?}");
+    sqlx::query(
+        "UPDATE plugin_configs SET scope = x'80' WHERE namespace = ? AND id = 'pc-attach-1'",
+    )
+    .bind(ATTACH_NAMESPACE)
+    .execute(&store.pool())
+    .await
+    .unwrap();
+    assert!(
+        store
+            .get_plugin_config(ATTACH_NAMESPACE, "pc-attach-1")
+            .await
+            .is_err()
+    );
+    let (status, body) = admin_call(
+        reqwest::Method::DELETE,
+        &base_url,
+        "/plugins/config/pc-attach-1?expected_proxy_ids=",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 412,
+        "repair must still enforce associations: {body:?}"
+    );
+    assert_eq!(
+        body["error"],
+        "plugin config 'pc-attach-1' is referenced by proxies outside expected_proxy_ids: proxy-attach-1; re-read the namespace and retry with the current referencing set"
+    );
+    let (status, body) = admin_call(
+        reqwest::Method::DELETE,
+        &base_url,
+        "/plugins/config/pc-attach-1?expected_proxy_ids=proxy-attach-1",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 204,
+        "repair must not decode damaged plugin metadata: {body:?}"
+    );
+    assert!(
+        store
+            .get_plugin_config(ATTACH_NAMESPACE, "pc-attach-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .get_proxy(ATTACH_NAMESPACE, "proxy-attach-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .plugins
+            .is_empty()
     );
 }

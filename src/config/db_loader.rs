@@ -25,7 +25,7 @@
 
 use crate::config::db_backend::{
     ConditionalNamespaceRestore, ConditionalNamespaceSnapshot, GatewayTrustBundleRevisionConflict,
-    NamespacePreconditionFailed,
+    NamespacePreconditionFailed, PluginAssociationPreconditionFailed,
 };
 use crate::config::db_backend::{
     ConsumerQuarantineTracker, consumer_change_requires_authoritative_reload,
@@ -4919,6 +4919,14 @@ impl DatabaseStore {
     }
 
     pub async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
+        self.update_plugin_config_inner(pc, None).await
+    }
+
+    async fn update_plugin_config_inner(
+        &self,
+        pc: &PluginConfig,
+        expected: Option<&BTreeSet<String>>,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let config_json = serde_json::to_string(&pc.config)?;
         let scope_str = match pc.scope {
@@ -4948,6 +4956,26 @@ impl DatabaseStore {
             tx.rollback().await?;
             self.check_slow_query("update_plugin_config", start);
             return Ok(false);
+        }
+        if let Some(expected) = expected {
+            let current: Vec<String> = sqlx::query_scalar(&self.q(
+                "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
+            ))
+            .bind(&pc.namespace)
+            .bind(&pc.id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let kept = if pc.scope == PluginScope::Proxy {
+                pc.proxy_id.as_deref()
+            } else {
+                None
+            };
+            PluginAssociationPreconditionFailed::check(
+                &pc.id,
+                &current.into_iter().collect(),
+                expected,
+                kept,
+            )?;
         }
         sqlx::query(
             &self.q("UPDATE plugin_configs SET labels=?, plugin_name=?, config=?, scope=?, proxy_id=?, enabled=?, priority_override=?, trigger_json=?, updated_at=? WHERE id=? AND namespace=?")
@@ -5006,6 +5034,15 @@ impl DatabaseStore {
         namespace: &str,
         id: &str,
     ) -> Result<bool, anyhow::Error> {
+        self.delete_plugin_config_inner(namespace, id, None).await
+    }
+
+    async fn delete_plugin_config_inner(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: Option<&BTreeSet<String>>,
+    ) -> Result<bool, anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.begin_write_tx().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
@@ -5048,6 +5085,15 @@ impl DatabaseStore {
                 })
             })
             .collect::<Result<_, _>>()?;
+
+        if let Some(expected) = expected {
+            PluginAssociationPreconditionFailed::check(
+                id,
+                &affected_proxy_ids.iter().cloned().collect(),
+                expected,
+                None,
+            )?;
+        }
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE).
         // The namespace predicate is what keeps a plugin-config delete in one
@@ -12715,6 +12761,55 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn delete_plugin_config(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         DatabaseStore::delete_plugin_config(self, namespace, id).await
+    }
+
+    async fn update_plugin_config_expected(
+        &self,
+        pc: &PluginConfig,
+        expected: &BTreeSet<String>,
+    ) -> Result<bool, anyhow::Error> {
+        self.update_plugin_config_inner(pc, Some(expected)).await
+    }
+
+    async fn delete_plugin_config_expected(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: &BTreeSet<String>,
+    ) -> Result<bool, anyhow::Error> {
+        self.delete_plugin_config_inner(namespace, id, Some(expected))
+            .await
+    }
+
+    async fn list_plugin_config_referencing_proxy_ids(
+        &self,
+        namespace: &str,
+        plugin_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error> {
+        let ids: Vec<String> =
+            sqlx::query_scalar(&self.q(
+                "SELECT proxy_id FROM proxy_plugins WHERE namespace = ? AND plugin_config_id = ?",
+            ))
+            .bind(namespace)
+            .bind(plugin_id)
+            .fetch_all(&self.pool())
+            .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    async fn list_proxy_scoped_plugin_config_ids(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> Result<BTreeSet<String>, anyhow::Error> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            &self.q("SELECT id FROM plugin_configs WHERE namespace = ? AND proxy_id = ?"),
+        )
+        .bind(namespace)
+        .bind(proxy_id)
+        .fetch_all(&self.pool())
+        .await?;
+        Ok(ids.into_iter().collect())
     }
 
     async fn get_plugin_config(

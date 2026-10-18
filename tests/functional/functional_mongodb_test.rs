@@ -744,8 +744,8 @@ async fn run_crud_and_proxy_tests(
     println!("\n--- {}: Delete Resources ---", test_prefix);
     let resp = client
         .delete(format!(
-            "{}/plugins/config/{}",
-            harness.admin_base_url, plugin_id
+            "{}/plugins/config/{}?expected_proxy_ids={}",
+            harness.admin_base_url, plugin_id, proxy_id
         ))
         .header("Authorization", &auth_header)
         .send()

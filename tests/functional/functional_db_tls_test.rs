@@ -477,7 +477,10 @@ async fn run_crud_and_proxy_tests(
     // --- Cleanup: delete resources ---
     println!("  [{db_label}] Cleaning up resources...");
     let _ = client
-        .delete(format!("{}/plugins/config/{}", admin_base_url, plugin_id))
+        .delete(format!(
+            "{}/plugins/config/{}?expected_proxy_ids={}",
+            admin_base_url, plugin_id, proxy_id
+        ))
         .header("Authorization", auth_header)
         .send()
         .await;

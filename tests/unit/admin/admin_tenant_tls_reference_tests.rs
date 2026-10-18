@@ -333,7 +333,7 @@ async fn namespace_claim_confines_route_plugin_tls_on_create_and_put() {
                 );
                 let (status, response) = put(
                     &base,
-                    &format!("/plugins/config/{id}"),
+                    &format!("/plugins/config/{id}?expected_proxy_ids="),
                     &operator,
                     &forbidden,
                 )
@@ -341,7 +341,9 @@ async fn namespace_claim_confines_route_plugin_tls_on_create_and_put() {
                 assert_eq!(status, 400, "{require} {field}: {response}");
                 assert!(is_scope_refusal(&response), "{response}");
                 let response = reqwest::Client::new()
-                    .delete(format!("{base}/plugins/config/{id}"))
+                    .delete(format!(
+                        "{base}/plugins/config/{id}?expected_proxy_ids=p-partner"
+                    ))
                     .bearer_auth(&operator)
                     .header("X-Ferrum-Namespace", "tenant-a")
                     .send()
@@ -367,8 +369,13 @@ async fn namespace_claim_confines_route_plugin_tls_on_create_and_put() {
         );
         let mut unrelated = stored.clone();
         unrelated["config"]["rules"][0]["match"] = json!({"methods": ["POST"]});
-        let (status, response) =
-            put(&base, "/plugins/config/admin-route", &operator, &unrelated).await;
+        let (status, response) = put(
+            &base,
+            "/plugins/config/admin-route?expected_proxy_ids=",
+            &operator,
+            &unrelated,
+        )
+        .await;
         assert!(
             (200..300).contains(&status),
             "exact stored field exemption: {response}"
@@ -378,8 +385,13 @@ async fn namespace_claim_confines_route_plugin_tls_on_create_and_put() {
             .as_array_mut()
             .unwrap()
             .push(additional);
-        let (status, response) =
-            put(&base, "/plugins/config/admin-route", &operator, &unrelated).await;
+        let (status, response) = put(
+            &base,
+            "/plugins/config/admin-route?expected_proxy_ids=",
+            &operator,
+            &unrelated,
+        )
+        .await;
         assert_eq!(
             status, 400,
             "a new rule must not inherit the stored exemption: {response}"
@@ -465,8 +477,13 @@ async fn namespace_claim_confines_udp_logging_dtls_material_on_create_and_put() 
                 assert!(!response.to_string().contains(value), "{response}");
                 let mut replacement = udp_logging_plugin_with("udp-base", field, value);
                 replacement["id"] = json!("udp-base");
-                let (status, response) =
-                    put(&base, "/plugins/config/udp-base", &operator, &replacement).await;
+                let (status, response) = put(
+                    &base,
+                    "/plugins/config/udp-base?expected_proxy_ids=",
+                    &operator,
+                    &replacement,
+                )
+                .await;
                 assert_eq!(status, 400, "{require} PUT {field}: {response}");
                 assert!(is_scope_refusal(&response), "{response}");
                 assert!(!response.to_string().contains(value), "{response}");
