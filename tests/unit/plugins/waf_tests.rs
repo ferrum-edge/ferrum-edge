@@ -948,7 +948,7 @@ async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
                 matches!(result, PluginResult::Continue),
                 "{label} (body_text rule: {with_body_text_rule}) benign body must pass"
             );
-            assert!(ctx.metadata.get("waf.rule_hits").is_none(), "{label}");
+            assert!(!ctx.metadata.contains_key("waf.rule_hits"), "{label}");
         }
     }
 }
@@ -1094,7 +1094,7 @@ async fn body_json_path_rule_inspects_every_duplicate_member() {
     )
     .await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(ctx.metadata.get("waf.rule_hits").is_none());
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
 }
 
 #[tokio::test]
