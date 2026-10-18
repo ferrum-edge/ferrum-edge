@@ -94,10 +94,10 @@ pub(super) fn scan_texts(node: &JsonNode) -> Vec<Cow<'_, str>> {
         JsonNode::Scalar(other) => vec![Cow::Owned(other.to_string())],
         JsonNode::Array(_) | JsonNode::Object(_) => {
             let render = |mode| serde_json::to_string(&Reading { node, mode }).ok();
-            let Some(last) = render(Duplicates::KeepLast) else {
+            let Some(last) = render(Duplicates::Last) else {
                 return Vec::new();
             };
-            let Some(all) = render(Duplicates::KeepAll) else {
+            let Some(all) = render(Duplicates::All) else {
                 return vec![Cow::Owned(last)];
             };
             // Equal only when the subtree has no duplicated member.
@@ -105,7 +105,7 @@ pub(super) fn scan_texts(node: &JsonNode) -> Vec<Cow<'_, str>> {
                 return vec![Cow::Owned(last)];
             }
             let mut texts = vec![Cow::Owned(last)];
-            if let Some(first) = render(Duplicates::KeepFirst)
+            if let Some(first) = render(Duplicates::First)
                 && !texts.iter().any(|text| *text == first)
             {
                 texts.push(Cow::Owned(first));
@@ -120,11 +120,11 @@ pub(super) fn scan_texts(node: &JsonNode) -> Vec<Cow<'_, str>> {
 enum Duplicates {
     /// One member per name at its first position with its last value —
     /// `serde_json::Value` with `preserve_order`.
-    KeepLast,
+    Last,
     /// One member per name at its first position with its first value.
-    KeepFirst,
+    First,
     /// Every member in source order.
-    KeepAll,
+    All,
 }
 
 /// Serializes `node` as one reading of its duplicated members, applied at
@@ -148,7 +148,7 @@ impl Serialize for Reading<'_> {
                 }
                 seq.end()
             }
-            JsonNode::Object(members) if self.mode == Duplicates::KeepAll => {
+            JsonNode::Object(members) if self.mode == Duplicates::All => {
                 let mut map = serializer.serialize_map(Some(members.len()))?;
                 for (name, node) in members {
                     map.serialize_entry(
@@ -167,7 +167,7 @@ impl Serialize for Reading<'_> {
                 for (name, node) in members {
                     match slots.get(name.as_str()) {
                         Some(&slot) => {
-                            if self.mode == Duplicates::KeepLast {
+                            if self.mode == Duplicates::Last {
                                 kept[slot].1 = node;
                             }
                         }
