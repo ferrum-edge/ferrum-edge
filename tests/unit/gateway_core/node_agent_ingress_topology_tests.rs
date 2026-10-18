@@ -953,7 +953,8 @@ async fn production_topology_monitor_processes_synthetic_node_events_and_skips_h
 
     let validator = IngressTopologyValidator::new(vec!["eth0".to_string()], "local", false)
         .with_roots(proc_root.clone(), sys_root);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
     let (event_tx, event_rx) =
         tokio::sync::mpsc::channel::<Result<Event<Node>, kube::runtime::watcher::Error>>(16);
     let event_stream = stream::unfold(event_rx, |mut receiver| async move {
@@ -1040,7 +1041,7 @@ async fn production_topology_monitor_processes_synthetic_node_events_and_skips_h
         IngressTopologyReason::NodeTopologyIncomplete,
     );
 
-    shutdown_tx.send(true).expect("request monitor shutdown");
+    shutdown_tx.shutdown();
     tokio::time::timeout(std::time::Duration::from_secs(2), task)
         .await
         .expect("monitor shutdown timeout")
@@ -1294,7 +1295,8 @@ async fn production_select_loop_applies_synthetic_ready_to_unavailable_transitio
     let metrics = Arc::new(NodeAgentMetrics::default());
     metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_READY);
     let mut backend = MockEbpfBackend::default();
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let pod_events =
         stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)]).chain(stream::pending());
@@ -1306,7 +1308,7 @@ async fn production_select_loop_applies_synthetic_ready_to_unavailable_transitio
     let shutdown = shutdown_tx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let _ = shutdown.send(true);
+        shutdown.shutdown();
     });
 
     let result = run_with_node_agent_topology_outcome_stream_for_test(

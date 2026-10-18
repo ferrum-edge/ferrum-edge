@@ -108,10 +108,21 @@ Which of those two terminals a connection takes depends on the peer:
   the endpoint with `H3_NO_ERROR`. Expect planned restarts to spend the full
   `FERRUM_SHUTDOWN_DRAIN_SECONDS` when such peers are connected.
 
-The H3 listener bounds its own `endpoint.open_connections()` wait with
-`FERRUM_SHUTDOWN_DRAIN_SECONDS`, then the
-serving mode's `begin_shutdown_drain` / `wait_for_drain` waits on
-`OverloadState` (`ConnectionGuard` / `RequestGuard`). Each H3 Incoming is
+The H3 listener bounds its own `endpoint.open_connections()` wait and the
+following `endpoint.wait_idle()` close with `FERRUM_SHUTDOWN_DRAIN_SECONDS`,
+then the serving mode's `begin_shutdown_drain` / `wait_for_drain` waits on
+`OverloadState` (`ConnectionGuard` / `RequestGuard`). These phases run one after
+the other but share **one** absolute drain deadline, published with the process
+shutdown watch broadcast after the optional pre-drain window. Every later phase
+gets only what is left, so a stalled H3 peer plus other long-lived work cannot
+spend the budget twice. Listener failures publish through the same broadcaster.
+A Gateway API listener retired during a reconcile has its own budget and never
+starts the process deadline, even during pre-drain. If process shutdown begins
+while its drain or endpoint close is waiting, that wait observes publication
+and is capped by the earlier of its retirement deadline and the process deadline.
+A repeated SIGTERM/SIGINT stops the H3 wait
+and the close wait as well as the global drain. With
+`FERRUM_SHUTDOWN_DRAIN_SECONDS=0` neither wait runs. Each H3 Incoming is
 registered with exactly one `ConnectionGuard` in the accept-loop spawn
 wrapper; handshake refuse, handshake timeout, GOAWAY completion, peer reset,
 and deadline force-close all drop that guard once. H3 WebSocket sessions still

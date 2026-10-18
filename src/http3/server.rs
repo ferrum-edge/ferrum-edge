@@ -1977,51 +1977,128 @@ pub async fn start_http3_listener_with_signal(
     // `endpoint.close()` call would forcefully terminate active streams the
     // moment the listener task exited — exactly the abrupt-abort behaviour
     // the soft-shutdown sequence is here to avoid.
+    //
+    // On process shutdown this phase runs before the serving mode's global
+    // drain (which starts only once this listener handle returns), so it
+    // is capped by the deadline published with the shutdown watch (issue
+    // #6714). A routine Gateway API retirement gets its own full budget and
+    // never publishes that deadline. If process shutdown begins during a
+    // retirement, BOTH waits below observe publication and clamp their timers.
+    // A repeated signal cuts both waits short as well.
+    let drain_budget = Duration::from_secs(drain_seconds);
+    let local_deadline = tokio::time::Instant::now() + drain_budget;
+    let escalation = crate::overload::shutdown_escalation_token();
     if drain_seconds > 0 {
-        let drain_timeout = Duration::from_secs(drain_seconds);
-        let drained = tokio::time::timeout(drain_timeout, async {
-            loop {
-                if endpoint.open_connections() == 0 {
-                    break;
-                }
-                // Poll active connections via overload state's notify
-                // signal — the same mechanism the central drain helper
-                // uses, so notifications are coherent across listeners.
-                tokio::select! {
-                    _ = overload_state.drain_complete.notified() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                }
-            }
-        })
-        .await
-        .is_ok();
-
-        if drained {
-            info!(
+        let outcome = wait_for_h3_drain(
+            || endpoint.open_connections(),
+            &overload_state.drain_complete,
+            &overload_state,
+            local_deadline,
+            escalation,
+        )
+        .await;
+        match outcome {
+            H3DrainOutcome::Drained => info!(
                 phase = "drain",
                 listener = "http3",
                 "HTTP/3 in-flight connections drained"
-            );
-        } else {
-            warn!(
+            ),
+            H3DrainOutcome::TimedOut => warn!(
                 phase = "drain",
                 listener = "http3",
                 remaining_connections = endpoint.open_connections(),
                 "HTTP/3 drain timeout — forcing endpoint close"
-            );
+            ),
+            H3DrainOutcome::Escalated => warn!(
+                phase = "drain",
+                listener = "http3",
+                remaining_connections = endpoint.open_connections(),
+                "Repeated shutdown signal — skipping the remaining HTTP/3 drain and forcing endpoint close"
+            ),
         }
     }
 
     // Finally, close any remaining connections cleanly. wait_idle() lets
     // peers receive the CONNECTION_CLOSE frame before the socket is
-    // dropped — without it some clients see a transport-layer abort.
+    // dropped — without it some clients see a transport-layer abort. It is
+    // a wait for peers too, so it is bounded by what is left of the shared
+    // drain budget (none when FERRUM_SHUTDOWN_DRAIN_SECONDS=0) and stops on
+    // a repeated shutdown signal.
     endpoint.close(
         quinn::VarInt::from_u32(H3_NO_ERROR_CLOSE_CODE),
         H3_NO_ERROR_CLOSE_REASON,
     );
-    endpoint.wait_idle().await;
+    if drain_seconds > 0 {
+        let _ = wait_for_h3_close(
+            &overload_state,
+            local_deadline,
+            escalation,
+            endpoint.wait_idle(),
+        )
+        .await;
+    }
 
     Ok(())
+}
+
+/// How the HTTP/3 listener's shutdown drain wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum H3DrainOutcome {
+    Drained,
+    TimedOut,
+    Escalated,
+}
+
+/// Wait until `open_connections()` reaches zero, bounded by the local and
+/// published process shutdown deadlines, and cut short when
+/// `escalation` (a repeated shutdown signal) fires.
+pub(crate) async fn wait_for_h3_drain(
+    open_connections: impl Fn() -> usize,
+    drain_complete: &tokio::sync::Notify,
+    overload: &crate::overload::OverloadState,
+    local_deadline: tokio::time::Instant,
+    escalation: &tokio_util::sync::CancellationToken,
+) -> H3DrainOutcome {
+    if open_connections() == 0 {
+        return H3DrainOutcome::Drained;
+    }
+    let drained = async {
+        loop {
+            if open_connections() == 0 {
+                break;
+            }
+            // Poll active connections via overload state's notify signal —
+            // the same mechanism the central drain helper uses, so
+            // notifications are coherent across listeners.
+            tokio::select! {
+                _ = drain_complete.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    };
+    wait_for_h3_close(overload, local_deadline, escalation, drained).await
+}
+
+/// The endpoint's close tail shares the same absolute local/process deadlines
+/// as its connection drain, including process publication during this await.
+pub(crate) async fn wait_for_h3_close(
+    overload: &crate::overload::OverloadState,
+    local_deadline: tokio::time::Instant,
+    escalation: &tokio_util::sync::CancellationToken,
+    wait_idle: impl std::future::Future<Output = ()>,
+) -> H3DrainOutcome {
+    match crate::overload::wait_with_shutdown_deadline(
+        overload.shutdown_deadline(),
+        local_deadline,
+        escalation,
+        wait_idle,
+    )
+    .await
+    {
+        crate::overload::DrainWait::Complete(()) => H3DrainOutcome::Drained,
+        crate::overload::DrainWait::TimedOut => H3DrainOutcome::TimedOut,
+        crate::overload::DrainWait::Escalated => H3DrainOutcome::Escalated,
+    }
 }
 
 /// Await `fut` while bounding the wait by `timeout`. Passing `Duration::ZERO`

@@ -44,7 +44,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const TEST_NAMESPACE: &str = "ferrum";
@@ -348,7 +347,7 @@ enum LaterWriter {
 struct Fixture {
     http_port: u16,
     https_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     join: JoinHandle<()>,
     tasks: Vec<JoinHandle<()>>,
     captures: Captures,
@@ -420,7 +419,9 @@ impl Fixture {
         drop(https_udp);
 
         let config = config(upstream_port, function_port);
-        let (shutdown_tx, _) = watch::channel(false);
+        let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+            std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+        );
         let handles =
             ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone())
                 .await
@@ -582,7 +583,7 @@ impl Fixture {
     }
 
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(10), self.join).await;
         for task in self.tasks {
             task.abort();

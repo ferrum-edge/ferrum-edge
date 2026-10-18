@@ -33,7 +33,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const MAX_PROXY_HOPS: u8 = 3;
@@ -459,13 +458,13 @@ fn grpc_gateway_config(backend_port: u16) -> GatewayConfig {
 
 struct RunningGrpcGateway {
     http_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     handles: ServeHandles,
 }
 
 impl RunningGrpcGateway {
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), self.handles.join())
             .await
             .expect("hop-limit gRPC gateway shutdown timed out")
@@ -509,7 +508,9 @@ async fn start_grpc_gateway(
         skip_initial_capability_refresh: true,
         ..ServeOptions::default()
     };
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles =
         ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone()).await?;
     Ok(RunningGrpcGateway {

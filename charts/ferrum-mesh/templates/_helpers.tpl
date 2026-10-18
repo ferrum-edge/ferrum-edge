@@ -863,6 +863,9 @@ Dict: root, component (string), preStop (seconds).
 Full additive post-SIGTERM shutdown budget (docs/graceful_shutdown.md):
   drain + 6s transport pool + 5s background + clamp(drain,5,60)s audit
   + 2s observability + 5s finalizer slack.
+The HTTP/3 listener drain/close and the global drain share the one drain term
+(ShutdownSender publishes the deadline with the shutdown broadcast), so it is
+counted once.
 preStop and preDrain are billed to the same terminationGracePeriodSeconds
 clock. Dict: root, component (string), values (component values).
 */}}

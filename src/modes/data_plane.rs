@@ -28,7 +28,7 @@ use crate::tls;
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     info!("DP mode: starting with empty config, waiting for CP");
 
@@ -120,6 +120,7 @@ pub async fn run(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    proxy_state.overload.attach_shutdown(&shutdown_tx);
     crate::runtime_metrics::global().configure(
         env_config.status_counts_max_entries,
         env_config.runtime_metrics_pool_tracking_enabled,
@@ -1138,7 +1139,7 @@ pub async fn run(
 /// listener failure (issue #2368).
 pub(crate) async fn await_dp_listener_handles(
     listener_handles: Vec<JoinHandle<()>>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), tokio::task::JoinError> {
     if listener_handles.is_empty() {
         let mut wait_shutdown = shutdown_tx.subscribe();
@@ -1151,7 +1152,7 @@ pub(crate) async fn await_dp_listener_handles(
     }
 
     let shutdown_on_panic = move || {
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
     };
     crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
 }
@@ -1264,10 +1265,11 @@ mod tests {
                     Duration::from_secs(43210),
                     crate::dp_config_freshness::StaleAction::FailClosed,
                 ));
-                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let (shutdown_tx, shutdown_rx) =
+                    crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
                 let monitor = start_config_staleness_monitor(freshness.clone(), shutdown_rx);
                 tokio::task::yield_now().await;
-                shutdown_tx.send(true).unwrap();
+                shutdown_tx.shutdown();
                 monitor.await.unwrap();
                 let snapshot = freshness.evaluate();
                 assert!(snapshot.stale);

@@ -11,7 +11,8 @@ use ferrum_edge::_test_support::wait_for_cp_listeners_until_shutdown_or_exit_for
 
 #[tokio::test]
 async fn pending_sibling_plus_listener_error_returns_err() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let mut sibling_rx = shutdown_tx.subscribe();
     let sibling = tokio::spawn(async move {
@@ -57,7 +58,8 @@ async fn pending_sibling_plus_listener_error_returns_err() {
 #[cfg(panic = "unwind")]
 #[tokio::test]
 async fn pending_sibling_plus_listener_panic_returns_err() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let mut sibling_rx = shutdown_tx.subscribe();
     let sibling = tokio::spawn(async move {
@@ -99,7 +101,8 @@ async fn pending_sibling_plus_listener_panic_returns_err() {
 
 #[tokio::test]
 async fn graceful_shutdown_returns_ok() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let mut admin_rx = shutdown_tx.subscribe();
     let admin = tokio::spawn(async move {
@@ -121,9 +124,7 @@ async fn graceful_shutdown_returns_ok() {
         Ok::<(), anyhow::Error>(())
     });
 
-    shutdown_tx
-        .send(true)
-        .expect("watch send must succeed with live receivers");
+    shutdown_tx.shutdown();
 
     let result = wait_for_cp_listeners_until_shutdown_or_exit_for_test(
         vec![
@@ -140,7 +141,8 @@ async fn graceful_shutdown_returns_ok() {
 
 #[tokio::test]
 async fn unsolicited_ok_exit_returns_err_and_drains_sibling() {
-    let (shutdown_tx, mut observed_shutdown) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, mut observed_shutdown) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let exited = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
@@ -182,10 +184,9 @@ async fn unsolicited_ok_exit_returns_err_and_drains_sibling() {
 
 #[tokio::test]
 async fn remaining_failure_keeps_its_listener_name_after_first_handle_is_removed() {
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-    shutdown_tx
-        .send(true)
-        .expect("shutdown receiver owned by helper must stay live");
+    let (shutdown_tx, _shutdown_rx) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+    shutdown_tx.shutdown();
 
     let first = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
     let innocent = tokio::spawn(async {
@@ -223,7 +224,8 @@ async fn remaining_failure_keeps_its_listener_name_after_first_handle_is_removed
 
 #[tokio::test]
 async fn unsolicited_exit_with_stuck_sibling_returns_err_after_drain_timeout() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let stuck = tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
     let exited = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
@@ -256,7 +258,8 @@ async fn unsolicited_exit_with_stuck_sibling_returns_err_after_drain_timeout() {
 
 #[tokio::test]
 async fn operator_shutdown_with_stuck_sibling_returns_ok_after_drain_timeout() {
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
     let stuck = tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
     let mut draining_rx = shutdown_tx.subscribe();
@@ -269,9 +272,7 @@ async fn operator_shutdown_with_stuck_sibling_returns_ok_after_drain_timeout() {
         Ok::<(), anyhow::Error>(())
     });
 
-    shutdown_tx
-        .send(true)
-        .expect("watch send must succeed with live receivers");
+    shutdown_tx.shutdown();
 
     let started = Instant::now();
     let result = tokio::time::timeout(

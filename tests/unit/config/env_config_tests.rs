@@ -8423,23 +8423,30 @@ fn main_resolves_predrain_through_the_shared_mode_gate() {
     let announce_at = MAIN_SOURCE
         .find("overload::announce_shutdown_drain();")
         .expect("the signal handler must publish the draining verdict");
-    // The wait is a `select!` arm rather than a bare `.await`: a repeated
-    // shutdown signal must be able to cut the window short (issue #4829), so
-    // match the timer expression itself and assert the race separately below.
-    let sleep_at = MAIN_SOURCE
-        .find("tokio::time::sleep(shutdown_predrain)")
+    // The sequencer delegates the window to the shutdown broadcaster so the
+    // drain deadline is stamped at the true broadcast moment, never before
+    // the pre-drain elapses (issue #6714).
+    let predrain_at = MAIN_SOURCE
+        .find(".shutdown_after_predrain(shutdown_predrain, overload::shutdown_escalation_token())")
         .expect("the signal handler must hold the accept loops open for the window");
-    let escalation_at = MAIN_SOURCE
-        .find("overload::shutdown_escalation_token().cancelled()")
-        .expect("a repeated shutdown signal must be able to cut the pre-drain window short");
-    let broadcast_at = MAIN_SOURCE
-        .find("let _ = shutdown_tx_signal.send(true);")
-        .expect("the signal handler must close the accept loops afterwards");
     assert!(
-        announce_at < sleep_at && sleep_at < broadcast_at,
-        "readiness must flip to not-ready, then the window elapses, and only then do the accept \
-         loops close"
+        announce_at < predrain_at,
+        "readiness must flip to not-ready before the pre-drain window starts"
     );
+    // The wait itself lives in the broadcaster: a `select!` arm rather than
+    // a bare `.await`, so a repeated shutdown signal can cut the window
+    // short (issue #4829), and the broadcast happens only afterwards.
+    const OVERLOAD_SOURCE: &str = include_str!("../../../src/overload.rs");
+    let sleep_at = OVERLOAD_SOURCE
+        .find("tokio::time::sleep(predrain)")
+        .expect("the broadcaster must wait out the pre-drain window");
+    let escalation_at = OVERLOAD_SOURCE
+        .find("escalation.cancelled()")
+        .expect("a repeated shutdown signal must be able to cut the pre-drain window short");
+    let broadcast_at = OVERLOAD_SOURCE[sleep_at..]
+        .find("self.shutdown();")
+        .expect("the broadcaster must close the accept loops afterwards")
+        + sleep_at;
     assert!(
         sleep_at < escalation_at && escalation_at < broadcast_at,
         "the pre-drain wait must race the escalation token inside the window, not outlive it"

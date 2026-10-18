@@ -531,7 +531,9 @@ async fn run_retirement_matrix() {
         proxy_bind_address: "127.0.0.1".into(),
         ..Default::default()
     };
-    let (stop, _) = watch::channel(false);
+    let (stop, _) = ferrum_edge::overload::ShutdownSender::channel(Duration::from_secs(
+        env.shutdown_drain_seconds,
+    ));
     let handles = serve(
         env,
         cfg,
@@ -756,7 +758,7 @@ async fn run_retirement_matrix() {
         .iter()
         .any(|e| e.path == "/probe" && e.identity == hx);
     assert!(!alien_reached_origin);
-    let _ = stop.send(true);
+    stop.shutdown();
     tokio::time::timeout(Duration::from_secs(8), handles.join())
         .await
         .unwrap()

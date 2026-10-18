@@ -1033,7 +1033,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
     let shutdown_predrain = std::time::Duration::from_secs(predrain_seconds);
     let gateway_exit_code: i32 = rt.block_on(async {
         // Shutdown signal
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown_tx = overload::ShutdownSender::new(std::time::Duration::from_secs(
+            env_config.shutdown_drain_seconds,
+        ));
         let shutdown_tx_signal = shutdown_tx.clone();
 
         // Signal observer (issue #4829). Deliberately keeps listening after
@@ -1141,21 +1143,9 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
             // killing the pod mid-drain. With the default 0s window the accept
             // loops still close immediately, exactly as before.
             overload::announce_shutdown_drain();
-            if !shutdown_predrain.is_zero() {
-                info!(
-                    predrain_seconds = shutdown_predrain.as_secs(),
-                    "Pre-drain: reporting not-ready while listeners keep accepting"
-                );
-                // A repeated signal cuts the window short: an operator asking
-                // twice does not want to keep accepting new connections.
-                tokio::select! {
-                    _ = tokio::time::sleep(shutdown_predrain) => {}
-                    _ = overload::shutdown_escalation_token().cancelled() => {
-                        warn!("Pre-drain window cut short by a repeated shutdown signal");
-                    }
-                }
-            }
-            let _ = shutdown_tx_signal.send(true);
+            shutdown_tx_signal
+                .shutdown_after_predrain(shutdown_predrain, overload::shutdown_escalation_token())
+                .await;
         });
 
         // Process-wide SIGHUP disposition (issue #4548). Without a registered

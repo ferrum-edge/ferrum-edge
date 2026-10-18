@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const TEST_NAMESPACE: &str = "ferrum";
@@ -264,13 +264,13 @@ async fn next_arrival(rx: &mut mpsc::UnboundedReceiver<Arrival>) -> Arrival {
 struct RunningGateway {
     http_port: u16,
     https_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     join: JoinHandle<()>,
 }
 
 impl RunningGateway {
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(10), self.join).await;
     }
 }
@@ -393,7 +393,9 @@ async fn start_gateway(
     // reservation proved free; hold the reservation until `serve` owns it.
     drop(https_udp);
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone())
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {

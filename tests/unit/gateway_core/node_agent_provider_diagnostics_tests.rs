@@ -87,7 +87,8 @@ fn iptables_provider_failures_survive_cleanup_with_safe_fatal_diagnostics() {
         };
         let metrics = NodeAgentMetrics::default();
         let ready = Arc::new(AtomicBool::new(false));
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let mut phases = Vec::new();
         let setup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (error, logs) = crate::modes::tests::capture_logs(|| {

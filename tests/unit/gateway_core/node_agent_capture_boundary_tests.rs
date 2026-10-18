@@ -47,7 +47,9 @@ async fn root_proxy_uid_is_rejected_before_any_iptables_fallback_command() {
         bpf_fs_available: false,
     };
     let metrics = NodeAgentMetrics::default();
-    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(true);
+    let (shutdown_tx, _shutdown_rx) =
+        crate::overload::ShutdownSender::channel(std::time::Duration::ZERO);
+    shutdown_tx.shutdown();
     let executed = AtomicBool::new(false);
     let ready = Arc::new(AtomicBool::new(false));
     let error = handle_fallback_with(

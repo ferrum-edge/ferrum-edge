@@ -24,7 +24,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -1692,13 +1692,13 @@ async fn functional_h3_grpc_web_retry_forwards_a_fresh_grpc_timeout() {
 
 struct RunningH3Gateway {
     https_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     join: JoinHandle<()>,
 }
 
 impl RunningH3Gateway {
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), self.join)
             .await
             .expect("h3 gateway shutdown timed out")
@@ -1789,7 +1789,9 @@ async fn start_h3_policy_gateway_with_env(
     };
     drop(https_udp);
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = ferrum_edge::modes::file::serve(env_config, prepared, opts, shutdown_tx.clone())
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {

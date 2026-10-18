@@ -48,12 +48,12 @@ use crate::startup::{sanitize_startup_scalar, wait_for_start_signals};
 use crate::tls;
 
 async fn shutdown_database_runtime_tasks(
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     proxy_state: &ProxyState,
     listener_handles: Vec<(String, ListenerJoinHandle)>,
     mut background_handles: Vec<JoinHandle<()>>,
 ) -> Result<(), anyhow::Error> {
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let listener_result = if listener_handles.is_empty() {
         Ok(())
     } else {
@@ -1042,7 +1042,7 @@ fn truncate_for_log(value: &str, max_chars: usize) -> String {
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     // Open the observability delivery lifecycle for this serving cycle before
     // any plugin activation registers a queue worker. Re-running this mode in
@@ -1545,6 +1545,7 @@ pub async fn run(
         Some(tls_policy.clone()),
         Some(shutdown_tx.subscribe()),
     )?;
+    proxy_state.overload.attach_shutdown(&shutdown_tx);
     // ProxyState construction is the initial live-config publication boundary.
     // Hot reloads install and record trust inside the request-epoch swap, but a
     // process restarted with an already-persisted bundle has no later delta to
@@ -3265,7 +3266,7 @@ pub async fn run(
     } else {
         let shutdown_tx_on_failure = shutdown_tx.clone();
         await_fallible_listener_handles(handles, move || {
-            let _ = shutdown_tx_on_failure.send(true);
+            shutdown_tx_on_failure.shutdown();
         })
         .await
     };

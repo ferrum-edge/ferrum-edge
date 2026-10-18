@@ -166,7 +166,8 @@ async fn file_mode_rejects_explicit_short_admin_jwt_secret() {
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
     let err = match file::serve(
         file_env(proxy_port, admin_port),
         empty_gateway_config(),
@@ -218,7 +219,8 @@ async fn file_mode_rejects_invalid_max_ttl_even_when_secret_unset() {
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
     let err = match file::serve(
         file_env(proxy_port, admin_port),
         empty_gateway_config(),
@@ -264,7 +266,8 @@ async fn file_mode_unset_admin_jwt_starts_and_rejects_external_tokens() {
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
     let handles = file::serve(
         file_env(proxy_port, admin_port),
         empty_gateway_config(),
@@ -294,6 +297,6 @@ async fn file_mode_unset_admin_jwt_starts_and_rejects_external_tokens() {
         "externally minted token must not validate against the random file-mode secret"
     );
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let _ = handles.join().await;
 }

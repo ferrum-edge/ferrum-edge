@@ -98,6 +98,7 @@ mod http3_connect_udp_tests;
 mod http3_peer_identity_tests;
 mod http3_selected_target_policy_tests;
 mod http3_server_dispatch_tests;
+mod http3_shutdown_budget_tests;
 mod http3_shutdown_goaway_tests;
 mod http3_websocket_tests;
 mod https_to_plaintext_tests;

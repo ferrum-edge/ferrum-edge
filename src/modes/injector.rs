@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
@@ -729,7 +729,7 @@ pub(crate) fn load_startup_config(
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let (config, tls_acceptor) = load_startup_config(&env_config)?;
     let max_connections = env_config.max_connections;

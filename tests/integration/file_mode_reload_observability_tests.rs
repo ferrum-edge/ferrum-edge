@@ -168,7 +168,8 @@ async fn file_mode_rejected_reload_surfaces_authenticated_health_and_clears_on_s
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
     let handles = file::serve(
         file_env(proxy_port, admin_port),
         parse_gateway_yaml(&initial_yaml),
@@ -299,7 +300,7 @@ async fn file_mode_rejected_reload_surfaces_authenticated_health_and_clears_on_s
         "config_rejected must clear after Unchanged: {health:?}"
     );
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let _ = handles.join().await;
 }
 
@@ -334,7 +335,8 @@ async fn file_mode_apply_rejection_raises_config_rejected_and_keeps_last_good() 
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) =
+        ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
     let handles = file::serve(
         file_env(proxy_port, admin_port),
         parse_gateway_yaml(&initial_yaml),
@@ -371,6 +373,6 @@ async fn file_mode_apply_rejection_raises_config_rejected_and_keeps_last_good() 
     assert_eq!(health["status"], "degraded");
     assert_eq!(health["config_rejected"], true);
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     let _ = handles.join().await;
 }
