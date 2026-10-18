@@ -3907,9 +3907,9 @@ mod inner {
                                 ),
                                 |s, (this, id, namespace, expected)| {
                                     Box::pin(async move {
-                                        let affected_proxy_ids = this.attached_plugin_proxy_ids(&namespace, &id, Some(&mut *s)).await?;
+                                        let affected_proxy_ids = this.attached_plugin_proxy_ids(namespace, id, Some(&mut *s)).await?;
                                         if let Some(expected) = expected {
-                                            PluginAssociationPreconditionFailed::check(&id, &affected_proxy_ids, expected, None)
+                                            PluginAssociationPreconditionFailed::check(id, &affected_proxy_ids, expected, None)
                                                 .map_err(mongodb::error::Error::custom)?;
                                         }
                                         this.proxies()
