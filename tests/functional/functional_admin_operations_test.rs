@@ -495,7 +495,7 @@ async fn test_admin_plugin_config_crud() {
 
     let resp = client
         .put(format!(
-            "{}/plugins/config/crud-plugin-1",
+            "{}/plugins/config/crud-plugin-1?expected_proxy_ids=",
             harness.admin_base_url
         ))
         .header("Authorization", &auth)
@@ -528,7 +528,7 @@ async fn test_admin_plugin_config_crud() {
     // Delete plugin config
     let resp = client
         .delete(format!(
-            "{}/plugins/config/crud-plugin-1",
+            "{}/plugins/config/crud-plugin-1?expected_proxy_ids=plugin-crud-proxy",
             harness.admin_base_url
         ))
         .header("Authorization", &auth)

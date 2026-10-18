@@ -1043,8 +1043,13 @@ async fn resource_labels_survive_crud_batch_backup_and_restore() {
             json!({"team":"platform","provisioned-by":"ferrum-nexus"})
         );
         body.as_object_mut().unwrap().remove("labels");
+        let expected = if path == "plugins/config" {
+            "?expected_proxy_ids="
+        } else {
+            ""
+        };
         let updated = client
-            .put(format!("{base}/{path}/{id}"))
+            .put(format!("{base}/{path}/{id}{expected}"))
             .bearer_auth(&bearer)
             .header("X-Ferrum-Provisioned-By", "ferrum-foundry")
             .json(&body)

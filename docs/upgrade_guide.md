@@ -28,6 +28,21 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Plugin-config writes require `expected_proxy_ids` (forge-ops #569, PR #6744)
+
+`PUT` and `DELETE /plugins/config/{id}` now require the
+`expected_proxy_ids` query parameter: a comma-separated list of every proxy
+the caller expects to reference the configuration and accepts the write
+detaching (present-but-empty expects none). Absent, repeated, or malformed
+values are `400`. If a proxy outside that set — other than the target a
+`proxy`-scoped `PUT` keeps — currently references the configuration, the
+write is refused with `412` and nothing is mutated, instead of silently
+detaching a proxy attached after the caller's read; the comparison is
+atomic with the write under the namespace config admission lease. Before
+upgrading, update every admin client that updates or deletes plugin
+configurations to send the parameter (gitforgeops, ferrum-nexus, and
+ferrum-foundry already do).
+
 ### `security_headers` values browsers ignore are refused (#6617, PR #6685)
 
 Custom `content_type_options`, `frame_options` and `referrer_policy` strings,

@@ -1081,7 +1081,7 @@ async fn run_admin_resource_crud_matrix(
     admin_put_json(
         &client,
         gateway,
-        &format!("/plugins/config/{plugin_id}"),
+        &format!("/plugins/config/{plugin_id}?expected_proxy_ids="),
         &auth,
         updated_plugin,
     )
@@ -1099,7 +1099,7 @@ async fn run_admin_resource_crud_matrix(
     admin_delete(
         &client,
         gateway,
-        &format!("/plugins/config/{plugin_id}"),
+        &format!("/plugins/config/{plugin_id}?expected_proxy_ids={proxy_id}"),
         &auth,
     )
     .await;
@@ -1848,7 +1848,7 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         admin_put_json(
             &client,
             gateway,
-            &format!("/plugins/config/{plugin_id}"),
+            &format!("/plugins/config/{plugin_id}?expected_proxy_ids="),
             &auth,
             update_body,
         )
@@ -1870,7 +1870,7 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
         admin_delete(
             &client,
             gateway,
-            &format!("/plugins/config/{plugin_id}"),
+            &format!("/plugins/config/{plugin_id}?expected_proxy_ids="),
             &auth,
         )
         .await;

@@ -3219,6 +3219,7 @@ pub(crate) async fn handle_create<R: AdminResource>(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_update<R: AdminResource>(
     state: &AdminState,
     actor: &AuditActor,

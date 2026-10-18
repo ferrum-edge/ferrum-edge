@@ -351,7 +351,7 @@ async fn enabling_proxy_group_plugin_rejects_conflict_on_unnamed_associated_prox
     let (status, body) = send(
         reqwest::Method::PUT,
         &base,
-        "/plugins/config/lt-group",
+        "/plugins/config/lt-group?expected_proxy_ids=p1,p2",
         namespace,
         &load_testing("lt-group", "proxy_group", None, true),
     )

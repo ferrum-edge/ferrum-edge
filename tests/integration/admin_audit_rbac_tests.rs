@@ -876,7 +876,9 @@ async fn malformed_persisted_serverless_url_is_wholly_redacted_from_views_and_au
     assert!(!viewer_body.to_string().contains(nested_secret));
 
     let response = reqwest::Client::new()
-        .delete(format!("{base}/plugins/config/{plugin_id}"))
+        .delete(format!(
+            "{base}/plugins/config/{plugin_id}?expected_proxy_ids="
+        ))
         .bearer_auth(&admin)
         .send()
         .await
@@ -2582,6 +2584,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let admin = token("security-admin", Some("admin"));
     let operator = token("mesh-operator", Some("operator"));
     let path = "/plugins/config/roundtrip-http-logging";
+    let write_path = "/plugins/config/roundtrip-http-logging?expected_proxy_ids=";
 
     let endpoint = "https://collector.example.com/roundtrip-path-canary/ingest?api_key=canary";
     let header_secret = "roundtrip-honeycomb-canary";
@@ -2616,7 +2619,7 @@ async fn operator_round_trip_of_masked_plugin_secrets_is_refused() {
     let (status, _, refused) = send_json(
         reqwest::Method::PUT,
         &base,
-        path,
+        write_path,
         &operator,
         Some(&etag),
         Some(&masked),

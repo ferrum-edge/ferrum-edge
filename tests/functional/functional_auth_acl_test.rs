@@ -2180,7 +2180,10 @@ async fn test_auth_acl_comprehensive() {
     );
 
     let resp = client
-        .put(format!("{}/plugins/config/plugin-acl-allow", admin_url))
+        .put(format!(
+            "{}/plugins/config/plugin-acl-allow?expected_proxy_ids=",
+            admin_url
+        ))
         .header("Authorization", &auth_header)
         .json(&json!({
             "id": "plugin-acl-allow",

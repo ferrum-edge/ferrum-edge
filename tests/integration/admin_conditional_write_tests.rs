@@ -3191,7 +3191,10 @@ async fn assert_deployment_mutation_contract(db: Arc<dyn DatabaseBackend>) {
                     .await
                     .body;
                 plugin["config"] = json!({"allowed_origins": ["https://operator.example"]});
-                ("/plugins/config/generated".to_string(), Some(plugin))
+                (
+                    "/plugins/config/generated?expected_proxy_ids=".to_string(),
+                    Some(plugin),
+                )
             }
             "spec" => {
                 document["info"]["description"] = json!("operator changed spec");

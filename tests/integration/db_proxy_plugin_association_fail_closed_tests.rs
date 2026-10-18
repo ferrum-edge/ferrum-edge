@@ -856,7 +856,7 @@ async fn proxy_scoped_plugin_update_rehomes_the_association() {
     let (status, body) = admin_call(
         reqwest::Method::PUT,
         &base_url,
-        "/plugins/config/pc-attach-1",
+        "/plugins/config/pc-attach-1?expected_proxy_ids=proxy-attach-1",
         Some(&attach_plugin_payload(
             "pc-attach-1",
             Some("proxy-attach-2"),
@@ -902,7 +902,7 @@ async fn plugin_scope_change_away_from_proxy_detaches_the_association() {
     let (status, body) = admin_call(
         reqwest::Method::PUT,
         &base_url,
-        "/plugins/config/pc-attach-1",
+        "/plugins/config/pc-attach-1?expected_proxy_ids=proxy-attach-1",
         Some(&attach_plugin_payload("pc-attach-1", None)),
     )
     .await;
@@ -938,7 +938,7 @@ async fn plugin_config_delete_detaches_the_association() {
     let (status, body) = admin_call(
         reqwest::Method::DELETE,
         &base_url,
-        "/plugins/config/pc-attach-1",
+        "/plugins/config/pc-attach-1?expected_proxy_ids=proxy-attach-1",
         None,
     )
     .await;

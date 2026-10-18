@@ -876,7 +876,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     // PUT /plugins/config/:id — update should fail
     let resp = admin_client
         .put(format!(
-            "{}/plugins/config/admin-test-plugin",
+            "{}/plugins/config/admin-test-plugin?expected_proxy_ids=",
             harness.admin_base_url
         ))
         .header("Authorization", &auth)
@@ -901,7 +901,7 @@ async fn test_db_outage_admin_api_reads_vs_writes() {
     // DELETE /plugins/config/:id — delete should fail
     let resp = admin_client
         .delete(format!(
-            "{}/plugins/config/admin-test-plugin",
+            "{}/plugins/config/admin-test-plugin?expected_proxy_ids=",
             harness.admin_base_url
         ))
         .header("Authorization", &auth)
