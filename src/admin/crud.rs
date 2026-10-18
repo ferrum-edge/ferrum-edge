@@ -1165,27 +1165,15 @@ async fn plugin_has_foreign_proxy_association(
     plugin_id: &str,
     own_proxy_id: Option<&str>,
 ) -> DbResult<bool> {
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_proxies_paginated(namespace, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        if page.items.iter().any(|proxy| {
-            own_proxy_id != Some(proxy.id.as_str())
-                && proxy
-                    .plugins
-                    .iter()
-                    .any(|association| association.plugin_config_id == plugin_id)
-        }) {
-            return Ok(true);
-        }
-        if items_len == 0 || offset + items_len >= page.total {
-            return Ok(false);
-        }
-        offset += items_len;
-    }
+    // Authoritative junction read, never the replica-backed proxy page: a
+    // just-committed attachment is exactly what must veto compensation, and
+    // a lagging replica would wave it through (forge-ops #569).
+    let referencing = db
+        .list_plugin_config_referencing_proxy_ids(namespace, plugin_id)
+        .await?;
+    Ok(referencing
+        .iter()
+        .any(|proxy_id| own_proxy_id != Some(proxy_id.as_str())))
 }
 
 /// Proxies in `current` that the caller did not account for: neither in
