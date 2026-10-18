@@ -6867,7 +6867,10 @@ paths:
         (and outside the `proxy_id` target this body keeps) currently
         references the config, the write is refused with `412` and nothing
         is mutated, instead of silently detaching that proxy. The check and
-        the write are atomic under the namespace config admission lease.
+        the write use the namespace config admission lease, with an additional
+        check inside the backend write transaction (SQL and replica-set MongoDB).
+        Standalone MongoDB checks immediately before its mutation sequence;
+        multi-document atomicity requires a replica set.
       tags: [Plugins]
       requestBody:
         required: true
@@ -6894,7 +6897,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/PluginConfig"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: Invalid request body or missing, repeated, or malformed expected_proxy_ids association precondition
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -6924,8 +6931,10 @@ paths:
         `expected_proxy_ids` (see the parameter): if a proxy outside that
         set currently references the config, the delete is refused with
         `412` and nothing is mutated, instead of silently detaching that
-        proxy. The check and the delete are atomic under the namespace
-        config admission lease.
+        proxy. The namespace config admission lease provides the early check;
+        SQL and replica-set MongoDB recheck in the backend write transaction.
+        Standalone MongoDB checks immediately before its mutation sequence;
+        multi-document atomicity requires a replica set.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
@@ -6942,7 +6951,7 @@ paths:
             X-Ferrum-Namespace-Unserved:
               $ref: "#/components/headers/X-Ferrum-Namespace-Unserved"
         "400":
-          description: Deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
+          description: Missing, repeated, or malformed expected_proxy_ids association precondition, or deletion would expose an invalid plugin-composition graph, including unsupported TCP connection-throttle attachments
           content:
             application/json:
               schema:
@@ -9037,9 +9046,13 @@ components:
   responses:
     PreconditionFailed:
       description: |
-        `If-Match` did not match: the resource changed after the supplied tag
-        was issued. Nothing was written. Re-read the resource, reapply the
-        intended changes to the current representation, and retry with its
+        A write precondition failed: `If-Match` did not match because the resource
+        changed after the supplied tag was issued, or a plugin configuration's
+        current referencing proxies exceeded its `expected_proxy_ids` association
+        precondition (excluding a PUT's kept proxy target). For an association
+        refusal, re-read the namespace and retry with the current referencing set.
+        Nothing was written. For an `If-Match` refusal, re-read the resource,
+        reapply the intended changes to the current representation, and retry with its
         new `ETag`; resending the same body with a fresh tag would revert the
         change that caused this refusal.
       content:

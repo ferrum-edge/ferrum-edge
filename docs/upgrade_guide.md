@@ -37,9 +37,11 @@ detaching (present-but-empty expects none). Absent, repeated, or malformed
 values are `400`. If a proxy outside that set — other than the target a
 `proxy`-scoped `PUT` keeps — currently references the configuration, the
 write is refused with `412` and nothing is mutated, instead of silently
-detaching a proxy attached after the caller's read; the comparison is
-atomic with the write under the namespace config admission lease. Before
-upgrading, update every admin client that updates or deletes plugin
+detaching a proxy attached after the caller's read. The namespace config
+admission lease provides the early check, and SQL and replica-set MongoDB
+recheck inside the backend write transaction. Standalone MongoDB checks
+immediately before its mutation sequence; multi-document atomicity requires
+a replica set. Before upgrading, update every admin client that updates or deletes plugin
 configurations to send the parameter (gitforgeops, ferrum-nexus, and
 ferrum-foundry already do).
 

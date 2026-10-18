@@ -1573,9 +1573,14 @@ list of every proxy the caller expects to reference the config and accepts
 the write detaching (a `proxy`-scoped PUT's kept `proxy_id` target may be
 listed or omitted; send the parameter with an empty value to expect none).
 Absent, repeated, or malformed is `400`. The gateway compares the set
-against the proxies referencing the config *now*, under the same namespace
-config admission lease as `If-Match`; a referencing proxy outside the set
-refuses the write with `412` naming it, and nothing is mutated. Re-read the
+against primary association state *now*, under the same namespace config
+admission lease as `If-Match`; a referencing proxy outside the set refuses
+the write with `412` naming it, and nothing is mutated. SQL and replica-set
+MongoDB also recheck inside the backend write transaction, so a write delayed
+past admission-lease loss cannot bypass the precondition. The association-only
+read does not decode the plugin row, preserving DELETE repair of damaged rows.
+Standalone MongoDB checks immediately before its mutation sequence; it cannot
+provide multi-document atomicity without a replica set. Re-read the
 namespace and retry with the current referencing set to accept detaching
 those proxies. This is unconditional (forge-ops #569): there is no opt-out,
 and older clients that omit the parameter now receive `400`.
