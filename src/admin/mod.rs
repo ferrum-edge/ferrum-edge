@@ -8529,7 +8529,20 @@ pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::Plug
                 state.backend_allow_ips.clone(),
             )
             .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-            .with_process_compression_admission_policy()
+            .with_compression_admission_policy(
+                // Admin only runs in a process whose startup `EnvConfig`
+                // parse already refused a typo'd gate/ceiling, so this parse
+                // cannot fail here; log loudly rather than panic if a future
+                // entry point ever breaks that invariant.
+                crate::config::CompressionAdmissionPolicy::from_process_env().unwrap_or_else(
+                    |error| {
+                        tracing::error!(
+                            "compression admission policy unparseable after EnvConfig startup                              parse (invariant broken), using defaults: {error}"
+                        );
+                        crate::config::CompressionAdmissionPolicy::default()
+                    },
+                ),
+            )
         })
 }
 

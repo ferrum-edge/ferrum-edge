@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Compression admission policy has a single typed source** (issue #6651,
+  item 3). Validation clients previously re-parsed
+  `FERRUM_COMPRESSION_GZIP_ENABLED`, `FERRUM_COMPRESSION_BROTLI_ENABLED`
+  and `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` with infallible helpers that
+  silently fell back on a typo (and accepted spellings `EnvConfig`
+  refuses). They now carry `CompressionAdmissionPolicy`, sourced from the
+  parsed `EnvConfig` or from its refusing `from_process_env` parse through
+  the same `EnvValue` implementations, so a typo'd gate/ceiling refuses
+  the load with the variable named — including through the library
+  validation entry points that never built an `EnvConfig`. The permissive
+  `parse_ferrum_flag_default_true` /
+  `parse_max_request_body_size_bytes_from_resolved` helpers are removed.
 - **Rustls log/LDAP/SMTP sinks now follow live CRL generations** (issue
   #6651, item 4). `tcp_logging`, `ws_logging`, `udp_logging` (DTLS),
   `ldap_auth` and the email notification channel built their verifiers

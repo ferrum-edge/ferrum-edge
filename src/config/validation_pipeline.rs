@@ -124,13 +124,15 @@ pub(crate) struct RejectedPluginConfig {
 /// limiter, so it needs no special case.
 pub(crate) fn collect_rejecting_plugin_config_errors(
     config: &GatewayConfig,
+    compression_policy: crate::config::CompressionAdmissionPolicy,
 ) -> Vec<RejectedPluginConfig> {
-    collect_plugin_config_errors(config, false)
+    collect_plugin_config_errors(config, false, compression_policy)
 }
 
 fn collect_plugin_config_errors(
     config: &GatewayConfig,
     optional_fail_open_only: bool,
+    compression_policy: crate::config::CompressionAdmissionPolicy,
 ) -> Vec<RejectedPluginConfig> {
     // Backend egress policy is node-local environment configuration. An
     // admitting CP whose `FERRUM_BACKEND_ALLOW_IPS` differs from the serving
@@ -148,7 +150,7 @@ fn collect_plugin_config_errors(
     let http_client =
         crate::plugins::PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
             .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-            .with_process_compression_admission_policy();
+            .with_compression_admission_policy(compression_policy);
 
     let mut rejected = Vec::new();
     for (index, plugin_config) in config.plugin_configs.iter().enumerate() {
@@ -231,7 +233,14 @@ fn collect_plugin_config_errors(
 /// unknown/retired plugins are never quarantined: they must continue to reject
 /// publication rather than silently removing a security control.
 pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConfig) -> Vec<String> {
-    let rejected = collect_plugin_config_errors(config, true);
+    let compression_policy = match crate::config::CompressionAdmissionPolicy::from_process_env() {
+        Ok(policy) => policy,
+        // A broken process compression gate must not quarantine anything:
+        // refuse the sweep (cache staging still fails closed downstream)
+        // and surface the configuration error instead.
+        Err(error) => return vec![error],
+    };
+    let rejected = collect_plugin_config_errors(config, true, compression_policy);
     if rejected.is_empty() {
         return Vec::new();
     }
@@ -252,6 +261,18 @@ pub(crate) fn quarantine_unconstructible_plugin_configs(config: &mut GatewayConf
 /// identity collisions) remains mode-specific and is intentionally excluded.
 pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) -> Vec<String> {
     let mut errors = Vec::new();
+
+    // The typed compression admission policy is process configuration: a
+    // typo'd gate/ceiling refuses the load here, exactly as `EnvConfig`
+    // refuses it at startup, instead of validating compression rows
+    // against silent defaults (issue #6651 item 3).
+    let compression_policy = match crate::config::CompressionAdmissionPolicy::from_process_env() {
+        Ok(policy) => policy,
+        Err(error) => {
+            errors.push(error);
+            return errors;
+        }
+    };
 
     // FIPS gateway-document admission must be part of the same rejecting
     // contract used by database full loads and CP full/delta composition.
@@ -293,7 +314,7 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
         &crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
             BackendEgressPolicy::unrestricted(),
         )
-        .with_process_compression_admission_policy(),
+        .with_compression_admission_policy(compression_policy),
         false,
     ) {
         errors.extend(found);
@@ -306,7 +327,7 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     // freezes every DP on its last-known-good cache — with no acknowledgement
     // on the server-streaming `ConfigSync.Subscribe` to show it.
     errors.extend(
-        collect_rejecting_plugin_config_errors(config)
+        collect_rejecting_plugin_config_errors(config, compression_policy)
             .into_iter()
             .map(|rejected| rejected.message),
     );
@@ -316,7 +337,7 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
             BackendEgressPolicy::unrestricted(),
         )
         .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
-        .with_process_compression_admission_policy(),
+        .with_compression_admission_policy(compression_policy),
     ) {
         errors.push(found);
     }
@@ -639,11 +660,20 @@ impl<'a> ValidationPipeline<'a> {
                     action,
                 } => {
                     let mut errors = Vec::new();
+                    let compression_policy =
+                        match crate::config::CompressionAdmissionPolicy::from_process_env() {
+                            Ok(policy) => policy,
+                            Err(error) => {
+                                errors.push(error);
+                                handle_validation_errors(action, errors, &mut collected_errors)?;
+                                continue;
+                            }
+                        };
                     let graph_http_client =
                         crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
                             backend_allow_ips.clone(),
                         )
-                        .with_process_compression_admission_policy();
+                        .with_compression_admission_policy(compression_policy);
                     // Built ONCE for the whole sweep (issue #4116). Every
                     // enabled plugin config in the namespace is screened here,
                     // and constructing the two-client validation stack plus its
@@ -654,7 +684,16 @@ impl<'a> ValidationPipeline<'a> {
                     // of converging. Same shape as the single-config
                     // `validate_plugin_config_with_policy` entry point.
                     let plugin_http_client =
-                        crate::plugins::plugin_config_validation_http_client(backend_allow_ips);
+                        match crate::plugins::plugin_config_validation_http_client(
+                            backend_allow_ips,
+                        ) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                errors.push(error);
+                                handle_validation_errors(action, errors, &mut collected_errors)?;
+                                continue;
+                            }
+                        };
                     if let Err(graph_errors) =
                         crate::plugins::transaction_log_schema::validate_config_graph(
                             config,

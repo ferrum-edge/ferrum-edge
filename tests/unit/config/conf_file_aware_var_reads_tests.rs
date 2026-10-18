@@ -2,11 +2,9 @@
 //! conf-file-aware resolver instead of reading `std::env::var` only.
 
 use crate::unit::env_lock::EnvGuard;
+use ferrum_edge::config::CompressionAdmissionPolicy;
 use ferrum_edge::config::conf_file::ConfFile;
 use ferrum_edge::plugins::api_chargeback_sink::resolve_node_id_with_primary;
-use ferrum_edge::plugins::utils::http_client::{
-    parse_ferrum_flag_default_true, parse_max_request_body_size_bytes_from_resolved,
-};
 use ferrum_edge::plugins::utils::metadata_redaction::{
     parse_extras_from_env, parse_extras_from_resolved,
 };
@@ -15,7 +13,7 @@ const ISSUE_3624_CONF: &str = r"
 FERRUM_LOG_REDACT_METADATA_KEYS = conf_only_redact,tenant_marker
 FERRUM_NODE_ID = conf-chargeback-node
 FERRUM_COMPRESSION_GZIP_ENABLED = false
-FERRUM_COMPRESSION_BROTLI_ENABLED = off
+FERRUM_COMPRESSION_BROTLI_ENABLED = 0
 FERRUM_MAX_REQUEST_BODY_SIZE_BYTES = 2048
 ";
 
@@ -39,17 +37,31 @@ fn conf_file_values_honored_for_chargeback_node_id() {
 #[test]
 fn conf_file_values_honored_for_validation_client_compression_gates() {
     let conf = ConfFile::parse(ISSUE_3624_CONF).unwrap();
-    assert!(!parse_ferrum_flag_default_true(
+    let policy = CompressionAdmissionPolicy::from_resolved(
         conf.get("FERRUM_COMPRESSION_GZIP_ENABLED"),
-    ));
-    assert!(!parse_ferrum_flag_default_true(
         conf.get("FERRUM_COMPRESSION_BROTLI_ENABLED"),
-    ));
+        conf.get("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES"),
+    )
+    .expect("conf values must parse");
+    assert!(!policy.gzip_enabled);
+    assert!(!policy.brotli_enabled);
+    assert_eq!(policy.max_request_body_size_bytes, 2048);
+}
+
+#[test]
+fn compression_policy_refuses_typoed_values_instead_of_falling_back() {
+    // Issue #6651 item 3: the old infallible helpers silently mapped a typo
+    // to enabled/default. The typed policy refuses, naming the variable.
+    let err = CompressionAdmissionPolicy::from_resolved(Some("flase"), None, None)
+        .expect_err("typo'd gzip gate must refuse");
+    assert!(err.contains("FERRUM_COMPRESSION_GZIP_ENABLED"), "{err}");
+    let err = CompressionAdmissionPolicy::from_resolved(None, None, Some("10MB"))
+        .expect_err("suffixed body ceiling must refuse");
+    assert!(err.contains("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES"), "{err}");
+    // Unset resolves to the EnvConfig defaults.
     assert_eq!(
-        parse_max_request_body_size_bytes_from_resolved(
-            conf.get("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES"),
-        ),
-        2048,
+        CompressionAdmissionPolicy::from_resolved(None, None, None).unwrap(),
+        CompressionAdmissionPolicy::default(),
     );
 }
 
@@ -105,17 +117,22 @@ fn issue_3624_reads_use_conf_aware_resolver_not_std_env_var() {
         "chargeback node id must not bypass ferrum.conf"
     );
 
-    let http_client = squeeze(include_str!("../../../src/plugins/utils/http_client.rs"));
+    // Since #6651 item 3 the compression gates resolve in exactly one
+    // place: CompressionAdmissionPolicy in env_config.rs.
+    let env_config = squeeze(include_str!("../../../src/config/env_config.rs"));
     assert!(
-        http_client.contains(&squeeze("resolve_ferrum_var(key)")),
+        env_config.contains(&squeeze(
+            "resolve_ferrum_var(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"
+        )),
         "compression gates must resolve through ferrum.conf"
     );
     assert!(
-        http_client.contains(&squeeze(
+        env_config.contains(&squeeze(
             "resolve_ferrum_var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"
         )),
         "validation client body ceiling must resolve through ferrum.conf"
     );
+    let http_client = squeeze(include_str!("../../../src/plugins/utils/http_client.rs"));
     assert!(
         !http_client.contains(&squeeze(
             "std::env::var(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"
@@ -133,5 +150,9 @@ fn issue_3624_reads_use_conf_aware_resolver_not_std_env_var() {
             "std::env::var(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"
         )),
         "body ceiling must not bypass ferrum.conf"
+    );
+    assert!(
+        !http_client.contains("FERRUM_COMPRESSION_GZIP_ENABLED"),
+        "http_client must not re-parse compression gates"
     );
 }

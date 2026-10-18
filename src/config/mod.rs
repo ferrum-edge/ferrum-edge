@@ -69,6 +69,7 @@ pub mod yaml_alias_budget;
 
 #[allow(unused_imports)] // AutoBool is used by unit tests but not directly by the binary
 pub use env_config::AutoBool;
+pub use env_config::CompressionAdmissionPolicy;
 #[allow(unused_imports)] // DbTlsMode is used by unit tests and public config consumers
 pub use env_config::{
     AdminHttpExposure, BackendAllowIps, BackendEgressPolicy, DbTlsMode, EffectiveSqlBackend,
