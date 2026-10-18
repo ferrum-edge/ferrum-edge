@@ -1867,10 +1867,12 @@ async fn run_available_plugin_config_crud(gateway: &TestGateway, backend_port: u
     }
 
     for plugin_id in plugin_ids {
+        // The validator proxy ends up referencing catalog plugins (its spec
+        // attaches them), so name it as the expected referencing proxy.
         admin_delete(
             &client,
             gateway,
-            &format!("/plugins/config/{plugin_id}?expected_proxy_ids="),
+            &format!("/plugins/config/{plugin_id}?expected_proxy_ids={validator_proxy_id}"),
             &auth,
         )
         .await;
