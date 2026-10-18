@@ -20,10 +20,11 @@ use crate::admin::plugin_config_projection::PlaceholderSiteRecorder;
 use crate::admin::preconditions::{self, IfMatch};
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, is_mtls_dns_admission_unavailable,
-    is_mtls_dns_identity_conflict, mark_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
-    tcp_connection_throttle_attachment_conflict, validate_api_spec_proxy_plugin_association,
-    validate_api_spec_restore_inputs,
+    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, PluginAssociationPreconditionFailed,
+    is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
+    mark_mtls_dns_admission_unavailable, mtls_dns_identity_conflict,
+    plugin_association_precondition_failed, tcp_connection_throttle_attachment_conflict,
+    validate_api_spec_proxy_plugin_association, validate_api_spec_restore_inputs,
 };
 use crate::config::db_loader::{is_proxy_plugin_association_load_error, is_row_decode_rejection};
 use crate::config::gateway_trust::GatewayTrustBundleRecord;
@@ -1187,37 +1188,6 @@ async fn plugin_has_foreign_proxy_association(
     }
 }
 
-/// Every proxy in the namespace whose `plugins` list references this
-/// plugin config, read through the backend's paginated proxy list.
-async fn plugin_referencing_proxy_ids(
-    db: &dyn DatabaseBackend,
-    namespace: &str,
-    plugin_id: &str,
-) -> DbResult<BTreeSet<String>> {
-    let mut referencing = BTreeSet::new();
-    let mut offset = 0_i64;
-    const PAGE_SIZE: i64 = 1_000;
-    loop {
-        let page = db
-            .list_proxies_paginated(namespace, PAGE_SIZE, offset)
-            .await?;
-        let items_len = page.items.len() as i64;
-        for proxy in &page.items {
-            if proxy
-                .plugins
-                .iter()
-                .any(|association| association.plugin_config_id == plugin_id)
-            {
-                referencing.insert(proxy.id.clone());
-            }
-        }
-        if items_len == 0 || offset + items_len >= page.total {
-            return Ok(referencing);
-        }
-        offset += items_len;
-    }
-}
-
 /// Proxies in `current` that the caller did not account for: neither in
 /// the supplied expected set nor the write's kept target.
 fn unexpected_plugin_references(
@@ -1238,12 +1208,10 @@ fn plugin_association_precondition_refusal(
 ) -> AfterValidateError {
     AfterValidateError::Response(Box::new(super::json_response(
         StatusCode::PRECONDITION_FAILED,
-        &json!({"error": format!(
-            "plugin config '{}' is referenced by proxies outside expected_proxy_ids: {}; \
-             re-read the namespace and retry with the current referencing set",
-            plugin_id,
-            unexpected.join(", ")
-        )}),
+        &json!({"error": PluginAssociationPreconditionFailed {
+            plugin_id: plugin_id.to_string(),
+            unexpected: unexpected.to_vec(),
+        }.to_string()}),
     )))
 }
 
@@ -1543,6 +1511,7 @@ async fn persist_update_to_settlement<R: AdminResource>(
     id: String,
     written: R,
     previous: R,
+    update_query: R::UpdateQuery,
 ) -> DbResult<Option<R>> {
     let OwnedWriteSettlementContext {
         db,
@@ -1553,8 +1522,11 @@ async fn persist_update_to_settlement<R: AdminResource>(
         actor,
     } = context;
     let success_db = db.clone();
-    let result = match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written))
-        .await
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_update_from_request(db.as_ref(), &written, &update_query),
+    )
+    .await
     {
         Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
         Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
@@ -1685,6 +1657,7 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
     context: OwnedWriteSettlementContext,
     id: String,
     written: R,
+    update_query: R::UpdateQuery,
 ) -> DbResult<Option<R>> {
     let OwnedWriteSettlementContext {
         db,
@@ -1694,21 +1667,25 @@ async fn persist_undecodable_update_repair<R: AdminResource>(
         state,
         actor,
     } = context;
-    let result =
-        match run_db_write_while_held(guard.as_ref(), R::db_update(db.as_ref(), &written)).await {
-            Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
-            Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
-                Ok(false) => Ok(false),
-                // Without a hydratable previous row or namespace snapshot we cannot
-                // compensate a late write. Fail closed rather than claiming success
-                // after an unverified admission loss.
-                Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
-                    "namespace config admission was lost during undecodable-row update repair"
-                ))),
-                Err(persistence_error) => Err(persistence_error),
-            },
-            Err(error) => Err(error),
-        };
+    let result = match run_db_write_while_held(
+        guard.as_ref(),
+        R::db_update_from_request(db.as_ref(), &written, &update_query),
+    )
+    .await
+    {
+        Ok(NamespaceConfigAdmissionCompletion::Held(result)) => result,
+        Ok(NamespaceConfigAdmissionCompletion::Lost { result, error: _ }) => match result {
+            Ok(false) => Ok(false),
+            // Without a hydratable previous row or namespace snapshot we cannot
+            // compensate a late write. Fail closed rather than claiming success
+            // after an unverified admission loss.
+            Ok(true) => Err(mark_mtls_dns_admission_unavailable(anyhow::anyhow!(
+                "namespace config admission was lost during undecodable-row update repair"
+            ))),
+            Err(persistence_error) => Err(persistence_error),
+        },
+        Err(error) => Err(error),
+    };
     if !result? {
         return Ok(None);
     }
@@ -2784,6 +2761,12 @@ pub(crate) trait AdminResource:
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
+        if let Some(refusal) = plugin_association_precondition_failed(error) {
+            return super::json_response(
+                StatusCode::PRECONDITION_FAILED,
+                &json!({"error": refusal.to_string()}),
+            );
+        }
         if is_mtls_dns_admission_unavailable(error) {
             return super::mtls_dns_admission_unavailable_response();
         }
@@ -2821,6 +2804,12 @@ pub(crate) trait AdminResource:
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if let Some(refusal) = plugin_association_precondition_failed(error) {
+            return super::json_response(
+                StatusCode::PRECONDITION_FAILED,
+                &json!({"error": refusal.to_string()}),
+            );
+        }
         if let Some(unsupported) =
             crate::config::db_backend::proxy_delete_atomicity_unsupported(error)
         {
@@ -2924,6 +2913,16 @@ pub(crate) trait AdminResource:
     /// is unused, mirroring [`Self::DeleteQuery`].
     type UpdateQuery: Send + Sync + Clone + Default + 'static;
 
+    /// Persist a PUT with its parsed request preconditions. Recovery uses
+    /// the plain `db_update` so it can restore the previous graph.
+    async fn db_update_from_request(
+        db: &dyn DatabaseBackend,
+        resource: &Self,
+        _opts: &Self::UpdateQuery,
+    ) -> DbResult<bool> {
+        Self::db_update(db, resource).await
+    }
+
     /// Parse resource-specific PUT query parameters. Default ignores the
     /// query string. Return `Err` for a 400 before any persistence.
     fn parse_update_query(_query: Option<&str>) -> Result<Self::UpdateQuery, String> {
@@ -2933,8 +2932,8 @@ pub(crate) trait AdminResource:
     /// Refuse an update whose caller-supplied precondition (from the query
     /// string) no longer holds against current stored state. Called under
     /// the namespace config admission lease, after validation and before
-    /// persistence, so the comparison is atomic with the write for every
-    /// supported writer — the same lease model that fences `If-Match`.
+    /// persistence. Resources requiring a write-time backstop must also
+    /// enforce their preconditions in `db_update_from_request`.
     async fn check_update_precondition(
         _db: &dyn DatabaseBackend,
         _namespace: &str,
@@ -4647,6 +4646,24 @@ impl AdminResource for PluginConfig {
         db.delete_plugin_config(namespace, id).await
     }
 
+    async fn db_update_from_request(
+        db: &dyn DatabaseBackend,
+        resource: &Self,
+        opts: &Self::UpdateQuery,
+    ) -> DbResult<bool> {
+        db.update_plugin_config_expected(resource, &opts.0).await
+    }
+
+    async fn db_delete_from_request(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        opts: Self::DeleteQuery,
+    ) -> DbResult<bool> {
+        db.delete_plugin_config_expected(namespace, id, &opts.0)
+            .await
+    }
+
     type DeleteQuery = ExpectedProxyIds;
     type UpdateQuery = ExpectedProxyIds;
 
@@ -4667,7 +4684,8 @@ impl AdminResource for PluginConfig {
         resource: &Self,
         expected: &ExpectedProxyIds,
     ) -> Result<(), AfterValidateError> {
-        let current = plugin_referencing_proxy_ids(db, namespace, &resource.id)
+        let current = db
+            .list_plugin_config_referencing_proxy_ids(namespace, &resource.id)
             .await
             .map_err(AfterValidateError::Db)?;
         let kept = if resource.scope == PluginScope::Proxy {
@@ -4689,7 +4707,7 @@ impl AdminResource for PluginConfig {
     /// Refuse the delete while a proxy the caller did not account for
     /// references this config (forge-ops #569). The lease-held snapshot is
     /// authoritative when present; the undecodable-row repair path reads
-    /// the junction state through the proxy list instead.
+    /// primary association ids independently of the damaged plugin row.
     async fn check_delete_precondition(
         db: &dyn DatabaseBackend,
         namespace: &str,
@@ -4709,7 +4727,8 @@ impl AdminResource for PluginConfig {
                 })
                 .map(|proxy| proxy.id.clone())
                 .collect::<BTreeSet<_>>(),
-            None => plugin_referencing_proxy_ids(db, namespace, id)
+            None => db
+                .list_plugin_config_referencing_proxy_ids(namespace, id)
                 .await
                 .map_err(AfterValidateError::Db)?,
         };
@@ -6503,6 +6522,7 @@ async fn handle_write<R: AdminResource>(
                         },
                         id.to_string(),
                         resource.clone(),
+                        update_query.clone(),
                     ))
                     .await
                     {
@@ -6536,6 +6556,7 @@ async fn handle_write<R: AdminResource>(
                         id.to_string(),
                         resource.clone(),
                         previous,
+                        update_query.clone(),
                     ))
                     .await
                     {

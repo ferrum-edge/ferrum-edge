@@ -61,8 +61,8 @@ mod inner {
         FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
         MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespacePreconditionFailed,
         NamespaceResourceCounts, NamespaceSnapshotTooLarge, NamespacedResourceId,
-        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, ProxyDeleteAtomicityUnsupported,
-        SnapshotDataIntegrityError, SnapshotDigest, SortOrder,
+        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, PluginAssociationPreconditionFailed,
+        ProxyDeleteAtomicityUnsupported, SnapshotDataIntegrityError, SnapshotDigest, SortOrder,
         TcpConnectionThrottleAttachmentConflict, is_namespace_snapshot_too_large,
     };
     use crate::config::db_loader::{
@@ -100,7 +100,7 @@ mod inner {
         Tls, TlsOptions, WriteConcern,
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::future::Future;
     use std::io::Write;
     use std::ops::Deref;
@@ -3639,6 +3639,419 @@ mod inner {
             Ok(())
         }
 
+        async fn update_plugin_config_inner(
+            &self,
+            pc: &PluginConfig,
+            expected: Option<&BTreeSet<String>>,
+        ) -> Result<bool, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
+            self.validate_plugin_graph_admission_candidate(&pc.namespace, |candidate| {
+                if let Some(existing) = candidate
+                    .plugin_configs
+                    .iter_mut()
+                    .find(|existing| existing.id == pc.id)
+                {
+                    *existing = pc.clone();
+                }
+                apply_proxy_association_to_candidate(candidate, pc);
+            })
+            .await?;
+            // Preserve api_spec_id by carrying it into the replacement document.
+            // Returning an error is safer than silently detaching spec ownership.
+            let mut doc = plugin_config_to_doc(pc)?;
+            let existing_doc = self
+                .plugin_configs()
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(&pc.namespace, &pc.id),
+                    "namespace": &pc.namespace,
+                })
+                .await?;
+            if existing_doc.is_none() {
+                // No document in this namespace — phantom update, no
+                // config-change record (DB-M4).
+                mtls_lease.release().await?;
+                self.check_slow_query("update_plugin_config", start);
+                return Ok(false);
+            }
+            let existing_spec_id = match existing_doc.as_ref().and_then(|d| d.get("api_spec_id")) {
+                Some(Bson::String(s)) if !s.is_empty() => Some(s.clone()),
+                Some(Bson::Null) | None => None,
+                Some(other) => {
+                    anyhow::bail!(
+                        "plugin_config {} has non-string api_spec_id ownership tag: {:?}",
+                        pc.id,
+                        other
+                    );
+                }
+            };
+            if let Some(sid) = existing_spec_id {
+                doc.insert("api_spec_id", sid);
+            }
+            // The junction reconciliation is planned before the mutation so the
+            // transaction knows exactly which proxies move (issue #4611). A
+            // `proxy_id` move detaches the old proxy and attaches the new one;
+            // a scope change away from `proxy` detaches the stale association.
+            // Always read associations, including operator-managed proxy_group
+            // references. Standalone Mongo checks immediately before mutation;
+            // replica sets repeat the read and check in the write transaction.
+            let attached = self
+                .attached_plugin_proxy_ids(&pc.namespace, &pc.id, None)
+                .await?;
+            if let Some(expected) = expected {
+                PluginAssociationPreconditionFailed::check(
+                    &pc.id,
+                    &attached,
+                    expected,
+                    pc.implied_proxy_association(),
+                )?;
+            }
+            let plan = Self::proxy_scoped_plugin_association_plan(pc, &attached);
+            let touched_proxies = plugin_config_touched_proxies(pc, &plan);
+            let matched = mtls_lease
+                .run_mutation(async {
+                    if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let matched = session
+                            .start_transaction()
+                            .and_run(
+                                (
+                                    self,
+                                    doc,
+                                    pc,
+                                    expected,
+                                ),
+                                |s, (this, doc, pc, expected)| {
+                                    Box::pin(async move {
+                                        let namespace = &pc.namespace;
+                                        let id = &pc.id;
+                                        let attached = this.attached_plugin_proxy_ids(namespace, id, Some(&mut *s)).await?;
+                                        if let Some(expected) = expected {
+                                            PluginAssociationPreconditionFailed::check(id, &attached, expected, pc.implied_proxy_association())
+                                                .map_err(mongodb::error::Error::custom)?;
+                                        }
+                                        let plan = Self::proxy_scoped_plugin_association_plan(pc, &attached);
+                                        let touched_proxies = plugin_config_touched_proxies(pc, &plan);
+                                        let replace_result = this
+                                            .plugin_configs()
+                                            .replace_one(
+                                                doc! {
+                                                    "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
+                                                    "namespace": namespace.as_str(),
+                                                },
+                                                doc.clone(),
+                                            )
+                                            .session(&mut *s)
+                                            .await?;
+                                        if replace_result.matched_count == 0 {
+                                            // Phantom update: no config-change record
+                                            // (DB-M4).
+                                            return Ok(false);
+                                        }
+                                        this.apply_proxy_association_plan_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            id.as_str(),
+                                            &plan,
+                                        )
+                                        .await?;
+                                        this.record_config_change_in_session(
+                                            &mut *s,
+                                            namespace.as_str(),
+                                            "plugin_config",
+                                            id.as_str(),
+                                            "upsert",
+                                        )
+                                        .await?;
+                                        for proxy_id in touched_proxies.iter() {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "proxy",
+                                                proxy_id.as_str(),
+                                                "upsert",
+                                            )
+                                            .await?;
+                                        }
+                                        Ok(true)
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(Self::plugin_association_transaction_error)
+                            .context("update_plugin_config transaction failed")?;
+                        if matched {
+                            self.compact_config_changes_best_effort(&pc.namespace).await;
+                        }
+                        return Ok(matched);
+                    } else {
+                        let replace_result = self
+                            .plugin_configs()
+                            .replace_one(
+                                doc! {
+                                    "_id": namespaced_doc_id(&pc.namespace, &pc.id),
+                                    "namespace": &pc.namespace,
+                                },
+                                doc,
+                            )
+                            .await?;
+                        if replace_result.matched_count == 0 {
+                            // Phantom update (concurrent delete): no config-change
+                            // record (DB-M4).
+                            return Ok(false);
+                        }
+                        let change_result: Result<(), anyhow::Error> = async {
+                            // Attach/detach before the change records: a
+                            // standalone deployment has no transaction, so the
+                            // association the runtime reads is written while the
+                            // plugin-config document can still be rolled back.
+                            self.apply_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await?;
+                            self.record_config_change(
+                                &pc.namespace,
+                                "plugin_config",
+                                &pc.id,
+                                "upsert",
+                            )
+                            .await?;
+                            for proxy_id in &touched_proxies {
+                                self.record_config_change(
+                                    &pc.namespace,
+                                    "proxy",
+                                    proxy_id.as_str(),
+                                    "upsert",
+                                )
+                                .await?;
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        if let Err(err) = change_result {
+                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
+                                .await;
+                            self.rollback_standalone_updated_document(
+                                "plugin_configs",
+                                &pc.namespace,
+                                "plugin_config",
+                                &pc.id,
+                                existing_doc,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    }
+                    Ok(true)
+                })
+                .await?;
+            mtls_lease.release().await?;
+            self.check_slow_query("update_plugin_config", start);
+            Ok(matched)
+        }
+
+        async fn delete_plugin_config_inner(
+            &self,
+            namespace: &str,
+            id: &str,
+            expected: Option<&BTreeSet<String>>,
+        ) -> Result<bool, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
+            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
+                candidate.plugin_configs.retain(|plugin| plugin.id != id);
+                for proxy in &mut candidate.proxies {
+                    proxy
+                        .plugins
+                        .retain(|association| association.plugin_config_id != id);
+                }
+            })
+            .await?;
+            let existing = self
+                .plugin_configs()
+                .find_one(doc! {
+                    "_id": namespaced_doc_id(namespace, id),
+                    "namespace": namespace,
+                })
+                .await?;
+            if existing.is_none() {
+                // No document in this namespace — nothing to delete, and no
+                // proxy associations to pull.
+                mtls_lease.release().await?;
+                self.check_slow_query("delete_plugin_config", start);
+                return Ok(false);
+            }
+            let namespace = namespace.to_string();
+            let affected_proxy_ids = self.attached_plugin_proxy_ids(&namespace, id, None).await?;
+            if let Some(expected) = expected {
+                PluginAssociationPreconditionFailed::check(
+                    id,
+                    &affected_proxy_ids,
+                    expected,
+                    None,
+                )?;
+            }
+            let deleted = mtls_lease
+                .run_mutation(async {
+                    let deleted = if self.replica_set_configured() {
+                        let connection = self.connection();
+                        let mut session = connection.client.start_session().await?;
+                        let deleted = session
+                            .start_transaction()
+                            .and_run(
+                                (
+                                    self,
+                                    id.to_string(),
+                                    namespace.clone(),
+                                    expected,
+                                ),
+                                |s, (this, id, namespace, expected)| {
+                                    Box::pin(async move {
+                                        let affected_proxy_ids = this.attached_plugin_proxy_ids(&namespace, &id, Some(&mut *s)).await?;
+                                        if let Some(expected) = expected {
+                                            PluginAssociationPreconditionFailed::check(&id, &affected_proxy_ids, expected, None)
+                                                .map_err(mongodb::error::Error::custom)?;
+                                        }
+                                        this.proxies()
+                                    .update_many(
+                                        doc! {
+                                            "plugins.plugin_config_id": id.as_str(),
+                                            "namespace": namespace.as_str(),
+                                        },
+                                        doc! {
+                                            "$pull": {
+                                                "plugins": { "plugin_config_id": id.as_str() }
+                                            },
+                                            "$set": { "updated_at": Utc::now().to_rfc3339() },
+                                        },
+                                    )
+                                    .session(&mut *s)
+                                    .await?;
+                                        let result = this
+                                            .plugin_configs()
+                                            .delete_one(doc! {
+                                                "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
+                                                "namespace": namespace.as_str(),
+                                            })
+                                            .session(&mut *s)
+                                            .await?;
+                                        if result.deleted_count > 0 {
+                                            this.record_config_change_in_session(
+                                                &mut *s,
+                                                namespace.as_str(),
+                                                "plugin_config",
+                                                id.as_str(),
+                                                "delete",
+                                            )
+                                            .await?;
+                                            for proxy_id in affected_proxy_ids.iter() {
+                                                this.record_config_change_in_session(
+                                                    &mut *s,
+                                                    namespace.as_str(),
+                                                    "proxy",
+                                                    proxy_id.as_str(),
+                                                    "upsert",
+                                                )
+                                                .await?;
+                                            }
+                                        }
+                                        Ok(result.deleted_count > 0)
+                                    })
+                                },
+                            )
+                            .await
+                            .map_err(Self::plugin_association_transaction_error)
+                            .context("delete_plugin_config transaction failed")?;
+                        if deleted {
+                            self.compact_config_changes_best_effort(&namespace).await;
+                        }
+                        deleted
+                    } else {
+                        self.proxies()
+                            .update_many(
+                                doc! {
+                                    "plugins.plugin_config_id": id,
+                                    "namespace": namespace.as_str(),
+                                },
+                                doc! {
+                                    "$pull": { "plugins": { "plugin_config_id": id } },
+                                    "$set": { "updated_at": Utc::now().to_rfc3339() },
+                                },
+                            )
+                            .await?;
+                        let result = self
+                            .plugin_configs()
+                            .delete_one(doc! {
+                                "_id": namespaced_doc_id(&namespace, id),
+                                "namespace": &namespace,
+                            })
+                            .await?;
+                        if result.deleted_count > 0 {
+                            self.record_config_change(&namespace, "plugin_config", id, "delete")
+                                .await?;
+                            for proxy_id in affected_proxy_ids {
+                                self.record_config_change(&namespace, "proxy", &proxy_id, "upsert")
+                                    .await?;
+                            }
+                        }
+                        result.deleted_count > 0
+                    };
+                    Ok(deleted)
+                })
+                .await?;
+            mtls_lease.release().await?;
+            self.check_slow_query("delete_plugin_config", start);
+            Ok(deleted)
+        }
+
+        fn plugin_association_transaction_error(error: mongodb::error::Error) -> anyhow::Error {
+            if let Some(refusal) = error.get_custom::<PluginAssociationPreconditionFailed>() {
+                anyhow::Error::new(refusal.clone())
+            } else {
+                anyhow::Error::new(error)
+            }
+        }
+
+        /// Primary association-only projection; never hydrates the plugin row.
+        async fn attached_plugin_proxy_ids(
+            &self,
+            namespace: &str,
+            plugin_id: &str,
+            session: Option<&mut ClientSession>,
+        ) -> mongodb::error::Result<BTreeSet<String>> {
+            let proxies = self.proxies();
+            let find = proxies
+                .find(doc! {
+                    "namespace": namespace,
+                    "plugins.plugin_config_id": plugin_id,
+                })
+                .projection(doc! { "_id": 0, "id": 1 });
+            let mut attached = BTreeSet::new();
+            if let Some(session) = session {
+                let mut cursor = find.session(&mut *session).await?;
+                while cursor.advance(&mut *session).await? {
+                    let doc = cursor.deserialize_current()?;
+                    attached.insert(Self::attached_plugin_proxy_id(&doc)?);
+                }
+            } else {
+                let mut cursor = find.await?;
+                while cursor.advance().await? {
+                    let doc = cursor.deserialize_current()?;
+                    attached.insert(Self::attached_plugin_proxy_id(&doc)?);
+                }
+            }
+            Ok(attached)
+        }
+
+        fn attached_plugin_proxy_id(doc: &Document) -> mongodb::error::Result<String> {
+            // Do not skip damaged association-bearing proxies.
+            doc.get_str("id").map(str::to_string).map_err(|_| {
+                mongodb::error::Error::custom(
+                    "failed to decode proxy id holding plugin association",
+                )
+            })
+        }
+
         /// Plan the proxy-association reconciliation for a proxy-scoped plugin
         /// config write (issue #4611).
         ///
@@ -3664,32 +4077,20 @@ mod inner {
             if pc.scope == PluginScope::ProxyGroup {
                 return Ok(ProxyAssociationPlan::default());
             }
-            let desired = pc.implied_proxy_association().map(str::to_string);
-
-            let mut attached = Vec::new();
-            let mut cursor = self
-                .proxies()
-                .find(doc! {
-                    "namespace": &pc.namespace,
-                    "plugins.plugin_config_id": &pc.id,
-                })
-                // `_id` is the composite "{namespace}:{id}" (issue #4627), so
-                // the bare proxy id is read from the `id` field.
-                .projection(doc! { "_id": 0, "id": 1 })
+            let attached = self
+                .attached_plugin_proxy_ids(&pc.namespace, &pc.id, None)
                 .await?;
-            while cursor.advance().await? {
-                let doc = cursor.deserialize_current()?;
-                // Every association-bearing proxy must decode: silently
-                // skipping one would leave an invalid association behind while
-                // the write reported success.
-                let proxy_id = doc.get_str("id").map_err(|error| {
-                    anyhow::anyhow!(
-                        "operation=plan_proxy_scoped_plugin_association resource=proxies field=id: failed to decode proxy holding the plugin association: {error}"
-                    )
-                })?;
-                attached.push(proxy_id.to_string());
-            }
+            Ok(Self::proxy_scoped_plugin_association_plan(pc, &attached))
+        }
 
+        fn proxy_scoped_plugin_association_plan(
+            pc: &PluginConfig,
+            attached: &BTreeSet<String>,
+        ) -> ProxyAssociationPlan {
+            if pc.scope == PluginScope::ProxyGroup {
+                return ProxyAssociationPlan::default();
+            }
+            let desired = pc.implied_proxy_association().map(str::to_string);
             let detach: Vec<String> = attached
                 .iter()
                 .filter(|proxy_id| desired.as_deref() != Some(proxy_id.as_str()))
@@ -3702,11 +4103,11 @@ mod inner {
             });
             let mut touched = detach.clone();
             touched.extend(attach.clone());
-            Ok(ProxyAssociationPlan {
+            ProxyAssociationPlan {
                 attach,
                 detach,
                 touched,
-            })
+            }
         }
 
         /// Apply a [`ProxyAssociationPlan`] inside a replica-set transaction.
@@ -11995,189 +12396,15 @@ mod inner {
         }
 
         async fn update_plugin_config(&self, pc: &PluginConfig) -> Result<bool, anyhow::Error> {
-            let start = std::time::Instant::now();
-            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(&pc.namespace).await?;
-            self.validate_plugin_graph_admission_candidate(&pc.namespace, |candidate| {
-                if let Some(existing) = candidate
-                    .plugin_configs
-                    .iter_mut()
-                    .find(|existing| existing.id == pc.id)
-                {
-                    *existing = pc.clone();
-                }
-                apply_proxy_association_to_candidate(candidate, pc);
-            })
-            .await?;
-            // Preserve api_spec_id by carrying it into the replacement document.
-            // Returning an error is safer than silently detaching spec ownership.
-            let mut doc = plugin_config_to_doc(pc)?;
-            let existing_doc = self
-                .plugin_configs()
-                .find_one(doc! {
-                    "_id": namespaced_doc_id(&pc.namespace, &pc.id),
-                    "namespace": &pc.namespace,
-                })
-                .await?;
-            if existing_doc.is_none() {
-                // No document in this namespace — phantom update, no
-                // config-change record (DB-M4).
-                mtls_lease.release().await?;
-                self.check_slow_query("update_plugin_config", start);
-                return Ok(false);
-            }
-            let existing_spec_id = match existing_doc.as_ref().and_then(|d| d.get("api_spec_id")) {
-                Some(Bson::String(s)) if !s.is_empty() => Some(s.clone()),
-                Some(Bson::Null) | None => None,
-                Some(other) => {
-                    anyhow::bail!(
-                        "plugin_config {} has non-string api_spec_id ownership tag: {:?}",
-                        pc.id,
-                        other
-                    );
-                }
-            };
-            if let Some(sid) = existing_spec_id {
-                doc.insert("api_spec_id", sid);
-            }
-            // The junction reconciliation is planned before the mutation so the
-            // transaction knows exactly which proxies move (issue #4611). A
-            // `proxy_id` move detaches the old proxy and attaches the new one;
-            // a scope change away from `proxy` detaches the stale association.
-            let plan = self.plan_proxy_scoped_plugin_association(pc).await?;
-            let touched_proxies = plugin_config_touched_proxies(pc, &plan);
-            let matched = mtls_lease
-                .run_mutation(async {
-                    if self.replica_set_configured() {
-                        let connection = self.connection();
-                        let mut session = connection.client.start_session().await?;
-                        let matched = session
-                            .start_transaction()
-                            .and_run(
-                                (
-                                    self,
-                                    doc,
-                                    pc.namespace.clone(),
-                                    pc.id.clone(),
-                                    plan.clone(),
-                                    touched_proxies.clone(),
-                                ),
-                                |s, (this, doc, namespace, id, plan, touched_proxies)| {
-                                    Box::pin(async move {
-                                        let replace_result = this
-                                            .plugin_configs()
-                                            .replace_one(
-                                                doc! {
-                                                    "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
-                                                    "namespace": namespace.as_str(),
-                                                },
-                                                doc.clone(),
-                                            )
-                                            .session(&mut *s)
-                                            .await?;
-                                        if replace_result.matched_count == 0 {
-                                            // Phantom update: no config-change record
-                                            // (DB-M4).
-                                            return Ok(false);
-                                        }
-                                        this.apply_proxy_association_plan_in_session(
-                                            &mut *s,
-                                            namespace.as_str(),
-                                            id.as_str(),
-                                            plan,
-                                        )
-                                        .await?;
-                                        this.record_config_change_in_session(
-                                            &mut *s,
-                                            namespace.as_str(),
-                                            "plugin_config",
-                                            id.as_str(),
-                                            "upsert",
-                                        )
-                                        .await?;
-                                        for proxy_id in touched_proxies.iter() {
-                                            this.record_config_change_in_session(
-                                                &mut *s,
-                                                namespace.as_str(),
-                                                "proxy",
-                                                proxy_id.as_str(),
-                                                "upsert",
-                                            )
-                                            .await?;
-                                        }
-                                        Ok(true)
-                                    })
-                                },
-                            )
-                            .await
-                            .map_err(anyhow::Error::new)
-                            .context("update_plugin_config transaction failed")?;
-                        if matched {
-                            self.compact_config_changes_best_effort(&pc.namespace).await;
-                        }
-                        return Ok(matched);
-                    } else {
-                        let replace_result = self
-                            .plugin_configs()
-                            .replace_one(
-                                doc! {
-                                    "_id": namespaced_doc_id(&pc.namespace, &pc.id),
-                                    "namespace": &pc.namespace,
-                                },
-                                doc,
-                            )
-                            .await?;
-                        if replace_result.matched_count == 0 {
-                            // Phantom update (concurrent delete): no config-change
-                            // record (DB-M4).
-                            return Ok(false);
-                        }
-                        let change_result: Result<(), anyhow::Error> = async {
-                            // Attach/detach before the change records: a
-                            // standalone deployment has no transaction, so the
-                            // association the runtime reads is written while the
-                            // plugin-config document can still be rolled back.
-                            self.apply_proxy_association_plan(&pc.namespace, &pc.id, &plan)
-                                .await?;
-                            self.record_config_change(
-                                &pc.namespace,
-                                "plugin_config",
-                                &pc.id,
-                                "upsert",
-                            )
-                            .await?;
-                            for proxy_id in &touched_proxies {
-                                self.record_config_change(
-                                    &pc.namespace,
-                                    "proxy",
-                                    proxy_id.as_str(),
-                                    "upsert",
-                                )
-                                .await?;
-                            }
-                            Ok(())
-                        }
-                        .await;
-                        if let Err(err) = change_result {
-                            self.compensate_proxy_association_plan(&pc.namespace, &pc.id, &plan)
-                                .await;
-                            self.rollback_standalone_updated_document(
-                                "plugin_configs",
-                                &pc.namespace,
-                                "plugin_config",
-                                &pc.id,
-                                existing_doc,
-                                &err,
-                            )
-                            .await;
-                            return Err(err);
-                        }
-                    }
-                    Ok(true)
-                })
-                .await?;
-            mtls_lease.release().await?;
-            self.check_slow_query("update_plugin_config", start);
-            Ok(matched)
+            self.update_plugin_config_inner(pc, None).await
+        }
+
+        async fn update_plugin_config_expected(
+            &self,
+            pc: &PluginConfig,
+            expected: &BTreeSet<String>,
+        ) -> Result<bool, anyhow::Error> {
+            self.update_plugin_config_inner(pc, Some(expected)).await
         }
 
         async fn delete_plugin_config(
@@ -12185,154 +12412,27 @@ mod inner {
             namespace: &str,
             id: &str,
         ) -> Result<bool, anyhow::Error> {
-            let start = std::time::Instant::now();
-            let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_plugin_graph_repair_delete_candidate(namespace, |candidate| {
-                candidate.plugin_configs.retain(|plugin| plugin.id != id);
-                for proxy in &mut candidate.proxies {
-                    proxy
-                        .plugins
-                        .retain(|association| association.plugin_config_id != id);
-                }
-            })
-            .await?;
-            let existing = self
-                .plugin_configs()
-                .find_one(doc! {
-                    "_id": namespaced_doc_id(namespace, id),
-                    "namespace": namespace,
-                })
-                .await?;
-            if existing.is_none() {
-                // No document in this namespace — nothing to delete, and no
-                // proxy associations to pull.
-                mtls_lease.release().await?;
-                self.check_slow_query("delete_plugin_config", start);
-                return Ok(false);
-            }
-            let namespace = namespace.to_string();
-            let mut affected_proxy_ids = Vec::new();
-            let mut affected_cursor = self
-                .proxies()
-                .find(doc! {
-                    "plugins.plugin_config_id": id,
-                    "namespace": namespace.as_str(),
-                })
-                // `_id` is composite (issue #4627); the bare proxy id is `id`.
-                .projection(doc! { "_id": 0, "id": 1 })
-                .await?;
-            while affected_cursor.advance().await? {
-                let doc = affected_cursor.deserialize_current()?;
-                if let Ok(proxy_id) = doc.get_str("id") {
-                    affected_proxy_ids.push(proxy_id.to_string());
-                }
-            }
-            let deleted = mtls_lease
-                .run_mutation(async {
-                    let deleted = if self.replica_set_configured() {
-                        let connection = self.connection();
-                        let mut session = connection.client.start_session().await?;
-                        let deleted = session
-                            .start_transaction()
-                            .and_run(
-                                (
-                                    self,
-                                    id.to_string(),
-                                    namespace.clone(),
-                                    affected_proxy_ids.clone(),
-                                ),
-                                |s, (this, id, namespace, affected_proxy_ids)| {
-                                    Box::pin(async move {
-                                        this.proxies()
-                                    .update_many(
-                                        doc! {
-                                            "plugins.plugin_config_id": id.as_str(),
-                                            "namespace": namespace.as_str(),
-                                        },
-                                        doc! {
-                                            "$pull": {
-                                                "plugins": { "plugin_config_id": id.as_str() }
-                                            },
-                                            "$set": { "updated_at": Utc::now().to_rfc3339() },
-                                        },
-                                    )
-                                    .session(&mut *s)
-                                    .await?;
-                                        let result = this
-                                            .plugin_configs()
-                                            .delete_one(doc! {
-                                                "_id": namespaced_doc_id(namespace.as_str(), id.as_str()),
-                                                "namespace": namespace.as_str(),
-                                            })
-                                            .session(&mut *s)
-                                            .await?;
-                                        if result.deleted_count > 0 {
-                                            this.record_config_change_in_session(
-                                                &mut *s,
-                                                namespace.as_str(),
-                                                "plugin_config",
-                                                id.as_str(),
-                                                "delete",
-                                            )
-                                            .await?;
-                                            for proxy_id in affected_proxy_ids.iter() {
-                                                this.record_config_change_in_session(
-                                                    &mut *s,
-                                                    namespace.as_str(),
-                                                    "proxy",
-                                                    proxy_id.as_str(),
-                                                    "upsert",
-                                                )
-                                                .await?;
-                                            }
-                                        }
-                                        Ok(result.deleted_count > 0)
-                                    })
-                                },
-                            )
-                            .await
-                            .map_err(anyhow::Error::new)
-                            .context("delete_plugin_config transaction failed")?;
-                        if deleted {
-                            self.compact_config_changes_best_effort(&namespace).await;
-                        }
-                        deleted
-                    } else {
-                        self.proxies()
-                            .update_many(
-                                doc! {
-                                    "plugins.plugin_config_id": id,
-                                    "namespace": namespace.as_str(),
-                                },
-                                doc! {
-                                    "$pull": { "plugins": { "plugin_config_id": id } },
-                                    "$set": { "updated_at": Utc::now().to_rfc3339() },
-                                },
-                            )
-                            .await?;
-                        let result = self
-                            .plugin_configs()
-                            .delete_one(doc! {
-                                "_id": namespaced_doc_id(&namespace, id),
-                                "namespace": &namespace,
-                            })
-                            .await?;
-                        if result.deleted_count > 0 {
-                            self.record_config_change(&namespace, "plugin_config", id, "delete")
-                                .await?;
-                            for proxy_id in affected_proxy_ids {
-                                self.record_config_change(&namespace, "proxy", &proxy_id, "upsert")
-                                    .await?;
-                            }
-                        }
-                        result.deleted_count > 0
-                    };
-                    Ok(deleted)
-                })
-                .await?;
-            mtls_lease.release().await?;
-            self.check_slow_query("delete_plugin_config", start);
-            Ok(deleted)
+            self.delete_plugin_config_inner(namespace, id, None).await
+        }
+
+        async fn delete_plugin_config_expected(
+            &self,
+            namespace: &str,
+            id: &str,
+            expected: &BTreeSet<String>,
+        ) -> Result<bool, anyhow::Error> {
+            self.delete_plugin_config_inner(namespace, id, Some(expected))
+                .await
+        }
+
+        async fn list_plugin_config_referencing_proxy_ids(
+            &self,
+            namespace: &str,
+            plugin_id: &str,
+        ) -> Result<BTreeSet<String>, anyhow::Error> {
+            Ok(self
+                .attached_plugin_proxy_ids(namespace, plugin_id, None)
+                .await?)
         }
 
         async fn get_plugin_config(
@@ -20109,7 +20209,7 @@ mod inner {
             );
 
             let update_plugin_start = source
-                .find("async fn update_plugin_config(&self, pc: &PluginConfig)")
+                .find("async fn update_plugin_config_inner(")
                 .expect("update_plugin_config function");
             let update_plugin_body = &source[update_plugin_start..];
             assert!(
