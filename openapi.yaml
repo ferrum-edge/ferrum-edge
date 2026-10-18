@@ -6859,6 +6859,15 @@ paths:
         request's namespace is rejected with `400`
         (`proxy_id '<P>' does not exist in namespace '<ns>'`) and nothing is
         mutated.
+
+        **Association precondition (required).** Association rows are outside
+        this resource's `ETag`, so `If-Match` cannot fence a proxy that
+        attached this config after the caller's read. Every `PUT` must send
+        `expected_proxy_ids` (see the parameter): if a proxy outside that set
+        (and outside the `proxy_id` target this body keeps) currently
+        references the config, the write is refused with `412` and nothing
+        is mutated, instead of silently detaching that proxy. The check and
+        the write are atomic under the namespace config admission lease.
       tags: [Plugins]
       requestBody:
         required: true
@@ -6869,6 +6878,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
         - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/ExpectedProxyIds"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -6909,10 +6919,18 @@ paths:
         Deletes the plugin configuration and, in the same transaction, removes
         it from the `plugins` array of every proxy that lists it, advancing
         those proxies' `updated_at`.
+
+        **Association precondition (required).** Every `DELETE` must send
+        `expected_proxy_ids` (see the parameter): if a proxy outside that
+        set currently references the config, the delete is refused with
+        `412` and nothing is mutated, instead of silently detaching that
+        proxy. The check and the delete are atomic under the namespace
+        config admission lease.
       tags: [Plugins]
       parameters:
         - $ref: "#/components/parameters/LiveApplyMode"
         - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/ExpectedProxyIds"
       responses:
         "202":
           $ref: "#/components/responses/AcceptedDeferred"
@@ -8767,6 +8785,23 @@ components:
         `PUT`, `PATCH`, or `DELETE` carrying it is refused with `400` rather
         than applied unconditionally. As RFC 9110 §13.2.1 requires, a request
         that would otherwise be `404` is `404` regardless of the precondition.
+    ExpectedProxyIds:
+      name: expected_proxy_ids
+      in: query
+      required: true
+      schema:
+        type: string
+      description: |
+        Required on `PUT`/`DELETE /plugins/config/{id}`. Comma-separated ids
+        of every proxy the caller expects to reference this plugin config
+        and accepts this write detaching (a `proxy`-scoped PUT's kept
+        `proxy_id` target may be listed or omitted). Present-but-empty
+        (`expected_proxy_ids=`) expects no referencing proxy. Absent,
+        supplied more than once, or malformed (empty entry, duplicate,
+        invalid resource id) is `400`. If any other proxy currently
+        references the config, the write is refused with `412` naming those
+        proxies and nothing is mutated. Re-read the namespace and retry
+        with the current referencing set to accept detaching them.
     ProvisionedBy:
       name: X-Ferrum-Provisioned-By
       in: header

@@ -4536,6 +4536,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4604,6 +4605,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4732,6 +4734,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4787,6 +4790,7 @@ async fn handle_admin_request_inner(
                 &namespace,
                 route_live_apply_mode!(),
                 if_match,
+                uri.query(),
             )
             .await
         }
@@ -4869,6 +4873,7 @@ async fn handle_admin_request_inner(
                 route_live_apply_mode!(),
                 // Trust bundles keep their own body `revision` contract.
                 None,
+                uri.query(),
             )
             .await
         }

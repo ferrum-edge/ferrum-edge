@@ -4,7 +4,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{BTreeSet, HashSet, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1185,6 +1185,66 @@ async fn plugin_has_foreign_proxy_association(
         }
         offset += items_len;
     }
+}
+
+/// Every proxy in the namespace whose `plugins` list references this
+/// plugin config, read through the backend's paginated proxy list.
+async fn plugin_referencing_proxy_ids(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin_id: &str,
+) -> DbResult<BTreeSet<String>> {
+    let mut referencing = BTreeSet::new();
+    let mut offset = 0_i64;
+    const PAGE_SIZE: i64 = 1_000;
+    loop {
+        let page = db
+            .list_proxies_paginated(namespace, PAGE_SIZE, offset)
+            .await?;
+        let items_len = page.items.len() as i64;
+        for proxy in &page.items {
+            if proxy
+                .plugins
+                .iter()
+                .any(|association| association.plugin_config_id == plugin_id)
+            {
+                referencing.insert(proxy.id.clone());
+            }
+        }
+        if items_len == 0 || offset + items_len >= page.total {
+            return Ok(referencing);
+        }
+        offset += items_len;
+    }
+}
+
+/// Proxies in `current` that the caller did not account for: neither in
+/// the supplied expected set nor the write's kept target.
+fn unexpected_plugin_references(
+    current: &BTreeSet<String>,
+    expected: &ExpectedProxyIds,
+    kept: Option<&str>,
+) -> Vec<String> {
+    current
+        .iter()
+        .filter(|proxy| Some(proxy.as_str()) != kept && !expected.0.contains(*proxy))
+        .cloned()
+        .collect()
+}
+
+fn plugin_association_precondition_refusal(
+    plugin_id: &str,
+    unexpected: &[String],
+) -> AfterValidateError {
+    AfterValidateError::Response(Box::new(super::json_response(
+        StatusCode::PRECONDITION_FAILED,
+        &json!({"error": format!(
+            "plugin config '{}' is referenced by proxies outside expected_proxy_ids: {}; \
+             re-read the namespace and retry with the current referencing set",
+            plugin_id,
+            unexpected.join(", ")
+        )}),
+    )))
 }
 
 async fn proxy_has_scoped_plugin(
@@ -2860,6 +2920,46 @@ pub(crate) trait AdminResource:
         Self::db_delete(db, namespace, id).await
     }
 
+    /// Extra query-string state for PUT (full-replacement update). Default
+    /// is unused, mirroring [`Self::DeleteQuery`].
+    type UpdateQuery: Send + Sync + Clone + Default + 'static;
+
+    /// Parse resource-specific PUT query parameters. Default ignores the
+    /// query string. Return `Err` for a 400 before any persistence.
+    fn parse_update_query(_query: Option<&str>) -> Result<Self::UpdateQuery, String> {
+        Ok(Self::UpdateQuery::default())
+    }
+
+    /// Refuse an update whose caller-supplied precondition (from the query
+    /// string) no longer holds against current stored state. Called under
+    /// the namespace config admission lease, after validation and before
+    /// persistence, so the comparison is atomic with the write for every
+    /// supported writer — the same lease model that fences `If-Match`.
+    async fn check_update_precondition(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _resource: &Self,
+        _opts: &Self::UpdateQuery,
+    ) -> Result<(), AfterValidateError> {
+        Ok(())
+    }
+
+    /// Refuse a delete whose caller-supplied precondition (from the query
+    /// string) no longer holds against current stored state. Called under
+    /// the namespace config admission lease, before persistence.
+    /// `previous_snapshot` is the lease-held namespace snapshot when one
+    /// was loaded; it is `None` only on the undecodable-row repair path,
+    /// where the snapshot cannot be hydrated.
+    async fn check_delete_precondition(
+        _db: &dyn DatabaseBackend,
+        _namespace: &str,
+        _id: &str,
+        _previous_snapshot: Option<&GatewayConfig>,
+        _opts: &Self::DeleteQuery,
+    ) -> Result<(), AfterValidateError> {
+        Ok(())
+    }
+
     async fn compensate_late_delete(
         db: &dyn DatabaseBackend,
         _namespace: &str,
@@ -3114,6 +3214,7 @@ pub(crate) async fn handle_create<R: AdminResource>(
         apply_mode,
         provisioner,
         None,
+        None,
     )
     .await
 }
@@ -3126,6 +3227,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
     namespace: &str,
     apply_mode: LiveApplyMode,
     if_match: Option<&IfMatch>,
+    query: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     handle_write::<R>(
         state,
@@ -3136,6 +3238,7 @@ pub(crate) async fn handle_update<R: AdminResource>(
         apply_mode,
         None,
         if_match,
+        query,
     )
     .await
 }
@@ -3188,6 +3291,59 @@ fn if_match_refusal<R: AdminResource>(
             id
         )}),
     ))
+}
+
+/// The caller-supplied set of proxies expected to reference a plugin
+/// config, from the required `expected_proxy_ids` query parameter on
+/// `PUT`/`DELETE /plugins/config/{id}` (forge-ops issue #569).
+///
+/// Deleting a plugin config removes every proxy association to it, and a
+/// `proxy`/`global` update removes every association but its target. Those
+/// rows are outside the plugin config's own `ETag`, so `If-Match` cannot
+/// fence an association another writer committed after the caller's read.
+/// The write is therefore refused unless every currently referencing
+/// proxy is in this set (or is the target a `proxy`-scoped update keeps).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExpectedProxyIds(BTreeSet<String>);
+
+/// Parse the required `expected_proxy_ids` query parameter: exactly one
+/// occurrence, comma-separated proxy ids, present-but-empty for "expect
+/// none". Absent, repeated, or malformed (empty entry, duplicate, invalid
+/// id) is an error, because the parameter decides which associations the
+/// write may detach.
+pub(crate) fn parse_expected_proxy_ids_query(
+    query: Option<&str>,
+) -> Result<ExpectedProxyIds, String> {
+    let mut found: Option<String> = None;
+    for (key, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+        if key.as_ref() != "expected_proxy_ids" {
+            continue;
+        }
+        if found.is_some() {
+            return Err("expected_proxy_ids must not be supplied more than once".to_string());
+        }
+        found = Some(value.into_owned());
+    }
+    let Some(value) = found else {
+        return Err(
+            "expected_proxy_ids query parameter is required: list every proxy that may \
+             reference this plugin config (empty value expects none)"
+                .to_string(),
+        );
+    };
+    let mut ids = BTreeSet::new();
+    if value.is_empty() {
+        return Ok(ExpectedProxyIds(ids));
+    }
+    for entry in value.split(',') {
+        validate_resource_id(entry).map_err(|message| format!("expected_proxy_ids: {message}"))?;
+        if !ids.insert(entry.to_string()) {
+            return Err(format!(
+                "expected_proxy_ids lists proxy '{entry}' more than once"
+            ));
+        }
+    }
+    Ok(ExpectedProxyIds(ids))
 }
 
 /// Parse `cleanup_orphaned_upstream` from `DELETE /proxies/{id}`.
@@ -3287,6 +3443,11 @@ pub(crate) async fn handle_delete<R: AdminResource>(
             if let Some(response) = if_match_refusal::<R>(state, if_match, id, None) {
                 return Ok(response);
             }
+            if let Err(error) =
+                R::check_delete_precondition(db, namespace, id, None, &delete_query).await
+            {
+                return Ok(map_after_validate_error::<R>(error));
+            }
             // Issue #2997: the target row exists but cannot be decoded. Skip
             // namespace-snapshot recovery (that load fails for the same row) and
             // delete by id so admin remains the in-band repair path.
@@ -3339,6 +3500,12 @@ pub(crate) async fn handle_delete<R: AdminResource>(
     } else {
         None
     };
+    if let Err(error) =
+        R::check_delete_precondition(db, namespace, id, previous_snapshot.as_ref(), &delete_query)
+            .await
+    {
+        return Ok(map_after_validate_error::<R>(error));
+    }
     let previous_api_spec = match R::late_delete_api_spec_snapshot(
         db,
         namespace,
@@ -4003,6 +4170,7 @@ impl AdminResource for Upstream {
     }
 
     type DeleteQuery = ();
+    type UpdateQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -4259,6 +4427,7 @@ impl AdminResource for GatewayTrustBundleRecord {
     }
 
     type DeleteQuery = ();
+    type UpdateQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -4477,7 +4646,79 @@ impl AdminResource for PluginConfig {
         db.delete_plugin_config(namespace, id).await
     }
 
-    type DeleteQuery = ();
+    type DeleteQuery = ExpectedProxyIds;
+    type UpdateQuery = ExpectedProxyIds;
+
+    fn parse_delete_query(query: Option<&str>) -> Result<ExpectedProxyIds, String> {
+        parse_expected_proxy_ids_query(query)
+    }
+
+    fn parse_update_query(query: Option<&str>) -> Result<ExpectedProxyIds, String> {
+        parse_expected_proxy_ids_query(query)
+    }
+
+    /// Refuse the update while a proxy the caller did not account for
+    /// references this config: applying it would silently detach that
+    /// proxy (forge-ops #569). Runs under the namespace admission lease.
+    async fn check_update_precondition(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        resource: &Self,
+        expected: &ExpectedProxyIds,
+    ) -> Result<(), AfterValidateError> {
+        let current = plugin_referencing_proxy_ids(db, namespace, &resource.id)
+            .await
+            .map_err(AfterValidateError::Db)?;
+        let kept = if resource.scope == PluginScope::Proxy {
+            resource.proxy_id.as_deref()
+        } else {
+            None
+        };
+        let unexpected = unexpected_plugin_references(&current, expected, kept);
+        if unexpected.is_empty() {
+            Ok(())
+        } else {
+            Err(plugin_association_precondition_refusal(
+                &resource.id,
+                &unexpected,
+            ))
+        }
+    }
+
+    /// Refuse the delete while a proxy the caller did not account for
+    /// references this config (forge-ops #569). The lease-held snapshot is
+    /// authoritative when present; the undecodable-row repair path reads
+    /// the junction state through the proxy list instead.
+    async fn check_delete_precondition(
+        db: &dyn DatabaseBackend,
+        namespace: &str,
+        id: &str,
+        previous_snapshot: Option<&GatewayConfig>,
+        expected: &ExpectedProxyIds,
+    ) -> Result<(), AfterValidateError> {
+        let current = match previous_snapshot {
+            Some(snapshot) => snapshot
+                .proxies
+                .iter()
+                .filter(|proxy| {
+                    proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == id)
+                })
+                .map(|proxy| proxy.id.clone())
+                .collect::<BTreeSet<_>>(),
+            None => plugin_referencing_proxy_ids(db, namespace, id)
+                .await
+                .map_err(AfterValidateError::Db)?,
+        };
+        let unexpected = unexpected_plugin_references(&current, expected, None);
+        if unexpected.is_empty() {
+            Ok(())
+        } else {
+            Err(plugin_association_precondition_refusal(id, &unexpected))
+        }
+    }
 
     async fn compensate_late_delete(
         db: &dyn DatabaseBackend,
@@ -5040,6 +5281,7 @@ impl AdminResource for Proxy {
     }
 
     type DeleteQuery = bool;
+    type UpdateQuery = ();
 
     fn parse_delete_query(query: Option<&str>) -> Result<bool, String> {
         parse_cleanup_orphaned_upstream_query(query)
@@ -5735,6 +5977,7 @@ impl AdminResource for Consumer {
     }
 
     type DeleteQuery = ();
+    type UpdateQuery = ();
 
     async fn check_uniqueness(
         db: &dyn DatabaseBackend,
@@ -5958,6 +6201,7 @@ async fn handle_write<R: AdminResource>(
     apply_mode: LiveApplyMode,
     provisioner: Option<&str>,
     if_match: Option<&IfMatch>,
+    query: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let _write_permit = match state.admit_write().await {
         Ok(permit) => permit,
@@ -5972,6 +6216,20 @@ async fn handle_write<R: AdminResource>(
             &json!({"error": message}),
         ));
     }
+
+    let update_query = if matches!(action, WriteAction::Update { .. }) {
+        match R::parse_update_query(query) {
+            Ok(opts) => opts,
+            Err(message) => {
+                return Ok(super::json_response(
+                    StatusCode::BAD_REQUEST,
+                    &json!({"error": message}),
+                ));
+            }
+        }
+    } else {
+        R::UpdateQuery::default()
+    };
 
     let db_arc = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -6168,6 +6426,15 @@ async fn handle_write<R: AdminResource>(
         &validation_ctx,
     )
     .await
+    {
+        return Ok(map_after_validate_error::<R>(error));
+    }
+
+    // Caller-supplied state precondition, still under the admission lease
+    // this write commits under (forge-ops #569).
+    if matches!(action, WriteAction::Update { .. })
+        && let Err(error) =
+            R::check_update_precondition(db, namespace, &resource, &update_query).await
     {
         return Ok(map_after_validate_error::<R>(error));
     }

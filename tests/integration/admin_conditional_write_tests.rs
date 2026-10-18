@@ -594,7 +594,7 @@ async fn every_full_replacement_family_refuses_a_stale_tag() {
         ),
         (
             "/plugins/config",
-            "/plugins/config/shared-plugin",
+            "/plugins/config/shared-plugin?expected_proxy_ids=",
             json!({"id": "shared-plugin", "plugin_name": "cors", "scope": "global", "enabled": false, "config": {"allowed_origins": ["https://a.example"]}}),
             json!({"id": "shared-plugin", "plugin_name": "cors", "scope": "global", "enabled": true, "config": {"allowed_origins": ["https://a.example"]}}),
             json!({"id": "shared-plugin", "plugin_name": "cors", "scope": "global", "enabled": false, "config": {"allowed_origins": ["https://b.example"]}}),
@@ -5365,4 +5365,309 @@ async fn assert_sql_deployment_raw_preservation(
         let expected_ids: Vec<String> = expected_ids.iter().map(|id| (*id).to_string()).collect();
         assert_eq!(identities, expected_ids, "{table} row identities");
     }
+}
+
+/// forge-ops #569: plugin-config `PUT`/`DELETE` require `expected_proxy_ids`
+/// and refuse, atomically with the write, to detach a referencing proxy the
+/// caller did not account for.
+fn assoc_proxy(id: &str, plugin_ids: &[&str]) -> Value {
+    json!({
+        "id": id,
+        "listen_path": format!("/{id}"),
+        "backend_scheme": "http",
+        "backend_host": "10.0.0.1",
+        "backend_port": 8080,
+        "plugins": plugin_ids
+            .iter()
+            .map(|plugin_id| json!({"plugin_config_id": plugin_id}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn group_plugin(id: &str, scope: &str, origin: &str) -> Value {
+    json!({
+        "id": id,
+        "plugin_name": "cors",
+        "scope": scope,
+        "enabled": true,
+        "config": {"allowed_origins": [origin]},
+    })
+}
+
+fn referencing(body: &Value, plugin_id: &str) -> bool {
+    body["plugins"]
+        .as_array()
+        .map(|plugins| {
+            plugins
+                .iter()
+                .any(|entry| entry["plugin_config_id"] == plugin_id)
+        })
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn plugin_delete_requires_and_enforces_expected_proxy_ids() {
+    let (_dir, base, _shutdown) = serve().await;
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-del", "proxy_group", "https://a.example"),
+    )
+    .await;
+    create(&base, "/proxies", assoc_proxy("pa", &["pc-del"])).await;
+    create(&base, "/proxies", assoc_proxy("pb", &["pc-del"])).await;
+
+    // Absent parameter: 400, nothing deleted.
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-del",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "absent: {}", reply.body);
+    assert_eq!(get(&base, "/plugins/config/pc-del").await.status, 200);
+
+    // Malformed values: duplicate, empty entry, invalid id, repeated key.
+    for query in [
+        "expected_proxy_ids=pa,pa",
+        "expected_proxy_ids=pa,,pb",
+        "expected_proxy_ids=bad!id",
+        "expected_proxy_ids=pa&expected_proxy_ids=pb",
+    ] {
+        let reply = send(
+            Method::DELETE,
+            &base,
+            &format!("/plugins/config/pc-del?{query}"),
+            &admin_token(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "{query}: {}", reply.body);
+    }
+
+    // A referencing proxy outside the expected set: 412 naming it, state intact.
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-del?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 412, "incomplete: {}", reply.body);
+    assert!(
+        reply.body["error"].as_str().expect("error").contains("pb"),
+        "names pb: {}",
+        reply.body
+    );
+    assert_eq!(get(&base, "/plugins/config/pc-del").await.status, 200);
+    assert!(referencing(&get(&base, "/proxies/pb").await.body, "pc-del"));
+
+    // The complete set: delete lands and the associations are gone.
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-del?expected_proxy_ids=pa,pb",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 204, "complete: {}", reply.body);
+    assert_eq!(get(&base, "/plugins/config/pc-del").await.status, 404);
+    assert!(!referencing(
+        &get(&base, "/proxies/pa").await.body,
+        "pc-del"
+    ));
+
+    // An explicitly empty expectation deletes an unreferenced config.
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-lonely", "global", "https://a.example"),
+    )
+    .await;
+    let reply = send(
+        Method::DELETE,
+        &base,
+        "/plugins/config/pc-lonely?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, 204, "empty: {}", reply.body);
+}
+
+#[tokio::test]
+async fn plugin_retarget_put_enforces_expected_proxy_ids() {
+    let (_dir, base, _shutdown) = serve().await;
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-move", "proxy_group", "https://a.example"),
+    )
+    .await;
+    create(&base, "/proxies", assoc_proxy("pa", &["pc-move"])).await;
+    create(&base, "/proxies", assoc_proxy("pb", &["pc-move"])).await;
+
+    let global = group_plugin("pc-move", "global", "https://a.example");
+    // Absent parameter: 400 even though the body is valid.
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-move",
+        &admin_token(),
+        None,
+        Some(&global),
+    )
+    .await;
+    assert_eq!(reply.status, 400, "absent: {}", reply.body);
+
+    // Retarget to global with an incomplete set: 412, scope unchanged.
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-move?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        Some(&global),
+    )
+    .await;
+    assert_eq!(reply.status, 412, "incomplete: {}", reply.body);
+    assert_eq!(
+        get(&base, "/plugins/config/pc-move").await.body["scope"],
+        "proxy_group"
+    );
+
+    // Complete set: retarget lands, both proxies detached.
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-move?expected_proxy_ids=pa,pb",
+        &admin_token(),
+        None,
+        Some(&global),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "complete: {}", reply.body);
+    assert!(!referencing(
+        &get(&base, "/proxies/pb").await.body,
+        "pc-move"
+    ));
+
+    // Re-home a proxy_group config onto pb: pa references it, pb is kept.
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-home", "proxy_group", "https://a.example"),
+    )
+    .await;
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/proxies/pa",
+        &admin_token(),
+        None,
+        Some(&assoc_proxy("pa", &["pc-home"])),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "attach pa: {}", reply.body);
+    let mut homed = group_plugin("pc-home", "proxy", "https://a.example");
+    homed["proxy_id"] = json!("pb");
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-home?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        Some(&homed),
+    )
+    .await;
+    assert_eq!(reply.status, 412, "pa unexpected: {}", reply.body);
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-home?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        Some(&homed),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "re-home: {}", reply.body);
+    assert!(!referencing(
+        &get(&base, "/proxies/pa").await.body,
+        "pc-home"
+    ));
+    assert!(referencing(
+        &get(&base, "/proxies/pb").await.body,
+        "pc-home"
+    ));
+
+    // The kept target need not be listed: a same-target update with an
+    // empty expectation succeeds while pb references the config.
+    let mut tweaked = group_plugin("pc-home", "proxy", "https://b.example");
+    tweaked["proxy_id"] = json!("pb");
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-home?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        Some(&tweaked),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "kept target: {}", reply.body);
+
+    // The precondition is unconditional: a non-detaching proxy_group update
+    // is still refused when a referencing proxy is not expected.
+    create(
+        &base,
+        "/plugins/config",
+        group_plugin("pc-group", "proxy_group", "https://a.example"),
+    )
+    .await;
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/proxies/pa",
+        &admin_token(),
+        None,
+        Some(&assoc_proxy("pa", &["pc-group"])),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "attach group: {}", reply.body);
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-group?expected_proxy_ids=",
+        &admin_token(),
+        None,
+        Some(&group_plugin(
+            "pc-group",
+            "proxy_group",
+            "https://b.example",
+        )),
+    )
+    .await;
+    assert_eq!(reply.status, 412, "group unconditional: {}", reply.body);
+    let reply = send(
+        Method::PUT,
+        &base,
+        "/plugins/config/pc-group?expected_proxy_ids=pa",
+        &admin_token(),
+        None,
+        Some(&group_plugin(
+            "pc-group",
+            "proxy_group",
+            "https://b.example",
+        )),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "group expected: {}", reply.body);
 }

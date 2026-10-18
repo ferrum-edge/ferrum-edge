@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING — plugin-config writes require an association precondition**
+  (forge-ops issue #569). `PUT`/`DELETE /plugins/config/{id}` now require
+  the `expected_proxy_ids` query parameter listing every proxy the caller
+  expects to reference the config (empty value expects none; absent or
+  malformed is `400`). A write that would detach a referencing proxy
+  outside that set — one another writer attached after the caller's read,
+  invisible to the config's own `ETag` — is refused with `412` under the
+  namespace config admission lease, atomically with the write. Clients
+  must send the parameter on every plugin-config update and delete.
+
 ### Fixed
 - **Compression admission policy has a single typed source** (issue #6651,
   item 3). Validation clients previously re-parsed
