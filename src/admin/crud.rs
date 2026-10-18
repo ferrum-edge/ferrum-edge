@@ -43,6 +43,7 @@ pub(crate) type DbResult<T> = Result<T, anyhow::Error>;
 
 /// Resolve the plugin validation HTTP client, mapping a compression-policy
 /// parse refusal (issue #6651 item 3) to a 500 response in handler context.
+#[allow(clippy::result_large_err)]
 fn validation_http_client_or_500(
     state: &AdminState,
 ) -> Result<crate::plugins::PluginHttpClient, Response<Full<Bytes>>> {
