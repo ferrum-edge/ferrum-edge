@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **BREAKING — plugin-config writes require an association precondition**
-  (forge-ops issue #569). `PUT`/`DELETE /plugins/config/{id}` now require
+  (issue #569 in ferrum-edge-git-forge-ops). `PUT`/`DELETE /plugins/config/{id}` now require
   the `expected_proxy_ids` query parameter listing every proxy the caller
   expects to reference the config (empty value expects none; absent or
   malformed is `400`). A write that would detach a referencing proxy
