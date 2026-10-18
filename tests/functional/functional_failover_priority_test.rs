@@ -24,7 +24,6 @@ use ferrum_edge::modes::mesh::{
 };
 use reqwest::StatusCode;
 use serde_json::json;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -167,7 +166,7 @@ async fn live_failover_priority_prefers_label_match_then_fails_over_on_outlier()
     preferred.assert_no_step_errors().await;
     secondary.assert_no_step_errors().await;
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     tokio::time::timeout(Duration::from_secs(5), gateway_join)
         .await
         .expect("gateway shutdown timed out")
@@ -246,7 +245,12 @@ async fn start_gateway(
     preferred_port: u16,
     secondary_port: u16,
 ) -> Result<
-    (GatewayConfig, u16, watch::Sender<bool>, JoinHandle<()>),
+    (
+        GatewayConfig,
+        u16,
+        ferrum_edge::overload::ShutdownSender,
+        JoinHandle<()>,
+    ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let proxy = reserve_port().await?;
@@ -292,7 +296,9 @@ async fn start_gateway(
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles =
         ferrum_edge::modes::file::serve(env_config, prepared.clone(), opts, shutdown_tx.clone())
             .await

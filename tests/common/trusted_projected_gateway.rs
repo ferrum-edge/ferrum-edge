@@ -32,7 +32,6 @@ use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -105,7 +104,7 @@ pub struct TrustedProjectedGateway {
     admin_base_url: String,
     jwt_secret: String,
     jwt_issuer: String,
-    shutdown_tx: Option<watch::Sender<bool>>,
+    shutdown_tx: Option<ferrum_edge::overload::ShutdownSender>,
     join: Option<JoinHandle<()>>,
     /// Retained so callers can keep cert/key temp dirs alive by embedding
     /// them in the options path strings; this field documents ownership of
@@ -200,7 +199,9 @@ impl TrustedProjectedGateway {
         // Release the UDP reservation immediately before serve binds QUIC.
         drop(https_udp_reservation);
 
-        let (shutdown_tx, _) = watch::channel(false);
+        let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+            std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+        );
         let handles = serve(env_config, config, opts, shutdown_tx.clone())
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -354,7 +355,7 @@ impl TrustedProjectedGateway {
     /// leak across tests.
     pub async fn shutdown(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(true);
+            tx.shutdown();
         }
         if let Some(join) = self.join.take() {
             let abort_handle = join.abort_handle();
@@ -373,7 +374,7 @@ impl TrustedProjectedGateway {
 
     fn signal_shutdown_and_abort_join(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(true);
+            tx.shutdown();
         }
         if let Some(join) = self.join.take() {
             join.abort();

@@ -152,10 +152,9 @@ pub struct OverloadState {
     /// Notified each time `active_connections` or `active_requests` reaches zero
     /// during drain. The drain waiter re-checks both counters in a loop.
     pub drain_complete: tokio::sync::Notify,
-    /// Start of the one shared `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget, set by
-    /// the first drain phase that asks for it (issue #6714). See
-    /// [`Self::shutdown_drain_remaining`].
-    shutdown_drain_clock: OnceLock<tokio::time::Instant>,
+    /// The shutdown broadcaster's absolute deadline. Attached before listeners
+    /// start; retirement drains only read it and can never publish it.
+    shutdown_deadline: OnceLock<Arc<ShutdownDeadline>>,
 
     /// Edge-triggered publication of the binary keepalive-pressure flag
     /// (issue #4542).
@@ -220,23 +219,14 @@ impl Default for OverloadState {
 }
 
 impl OverloadState {
-    /// What is left of the shared shutdown drain `budget`
-    /// (`FERRUM_SHUTDOWN_DRAIN_SECONDS`) for the calling phase (issue #6714).
-    ///
-    /// Shutdown waits for peers in sequential phases: the HTTP/3 listener's
-    /// GOAWAY drain and endpoint close run before its listener handle returns,
-    /// and only then does the serving mode start the global
-    /// [`wait_for_drain`]. Each phase used to take a fresh full budget, so a
-    /// stalled H3 connection plus other long-lived work could spend the budget
-    /// twice, past what the Helm grace-period validation and
-    /// `docs/graceful_shutdown.md` account for. The first call starts one
-    /// clock; every phase gets only the remainder, so all of them together
-    /// stay within one budget.
-    pub fn shutdown_drain_remaining(&self, budget: Duration) -> Duration {
-        let started = *self
-            .shutdown_drain_clock
-            .get_or_init(tokio::time::Instant::now);
-        budget.saturating_sub(started.elapsed())
+    /// Attach the runtime's shutdown deadline before spawning listeners.
+    pub(crate) fn attach_shutdown(&self, shutdown: &ShutdownSender) {
+        self.shutdown_deadline
+            .get_or_init(|| shutdown.inner.deadline.clone());
+    }
+
+    pub(crate) fn shutdown_deadline(&self) -> Option<&ShutdownDeadline> {
+        self.shutdown_deadline.get().map(Arc::as_ref)
     }
 
     pub fn new() -> Self {
@@ -249,7 +239,7 @@ impl OverloadState {
             active_connections: CachePadded::new(AtomicU64::new(0)),
             active_requests: CachePadded::new(AtomicU64::new(0)),
             drain_complete: tokio::sync::Notify::new(),
-            shutdown_drain_clock: OnceLock::new(),
+            shutdown_deadline: OnceLock::new(),
             keepalive_pressure_tx: tokio::sync::watch::channel(false).0,
             red_drop_probability: CachePadded::new(AtomicU32::new(0)),
             red_request_counter: CachePadded::new(AtomicU64::new(0)),
@@ -1437,6 +1427,176 @@ pub fn start_monitor(
     })
 }
 
+/// A runtime's one absolute drain deadline and its race-free publication event.
+/// The broadcaster publishes it at the shutdown watch transition. Listener
+/// retirements and readiness announcements never start it.
+#[derive(Debug)]
+pub(crate) struct ShutdownDeadline {
+    at: OnceLock<tokio::time::Instant>,
+    published: CancellationToken,
+}
+
+impl ShutdownDeadline {
+    fn publish(&self, budget: Duration) {
+        self.at.get_or_init(|| {
+            let now = tokio::time::Instant::now();
+            match now.checked_add(budget) {
+                Some(at) => at,
+                None => {
+                    warn!("Shutdown drain deadline exceeds clock range; skipping peer waits");
+                    now
+                }
+            }
+        });
+        self.published.cancel();
+    }
+}
+
+/// The process shutdown broadcaster. Its raw watch sender is private, so every
+/// trigger (signals, listener failures and startup rollback) publishes the same
+/// deadline before waking listeners. Clones share the first publication; a
+/// second trigger cannot grant more time. Separate in-process runtimes own
+/// independent deadlines.
+#[derive(Clone, Debug)]
+pub struct ShutdownSender {
+    inner: Arc<ShutdownBroadcast>,
+}
+
+#[derive(Debug)]
+struct ShutdownBroadcast {
+    tx: tokio::sync::watch::Sender<bool>,
+    deadline: Arc<ShutdownDeadline>,
+    budget: Duration,
+}
+
+impl ShutdownBroadcast {
+    fn shutdown(&self) {
+        self.tx.send_if_modified(|requested| {
+            if *requested {
+                return false;
+            }
+            // Publish while holding the watch's write lock, at the actual
+            // false -> true transition. No pre-drain or watch-lock wait is
+            // billed to the budget. The deadline is visible before receivers
+            // wake, including retirement waiters using the publication token.
+            self.deadline.publish(self.budget);
+            *requested = true;
+            true
+        });
+    }
+}
+
+impl Drop for ShutdownBroadcast {
+    fn drop(&mut self) {
+        // Accept loops treat watch closure as shutdown too. Publish before the
+        // raw sender drops, without trying to write the watch: a receiver may
+        // still hold a read guard while its last sender is being dropped.
+        self.deadline.publish(self.budget);
+    }
+}
+
+impl ShutdownSender {
+    pub fn new(budget: Duration) -> Self {
+        Self {
+            inner: Arc::new(ShutdownBroadcast {
+                tx: tokio::sync::watch::channel(false).0,
+                deadline: Arc::new(ShutdownDeadline {
+                    at: OnceLock::new(),
+                    published: CancellationToken::new(),
+                }),
+                budget,
+            }),
+        }
+    }
+
+    pub fn channel(budget: Duration) -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let sender = Self::new(budget);
+        let receiver = sender.subscribe();
+        (sender, receiver)
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.tx.subscribe()
+    }
+
+    pub fn borrow(&self) -> tokio::sync::watch::Ref<'_, bool> {
+        self.inner.tx.borrow()
+    }
+
+    /// Publish exactly once, then broadcast shutdown even with no subscribers.
+    /// No await separates these operations, and the deadline is visible before
+    /// any listener can observe the shutdown watch firing.
+    pub fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    /// The signal sequencer calls this after announcing readiness withdrawal.
+    /// A retirement during this window cannot start the process drain clock.
+    pub async fn shutdown_after_predrain(
+        &self,
+        predrain: Duration,
+        escalation: &CancellationToken,
+    ) {
+        if !predrain.is_zero() {
+            info!(
+                predrain_seconds = predrain.as_secs(),
+                "Pre-drain: reporting not-ready while listeners keep accepting"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(predrain) => {}
+                _ = escalation.cancelled() => {
+                    warn!("Pre-drain window cut short by a repeated shutdown signal");
+                }
+            }
+        }
+        self.shutdown();
+    }
+}
+
+/// Result of a wait bounded by the retirement/local deadline, the process
+/// shutdown deadline (including one published during the wait), and escalation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DrainWait<T> {
+    Complete(T),
+    TimedOut,
+    Escalated,
+}
+
+pub(crate) async fn wait_with_shutdown_deadline<F: std::future::Future>(
+    deadline: Option<&ShutdownDeadline>,
+    local_deadline: tokio::time::Instant,
+    escalation: &CancellationToken,
+    work: F,
+) -> DrainWait<F::Output> {
+    let effective_deadline = || {
+        deadline
+            .and_then(|deadline| deadline.at.get().copied())
+            .map_or(local_deadline, |at| at.min(local_deadline))
+    };
+    let timer = tokio::time::sleep_until(effective_deadline());
+    tokio::pin!(timer, work);
+    let publication = async {
+        match deadline {
+            Some(deadline) => deadline.published.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(publication);
+    let mut observed_publication = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = escalation.cancelled() => return DrainWait::Escalated,
+            _ = &mut publication, if !observed_publication => {
+                observed_publication = true;
+                timer.as_mut().reset(effective_deadline());
+            }
+            _ = &mut timer => return DrainWait::TimedOut,
+            result = &mut work => return DrainWait::Complete(result),
+        }
+    }
+}
+
 /// Process-wide shutdown announcement latch (issue #4154).
 ///
 /// Every serving mode drives its drain from the same `watch` channel its
@@ -1646,10 +1806,9 @@ pub const SHUTDOWN_DRAIN_BEGUN_LOG: &str =
 /// been invoked. Returns `true` if all connections and requests drained within
 /// the timeout, `false` if the timeout expired.
 ///
-/// `timeout` is the whole shutdown drain budget, not a fresh allowance: the
-/// wait is bounded by [`OverloadState::shutdown_drain_remaining`], so time an
-/// earlier phase (the HTTP/3 listener drain) already spent is not granted
-/// again.
+/// `timeout` is capped by the absolute deadline published by the runtime's
+/// [`ShutdownSender`], so time spent joining listeners (including H3's drain
+/// and endpoint close) is never granted again.
 ///
 /// This function does NOT toggle `draining` / `reject_new_requests` — that is
 /// [`begin_drain`]'s job, run unconditionally on shutdown so the close hint
@@ -1669,7 +1828,6 @@ pub async fn wait_for_drain_with_escalation(
     timeout: Duration,
     escalation: CancellationToken,
 ) -> bool {
-    let timeout = state.shutdown_drain_remaining(timeout);
     let active_conns = state.active_connections.load(Ordering::Relaxed);
     let active_reqs = state.active_requests.load(Ordering::Relaxed);
     if active_conns == 0 && active_reqs == 0 {
@@ -1702,15 +1860,15 @@ pub async fn wait_for_drain_with_escalation(
     // as "not drained" — the caller's contract is "did everything finish?",
     // and it did not — so the force-close and the fixed cleanup phases after
     // this call run exactly as they do on a timeout.
-    match tokio::time::timeout(timeout, async {
-        tokio::select! {
-            _ = drained => true,
-            _ = escalation.cancelled() => false,
-        }
-    })
+    match wait_with_shutdown_deadline(
+        state.shutdown_deadline(),
+        tokio::time::Instant::now() + timeout,
+        &escalation,
+        drained,
+    )
     .await
     {
-        Ok(true) => {
+        DrainWait::Complete(()) => {
             info!(
                 phase = "drain",
                 result = "complete",
@@ -1718,7 +1876,7 @@ pub async fn wait_for_drain_with_escalation(
             );
             true
         }
-        Ok(false) => {
+        DrainWait::Escalated => {
             warn!(
                 phase = "drain",
                 result = "escalated",
@@ -1728,7 +1886,7 @@ pub async fn wait_for_drain_with_escalation(
             );
             false
         }
-        Err(_) => {
+        DrainWait::TimedOut => {
             let remaining_conns = state.active_connections.load(Ordering::Relaxed);
             let remaining_reqs = state.active_requests.load(Ordering::Relaxed);
             warn!(

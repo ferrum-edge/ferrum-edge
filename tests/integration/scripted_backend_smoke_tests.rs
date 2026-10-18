@@ -524,7 +524,9 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
         .await
         .expect("serve() must succeed with all-zero ports");
@@ -554,7 +556,7 @@ async fn serve_blocks_until_shutdown_when_no_listener_handles() {
     // 2 s timeout — the actual cost is one watch-channel notification
     // plus the DNS / overload / metrics tasks each observing
     // `shutdown_rx.changed()`.
-    shutdown_tx.send(true).expect("shutdown_tx send");
+    shutdown_tx.shutdown();
     tokio::time::timeout(Duration::from_secs(2), join_task)
         .await
         .expect("join() did not complete within 2 s of shutdown")
@@ -791,7 +793,9 @@ async fn serve_drains_spawned_tasks_when_late_startup_fails() {
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let result = file::serve(env_config, config, opts, shutdown_tx.clone()).await;
 
     let err = match result {
@@ -927,7 +931,8 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
             ..ServeOptions::default()
         };
 
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            ferrum_edge::overload::ShutdownSender::channel(std::time::Duration::ZERO);
         let result = file::serve(
             make_env(occupied_proxy_port, admin_port, pool_warmup_enabled),
             config.clone(),
@@ -984,7 +989,9 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
         .await
         .expect("retry serve() must succeed on a free proxy port");
@@ -1016,7 +1023,7 @@ async fn abandoned_bind_failure_does_not_probe_backend_before_successful_retry()
         backend.acceptors_waiting()
     );
 
-    shutdown_tx.send(true).expect("shutdown_tx send");
+    shutdown_tx.shutdown();
     tokio::time::timeout(Duration::from_secs(2), handles.join())
         .await
         .expect("join() did not complete within 2 s of shutdown")
@@ -1116,7 +1123,9 @@ async fn serve_drops_prebound_admin_https_without_tls_before_reserved_ports() {
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = file::serve(env_config, config, opts, shutdown_tx.clone())
         .await
         .expect(
@@ -1130,7 +1139,7 @@ async fn serve_drops_prebound_admin_https_without_tls_before_reserved_ports() {
         handles.bound.admin_https
     );
 
-    shutdown_tx.send(true).expect("shutdown_tx send");
+    shutdown_tx.shutdown();
     tokio::time::timeout(Duration::from_secs(2), handles.join())
         .await
         .expect("join() did not complete within 2 s of shutdown")
@@ -1223,7 +1232,9 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
             ..ServeOptions::default()
         };
 
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+            std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+        );
         let _ = env_admin_https_reservation.drop_and_take_port();
         match file::serve(env_config, config, opts, shutdown_tx.clone()).await {
             Ok(handles) => {
@@ -1233,7 +1244,7 @@ async fn serve_drop_prebound_admin_https_without_tls_does_not_reserve_env_https_
                     handles.bound.admin_https
                 );
 
-                shutdown_tx.send(true).expect("shutdown_tx send");
+                shutdown_tx.shutdown();
                 tokio::time::timeout(Duration::from_secs(2), handles.join())
                     .await
                     .expect("join() did not complete within 2 s of shutdown")
@@ -1322,7 +1333,9 @@ async fn serve_still_reserves_env_admin_https_port_without_prebound_drop() {
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     // Match instead of expect_err: ServeHandles does not implement Debug, and
     // Result::expect_err requires Debug on the Ok type.
     let err = match file::serve(env_config, config, opts, shutdown_tx).await {

@@ -1975,7 +1975,7 @@ fn partition_incremental_by_namespace(
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let effective_url = env_config
         .effective_db_url()
@@ -4174,7 +4174,7 @@ pub async fn run(
 
 pub(crate) async fn wait_for_cp_listeners_until_shutdown_or_exit(
     listener_handles: Vec<(String, ListenerJoinHandle)>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     drain_timeout: Duration,
 ) -> Result<(), anyhow::Error> {
     if listener_handles.is_empty() {
@@ -4204,7 +4204,7 @@ enum CpListenerMonitorWake {
 
 async fn monitor_cp_listener_handles_until_exit(
     listener_handles: Vec<(String, ListenerJoinHandle)>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     drain_timeout: Duration,
 ) -> Result<(), anyhow::Error> {
     use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -4268,7 +4268,7 @@ async fn monitor_cp_listener_handles_until_exit(
                 listener = %first_name,
                 "CP listener task exited; triggering control-plane shutdown"
             );
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
 
             let remaining_result = drain_cp_listener_futures(
                 &mut futures,
@@ -4382,7 +4382,7 @@ fn classify_cp_listener_exit(
     }
 }
 
-async fn wait_for_cp_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
+async fn wait_for_cp_shutdown(shutdown_tx: &crate::overload::ShutdownSender) {
     let mut wait_shutdown = shutdown_tx.subscribe();
     while !*wait_shutdown.borrow() {
         if wait_shutdown.changed().await.is_err() {
@@ -5135,7 +5135,8 @@ mod tests {
     // watch receivers.
     #[tokio::test]
     async fn cp_shutdown_drains_remaining_listeners_when_one_panics() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let drained_listeners = Arc::new(AtomicUsize::new(0));
 
         let mut admin_http_rx = shutdown_tx.subscribe();
@@ -5196,7 +5197,8 @@ mod tests {
     // returns Ok. This verifies the "happy path" is preserved end-to-end.
     #[tokio::test]
     async fn cp_shutdown_drains_all_listeners_on_signal() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let mut admin_http_rx = shutdown_tx.subscribe();
         let admin_http = tokio::spawn(async move {
@@ -5216,9 +5218,7 @@ mod tests {
 
         // Fire shutdown after spawning so the listeners are already
         // parked on changed() — models the SIGTERM path.
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
 
         let result = wait_for_cp_listeners_until_shutdown_or_exit(
             vec![
@@ -5235,7 +5235,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_listener_wait_does_not_apply_drain_timeout_before_shutdown() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let mut listener_rx = shutdown_tx.subscribe();
         let listener = tokio::spawn(async move {
@@ -5260,9 +5261,7 @@ mod tests {
             "CP listener wait must not return before shutdown just because the drain timeout elapsed",
         );
 
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
         let result = tokio::time::timeout(Duration::from_secs(1), wait)
             .await
             .expect("CP listener wait should complete after shutdown")
@@ -5272,7 +5271,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_listener_exit_triggers_shutdown_and_drains_siblings() {
-        let (shutdown_tx, mut observed_shutdown) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, mut observed_shutdown) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let grpc = tokio::spawn(async { Ok::<(), anyhow::Error>(()) });
 
@@ -5319,7 +5319,8 @@ mod tests {
     // the monitor, and return `Ok(())` — losing the failure.
     #[tokio::test]
     async fn cp_listener_exit_applies_drain_timeout_to_stuck_sibling() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5362,7 +5363,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_listener_error_with_stuck_sibling_returns_err_after_drain_timeout() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5398,7 +5400,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_operator_shutdown_with_stuck_listener_returns_ok_after_drain_timeout() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5412,9 +5415,7 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         });
 
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
 
         let started = Instant::now();
         let result = tokio::time::timeout(
@@ -5440,7 +5441,8 @@ mod tests {
 
     #[tokio::test]
     async fn cp_operator_shutdown_preserves_listener_error_when_sibling_stuck() {
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
 
         let stuck =
             tokio::spawn(async { std::future::pending::<Result<(), anyhow::Error>>().await });
@@ -5448,9 +5450,7 @@ mod tests {
             Err::<(), anyhow::Error>(anyhow::anyhow!("failed during operator drain"))
         });
 
-        shutdown_tx
-            .send(true)
-            .expect("watch send must succeed with live receivers");
+        shutdown_tx.shutdown();
 
         let started = Instant::now();
         let result = tokio::time::timeout(

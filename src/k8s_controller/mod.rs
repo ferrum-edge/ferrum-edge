@@ -361,19 +361,17 @@ impl K8sControllerHandle {
     /// period, aborting whatever is still running at the deadline and
     /// confirming those aborts within a bounded settle phase.
     ///
-    /// The signal is sent here (idempotently — `watch::Sender::send` on an
-    /// already-`true` channel still notifies) so the ordering is structural:
+    /// The signal is published here idempotently through `ShutdownSender`,
+    /// preserving the first drain deadline, so the ordering is structural:
     /// no caller can await controller tasks that were never told to stop.
     /// Whether a task exited early was already decided inside the task itself
     /// at its completion boundary, not by the state of the channel here.
     pub async fn shutdown(
         self,
-        shutdown_tx: &watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         grace: Duration,
     ) -> K8sControllerShutdownOutcome {
-        // Ignore the send result: with no receivers left there is nothing to
-        // notify, and every task is already gone or about to be joined.
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
 
         // Signal first, then close. Closing stops the CRD reprobe loop from
         // registering further watchers, and the two steps together drain the

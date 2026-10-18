@@ -104,6 +104,69 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Bind a caller-owned shutdown broadcaster exactly as the serving modes do.
+    pub fn shutdown_overload_for_test(
+        shutdown: &crate::overload::ShutdownSender,
+    ) -> std::sync::Arc<crate::overload::OverloadState> {
+        let state = std::sync::Arc::new(crate::overload::OverloadState::new());
+        state.attach_shutdown(shutdown);
+        state
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum H3DrainOutcomeForTest {
+        Drained,
+        TimedOut,
+        Escalated,
+    }
+
+    impl From<crate::http3::server::H3DrainOutcome> for H3DrainOutcomeForTest {
+        fn from(outcome: crate::http3::server::H3DrainOutcome) -> Self {
+            match outcome {
+                crate::http3::server::H3DrainOutcome::Drained => Self::Drained,
+                crate::http3::server::H3DrainOutcome::TimedOut => Self::TimedOut,
+                crate::http3::server::H3DrainOutcome::Escalated => Self::Escalated,
+            }
+        }
+    }
+
+    pub async fn wait_for_h3_drain_for_test(
+        state: &crate::overload::OverloadState,
+        open_connections: impl Fn() -> usize,
+        local_deadline: tokio::time::Instant,
+        escalation: &tokio_util::sync::CancellationToken,
+    ) -> H3DrainOutcomeForTest {
+        crate::http3::server::wait_for_h3_drain(
+            open_connections,
+            &state.drain_complete,
+            state,
+            local_deadline,
+            escalation,
+        )
+        .await
+        .into()
+    }
+
+    pub async fn wait_for_h3_close_for_test(
+        state: &crate::overload::OverloadState,
+        local_deadline: tokio::time::Instant,
+        escalation: &tokio_util::sync::CancellationToken,
+        wait_idle: impl std::future::Future<Output = ()>,
+    ) -> H3DrainOutcomeForTest {
+        crate::http3::server::wait_for_h3_close(state, local_deadline, escalation, wait_idle)
+            .await
+            .into()
+    }
+
+    /// Run the real file/database listener supervisor with an isolated sender.
+    pub async fn supervise_shutdown_listeners_for_test(
+        handles: Vec<(String, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
+        shutdown: crate::overload::ShutdownSender,
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::file::await_fallible_listener_handles(handles, move || shutdown.shutdown())
+            .await
+    }
+
     /// `body_validator`'s omitted-field gRPC decompression default resolved
     /// from a raw `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` value (clamped to the
     /// hard ceiling).
@@ -669,7 +732,7 @@ pub mod _test_support {
     /// expanding the production API solely for external regression tests.
     pub async fn await_dp_listener_handles(
         listener_handles: Vec<tokio::task::JoinHandle<()>>,
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        shutdown_tx: crate::overload::ShutdownSender,
     ) -> Result<(), tokio::task::JoinError> {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
@@ -10246,7 +10309,8 @@ pub mod _test_support {
         deadline_after: std::time::Duration,
         overload: std::sync::Arc<crate::overload::OverloadState>,
     ) -> &'static str {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let deadline = crate::proxy::WsSessionDeadline {
             at: tokio::time::Instant::now()
                 .checked_add(deadline_after)
@@ -17196,7 +17260,7 @@ pub mod _test_support {
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
         metrics: Arc<crate::ebpf::NodeAgentMetrics>,
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         pod_stream: S,
         seed_pods: I,
     ) -> Result<(), anyhow::Error>
@@ -17282,7 +17346,7 @@ pub mod _test_support {
         backend: &mut crate::ebpf::MockEbpfBackend,
         config: &crate::modes::node_agent::NodeAgentConfig,
         metrics: Arc<crate::ebpf::NodeAgentMetrics>,
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         pod_stream: S,
         initial_topology: NodeAgentIngressTopologyOutcomeForTest,
         topology_stream: T,
@@ -17339,7 +17403,7 @@ pub mod _test_support {
     /// (issue #3704) from external unit/integration tests.
     pub async fn start_node_agent_admin_listeners_for_test(
         env_config: &crate::config::EnvConfig,
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         startup_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
         crate::modes::node_agent::start_node_agent_admin_listeners_for_test(
@@ -17470,7 +17534,7 @@ pub mod _test_support {
     /// so external tests can assert Ok/Err without constructing a full CP.
     pub async fn wait_for_cp_listeners_until_shutdown_or_exit_for_test(
         listener_handles: Vec<(String, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        shutdown_tx: crate::overload::ShutdownSender,
         drain_timeout: std::time::Duration,
     ) -> Result<(), anyhow::Error> {
         crate::modes::control_plane::wait_for_cp_listeners_until_shutdown_or_exit(

@@ -14498,7 +14498,7 @@ fn remove_mesh_managed_plugin(config: &mut GatewayConfig, id: &str, namespace: &
 
 pub async fn run(
     mut env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     // Normalize once before either the arming decision or any filesystem
     // reader sees the path. A whitespace-padded configured value must not arm
@@ -14931,7 +14931,7 @@ async fn serve_mesh_runtime(
     env_config: EnvConfig,
     runtime: MeshRuntimeConfig,
     config: GatewayConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     mesh_state: MeshRuntimeState,
     initial_apply: Option<(Arc<MeshSlice>, revision::MeshRevisionApplyToken)>,
     background_ownership: MeshRuntimeBackgroundOwnership,
@@ -15048,7 +15048,7 @@ fn prepare_mesh_runtime_before_owner(
     env_config: &EnvConfig,
     runtime: &MeshRuntimeConfig,
     config: GatewayConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     initial_applied_mesh_slice: Option<&Arc<MeshSlice>>,
 ) -> Result<PreparedMeshRuntimeBeforeOwner, anyhow::Error> {
     // Fail closed on malformed UDP capture settings (codex r2 P2 / r3 P2),
@@ -15176,6 +15176,7 @@ fn prepare_mesh_runtime_before_owner(
         Some(shutdown_tx.subscribe()),
         bpf_metrics_state.clone(),
     )?;
+    proxy_state.overload.attach_shutdown(shutdown_tx);
     // Proxy hop limit (issue #6109): publish this generation's listener ports
     // before any listener binds, so the mesh inbound exemption never forwards
     // an unchanged count to another gateway listener.
@@ -16725,7 +16726,7 @@ struct MeshServingSignals {
 #[allow(clippy::too_many_arguments)]
 fn start_mesh_admin_listeners(
     env_config: &EnvConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     proxy_state: ProxyState,
     mesh_state: MeshRuntimeState,
     config_rejected: Arc<AtomicBool>,
@@ -20739,7 +20740,7 @@ struct MeshBackgroundTasks {
 /// created so any later initialization error can signal shared shutdown and
 /// run bounded teardown before returning the original cause (issue #2372).
 struct MeshStartupOwner {
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     proxy_state: ProxyState,
     tasks: MeshBackgroundTasks,
     listener_handles: Vec<JoinHandle<()>>,
@@ -20754,7 +20755,7 @@ struct MeshStartupOwner {
 
 impl MeshStartupOwner {
     fn new(
-        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        shutdown_tx: crate::overload::ShutdownSender,
         proxy_state: ProxyState,
         health_check_handles: Vec<JoinHandle<()>>,
         mesh_background_handles: Vec<JoinHandle<()>>,
@@ -20874,7 +20875,7 @@ impl MeshStartupOwner {
                 "SPIFFE Workload API server terminated unexpectedly; initiating mesh shutdown \
                  rather than serving traffic with no identity endpoint"
             );
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
         });
         self.tasks.mesh_background_handles.push(handle);
     }
@@ -20885,7 +20886,7 @@ impl MeshStartupOwner {
             "Mesh runtime startup failed after spawning tasks: {}; draining before returning",
             sanitize_startup_scalar(&err)
         );
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         // Stop the Workload API first so its socket artifact is gone before the
         // process exits: a rollback that leaves the socket behind makes the
         // operator's next attempt fail to bind for a different reason than the
@@ -20953,7 +20954,7 @@ const MESH_STARTUP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// tasks after a failure that precedes [`MeshStartupOwner`] (initial-config wait
 /// or pre-`ProxyState` preparation). Preserves `err` as the returned cause.
 async fn fail_mesh_pre_owner(
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     handles: Vec<JoinHandle<()>>,
     err: anyhow::Error,
 ) -> anyhow::Error {
@@ -20961,7 +20962,7 @@ async fn fail_mesh_pre_owner(
         "Mesh runtime startup failed after spawning config consumers: {}; draining before returning",
         sanitize_startup_scalar(&err)
     );
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     join_mesh_background_handles(handles, MESH_STARTUP_BACKGROUND_DRAIN_TIMEOUT).await;
     err
 }
@@ -20995,7 +20996,7 @@ fn peek_mesh_startup_fault_inject() -> MeshStartupFaultInject {
 
 async fn await_mesh_listener_handles(
     listener_handles: Vec<JoinHandle<()>>,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
     reason: &str,
 ) -> Result<(), tokio::task::JoinError> {
     if listener_handles.is_empty() {
@@ -21012,7 +21013,7 @@ async fn await_mesh_listener_handles(
         Ok(())
     } else {
         let shutdown_on_panic = move || {
-            let _ = shutdown_tx.send(true);
+            shutdown_tx.shutdown();
         };
         crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
     }
@@ -21221,7 +21222,7 @@ pub mod startup_rollback_test_seams {
     /// Spawn a netns-manager-shaped sentinel: wait for shutdown, then run an
     /// async teardown step before exiting. Rollback must await this completion.
     fn spawn_netns_style_sentinel(
-        shutdown_tx: &tokio::sync::watch::Sender<bool>,
+        shutdown_tx: &crate::overload::ShutdownSender,
         shutdown_observed: Arc<AtomicBool>,
         teardown_completed: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
@@ -21254,7 +21255,8 @@ pub mod startup_rollback_test_seams {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
         });
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let shutdown_observed = Arc::new(AtomicBool::new(false));
         let teardown_completed = Arc::new(AtomicBool::new(false));
         let sentinel = spawn_netns_style_sentinel(
@@ -22072,7 +22074,7 @@ fn parse_stock_xds_credential_policy() -> Result<StockCredentialLifetimePolicy, 
 /// — the plugin still emits zero counters via the empty `BpfMetricsState`.
 fn spawn_sock_ops_consumer_task(
     state: std::sync::Arc<crate::ebpf::bpf_metrics::BpfMetricsState>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
 ) -> Option<tokio::task::JoinHandle<()>> {
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     {
@@ -22109,7 +22111,7 @@ fn spawn_sock_ops_consumer_task(
 /// re-open logic in `crate::ebpf::orig_dst_bridge`.
 fn spawn_orig_dst_bridge_task(
     resolver: std::sync::Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
 ) -> tokio::task::JoinHandle<()> {
     let shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -22415,7 +22417,8 @@ mod tests {
         let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
             registry.path(),
         ));
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let task = tokio::spawn(run_ambient_udp_placement_cleanup(
             context,
             source,
@@ -22444,7 +22447,7 @@ mod tests {
         }
         assert_eq!(snapshot().phase, UdpMigrationStatusPhase::CleanupComplete);
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         task.await.expect("cleanup supervisor task");
     }
     use crate::config::EnvConfig;
@@ -23244,7 +23247,8 @@ mod tests {
             version: chrono::Utc::now().to_rfc3339(),
             ..MeshSlice::default()
         });
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let task_shutdown = shutdown_tx.clone();
         let task = tokio::spawn(async move {
             serve_mesh_runtime(
@@ -23268,7 +23272,7 @@ mod tests {
             !task.is_finished(),
             "mesh runtime should keep serving until shutdown"
         );
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
 
         let result = tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -35026,7 +35030,8 @@ mod tests {
         let runtime = test_mesh_runtime_config();
         let mesh_state = MeshRuntimeState::new();
         let proxy_state = make_test_proxy_state(GatewayConfig::default());
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35058,7 +35063,7 @@ mod tests {
         });
         wait_for_mesh_authz_label(&proxy_state, "app", "worker").await;
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35077,7 +35082,8 @@ mod tests {
         let runtime = test_mesh_runtime_config();
         let mesh_state = MeshRuntimeState::new();
         let proxy_state = make_test_proxy_state(GatewayConfig::default());
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35216,7 +35222,7 @@ mod tests {
             "rejected slice must not become the live config; only its remote overlay re-applies onto the accepted slice"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35247,7 +35253,8 @@ mod tests {
         )
         .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35292,7 +35299,7 @@ mod tests {
         });
         wait_for_mesh_inbound_tls(&proxy_state, false).await;
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35328,7 +35335,8 @@ mod tests {
         )
         .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35430,7 +35438,7 @@ mod tests {
             "PeerAuthentication reload must not invent a DTLS listener"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -35649,7 +35657,8 @@ mod tests {
         )
         .expect("initial snapshot");
         let mesh_state = MeshRuntimeState::new();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -35700,7 +35709,7 @@ mod tests {
             "a rejected PeerAuthentication slice must not seed or reject ordinary DTLS generation"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -37254,7 +37263,8 @@ mod tests {
             }),
         });
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let apply_task = start_mesh_slice_apply_task(
             mesh_state.clone(),
             proxy_state.clone(),
@@ -37321,7 +37331,7 @@ mod tests {
             .expect("federated trust published");
         assert_eq!(remote.x509_authorities, vec![expected_partner_root]);
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(2), apply_task)
             .await
             .expect("apply task should stop")
@@ -37467,7 +37477,8 @@ mod tests {
         publish_staged_spiffe_bundle(&state, staged);
 
         let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let republisher = start_mesh_inbound_svid_rotation_republisher(
             state.clone(),
             inbound_slot.clone(),
@@ -37504,7 +37515,7 @@ mod tests {
             "accepted federated overlay must survive file-backed SVID republish"
         );
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(1), republisher)
             .await
             .expect("republisher observed shutdown")
@@ -37547,7 +37558,8 @@ mod tests {
         // Old roots in place when the republisher subscribes.
         state.install_gateway_runtime_svid_bundle(svid_bundle(vec![vec![1]]));
         let (revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let republisher = start_mesh_inbound_svid_rotation_republisher(
             state.clone(),
             inbound_slot.clone(),
@@ -37575,7 +37587,7 @@ mod tests {
         .await
         .expect("republisher must pin the inbound verifier to the new roots");
 
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(1), republisher)
             .await
             .expect("republisher observed shutdown")

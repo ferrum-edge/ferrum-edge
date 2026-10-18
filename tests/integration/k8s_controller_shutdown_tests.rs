@@ -51,7 +51,8 @@ async fn run_until_shutdown(mut shutdown: watch::Receiver<bool>) {
 /// not detached: `shutdown()` may not return before the task has exited.
 #[tokio::test]
 async fn shutdown_awaits_task_that_exits_after_a_delay() {
-    let (shutdown_tx, _keep_open) = watch::channel(false);
+    let (shutdown_tx, _keep_open) =
+        ferrum_edge::overload::ShutdownSender::channel(Duration::from_secs(30));
     let registry = k8s_controller_registry_for_test();
     let exited = Arc::new(AtomicBool::new(false));
 
@@ -89,7 +90,8 @@ async fn shutdown_awaits_task_that_exits_after_a_delay() {
 #[cfg(panic = "unwind")]
 #[tokio::test]
 async fn shutdown_surfaces_a_panicked_controller_task() {
-    let (shutdown_tx, _keep_open) = watch::channel(false);
+    let (shutdown_tx, _keep_open) =
+        ferrum_edge::overload::ShutdownSender::channel(Duration::from_secs(30));
     let registry = k8s_controller_registry_for_test();
 
     let clean = run_until_shutdown(shutdown_tx.subscribe());
@@ -129,7 +131,8 @@ async fn shutdown_surfaces_a_panicked_controller_task() {
 /// future was already dropped by the time the call returned — no polling.
 #[tokio::test]
 async fn shutdown_aborts_a_task_still_running_at_the_grace_deadline() {
-    let (shutdown_tx, _keep_open) = watch::channel(false);
+    let (shutdown_tx, _keep_open) =
+        ferrum_edge::overload::ShutdownSender::channel(Duration::from_secs(30));
     let registry = k8s_controller_registry_for_test();
     let dropped = Arc::new(AtomicBool::new(false));
 
@@ -179,7 +182,8 @@ async fn shutdown_aborts_a_task_still_running_at_the_grace_deadline() {
 /// because the value was recorded inside the task itself.
 #[tokio::test]
 async fn early_exit_is_latched_at_the_completion_boundary_not_at_teardown() {
-    let (shutdown_tx, _keep_open) = watch::channel(false);
+    let (shutdown_tx, _keep_open) =
+        ferrum_edge::overload::ShutdownSender::channel(Duration::from_secs(30));
     let registry = k8s_controller_registry_for_test();
 
     let (exited_tx, exited_rx) = oneshot::channel();
@@ -199,9 +203,7 @@ async fn early_exit_is_latched_at_the_completion_boundary_not_at_teardown() {
     let controller = registry.handle();
 
     exited_rx.await.expect("early watcher signalled its exit");
-    shutdown_tx
-        .send(true)
-        .expect("watch receivers are still alive");
+    shutdown_tx.shutdown();
     for _ in 0..64 {
         tokio::task::yield_now().await;
     }
@@ -240,7 +242,8 @@ async fn early_exit_is_latched_at_the_completion_boundary_not_at_teardown() {
 /// no terminal join boundary — the exact defect class #3220 closes.
 #[tokio::test]
 async fn shutdown_owns_and_drains_watchers_registered_after_the_handle_exists() {
-    let (shutdown_tx, _keep_open) = watch::channel(false);
+    let (shutdown_tx, _keep_open) =
+        ferrum_edge::overload::ShutdownSender::channel(Duration::from_secs(30));
     let registry = k8s_controller_registry_for_test();
     let controller = registry.handle();
 
@@ -302,7 +305,8 @@ async fn shutdown_owns_and_drains_watchers_registered_after_the_handle_exists() 
 /// no window in which a just-created watcher exists without an owner.
 #[tokio::test]
 async fn shutdown_refuses_watchers_a_racing_reprobe_tries_to_register() {
-    let (shutdown_tx, _keep_open) = watch::channel(false);
+    let (shutdown_tx, _keep_open) =
+        ferrum_edge::overload::ShutdownSender::channel(Duration::from_secs(30));
     let registry = k8s_controller_registry_for_test();
     let controller = registry.handle();
 

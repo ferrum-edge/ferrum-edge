@@ -112,7 +112,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -485,7 +484,9 @@ async fn try_spawn_in_process(
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = ferrum_edge::modes::file::serve(env_config, config, opts, shutdown_tx.clone())
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -657,7 +658,7 @@ struct InProcessBackend {
     admin_port: u16,
     jwt_secret: String,
     jwt_issuer: String,
-    shutdown_tx: Option<watch::Sender<bool>>,
+    shutdown_tx: Option<ferrum_edge::overload::ShutdownSender>,
     join: Option<JoinHandle<()>>,
     _temp_dir: Arc<TempDir>,
     #[allow(dead_code)] // Retained for diagnostic dumps.
@@ -670,7 +671,7 @@ impl Drop for InProcessBackend {
         // subscribed to the watch channel observes this and exits on its
         // own.
         if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(true);
+            tx.shutdown();
         }
         // Drop the JoinHandle without aborting. `abort()` would cancel
         // the task running `ServeHandles::join`, which is the ONLY task
@@ -1010,7 +1011,7 @@ impl GatewayHarness {
                 // tasks and letting them outlive the harness — exactly
                 // the cross-test interference Codex P2 #4 flagged.
                 if let Some(tx) = b.shutdown_tx.take() {
-                    let _ = tx.send(true);
+                    tx.shutdown();
                 }
                 let _ = b.join.take();
                 String::new()

@@ -26,7 +26,6 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const TEST_NAMESPACE: &str = "ferrum";
@@ -77,13 +76,13 @@ async fn functional_serverless_terminate_frames_native_grpc_unary() {
 
 struct RunningGateway {
     http_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     handles: ServeHandles,
 }
 
 impl RunningGateway {
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         tokio::time::timeout(Duration::from_secs(5), self.handles.join())
             .await
             .expect("serverless gRPC terminate gateway shutdown timed out")
@@ -128,7 +127,9 @@ async fn start_gateway(
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles =
         ferrum_edge::modes::file::serve(env_config, config, options, shutdown_tx.clone()).await?;
 

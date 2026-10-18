@@ -369,13 +369,13 @@ async fn functional_subset_http1_pending_admission_is_subset_isolated() {
 
 struct RunningGateway {
     http_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     join: JoinHandle<()>,
 }
 
 impl RunningGateway {
     async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         match timeout(Duration::from_secs(5), self.join).await {
             Ok(Ok(())) => {}
             Ok(Err(join_err)) => panic!("subset gateway task panicked: {join_err}"),
@@ -439,7 +439,9 @@ async fn start_subset_gateway(
         skip_initial_capability_refresh: true,
         ..ServeOptions::default()
     };
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = ferrum_edge::modes::file::serve(env_config, prepared, opts, shutdown_tx.clone())
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {

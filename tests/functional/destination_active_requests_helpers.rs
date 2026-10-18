@@ -68,13 +68,13 @@ pub(super) struct RunningGateway {
     pub http_port: u16,
     /// HTTPS/QUIC listener port. `0` when HTTP/3 was not requested.
     pub https_port: u16,
-    shutdown_tx: watch::Sender<bool>,
+    shutdown_tx: ferrum_edge::overload::ShutdownSender,
     join: JoinHandle<()>,
 }
 
 impl RunningGateway {
     pub async fn shutdown(self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.shutdown();
         match timeout(Duration::from_secs(10), self.join).await {
             Ok(Ok(())) => {}
             Ok(Err(join_err)) => panic!("destination-breaker gateway task panicked: {join_err}"),
@@ -149,7 +149,9 @@ pub(super) async fn start_gateway(
         ..ServeOptions::default()
     };
 
-    let (shutdown_tx, _) = watch::channel(false);
+    let (shutdown_tx, _) = ferrum_edge::overload::ShutdownSender::channel(
+        std::time::Duration::from_secs(env_config.shutdown_drain_seconds),
+    );
     let handles = ferrum_edge::modes::file::serve(env_config, prepared, opts, shutdown_tx.clone())
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {

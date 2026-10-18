@@ -954,8 +954,8 @@ Validation: fail render on missing/unsafe configuration.
 {{/* Graceful shutdown budget (database/cp proxy path, src/modes/database.rs):
      FERRUM_SHUTDOWN_DRAIN_SECONDS wait (default 30; 0 skips the wait). The
        HTTP/3 listener drain/close and the global drain run one after the
-       other but share this one budget (OverloadState::shutdown_drain_remaining),
-       so it is counted once.
+       other but share the absolute deadline published by ShutdownSender with
+       the shutdown broadcast, so the drain budget is counted once.
      + unix transport-pool tail (DRIVER_DRAIN 5s + REAP 1s in unix_backend_pool.rs)
      + background task join (5s)
      + audit flush (clamp(drain, 5, 60)s; database/cp only)

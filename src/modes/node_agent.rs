@@ -1112,7 +1112,7 @@ fn log_node_agent_startup(config: &NodeAgentConfig) {
 
 pub async fn run(
     env_config: EnvConfig,
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_tx: crate::overload::ShutdownSender,
 ) -> Result<(), anyhow::Error> {
     let config = NodeAgentConfig::from_env_config(&env_config).map_err(anyhow::Error::msg)?;
     let metrics = Arc::new(NodeAgentMetrics::default());
@@ -1158,7 +1158,7 @@ pub async fn run(
     ) {
         metrics.set_topology_degraded(probe.degradation_reason().unwrap_or("unknown"));
         metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         for handle in admin_handles {
             if let Err(err) = handle.await {
                 warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent admin listener task failed");
@@ -1204,7 +1204,7 @@ pub async fn run(
         .await
     };
 
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
     for handle in admin_handles {
         if let Err(err) = handle.await {
             warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent admin listener task failed");
@@ -1240,7 +1240,7 @@ fn ambient_udp_registry_requires_ebpf(
 
 async fn start_node_agent_admin_listeners(
     env_config: &EnvConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
     let mut handles = Vec::new();
@@ -1537,7 +1537,7 @@ async fn start_node_agent_admin_listeners(
     {
         // Partial bind must not leave a half-started admin surface: shut down
         // and join every listener/watcher already spawned.
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         for handle in handles {
             if let Err(join_err) = handle.await {
                 warn!(
@@ -1558,7 +1558,7 @@ async fn start_node_agent_admin_listeners(
 #[doc(hidden)]
 pub async fn start_node_agent_admin_listeners_for_test(
     env_config: &EnvConfig,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<Vec<tokio::task::JoinHandle<()>>, anyhow::Error> {
     start_node_agent_admin_listeners(env_config, shutdown_tx, startup_ready).await
@@ -1702,7 +1702,7 @@ async fn run_with_backend(
     mut backend: Box<dyn EbpfBackend>,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
@@ -2002,7 +2002,7 @@ pub(crate) async fn run_with_pod_stream_for_test<S, I>(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     pod_stream: S,
     seed_pods: I,
 ) -> Result<(), anyhow::Error>
@@ -2049,7 +2049,7 @@ pub(crate) async fn run_with_topology_outcome_stream_for_test<S, T>(
     backend: &mut crate::ebpf::MockEbpfBackend,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     pod_stream: S,
     initial_topology: IngressTopologyOutcome,
     mut topology_stream: T,
@@ -2107,7 +2107,7 @@ async fn run_with_pod_stream<S, I>(
     owner: &mut InitializedBackendOwner<'_>,
     config: &NodeAgentConfig,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
     kube_client: Option<Client>,
@@ -2873,7 +2873,7 @@ where
     // do not keep reporting ready while capture is tearing down.
     //
     startup_ready.store(false, Ordering::Release);
-    let _ = shutdown_tx.send(true);
+    shutdown_tx.shutdown();
 
     info!(
         exit_reason = ?exit_reason,
@@ -3915,7 +3915,7 @@ pub fn apply_cni_request(
     }
 }
 
-async fn wait_for_shutdown(shutdown_tx: &tokio::sync::watch::Sender<bool>) {
+async fn wait_for_shutdown(shutdown_tx: &crate::overload::ShutdownSender) {
     let mut shutdown_rx = shutdown_tx.subscribe();
     if *shutdown_rx.borrow() {
         return;
@@ -9398,7 +9398,7 @@ async fn handle_fallback(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
     metrics: Arc<NodeAgentMetrics>,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     startup_ready: Arc<AtomicBool>,
     cni_config: CniListenerConfig,
 ) -> Result<(), anyhow::Error> {
@@ -9433,7 +9433,7 @@ async fn handle_fallback(
     .await;
 
     if let Some((listener, worker)) = cni_handles {
-        let _ = shutdown_tx.send(true);
+        shutdown_tx.shutdown();
         if let Err(err) = listener.await {
             warn!(error = %crate::startup::sanitize_startup_scalar(&err), "Node agent CNI passthrough listener task panicked");
         }
@@ -9533,7 +9533,7 @@ async fn handle_fallback_with<F, Fut>(
     config: &NodeAgentConfig,
     probe: &KernelProbeResult,
     metrics: &NodeAgentMetrics,
-    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    shutdown_tx: &crate::overload::ShutdownSender,
     mut execute: F,
     startup_ready: Arc<AtomicBool>,
 ) -> Result<(), anyhow::Error>
@@ -13954,10 +13954,9 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        shutdown_tx
-            .send(true)
-            .expect("watch channel should be open");
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+        shutdown_tx.shutdown();
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
 
@@ -14140,7 +14139,8 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -14359,7 +14359,8 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
         let phases = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
@@ -17015,7 +17016,8 @@ mod tests {
         let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
         let startup_ready = Arc::new(AtomicBool::new(false));
         let readiness = startup_ready.clone();
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let events = futures_util::stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)]);
 
         let error = run_with_pod_stream(
@@ -17068,7 +17070,8 @@ mod tests {
         let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
         let startup_ready = Arc::new(AtomicBool::new(false));
         let readiness = startup_ready.clone();
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let stop = shutdown_tx.clone();
         let events = futures_util::stream::iter(vec![Ok(Event::Init), Ok(Event::InitDone)])
             .chain(futures_util::stream::pending());
@@ -17102,7 +17105,7 @@ mod tests {
             }
             assert!(readiness.load(Ordering::Acquire));
             assert!(registry.path().join(".udp-registry-synced").is_file());
-            let _ = stop.send(true);
+            stop.shutdown();
         };
 
         let (result, ()) = tokio::join!(run, recover);
@@ -17135,7 +17138,8 @@ mod tests {
         {
             let mut owner = InitializedBackendOwner::borrowed(&mut backend, false);
             let startup_ready = Arc::new(AtomicBool::new(false));
-            let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+            let (shutdown_tx, _shutdown_rx) =
+                crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
             let events = futures_util::stream::pending::<Result<Event<Pod>, kube_watcher::Error>>();
             let run = run_with_pod_stream(
                 &mut owner,
@@ -17158,7 +17162,7 @@ mod tests {
             );
             let stop = async {
                 tokio::task::yield_now().await;
-                let _ = shutdown_tx.send(true);
+                shutdown_tx.shutdown();
             };
             let (result, ()) = tokio::join!(run, stop);
             result.expect("shutdown remains clean while fail-closed state is preserved");
@@ -19827,7 +19831,8 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: false,
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = Arc::new(NodeAgentMetrics::default());
 
@@ -19878,10 +19883,9 @@ mod tests {
             cgroup_v2_available: false,
             bpf_fs_available: true,
         };
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
-        shutdown_tx
-            .send(true)
-            .expect("watch channel should be open");
+        let (shutdown_tx, _shutdown_rx) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
+        shutdown_tx.shutdown();
         let startup_ready = Arc::new(AtomicBool::new(false));
         let metrics = NodeAgentMetrics::default();
 
@@ -19912,7 +19916,8 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_shutdown_blocks_until_signal() {
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let wait = wait_for_shutdown(&shutdown_tx);
         tokio::pin!(wait);
 
@@ -19921,9 +19926,7 @@ mod tests {
             _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
         }
 
-        shutdown_tx
-            .send(true)
-            .expect("shutdown receiver should be live");
+        shutdown_tx.shutdown();
         tokio::time::timeout(std::time::Duration::from_secs(1), wait)
             .await
             .expect("shutdown wait should resolve after signal");
@@ -19939,7 +19942,8 @@ mod tests {
             admin_https_port: 0,
             ..EnvConfig::default()
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
@@ -19952,7 +19956,8 @@ mod tests {
     #[tokio::test]
     async fn admin_listener_default_disabled_spawns_no_tasks() {
         let env_config = EnvConfig::default();
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let handles = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
@@ -19970,7 +19975,8 @@ mod tests {
             admin_allowed_cidrs: "not-a-cidr".to_string(),
             ..EnvConfig::default()
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let err = start_node_agent_admin_listeners(&env_config, &shutdown_tx, startup_ready)
@@ -19991,7 +19997,8 @@ mod tests {
             admin_http_port: blocked_port,
             ..EnvConfig::default()
         };
-        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, _) =
+            crate::overload::ShutdownSender::channel(std::time::Duration::from_secs(30));
         let startup_ready = Arc::new(AtomicBool::new(false));
 
         let err =
