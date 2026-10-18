@@ -121,9 +121,7 @@ fn issue_3624_reads_use_conf_aware_resolver_not_std_env_var() {
     // place: CompressionAdmissionPolicy in env_config.rs.
     let env_config = squeeze(include_str!("../../../src/config/env_config.rs"));
     assert!(
-        env_config.contains(&squeeze(
-            "resolve(\"FERRUM_COMPRESSION_GZIP_ENABLED\")"
-        )),
+        env_config.contains(&squeeze("resolve(\"FERRUM_COMPRESSION_GZIP_ENABLED\")")),
         "compression gates must resolve through ferrum.conf"
     );
     assert!(
@@ -131,9 +129,7 @@ fn issue_3624_reads_use_conf_aware_resolver_not_std_env_var() {
         "a sticky conf-load failure must refuse, not resolve to defaults"
     );
     assert!(
-        env_config.contains(&squeeze(
-            "resolve(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")"
-        )),
+        env_config.contains(&squeeze("resolve(\"FERRUM_MAX_REQUEST_BODY_SIZE_BYTES\")")),
         "validation client body ceiling must resolve through ferrum.conf"
     );
     let http_client = squeeze(include_str!("../../../src/plugins/utils/http_client.rs"));
