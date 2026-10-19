@@ -1,9 +1,9 @@
 ---
 name: deepseek-pro-agents
-description: Dispatch and orchestrate local opencode subagents pinned to alibaba-token-plan/deepseek-v4.1-flash (DeepSeek V4.1 Flash; legacy deepseek-pro-agents name, no V4 Pro model is dispatched) via the opencode CLI harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. This lane is used for invariant-heavy security, protocol, and concurrency work. Use when the user asks Claude to spawn DeepSeek Pro/deepseek-pro-agents agents on issues, PRs, review findings, or red CI, and tell them the pinned model they will get.
+description: Dispatch and orchestrate local opencode subagents pinned to alibaba-token-plan/deepseek-v4.1-flash-1017 (DeepSeek V4.1 Flash 1017; legacy deepseek-pro-agents name, no V4 Pro model is dispatched) via the opencode CLI harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with worktree isolation and the review loop. This lane is used for invariant-heavy security, protocol, and concurrency work. Use when the user asks Claude to spawn DeepSeek Pro/deepseek-pro-agents agents on issues, PRs, review findings, or red CI, and tell them the pinned model they will get.
 ---
 
-# DeepSeek agents (legacy "Pro" name, pinned to V4.1 Flash)
+# DeepSeek agents (legacy "Pro" name, pinned to V4.1 Flash 1017)
 
 Act as the orchestrator. Read and follow the shared workflow in
 [the canonical skill](../../../.agents/skills/deepseek-pro-agents/SKILL.md), interpreting its Codex
