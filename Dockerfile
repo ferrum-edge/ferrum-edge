@@ -43,7 +43,7 @@ ARG EBPF_NIGHTLY_TOOLCHAIN=nightly-2026-09-30
 # `--locked` builds exactly ebpf/Cargo.lock and fails instead of re-resolving.
 # core-only build-std matches the crate's `#![no_std]` + `panic = "abort"`.
 # Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS ebpf-builder
+FROM rust:latest@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a AS ebpf-builder
 ARG TARGETARCH
 ARG BPF_LINKER_VERSION
 ARG BPF_LINKER_AMD64_SHA256
@@ -95,7 +95,7 @@ RUN --mount=from=runtime-base,source=/,target=/distroless-root,ro \
 
 # Stage 1: Builder — rust:latest uses trixie (Debian 13), matching distroless/cc-debian13 glibc
 # Digest resolved 2026-10-05; the tag is kept for readability, the digest is authoritative.
-FROM rust:latest@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS builder
+FROM rust:latest@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a AS builder
 
 # Install build dependencies
 # clang/libclang-dev: required by bindgen (used by zstd-sys)
