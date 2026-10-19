@@ -205,7 +205,7 @@ jobs:
           cache-on-failure: "false"
 
       - name: Install cargo-llvm-cov and cargo-nextest
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -556,7 +556,7 @@ jobs:
 
       - name: Install cargo-llvm-cov
         if: needs.coverage-plan.outputs.mode != 'skip'
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-llvm-cov
 
