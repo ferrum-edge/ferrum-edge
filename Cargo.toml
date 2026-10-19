@@ -335,7 +335,7 @@ google-cloud-gax = { version = "=1.11.0", default-features = false, optional = t
 google-cloud-wkt = { version = "=1.9.0", default-features = false, optional = true }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, optional = true }
 # GHSA-8ffr-xgwf-xj56: constrain the AWS runtime to the fixed JSON parser.
-aws-smithy-json = { version = "=0.62.7", optional = true }
+aws-smithy-json = { version = "=0.63.1", optional = true }
 # Azure SDK 1.x trio: upgrade all three together (`azure_identity` and the
 # Key Vault client implement/consume `azure_core`'s `TokenCredential`, so a
 # mixed major line does not compile). 1.x refuses bearer auth over non-TLS
