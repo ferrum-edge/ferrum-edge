@@ -115,7 +115,8 @@ impl BasicAuth {
             hmac_secret: hmac_secret.as_bytes().to_vec(),
             dummy_password_hash,
             verification_rounds: bounded_verification_rounds(
-                crate::config::types::max_credentials_per_type(),
+                crate::config::types::max_credentials_per_type()
+                    .map_err(|error| format!("basic_auth: {error}"))?,
             ),
             hide_credentials,
         })

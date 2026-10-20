@@ -583,17 +583,20 @@ fn test_env_config_rejects_non_finite_overload_thresholds() {
 fn test_env_config_rejects_zero_max_credentials_per_type() {
     // 0 is not "unlimited": credential arrays must be non-empty and at most
     // this long, so 0 would make every consumer credential inadmissible.
-    with_env_vars(
-        &[
-            ("FERRUM_MODE", "file"),
-            ("FERRUM_FILE_CONFIG_PATH", "/path/to/config.yaml"),
-            ("FERRUM_MAX_CREDENTIALS_PER_TYPE", "0"),
-        ],
-        || {
-            let err = EnvConfig::from_env().expect_err("zero limit must fail startup");
-            assert!(err.contains("FERRUM_MAX_CREDENTIALS_PER_TYPE"), "{err}");
-        },
-    );
+    // Supplied through the conf file so the process environment never carries
+    // a value that concurrently running validation tests would observe (this
+    // suite's validation tests do not all hold ENV_LOCK).
+    use ferrum_edge::config::conf_file::ConfFile;
+
+    with_env_vars(&[], || {
+        let conf = ConfFile::parse(
+            "FERRUM_MODE = file\nFERRUM_FILE_CONFIG_PATH = /path/to/config.yaml\n\
+             FERRUM_MAX_CREDENTIALS_PER_TYPE = 0",
+        )
+        .expect("conf file parses");
+        let err = EnvConfig::from_env_with_conf(&conf).expect_err("zero limit must fail startup");
+        assert!(err.contains("FERRUM_MAX_CREDENTIALS_PER_TYPE"), "{err}");
+    });
 }
 
 #[test]
@@ -610,11 +613,41 @@ fn test_max_credentials_per_type_runtime_parse_matches_env_config() {
             let config = EnvConfig::from_env().expect("trimmed value is valid");
             assert_eq!(config.max_credentials_per_type, 5);
             assert_eq!(
-                ferrum_edge::config::types::max_credentials_per_type(),
+                ferrum_edge::config::types::max_credentials_per_type()
+                    .expect("trimmed value is valid"),
                 config.max_credentials_per_type
             );
         },
     );
+}
+
+#[test]
+fn test_max_credentials_per_type_resolver_refuses_invalid_values() {
+    use ferrum_edge::config::types::{
+        DEFAULT_MAX_CREDENTIALS_PER_TYPE, max_credentials_per_type_from_resolved,
+    };
+
+    // Unset keeps the documented default.
+    assert_eq!(
+        max_credentials_per_type_from_resolved(None).expect("unset limit uses the default"),
+        DEFAULT_MAX_CREDENTIALS_PER_TYPE
+    );
+    // Same surrounding-whitespace trimming as `EnvConfig`.
+    assert_eq!(
+        max_credentials_per_type_from_resolved(Some(" 5\n")).expect("trimmed value is valid"),
+        5
+    );
+
+    // A configured but invalid value must refuse instead of silently
+    // enforcing the default (issue #6754).
+    for raw in ["5x", "0", "", "-1"] {
+        let err = max_credentials_per_type_from_resolved(Some(raw))
+            .expect_err("invalid rotation ceiling must refuse");
+        assert!(
+            err.contains("FERRUM_MAX_CREDENTIALS_PER_TYPE"),
+            "{raw:?}: {err}"
+        );
+    }
 }
 
 #[test]

@@ -8244,7 +8244,15 @@ async fn handle_append_credential(
             _ => Value::Array(vec![new_cred]),
         };
 
-        let limit = max_credentials_per_type();
+        // A configured-but-invalid rotation ceiling is a server-side
+        // configuration error: refuse the write with a response instead of
+        // enforcing a silently substituted default (issue #6754).
+        let limit = match max_credentials_per_type() {
+            Ok(limit) => limit,
+            Err(error) => {
+                return json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": error}));
+            }
+        };
         if let Value::Array(ref arr) = new_value
             && arr.len() > limit
         {

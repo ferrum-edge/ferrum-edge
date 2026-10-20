@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
+  (issue #6754; follow-up to #6651 item 3). The library and
+  config-validation resolver used by `Consumer::validate_fields`, the
+  admin credential-append route, and `basic_auth` / `hmac_auth`
+  construction silently fell back to the default of 2 when the variable
+  was unparsable or zero, while the gateway binary refused startup. It now
+  parses through the same `EnvValue` parser `EnvConfig` uses, rejects `0`,
+  and returns an error naming the variable; every call site propagates it
+  (admin returns `500`, consumer validation reports the error, and plugin
+  construction refuses the candidate).
 - **Compression admission policy has a single typed source** (issue #6651,
   item 3). Validation clients previously re-parsed
   `FERRUM_COMPRESSION_GZIP_ENABLED`, `FERRUM_COMPRESSION_BROTLI_ENABLED`

@@ -323,17 +323,42 @@ pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
 /// Overridable at runtime via `FERRUM_MAX_CREDENTIALS_PER_TYPE` env var / conf file.
 pub const DEFAULT_MAX_CREDENTIALS_PER_TYPE: usize = 2;
 
-/// Resolve the runtime max credentials per type from env var / conf file, falling
-/// back to `DEFAULT_MAX_CREDENTIALS_PER_TYPE` if unset or unparsable.
+/// Environment variable / conf-file key for the credential rotation ceiling.
+pub const MAX_CREDENTIALS_PER_TYPE_ENV: &str = "FERRUM_MAX_CREDENTIALS_PER_TYPE";
+
+/// Resolve the runtime max credentials per type from env var / conf file.
 ///
-/// Parses exactly like `EnvConfig` (surrounding whitespace trimmed) so a value
-/// startup validated is the value enforced here; `EnvConfig::validate` rejects
-/// unparsable and zero values before serving.
-pub fn max_credentials_per_type() -> usize {
-    crate::config::conf_file::resolve_ferrum_var("FERRUM_MAX_CREDENTIALS_PER_TYPE")
-        .and_then(|v| v.trim().parse().ok())
-        .filter(|limit: &usize| *limit >= 1)
-        .unwrap_or(DEFAULT_MAX_CREDENTIALS_PER_TYPE)
+/// Parses through the same typed parser `EnvConfig` uses (surrounding
+/// whitespace trimmed), so a value startup accepted is the value enforced
+/// here. An unset value resolves to [`DEFAULT_MAX_CREDENTIALS_PER_TYPE`]; a
+/// configured but unparsable or zero value is refused with an error naming the
+/// variable instead of silently falling back to the default (issue #6754,
+/// follow-up to #6742 / #6651 item 3).
+pub fn max_credentials_per_type() -> Result<usize, String> {
+    // Load the conf file fallibly first: `resolve_ferrum_var` resolves a sticky
+    // conf-load failure to `None`, which would silently become the default here
+    // while `EnvConfig::from_env` refuses the same file.
+    let conf = crate::config::conf_file::ConfFile::load()?;
+    let raw = crate::config::env_config::resolve_var(&conf, MAX_CREDENTIALS_PER_TYPE_ENV);
+    max_credentials_per_type_from_resolved(raw.as_deref())
+}
+
+/// Build the runtime ceiling from an already-resolved value (`None` = unset),
+/// through the same `EnvValue` parser `EnvConfig` uses.
+pub fn max_credentials_per_type_from_resolved(raw: Option<&str>) -> Result<usize, String> {
+    use crate::config::env_config::EnvValue;
+
+    let limit = match raw {
+        Some(raw) => <usize as EnvValue>::parse_env(raw, MAX_CREDENTIALS_PER_TYPE_ENV)?,
+        None => DEFAULT_MAX_CREDENTIALS_PER_TYPE,
+    };
+    if limit == 0 {
+        return Err(format!(
+            "{MAX_CREDENTIALS_PER_TYPE_ENV} must be at least 1; 0 would reject every consumer \
+             credential"
+        ));
+    }
+    Ok(limit)
 }
 
 /// Validate the shared Basic-auth HMAC secret without exposing its value.
@@ -9078,6 +9103,17 @@ impl Consumer {
             ));
         }
 
+        // Credential array ceiling. Resolve once so a parse failure is reported
+        // exactly once, and never judge an array against a silently-defaulted
+        // limit (issue #6754).
+        let credential_limit = match max_credentials_per_type() {
+            Ok(limit) => Some(limit),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        };
+
         // Validate individual credential values.
         for (cred_type, cred_value) in &self.credentials {
             if let Err(e) = validate_credential_type_name(cred_type) {
@@ -9088,8 +9124,9 @@ impl Consumer {
             // credentials.
             let objects: Vec<&serde_json::Map<String, serde_json::Value>> =
                 if let Some(arr) = cred_value.as_array() {
-                    let limit = max_credentials_per_type();
-                    if arr.len() > limit {
+                    if let Some(limit) = credential_limit
+                        && arr.len() > limit
+                    {
                         errors.push(format!(
                             "credentials.{} array must not exceed {} entries (got {})",
                             cred_type,
