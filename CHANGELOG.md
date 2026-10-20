@@ -28,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parses through the same `EnvValue` parser `EnvConfig` uses, rejects `0`,
   and returns an error naming the variable; every call site propagates it
   (admin returns `500`, consumer validation reports the error, and plugin
-  construction refuses the candidate).
+  construction refuses the candidate). The runtime resolver now borrows the
+  cached `ferrum.conf` snapshot and reads only that key instead of cloning
+  the full defaults map per consumer, and it propagates a sticky conf-file
+  load failure rather than treating it as unset.
 - **Compression admission policy has a single typed source** (issue #6651,
   item 3). Validation clients previously re-parsed
   `FERRUM_COMPRESSION_GZIP_ENABLED`, `FERRUM_COMPRESSION_BROTLI_ENABLED`

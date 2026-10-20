@@ -335,11 +335,12 @@ pub const MAX_CREDENTIALS_PER_TYPE_ENV: &str = "FERRUM_MAX_CREDENTIALS_PER_TYPE"
 /// variable instead of silently falling back to the default (issue #6754,
 /// follow-up to #6742 / #6651 item 3).
 pub fn max_credentials_per_type() -> Result<usize, String> {
-    // Load the conf file fallibly first: `resolve_ferrum_var` resolves a sticky
-    // conf-load failure to `None`, which would silently become the default here
-    // while `EnvConfig::from_env` refuses the same file.
-    let conf = crate::config::conf_file::ConfFile::load()?;
-    let raw = crate::config::env_config::resolve_var(&conf, MAX_CREDENTIALS_PER_TYPE_ENV);
+    // Resolve through the cached conf snapshot directly: `ConfFile::load()`
+    // would clone the whole defaults map, and this runs per consumer during
+    // batch validation and per plugin construction. The checked resolver also
+    // propagates a sticky conf-load failure instead of silently becoming the
+    // default here while `EnvConfig::from_env` refuses the same file.
+    let raw = crate::config::conf_file::resolve_ferrum_var_checked(MAX_CREDENTIALS_PER_TYPE_ENV)?;
     max_credentials_per_type_from_resolved(raw.as_deref())
 }
 
