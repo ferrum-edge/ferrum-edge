@@ -119,6 +119,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The shared HTTP batch-response helper renders a transport error without its
   request URL (PR #6684), so an endpoint credential in the path or query is
   never echoed into a sink diagnostic.
+- **WAF wide-charset inspection scans both readings when a BOM's width
+  disagrees with the declared wide charset.** A body declared as one wide
+  family but prefixed with the other family's byte-order mark (for example
+  `charset=utf-32le` over a body starting with the UTF-16BE mark `FE FF`, or
+  `charset=utf-16le` over one starting with the UTF-32BE mark `00 00 FE FF`)
+  was previously decoded only one way — the declared reading or the BOM's
+  reading, depending on the case. Both the declared reading of the whole body
+  and the BOM's reading after the mark are now scanned, mirroring the
+  same-width declared/BOM disagreement and staying within the four-wide-view
+  cap. `FF FE 00 00` keeps its UTF-32LE / UTF-16LE ambiguity handling; under
+  an explicit `utf-16be` declaration the declared reading is added to it.
+  Separately, a BOM-less body whose explicit endianness already matches its
+  wide signature (for example `charset=utf-16le` over genuine UTF-16LE bytes)
+  no longer pays an extra opposite-endian decode and text-rule scan; only a
+  disagreement does, as documented.
 - **WAF wide-charset inspection follows a disagreeing BOM-less signature**
   (follow-up to #6729). A body whose declared wide charset is wrong about
   width or endianness (for example `charset=utf-16be` over UTF-16LE bytes, or

@@ -233,7 +233,8 @@ matching request and response bodies, the WAF also scans **decoded variants**:
   switch the signature off; bare `utf-16` / `utf-32` without a BOM tries both
   endiannesses; and when a BOM-less wide signature disagrees with a declared
   wide charset's width or endianness, both endiannesses of the signature's
-  width are scanned in addition to the declared readings)
+  width are scanned in addition to the declared readings; a BOM of the other
+  wide width likewise adds the BOM's reading to the declared one)
 - JSON / JavaScript string escapes — `\uXXXX`, `\u{...}`, `\xXX`, and the
   single-character escapes `\n`, `\t`, `\r`, `\f`, `\b`, `\v`, `\/`, `\"`,
   `\'`, `\\`. A JSON parser resolves these before the application sees the
@@ -319,12 +320,25 @@ readings are scanned: the declaration-honouring reading decodes the whole
 body including the BOM bytes — which is what a backend trusting
 `Content-Type` sees, reading `FE FF` as the noncharacter `U+FFFE` — and the
 BOM-honouring reading decodes the body after the mark. The raw/lossy view is
-kept as well, so a mismatched declaration cannot hide the payload. The same
-holds without a BOM: when the BOM-less wide signature disagrees with a
-declared wide charset (`charset=utf-16be` on UTF-16LE bytes, or
-`charset=utf-16` on UTF-32 bytes), both endiannesses of the signature's
-width are scanned in addition to the declared readings — at most four wide
-views in that disagreement case, two otherwise.
+kept as well, so a mismatched declaration cannot hide the payload.
+
+The same holds when the BOM's **width** disagrees with the declared wide
+charset family — a UTF-16 mark under a UTF-32 declaration
+(`charset=utf-32le` on a body starting with `FE FF`) or the UTF-32BE mark
+under a UTF-16 declaration (`charset=utf-16le` on a body starting with
+`00 00 FE FF`): the declared reading of the whole body and the BOM's
+reading after the mark are both scanned (both endiannesses of the declared
+width for a bare `utf-16` / `utf-32`). `FF FE 00 00` keeps the ambiguity
+handling above: a UTF-32 charset settles it as UTF-32, and otherwise its
+UTF-32LE and UTF-16LE readings are scanned, plus the declared whole-body
+reading when the charset is explicitly `utf-16be`.
+
+Without a BOM, when the wide signature disagrees with a declared wide
+charset (`charset=utf-16be` on UTF-16LE bytes, or `charset=utf-16` on UTF-32
+bytes), both endiannesses of the signature's width are scanned in addition
+to the declared readings. A declaration whose width and endianness already
+match the signature (`charset=utf-16le` on UTF-16LE bytes) adds nothing. At
+most four wide views are scanned in a disagreement case, two otherwise.
 
 The full WHATWG UTF-16LE label set is recognized, not just `utf-16le` /
 `utf16le`: `unicode`, `unicodefeff`, `ucs-2`, `iso-10646-ucs-2`, and
