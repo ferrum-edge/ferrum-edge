@@ -275,12 +275,10 @@ impl WideCharsetViews {
                     self.push_view(decode_utf16(body, Utf16Endian::Big));
                 }
             },
-            Some((Utf32Endian::Little, _)) => {
-                if declared == Some(Utf16Endian::Big) {
-                    self.push_view(decode_utf16(body, Utf16Endian::Big));
-                }
+            Some((Utf32Endian::Little, _)) if declared == Some(Utf16Endian::Big) => {
+                self.push_view(decode_utf16(body, Utf16Endian::Big));
             }
-            None => {}
+            Some((Utf32Endian::Little, _)) | None => {}
         }
     }
 
