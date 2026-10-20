@@ -1766,9 +1766,10 @@ async fn test_mongodb_replica_set_plugin_config_expected_proxy_ids() {
 // The HTTP cells above are refused by the admin precheck before Mongo's write
 // methods run. These cells call `MongoStore` directly, which bypasses admin
 // admission and models a write that reaches persistence after its lease-held
-// precheck went stale, so the store's own refusal (standalone pre-mutation
-// check; replica-set check plus in-transaction re-check and
-// `plugin_association_transaction_error`) is what is under test. The SQLite
+// precheck went stale, so the store's own lease-held pre-mutation check is
+// what refuses. On a replica set that check runs before the transaction, so
+// the in-transaction re-check is not reached here: driving it needs a writer
+// between the two reads, and there is no test hook for that. The SQLite
 // equivalents live in
 // `tests/integration/db_proxy_plugin_association_fail_closed_tests.rs`.
 
