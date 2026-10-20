@@ -69,6 +69,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
+  #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
+  0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their
+  own 0.62.7 copy, so the GHSA-8ffr-xgwf-xj56 pin constrained nothing. The SDK
+  now moves to `aws-config` 1.12 and `aws-sdk-secretsmanager` 1.120 (with
+  `aws-sdk-sts` 1.119, `aws-sdk-sso` 1.114, `aws-sdk-ssooidc` 1.116), which
+  require 0.63, and `Cargo.lock` holds one `aws-smithy-json` and one
+  `aws-smithy-schema`. The pin is now a 0.63.1 floor, and the dependency audit
+  fails any lockfile that resolves more than one `aws-smithy-json`.
 - **Plugin execution triggers that read `query` now refuse an unencoded `;`**
   (issue #6655; follow-up to #6579). Trigger `query` predicates split pairs
   only on `&`, so a backend that also splits on `;` (Rack before 3.0, Go
