@@ -8,6 +8,7 @@
 //! - Full Admin API CRUD lifecycle (proxies, consumers, plugins, upstreams)
 //! - Proxy traffic routing through a MongoDB-backed gateway
 //! - Health endpoint reports MongoDB connectivity
+//! - Plugin-config `expected_proxy_ids` precondition (standalone + replica set)
 //!
 //! Prerequisites:
 //!   1. MongoDB running on localhost:27017 (plaintext test)
@@ -1218,6 +1219,546 @@ async fn test_mongodb_batch_atomicity_all_or_nothing_on_replica_set() {
     assert_eq!(body["created"]["plugin_configs"], 1);
     println!("  OK: corrected retry applied the whole graph");
     println!("\n=== MongoDB Replica-Set Batch Atomicity Test PASSED ===\n");
+}
+
+// ==========================================================================
+// Test: plugin-config `expected_proxy_ids` precondition (issue #6756, #6744)
+// ==========================================================================
+//
+// `PUT`/`DELETE /plugins/config/{id}` require `expected_proxy_ids` and refuse
+// with `412` — before any mutation — when a proxy that references the config is
+// missing from the set. The SQLite expectations live in
+// `tests/integration/admin_conditional_write_tests.rs`; these cells pin the
+// same contract on MongoDB, both standalone (lease-guarded check) and replica
+// set (check repeated inside the write transaction).
+
+/// Issue one admin request and return `(status, json body)`. A `204` or other
+/// non-JSON body comes back as `Value::Null`.
+async fn admin_call(
+    client: &reqwest::Client,
+    harness: &MongoTestHarness,
+    auth_header: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> (u16, serde_json::Value) {
+    let mut request = client
+        .request(
+            method.clone(),
+            format!("{}{}", harness.admin_base_url, path),
+        )
+        .header("Authorization", auth_header);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{method} {path}: {e}"));
+    let status = response.status().as_u16();
+    let text = response.text().await.unwrap_or_default();
+    let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+/// A proxy that references `plugin_ids` through its association list.
+fn expected_ids_proxy(id: &str, plugin_ids: &[&str]) -> serde_json::Value {
+    json!({
+        "id": id,
+        "name": format!("expected-ids-{id}"),
+        "listen_path": format!("/{id}"),
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080,
+        "plugins": plugin_ids
+            .iter()
+            .map(|plugin_id| json!({"plugin_config_id": plugin_id}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn expected_ids_plugin(id: &str, scope: &str, origin: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "plugin_name": "cors",
+        "scope": scope,
+        "enabled": true,
+        "config": {"allowed_origins": [origin]},
+    })
+}
+
+/// Durable proxy -> plugin association as the admin API reads it back.
+async fn proxy_references_plugin(
+    client: &reqwest::Client,
+    harness: &MongoTestHarness,
+    auth_header: &str,
+    proxy_id: &str,
+    plugin_id: &str,
+) -> bool {
+    let (status, body) = admin_call(
+        client,
+        harness,
+        auth_header,
+        reqwest::Method::GET,
+        &format!("/proxies/{proxy_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "GET proxy {proxy_id}: {body:?}");
+    body["plugins"]
+        .as_array()
+        .map(|plugins| {
+            plugins
+                .iter()
+                .any(|entry| entry["plugin_config_id"] == plugin_id)
+        })
+        .unwrap_or(false)
+}
+
+/// Durable plugin-config document, or `None` when it is gone.
+async fn plugin_config_state(
+    client: &reqwest::Client,
+    harness: &MongoTestHarness,
+    auth_header: &str,
+    plugin_id: &str,
+) -> Option<serde_json::Value> {
+    let (status, body) = admin_call(
+        client,
+        harness,
+        auth_header,
+        reqwest::Method::GET,
+        &format!("/plugins/config/{plugin_id}"),
+        None,
+    )
+    .await;
+    match status {
+        200 => Some(body),
+        404 => None,
+        other => panic!("GET plugin config {plugin_id}: {other} {body:?}"),
+    }
+}
+
+/// The fields a refused write must leave untouched.
+fn plugin_config_fingerprint(body: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "scope": body["scope"],
+        "proxy_id": body["proxy_id"],
+        "config": body["config"],
+    })
+}
+
+/// Drive the full `expected_proxy_ids` contract against a running
+/// MongoDB-backed gateway. Every id carries a fresh run suffix because the
+/// standalone and replica-set cells share a persistent database.
+async fn assert_plugin_config_expected_proxy_ids_enforced(harness: &MongoTestHarness, label: &str) {
+    use reqwest::Method;
+
+    let client = reqwest::Client::new();
+    let auth = format!("Bearer {}", harness.generate_token().expect("token"));
+    let run = Uuid::new_v4().to_string()[..8].to_string();
+    let pa = format!("{label}-epi-pa-{run}");
+    let pb = format!("{label}-epi-pb-{run}");
+    let pc_del = format!("{label}-epi-del-{run}");
+    let pc_lonely = format!("{label}-epi-lonely-{run}");
+    let pc_move = format!("{label}-epi-move-{run}");
+    let pc_home = format!("{label}-epi-home-{run}");
+
+    let create = |path: &'static str, body: serde_json::Value| {
+        let client = client.clone();
+        let auth = auth.clone();
+        async move {
+            let (status, reply) =
+                admin_call(&client, harness, &auth, Method::POST, path, Some(&body)).await;
+            assert_eq!(status, 201, "create {path} {}: {reply:?}", body["id"]);
+        }
+    };
+    let refs = |proxy: &str, plugin: &str| {
+        let client = client.clone();
+        let auth = auth.clone();
+        let proxy = proxy.to_string();
+        let plugin = plugin.to_string();
+        async move { proxy_references_plugin(&client, harness, &auth, &proxy, &plugin).await }
+    };
+
+    // ---------------------------------------------------------------- DELETE
+    println!("\n--- {label}: DELETE /plugins/config expected_proxy_ids ---");
+    create(
+        "/plugins/config",
+        expected_ids_plugin(&pc_del, "proxy_group", "https://a.example"),
+    )
+    .await;
+    create("/proxies", expected_ids_proxy(&pa, &[pc_del.as_str()])).await;
+    create("/proxies", expected_ids_proxy(&pb, &[pc_del.as_str()])).await;
+    let del_before = plugin_config_fingerprint(
+        &plugin_config_state(&client, harness, &auth, &pc_del)
+            .await
+            .expect("pc_del exists"),
+    );
+
+    // Absent parameter: 400, nothing deleted.
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::DELETE,
+        &format!("/plugins/config/{pc_del}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 400, "absent expected_proxy_ids: {body:?}");
+
+    // Malformed values: duplicate, empty entry, invalid id, repeated key.
+    for query in [
+        format!("expected_proxy_ids={pa},{pa}"),
+        format!("expected_proxy_ids={pa},,{pb}"),
+        "expected_proxy_ids=bad!id".to_string(),
+        format!("expected_proxy_ids={pa}&expected_proxy_ids={pb}"),
+    ] {
+        let (status, body) = admin_call(
+            &client,
+            harness,
+            &auth,
+            Method::DELETE,
+            &format!("/plugins/config/{pc_del}?{query}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 400, "malformed {query}: {body:?}");
+    }
+    assert!(
+        plugin_config_state(&client, harness, &auth, &pc_del)
+            .await
+            .is_some(),
+        "a 400 must not delete the plugin config"
+    );
+    assert!(refs(&pa, &pc_del).await && refs(&pb, &pc_del).await);
+    println!("  OK: absent/malformed expected_proxy_ids -> 400, nothing deleted");
+
+    // A referencing proxy outside the expected set: 412 naming it, state intact.
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::DELETE,
+        &format!("/plugins/config/{pc_del}?expected_proxy_ids={pa}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 412, "incomplete expected set: {body:?}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(&pb), "412 must name {pb}: {body:?}");
+    assert!(
+        !error.contains(&pa),
+        "412 must not name expected {pa}: {body:?}"
+    );
+    let del_after = plugin_config_state(&client, harness, &auth, &pc_del)
+        .await
+        .expect("a 412 must not delete the plugin config");
+    assert_eq!(plugin_config_fingerprint(&del_after), del_before);
+    assert!(
+        refs(&pa, &pc_del).await,
+        "a refused delete must not detach the expected proxy"
+    );
+    assert!(
+        refs(&pb, &pc_del).await,
+        "a refused delete must not detach the unexpected proxy"
+    );
+    println!("  OK: incomplete set -> 412 naming the proxy; config and associations intact");
+
+    // The complete set, in a different order: delete lands, associations gone.
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::DELETE,
+        &format!("/plugins/config/{pc_del}?expected_proxy_ids={pb},{pa}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "complete expected set: {body:?}");
+    assert!(
+        plugin_config_state(&client, harness, &auth, &pc_del)
+            .await
+            .is_none()
+    );
+    assert!(!refs(&pa, &pc_del).await && !refs(&pb, &pc_del).await);
+    println!("  OK: complete set (order-insensitive) -> 204, associations removed");
+
+    // An explicitly empty expectation deletes an unreferenced config.
+    create(
+        "/plugins/config",
+        expected_ids_plugin(&pc_lonely, "global", "https://a.example"),
+    )
+    .await;
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::DELETE,
+        &format!("/plugins/config/{pc_lonely}?expected_proxy_ids="),
+        None,
+    )
+    .await;
+    assert_eq!(status, 204, "empty expectation on unreferenced: {body:?}");
+    println!("  OK: empty expectation deletes an unreferenced config");
+
+    // ------------------------------------------------------------------- PUT
+    println!("\n--- {label}: PUT /plugins/config expected_proxy_ids ---");
+    create(
+        "/plugins/config",
+        expected_ids_plugin(&pc_move, "proxy_group", "https://a.example"),
+    )
+    .await;
+    for proxy in [&pa, &pb] {
+        let (status, body) = admin_call(
+            &client,
+            harness,
+            &auth,
+            Method::PUT,
+            &format!("/proxies/{proxy}"),
+            Some(&expected_ids_proxy(proxy, &[pc_move.as_str()])),
+        )
+        .await;
+        assert_eq!(status, 200, "attach {proxy} to {pc_move}: {body:?}");
+    }
+    let move_before = plugin_config_fingerprint(
+        &plugin_config_state(&client, harness, &auth, &pc_move)
+            .await
+            .expect("pc_move exists"),
+    );
+    let global = expected_ids_plugin(&pc_move, "global", "https://b.example");
+
+    // Absent and malformed parameters: 400 even though the body is valid.
+    for query in [
+        String::new(),
+        format!("?expected_proxy_ids={pa},{pa}"),
+        "?expected_proxy_ids=bad!id".to_string(),
+        format!("?expected_proxy_ids={pa}&expected_proxy_ids={pb}"),
+    ] {
+        let (status, body) = admin_call(
+            &client,
+            harness,
+            &auth,
+            Method::PUT,
+            &format!("/plugins/config/{pc_move}{query}"),
+            Some(&global),
+        )
+        .await;
+        assert_eq!(status, 400, "PUT {query:?}: {body:?}");
+    }
+    println!("  OK: absent/malformed expected_proxy_ids -> 400");
+
+    // Retarget to global with an incomplete set: 412, nothing changed.
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::PUT,
+        &format!("/plugins/config/{pc_move}?expected_proxy_ids={pa}"),
+        Some(&global),
+    )
+    .await;
+    assert_eq!(status, 412, "incomplete retarget: {body:?}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains(&pb),
+        "412 must name {pb}: {body:?}"
+    );
+    let move_after = plugin_config_state(&client, harness, &auth, &pc_move)
+        .await
+        .expect("a 412 must not delete the plugin config");
+    assert_eq!(
+        plugin_config_fingerprint(&move_after),
+        move_before,
+        "a refused PUT must leave the plugin config unchanged"
+    );
+    assert!(refs(&pa, &pc_move).await && refs(&pb, &pc_move).await);
+    println!("  OK: incomplete set -> 412; scope/config and associations intact");
+
+    // Complete set (order-insensitive): retarget lands, both proxies detached.
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::PUT,
+        &format!("/plugins/config/{pc_move}?expected_proxy_ids={pb},{pa}"),
+        Some(&global),
+    )
+    .await;
+    assert_eq!(status, 200, "complete retarget: {body:?}");
+    let moved = plugin_config_state(&client, harness, &auth, &pc_move)
+        .await
+        .expect("retargeted config exists");
+    assert_eq!(moved["scope"], "global");
+    assert_eq!(
+        moved["config"]["allowed_origins"],
+        json!(["https://b.example"])
+    );
+    assert!(!refs(&pa, &pc_move).await && !refs(&pb, &pc_move).await);
+    println!("  OK: complete set -> 200, retargeted and detached");
+
+    // Re-home a proxy_group config onto pb while pa references it.
+    create(
+        "/plugins/config",
+        expected_ids_plugin(&pc_home, "proxy_group", "https://a.example"),
+    )
+    .await;
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::PUT,
+        &format!("/proxies/{pa}"),
+        Some(&expected_ids_proxy(&pa, &[pc_home.as_str()])),
+    )
+    .await;
+    assert_eq!(status, 200, "attach {pa} to {pc_home}: {body:?}");
+    let home_before = plugin_config_fingerprint(
+        &plugin_config_state(&client, harness, &auth, &pc_home)
+            .await
+            .expect("pc_home exists"),
+    );
+    let mut homed = expected_ids_plugin(&pc_home, "proxy", "https://a.example");
+    homed["proxy_id"] = json!(pb);
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::PUT,
+        &format!("/plugins/config/{pc_home}?expected_proxy_ids="),
+        Some(&homed),
+    )
+    .await;
+    assert_eq!(status, 412, "re-home with {pa} unexpected: {body:?}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains(&pa),
+        "412 must name {pa}: {body:?}"
+    );
+    let home_after = plugin_config_state(&client, harness, &auth, &pc_home)
+        .await
+        .expect("pc_home exists");
+    assert_eq!(plugin_config_fingerprint(&home_after), home_before);
+    assert!(refs(&pa, &pc_home).await, "refused re-home kept {pa}");
+    assert!(!refs(&pb, &pc_home).await, "refused re-home attached {pb}");
+
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::PUT,
+        &format!("/plugins/config/{pc_home}?expected_proxy_ids={pa}"),
+        Some(&homed),
+    )
+    .await;
+    assert_eq!(status, 200, "re-home with {pa} expected: {body:?}");
+    assert!(!refs(&pa, &pc_home).await, "re-home detaches {pa}");
+    assert!(refs(&pb, &pc_home).await, "re-home attaches {pb}");
+    println!("  OK: proxy-scoped re-home -> 412 then 200 with the old target expected");
+
+    // The kept target need not be listed: a same-target update with an
+    // empty expectation succeeds while pb references the config.
+    let mut tweaked = expected_ids_plugin(&pc_home, "proxy", "https://c.example");
+    tweaked["proxy_id"] = json!(pb);
+    let (status, body) = admin_call(
+        &client,
+        harness,
+        &auth,
+        Method::PUT,
+        &format!("/plugins/config/{pc_home}?expected_proxy_ids="),
+        Some(&tweaked),
+    )
+    .await;
+    assert_eq!(status, 200, "kept target update: {body:?}");
+    let kept = plugin_config_state(&client, harness, &auth, &pc_home)
+        .await
+        .expect("pc_home exists");
+    assert_eq!(kept["proxy_id"], json!(pb));
+    assert_eq!(
+        kept["config"]["allowed_origins"],
+        json!(["https://c.example"])
+    );
+    assert!(refs(&pb, &pc_home).await, "kept target stays attached");
+    println!("  OK: proxy-scoped PUT keeping its target needs no expectation");
+
+    // ---------------------------------------------------------------- cleanup
+    for (method, path) in [
+        (
+            Method::DELETE,
+            format!("/plugins/config/{pc_home}?expected_proxy_ids={pb}"),
+        ),
+        (
+            Method::DELETE,
+            format!("/plugins/config/{pc_move}?expected_proxy_ids="),
+        ),
+        (Method::DELETE, format!("/proxies/{pa}")),
+        (Method::DELETE, format!("/proxies/{pb}")),
+    ] {
+        let (status, body) = admin_call(&client, harness, &auth, method, &path, None).await;
+        assert_eq!(status, 204, "cleanup {path}: {body:?}");
+    }
+}
+
+/// Standalone MongoDB: the precondition is enforced under the namespace
+/// admission lease immediately before the (non-transactional) mutation.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_plugin_config_expected_proxy_ids() {
+    println!("\n=== MongoDB Standalone Plugin expected_proxy_ids Test ===\n");
+
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("Create harness");
+    harness
+        .start_gateway_plaintext(&mongo_url)
+        .await
+        .expect("Start gateway with standalone MongoDB");
+
+    assert_plugin_config_expected_proxy_ids_enforced(&harness, "standalone").await;
+    println!("\n=== MongoDB Standalone Plugin expected_proxy_ids Test PASSED ===\n");
+}
+
+/// Replica-set MongoDB: the precondition is additionally re-checked inside the
+/// write transaction, and its refusal must still surface as `412`.
+///
+/// Requires a replica set (`FERRUM_TEST_MONGO_REPLICA_SET`, optionally
+/// `FERRUM_TEST_MONGO_REPLICA_SET_URL`); skipped otherwise.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_replica_set_plugin_config_expected_proxy_ids() {
+    println!("\n=== MongoDB Replica-Set Plugin expected_proxy_ids Test ===\n");
+
+    let Ok(replica_set) = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET") else {
+        println!("SKIP: FERRUM_TEST_MONGO_REPLICA_SET not set — no replica set available");
+        return;
+    };
+    let mongo_url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
+        .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
+        .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb-replica-set",
+        mongodb_is_available(&mongo_url).await,
+        &format!("declared but not available at {mongo_host_port}"),
+    ) {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("Create harness");
+    harness
+        .start_gateway_replica_set(&mongo_url, &replica_set)
+        .await
+        .expect("Start gateway with MongoDB replica set");
+
+    assert_plugin_config_expected_proxy_ids_enforced(&harness, "replset").await;
+    println!("\n=== MongoDB Replica-Set Plugin expected_proxy_ids Test PASSED ===\n");
 }
 
 #[derive(Debug)]
