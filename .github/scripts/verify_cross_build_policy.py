@@ -45,6 +45,12 @@ PIN_NORMALIZED_SUFFIXES = frozenset({".yml", ".yaml"})
 # not: inside a pin comment they would hide an executable step from
 # every pin-normalized comparison while the runner still parses it as
 # structure (#6689). Governed YAML containing them is refused outright.
+# A lone `\r` is the same hazard (#6752) but needs no entry here: every
+# governed text is loaded through `Path.read_text()`, whose universal-
+# newline translation turns a bare `\r` into `\n` before normalization,
+# so a hidden step stays on its own line. The standalone
+# `verify_trusted_local_action.py` checker decodes raw bytes and rejects
+# a bare `\r` explicitly.
 YAML_UNICODE_LINE_BREAKS = ("\u0085", "\u2028", "\u2029")
 
 
