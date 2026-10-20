@@ -32,8 +32,9 @@ enum Utf32Endian {
 /// single inspection view; the underlying `RegexSet` matching is linear so
 /// this is a hard multiplier. A bare `charset=utf-16` / `utf-32` with no BOM
 /// may produce up to [`MAX_WIDE_CHARSET_VIEWS`] transcoded views (plus up to
-/// [`MAX_SIGNATURE_VIEWS`] more when the BOM-less wide signature disagrees
-/// with the declared wide charset) and still scans the raw/lossy view, so
+/// [`MAX_SIGNATURE_VIEWS`] more when the BOM-less wide signature, or a BOM of
+/// the other wide width, disagrees with the declared wide charset) and still
+/// scans the raw/lossy view, so
 /// that path's worst case is
 /// `O((1 + MAX_WIDE_CHARSET_VIEWS + MAX_SIGNATURE_VIEWS) × (1 + MAX_VARIANTS) × bytes × rules)`.
 /// That is a deliberate bound for an uncommon Content-Type, not an unbounded
@@ -50,14 +51,24 @@ const MAX_VARIANTS: usize = 5;
 /// views are kept up to this cap.
 const MAX_WIDE_CHARSET_VIEWS: usize = 2;
 
-/// Extra views a BOM-less wide signature may add when it disagrees with the
-/// declared wide charset's width or endianness (for example `charset=utf-16`
-/// on UTF-32 bytes, or `charset=utf-16be` on UTF-16LE bytes): both
-/// endiannesses of the signature's width, on top of the declared readings.
-/// A byte-sniffing backend reads the signature, not the header, so capping
-/// at the declared readings alone would leave the sniffed reading unscanned.
-/// Only a disagreement pays this: a signature the declared readings already
-/// cover adds nothing.
+/// Extra views the body's own bytes may add when they disagree with the
+/// declared wide charset in a way the declared readings do not cover:
+///
+/// - a BOM-less wide signature whose width or endianness differs from the
+///   declaration (for example `charset=utf-16` on UTF-32 bytes, or
+///   `charset=utf-16be` on UTF-16LE bytes) adds both endiannesses of the
+///   signature's width;
+/// - a BOM of the other wide width (for example `charset=utf-32le` on a body
+///   that starts with the UTF-16BE mark `FE FF`, or `charset=utf-16le` on one
+///   that starts with the UTF-32BE mark `00 00 FE FF`) adds whichever of the
+///   declared whole-body reading and the BOM-stripped BOM reading the
+///   declared path did not already produce.
+///
+/// A byte-sniffing backend reads the signature or BOM, not the header, and a
+/// declaration-honouring one reads the header, so capping at either side
+/// alone would leave the other reading unscanned. Only a disagreement pays
+/// this: a signature whose width and endianness the declaration already names
+/// adds nothing.
 const MAX_SIGNATURE_VIEWS: usize = 2;
 const MAX_NUMERIC_ENTITY_DIGITS: usize = 16;
 
@@ -149,9 +160,11 @@ fn decoded_variants(text: &str, escapes: StringEscapes) -> (Vec<String>, bool) {
 /// prefix, or a charset that disagrees with the BOM — yields both candidate
 /// views, capped at [`MAX_WIDE_CHARSET_VIEWS`]. When a BOM-less wide
 /// signature disagrees with the declared wide charset, both endiannesses of
-/// the signature's width are added on top (up to [`MAX_SIGNATURE_VIEWS`]
-/// more). The scanner always keeps the raw/lossy view and its
-/// transformations alongside these additional views.
+/// the signature's width are added on top, and when a BOM's width disagrees
+/// with the declared wide charset family, the declared whole-body reading and
+/// the BOM's reading are both kept (up to [`MAX_SIGNATURE_VIEWS`] more). The
+/// scanner always keeps the raw/lossy view and its transformations alongside
+/// these additional views.
 pub(super) struct WideCharsetViews {
     views: [Option<String>; MAX_WIDE_CHARSET_VIEWS + MAX_SIGNATURE_VIEWS],
     /// The body declares a charset this WAF cannot transcode at all (UTF-7,
@@ -192,28 +205,80 @@ impl WideCharsetViews {
         }
     }
 
+    /// Add one reading, skipping a duplicate of one already present. The
+    /// array is sized for the largest combination any path produces (at most
+    /// two declared readings plus at most two disagreement readings), so a
+    /// free slot always exists.
+    fn push_view(&mut self, text: String) {
+        if self.views.iter().flatten().any(|view| view == &text) {
+            return;
+        }
+        let slot = self.views.iter_mut().find(|slot| slot.is_none());
+        debug_assert!(slot.is_some(), "wide-charset view array sized too small");
+        if let Some(slot) = slot {
+            *slot = Some(text);
+        }
+    }
+
     /// Add both endiannesses of a disagreeing BOM-less wide signature,
-    /// skipping any reading already present. The signature selects only a
-    /// width, so both endians are candidates, exactly as for a bare wide
-    /// declaration.
+    /// skipping any reading already present. Once the declaration is known
+    /// to disagree, both endians of the signature's width are candidates,
+    /// exactly as for a bare wide declaration.
     fn add_signature_views(&mut self, body: &[u8], signature: WideSignature) {
-        let pair = match signature {
-            WideSignature::Utf16 => [
-                decode_utf16(body, Utf16Endian::Little),
-                decode_utf16(body, Utf16Endian::Big),
-            ],
-            WideSignature::Utf32 => [
-                decode_utf32(body, Utf32Endian::Little),
-                decode_utf32(body, Utf32Endian::Big),
-            ],
-        };
-        for text in pair {
-            if self.views.iter().flatten().any(|view| view == &text) {
-                continue;
+        match signature {
+            WideSignature::Utf16(_) => {
+                self.push_view(decode_utf16(body, Utf16Endian::Little));
+                self.push_view(decode_utf16(body, Utf16Endian::Big));
             }
-            if let Some(slot) = self.views.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(text);
+            WideSignature::Utf32(_) => {
+                self.push_view(decode_utf32(body, Utf32Endian::Little));
+                self.push_view(decode_utf32(body, Utf32Endian::Big));
             }
+        }
+    }
+
+    /// Add the readings of a body whose BOM's width disagrees with the
+    /// declared wide charset family. Same-width disagreements are already
+    /// [`WideEndian::Conflict`]; here the declared path produced only one side:
+    ///
+    /// - A UTF-32 declaration over a UTF-16 BOM (`FE FF`, or `FF FE` not
+    ///   followed by `00 00`) produced the declared UTF-32 reading(s) of the
+    ///   whole body; the BOM-honouring UTF-16 reading after the mark is added.
+    /// - A UTF-16 declaration over the UTF-32BE BOM `00 00 FE FF` produced the
+    ///   BOM-honouring UTF-32BE reading; the declared UTF-16 reading of the
+    ///   whole body is added (both endiannesses for a bare `utf-16`).
+    /// - A UTF-16 declaration over `FF FE 00 00` keeps the ambiguity readings
+    ///   (UTF-32LE and UTF-16LE after the mark). The UTF-16LE one is already
+    ///   what a little-endian or bare `utf-16` declaration reads, so only an
+    ///   explicit big-endian declaration adds its whole-body reading.
+    ///
+    /// A UTF-32 declaration over `FF FE 00 00` is not a width disagreement:
+    /// the declaration settles that mark as UTF-32, as before.
+    fn add_cross_width_bom_views(&mut self, body: &[u8], content_type: Option<&str>) {
+        if charset_declares_utf32_family(content_type) {
+            // `utf16_bom` defers to both UTF-32 marks, so this is never the
+            // start of `FF FE 00 00`.
+            if let Some((endian, skip)) = utf16_bom(body) {
+                self.push_view(decode_utf16(&body[skip..], endian));
+            }
+            return;
+        }
+        if !charset_declares_utf16_family(content_type) {
+            return;
+        }
+        let declared = declared_utf16_endian(content_type, None);
+        match utf32_bom(body) {
+            Some((Utf32Endian::Big, _)) => match declared {
+                Some(endian) => self.push_view(decode_utf16(body, endian)),
+                None => {
+                    self.push_view(decode_utf16(body, Utf16Endian::Little));
+                    self.push_view(decode_utf16(body, Utf16Endian::Big));
+                }
+            },
+            Some((Utf32Endian::Little, _)) if declared == Some(Utf16Endian::Big) => {
+                self.push_view(decode_utf16(body, Utf16Endian::Big));
+            }
+            Some((Utf32Endian::Little, _)) | None => {}
         }
     }
 
@@ -269,7 +334,10 @@ fn charset_is_uninspectable(content_type: Option<&str>) -> bool {
 enum WideEndian<E> {
     /// Neither a declared charset of this family nor a BOM: no view.
     Unknown,
-    /// One authoritative reading: decode `body[skip..]` with this endianness.
+    /// One authoritative reading of this width: decode `body[skip..]` with
+    /// this endianness. A BOM of the other wide width is not a disagreement
+    /// this type can express; [`WideCharsetViews::add_cross_width_bom_views`]
+    /// adds that reading afterwards.
     Resolved(E, usize),
     /// The declared charset and the BOM disagree. Neither reading can be
     /// discarded: the declaration is what a backend honouring `Content-Type`
@@ -294,9 +362,10 @@ enum WideEndian<E> {
 /// `FF FE 00 00` and would otherwise be misread as a UTF-16LE BOM. When a
 /// charset declares the UTF-16 or UTF-32 family without an endianness and
 /// without a BOM, both endiannesses are decoded. When a declared endianness
-/// disagrees with the BOM, both readings are decoded as well — dropping the
-/// views on a disagreement is exactly the bypass an attacker constructs by
-/// prefixing a `charset=utf-16le` payload with `FE FF`.
+/// or width disagrees with the BOM, both readings are decoded as well —
+/// dropping the views on a disagreement would leave unscanned the reading a
+/// backend takes when, for example, a `charset=utf-16le` payload is prefixed
+/// with `FE FF`, or a `charset=utf-32le` one with a UTF-16 BOM.
 ///
 /// Decoding itself is lossy (`U+FFFD` substitution), so a single malformed
 /// code unit cannot disable inspection of an otherwise readable body.
@@ -313,11 +382,14 @@ pub(super) fn decode_wide_charset_body_views(
 
 /// The wide width a BOM-less body's first four octets sign, if any: the
 /// NUL placement of two ASCII UTF-16 units or one ASCII UTF-32 unit. The
-/// signature selects only a width, never an endianness.
+/// NUL placement also implies an endianness (a leading NUL is big-endian).
+/// That endianness only decides whether an explicit declaration already
+/// agrees with the bytes; the views a disagreeing signature adds, like the
+/// views of an undeclared signature, always cover both endiannesses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WideSignature {
-    Utf16,
-    Utf32,
+    Utf16(Utf16Endian),
+    Utf32(Utf32Endian),
 }
 
 fn wide_signature(body: &[u8]) -> Option<WideSignature> {
@@ -325,24 +397,33 @@ fn wide_signature(body: &[u8]) -> Option<WideSignature> {
         return None;
     };
     let ascii = |byte: u8| byte != 0 && byte.is_ascii();
-    if (*a == 0 && *b == 0 && *c == 0 && ascii(*d)) || (ascii(*a) && *b == 0 && *c == 0 && *d == 0)
-    {
-        Some(WideSignature::Utf32)
-    } else if (*a == 0 && ascii(*b) && *c == 0 && ascii(*d))
-        || (ascii(*a) && *b == 0 && ascii(*c) && *d == 0)
-    {
-        Some(WideSignature::Utf16)
+    if *a == 0 && *b == 0 && *c == 0 && ascii(*d) {
+        Some(WideSignature::Utf32(Utf32Endian::Big))
+    } else if ascii(*a) && *b == 0 && *c == 0 && *d == 0 {
+        Some(WideSignature::Utf32(Utf32Endian::Little))
+    } else if *a == 0 && ascii(*b) && *c == 0 && ascii(*d) {
+        Some(WideSignature::Utf16(Utf16Endian::Big))
+    } else if ascii(*a) && *b == 0 && ascii(*c) && *d == 0 {
+        Some(WideSignature::Utf16(Utf16Endian::Little))
     } else {
         None
     }
 }
 
-/// Whether the declared readings already include both endiannesses of the
-/// signature's width (only a bare `utf-16` / `utf-32` declaration does).
+/// Whether the declared readings already cover the reading a byte-sniffing
+/// parser takes from the signature: a bare `utf-16` / `utf-32` of the same
+/// width decodes both endiannesses, and an explicit endianness of the same
+/// width that matches the signature's decodes exactly the sniffed reading.
 fn signature_pair_covered(content_type: Option<&str>, signature: WideSignature) -> bool {
     match signature {
-        WideSignature::Utf16 => charset_is_unspecified_utf16(content_type),
-        WideSignature::Utf32 => charset_is_unspecified_utf32(content_type),
+        WideSignature::Utf16(endian) => {
+            charset_is_unspecified_utf16(content_type)
+                || declared_utf16_endian(content_type, None) == Some(endian)
+        }
+        WideSignature::Utf32(endian) => {
+            charset_is_unspecified_utf32(content_type)
+                || declared_utf32_endian(content_type, None) == Some(endian)
+        }
     }
 }
 
@@ -350,18 +431,22 @@ fn wide_charset_body_views(body: &[u8], content_type: Option<&str>) -> WideChars
     let mut views = declared_wide_charset_body_views(body, content_type);
     // A wide declaration the bytes contradict: the declared readings are
     // what a declaration-honouring backend sees, but a byte-sniffing parser
-    // follows the BOM-less signature instead. When the signature's width or
-    // endianness is not already covered by the declared readings, add both
-    // endiannesses of the signature's width so the sniffed reading is
-    // scanned too. With a BOM present the declared/BOM conflict path above
-    // already yields both readings, so the signature adds nothing there.
-    if utf32_bom(body).is_none()
-        && utf16_bom(body).is_none()
-        && (charset_declares_utf16_family(content_type)
-            || charset_declares_utf32_family(content_type))
-        && let Some(signature) = wide_signature(body)
+    // follows the BOM or the BOM-less signature instead.
+    if !charset_declares_utf16_family(content_type) && !charset_declares_utf32_family(content_type)
+    {
+        return views;
+    }
+    if utf32_bom(body).is_some() || utf16_bom(body).is_some() {
+        // A same-width declared/BOM disagreement already yields both
+        // readings (`WideEndian::Conflict`). A BOM of the other wide width
+        // yields only one side from the declared path; add the other.
+        views.add_cross_width_bom_views(body, content_type);
+    } else if let Some(signature) = wide_signature(body)
         && !signature_pair_covered(content_type, signature)
     {
+        // When the signature's width or endianness is not already covered
+        // by the declared readings, add both endiannesses of the signature's
+        // width so the sniffed reading is scanned too.
         views.add_signature_views(body, signature);
     }
     views
@@ -381,11 +466,11 @@ fn declared_wide_charset_body_views(body: &[u8], content_type: Option<&str>) -> 
         && utf16_bom(body).is_none()
     {
         return match wide_signature(body) {
-            Some(WideSignature::Utf32) => WideCharsetViews::unresolved(
+            Some(WideSignature::Utf32(_)) => WideCharsetViews::unresolved(
                 decode_utf32(body, Utf32Endian::Little),
                 decode_utf32(body, Utf32Endian::Big),
             ),
-            Some(WideSignature::Utf16) => WideCharsetViews::unresolved(
+            Some(WideSignature::Utf16(_)) => WideCharsetViews::unresolved(
                 decode_utf16(body, Utf16Endian::Little),
                 decode_utf16(body, Utf16Endian::Big),
             ),

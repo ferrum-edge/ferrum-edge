@@ -852,7 +852,7 @@ type BodyEncoder = fn(&str) -> Vec<u8>;
 async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
     let forbidden = r#"{"user":{"bio":"forbidden-canary"}}"#;
     let benign = r#"{"user":{"bio":"ordinary"}}"#;
-    let cases: [(&str, &str, BodyEncoder); 20] = [
+    let cases: [(&str, &str, BodyEncoder); 25] = [
         ("utf-8", "application/json", |t| t.as_bytes().to_vec()),
         ("utf-8 bom", "application/json", |t| {
             with_bom(&[0xEF, 0xBB, 0xBF], t.as_bytes())
@@ -931,6 +931,36 @@ async fn body_json_path_rule_inspects_utf16_and_utf32_json_bodies() {
             "utf-16be declared with le bom",
             "application/json; charset=utf-16be",
             |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        // A BOM of the other wide width than the declared charset: the
+        // BOM-honouring reading after the mark is inspected too. (The
+        // declared reading of the whole body starts with the BOM's code
+        // units, so it is never a JSON document here; the body-text
+        // counterpart covers that side.)
+        (
+            "utf-32le declared with utf-16be bom",
+            "application/json; charset=utf-32le",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "utf-32be declared with utf-16le bom",
+            "application/json; charset=utf-32be",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "utf-32 declared with utf-16be bom",
+            "application/json; charset=utf-32",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "utf-16le declared with utf-32be bom",
+            "application/json; charset=utf-16le",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf32(t, true)),
+        ),
+        (
+            "utf-16be declared with utf-32le bom",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_LE_BOM, &encode_utf32(t, false)),
         ),
     ];
     for with_body_text_rule in [false, true] {
@@ -8802,6 +8832,198 @@ async fn wrong_declared_wide_charset_still_scans_signature_readings() {
             matches!(result, PluginResult::Continue),
             "benign response={response}"
         );
+    }
+}
+
+#[tokio::test]
+async fn bom_width_disagreeing_with_declared_wide_charset_scans_both_readings() {
+    // A BOM whose width differs from the declared wide charset family: a
+    // declaration-honouring backend decodes the whole body (BOM bytes
+    // included) in the declared charset, while a BOM-sniffing one decodes the
+    // body after the mark in the BOM's charset. Both readings are scanned.
+    let plugin = wide_parity_waf();
+    let text = r#"{"value":"inspection-marker"}"#;
+    let benign = r#"{"value":"ordinary"}"#;
+    let shapes: [(&str, &str, BodyEncoder); 12] = [
+        // UTF-16 BOM under a UTF-32 declaration: the BOM's reading.
+        (
+            "utf-32le over UTF-16BE BOM",
+            "application/json; charset=utf-32le",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "utf-32be over UTF-16LE BOM",
+            "application/json; charset=utf-32be",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "bare utf-32 over UTF-16BE BOM",
+            "application/json; charset=utf-32",
+            |t| with_bom(&[0xFE, 0xFF], &encode_utf16(t, true)),
+        ),
+        (
+            "bare utf-32 over UTF-16LE BOM",
+            "application/json; charset=utf-32",
+            |t| with_bom(UTF16_LE_BOM, &encode_utf16(t, false)),
+        ),
+        // UTF-32 BOM under a UTF-16 declaration: the declared reading.
+        (
+            "utf-16le over UTF-32BE BOM",
+            "application/json; charset=utf-16le",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "utf-16be over UTF-32BE BOM",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, true)),
+        ),
+        (
+            "bare utf-16 over UTF-32BE BOM, LE text",
+            "application/json; charset=utf-16",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, false)),
+        ),
+        (
+            "bare utf-16 over UTF-32BE BOM, BE text",
+            "application/json; charset=utf-16",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf16(t, true)),
+        ),
+        // `FF FE 00 00` under an explicit big-endian UTF-16 declaration: the
+        // ambiguity readings stay, and the declared reading joins them.
+        (
+            "utf-16be over UTF-32LE BOM",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_LE_BOM, &encode_utf16(t, true)),
+        ),
+        // The side the declared path already produced is still scanned.
+        (
+            "utf-16le over UTF-32BE BOM, UTF-32 text",
+            "application/json; charset=utf-16le",
+            |t| with_bom(UTF32_BE_BOM, &encode_utf32(t, true)),
+        ),
+        (
+            "utf-16be over UTF-32LE BOM, UTF-32 text",
+            "application/json; charset=utf-16be",
+            |t| with_bom(UTF32_LE_BOM, &encode_utf32(t, false)),
+        ),
+        (
+            "utf-32le over UTF-16BE BOM, UTF-32 text",
+            "application/json; charset=utf-32le",
+            // `FE FF 00 00` keeps the declared UTF-32 units aligned.
+            |t| with_bom(&[0xFE, 0xFF, 0x00, 0x00], &encode_utf32(t, false)),
+        ),
+    ];
+    for response in [false, true] {
+        let expected = if response {
+            "WIDE-RESPONSE"
+        } else {
+            "WIDE-REQUEST"
+        };
+        for (label, content_type, encode) in shapes {
+            let (result, request) =
+                scan_wide_direction(&plugin, response, content_type, &encode(text)).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "response={response} {label}"
+            );
+            assert_eq!(
+                request.metadata.get("waf.rule_hits").unwrap(),
+                expected,
+                "response={response} {label}"
+            );
+            let (result, request) =
+                scan_wide_direction(&plugin, response, content_type, &encode(benign)).await;
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "benign response={response} {label}"
+            );
+            assert!(!request.metadata.contains_key("waf.rule_hits"), "{label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn correctly_labelled_wide_body_adds_no_opposite_endian_view() {
+    // A BOM-less body whose explicit wide charset matches its signature's
+    // width and endianness is already read exactly as a byte-sniffing parser
+    // reads it, so the opposite-endian decode is not added. These markers
+    // appear only in that opposite-endian decode: `A` (U+0041) read with the
+    // wrong UTF-16 byte order is U+4100, and `Ā` (U+0100) read with the wrong
+    // UTF-32 byte order is U+10000.
+    let plugin = waf(json!({
+        "on_unlisted_content_type": "allow",
+        "include_default_rules": false,
+        "custom_rules": [
+            {
+                "id": "OPPOSITE-UTF16", "name": "opposite utf-16 reading", "category": "custom",
+                "severity": "high", "target": "body_text", "match_kind": "contains",
+                "pattern": "\u{4100}", "action": "enforce"
+            },
+            {
+                "id": "OPPOSITE-UTF32", "name": "opposite utf-32 reading", "category": "custom",
+                "severity": "high", "target": "body_text", "match_kind": "contains",
+                "pattern": "\u{10000}", "action": "enforce"
+            }
+        ]
+    }))
+    .unwrap();
+    let utf16_text = r#"{"v":"A"}"#;
+    let utf32_text = "{\"v\":\"\u{100}\"}";
+    for (charset, opposite, rule, bytes) in [
+        (
+            "utf-16le",
+            "utf-16be",
+            "OPPOSITE-UTF16",
+            encode_utf16(utf16_text, false),
+        ),
+        (
+            "utf-16be",
+            "utf-16le",
+            "OPPOSITE-UTF16",
+            encode_utf16(utf16_text, true),
+        ),
+        (
+            "utf-32le",
+            "utf-32be",
+            "OPPOSITE-UTF32",
+            encode_utf32(utf32_text, false),
+        ),
+        (
+            "utf-32be",
+            "utf-32le",
+            "OPPOSITE-UTF32",
+            encode_utf32(utf32_text, true),
+        ),
+    ] {
+        let (result, ctx) = scan_body_with_content_type(
+            &plugin,
+            &format!("application/json; charset={charset}"),
+            &bytes,
+        )
+        .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "correctly labelled {charset} must not add the opposite-endian view"
+        );
+        assert!(!ctx.metadata.contains_key("waf.rule_hits"), "{charset}");
+        // Controls: the marker is reachable whenever the opposite-endian
+        // reading is legitimately scanned — an undeclared signature, a bare
+        // declaration, and a declaration that disagrees with the bytes.
+        for content_type in [
+            "application/json".to_string(),
+            format!("application/json; charset={}", &charset[..6]),
+            format!("application/json; charset={opposite}"),
+        ] {
+            let (result, ctx) = scan_body_with_content_type(&plugin, &content_type, &bytes).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "{charset} bytes under {content_type}"
+            );
+            assert_eq!(
+                ctx.metadata.get("waf.rule_hits").map(String::as_str),
+                Some(rule),
+                "{charset} bytes under {content_type}"
+            );
+        }
     }
 }
 
