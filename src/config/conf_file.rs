@@ -55,6 +55,43 @@ pub fn resolve_ferrum_var(key: &str) -> Option<String> {
     conf_value_from_cached(CONF_FILE_CACHE.get_or_init(ConfFile::load_uncached), key)
 }
 
+/// Fallible single-key variant of [`resolve_ferrum_var`].
+///
+/// Precedence matches [`resolve_ferrum_var`] and `EnvConfig`'s `resolve_var`:
+/// **env var > conf file**. An exported-but-empty environment value still wins
+/// over the conf file (typed parsing at the call site decides whether an empty
+/// value is valid). Unlike `EnvConfig::resolve_var`, this logs nothing: it is
+/// called per consumer / plugin construction, so repeating the startup
+/// env-overrides-conf notice there would be noise.
+///
+/// A sticky conf-file load failure is propagated instead of resolving to
+/// `None`, so callers cannot silently fall back to a default and diverge from
+/// `EnvConfig::from_env`. The cached snapshot is borrowed; only the error path
+/// clones the (short) cached error string.
+#[doc(hidden)]
+pub fn resolve_ferrum_var_checked(key: &str) -> Result<Option<String>, String> {
+    resolve_ferrum_var_checked_from(
+        std::env::var(key).ok(),
+        CONF_FILE_CACHE.get_or_init(ConfFile::load_uncached),
+        key,
+    )
+}
+
+/// Precedence half of [`resolve_ferrum_var_checked`], split out so the
+/// env-over-conf rule and the sticky error path are testable without pinning
+/// the process-wide `OnceLock` snapshot.
+#[doc(hidden)]
+pub fn resolve_ferrum_var_checked_from(
+    env_value: Option<String>,
+    cached: &Result<ConfFile, String>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    if let Some(value) = env_value {
+        return Ok(Some(value));
+    }
+    conf_value_checked_from_cached(cached, key)
+}
+
 /// Conf-file half of [`resolve_ferrum_var`], split out so the fail-closed
 /// behavior is testable without pinning the process-wide `OnceLock` snapshot.
 ///
@@ -63,9 +100,21 @@ pub fn resolve_ferrum_var(key: &str) -> Option<String> {
 /// `ferrum.conf` into "no values configured" for the process lifetime.
 #[doc(hidden)]
 pub fn conf_value_from_cached(cached: &Result<ConfFile, String>, key: &str) -> Option<String> {
+    conf_value_checked_from_cached(cached, key).ok().flatten()
+}
+
+/// Fallible conf-file half of [`resolve_ferrum_var_checked`].
+///
+/// Borrows the cached snapshot and looks up only `key`; a sticky load failure
+/// is returned as `Err` so callers can fail closed.
+#[doc(hidden)]
+pub fn conf_value_checked_from_cached(
+    cached: &Result<ConfFile, String>,
+    key: &str,
+) -> Result<Option<String>, String> {
     match cached {
-        Ok(conf) => conf.get(key).map(|v| v.to_string()),
-        Err(_) => None,
+        Ok(conf) => Ok(conf.get(key).map(|v| v.to_string())),
+        Err(error) => Err(error.clone()),
     }
 }
 

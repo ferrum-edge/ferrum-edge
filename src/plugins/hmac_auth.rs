@@ -1167,7 +1167,8 @@ impl HmacAuth {
             replay_authority,
             prebuffer_owner,
             verification_rounds: bounded_hmac_verification_rounds(
-                crate::config::types::max_credentials_per_type(),
+                crate::config::types::max_credentials_per_type()
+                    .map_err(|error| format!("hmac_auth: {error}"))?,
             ),
         })
     }

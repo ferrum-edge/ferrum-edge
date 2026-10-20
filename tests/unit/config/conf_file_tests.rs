@@ -471,6 +471,83 @@ fn conf_lookup_fails_closed_on_a_sticky_load_failure() {
 }
 
 #[test]
+fn checked_var_resolution_prefers_env_then_conf() {
+    use ferrum_edge::config::conf_file::resolve_ferrum_var_checked_from;
+
+    let loaded: Result<ConfFile, String> =
+        ConfFile::parse("FERRUM_MAX_CREDENTIALS_PER_TYPE = 3\nFERRUM_LOG_LEVEL = debug\n");
+
+    // Environment wins over the conf file, including an exported-but-empty
+    // value: typed parsing at the call site decides whether empty is valid,
+    // matching `EnvConfig::resolve_var`.
+    for env_value in ["7", ""] {
+        assert_eq!(
+            resolve_ferrum_var_checked_from(
+                Some(env_value.to_string()),
+                &loaded,
+                "FERRUM_MAX_CREDENTIALS_PER_TYPE",
+            )
+            .expect("env value resolves without touching the conf snapshot"),
+            Some(env_value.to_string()),
+            "environment value {env_value:?} must win over the conf file"
+        );
+    }
+
+    // With no environment value the conf-file value is used.
+    assert_eq!(
+        resolve_ferrum_var_checked_from(None, &loaded, "FERRUM_MAX_CREDENTIALS_PER_TYPE")
+            .expect("accepted snapshot resolves"),
+        Some("3".to_string())
+    );
+
+    // Absent from both stays unset rather than defaulting here.
+    assert_eq!(
+        resolve_ferrum_var_checked_from(None, &loaded, "FERRUM_NOT_CONFIGURED_ANYWHERE")
+            .expect("accepted snapshot resolves"),
+        None
+    );
+}
+
+#[test]
+fn checked_var_resolution_reads_the_environment_first() {
+    use ferrum_edge::config::conf_file::resolve_ferrum_var_checked;
+
+    // The public resolver memoizes the conf snapshot, so only the env half is
+    // deterministic here; the env-over-conf and sticky-error halves are covered
+    // by `resolve_ferrum_var_checked_from` above.
+    with_env_vars(&[("FERRUM_MAX_CREDENTIALS_PER_TYPE", "11")], || {
+        assert_eq!(
+            resolve_ferrum_var_checked("FERRUM_MAX_CREDENTIALS_PER_TYPE")
+                .expect("env value resolves"),
+            Some("11".to_string())
+        );
+    });
+}
+
+#[test]
+fn checked_var_resolution_propagates_a_sticky_conf_load_failure() {
+    use ferrum_edge::config::conf_file::resolve_ferrum_var_checked_from;
+
+    let failed: Result<ConfFile, String> =
+        Err("Failed to read ferrum.conf /etc/ferrum.conf: path not found".to_string());
+    let err = resolve_ferrum_var_checked_from(None, &failed, "FERRUM_MAX_CREDENTIALS_PER_TYPE")
+        .expect_err("a sticky conf-load failure must propagate, not resolve to unset");
+    assert!(err.contains("Failed to read ferrum.conf"), "{err}");
+
+    // The environment still wins when the conf file is broken, exactly like
+    // `EnvConfig::resolve_var` returning the env value before consulting conf.
+    assert_eq!(
+        resolve_ferrum_var_checked_from(
+            Some("9".to_string()),
+            &failed,
+            "FERRUM_MAX_CREDENTIALS_PER_TYPE",
+        )
+        .expect("env value resolves without touching the broken conf snapshot"),
+        Some("9".to_string())
+    );
+}
+
+#[test]
 fn empty_or_whitespace_conf_path_is_treated_as_unset() {
     use ferrum_edge::config::conf_file::conf_path_selection;
     use std::path::PathBuf;
