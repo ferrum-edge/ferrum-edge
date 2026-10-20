@@ -6,7 +6,10 @@ or above its fixed version. Every lockfile that builds `ferrum-edge` must also
 resolve each PATH_PATCHED crate to exactly one copy: the `[patch.crates-io]`
 path crate under `vendor/`, which has no `source` or `checksum`. A second,
 registry copy (for example a dependency that moves to a semver line the patch
-does not cover) would ship that crate without Ferrum's patches.
+does not cover) would ship that crate without Ferrum's patches. Each
+SINGLE_COPY crate must resolve to at most one version per lockfile: a direct
+security pin on a semver line its dependents do not use constrains nothing
+(issue #6755).
 """
 
 from pathlib import Path
@@ -22,6 +25,10 @@ SECURITY_FLOORS = {
     "xxhash-rust": (0, 8, 16),
 }
 PATH_PATCHED = ("hyper", "reqwest", "h2", "hyper-util")
+# The direct `aws-smithy-json` requirement in Cargo.toml exists only to hold the
+# AWS SDK on the fixed parser. If the SDK resolves a second copy on another 0.x
+# line, that requirement no longer constrains the SDK.
+SINGLE_COPY = ("aws-smithy-json",)
 
 
 def vendored_version(crate: str) -> str:
@@ -37,7 +44,70 @@ def vendored_version(crate: str) -> str:
     return version
 
 
+def lockfile_failures(name: str, packages: list[dict], patched: dict[str, str]) -> list[str]:
+    failures = []
+    by_name = {}
+    for package in packages:
+        by_name.setdefault(package["name"], []).append(package)
+        floor = SECURITY_FLOORS.get(package["name"])
+        if floor is not None:
+            version = package["version"]
+            parts = version.split(".")
+            if len(parts) != 3 or not all(part.isdecimal() for part in parts):
+                failures.append(f"{name}: unrecognized security version {version!r}")
+            elif tuple(map(int, parts)) < floor:
+                failures.append(f"{name}: vulnerable {package['name']} {version}")
+    for crate in SINGLE_COPY:
+        versions = sorted(package["version"] for package in by_name.get(crate, []))
+        if len(versions) > 1:
+            failures.append(
+                f"{name}: {crate} resolves to {', '.join(versions)}; "
+                "its dependents must converge on one copy"
+            )
+    if "ferrum-edge" in by_name:
+        for crate, expected in patched.items():
+            copies = by_name.get(crate, [])
+            if (
+                len(copies) != 1
+                or copies[0]["version"] != expected
+                or "source" in copies[0]
+                or "checksum" in copies[0]
+            ):
+                failures.append(
+                    f"{name}: {crate} must resolve only to the vendored {expected} path patch"
+                )
+    return failures
+
+
+def self_test() -> None:
+    registry = "registry+https://github.com/rust-lang/crates.io-index"
+
+    def pkg(name: str, version: str) -> dict:
+        return {"name": name, "version": version, "source": registry}
+
+    cases = [
+        ([pkg("aws-smithy-json", "0.63.1")], []),
+        ([pkg("aws-smithy-json", "0.62.6")], ["vulnerable aws-smithy-json 0.62.6"]),
+        (
+            [pkg("aws-smithy-json", "0.62.7"), pkg("aws-smithy-json", "0.63.1")],
+            ["aws-smithy-json resolves to 0.62.7, 0.63.1"],
+        ),
+        (
+            [pkg("ferrum-edge", "1.0.0"), pkg("hyper", "1.0.0")],
+            ["hyper must resolve only to the vendored 1.0.0 path patch"],
+        ),
+        ([pkg("ferrum-edge", "1.0.0"), {"name": "hyper", "version": "1.0.0"}], []),
+    ]
+    for packages, expected in cases:
+        failures = lockfile_failures("Cargo.lock", packages, {"hyper": "1.0.0"})
+        if len(failures) != len(expected) or not all(
+            want in got for want, got in zip(expected, failures)
+        ):
+            raise SystemExit(f"self-test failed: {packages!r} -> {failures!r}")
+
+
 def verify() -> None:
+    self_test()
     patched = {crate: vendored_version(crate) for crate in PATH_PATCHED}
     names = subprocess.check_output(
         ["git", "ls-files", "-z", "Cargo.lock", "**/Cargo.lock"], cwd=ROOT
@@ -45,29 +115,7 @@ def verify() -> None:
     failures = []
     for name in sorted(set(names) - {""}):
         packages = tomllib.loads((ROOT / name).read_text())["package"]
-        by_name = {}
-        for package in packages:
-            by_name.setdefault(package["name"], []).append(package)
-            floor = SECURITY_FLOORS.get(package["name"])
-            if floor is not None:
-                version = package["version"]
-                parts = version.split(".")
-                if len(parts) != 3 or not all(part.isdecimal() for part in parts):
-                    failures.append(f"{name}: unrecognized security version {version!r}")
-                elif tuple(map(int, parts)) < floor:
-                    failures.append(f"{name}: vulnerable {package['name']} {version}")
-        if "ferrum-edge" in by_name:
-            for crate, expected in patched.items():
-                copies = by_name.get(crate, [])
-                if (
-                    len(copies) != 1
-                    or copies[0]["version"] != expected
-                    or "source" in copies[0]
-                    or "checksum" in copies[0]
-                ):
-                    failures.append(
-                        f"{name}: {crate} must resolve only to the vendored {expected} path patch"
-                    )
+        failures.extend(lockfile_failures(name, packages, patched))
         print(f"Inspected {name}: {len(packages)} packages")
     if failures:
         raise SystemExit("\n".join(failures))

@@ -70,8 +70,17 @@ names, with no `source` or `checksum`. A second, registry copy would ship that
 crate without Ferrum's patches. The expected versions come from the `vendor/`
 directories, so moving a vendored crate needs no change to the checker.
 
-Some optional GCP crates and the AWS Smithy support crates also have exact
-`=` constraints in `Cargo.toml`. Those constraints selected a published,
+Every committed lockfile must also resolve `aws-smithy-json` to a single copy.
+The direct `aws-smithy-json` requirement only constrains the AWS SDK while it
+sits on the same 0.x line the SDK crates (`aws-config`,
+`aws-sdk-secretsmanager`, and the transitive `aws-sdk-sts`, `aws-sdk-sso`, and
+`aws-sdk-ssooidc`) require. A requirement on a newer line, such as the
+Dependabot-only bump in #6750, resolves a second copy and constrains nothing
+(issue #6755). Move the requirement together with the SDK crates and their
+`Cargo.toml` floors (`aws-config` 1.12, `aws-sdk-secretsmanager` 1.120 for
+the 0.63 line).
+
+Some optional GCP crates also have exact `=` constraints in `Cargo.toml`. Those constraints selected a published,
 compatible dependency generation for the fixes above; they are not a promise to
 stay on those releases. To lift them:
 
@@ -90,13 +99,14 @@ stay on those releases. To lift them:
 3. Refresh the root and affected standalone lockfiles from their real manifest
    roots. Inspect Cargo metadata for the root, mesh, and fuzz graphs where they
    consume Ferrum's production dependency path; do not hand-edit lockfile
-   package entries or checksums. The lockfiles hold the AWS Smithy runtime
-   crates (`aws-smithy-runtime-api` 1.12.3, `aws-smithy-types` 1.4.9,
-   `aws-smithy-schema` 0.1.0, `aws-smithy-async` 1.2.14, and
-   `aws-smithy-runtime-api-macros` 1.0.0) on the generation whose published
-   compiler floor is Rust 1.91.1. A broad refresh moves them to the 1.94.1
-   compiler generation, so update them with targeted `cargo update --precise`
-   unless that compiler move is intended. No CI job enforces this MSRV.
+   package entries or checksums. The AWS SDK and Smithy runtime crates are
+   not held back: since issue #6755 the root lockfile carries the Rust 1.94.1
+   compiler generation (`aws-config` 1.12, `aws-sdk-secretsmanager` 1.120,
+   `aws-smithy-json` 0.63, `aws-smithy-runtime` 1.16.0). `aws-smithy-runtime`
+   is held at 1.16.0 with `cargo update --precise` only because 1.16.1 moves to
+   `aws-smithy-schema` 1.0 while the SDK crates still require 0.2, which would
+   resolve two schema copies; let it move once the SDK crates do. No CI job
+   enforces an MSRV; CI builds on stable.
 4. If a newer advisory fixes one of these packages, update the corresponding
    floor in the checker and this table together. The required dependency audit
    must keep checking every committed lockfile, including standalone graphs.
