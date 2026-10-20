@@ -105,32 +105,30 @@ rejects crash artifacts larger than 64 KiB before upload.
 sanitizer build in both lanes. That build, not the fuzzing, was the cost: the
 `Fuzz Smoke` job averaged ~47 minutes on pull requests, of which ~39 minutes was
 compiling the instrumented targets for ~48 seconds of fuzzing. The `Fuzz Smoke`
-job now uses the repository's checksum-pinned `setup-sccache` action, then
-selects its cache backend: `setup-boringcache` runs first, and
-`Swatinem/rust-cache` (fuzz workspace, `fuzz-smoke` shared key) runs only as
-the legacy fallback when `CI_BORINGCACHE_ENABLED` is not `true`. The fallback
-does not archive the local `.cache/sccache` directory; BoringCache retains
-compiler objects through its own adapter instead. On the fallback, `save-if`
-is strictly `${{ github.event_name == 'push' && github.ref ==
+job now uses the repository's checksum-pinned `setup-sccache` action and
+`Swatinem/rust-cache` (fuzz workspace, `fuzz-smoke` shared key); it holds only
+`contents: read` and uses no remote compiler-cache backend. `save-if` is
+strictly `${{ github.event_name == 'push' && github.ref ==
 'refs/heads/main' }}`: pull requests (including same-repository PR refs and
 forks), `merge_group`, and `workflow_dispatch` never publish a `fuzz-smoke`
 cache. The generation that predates #3902 had no `save-if` at all, which is how
-a full-mode predecessor PR could still mint a PR-ref Fuzz cache; neither
+a full-mode predecessor PR could still mint a PR-ref Fuzz cache; no
 admitted generation can create another.
 The credential-bearing sccache GHA backend is never enabled. After a
 successful property-smoke command the run logs `Fuzz property smoke seconds`,
 and after a successful sanitizer budget `Fuzz sanitizer lane seconds`; both
 echoes sit after their commands under `set -e`, so a failed or skipped
-command emits no duration line. The closing report step runs on every
-outcome: it prints the lane shape the run took and whether the sccache
-wrapper is available (pointing at the BoringCache command logs for cache
-results), warning when the wrapper is unavailable. The job no longer emits
-`sccache --show-stats` or an on-disk cache-size report; before the sanitizer
-budget it only checks wrapper availability and warns when it is absent.
+command emits no duration line. Runs that execute the sanitizer budget print
+`sccache --show-stats` just before it, so the log shows directly whether the
+sanitizer build reused compilation. The closing report step runs on every
+outcome: it prints the lane shape the run took, a closing `--show-stats`, and
+the on-disk cache size. When sccache is unavailable both steps say so, and the
+closing step emits a warning annotation rather than letting caching fail
+silently.
 
 Both hosted shapes are byte-frozen by the trusted Cross build policy. The
-`fuzz-smoke` job is admitted as two generations with a one-way transition
-(`CI_FUZZ_SMOKE_JOB_GENERATIONS`); see
+`fuzz-smoke` job is admitted as an ordered list of generations with one-way
+transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`); see
 [ci_cd.md](ci_cd.md#admitted-fuzz-smoke-lane-split-generation).
 
 The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
