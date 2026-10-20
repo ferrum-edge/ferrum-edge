@@ -9,9 +9,15 @@
 //! of the document carries the forbidden value.
 //!
 //! Parsing still goes through `serde_json`'s deserializer, so its grammar,
-//! UTF-8 / surrogate validation, member-name unescaping (a `\u`-escaped name
-//! is the same member as its literal spelling) and 128-level recursion limit
-//! are unchanged.
+//! member-name unescaping (a `\u`-escaped name is the same member as its
+//! literal spelling) and 128-level recursion limit are unchanged. Its string
+//! validation is stricter than the parsers backends commonly use: it refuses
+//! invalid UTF-8 inside a string and a `\u` escape naming an unpaired UTF-16
+//! surrogate. JavaScript `JSON.parse`, Python `json.loads` and Jackson keep an
+//! unpaired surrogate, and Go `encoding/json` substitutes `U+FFFD` for it and
+//! for invalid UTF-8.
+//! A view refused for only those reasons is re-read leniently (see [`parse`]),
+//! so one such string cannot hide the rest of the document from inspection.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -36,11 +42,86 @@ pub(super) enum JsonNode {
     Object(Vec<(String, JsonNode)>),
 }
 
-/// Parse one inspection view. A leading byte-order mark is skipped; anything
-/// `serde_json` rejects yields `None`, exactly as the collapsed parse did.
+/// Parse one inspection view. A leading byte-order mark is skipped.
+///
+/// A view the strict parse accepts is parsed in place, with no copy. When it
+/// is refused, the view is re-read the way lenient parsers read it: invalid
+/// UTF-8 decodes to `U+FFFD`, and every `\u` escape naming an unpaired
+/// surrogate (`\uD800`–`\uDFFF` not forming a high-then-low pair) becomes
+/// `\uFFFD`. Only that failure path allocates, and only when there is
+/// something to repair; a view that is still refused, or that needed no
+/// repair, yields `None`.
 pub(super) fn parse(bytes: &[u8]) -> Option<JsonNode> {
     let bytes = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
-    serde_json::from_slice(bytes).ok()
+    if let Ok(document) = serde_json::from_slice(bytes) {
+        return Some(document);
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let repaired = replace_unpaired_surrogate_escapes(&text);
+    if matches!((&text, &repaired), (Cow::Borrowed(_), Cow::Borrowed(_))) {
+        // Nothing lenient parsers read differently: the refusal stands.
+        return None;
+    }
+    serde_json::from_str(&repaired).ok()
+}
+
+/// Rewrite every `\u` escape that names an unpaired UTF-16 surrogate to
+/// `\uFFFD`, leaving valid high-then-low pairs and every other byte as is.
+/// Text with nothing to rewrite is borrowed.
+///
+/// Escapes are consumed left to right as whole units, so the `\\` in
+/// `"\\ud800"` is one escape and the `ud800` after it stays literal text. A
+/// backslash is only legal inside a string, so this walk sees exactly the
+/// string escapes of any document that can parse.
+fn replace_unpaired_surrogate_escapes(text: &str) -> Cow<'_, str> {
+    const ESCAPE_LEN: usize = 6;
+    let bytes = text.as_bytes();
+    let mut repaired: Option<String> = None;
+    let mut copied = 0;
+    let mut at = 0;
+    while let Some(offset) = bytes.get(at..).and_then(|rest| memchr::memchr(b'\\', rest)) {
+        at += offset;
+        let Some(unit) = unicode_escape(bytes, at) else {
+            // Any other escape is the backslash and one character; skipping
+            // both keeps `\\` from exposing a following `u`.
+            at += 2;
+            continue;
+        };
+        if (0xD800..=0xDBFF).contains(&unit)
+            && unicode_escape(bytes, at + ESCAPE_LEN)
+                .is_some_and(|low| (0xDC00..=0xDFFF).contains(&low))
+        {
+            at += 2 * ESCAPE_LEN;
+            continue;
+        }
+        if (0xD800..=0xDFFF).contains(&unit) {
+            let out = repaired.get_or_insert_with(|| String::with_capacity(text.len()));
+            // `at` indexes an ASCII backslash and `copied` the byte after a
+            // six-byte ASCII escape, so both are character boundaries.
+            out.push_str(&text[copied..at]);
+            out.push_str("\\uFFFD");
+            copied = at + ESCAPE_LEN;
+        }
+        at += ESCAPE_LEN;
+    }
+    match repaired {
+        Some(mut out) => {
+            out.push_str(&text[copied..]);
+            Cow::Owned(out)
+        }
+        None => Cow::Borrowed(text),
+    }
+}
+
+/// The code unit of the `\uXXXX` escape starting at `at`, if one does.
+fn unicode_escape(bytes: &[u8], at: usize) -> Option<u16> {
+    let [b'\\', b'u', digits @ ..] = bytes.get(at..at + 6)? else {
+        return None;
+    };
+    digits.iter().try_fold(0u16, |unit, &digit| {
+        let value = (digit as char).to_digit(16)?;
+        Some((unit << 4) | value as u16)
+    })
 }
 
 /// Every node `path` reaches. A key segment follows every member with that

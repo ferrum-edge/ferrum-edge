@@ -1097,6 +1097,171 @@ async fn body_json_path_rule_inspects_every_duplicate_member() {
     assert!(!ctx.metadata.contains_key("waf.rule_hits"));
 }
 
+async fn assert_json_path_verdicts(
+    plugin: &Waf,
+    content_type: &str,
+    forbidden: &[Vec<u8>],
+    benign: &[Vec<u8>],
+) {
+    for body in forbidden {
+        let (result, ctx) = scan_body_with_content_type(plugin, content_type, body).await;
+        assert!(
+            json_path_rule_hit(&result, &ctx),
+            "{content_type} {:?} must be enforced",
+            String::from_utf8_lossy(body)
+        );
+    }
+    for body in benign {
+        let (result, ctx) = scan_body_with_content_type(plugin, content_type, body).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{content_type} {:?} must pass",
+            String::from_utf8_lossy(body)
+        );
+        assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_bodies_with_unpaired_surrogate_escapes() {
+    // `serde_json` refuses a `\u` escape naming an unpaired surrogate, while
+    // `JSON.parse`, `json.loads`, Jackson and Go accept it. One such string
+    // anywhere in the body must not hide the rest of the document.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        // Lone high surrogate.
+        br#"{"pad":"\ud800","user":{"bio":"forbidden-canary"}}"#.as_slice(),
+        // Lone low surrogate.
+        br#"{"pad":"\udc00","user":{"bio":"forbidden-canary"}}"#,
+        // Reversed pair: a low then a high surrogate, both unpaired.
+        br#"{"pad":"\udc00\ud800","user":{"bio":"forbidden-canary"}}"#,
+        // High surrogate followed by a non-surrogate escape (uppercase hex).
+        br#"{"pad":"\uD800\u0041","user":{"bio":"forbidden-canary"}}"#,
+        // High surrogate closing a string after the selected value.
+        br#"{"user":{"bio":"forbidden-canary"},"pad":"x\uDBFF"}"#,
+        // A valid pair stays a pair; the trailing high surrogate is unpaired.
+        br#"{"pad":"\ud83d\ude00\ud83d","user":{"bio":"forbidden-canary"}}"#,
+        // In a member name and inside the selected value itself.
+        br#"{"\ud800":1,"user":{"bio":"\udfffforbidden-canary"}}"#,
+        // An escaped backslash followed by a real unpaired escape.
+        br#"{"pad":"\\\ud800","user":{"bio":"forbidden-canary"}}"#,
+        // Control: a valid pair was already accepted by the strict parse.
+        br#"{"pad":"\ud83d\ude00","user":{"bio":"forbidden-canary"}}"#,
+        // Duplicated members are still all inspected on the lenient reading.
+        br#"{"user":{"bio":"forbidden-canary"},"user":{"bio":"ordinary"},"pad":"\udc00"}"#,
+        br#"{"user":{"bio":"ordinary"},"user":{"bio":"forbidden-canary"},"pad":"\ud800"}"#,
+        br#"{"user":{"bio":"forbidden-canary\ud800","bio":"ordinary"}}"#,
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [
+        br#"{"pad":"\ud800","user":{"bio":"ordinary"}}"#.as_slice(),
+        br#"{"pad":"\udc00\ud800","user":{"bio":"ordinary"},"user":{"bio":"fine"}}"#,
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &forbidden, &benign).await;
+
+    // A UTF-8 byte-order mark and every UTF-16 / UTF-32 view get the same
+    // lenient reading: the escape is still ASCII text after transcoding.
+    let with_utf8_bom = |body: &Vec<u8>| with_bom(&[0xEF, 0xBB, 0xBF], body);
+    assert_json_path_verdicts(
+        &plugin,
+        "application/json",
+        &forbidden.iter().map(with_utf8_bom).collect::<Vec<_>>(),
+        &benign.iter().map(with_utf8_bom).collect::<Vec<_>>(),
+    )
+    .await;
+    let as_text = |body: &Vec<u8>| String::from_utf8(body.clone()).unwrap();
+    let wide: [(&str, BodyEncoder); 3] = [
+        ("application/json; charset=utf-16le", |t| {
+            encode_utf16(t, false)
+        }),
+        ("application/json", |t| {
+            with_bom(UTF16_LE_BOM, &encode_utf16(t, false))
+        }),
+        ("application/json; charset=utf-32be", |t| {
+            encode_utf32(t, true)
+        }),
+    ];
+    for (content_type, encode) in wide {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &forbidden
+                .iter()
+                .map(|body| encode(&as_text(body)))
+                .collect::<Vec<_>>(),
+            &benign
+                .iter()
+                .map(|body| encode(&as_text(body)))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_lenient_reading_keeps_escaped_backslashes_literal() {
+    // `\\ud800` is an escaped backslash followed by the literal text `ud800`,
+    // not a surrogate escape: the lenient reading forced by the unpaired
+    // escape in `pad` must leave it alone.
+    let plugin = container_json_path_waf("user.bio", "equals", r"\ud800 forbidden-canary", &[]);
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"\\ud800 forbidden-canary"},"pad":"\ud800"}"#,
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
+
+    // A real unpaired escape in the value decodes to U+FFFD, so the same
+    // `equals` rule does not see the literal escape text.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"\ud800 forbidden-canary"}}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    let plugin = container_json_path_waf("user.bio", "equals", "\u{FFFD} forbidden-canary", &[]);
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"\ud800 forbidden-canary"}}"#,
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_bodies_with_invalid_utf8_strings() {
+    // `serde_json` refuses invalid UTF-8 inside a string, while Go
+    // `encoding/json` and `TextDecoder`-based readers substitute U+FFFD and
+    // keep parsing.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        b"{\"pad\":\"\xff\",\"user\":{\"bio\":\"forbidden-canary\"}}".as_slice(),
+        // An overlong `/` and a UTF-8-encoded surrogate (CESU-8).
+        b"{\"pad\":\"\xc0\xaf\xed\xa0\x80\",\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // Inside the selected value, combined with an unpaired escape.
+        b"{\"user\":{\"bio\":\"\xfeforbidden-canary\"},\"pad\":\"\\ud800\"}",
+        // Duplicated members on the lenient reading.
+        b"{\"user\":{\"bio\":\"forbidden-canary\"},\"user\":{\"bio\":\"ordinary\"},\"p\xff\":1}",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [b"{\"pad\":\"\xff\",\"user\":{\"bio\":\"ordinary\"}}".as_slice()]
+        .iter()
+        .map(|body| body.to_vec())
+        .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &forbidden, &benign).await;
+}
+
 #[tokio::test]
 async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
     let plugin = waf(json!({

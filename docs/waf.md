@@ -439,6 +439,27 @@ first-wins parser reads it and with every member kept; each reading is
 matched and false-positive-filtered on its own. A backend that keeps the
 first, the last, or every occurrence is therefore covered by the same verdict.
 
+Each reading is first parsed strictly. A reading the strict parser refuses
+only because a string holds invalid UTF-8 or a `\u` escape naming an unpaired
+UTF-16 surrogate (`\uD800`–`\uDFFF` not forming a high-then-low pair, such as
+a lone `"\ud800"` or the reversed `"\udc00\ud800"`) is parsed again the way
+lenient backends read it — JavaScript `JSON.parse`, Python `json.loads` and
+Jackson keep an unpaired surrogate, and Go `encoding/json` and
+`TextDecoder`-based readers substitute `U+FFFD` for it and for invalid bytes:
+invalid bytes become `U+FFFD`, and each unpaired surrogate escape is read as
+`\uFFFD` (an escaped backslash such as `"\\ud800"` is literal text and is not
+changed). One such string therefore cannot hide the rest of the
+document from `body_json_path` rules. Only that fallback copies the body; a
+body the strict parser accepts is read in place.
+
+A reading that still does not parse as JSON is not inspected by
+`body_json_path` rules; `body_text` rules, byte rules and the body-scoped
+specials still scan it. That includes grammar some lenient backends accept
+but the WAF's parser refuses, for example numbers beyond the `f64` range,
+nesting deeper than 128 levels, comments, trailing commas, or `NaN`. Pair a
+`body_json_path` rule with a `body_text` rule, or validate the body against a
+schema before it reaches the backend, when such a backend must be protected.
+
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
 Semantics:
