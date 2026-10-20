@@ -1994,8 +1994,8 @@ async fn test_mongodb_standalone_store_plugin_config_expected_proxy_ids() {
     assert_store_delete_expected_enforced(&url, None).await;
 }
 
-/// Replica-set `MongoStore`: the transactional write path refuses and the
-/// refusal survives as the typed error. Skipped without
+/// Replica-set `MongoStore`: the pre-transaction check refuses with the typed
+/// error and the transactional success path applies. Skipped without
 /// `FERRUM_TEST_MONGO_REPLICA_SET`.
 #[tokio::test]
 #[ignore]
