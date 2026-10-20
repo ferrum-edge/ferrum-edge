@@ -8,7 +8,8 @@
 //! - Full Admin API CRUD lifecycle (proxies, consumers, plugins, upstreams)
 //! - Proxy traffic routing through a MongoDB-backed gateway
 //! - Health endpoint reports MongoDB connectivity
-//! - Plugin-config `expected_proxy_ids` precondition (standalone + replica set)
+//! - Plugin-config `expected_proxy_ids` precondition, over HTTP and directly
+//!   against `MongoStore` (standalone + replica set)
 //!
 //! Prerequisites:
 //!   1. MongoDB running on localhost:27017 (plaintext test)
@@ -39,6 +40,7 @@ use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::ClientOptions;
 use mongodb::{Client as MongoClient, Database as MongoDatabase};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1759,6 +1761,263 @@ async fn test_mongodb_replica_set_plugin_config_expected_proxy_ids() {
 
     assert_plugin_config_expected_proxy_ids_enforced(&harness, "replset").await;
     println!("\n=== MongoDB Replica-Set Plugin expected_proxy_ids Test PASSED ===\n");
+}
+
+// The HTTP cells above are refused by the admin precheck before Mongo's write
+// methods run. These cells call `MongoStore` directly, which bypasses admin
+// admission and models a write that reaches persistence after its lease-held
+// precheck went stale, so the store's own refusal (standalone pre-mutation
+// check; replica-set check plus in-transaction re-check and
+// `plugin_association_transaction_error`) is what is under test. The SQLite
+// equivalents live in
+// `tests/integration/db_proxy_plugin_association_fail_closed_tests.rs`.
+
+/// Connect a `MongoStore` to a fresh per-run database and apply the baseline.
+async fn expected_ids_mongo_store(
+    url: &str,
+    replica_set: Option<&str>,
+) -> (ferrum_edge::config::mongo_store::MongoStore, MongoDatabase) {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::mongo_store::MongoStore;
+
+    let database_name = format!("ferrum_epi_{}", Uuid::new_v4().simple());
+    let observer = MongoClient::with_uri_str(url)
+        .await
+        .expect("connect MongoDB test observer")
+        .database(&database_name);
+    let store = MongoStore::connect(
+        url,
+        &database_name,
+        None,
+        replica_set,
+        None,
+        Some(10),
+        Some(10),
+        false,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect("connect MongoStore");
+    store.run_migrations().await.expect("apply Mongo baseline");
+    (store, observer)
+}
+
+/// Seed `plugin-1` (proxy_group) referenced by both `proxy-1` and `proxy-2`.
+async fn seed_store_shared_plugin(store: &ferrum_edge::config::mongo_store::MongoStore) {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::types::{PluginConfig, Proxy};
+
+    let plugin: PluginConfig = serde_json::from_value(expected_ids_plugin(
+        "plugin-1",
+        "proxy_group",
+        "https://a.example",
+    ))
+    .expect("plugin fixture");
+    store
+        .create_plugin_config(&plugin)
+        .await
+        .expect("create plugin-1");
+    for proxy_id in ["proxy-1", "proxy-2"] {
+        let proxy: Proxy = serde_json::from_value(expected_ids_proxy(proxy_id, &["plugin-1"]))
+            .expect("proxy fixture");
+        store.create_proxy(&proxy).await.expect("create proxy");
+    }
+    assert_eq!(
+        store
+            .list_plugin_config_referencing_proxy_ids("ferrum", "plugin-1")
+            .await
+            .unwrap(),
+        BTreeSet::from(["proxy-1".to_string(), "proxy-2".to_string()])
+    );
+}
+
+/// Raw documents a refused write must leave byte-for-byte unchanged.
+async fn expected_ids_raw_state(observer: &MongoDatabase) -> (Vec<Document>, Vec<Document>) {
+    async fn sorted(observer: &MongoDatabase, collection: &str) -> Vec<Document> {
+        let mut cursor = observer
+            .collection::<Document>(collection)
+            .find(doc! { "namespace": "ferrum" })
+            .sort(doc! { "_id": 1 })
+            .await
+            .unwrap();
+        let mut docs = Vec::new();
+        while cursor.advance().await.unwrap() {
+            docs.push(cursor.deserialize_current().unwrap());
+        }
+        docs
+    }
+    (
+        sorted(observer, "proxies").await,
+        sorted(observer, "plugin_configs").await,
+    )
+}
+
+fn assert_store_refusal(error: anyhow::Error) {
+    use ferrum_edge::config::db_backend::plugin_association_precondition_failed;
+
+    // The admin layer maps exactly this typed refusal to 412 through
+    // `plugin_association_precondition_failed`; outer context must not hide it.
+    let wrapped = error.context("outer database context must not change the refusal");
+    let refusal = plugin_association_precondition_failed(&wrapped)
+        .unwrap_or_else(|| panic!("expected typed precondition refusal, got {wrapped:#}"));
+    assert_eq!(refusal.plugin_id, "plugin-1");
+    assert_eq!(refusal.unexpected, ["proxy-2"]);
+    assert_eq!(
+        refusal.to_string(),
+        "plugin config 'plugin-1' is referenced by proxies outside expected_proxy_ids: proxy-2; re-read the namespace and retry with the current referencing set"
+    );
+}
+
+async fn assert_store_update_expected_enforced(url: &str, replica_set: Option<&str>) {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+    use ferrum_edge::config::types::PluginScope;
+
+    let (store, observer) = expected_ids_mongo_store(url, replica_set).await;
+    seed_store_shared_plugin(&store).await;
+    let before = expected_ids_raw_state(&observer).await;
+    let cursor = store.latest_change_sequence("ferrum").await.unwrap();
+    let mut plugin = store
+        .get_plugin_config("ferrum", "plugin-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let incomplete = BTreeSet::from(["proxy-1".to_string()]);
+    // A proxy_group write keeps the graph but must still enforce the set.
+    for scope in [PluginScope::ProxyGroup, PluginScope::Global] {
+        plugin.scope = scope;
+        let error = store
+            .update_plugin_config_expected(&plugin, &incomplete)
+            .await
+            .expect_err("incomplete expected set must be refused");
+        assert_store_refusal(error);
+        assert_eq!(expected_ids_raw_state(&observer).await, before);
+        assert_eq!(
+            store.latest_change_sequence("ferrum").await.unwrap(),
+            cursor
+        );
+    }
+
+    let complete = BTreeSet::from(["proxy-2".to_string(), "proxy-1".to_string()]);
+    assert!(
+        store
+            .update_plugin_config_expected(&plugin, &complete)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .list_plugin_config_referencing_proxy_ids("ferrum", "plugin-1")
+            .await
+            .unwrap()
+            .is_empty(),
+        "retargeting to global must detach every expected proxy"
+    );
+    assert_eq!(
+        store
+            .get_plugin_config("ferrum", "plugin-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .scope,
+        PluginScope::Global
+    );
+    assert!(store.latest_change_sequence("ferrum").await.unwrap() > cursor);
+    observer.drop().await.unwrap();
+}
+
+async fn assert_store_delete_expected_enforced(url: &str, replica_set: Option<&str>) {
+    use ferrum_edge::config::db_backend::DatabaseBackend;
+
+    let (store, observer) = expected_ids_mongo_store(url, replica_set).await;
+    seed_store_shared_plugin(&store).await;
+    let before = expected_ids_raw_state(&observer).await;
+    let cursor = store.latest_change_sequence("ferrum").await.unwrap();
+    let error = store
+        .delete_plugin_config_expected(
+            "ferrum",
+            "plugin-1",
+            &BTreeSet::from(["proxy-1".to_string()]),
+        )
+        .await
+        .expect_err("incomplete expected set must be refused");
+    assert_store_refusal(error);
+    assert_eq!(expected_ids_raw_state(&observer).await, before);
+    assert_eq!(
+        store.latest_change_sequence("ferrum").await.unwrap(),
+        cursor
+    );
+
+    let complete = BTreeSet::from(["proxy-2".to_string(), "proxy-1".to_string()]);
+    assert!(
+        store
+            .delete_plugin_config_expected("ferrum", "plugin-1", &complete)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .get_plugin_config("ferrum", "plugin-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .list_plugin_config_referencing_proxy_ids("ferrum", "plugin-1")
+            .await
+            .unwrap()
+            .is_empty(),
+        "deleting the config must remove every association"
+    );
+    assert!(store.latest_change_sequence("ferrum").await.unwrap() > cursor);
+    observer.drop().await.unwrap();
+}
+
+/// Standalone `MongoStore`: the pre-mutation check refuses on its own.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_standalone_store_plugin_config_expected_proxy_ids() {
+    let url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&url).await,
+        &format!("not available at {}", host_port_from_db_url(&url)),
+    ) {
+        return;
+    }
+    assert_store_update_expected_enforced(&url, None).await;
+    assert_store_delete_expected_enforced(&url, None).await;
+}
+
+/// Replica-set `MongoStore`: the transactional write path refuses and the
+/// refusal survives as the typed error. Skipped without
+/// `FERRUM_TEST_MONGO_REPLICA_SET`.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_replica_set_store_plugin_config_expected_proxy_ids() {
+    let Ok(replica_set) = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET") else {
+        println!("SKIP: FERRUM_TEST_MONGO_REPLICA_SET not set — no replica set available");
+        return;
+    };
+    let url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
+        .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
+        .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !continue_if_backend_available(
+        "mongodb-replica-set",
+        mongodb_is_available(&url).await,
+        &format!(
+            "declared but not available at {}",
+            host_port_from_db_url(&url)
+        ),
+    ) {
+        return;
+    }
+    assert_store_update_expected_enforced(&url, Some(&replica_set)).await;
+    assert_store_delete_expected_enforced(&url, Some(&replica_set)).await;
 }
 
 #[derive(Debug)]
