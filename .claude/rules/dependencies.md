@@ -155,27 +155,21 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   still compared byte for byte, and the wiring cannot be removed once adopted. A
   committed `.cargo/config[.toml]` below the repository root is rejected
   outright.
-- The `fuzz-smoke` job carries TWO admitted generations
-  (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first): `CI_FUZZ_SMOKE_RETIRED_JOB`
-  is the previous shape (the seven-target bounded budget, always scheduled in full
-  mode, sccache store persisted in the lane); `CI_FUZZ_SMOKE_JOB` is the
-  PR-gated shape from the CI plan rework — identical except that the job
-  `if:` also requires the planner's `run_fuzz_smoke` gate (the fuzz crate, its
-  `fuzz_support` parsers, `Cargo.*`, `vendor/`, or `ci.yml` changed; every
-  push to `main` still runs it) and the lane no longer persists the sccache
-  store. The `test` aggregate wiring
-  (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`) anchors on the `require_planned_gate`
-  Lint line and inserts the `require_planned_gate "Fuzz Smoke"` line. The
-  transition is exact on both ends and
-  one-way — withholding is symmetric, so `admitted_fuzz_smoke_removal_errors` is
-  what refuses a revert. `CI_FUZZ_SMOKE_BOUNDED_BUDGET` must appear exactly once
-  in every generation and `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` exactly once in the
-  adopted one, so a generation can never move or extend the lane and relax its
-  bounds at the same time. `FUZZ_WORKFLOW` carries the same target in the
-  scheduled matrix and the literal shell allowlist. Delete the retired
-  generation once the adopted one is
-  on `main`. See `docs/ci_cd.md` → "Admitted `fuzz-smoke` lane-split
-  generation".
+- The `fuzz-smoke` job's admitted texts live in `CI_FUZZ_SMOKE_JOB_GENERATIONS`
+  (oldest first; the newest must be `CI_FUZZ_SMOKE_JOB`). Every earlier
+  transition is spent, so it holds one generation: main's shape (property
+  smoke as the required PR/merge_group gate, bounded libFuzzer budget on push
+  to `main` / dispatch only, `contents: read`, no remote compiler cache). A
+  change to the job appends its successor as `CI_FUZZ_SMOKE_JOB` and keeps the
+  current text as the retired end until the successor is on `main`; the
+  transition is exact on both ends and one-way — withholding is symmetric, so
+  `admitted_fuzz_smoke_removal_errors` is what refuses a revert.
+  `CI_FUZZ_SMOKE_BOUNDED_BUDGET`, `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` and
+  `CI_FUZZ_SMOKE_PARSER_BUDGET` must each appear exactly once in every
+  generation, so a generation can never move or extend the lane and relax its
+  bounds at the same time. `FUZZ_WORKFLOW` carries the same targets in the
+  scheduled matrix and the literal shell allowlist. See `docs/ci_cd.md` →
+  "Admitted `fuzz-smoke` generations".
 - `release.yml` is admitted in exactly two shapes
   (`RELEASE_IMAGE_FAMILY_GENERATIONS`): the current two image families, or those
   plus the complete frozen `-ebpf-tools` contract (`docker-ebpf-tools-manifest`

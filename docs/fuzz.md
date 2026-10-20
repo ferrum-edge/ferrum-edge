@@ -129,7 +129,7 @@ silently.
 Both hosted shapes are byte-frozen by the trusted Cross build policy. The
 `fuzz-smoke` job is admitted as an ordered list of generations with one-way
 transitions (`CI_FUZZ_SMOKE_JOB_GENERATIONS`); see
-[ci_cd.md](ci_cd.md#admitted-fuzz-smoke-lane-split-generation).
+[ci_cd.md](ci_cd.md#admitted-fuzz-smoke-generations).
 
 The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
 `librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1

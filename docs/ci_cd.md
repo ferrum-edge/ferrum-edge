@@ -305,15 +305,17 @@ No `ci.yml` job requests `id-token: write`. Issue #6573 removed the BoringCache
 backend (PR #5890's rollout), which had been disabled through the
 `BORINGCACHE_ENABLED` repository variable since 2026-09-30 because it added no
 measurable benefit. With it went the 17 job-scoped `id-token: write`
-grants it needed, `setup-boringcache`, `.boringcache.toml`, and the
-`boringcache-connect.yml` enrollment workflow. GitHub Actions cannot condition a
-job's permissions on its event, so those grants let pull-request code mint
-repository OIDC tokens. A same-repository pull request can still add the
-permission to its own workflow copy, so a token is only harmless when nothing
-trusts it: revoke the `ferrum-edge/ferrum-edge` Machine connection in the
-BoringCache Workspace `jeremy-j/ferrum-edge`, and delete the
-`BORINGCACHE_ENABLED` variable. OIDC remains only where it signs or attests
-release artifacts (`release.yml` and `main-latest-image.yml`).
+grants it needed, `setup-boringcache`, `.boringcache.toml`, the
+`boringcache-connect.yml` enrollment workflow, and the `BORINGCACHE_ENABLED`
+variable. GitHub Actions cannot condition a job's permissions on its event, so
+those grants let pull-request code mint repository OIDC tokens. The trusted
+Cross build policy now refuses `id-token: write` anywhere in `ci.yml`
+(`nonpublishing_ci_errors`), job-scoped or workflow-level. A same-repository
+pull request can still add the permission to its own workflow copy for that
+run, so a token is only harmless when nothing trusts it: revoke the
+`ferrum-edge/ferrum-edge` Machine connection in the BoringCache Workspace
+`jeremy-j/ferrum-edge`. OIDC remains only where it signs or attests release
+artifacts (`release.yml` and `main-latest-image.yml`).
 
 ## CI runtime caching (production images and FIPS)
 
@@ -2205,7 +2207,7 @@ shapes and nothing else:
   (#4442) is admitted as two byte-frozen **generations** with a one-way
   transition between them (`CI_FUZZ_SMOKE_JOB_GENERATIONS`, oldest first) — the
   same shape as the admitted `release.yml` image-family adoption. See
-  [Admitted `fuzz-smoke` lane-split generation](#admitted-fuzz-smoke-lane-split-generation).
+  [Admitted `fuzz-smoke` generations](#admitted-fuzz-smoke-generations).
 - `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
   that has not adopted it may omit it; once the trusted base carries it, a pull
   request may neither remove nor alter it. Whole-file
@@ -2261,64 +2263,59 @@ Because only the repository-root Cargo configuration is validated, a committed
 `working-directory: fuzz`, and a nested Cargo configuration there would be an
 unreviewed place to set a target linker, runner, or rustflags.
 
-###### Admitted `fuzz-smoke` lane-split generation
+###### Admitted `fuzz-smoke` generations
 
 The whole job is frozen, so neither moving the lane nor extending its target
 list can be an edit. `CI_FUZZ_SMOKE_JOB_GENERATIONS` therefore lists the job's
 admitted texts oldest first, and a generation retires once its successor is on
-`main`. The newest generation retires BoringCache (issue #6573).
+`main`. Every earlier transition is spent, so one generation remains:
 
-- `CI_FUZZ_SMOKE_RETIRED_JOB` — the shape issue #4238 landed. `Fuzz Smoke` had
-  been the longest job in required pull-request CI (roughly 47 minutes, of which
-  roughly 46 were compilation) because the six sanitizer-instrumented libFuzzer
-  targets were rebuilt from scratch on every pull request to buy about 48
-  seconds of actual fuzzing. #3902 moved that budget off the pull-request path
-  and added the checksum-pinned `setup-sccache` compiler cache; #4238 moved it
-  off `merge_group` as well, because a hosted-runner reclamation (`exit 143`)
-  inside the ~38-minute window ejected the queue entry and cascaded a rebuild of
-  everything behind it with no defect in the ejected change. In this shape the
-  deterministic property smoke is the required `pull_request` and `merge_group`
-  gate, and the six-target bounded budget runs on the push to `main` and on
-  `workflow_dispatch` only.
-- `CI_FUZZ_SMOKE_PRE_PARSER_TARGETS_JOB` — the #4442 shape with the PR #5890
-  BoringCache rollout: identical, plus a seventh bounded libFuzzer invocation for
-  `datagram_client_address`.
+- `CI_FUZZ_SMOKE_JOB` — main's shape. It accumulates what each retired
+  generation added:
+  - issue #4238's lane split. `Fuzz Smoke` had been the longest job in required
+    pull-request CI (roughly 47 minutes, of which roughly 46 were compilation)
+    because the six sanitizer-instrumented libFuzzer targets were rebuilt from
+    scratch on every pull request to buy about 48 seconds of actual fuzzing.
+    #3902 moved that budget off the pull-request path and added the
+    checksum-pinned `setup-sccache` compiler cache; #4238 moved it off
+    `merge_group` as well, because a hosted-runner reclamation (`exit 143`)
+    inside the ~38-minute window ejected the queue entry and cascaded a rebuild
+    of everything behind it with no defect in the ejected change. The
+    deterministic property smoke is the required `pull_request` and
+    `merge_group` gate, and the bounded budget runs on the push to `main` and on
+    `workflow_dispatch` only.
+  - issue #4442's seventh bounded libFuzzer invocation for
+    `datagram_client_address`. That target parses the Datagram PROXY v2
+    envelope — address block, the `0xE0` authentication-tag and `0xE1`
+    freshness TLVs, and the freshness value — on attacker-controlled UDP input,
+    entirely **before** the MAC decision. It had been registered,
+    corpus-seeded, and property-tested since #3289/#3862, but neither libFuzzer
+    lane executed it. It is invoked on its own rather than appended to the
+    six-target loop because its documented input budget is 64 KiB
+    (`fuzz_support::MAX_FUZZ_INPUT_BYTES`), not the loop's 4 KiB. The scheduled
+    `fuzz.yml` lane runs every target at `-max_len=65536`; running this one at
+    4 KiB here would leave the same parser's length boundaries reachable in one
+    required lane and unreachable in the other. Every other bound —
+    `-runs=512`, `-max_total_time=8`, `-timeout=2`, `-rss_limit_mb=1024` — is
+    byte-identical to the loop's, so the budget is widened by one target rather
+    than relaxed.
+  - issue #6584's bounded loop over `ocsp_response`, `jwt_svid`, and
+    `tls_material`: the hand-rolled stapled-OCSP DER grammar, the JWT-SVID
+    strict-JSON, token, and JWKS validators, and PEM certificate/key/CRL
+    admission, at the same 64 KiB `-max_len` and otherwise the six-target
+    loop's bounds. Adopted-generation mutations reject dropping a target and
+    re-bounding the loop to 4 KiB, and the `fuzz.yml` freeze carries all three
+    targets in its matrix and shell allowlist.
+  - issue #6573's BoringCache retirement. Each command runs native Cargo only,
+    the job holds only `contents: read`, `Swatinem/rust-cache` restores
+    unconditionally and saves only on a push to `main`, and the sanitizer step
+    and closing report print `sccache --show-stats`.
 
-  That target parses the Datagram PROXY v2 envelope — address block, the `0xE0`
-  authentication-tag and `0xE1` freshness TLVs, and the freshness value — on
-  attacker-controlled UDP input, entirely **before** the MAC decision. It had
-  been registered, corpus-seeded, and property-tested since #3289/#3862, but
-  neither libFuzzer lane executed it, so no lane was actually fuzzing that
-  parser.
-
-  It is invoked on its own rather than appended to the six-target loop because
-  its documented input budget is 64 KiB (`fuzz_support::MAX_FUZZ_INPUT_BYTES`),
-  not the loop's 4 KiB. The scheduled `fuzz.yml` lane runs every target at
-  `-max_len=65536`; running this one at 4 KiB here would leave the same parser's
-  length boundaries reachable in one required lane and unreachable in the other.
-  Every other bound — `-runs=512`, `-max_total_time=8`, `-timeout=2`,
-  `-rss_limit_mb=1024` — is byte-identical to the loop's, so the budget is
-  widened by one target rather than relaxed.
-- `CI_FUZZ_SMOKE_BORINGCACHE_JOB` — the #6584 shape: identical, plus a bounded
-  loop over `ocsp_response`, `jwt_svid`, and `tls_material`: the hand-rolled
-  stapled-OCSP DER grammar, the JWT-SVID strict-JSON, token, and JWKS
-  validators, and PEM certificate/key/CRL admission, at the same 64 KiB
-  `-max_len` and otherwise the six-target loop's bounds.
-  `CI_FUZZ_SMOKE_PARSER_BUDGET` freezes the loop in its native projection: it
-  must appear exactly once in this generation and the adopted one, and in no
-  earlier one. Adopted-generation mutations reject dropping a target and
-  re-bounding the loop to 4 KiB, and the `fuzz.yml` freeze carries all three
-  targets in its matrix and shell allowlist.
-- `CI_FUZZ_SMOKE_JOB` — the adopted shape (issue #6573): BoringCache retired.
-  Each cached command keeps only its native Cargo branch, the job holds only
-  `contents: read`, `Swatinem/rust-cache` restores unconditionally and saves
-  only on a push to `main`, and the sanitizer step and closing report print
-  `sccache --show-stats` again. Every target, bound, toolchain pin, and event
-  gate is unchanged.
-
-  Scheduling them edits the byte-frozen `fuzz-smoke` job and `fuzz.yml`
-  together with the policy that admits them. The trusted base's policy
-  therefore rejects that pull request, so it needs the owner's admin merge.
+A change to what the job runs edits the byte-frozen `fuzz-smoke` job together
+with the policy that admits it: the new text becomes `CI_FUZZ_SMOKE_JOB`, and
+the current text stays admitted under another name as the retired end until the
+successor is on `main`. The trusted base's policy rejects that pull request, so
+it needs the owner's admin merge.
 
 What is invariant across every generation:
 
@@ -2330,10 +2327,10 @@ What is invariant across every generation:
   `-max_total_time=8`, `-max_len=4096`, `-timeout=2`, `-rss_limit_mb=1024` —
   appears exactly once in every generation, so a generation can never move or
   extend the lane and relax its bounds in the same change;
-- the seventh invocation is frozen the same way in the adopted generation only.
-  `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` must appear exactly once in
-  `CI_FUZZ_SMOKE_JOB` and never in `CI_FUZZ_SMOKE_RETIRED_JOB`, and the
-  self-test separately asserts its 64 KiB `-max_len` and each shared bound;
+- the seventh invocation and the parser-target loop are frozen the same way.
+  `CI_FUZZ_SMOKE_DATAGRAM_BUDGET` and `CI_FUZZ_SMOKE_PARSER_BUDGET` must each
+  appear exactly once in every generation, and the self-test separately asserts
+  their 64 KiB `-max_len` and each shared bound;
 - the bounded budget is gated by an **allow-list** —
   `if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'`
   — not by excluding events. The self-test rejects a `!=` form outright;
@@ -2363,14 +2360,15 @@ What is invariant across every generation:
   sanitizer build actually reused work, and warns explicitly when sccache was
   unavailable.
 
-The transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
-accepts a `fuzz-smoke` job only at one of these two texts (or absent);
+A transition is exact on both ends and one-way. `admitted_fuzz_smoke_errors`
+accepts a `fuzz-smoke` job only at an admitted text (or absent);
 `admitted_fuzz_smoke_removal_errors` refuses both removal and a move to a lower
 generation. That direction check is load-bearing rather than decorative: every
 admitted generation is withheld from *both* sides of the surface comparison, so
-the digest comparison alone would accept a revert. The self-test drives the full
-transition through `compare_pr_workflow_job` in both directions, re-runs every
-shared tamper mutation against each generation, and adds adopted-generation
+the digest comparison alone would accept a revert. Whenever a transition is
+open, the self-test drives it through `compare_pr_workflow_job` in both
+directions. It always re-runs every shared tamper mutation against each
+generation, and adds adopted-generation
 mutations covering what #3902, #4238, and #4442 introduced — restoring the
 sanitizer budget to pull requests, dropping it from the push to `main`,
 re-adding it to the merge queue, skipping the property gate on pull requests,
@@ -2387,10 +2385,8 @@ The aggregate wiring is unaffected: this is still one job named `fuzz-smoke`,
 so `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS` and the `require_success "Fuzz Smoke"`
 assertion are byte-identical across the transition.
 
-Delete `CI_FUZZ_SMOKE_RETIRED_JOB` from `CI_FUZZ_SMOKE_JOB_GENERATIONS` — and the
-`("retired fuzz-smoke generation", CI_FUZZ_SMOKE_RETIRED_JOB)` self-test row with
-it — once the adopted generation is on `main` and no supported base still carries
-the retired one.
+Delete a retired generation from `CI_FUZZ_SMOKE_JOB_GENERATIONS`, with any
+self-test row that names it, once its successor is on `main`.
 
 ##### Admitted release image-family adoption (`-ebpf-tools`)
 
@@ -2558,10 +2554,6 @@ relaxing the scan, the trusted policy admits exact retired→adopted pairs
 | `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
 | `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
 
-| `build-binaries` | `5309921766cd3d8ab17e6879b004dda6fead74c7e11d0001716aa0f68ce5374d` | `c65491ae768a6a5cc9d89841fc975b79d2ddfea62cfd7a2bafe20516c09c244f` | Issue #6573 (BoringCache retirement) |
-| `ebpf-live` | `414af469c95c07c9edd8d5570e55922dc139197f6e2a0ecc7a7447d2109698e8` | `b308f2291f14fe2e714177e0d14e176db1c7b912769f031bb87414c2df7b3754` | Issue #6573 (BoringCache retirement) |
-| `netns-capture-live` | `2abc982b0a6b9abb7fd8749ade0fb3be26bd05b7acc22c2940957e1c2a923913` | `e1b827fd0953966ceb99298e67240a272c5816ab70eb5438d548d29796c9a47f` | Issue #6573 (BoringCache retirement) |
-| `two-cluster-mesh-live` | `1ea07f561e9b748094171562c6d1de0bd134edf27f31f5d1ad7355bb929f7c9e` | `82da14e6c3426607508d3f600d4040ba9a5fba4d3564a6d7d5bde43ec6311470` | Issue #6573 (BoringCache retirement) |
 The three `#3915` pairs admit the per-suite planner-gate split (the union
 `run_ebpf_live` output becomes `run_ebpf_kernel_live` /
 `run_netns_capture_live` / `run_two_cluster_live`); the adopted digests are
@@ -2573,14 +2565,11 @@ does not read as Cross-sensitive, so those need no pair here. The
 `performance-regression.yml`, so its pair can no longer match and should be
 retired.
 
-The four #6573 pairs retire BoringCache from the Cross-sensitive cached jobs:
-each keeps only its native Cargo and GitHub-cache branch and drops its
-job-scoped `id-token: write`. Their digests are over pin-normalized job text,
-the form the comparison loads. They replace PR #5890's rollout pairs, whose
-raw-text digests predate pin normalization and so no longer matched `main`. The
-policy still admits removing the trailing top-level `env` line
-`BORINGCACHE_ENABLED: ${{ vars.BORINGCACHE_ENABLED }}` (with its comment); the
-ARM64 job never read it, and any other env edit is still refused.
+The four issue #6573 pairs (`build-binaries`, `ebpf-live`,
+`netns-capture-live`, `two-cluster-mesh-live`), which retired BoringCache from
+the Cross-sensitive cached jobs, are retired: each pin-normalized destination
+is main's live job text. The `BORINGCACHE_ENABLED` top-level `env` allowance
+went with them, so any edit to the protected top-level `env` is refused again.
 
 PR #3916's `build-binaries` pair is retired: its destination is main's live
 value, so the tuple admitted a transition between two states `main` is not in
@@ -2740,12 +2729,10 @@ superseded by this chain. The current `setup-rust-ci/action.yml` has since
 moved past both destinations, so the chain is spent and its tuples should be
 retired.
 
-Issue #6573 adds one more pair, from the BoringCache generation on `main`
-(`d3b4088f8efb5ba4117686e96558a5726564ad6225503a1a20f9ea960d84c56d`) back to
-the GitHub-cache-only file
-(`e52e897637ce12e001ba7b3abb83d9c6d1e1edce20fcd1f3b78adbd633194b99`). Both are
-digests of pin-normalized text, the form the comparison loads. It replaces PR
-#5890's rollout pair, whose raw-text digests predate pin normalization.
+Issue #6573's pair, from the BoringCache generation back to the
+GitHub-cache-only file, is retired: its pin-normalized destination
+(`e52e897637ce12e001ba7b3abb83d9c6d1e1edce20fcd1f3b78adbd633194b99`) is main's
+live `setup-rust-ci/action.yml`.
 
 #### 8. Linux CI Image
 
