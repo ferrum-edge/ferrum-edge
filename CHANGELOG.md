@@ -141,6 +141,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Separately, the wide-text prefix signature (used for every body rule, request
   and response) now also applies when a non-wide charset such as `utf-8` or an
   unrecognized label is declared, since a byte-sniffing parser ignores it.
+- **WAF `body_json_path` rules inspect JSON bodies that strict `serde_json`
+  rejects.** A body carrying invalid UTF-8 or a `\u` escape naming an unpaired
+  UTF-16 surrogate (a lone `\ud800` / `\udc00`, or a reversed pair) anywhere in
+  a string failed the WAF's strict parse, so no JSON-path rule ran, while
+  lenient backends (`JSON.parse`, `json.loads`, Jackson, Go `encoding/json`)
+  still read the rest of the document. A refused reading (raw, UTF-8-BOM-stripped, or UTF-16 / UTF-32) is
+  now parsed again with invalid bytes read as `U+FFFD` and unpaired surrogate
+  escapes read as `\uFFFD` (escaped backslashes are left literal), and the
+  JSON-path rules run on that reading with duplicate members preserved. Bodies
+  the strict parse accepts are still read in place without a copy. A reading
+  that still does not parse remains outside `body_json_path` inspection; see
+  `docs/waf.md`.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,
