@@ -9,6 +9,7 @@
 # containers) to the output directory.
 #
 # Usage: ./run_mesh_runtime_bench.sh <mesh> [options]
+#        ./run_mesh_runtime_bench.sh --build-only [options]
 #   Mesh: direct | ferrum | envoy | consul | linkerd
 #
 # Options:
@@ -17,6 +18,8 @@
 #   --concurrency 100
 #   --warmup 2            (seconds of discarded load before each cell)
 #   --output-dir /tmp/mesh-runtime-results
+#   --build-only          (build the harness tools image and the Ferrum bench
+#                          image, then exit without starting an arm)
 #   --skip-build          (reuse existing tools/ferrum docker images)
 #
 # Environment:
@@ -38,13 +41,20 @@ set -eo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
-MESH="${1:-}"
-[ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|linkerd> [options]" >&2; exit 2; }
-shift
-case "$MESH" in
-    direct|ferrum|envoy|consul|linkerd) ;;
-    *) echo "unknown mesh arm: $MESH" >&2; exit 2 ;;
-esac
+BUILD_ONLY=false
+MESH=""
+if [ "${1:-}" = "--build-only" ]; then
+    BUILD_ONLY=true
+    shift
+else
+    MESH="${1:-}"
+    [ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|linkerd> [options]" >&2; exit 2; }
+    shift
+    case "$MESH" in
+        direct|ferrum|envoy|consul|linkerd) ;;
+        *) echo "unknown mesh arm: $MESH" >&2; exit 2 ;;
+    esac
+fi
 
 PAYLOAD_SIZES="1024 10240 71680 512000 1048576 5242880"
 DURATION=10
@@ -65,6 +75,11 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+if $BUILD_ONLY && $SKIP_BUILD; then
+    echo "--build-only and --skip-build are mutually exclusive" >&2
+    exit 2
+fi
 
 # Validate numeric inputs before they reach any command.
 for v in "$DURATION" "$CONCURRENCY" "$WARMUP"; do
@@ -171,14 +186,36 @@ generate_certs() {
 }
 
 # ── Builds / pulls ──────────────────────────────────────────────────────────
+build_tools_image() {
+    echo "[build] building harness tools image $TOOLS_IMAGE"
+    docker build -f "$SCRIPT_DIR/Dockerfile.tools" -t "$TOOLS_IMAGE" "$SCRIPT_DIR" \
+        > "$OUTPUT_DIR/logs/tools-build.log" 2>&1 || {
+        tail -30 "$OUTPUT_DIR/logs/tools-build.log" >&2; exit 1; }
+}
+
+build_ferrum_image() {
+    echo "[build] building ferrum image $FERRUM_IMAGE (repo Dockerfile)"
+    docker build -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" \
+        > "$OUTPUT_DIR/logs/ferrum-build.log" 2>&1 || {
+        tail -30 "$OUTPUT_DIR/logs/ferrum-build.log" >&2; exit 1; }
+}
+
 prepare_images() {
+    # --build-only: the campaign's one shared build, independent of any arm.
+    # The ferrum arm needs this image but cannot be the first arm to build it
+    # (the arm loop always runs with --skip-build after this step).
+    if $BUILD_ONLY; then
+        build_tools_image
+        build_ferrum_image
+        return
+    fi
     if $SKIP_BUILD; then
         echo "[build] --skip-build: expecting $TOOLS_IMAGE to exist"
+        if ! docker image inspect "$TOOLS_IMAGE" >/dev/null 2>&1; then
+            echo "[build] tools image $TOOLS_IMAGE missing and --skip-build set" >&2; exit 1
+        fi
     else
-        echo "[build] building harness tools image $TOOLS_IMAGE"
-        docker build -f "$SCRIPT_DIR/Dockerfile.tools" -t "$TOOLS_IMAGE" "$SCRIPT_DIR" \
-            > "$OUTPUT_DIR/logs/tools-build.log" 2>&1 || {
-            tail -30 "$OUTPUT_DIR/logs/tools-build.log" >&2; exit 1; }
+        build_tools_image
     fi
     case "$MESH" in
         ferrum)
@@ -186,10 +223,7 @@ prepare_images() {
                 if $SKIP_BUILD; then
                     echo "[build] ferrum image $FERRUM_IMAGE missing and --skip-build set" >&2; exit 1
                 fi
-                echo "[build] building ferrum image $FERRUM_IMAGE (repo Dockerfile)"
-                docker build -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" \
-                    > "$OUTPUT_DIR/logs/ferrum-build.log" 2>&1 || {
-                    tail -30 "$OUTPUT_DIR/logs/ferrum-build.log" >&2; exit 1; }
+                build_ferrum_image
             fi
             ;;
         envoy) docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true ;;
@@ -540,6 +574,15 @@ write_manifest() {
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
+if $BUILD_ONLY; then
+    echo "================================================="
+    echo "  Mesh Runtime Benchmark — build images only"
+    echo "================================================="
+    prepare_images
+    echo "[build] ready: $TOOLS_IMAGE and $FERRUM_IMAGE"
+    exit 0
+fi
+
 echo "================================================="
 echo "  Mesh Runtime Benchmark — arm: $MESH"
 echo "================================================="

@@ -141,8 +141,23 @@ jobs:
 
       # No docker/buildx actions here by design: a new workflow may not
       # add Cross executable surfaces (Trusted Cross Build Policy). The
-      # harness builds the Ferrum image with a literal `docker build`
-      # on first use, exactly as it builds its tools image.
+      # harness builds both images with literal `docker build` commands in
+      # its own `--build-only` mode, once, before the arm loop.
+
+      # Build the harness tools image and the Ferrum bench image in one
+      # place. The `direct` arm builds only the tools image, so leaving
+      # image builds to the first arm made the later `ferrum` arm fail
+      # under `--skip-build`. Every arm now runs with `--skip-build` and
+      # fails fast if this step did not produce the image it needs.
+      - name: Build benchmark images
+        if: steps.plan.outputs.meshes != ''
+        timeout-minutes: 45
+        env:
+          FERRUM_IMAGE: ferrum-edge:bench
+        run: |
+          bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh \
+            --build-only \
+            --output-dir results/images
 
       - name: Run benchmark (all arms, sequential, same runner)
         timeout-minutes: 150
@@ -169,18 +184,16 @@ jobs:
               echo "============================================"
               run_dir="results/${mesh}/run_${run}"
               mkdir -p "$run_dir"
-              extra_flags=""
-              # Tools + Ferrum images are built by the first arm run.
-              if [ -f results/.tools-built ]; then extra_flags="--skip-build"; fi
+              # The tools and Ferrum images were built once in the step
+              # above; arms only consume them.
               bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh \
                 "$mesh" \
                 --payload-sizes "$PAYLOAD_SIZES" \
                 --duration "$BENCH_DURATION" \
                 --concurrency "$BENCH_CONCURRENCY" \
                 --output-dir "$run_dir" \
-                $extra_flags \
+                --skip-build \
                 2>&1 | tee "$run_dir/run.log" || true
-              touch results/.tools-built
             done
           done
 

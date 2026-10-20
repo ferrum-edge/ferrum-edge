@@ -12,6 +12,12 @@ overhead, mesh DNS), which contain no competitor comparison.
 - Harness: `tests/performance/mesh_runtime/` (see its README)
 - Summarizer: `.github/scripts/summarize_mesh_runtime_results.py`
 
+The workflow builds the harness tools image and the Ferrum bench image once,
+in a dedicated step before the arm loop (`run_mesh_runtime_bench.sh
+--build-only`), then runs every arm with `--skip-build`. Image builds
+therefore stay out of the per-cell measurement window and out of the arm
+loop's failure surface; a missing image fails that arm immediately.
+
 ## What is measured
 
 For each arm and each payload size (1KB, 10KB, 70KB, 500KB, 1MB, 5MB —
