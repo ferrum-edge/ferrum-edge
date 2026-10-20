@@ -39,7 +39,6 @@ from ci_runtime_plan import (
 )
 from ci_runtime_telemetry import self_test as telemetry_self_test
 from verify_cross_build_policy import (
-    CI_CACHE_PERMISSIONS,
     AMBIENT_REGISTRY_IMAGE_AGGREGATE_JOB,
     AMBIENT_REGISTRY_IMAGE_READ_JOB,
     AMBIENT_REGISTRY_IMAGE_WRITE_JOB,
@@ -114,8 +113,6 @@ COMPLETED_CACHE_PRODUCER_JOBS = (
 CHECKOUT = "actions/checkout@0000000000000000000000000000000000000000"
 RUST_TOOLCHAIN = "dtolnay/rust-toolchain@0000000000000000000000000000000000000000"
 RUST_CACHE = "Swatinem/rust-cache@0000000000000000000000000000000000000000"
-BORINGCACHE_CARGO_PREFIX = "boringcache cargo --${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'write' || 'read-only' }} --profile "
-BORINGCACHE_DIRECT_PROFILES = {("ci.yml", "build-binaries"): "binaries", ("ci.yml", "build-ebpf"): "ebpf"}
 BUILDX = "docker/setup-buildx-action@0000000000000000000000000000000000000000"
 BUILD_PUSH = "docker/build-push-action@0000000000000000000000000000000000000000"
 CACHE_RESTORE = "actions/cache/restore@0000000000000000000000000000000000000000"
@@ -3434,35 +3431,8 @@ def check_direct_rust_cache_diet(
     failures: list[str],
     *,
     compiler_only: bool,
-    cargo_profile: str | None = None,
 ) -> None:
     blocks = rust_cache_with_blocks(job)
-    if cargo_profile is not None and BORINGCACHE_CARGO_PREFIX in job:
-        # The fallback still gets the save-if/cache-directories checks below.
-        fallback_steps = [
-            chunk for chunk in re.split(r"(?m)^(?=[ ]{2,}- )", job) if RUST_CACHE in chunk
-        ]
-        require(
-            len(fallback_steps) == 1
-            and "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n" in fallback_steps[0],
-            f"{source} must gate the GitHub cache fallback", failures,
-        )
-        require(
-            job.count("uses: ./.github/actions/setup-boringcache") == 1,
-            f"{source} must install BoringCache exactly once", failures,
-        )
-        require(
-            CI_CACHE_PERMISSIONS in job,
-            f"{source} must scope cache OIDC permission to this job", failures,
-        )
-        require(
-            not re.search(r"BORINGCACHE_\w*TOKEN:", job),
-            f"{source} must use OIDC without static cache credentials", failures,
-        )
-        require(
-            job.count(BORINGCACHE_CARGO_PREFIX + cargo_profile + " ") == 2,
-            f"{source} must cache both native Cargo commands with profile {cargo_profile}", failures,
-        )
     require(len(blocks) == 1, f"{source} must keep one pinned rust-cache site", failures)
     for block in blocks:
         saves = re.findall(r"(?m)^\s*save-if:([^\n]*)$", block)
@@ -5613,40 +5583,6 @@ def self_test() -> int:
         )
         if not registry_errors:
             failures.append(f"registry-cache fixture without {label} was accepted")
-    boringcache_job = (
-        CI_CACHE_PERMISSIONS +
-        "      - uses: ./.github/actions/setup-boringcache\n"
-        f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries check\n"
-        f"      - run: {BORINGCACHE_CARGO_PREFIX}binaries build\n"
-        f"      - uses: {RUST_CACHE}\n"
-        "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n"
-        "        with:\n"
-        "          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}\n"
-    )
-    for mutation in (
-        None,
-        boringcache_job.replace(CI_CACHE_PERMISSIONS, "    permissions:\n      contents: read\n"),
-        boringcache_job + "      BORINGCACHE_SAVE_TOKEN: ${{ secrets.BORINGCACHE_SAVE_TOKEN }}\n",
-        boringcache_job.replace("setup-boringcache", "other-cache"),
-        boringcache_job.replace("--profile binaries", "--profile unrelated"),
-        boringcache_job + f"      - uses: {RUST_CACHE}\n        with:\n          save-if: true\n",
-        re.sub(r"save-if: [^\n]+", "save-if: true", boringcache_job),
-        boringcache_job + "          cache-directories: /\n",
-        boringcache_job.replace(
-            "        if: env.CI_BORINGCACHE_ENABLED != 'true'\n", ""
-        ).replace("      - run:", "      - if: env.CI_BORINGCACHE_ENABLED != 'true'\n        run:", 1),
-    ):
-        cache_errors: list[str] = []
-        check_direct_rust_cache_diet(
-            boringcache_job if mutation is None else mutation,
-            "self-test-boringcache", cache_errors,
-            compiler_only=False, cargo_profile="binaries",
-        )
-        require(
-            bool(cache_errors) == (mutation is not None),
-            "self-test: BoringCache must enforce scoped credentials, one cache backend and the native profile",
-            failures,
-        )
     direct_cache = (
         f"      - uses: {RUST_CACHE}\n"
         "        with:\n"
@@ -9265,7 +9201,6 @@ def main(argv: list[str] | None = None) -> int:
             f"{filename}/{job_name}",
             failures,
             compiler_only=compiler_only,
-            cargo_profile=BORINGCACHE_DIRECT_PROFILES.get((filename, job_name)),
         )
     check_docs_and_coverage(failures)
     check_dockerfile(failures)

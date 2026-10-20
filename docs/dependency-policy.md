@@ -1063,7 +1063,9 @@ Current admissions:
   cache-budget generation
   `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`, then to
   the combined #3911 destination
-  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`.
+  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`, plus the
+  issue #6573 BoringCache retirement pair
+  (`d3b4088f…` → `e52e8976…`, pin-normalized).
 
 Details and digests: `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
 transition", "Admitted CI job SHA-256 generation transitions", and "Admitted
