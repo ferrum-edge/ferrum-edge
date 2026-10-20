@@ -55,6 +55,22 @@ In CI: Actions → “Mesh Runtime Benchmark” → Run workflow (defaults:
 10s × concurrency 100 × payloads 1KB–5MB, 1 iteration; use 3 iterations
 for publishable numbers).
 
+## Builds and images
+
+The harness builds its own tools image (`mesh-bench-tools:local`) and, for
+the `ferrum` arm, the repository image (`ferrum-edge:bench`) with literal
+`docker build` commands (no Buildx action). The workflow builds both once in
+a dedicated step before the arm loop:
+
+```bash
+./run_mesh_runtime_bench.sh --build-only --output-dir results/images
+```
+
+Every arm then runs with `--skip-build`, so an arm consumes the prepared
+images and fails fast if one is missing instead of rebuilding mid-campaign.
+Locally, omit `--skip-build` on a first single-arm run to let that arm build
+what it needs; use `--build-only` to prebuild both images.
+
 ## Output contract
 
 Per cell `<mesh>_http1_<payload>.json` carries the gateway-bench fields

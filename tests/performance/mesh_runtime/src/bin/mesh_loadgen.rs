@@ -34,6 +34,11 @@ struct Cli {
     concurrency: u64,
     #[arg(long, default_value_t = 1024)]
     payload_size: usize,
+    /// Deadline for one complete request/response exchange: sending the
+    /// request and reading the whole response body share it. An expired
+    /// exchange is recorded as a cell error and the connection is dropped.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    exchange_timeout_secs: u64,
     #[arg(long, default_value_t = false)]
     json: bool,
 }
@@ -59,6 +64,7 @@ async fn main() -> Result<()> {
     // charged to the measured window and the deadline is common.
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(args.concurrency as usize));
     let duration = Duration::from_secs(args.duration);
+    let exchange_timeout = Duration::from_secs(args.exchange_timeout_secs);
     let mut handles = Vec::with_capacity(args.concurrency as usize);
     for _ in 0..args.concurrency {
         let host = host.clone();
@@ -67,7 +73,17 @@ async fn main() -> Result<()> {
         let payload = payload.clone();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            worker(host, port, path, host_header, payload, barrier, duration).await
+            worker(
+                host,
+                port,
+                path,
+                host_header,
+                payload,
+                barrier,
+                duration,
+                exchange_timeout,
+            )
+            .await
         }));
     }
 
@@ -132,6 +148,7 @@ async fn worker(
     payload: Bytes,
     barrier: std::sync::Arc<tokio::sync::Barrier>,
     duration: Duration,
+    exchange_timeout: Duration,
 ) -> BenchMetrics {
     let mut metrics = BenchMetrics::new();
     // Establish the first connection before the shared start epoch; a
@@ -175,34 +192,28 @@ async fn worker(
         };
 
         let start = Instant::now();
-        // Bounded request phase: a stalled peer must not let a worker
-        // overrun the measurement epoch or hang the cell forever.
-        let send_result =
-            match tokio::time::timeout(Duration::from_secs(60), send.send_request(req)).await {
-                Ok(result) => result.map_err(|e| e.into()),
-                Err(_) => Err(anyhow::anyhow!("request timed out")),
-            };
+        // One deadline for the whole exchange, send plus body read: a peer
+        // that returns headers and then stalls mid-body must not pin a
+        // worker past the measurement epoch (or until the harness step
+        // times out) without recording a cell error. Dropping the timed-out
+        // exchange also drops the connection, so the next iteration opens
+        // a fresh one.
+        let exchange = async move {
+            let resp = send.send_request(req).await?;
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await?.to_bytes();
+            Ok::<(SendRequest<Full<Bytes>>, StatusCode, Bytes), anyhow::Error>((
+                send, status, bytes,
+            ))
+        };
 
-        match send_result {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.into_body().collect().await {
-                    Ok(body) if status == StatusCode::OK => {
-                        let bytes = body.to_bytes();
-                        if bytes == payload {
-                            let elapsed = start.elapsed().as_micros() as u64;
-                            metrics.record(elapsed, bytes.len());
-                            sender = Some(send);
-                        } else {
-                            metrics.record_error();
-                        }
-                    }
-                    _ => {
-                        metrics.record_error();
-                    }
-                }
+        match tokio::time::timeout(exchange_timeout, exchange).await {
+            Ok(Ok((send, status, bytes))) if status == StatusCode::OK && bytes == payload => {
+                let elapsed = start.elapsed().as_micros() as u64;
+                metrics.record(elapsed, bytes.len());
+                sender = Some(send);
             }
-            Err(_) => {
+            _ => {
                 metrics.record_error();
             }
         }
