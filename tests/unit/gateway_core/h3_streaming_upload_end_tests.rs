@@ -82,10 +82,12 @@ fn every_reset_and_every_lost_connection_is_a_client_abort() {
 fn the_native_h3_upload_finishes_the_backend_only_after_the_stream_ends() {
     let upload = region(CLIENT, "async fn do_request_streaming_body(", "\n    }\n");
     let end_of_stream = find_after(upload, 0, "frontend_stream.recv_trailers().await");
+    // Issue #6772: the arm mints the typed client-abort evidence with the
+    // shared predicate; everything else is malformed trailers.
     let abort_arm = find_after(
         upload,
         end_of_stream,
-        "Err(e) if crate::http3::stream_util::h3_request_read_error_is_client_abort(&e) => {",
+        "ProvenClientAbort::from_h3_request_read_error(&e)",
     );
     let abort_error = find_after(
         upload,
@@ -137,11 +139,7 @@ fn the_grpc_bridge_pump_flags_a_reset_after_the_trailers_as_a_client_abort() {
         error_arm,
         "if !h3_request_read_error_is_client_abort(&e) {",
     );
-    let malformed = find_after(
-        pump,
-        guard,
-        "pump_frontend_malformed.store(true, Ordering::Release);",
-    );
+    let malformed = find_after(pump, guard, "GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS,");
     let failed = find_after(
         pump,
         malformed,

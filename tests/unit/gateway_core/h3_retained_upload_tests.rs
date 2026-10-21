@@ -291,14 +291,18 @@ fn failed_h3_uploads_finalize_once_and_bridge_logs_before_sending() {
             1
         );
     }
+    // Issue #6772: the buffered drains mint their client-abort evidence through
+    // the shared `ProvenClientAbort`, whose predicate is the streamed paths' too.
     let classify = server
-        .split("pub(crate) fn is_client_disconnect(&self)")
+        .split("pub(crate) fn proven_client_abort(")
         .nth(1)
         .unwrap()
         .split("/// Drain an H3 request-body")
         .next()
         .unwrap();
-    assert!(classify.contains("h3_request_read_error_is_client_abort(error)"));
+    assert!(classify.contains("ProvenClientAbort::from_h3_request_read_error(error)"));
+    let client_abort = include_str!("../../../src/proxy/client_abort.rs");
+    assert!(client_abort.contains("h3_request_read_error_is_client_abort(error)"));
 
     let bridge = include_str!("../../../src/http3/cross_protocol.rs");
     let finalizer = bridge

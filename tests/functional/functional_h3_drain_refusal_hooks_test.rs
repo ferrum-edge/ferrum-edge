@@ -35,6 +35,13 @@
 //! the gateway runs with the plain bridge's debug lines on, so a failure says
 //! whether the request never reached the backend or was left open there.
 //!
+//! The client-abort tests (issue #6772) prove that a client that goes away
+//! before response headers is logged with the shared client-abort terminal on
+//! the plain bridge, the native-HTTP/3 backend path, and the streaming gRPC
+//! bridge: `499` (gRPC `CANCELLED`), `client_disconnect`, and
+//! `client_disconnected`, with backend health neutral. A client that leaves
+//! after the response head keeps the committed status.
+//!
 //! Run with:
 //!
 //! ```bash
@@ -459,6 +466,51 @@ async fn wait_for_rejection_phase(harness: &GatewayHarness, expected_phase: &str
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Wait for the `stdout_logging` transaction entry for this proxy's `path`
+/// that `matches` accepts.
+async fn wait_for_transaction(
+    harness: &GatewayHarness,
+    path: &str,
+    what: &str,
+    matches: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let logs = harness.captured_combined().unwrap_or_default();
+        if let Some(entry) = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .find(|entry| {
+                entry.get("proxy_id").and_then(Value::as_str) == Some(PROXY_ID)
+                    && entry.get("request_path").and_then(Value::as_str) == Some(path)
+                    && matches(entry)
+            })
+        {
+            return entry;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stdout_logging must log {what} for {path}; logs:\n{logs}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait for the transaction entry for `path` logged with HTTP `status`.
+async fn wait_for_status(harness: &GatewayHarness, path: &str, status: u64) -> Value {
+    wait_for_transaction(harness, path, &format!("a {status}"), |entry| {
+        entry.get("response_status_code").and_then(Value::as_u64) == Some(status)
+    })
+    .await
+}
+
+/// Issue #6772: the shared pre-header client-abort terminal, as logged.
+fn assert_client_abort_entry(entry: &Value) {
+    assert_eq!(entry["response_status_code"], 499, "{entry}");
+    assert_eq!(entry["error_class"], "client_disconnect", "{entry}");
+    assert_eq!(entry["client_disconnected"], true, "{entry}");
 }
 
 /// The aggregate buffered-request budget from the authenticated `/overload`
@@ -1231,6 +1283,9 @@ async fn h3_streamed_upload_aborts_the_backend_body_on_reset_and_stop_sending_af
     upload.cancel_response_download();
     upload.reset_request_upload(h3::error::Code::H3_NO_ERROR);
     assert_upload_aborted(&harness, &ends).await;
+    // Issue #6772: whichever signal wins the race, the request is the shared
+    // client-abort terminal.
+    assert_client_abort_entry(&wait_for_status(&harness, UPLOAD_PATH, 499).await);
     drop(upload);
     backend_task.abort();
 }
@@ -1250,6 +1305,9 @@ async fn h3_streamed_upload_aborts_the_backend_body_on_a_lost_connection_after_t
     let upload = upload_through_trailers(&url, &[], &harness, &ends).await;
     upload.close_connection();
     assert_upload_aborted(&harness, &ends).await;
+    // Issue #6772: a lost connection before any response head is the shared
+    // client-abort terminal, never status `0`.
+    assert_client_abort_entry(&wait_for_status(&harness, UPLOAD_PATH, 499).await);
     drop(upload);
     backend_task.abort();
 }
@@ -1363,5 +1421,283 @@ async fn h3_streamed_upload_header_timeout_aborts_the_backend_body() {
     );
     assert_upload_aborted(&harness, &ends).await;
     drop(upload);
+    backend_task.abort();
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Client-abort terminal (issue #6772)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A circuit breaker that would open on the first `499`, `502`, or `504`: if a
+/// client abort were charged to the backend, the next request would be shed.
+fn with_one_strike_breaker(mut proxy: Value) -> Value {
+    proxy["circuit_breaker"] = json!({
+        "failure_threshold": 1,
+        "failure_status_codes": [499, 502, 504],
+    });
+    proxy
+}
+
+/// A client that resets its streamed upload over the plain HTTP/3-to-HTTP
+/// bridge after its trailers, before any response head, is logged and counted
+/// with the shared client-abort terminal (`499`, `client_disconnect`,
+/// `client_disconnected`) instead of status `0`. Backend health stays neutral:
+/// a one-strike circuit breaker still admits the next upload, which ends with
+/// FIN and completes as the normal-FIN control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streamed_upload_client_abort_logs_499_and_leaves_backend_health_neutral() {
+    let (backend_port, ends, backend_task) = spawn_streamed_upload_backend(UPLOAD_PATH).await;
+    let proxy = with_one_strike_breaker(base_proxy("http", backend_port));
+    let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
+    let url = proxy_url(https_port, UPLOAD_PATH);
+
+    let mut reset = upload_through_trailers(&url, &[], &harness, &ends).await;
+    reset.reset_request_upload(h3::error::Code::H3_NO_ERROR);
+    assert_upload_aborted(&harness, &ends).await;
+    assert_client_abort_entry(&wait_for_status(&harness, UPLOAD_PATH, 499).await);
+    drop(reset);
+
+    let mut complete = open_upload_stream(&url, "application/octet-stream").await;
+    complete
+        .send_raw_data(Bytes::from_static(b"complete upload"))
+        .await
+        .expect("send upload");
+    complete.finish().await.expect("finish upload");
+    let (status, _) = complete.recv_response().await.expect("response head");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a client abort must not open the backend's circuit breaker"
+    );
+    let entry = wait_for_status(&harness, UPLOAD_PATH, 200).await;
+    assert_ne!(entry["client_disconnected"], true, "{entry}");
+    assert_eq!(
+        count(&ends.completed),
+        1,
+        "only the upload that ended with FIN completes at the backend; {}",
+        ends.summary()
+    );
+    backend_task.abort();
+}
+
+/// The native-HTTP/3 backend path: a client that resets its streamed upload
+/// before any response head cancels the backend request stream, is logged as
+/// `499` / `client_disconnect`, and is never answered with a gateway `502`.
+/// The target's HTTP/3 capability is not downgraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_native_streamed_upload_client_abort_logs_499_without_a_gateway_502() {
+    let (backend_port, h3_backend) = spawn_native_h3_backend(
+        "h3-native-client-abort",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::ReadRequestData,
+            H3Step::ExpectRequestReset,
+            H3Step::StallFor(Duration::from_secs(30)),
+        ],
+    )
+    .await;
+    let yaml = gateway_yaml(
+        with_one_strike_breaker(base_proxy("https", backend_port)),
+        Vec::new(),
+    );
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    wait_for_h3_supported(&harness).await;
+
+    let mut upload = open_upload_stream(
+        &proxy_url(https_port, UPLOAD_PATH),
+        "application/octet-stream",
+    )
+    .await;
+    upload
+        .send_raw_data(Bytes::from_static(b"cancelled upload"))
+        .await
+        .expect("send upload");
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    loop {
+        let received = h3_backend.received_requests().await;
+        if received
+            .iter()
+            .any(|request| request.path.starts_with(UPLOAD_PATH) && !request.body.is_empty())
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the H3 backend must receive the upload before the client resets it; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    upload.reset_request_upload(h3::error::Code::H3_REQUEST_CANCELLED);
+
+    assert_client_abort_entry(&wait_for_status(&harness, UPLOAD_PATH, 499).await);
+    match upload.recv_response().await {
+        Ok((status, headers)) => panic!(
+            "a departed client must not be answered with a gateway status; got {status} {headers:?}"
+        ),
+        Err(error) => assert!(
+            !error.to_string().contains("timed out"),
+            "the gateway must reset the response, not leave it open: {error}"
+        ),
+    }
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    while h3_backend.request_resets() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the H3 backend must see its request stream reset; step errors: {:?}",
+            h3_backend.step_errors().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let capability = fetch_capability_entry(&harness)
+        .await
+        .expect("capability entry");
+    assert_eq!(
+        capability["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "a client abort must not downgrade the target's HTTP/3 capability: {capability}"
+    );
+}
+
+/// The streaming HTTP/3-to-gRPC bridge: a client that resets its upload before
+/// the backend's response headers cancels the RPC. It is answered and logged
+/// `CANCELLED` (1), never `UNAVAILABLE` (14), with `client_disconnect` and
+/// `client_disconnected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_grpc_bridge_client_abort_is_cancelled_not_unavailable() {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let ca = TestCa::new("h3-client-abort-grpc-be").expect("ca");
+    let (cert, key) = ca.valid().expect("backend leaf");
+    let backend = ScriptedGrpcBackend::builder_tls(listener, &cert, &key)
+        .expect("backend tls")
+        .step(GrpcStep::AcceptStreamingRpc(MatchRpc::any()))
+        .step(GrpcStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn grpc backend");
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(base_proxy("https", backend_port), Vec::new()),
+        &[],
+    )
+    .await;
+    let streams_before = backend.received_stream_count();
+
+    let mut upload =
+        open_upload_stream(&proxy_url(https_port, GRPC_PATH), "application/grpc").await;
+    upload
+        .send_raw_data(Bytes::from(grpc_frame(b"cancelled")))
+        .await
+        .expect("upload DATA");
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    while backend.received_stream_count() == streams_before {
+        assert!(
+            Instant::now() < deadline,
+            "the gRPC backend must receive the RPC before the client cancels it; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    upload.cancel_request_upload();
+
+    let (status, headers) = upload.recv_response().await.expect("cancellation response");
+    assert_eq!(status, StatusCode::OK, "gRPC errors ride on HTTP 200");
+    assert_eq!(
+        headers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "a client abort is CANCELLED, never UNAVAILABLE; got {headers:?}"
+    );
+    let entry = wait_for_transaction(&harness, GRPC_PATH, "a CANCELLED RPC", |entry| {
+        entry
+            .pointer("/metadata/grpc_status")
+            .and_then(Value::as_str)
+            == Some("1")
+    })
+    .await;
+    assert_eq!(entry["response_status_code"], 200, "{entry}");
+    assert_eq!(entry["error_class"], "client_disconnect", "{entry}");
+    assert_eq!(entry["client_disconnected"], true, "{entry}");
+}
+
+/// After the response head is committed, a client that goes away keeps the
+/// committed status: the request is logged with the backend's `200`, marked
+/// `client_disconnected`, never rewritten to `499`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_client_abort_after_response_headers_keeps_the_committed_status() {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                continue;
+            };
+            tokio::spawn(async move {
+                let mut head: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => head.extend_from_slice(&buf[..read]),
+                    }
+                }
+                let request_line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if !request_line.contains(UPLOAD_PATH) {
+                    let _ = socket.write_all(OK_RESPONSE).await;
+                    return;
+                }
+                // A long response the client abandons after its head.
+                let response_head =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
+                if socket.write_all(response_head).await.is_err() {
+                    return;
+                }
+                let chunk = [b'r'; 1024];
+                for _ in 0..1024 {
+                    if socket.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+        }
+    });
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(base_proxy("http", backend_port), Vec::new()),
+        &[],
+    )
+    .await;
+
+    let mut download = open_upload_stream(
+        &proxy_url(https_port, UPLOAD_PATH),
+        "application/octet-stream",
+    )
+    .await;
+    download.finish().await.expect("finish request");
+    let (status, _) = download.recv_response().await.expect("response head");
+    assert_eq!(status, StatusCode::OK);
+    let _ = download.recv_data().await.expect("first response bytes");
+    download.close_connection();
+
+    let entry = wait_for_transaction(&harness, UPLOAD_PATH, "the committed response", |entry| {
+        entry["client_disconnected"] == true
+    })
+    .await;
+    assert_eq!(
+        entry["response_status_code"], 200,
+        "a client that leaves after the response head keeps the committed status: {entry}"
+    );
+    drop(download);
     backend_task.abort();
 }

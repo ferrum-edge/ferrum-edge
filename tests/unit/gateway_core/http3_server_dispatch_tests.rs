@@ -4260,8 +4260,15 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         "undecodable trailing metadata is INVALID_ARGUMENT, not a server outage"
     );
     assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::MalformedBody),
+        Some((3, "Malformed request body")),
+        "a request DATA read the gateway refused is INVALID_ARGUMENT, not a client abort"
+    );
+    // Issue #6772: a client that reset or lost its upload cancelled the RPC; it
+    // is never reported as a service outage (UNAVAILABLE / 14).
+    assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::ClientAbort),
-        Some((14, "Service unavailable")),
+        Some((1, "Client disconnected")),
     );
     assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::AuthorizationExpired),
@@ -4272,6 +4279,7 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
     for terminating in [
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
+        H3GrpcUploadFaultKind::MalformedBody,
         H3GrpcUploadFaultKind::Oversize,
         H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {

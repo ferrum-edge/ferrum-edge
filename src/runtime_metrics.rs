@@ -261,6 +261,11 @@ impl RuntimeMetrics {
         self.reqwest_active_backend_requests.load(Ordering::Relaxed)
     }
 
+    /// Requests recorded as client disconnects so far.
+    pub fn client_disconnects(&self) -> u64 {
+        self.client_disconnects.load(Ordering::Relaxed)
+    }
+
     pub fn record_transaction(&self, summary: &TransactionSummary) {
         self.record_terminal_outcome(TerminalOutcome {
             proxy_id: summary.proxy_id.as_deref(),

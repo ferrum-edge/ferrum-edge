@@ -39,6 +39,7 @@ pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod backend_send_queue;
 pub mod body;
+pub mod client_abort;
 pub mod client_ip;
 pub mod datagram_client_address;
 pub mod deferred_log;
@@ -31202,7 +31203,7 @@ async fn finalize_terminal_request_body_read_rejection(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &normalized);
-    if status.as_u16() == 499 {
+    if status.as_u16() == client_abort::CLIENT_CLOSED_REQUEST_STATUS {
         log_client_disconnect_rejection_with_path(
             plugins,
             ctx,
@@ -35267,17 +35268,18 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_authenticate",
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
                         .await;
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
@@ -35482,17 +35484,18 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_authorize",
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
                         .await;
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
@@ -35744,17 +35747,18 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_before_proxy",
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
                         .await;
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
@@ -36752,8 +36756,9 @@ async fn handle_proxy_request_inner(
                             &state,
                             &plugins,
                             &mut ctx,
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            br#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY.as_bytes(),
                             HashMap::new(),
                             is_grpc_request,
                             start_time,
@@ -37223,17 +37228,18 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_dispatch",
                             plugin_execution_ns,
                             Some(&original_request_path),
                         )
                         .await;
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {

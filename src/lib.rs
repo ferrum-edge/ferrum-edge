@@ -9153,6 +9153,7 @@ pub mod _test_support {
     pub enum H3GrpcUploadFaultKind {
         ClientAbort,
         MalformedTrailers,
+        MalformedBody,
         Oversize,
         BackendUploadHalted,
         AuthorizationExpired,
@@ -9167,6 +9168,9 @@ pub mod _test_support {
             }
             H3GrpcUploadFaultKind::MalformedTrailers => {
                 crate::http3::server::H3GrpcUploadFault::MalformedTrailers
+            }
+            H3GrpcUploadFaultKind::MalformedBody => {
+                crate::http3::server::H3GrpcUploadFault::MalformedBody
             }
             H3GrpcUploadFaultKind::Oversize => crate::http3::server::H3GrpcUploadFault::Oversize,
             H3GrpcUploadFaultKind::BackendUploadHalted => {
@@ -9239,6 +9243,9 @@ pub mod _test_support {
             }
             Some(crate::http3::server::H3GrpcUploadFault::MalformedTrailers) => {
                 H3GrpcUploadFaultKind::MalformedTrailers
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedBody) => {
+                H3GrpcUploadFaultKind::MalformedBody
             }
             Some(crate::http3::server::H3GrpcUploadFault::Oversize) => {
                 H3GrpcUploadFaultKind::Oversize
