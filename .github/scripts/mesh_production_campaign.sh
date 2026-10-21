@@ -36,11 +36,27 @@ elif [ "$mode" = measure ]; then
         export BENCH_RATE="$rate"
         directory="results/$arm/$load/run_$repetition/payload_$payload"
         mkdir -p "$directory"
+        if [ -e "$directory/${physical}_http1_${payload}.json" ] || [ -e "$directory/${physical}_http1_${payload}.resources.json" ]; then
+            echo "[production] refusing to reuse an existing planned observation: $directory" >&2
+            exit 1
+        fi
+        classification_args=(classify --arm "$arm" --payload "$payload" --repetition "$repetition"
+            --load "$load" --duration "$duration" --rate "$rate")
+        if [ "${BENCH_PHASE:-smoke-l7}" = ranking ]; then classification_args+=(--measurement-only); fi
         echo "[production] arm=$arm physical=$physical payload=$payload repetition=$repetition load=$load rate=$rate"
         if timeout --signal=TERM --kill-after=10s "$((duration+420))s"             bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh "$physical"             --payload-sizes "$payload" --duration "$duration" --concurrency 100 --warmup 3             --output-dir "$directory" --skip-build 2>&1 | tee "$directory/run.log"; then
-            :
+            python3 .github/scripts/mesh_production_campaign.py "${classification_args[@]}" --runner-exit-code 0
         else
-            echo "[production] invalid cell; stopping with every planned outcome retained" >&2
+            pipeline_status=("${PIPESTATUS[@]}")
+            # Only an ordinary cell rc=1 can be retained as an observation.
+            # Timeouts/signals, failed log capture, auth/fixture failures and
+            # incomplete/resource-invalid reports still stop this campaign.
+            if [ "${BENCH_PHASE:-smoke-l7}" = ranking ] && [ "${pipeline_status[0]}" -eq 1 ] && [ "${pipeline_status[1]}" -eq 0 ] \
+                && python3 .github/scripts/mesh_production_campaign.py "${classification_args[@]}" --runner-exit-code 1; then
+                echo "[production] retained error-inclusive observation; zero-error capacity SLO remains failed" >&2
+                continue
+            fi
+            echo "[production] unqualified cell; stopping with every planned outcome retained" >&2
             exit 1
         fi
     done < results/production-plan.txt
