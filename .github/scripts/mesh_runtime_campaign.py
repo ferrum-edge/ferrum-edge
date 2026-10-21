@@ -39,15 +39,18 @@ def build(args):
     results.mkdir(parents=True, exist_ok=True)
     baseline = os.environ.get("BENCH_BASELINE_SHA", "")
     profile = os.environ.get("BENCH_CARGO_PROFILE", "release")
+    features = os.environ.get("BENCH_FERRUM_FEATURES", "cloud-secrets")
     if profile not in ("release", "ci-release"):
         raise ValueError("unsupported profile")
+    if features not in ("cloud-secrets", "cloud-secrets,bench-h1-profile"):
+        raise ValueError("unsupported features")
     if baseline and not re.fullmatch(r"[0-9a-f]{40}", baseline):
         raise ValueError("baseline must be an exact lowercase 40-hex commit SHA")
     subprocess.run(["bash", "tests/performance/mesh_runtime/run_mesh_runtime_bench.sh", "--build-only",
           "--output-dir", str(results / "images")], check=True)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     provenance = {"candidate_sha": revision, "baseline_sha": baseline or None,
-                  "profile": profile, "features": "cloud-secrets", "runner": os.environ.get("RUNNER_OS"),
+                  "profile": profile, "features": features, "runner": os.environ.get("RUNNER_OS"),
                   "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
                   "candidate_image_id": subprocess.check_output(["docker", "image", "inspect", "ferrum-edge:bench", "--format", "{{.Id}}"], text=True).strip(),
                   "tools_image_id": subprocess.check_output(["docker", "image", "inspect", "mesh-bench-tools:local", "--format", "{{.Id}}"], text=True).strip(),
@@ -62,7 +65,7 @@ def build(args):
         subprocess.run(["git", "worktree", "add", "--detach", str(source), baseline], check=True)
         try:
             with (results / "images" / "baseline-build.log").open("w") as log:
-                subprocess.run(["docker", "build", "--build-arg", f"CARGO_PROFILE={profile}",
+                subprocess.run(["docker", "build", "--build-arg", f"CARGO_PROFILE={profile}", "--build-arg", f"FEATURES={features}",
                       "-t", "ferrum-edge:baseline", "-f", str(source / "Dockerfile"), str(source)],
                      check=True, stdout=log, stderr=subprocess.STDOUT)
             provenance["baseline_image_id"] = subprocess.check_output(["docker", "image", "inspect", "ferrum-edge:baseline", "--format", "{{.Id}}"], text=True).strip()

@@ -8,16 +8,34 @@ scheduler delivery jitter. Warmup and post-deadline response drains are excluded
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 START = "MESH_BENCH_MEASUREMENT_START"
 END = "MESH_BENCH_MEASUREMENT_END"
+
+
+def allocation_snapshot(urls: list[str]) -> list[dict]:
+    # Reuse the existing observer-loss/schema/required-counter parser.
+    path = Path(__file__).resolve().parents[1] / "multi_protocol" / "alloc_per_request.py"
+    spec = importlib.util.spec_from_file_location("alloc_per_request", path)
+    parser = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(parser)
+    counters = []
+    for url in urls:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            record = parser.parse_metrics(response.read().decode())
+        if record["lost_events"] or record["missing_slots"] or record["schema"] != 1:
+            raise ValueError("incomplete allocation observer")
+        counters.append(record)
+    return counters
 
 
 def process_snapshot(pid: int, proc: Path = Path("/proc")) -> dict:
@@ -47,6 +65,10 @@ def run(args: argparse.Namespace) -> int:
               "rss_interval_seconds": 0.1,
               "interval": "loadgen common epoch, host receipt of stderr phase markers",
               "valid": False, "errors": []}
+    if args.allocation_url:
+        report["idle_alloc_begin"] = allocation_snapshot(args.allocation_url)
+        time.sleep(1)
+        report["idle_alloc_end"] = allocation_snapshot(args.allocation_url)
     begin = None
     finish = None
     samples: list[int] = []
@@ -54,7 +76,8 @@ def run(args: argparse.Namespace) -> int:
 
     def snapshot() -> dict:
         return {"monotonic": time.monotonic(), "host": host_snapshot(),
-                "processes": [process_snapshot(c["pid"]) for c in containers]}
+                "processes": [process_snapshot(c["pid"]) for c in containers],
+                "allocation_counters": allocation_snapshot(args.allocation_url) if args.allocation_url else []}
 
     def sample() -> None:
         while not stop.wait(0.1):
@@ -106,6 +129,7 @@ def run(args: argparse.Namespace) -> int:
                        "proxy_cpu_seconds": ticks / report["clock_ticks_per_second"],
                        "host_cpu_steal_percent": 100 * steal / total if total > 0 else None,
                        "proxy_rss_bytes_peak": max(samples, default=0),
+                       "proxy_rss_bytes_mean": sum(samples) / len(samples) if samples else 0,
                        "rss_samples": len(samples)})
         if elapsed <= 0 or total <= 0 or steal < 0 or ticks < 0:
             report["errors"].append("invalid counter interval")
@@ -117,6 +141,7 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--container", action="append", default=[])
+    parser.add_argument("--allocation-url", action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resources", type=Path, required=True)
     for name in ("image", "target", "host-header", "mesh", "duration", "concurrency", "warmup", "payload-size"):
