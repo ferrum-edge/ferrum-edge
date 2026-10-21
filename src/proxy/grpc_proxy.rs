@@ -275,6 +275,11 @@ pub enum GrpcBody {
         /// DATA bytes actually yielded to hyper for the H2 backend. Queued or
         /// cancellation-discarded frames are deliberately not counted.
         forwarded_bytes: Arc<AtomicU64>,
+        /// Set the moment this body hands the pump's frontend-failure error to
+        /// hyper, which resets the backend stream (issue #6772). It is the
+        /// typed evidence that the CLIENT's upload failure, not an independent
+        /// backend fault, ended the backend exchange. `None` when unobserved.
+        frontend_failure_relayed: Option<Arc<AtomicBool>>,
         /// Fired from `Drop` when this request body terminates — same contract
         /// as [`GrpcBody::Streaming::upload_observer`]. `None` for the H3
         /// bridge, which records the circuit-breaker outcome at response time.
@@ -446,6 +451,7 @@ impl http_body::Body for GrpcBody {
                 cancelled,
                 cancelled_terminal,
                 forwarded_bytes,
+                frontend_failure_relayed,
                 grpc_messages,
                 grpc_scanner,
                 ..
@@ -528,9 +534,14 @@ impl http_body::Body for GrpcBody {
                     // The pump task signals a frontend upload failure with `Err(())`
                     // so we RST the backend instead of sending a clean END_STREAM
                     // that the backend would mistake for a completed request.
-                    Poll::Ready(Some(Err(()))) => Poll::Ready(Some(Err(
-                        "gRPC request body upload failed (frontend stream error)".into(),
-                    ))),
+                    Poll::Ready(Some(Err(()))) => {
+                        if let Some(relayed) = frontend_failure_relayed {
+                            relayed.store(true, Ordering::Release);
+                        }
+                        Poll::Ready(Some(Err(
+                            "gRPC request body upload failed (frontend stream error)".into(),
+                        )))
+                    }
                     Poll::Ready(None) => Poll::Ready(None),
                     Poll::Pending => Poll::Pending,
                 }
@@ -3064,8 +3075,11 @@ pub(crate) fn http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
 }
 
 /// The non-standard `499 Client Closed Request` status the gateway records for
-/// a client that disconnected before the response.
-pub(crate) const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
+/// a client that disconnected before the response. Defined once in
+/// [`crate::proxy::client_abort`] (issue #6772); this path stays valid for
+/// every existing user.
+pub(crate) const CLIENT_CLOSED_REQUEST_STATUS: u16 =
+    crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;
 
 /// Map a gRPC status code to the closest HTTP status — the reverse of
 /// [`http_reject_status_to_grpc_status`]. Used to feed the adaptive-concurrency
@@ -5448,8 +5462,9 @@ pub async fn proxy_grpc_request_streaming(
 /// DATA via the same byte counting. `body_size_exceeded` is the shared overflow
 /// flag the channel body sets on limit breach so the caller can surface
 /// `RESOURCE_EXHAUSTED`; `body_cancelled` converts response-side shutdown into
-/// a backend request-body error, and `body_bytes_forwarded` counts only DATA
-/// frames yielded across that boundary.
+/// a backend request-body error, `body_bytes_forwarded` counts only DATA
+/// frames yielded across that boundary, and `body_frontend_failure_relayed` is
+/// set when the body hands a frontend upload failure to hyper.
 #[allow(clippy::too_many_arguments)]
 pub async fn proxy_grpc_request_streaming_channel(
     method: hyper::Method,
@@ -5463,6 +5478,7 @@ pub async fn proxy_grpc_request_streaming_channel(
     body_size_exceeded: Arc<AtomicBool>,
     body_cancelled: Arc<AtomicBool>,
     body_bytes_forwarded: Arc<AtomicU64>,
+    body_frontend_failure_relayed: Option<Arc<AtomicBool>>,
     upload_observer: Option<Arc<dyn GrpcUploadTerminationObserver>>,
     grpc_deadline_at: Option<tokio::time::Instant>,
     held_frontend_upload: &mut Option<GrpcBody>,
@@ -5486,6 +5502,7 @@ pub async fn proxy_grpc_request_streaming_channel(
         cancelled: body_cancelled,
         cancelled_terminal: false,
         forwarded_bytes: body_bytes_forwarded,
+        frontend_failure_relayed: body_frontend_failure_relayed,
         upload_observer,
         grpc_messages,
         grpc_scanner,

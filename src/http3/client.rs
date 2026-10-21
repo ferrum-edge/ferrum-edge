@@ -30,6 +30,7 @@ use tracing::debug;
 use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::pool::{GenericPool, PoolCreateCaller, PoolManager};
+use crate::proxy::client_abort::ProvenClientAbort;
 use crate::proxy::headers::{
     is_backend_request_strip_header, is_backend_response_strip_header,
     parse_connection_listed_headers, sanitize_backend_request_trailers,
@@ -1087,6 +1088,65 @@ pub struct H3PoolError {
     route_deadline: Option<crate::proxy::RouteDeadlineExpiry>,
     authorization_expiry: Option<crate::proxy::auth_lifetime::StreamAuthTermination>,
     client_deadline_expired: bool,
+    client_request_fault: Option<H3ClientRequestFault>,
+}
+
+/// Why reading the CLIENT's HTTP/3 request upload failed while the native-H3
+/// streaming dispatch was forwarding it (issue #6772).
+///
+/// Typed so the gateway terminal is keyed on the observed cause rather than on
+/// the error text: only [`Self::Abort`] carries the
+/// [`ProvenClientAbort`](crate::proxy::client_abort::ProvenClientAbort) that
+/// reaches the `499` / `CANCELLED` client-abort terminal. None of the variants
+/// is a backend fault, so all of them are neutral for backend health.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H3ClientRequestFault {
+    /// The client reset its request stream, or closed its connection.
+    Abort(ProvenClientAbort),
+    /// A request DATA read failed on a framing violation (`400`).
+    MalformedBody,
+    /// The trailer section could not be decoded, or a frame followed it (`400`).
+    MalformedTrailers,
+    /// The gateway ended the client's request stream or connection itself, or
+    /// the cause is not observable: the gateway-closed `503` / `UNAVAILABLE`
+    /// terminal, never a client abort.
+    GatewayTerminated,
+}
+
+/// The typed [`H3PoolError`] for a failed read of the client's own upload.
+///
+/// The cause is classified positively by
+/// [`crate::http3::stream_util::classify_h3_request_read_error`], the predicate
+/// the buffered drains use too (issue #6772). `malformed` names the malformed
+/// variant for the read that failed (DATA or the trailer section).
+fn h3_client_upload_read_error(
+    error: &h3::error::StreamError,
+    malformed: H3ClientRequestFault,
+) -> H3PoolError {
+    use crate::http3::stream_util::H3RequestReadFailure;
+    match crate::http3::stream_util::classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => H3PoolError::client_request(
+            H3ClientRequestFault::Abort(ProvenClientAbort::latched_upload_abort()),
+            anyhow::anyhow!("client disconnected while sending request body: {}", error),
+        ),
+        H3RequestReadFailure::Malformed => {
+            if malformed == H3ClientRequestFault::MalformedTrailers {
+                H3PoolError::client_request(
+                    malformed,
+                    anyhow::anyhow!("malformed client request trailers: {}", error),
+                )
+            } else {
+                H3PoolError::client_request(
+                    malformed,
+                    anyhow::anyhow!("malformed client request body: {}", error),
+                )
+            }
+        }
+        H3RequestReadFailure::GatewayTerminated => H3PoolError::client_request(
+            H3ClientRequestFault::GatewayTerminated,
+            anyhow::anyhow!("client request stream closed by the gateway: {}", error),
+        ),
+    }
 }
 
 impl H3PoolError {
@@ -1103,6 +1163,7 @@ impl H3PoolError {
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1119,6 +1180,7 @@ impl H3PoolError {
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1142,6 +1204,7 @@ impl H3PoolError {
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1169,6 +1232,7 @@ impl H3PoolError {
             route_deadline: None,
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1208,6 +1272,7 @@ impl H3PoolError {
             route_deadline: Some(expiry),
             authorization_expiry: None,
             client_deadline_expired: false,
+            client_request_fault: None,
         }
     }
 
@@ -1223,6 +1288,64 @@ impl H3PoolError {
 
     pub(crate) fn client_deadline_expired(&self) -> bool {
         self.client_deadline_expired
+    }
+
+    /// A post-wire failure reading the client's own request upload (issue
+    /// #6772). The backend stream is already open, so it is post-wire like any
+    /// other mid-upload failure; the typed fault decides the gateway terminal.
+    pub(crate) fn client_request(
+        fault: H3ClientRequestFault,
+        error: impl Into<anyhow::Error>,
+    ) -> Self {
+        let mut error = Self::post_wire(error);
+        error.client_request_fault = Some(fault);
+        error
+    }
+
+    /// [`Self::client_request`] for a client fault observed while the dispatch
+    /// may not have handed the request to the backend yet: `request_on_wire`
+    /// is whether the backend stream had opened.
+    pub(crate) fn client_request_at_handoff(
+        fault: H3ClientRequestFault,
+        error: impl Into<anyhow::Error>,
+        request_on_wire: bool,
+    ) -> Self {
+        let mut error = Self::client_request(fault, error);
+        error.request_on_wire = request_on_wire;
+        error
+    }
+
+    /// The client-upload fault that ended this request, when one did.
+    pub(crate) fn client_request_fault(&self) -> Option<H3ClientRequestFault> {
+        self.client_request_fault
+    }
+
+    /// Settle a gateway-terminated upload read against the client's
+    /// connection (issue #6772): when the client closed that connection, the
+    /// fault is its abort. A read on a connection the client closed can fail
+    /// as an unclassified closed stream rather than as the connection error,
+    /// so the connection's own close reason is the proof. Every other error,
+    /// and a connection the gateway closed or that timed out, is unchanged.
+    pub(crate) fn with_peer_closed_upload(
+        mut self,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        if self.client_request_fault == Some(H3ClientRequestFault::GatewayTerminated)
+            && let Some(abort) = ProvenClientAbort::from_peer_connection(peer)
+        {
+            self.client_request_fault = Some(H3ClientRequestFault::Abort(abort));
+        }
+        self
+    }
+
+    /// The proven client abort that ended this request, when one did. Only
+    /// this, never the error class or text, selects the `499` / `CANCELLED`
+    /// client-abort terminal.
+    pub(crate) fn proven_client_abort(&self) -> Option<ProvenClientAbort> {
+        match self.client_request_fault {
+            Some(H3ClientRequestFault::Abort(abort)) => Some(abort),
+            _ => None,
+        }
     }
 
     pub(crate) fn authorization_expiry(
@@ -3616,13 +3739,16 @@ impl Http3ConnectionPool {
                 Ok(frontend_stream.recv_data().await)
             })
             .await?;
+            // Only a read failure the client caused (a reset or a lost
+            // connection) is a client abort; anything else is input the gateway
+            // refused (issue #6772), exactly as the buffered drains decide.
             let chunk_opt = match recv_res {
                 Ok(c) => c,
                 Err(e) => {
-                    return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                        "client disconnected while sending request body: {}",
-                        e
-                    )));
+                    return Err(h3_client_upload_read_error(
+                        &e,
+                        H3ClientRequestFault::MalformedBody,
+                    ));
                 }
             };
             let Some(mut chunk) = chunk_opt else { break };
@@ -3695,17 +3821,11 @@ impl Http3ConnectionPool {
                 }
             }
             Ok(_) => {}
-            Err(e) if crate::http3::stream_util::h3_request_read_error_is_client_abort(&e) => {
-                return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                    "client disconnected while sending request body: {}",
-                    e
-                )));
-            }
             Err(e) => {
-                return Err(H3PoolError::post_wire(anyhow::anyhow!(
-                    "malformed client request trailers: {}",
-                    e
-                )));
+                return Err(h3_client_upload_read_error(
+                    &e,
+                    H3ClientRequestFault::MalformedTrailers,
+                ));
             }
         }
         await_h3_write_under_authorization(

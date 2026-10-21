@@ -39,6 +39,7 @@ pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod backend_send_queue;
 pub mod body;
+pub mod client_abort;
 pub mod client_abort_scope;
 pub mod client_ip;
 pub mod datagram_client_address;
@@ -31472,7 +31473,7 @@ async fn finalize_terminal_request_body_read_rejection(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &normalized);
-    if status.as_u16() == 499 {
+    if status.as_u16() == client_abort::CLIENT_CLOSED_REQUEST_STATUS {
         log_client_disconnect_rejection_with_path(
             plugins,
             ctx,
@@ -31755,7 +31756,8 @@ fn boxed_finalize_authorization_expired_rejection<'a>(
 
 /// Fixed `grpc-message` for a client that reset or dropped its buffered gRPC
 /// upload. Compiled in: it echoes nothing from the client's transport error.
-const GRPC_CLIENT_DISCONNECT_MESSAGE: &str = "Client disconnected";
+/// The one definition lives in [`client_abort`] (issue #6772).
+const GRPC_CLIENT_DISCONNECT_MESSAGE: &str = client_abort::CLIENT_ABORT_MESSAGE;
 
 /// Transaction-log `rejection_phase` for a buffered native-gRPC / gRPC-Web
 /// upload the client reset or dropped before dispatch (issue #6022).
@@ -35766,7 +35768,7 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_authenticate",
                             plugin_execution_ns,
@@ -35774,10 +35776,11 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         ctx.terminal_record.mark_counted();
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
@@ -35986,7 +35989,7 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_authorize",
                             plugin_execution_ns,
@@ -35994,10 +35997,11 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         ctx.terminal_record.mark_counted();
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
@@ -36254,7 +36258,7 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_before_proxy",
                             plugin_execution_ns,
@@ -36262,10 +36266,11 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         ctx.terminal_record.mark_counted();
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
@@ -37280,8 +37285,9 @@ async fn handle_proxy_request_inner(
                             &state,
                             &plugins,
                             &mut ctx,
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            br#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY.as_bytes(),
                             HashMap::new(),
                             is_grpc_request,
                             start_time,
@@ -37757,7 +37763,7 @@ async fn handle_proxy_request_inner(
                         boxed_log_client_disconnect_rejection_with_path(
                             &plugins,
                             &ctx,
-                            499,
+                            client_abort::CLIENT_CLOSED_REQUEST_STATUS,
                             start_time,
                             "client_disconnect_upload_before_dispatch",
                             plugin_execution_ns,
@@ -37765,10 +37771,11 @@ async fn handle_proxy_request_inner(
                         )
                         .await;
                         ctx.terminal_record.mark_counted();
-                        record_request(&state, 499);
+                        record_request(&state, client_abort::CLIENT_CLOSED_REQUEST_STATUS);
                         return Ok(build_response(
-                            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
-                            r#"{"error":"Client disconnected"}"#,
+                            StatusCode::from_u16(client_abort::CLIENT_CLOSED_REQUEST_STATUS)
+                                .unwrap_or(StatusCode::BAD_REQUEST),
+                            client_abort::CLIENT_ABORT_HTTP_BODY,
                         ));
                     }
                     Err(RequestBodyBufferError::BufferCapacityExceeded) => {
@@ -54854,9 +54861,10 @@ fn upload_authorization_ended(auth: Option<&RequestAuthLifetimePlan>) -> bool {
 
 /// Fixed client-visible body for a client upload the frontend codec rejected
 /// as malformed before the backend response head (issue #6776).
-const MALFORMED_REQUEST_BODY_JSON: &[u8] = br#"{"error":"Malformed request body"}"#;
+/// Shared with the HTTP/3 paths through [`client_abort`] (issue #6772).
+const MALFORMED_REQUEST_BODY_JSON: &[u8] = client_abort::MALFORMED_UPLOAD_HTTP_BODY.as_bytes();
 /// Fixed `grpc-message` for the same refusal on a gRPC-flavored request.
-const MALFORMED_REQUEST_BODY_GRPC_MESSAGE: &str = "Malformed request body";
+const MALFORMED_REQUEST_BODY_GRPC_MESSAGE: &str = client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE;
 
 /// Trailers-only gRPC refusal for a gRPC-flavored client whose upload failed
 /// before the backend response head (issue #6776): `grpc-status: 1`
@@ -54945,17 +54953,21 @@ pub(crate) fn pre_header_upload_termination_response(
                 error_kind = retry::error_class_log_kind(retry::ErrorClass::ClientDisconnect),
                 "Client abandoned its request upload before backend response headers"
             );
+            // The shared pre-header client-abort terminal (issue #6772): the
+            // typed upload terminal is the evidence.
+            let terminal =
+                client_abort::ProvenClientAbort::latched_upload_abort().pre_header_terminal();
             if is_grpc_flavored {
                 mesh_grpc_client_upload_failure_response(
                     resolved_ip,
-                    grpc_proxy::grpc_status::CANCELLED,
-                    GRPC_CLIENT_DISCONNECT_MESSAGE,
+                    terminal.grpc_status,
+                    terminal.grpc_message,
                 )
             } else {
                 client_upload_failure_response(
                     resolved_ip,
-                    grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS,
-                    br#"{"error":"Client disconnected"}"#,
+                    terminal.http_status,
+                    client_abort::CLIENT_ABORT_HTTP_BODY.as_bytes(),
                 )
             }
         }

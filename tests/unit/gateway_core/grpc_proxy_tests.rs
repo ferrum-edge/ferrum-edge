@@ -2103,6 +2103,7 @@ fn grpc_channel_body(max_bytes: usize) -> GrpcChannelBodyFixture {
         cancelled: std::sync::Arc::clone(&cancelled),
         cancelled_terminal: false,
         forwarded_bytes: std::sync::Arc::clone(&forwarded),
+        frontend_failure_relayed: None,
         upload_observer: None,
         grpc_messages: None,
         grpc_scanner: None,
@@ -2211,6 +2212,47 @@ async fn grpc_channel_body_propagates_frontend_error_as_body_error() {
         "a transport-level abort is not a size violation"
     );
     assert_eq!(forwarded.load(Ordering::Relaxed), 7);
+}
+
+/// Issue #6772: the channel body marks a frontend failure as RELAYED only when
+/// it actually hands that failure to hyper (which resets the backend stream).
+/// The H3→gRPC bridge selects its frontend terminal on this evidence, never on
+/// the pump's own flag alone, so a backend failure that happened on its own is
+/// never relabelled as a client cancellation.
+#[tokio::test]
+async fn grpc_channel_body_marks_a_frontend_failure_relayed_only_when_handed_on() {
+    use http_body_util::BodyExt;
+    use std::sync::atomic::Ordering;
+
+    let relayed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, mut body, _exceeded, _cancelled, _forwarded) = grpc_channel_body(0);
+    if let grpc_proxy::GrpcBody::Channel {
+        frontend_failure_relayed,
+        ..
+    } = &mut body
+    {
+        *frontend_failure_relayed = Some(std::sync::Arc::clone(&relayed));
+    }
+    tx.send(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+        b"partial",
+    ))))
+    .await
+    .unwrap();
+    let first = body.frame().await.expect("frame").expect("DATA");
+    assert!(first.is_data());
+    assert!(
+        !relayed.load(Ordering::Acquire),
+        "forwarded DATA is not a relayed failure"
+    );
+    tx.send(Err(())).await.unwrap();
+    assert!(
+        body.frame().await.expect("terminal").is_err(),
+        "the frontend failure surfaces as a body error"
+    );
+    assert!(
+        relayed.load(Ordering::Acquire),
+        "handing the failure to hyper is the relay evidence"
+    );
 }
 
 #[tokio::test]

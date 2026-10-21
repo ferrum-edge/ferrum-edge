@@ -3143,8 +3143,9 @@ fn h3_stamps_a_connection_close_watch_so_injected_delays_cannot_outlive_the_peer
         "the watch must observe QUIC connection close"
     );
     assert!(
-        watch_body.contains("self.connection.close_reason().is_some()"),
-        "the watch must offer a non-blocking already-closed check"
+        watch_body.contains("self.observe_close().is_some()")
+            && watch_body.contains("self.connection\n                .close_reason()"),
+        "the watch must offer a non-blocking already-closed check over the latched close"
     );
     // Ownership guard: the watch must never touch the request stream. Reading
     // or polling it from a detached watcher would race the proxy path for
@@ -3249,11 +3250,11 @@ fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close(
         .next()
         .expect("bounded dispatch_plain");
     assert!(
-        dispatch.contains("crate::http3::stream_util::peer_response_cancelled(stream)"),
+        dispatch.contains("crate::http3::stream_util::peer_response_cancelled("),
         "the prebuffered/no-body header wait must watch per-stream STOP_SENDING"
     );
     assert!(
-        dispatch.matches("peer_response_cancelled(stream)").count() >= 2,
+        dispatch.matches("peer_response_cancelled(").count() >= 2,
         "both prebuffered and streaming-upload header waits must watch per-stream STOP_SENDING"
     );
     assert!(
@@ -3353,20 +3354,35 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         .next()
         .expect("bounded peer_response_cancelled");
     assert!(
-        watch.contains("impl Future<Output = ()> + Send + 'static"),
-        "peer_response_cancelled must return a statically dispatched 'static future: {watch}"
+        watch.contains("impl Future<Output = ()> + Send + 'a")
+            && watch.contains("F: Future<Output = bool> + Send + 'static,"),
+        "peer_response_cancelled must take the already-built 'static stopped future and \
+         return a statically dispatched future that never borrows the stream: {watch}"
     );
     assert!(
         !watch.contains("Box::pin") && !watch.contains("Pin<Box") && !watch.contains("dyn Future"),
         "peer_response_cancelled must not box a trait-object future: {watch}"
     );
     assert!(
-        watch.contains("Ok(Some(_)) | Err(_) => {}"),
-        "STOP_SENDING and connection loss must complete the cancel watch: {watch}"
+        watch.contains("if stopped.await {")
+            && watch.contains("stop_sending.store(true, std::sync::atomic::Ordering::Release);"),
+        "the cancel watch must record a typed STOP_SENDING (issue #6772): {watch}"
+    );
+    let stopped = util
+        .split("pub(crate) fn peer_response_stopped<")
+        .nth(1)
+        .expect("peer_response_stopped must exist")
+        .split("pub(crate) fn peer_response_cancelled<")
+        .next()
+        .expect("bounded peer_response_stopped");
+    assert!(stopped.contains("impl Future<Output = bool> + Send + 'static"));
+    assert!(
+        stopped.contains("Ok(Some(_)) => true,") && stopped.contains("Err(_) => false,"),
+        "STOP_SENDING and connection loss must complete the watch, typed apart: {stopped}"
     );
     assert!(
-        watch.contains("Ok(None) => std::future::pending::<()>().await"),
-        "a local finish acknowledgement must not be treated as cancellation: {watch}"
+        stopped.contains("Ok(None) => std::future::pending::<bool>().await"),
+        "a local finish acknowledgement must not be treated as cancellation: {stopped}"
     );
 }
 
@@ -4260,8 +4276,21 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         "undecodable trailing metadata is INVALID_ARGUMENT, not a server outage"
     );
     assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::MalformedBody),
+        Some((3, "Malformed request body")),
+        "a request DATA read the gateway refused is INVALID_ARGUMENT, not a client abort"
+    );
+    // Issue #6772: a client that reset or lost its upload cancelled the RPC; it
+    // is never reported as a service outage (UNAVAILABLE / 14).
+    assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::ClientAbort),
-        Some((14, "Service unavailable")),
+        Some((1, "Client disconnected")),
+    );
+    // A stream the gateway ended itself is never laundered into a client
+    // cancellation: it is the gateway's own UNAVAILABLE.
+    assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::GatewayTerminated),
+        Some((14, "Request stream closed by the gateway")),
     );
     assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::AuthorizationExpired),
@@ -4272,6 +4301,8 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
     for terminating in [
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
+        H3GrpcUploadFaultKind::MalformedBody,
+        H3GrpcUploadFaultKind::GatewayTerminated,
         H3GrpcUploadFaultKind::Oversize,
         H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {

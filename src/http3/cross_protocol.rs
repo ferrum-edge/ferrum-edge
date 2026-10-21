@@ -106,7 +106,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -128,6 +128,7 @@ use crate::plugins::{
 use crate::proxy::LoadBalancerConnectionGuard;
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end;
+use crate::proxy::client_abort::ProvenClientAbort;
 use crate::proxy::grpc_proxy::{
     self, GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
@@ -148,7 +149,7 @@ use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
 
 use super::server::{H3RetainedUpload, publish_h3_retained_body};
-use super::stream_util::h3_request_read_error_is_client_abort;
+use super::stream_util::{H3RequestReadFailure, classify_h3_request_read_error};
 
 /// Outcome reported back to the H3 listener so it can update request
 /// counters, build the `TransactionSummary` for log plugins, and record
@@ -536,6 +537,92 @@ struct PlainPeerGoneBeforeResponseHeadersCtx<'a> {
     bytes_sent: u64,
     current_url: &'a str,
     response_streamed: bool,
+    /// Who ended the request (issue #6772).
+    cause: PlainPeerGone,
+}
+
+/// Why a plain-bridge request ended before any backend response head (issue
+/// #6772), from positive evidence only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlainPeerGone {
+    /// The client reset its upload, sent `STOP_SENDING`, or closed its
+    /// connection.
+    ClientAbort(ProvenClientAbort),
+    /// The upload reader failed on an HTTP/3 framing violation.
+    Malformed,
+    /// The gateway ended the stream or connection itself, or the cause is not
+    /// observable.
+    GatewayClosed,
+}
+
+/// The plain bridge reader's record of why its read failed: one of these codes,
+/// stored once beside `reader_reset_flag`.
+const PLAIN_READER_OK: u8 = 0;
+const PLAIN_READER_CLIENT_ABORT: u8 = 1;
+const PLAIN_READER_MALFORMED: u8 = 2;
+const PLAIN_READER_GATEWAY_TERMINATED: u8 = 3;
+
+fn plain_reader_failure_code(error: &h3::error::StreamError) -> u8 {
+    match classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => PLAIN_READER_CLIENT_ABORT,
+        H3RequestReadFailure::Malformed => PLAIN_READER_MALFORMED,
+        H3RequestReadFailure::GatewayTerminated => PLAIN_READER_GATEWAY_TERMINATED,
+    }
+}
+
+impl PlainPeerGone {
+    /// The cause when the response-cancellation or connection-close watcher
+    /// ended the wait. `stop_sending` is the watcher's own typed record of a
+    /// peer `STOP_SENDING`; otherwise a closed connection is the client's only
+    /// when the client closed it.
+    fn from_watcher(
+        stop_sending: bool,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        match ProvenClientAbort::from_response_cancellation(stop_sending, peer) {
+            Some(abort) => Self::ClientAbort(abort),
+            None => Self::GatewayClosed,
+        }
+    }
+
+    /// The cause for the streamed-upload arm: the reader's own classified read
+    /// failure when it recorded one, the watchers' evidence otherwise.
+    fn from_reader(
+        code: u8,
+        stop_sending: bool,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        match code {
+            PLAIN_READER_CLIENT_ABORT => {
+                Self::ClientAbort(ProvenClientAbort::latched_upload_abort())
+            }
+            PLAIN_READER_MALFORMED => Self::Malformed,
+            // A read on a connection the client closed can fail as an
+            // unclassified closed stream rather than as the connection error;
+            // the connection's own close reason still proves the abort.
+            PLAIN_READER_GATEWAY_TERMINATED => {
+                match ProvenClientAbort::from_peer_connection(peer) {
+                    Some(abort) => Self::ClientAbort(abort),
+                    None => Self::GatewayClosed,
+                }
+            }
+            _ => Self::from_watcher(stop_sending, peer),
+        }
+    }
+
+    /// End the response direction without writing to it: a departed client's
+    /// with `H3_REQUEST_CANCELLED`, anything else as an error.
+    fn reset_response<S>(self, stream: &mut RequestStream<S, Bytes>)
+    where
+        S: SendStream<Bytes>,
+    {
+        match self {
+            Self::ClientAbort(_) => stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED),
+            Self::Malformed | Self::GatewayClosed => {
+                crate::http3::stream_util::abort_response_stream(stream)
+            }
+        }
+    }
 }
 
 /// Arguments for the ONE pre-header backend-timeout terminal on the plain
@@ -642,9 +729,31 @@ where
     Ok(outcome)
 }
 
+/// The plain bridge's terminal for a request that ended before any backend
+/// response head because its client stream ended (issue #6772).
+///
+/// A proven client abort (STOP_SENDING on the response, a connection the client
+/// closed, or a client reset seen by the upload reader) takes the shared
+/// pre-header client-abort terminal: `499` in the log and request metrics, the
+/// `ClientDisconnect` error class, `client_disconnected`, and nothing written to
+/// the departed client. A framing violation the reader saw is a `400`, and a
+/// stream the gateway ended itself is the gateway-closed `503`; neither is a
+/// client disconnect. Backend health and admission stay neutral every way: the
+/// backend did not end the exchange.
 fn plain_peer_gone_before_response_headers(
     ctx: PlainPeerGoneBeforeResponseHeadersCtx<'_>,
 ) -> CrossProtocolOutcome {
+    let client_abort = match ctx.cause {
+        PlainPeerGone::ClientAbort(abort) => Some(abort.pre_header_terminal()),
+        PlainPeerGone::Malformed | PlainPeerGone::GatewayClosed => None,
+    };
+    let status = match ctx.cause {
+        PlainPeerGone::ClientAbort(abort) => abort.pre_header_terminal().http_status,
+        PlainPeerGone::Malformed => StatusCode::BAD_REQUEST.as_u16(),
+        PlainPeerGone::GatewayClosed => {
+            crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL.http_status
+        }
+    };
     record_cross_protocol_header_write_disconnect(
         ctx.state,
         ctx.proxy,
@@ -652,21 +761,32 @@ fn plain_peer_gone_before_response_headers(
         ctx.upstream_balancer,
         ctx.current_target,
         ctx.cb_target_key,
-        0,
-        0,
+        status,
+        status,
         ctx.cb_probe,
         ctx.backend_start,
         ctx.backend_admission_permits,
         ctx.backend_admission_elapsed,
     );
-    cross_protocol_header_write_disconnect_outcome(
-        0,
+    let mut outcome = cross_protocol_header_write_disconnect_outcome(
+        status,
         ctx.response_streamed,
         ctx.bytes_sent,
         ctx.backend_start,
         Some(strip_query_from_backend_url(ctx.current_url)),
         None,
-    )
+    );
+    match client_abort {
+        Some(terminal) => {
+            outcome.error_class = Some(terminal.error_class);
+            outcome.client_disconnected = terminal.client_disconnected;
+        }
+        None => {
+            outcome.client_disconnected = false;
+            outcome.body_error_class = None;
+        }
+    }
+    outcome
 }
 
 fn cross_protocol_header_write_disconnect_outcome(
@@ -3615,9 +3735,12 @@ where
             }
             Err(super::server::H3RequestBodyReadError::Read(error)) => {
                 cb_probe.release_neutral();
-                if error.is_client_disconnect() {
+                if let Some(abort) =
+                    error.proven_client_abort_with_peer(ctx.peer_connection.as_ref())
+                {
                     return Box::pin(write_bridge_upload_client_disconnect(
                         stream,
+                        abort,
                         HttpFlavor::Plain,
                         plugins,
                         ctx,
@@ -3627,11 +3750,19 @@ where
                     ))
                     .await;
                 }
+                if error.failure() == H3RequestReadFailure::GatewayTerminated {
+                    return Ok(bridge_upload_gateway_closed_outcome(
+                        stream,
+                        ctx,
+                        false,
+                        backend_start,
+                    ));
+                }
                 return write_plain_gateway_error(
                     stream,
                     ctx,
                     StatusCode::BAD_REQUEST,
-                    r#"{"error":"Malformed request body"}"#,
+                    crate::proxy::client_abort::MALFORMED_UPLOAD_HTTP_BODY,
                     None,
                     backend_start,
                     0,
@@ -4268,6 +4399,9 @@ where
                     );
                     let plain_upload_deadline = plain_write_bound.deadline();
                     let plain_peer_signal = ctx.peer_connection.as_ref();
+                    // Set by the response-cancellation watcher when a peer
+                    // `STOP_SENDING` ended the wait (issue #6772).
+                    let plain_stop_sending = AtomicBool::new(false);
                     let mut plain_attempt_builder = plain_request_builder.body(plain_upload_body);
                     // Every way this attempt can end, classified before anything
                     // acts on it, so it is recorded at ONE point below (issue
@@ -4285,7 +4419,10 @@ where
                         // the eventual response.
                         let header_bound = loop {
                             let stream_cancelled =
-                                crate::http3::stream_util::peer_response_cancelled(stream);
+                                crate::http3::stream_util::peer_response_cancelled(
+                                    crate::http3::stream_util::peer_response_stopped(stream),
+                                    &plain_stop_sending,
+                                );
                             let attempt = crate::plugins::await_deadline_first(
                                 plain_header_deadline_at,
                                 await_h3_backend_or_peer(
@@ -4517,6 +4654,13 @@ where
                         PlainAttemptEnd::PeerGone => {
                             drop(attempt_end);
                             crate::http3::stream_util::halt_request_body(stream);
+                            // Only the watchers can end this wait; nothing is
+                            // written, the response direction is reset.
+                            let cause = PlainPeerGone::from_watcher(
+                                plain_stop_sending.load(Ordering::Acquire),
+                                ctx.peer_connection.as_ref(),
+                            );
+                            cause.reset_response(stream);
                             return Ok(plain_peer_gone_before_response_headers(
                                 PlainPeerGoneBeforeResponseHeadersCtx {
                                     state,
@@ -4532,6 +4676,7 @@ where
                                     bytes_sent,
                                     current_url: &current_url,
                                     response_streamed: false,
+                                    cause,
                                 },
                             ));
                         }
@@ -5165,8 +5310,20 @@ where
                 // Capture STOP_SENDING before the reader borrows the stream.
                 // The future is `'static` and does not hold `&mut` on either
                 // half, so the upload pump can keep polling recv_data.
-                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(stream);
+                // Set by the response-cancellation watcher when a peer
+                // `STOP_SENDING` ended the wait (issue #6772).
+                let response_stop_sending = AtomicBool::new(false);
+                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(
+                    crate::http3::stream_util::peer_response_stopped(stream),
+                    &response_stop_sending,
+                );
                 let reader_reset_flag = Arc::clone(&reader_peer_reset);
+                // Set by the reader beside `reader_reset_flag` with the
+                // classified cause of its failed read, so the terminal can tell
+                // a client abort (`499`) from malformed input (`400`) and the
+                // gateway's own close (`503`, issue #6772). A borrowed local:
+                // the reader runs on this task.
+                let reader_upload_failure = AtomicU8::new(PLAIN_READER_OK);
                 // gRPC request-message accounting for the streamed upload, read
                 // in its own framing: a pass-through gRPC-Web upload counts its
                 // decoded message frames, never its trailer frame or its
@@ -5297,13 +5454,19 @@ where
                                             }
                                             end = stream.recv_trailers() => end,
                                         };
+                                        if let Err(error) = &end {
+                                            reader_upload_failure.store(
+                                                plain_reader_failure_code(error),
+                                                Ordering::Release,
+                                            );
+                                        }
                                         if end.is_err() {
                                             reader_reset_flag.store(true, Ordering::Release);
                                         }
                                         finish_reader();
                                         return;
                                     }
-                                    Err(_e) => {
+                                    Err(error) => {
                                         // Request-stream reset/termination while
                                         // headers are still outstanding is
                                         // downstream cancellation, not a
@@ -5311,6 +5474,12 @@ where
                                         // makes the body stream end with an
                                         // error, so the backend upload is
                                         // aborted rather than cleanly ended.
+                                        // The cause is classified positively
+                                        // (issue #6772).
+                                        reader_upload_failure.store(
+                                            plain_reader_failure_code(&error),
+                                            Ordering::Release,
+                                        );
                                         reader_reset_flag.store(true, Ordering::Release);
                                         finish_reader();
                                         return;
@@ -5701,6 +5870,14 @@ where
                     }
                     PlainAttemptEnd::PeerGone => {
                         drop(attempt_end);
+                        let cause = PlainPeerGone::from_reader(
+                            reader_upload_failure.load(Ordering::Acquire),
+                            response_stop_sending.load(Ordering::Acquire),
+                            ctx.peer_connection.as_ref(),
+                        );
+                        // Nothing is written either way: the response direction
+                        // is reset, never finished.
+                        cause.reset_response(stream);
                         return Ok(plain_peer_gone_before_response_headers(
                             PlainPeerGoneBeforeResponseHeadersCtx {
                                 state,
@@ -5716,6 +5893,7 @@ where
                                 bytes_sent,
                                 current_url: &current_url,
                                 response_streamed: true,
+                                cause,
                             },
                         ));
                     }
@@ -7336,10 +7514,12 @@ async fn handle_h3_grpc_streaming_response<S>(
     bytes_sent: u64,
     backend_target_url: &str,
     final_backend_resolved_ip: Option<String>,
-    // Set by the streaming-request pump when the H3 client resets its upload; used
-    // to classify a resulting response-body error as a CLIENT abort rather than a
-    // backend fault (codex P2). `None` on the buffered-request path (no pump).
-    frontend_upload_failed: Option<&Arc<AtomicBool>>,
+    // The streaming-request pump's upload evidence: a frontend failure the
+    // channel body relayed to hyper classifies a resulting response-body error as
+    // the frontend's terminal rather than a backend fault (codex P2), and a
+    // proven client abort records `CANCELLED` (issue #6772). `None` on the
+    // buffered-request path (no pump).
+    frontend_upload: Option<GrpcBridgeUploadSignals<'_>>,
     // Config-time response-trailer governance. Native gRPC terminal metadata on
     // this bridge crosses the response-header policy boundary exactly like a
     // plain streaming relay's trailer section (GHSA-r78v-rc86-6r86); only the
@@ -7735,6 +7915,9 @@ where
     // authorization exit inside it records through the REQUEST's shared latch
     // rather than the bare counter.
     let auth_latch = ctx.authorization_termination_latch();
+    // Typed evidence that the gateway's own reset ended the backend body (issue
+    // #6772); read with the relayed upload fault below.
+    let body_error_local_reset = AtomicBool::new(false);
     let (
         mut bytes_streamed,
         body_completed,
@@ -7759,6 +7942,7 @@ where
             // and never recomputed from relay activity.
             auth_deadline: auth_deadline_plan,
             auth_latch: &auth_latch,
+            body_error_local_reset: &body_error_local_reset,
         },
     )
     .await;
@@ -8070,12 +8254,41 @@ where
         }
     }
 
-    // A client upload reset (recv-half error) makes the pump set
-    // `frontend_upload_failed`; the backend then sees an RST and the response body
-    // surfaces a hyper error here. That is a CLIENT abort, not a backend fault — so
-    // classify it as ClientDisconnect (neutral for backend health / adaptive
-    // concurrency) rather than the protocol/timeout class hyper reports (codex P2).
-    let frontend_aborted = frontend_upload_failed.is_some_and(|flag| flag.load(Ordering::Acquire));
+    // A client upload failure (recv-half error) the channel body relayed resets
+    // the backend stream, and the response body then surfaces a hyper error here.
+    // That is the frontend's terminal, not a backend fault — so classify it as
+    // ClientDisconnect (neutral for backend health / adaptive concurrency) rather
+    // than the protocol/timeout class hyper reports (codex P2).
+    // The relay latch counts only together with the typed local-reset
+    // evidence: a backend reset that beat hyper's own reset stays the
+    // backend's failure.
+    let relayed_upload_fault = if body_error_local_reset.load(Ordering::Relaxed) {
+        grpc_bridge_upload_fault_with_peer(
+            frontend_upload.map_or(
+                GRPC_BRIDGE_UPLOAD_OK,
+                GrpcBridgeUploadSignals::relayed_fault,
+            ),
+            ctx.peer_connection.as_ref(),
+        )
+    } else {
+        GRPC_BRIDGE_UPLOAD_OK
+    };
+    let frontend_aborted = relayed_upload_fault != GRPC_BRIDGE_UPLOAD_OK;
+    // Response headers are committed, so HTTP 200 stands; a PROVEN client abort
+    // that ended the response body records `CANCELLED` and `client_disconnected`
+    // (issue #6772). The relay already reset the response when the body failed,
+    // so no further terminal frame can be written. Gateway-selected terminals
+    // (an oversized upload, an authorization expiry, the client deadline) keep
+    // their own status.
+    let client_cancelled = relayed_upload_fault == GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+        && body_error_class.is_some()
+        && !final_body_completed
+        && !request_overflowed_late
+        && auth_termination.is_none()
+        && !client_deadline_expired;
+    if client_cancelled {
+        final_client_disconnected = true;
+    }
     let outcome_error_class = if request_overflowed_late {
         Some(ErrorClass::RequestBodyTooLarge)
     } else if client_deadline_expired || (frontend_aborted && body_error_class.is_some()) {
@@ -8127,6 +8340,10 @@ where
         grpc_proxy::grpc_status::UNAUTHENTICATED
     } else if client_deadline_expired {
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED
+    } else if client_cancelled {
+        ProvenClientAbort::latched_upload_abort()
+            .pre_header_terminal()
+            .grpc_status
     } else {
         grpc_trailer_status
             .or(client_header_grpc_status)
@@ -8375,9 +8592,10 @@ where
                     "cross-protocol H3→gRPC: request body read failed"
                 );
                 cb_probe.release_neutral();
-                if e.is_client_disconnect() {
+                if let Some(abort) = e.proven_client_abort_with_peer(ctx.peer_connection.as_ref()) {
                     return Box::pin(write_bridge_upload_client_disconnect(
                         stream,
+                        abort,
                         HttpFlavor::Grpc,
                         plugins,
                         ctx,
@@ -8386,6 +8604,14 @@ where
                         backend_start,
                     ))
                     .await;
+                }
+                if e.failure() == H3RequestReadFailure::GatewayTerminated {
+                    return Ok(bridge_upload_gateway_closed_outcome(
+                        stream,
+                        ctx,
+                        true,
+                        backend_start,
+                    ));
                 }
                 return write_grpc_error_for_request(
                     stream,
@@ -10082,6 +10308,89 @@ pub(crate) fn boxed_dispatch_grpc_streaming<'a>(
     })
 }
 
+/// The H3→gRPC bridge pump's ONE published upload fault (issue #6772): a
+/// single atomic, so a reader can never pair one cause with another's failure.
+/// Each failed read is classified positively by
+/// `stream_util::classify_h3_request_read_error`.
+const GRPC_BRIDGE_UPLOAD_OK: u8 = 0;
+const GRPC_BRIDGE_UPLOAD_CLIENT_ABORT: u8 = 1;
+const GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS: u8 = 2;
+const GRPC_BRIDGE_UPLOAD_MALFORMED_BODY: u8 = 3;
+const GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED: u8 = 4;
+
+/// The bridge upload fault code for a failed read of the client's upload.
+/// `trailers` is whether the read was the trailer section's.
+fn grpc_bridge_upload_fault(error: &h3::error::StreamError, trailers: bool) -> u8 {
+    match classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => GRPC_BRIDGE_UPLOAD_CLIENT_ABORT,
+        H3RequestReadFailure::Malformed if trailers => GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS,
+        H3RequestReadFailure::Malformed => GRPC_BRIDGE_UPLOAD_MALFORMED_BODY,
+        H3RequestReadFailure::GatewayTerminated => GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED,
+    }
+}
+
+/// Settle a published bridge upload fault against the client's connection: a
+/// gateway-terminated read on a connection the client closed is its abort,
+/// because such a read can fail as an unclassified closed stream rather than
+/// as the connection error (issue #6772). Every other code is unchanged.
+fn grpc_bridge_upload_fault_with_peer(
+    fault: u8,
+    peer: Option<&crate::plugins::PeerConnectionSignal>,
+) -> u8 {
+    if fault == GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED
+        && ProvenClientAbort::from_peer_connection(peer).is_some()
+    {
+        GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+    } else {
+        fault
+    }
+}
+
+/// Whether a backend error chain ends in the gateway's OWN HTTP/2 stream reset
+/// (issue #6772): an `h2` reset that the backend did not send (`is_remote`) and
+/// that h2 did not raise for a backend protocol violation (`is_library`). That
+/// is the reset hyper issues when the channel body hands it the client's
+/// upload failure. Whichever side reset the stream first owns it: a backend
+/// reset that arrived first stays remote, so it, a connection failure, and an
+/// I/O failure all return `false` and stay backend failures. Typed only, and
+/// allocation-free.
+fn error_chain_is_local_h2_reset(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(node) = current {
+        if let Some(h2_err) = node.downcast_ref::<h2::Error>() {
+            return h2_err.is_reset() && !h2_err.is_remote() && !h2_err.is_library();
+        }
+        current = node.source();
+    }
+    false
+}
+
+/// The streaming bridge's frontend upload evidence, read together.
+#[derive(Clone, Copy)]
+struct GrpcBridgeUploadSignals<'a> {
+    /// The pump's published fault code.
+    fault: &'a AtomicU8,
+    /// Set by `GrpcBody::Channel` when it handed the pump's failure to hyper.
+    relayed: &'a AtomicBool,
+}
+
+impl GrpcBridgeUploadSignals<'_> {
+    /// The upload fault that ENDED the backend exchange, or
+    /// `GRPC_BRIDGE_UPLOAD_OK`. A fault counts only once the channel body
+    /// relayed it to hyper (which resets the backend stream): that acquire is
+    /// the publication flag, and the pump stored the fault before it sent the
+    /// failure, so the cause read after it is the one that was relayed. A
+    /// failure the body never relayed cannot have ended the exchange, so an
+    /// independently selected backend failure keeps its own classification.
+    fn relayed_fault(self) -> u8 {
+        if self.relayed.load(Ordering::Acquire) {
+            self.fault.load(Ordering::Acquire)
+        } else {
+            GRPC_BRIDGE_UPLOAD_OK
+        }
+    }
+}
+
 /// HTTP/3 → non-H3 gRPC backend with a STREAMING request body.
 ///
 /// The streaming-safe counterpart to [`dispatch_grpc`] (which buffers the H3
@@ -10259,13 +10568,18 @@ pub(crate) async fn dispatch_grpc_streaming(
     // merely read from H3 but still queued when cancellation wins never reached
     // the backend request and must not inflate TransactionSummary.bytes_sent.
     let request_bytes_forwarded = Arc::new(AtomicU64::new(0));
-    // Set by the pump when the H3 recv half errors (the client reset its upload).
-    // The resulting backend RST must be recorded as a CLIENT abort, not a backend
-    // fault (codex P2) — read in the dispatch Err arm below.
-    let frontend_upload_failed = Arc::new(AtomicBool::new(false));
-    let pump_frontend_failed = Arc::clone(&frontend_upload_failed);
-    let frontend_upload_malformed = Arc::new(AtomicBool::new(false));
-    let pump_frontend_malformed = Arc::clone(&frontend_upload_malformed);
+    // Set by the pump when the H3 recv half errors, with the classified cause
+    // (issue #6772), BEFORE it hands the failure to the channel body. The body
+    // sets `frontend_failure_relayed` when it passes that failure to hyper, so a
+    // resulting backend RST is recorded as the frontend's terminal, not a backend
+    // fault (codex P2) — read together in the dispatch Err arm below.
+    let frontend_upload_fault = Arc::new(AtomicU8::new(GRPC_BRIDGE_UPLOAD_OK));
+    let pump_frontend_fault = Arc::clone(&frontend_upload_fault);
+    let frontend_failure_relayed = Arc::new(AtomicBool::new(false));
+    let upload_signals = GrpcBridgeUploadSignals {
+        fault: &frontend_upload_fault,
+        relayed: &frontend_failure_relayed,
+    };
     // The pump sets this when response-side completion/cancellation stops it
     // before downstream request EOF. `GrpcBody::Channel` checks it before
     // queued DATA so the backend upload is reset, never cleanly truncated.
@@ -10357,10 +10671,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                                     }
                                     Ok(_) => {}
                                     Err(e) => {
-                                        if !h3_request_read_error_is_client_abort(&e) {
-                                            pump_frontend_malformed.store(true, Ordering::Release);
-                                        }
-                                        pump_frontend_failed.store(true, Ordering::Release);
+                                        pump_frontend_fault.store(
+                                            grpc_bridge_upload_fault(&e, true),
+                                            Ordering::Release,
+                                        );
                                         tokio::select! {
                                             biased;
                                             _ = pump_shutdown_signal.notified() => {
@@ -10372,13 +10686,17 @@ pub(crate) async fn dispatch_grpc_streaming(
                                 }
                                 break;
                             }
-                            Err(_e) => {
+                            Err(e) => {
                                 // Frontend upload failure: flag it (so the dispatch Err
                                 // arm records a client abort, not a backend fault) and
                                 // best-effort signal the channel body to RST the backend
                                 // instead of sending a clean END_STREAM. The send stays
                                 // cancellable for the same reason as the data send above.
-                                pump_frontend_failed.store(true, Ordering::Release);
+                                // The cause is classified positively (issue #6772).
+                                pump_frontend_fault.store(
+                                    grpc_bridge_upload_fault(&e, false),
+                                    Ordering::Release,
+                                );
                                 tokio::select! {
                                     biased;
                                     _ = pump_shutdown_signal.notified() => {
@@ -10437,6 +10755,14 @@ pub(crate) async fn dispatch_grpc_streaming(
     let mut held_frontend_grpc_upload = None;
     // The single attempt's `otel_tracing` CLIENT span (issue #5867).
     let attempt_span = ctx.begin_backend_attempt_span(backend_url, &merge_proxy_headers);
+    // The client's response direction is watched until the response head
+    // (issue #6772): after a clean upload FIN the pump has nothing left to
+    // observe, so a `STOP_SENDING`, or a connection the client closed, while the
+    // backend withholds its head is seen here and recorded with its typed
+    // provenance, never left to surface as a backend timeout. A settled attempt
+    // (including every deadline inside it) keeps precedence.
+    let response_stopped = crate::http3::stream_util::peer_response_stopped(&send_half);
+    let mut response_cancel: Option<bool> = None;
     let mut result = {
         let attempt = grpc_proxy::proxy_grpc_request_streaming_channel(
             hyper_method,
@@ -10450,6 +10776,7 @@ pub(crate) async fn dispatch_grpc_streaming(
             Arc::clone(&body_size_exceeded),
             Arc::clone(&backend_upload_cancelled),
             Arc::clone(&request_bytes_forwarded),
+            Some(Arc::clone(&frontend_failure_relayed)),
             None,
             ctx.grpc_deadline_at(),
             &mut held_frontend_grpc_upload,
@@ -10457,7 +10784,20 @@ pub(crate) async fn dispatch_grpc_streaming(
             grpc_auth.as_ref(),
         );
         tokio::pin!(attempt);
-        attempt_span.scope(attempt).await
+        let scoped = attempt_span.scope(attempt);
+        tokio::pin!(scoped);
+        tokio::pin!(response_stopped);
+        tokio::select! {
+            biased;
+            result = &mut scoped => result,
+            peer_stop_sending = &mut response_stopped => {
+                response_cancel = Some(peer_stop_sending);
+                Err(grpc_proxy::GrpcProxyError::backend_unavailable(
+                    grpc_proxy::GrpcBackendUnavailableKind::DispatchCanceled,
+                    "client response direction ended before the response head".to_string(),
+                ))
+            }
+        }
     };
     // A stall the matched rule's per-attempt budget (`backendRequest`) cut is
     // the backend's, exactly as on the H1/H2 gRPC path (#5646).
@@ -10526,7 +10866,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 bytes_sent,
                 backend_url,
                 final_backend_resolved_ip.clone(),
-                Some(&frontend_upload_failed),
+                Some(upload_signals),
                 response_trailer_governance,
             )
             .await
@@ -10574,12 +10914,68 @@ pub(crate) async fn dispatch_grpc_streaming(
         }
         Err(err) => {
             let bytes_sent = request_bytes_forwarded.load(Ordering::Relaxed);
-            let malformed_upload = frontend_upload_malformed.load(Ordering::Acquire);
+            // Only an upload failure the channel body RELAYED to hyper ended this
+            // backend exchange (issue #6772); a backend failure that happened on
+            // its own keeps its own classification even if the client also went
+            // away. Deadline and authorization terminals keep their accounting.
+            let gateway_terminal = matches!(
+                &err,
+                grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_)
+                    | grpc_proxy::GrpcProxyError::BackendTimeout { .. }
+                    | grpc_proxy::GrpcProxyError::AuthorizationExpired { .. }
+            );
+            // The relay latch alone does not prove the relay ended the exchange:
+            // a backend reset can win before hyper's own reset, which h2 then
+            // drops. So a relayed upload fault counts only when the returned
+            // error is the gateway's own local reset as well.
+            let upload_fault = if let Some(peer_stop_sending) = response_cancel {
+                // The response-direction watcher above ended the dispatch.
+                if ProvenClientAbort::from_response_cancellation(
+                    peer_stop_sending,
+                    ctx.peer_connection.as_ref(),
+                )
+                .is_some()
+                {
+                    GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+                } else {
+                    GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED
+                }
+            } else if gateway_terminal || !error_chain_is_local_h2_reset(&err) {
+                GRPC_BRIDGE_UPLOAD_OK
+            } else {
+                upload_signals.relayed_fault()
+            };
+            let upload_fault =
+                grpc_bridge_upload_fault_with_peer(upload_fault, ctx.peer_connection.as_ref());
+            let malformed_upload = matches!(
+                upload_fault,
+                GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS | GRPC_BRIDGE_UPLOAD_MALFORMED_BODY
+            );
+            let gateway_closed = upload_fault == GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED;
+            // A client that reset or lost its upload before any response header
+            // takes the shared client-abort terminal: `CANCELLED`, never the
+            // `UNAVAILABLE` its backend reset would map to.
+            let client_abort = if upload_fault == GRPC_BRIDGE_UPLOAD_CLIENT_ABORT {
+                Some(ProvenClientAbort::latched_upload_abort().pre_header_terminal())
+            } else {
+                None
+            };
+            let frontend_aborted = client_abort.is_some() || gateway_closed;
+            let upload_terminal_selected = upload_fault != GRPC_BRIDGE_UPLOAD_OK;
             let (grpc_status_code, grpc_message): (u32, &str) = if malformed_upload {
                 (
                     grpc_proxy::grpc_status::INVALID_ARGUMENT,
-                    "Malformed request trailers",
+                    if upload_fault == GRPC_BRIDGE_UPLOAD_MALFORMED_BODY {
+                        crate::proxy::client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE
+                    } else {
+                        "Malformed request trailers"
+                    },
                 )
+            } else if let Some(terminal) = client_abort {
+                (terminal.grpc_status, terminal.grpc_message)
+            } else if gateway_closed {
+                let terminal = crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL;
+                (terminal.grpc_status, terminal.grpc_message)
             } else {
                 match &err {
                     grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_) => (
@@ -10623,9 +11019,10 @@ pub(crate) async fn dispatch_grpc_streaming(
             // concurrency (both neutralized by `client_side_no_backend_signal`):
             //   * `ResourceExhausted` — the gateway rejected an oversized client
             //     upload (the channel body tripped `max_grpc_recv_size_bytes`).
-            //   * a frontend upload abort — the H3 recv half errored, so the pump
-            //     set `frontend_upload_failed` and RST the backend; the resulting
-            //     `BackendUnavailable` is a consequence of the client reset.
+            //   * a frontend upload abort or gateway-closed stream — the H3 recv
+            //     half errored, the pump published the fault, and the channel
+            //     body relayed it and RST the backend; the resulting
+            //     `BackendUnavailable` is a consequence of that reset.
             //   * malformed request trailers — the H3 decoder refused the
             //     trailing block and the channel body RST the backend upload.
             // All three mirror the buffered H3 path, which releases the probe without
@@ -10633,8 +11030,6 @@ pub(crate) async fn dispatch_grpc_streaming(
             // wire-boundary derivation so a real backend failure still trains the
             // limiter.
             let request_overflow = matches!(&err, grpc_proxy::GrpcProxyError::ResourceExhausted(_));
-            let frontend_aborted =
-                !malformed_upload && frontend_upload_failed.load(Ordering::Acquire);
             let client_deadline =
                 matches!(&err, grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_));
             let error_class = if request_overflow {
@@ -10662,6 +11057,21 @@ pub(crate) async fn dispatch_grpc_streaming(
                 connection_error,
                 "cross-protocol H3→gRPC streaming backend call failed"
             );
+            // A frontend terminal is recorded under its own status, never an
+            // upstream `502`; its `ClientDisconnect` class keeps it neutral.
+            // Every other failure keeps the shared bridge health mapping.
+            let (health_status, health_class) = if let Some(terminal) = client_abort {
+                (terminal.http_status, error_class)
+            } else if gateway_closed {
+                (
+                    crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL.http_status,
+                    error_class,
+                )
+            } else if malformed_upload {
+                (StatusCode::BAD_REQUEST.as_u16(), error_class)
+            } else {
+                (health_status, health_class)
+            };
             record_backend_outcome_no_conn_end(
                 state,
                 proxy,
@@ -10683,6 +11093,13 @@ pub(crate) async fn dispatch_grpc_streaming(
                 Some(health_class),
                 backend_admission_start.elapsed(),
             );
+            if upload_terminal_selected {
+                crate::proxy::insert_grpc_error_metadata(
+                    &mut ctx.metadata,
+                    grpc_status_code,
+                    grpc_message,
+                );
+            }
             // Drop the held upload only after the Trailers-Only error is queued
             // on the H3 send half (#2057).
             let grpc_error_write = if let grpc_proxy::GrpcProxyError::AuthorizationExpired {
@@ -10700,20 +11117,51 @@ pub(crate) async fn dispatch_grpc_streaming(
                 )
                 .await
             } else {
-                write_grpc_error_send_with_policy(
+                let write = write_grpc_error_send_with_policy(
                     &mut send_half,
                     grpc_status_code,
                     grpc_message,
                     backend_start,
                     bytes_sent,
                     initial_response_header_policy_plugins,
-                )
-                .await
-                .map(|mut outcome| {
+                );
+                // A frontend-selected terminal (`CANCELLED`, `INVALID_ARGUMENT`,
+                // or the gateway-closed `UNAVAILABLE`) is best effort: a stream
+                // that is already gone cannot take it, and a client that keeps
+                // its response direction open without QUIC credit must not hold
+                // it, so the write takes the shared terminal-write grace. Either
+                // way the request reaches the transaction log once rather than
+                // surface as a request-task error.
+                let write = if upload_terminal_selected {
+                    crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("frontend terminal write did not complete"))
+                } else {
+                    write.await
+                };
+                let write = match write {
+                    Err(_) if upload_terminal_selected => {
+                        crate::http3::stream_util::abort_response_stream(&mut send_half);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            bytes_sent,
+                            client_abort.is_some(),
+                        ))
+                    }
+                    write => write,
+                };
+                write.map(|mut outcome| {
                     outcome.backend_target = Some(strip_query_from_backend_url(backend_url));
                     outcome.connection_error = connection_error;
                     outcome.error_class = Some(error_class);
                     outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
+                    if let Some(terminal) = client_abort {
+                        outcome.client_disconnected = terminal.client_disconnected;
+                    } else if gateway_closed {
+                        outcome.client_disconnected = false;
+                    }
                     outcome
                 })
             };
@@ -11525,6 +11973,11 @@ struct StreamHyperIncomingOpts<'a> {
     /// exit inside the relay records through it, so the idle arm, the
     /// blocked-write seam, and the terminal FIN cannot double count one stream.
     auth_latch: &'a crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    /// Set when the backend body failed with the gateway's OWN HTTP/2 reset
+    /// (see [`error_chain_is_local_h2_reset`]), the typed evidence that a
+    /// relayed client upload failure, not the backend, ended the body (issue
+    /// #6772).
+    body_error_local_reset: &'a AtomicBool,
 }
 
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
@@ -11561,6 +12014,7 @@ where
         grpc_response_messages,
         auth_deadline,
         auth_latch,
+        body_error_local_reset,
     } = opts;
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
@@ -11878,6 +12332,9 @@ where
                     }
                     Some(Err(e)) => {
                         body_error_class = Some(classify_hyper_error(&e));
+                        if error_chain_is_local_h2_reset(&e) {
+                            body_error_local_reset.store(true, Ordering::Relaxed);
+                        }
                         coalesce_buf.clear();
                         crate::http3::stream_util::abort_response_stream(stream);
                         break 'outer;
@@ -12912,6 +13369,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn write_bridge_upload_client_disconnect<S>(
     stream: &mut RequestStream<S, Bytes>,
+    abort: ProvenClientAbort,
     flavor: HttpFlavor,
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -12926,15 +13384,14 @@ where
         crate::plugins::RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY.to_string(),
         "true".to_string(),
     );
+    // The shared pre-header client-abort terminal (issue #6772).
+    let terminal = abort.pre_header_terminal();
     let mut headers = HashMap::new();
     if matches!(flavor, HttpFlavor::Grpc) || crate::plugins::grpc_web::client_uses_grpc_web(ctx) {
-        headers.insert(
-            "grpc-status".to_string(),
-            grpc_proxy::grpc_status::CANCELLED.to_string(),
-        );
+        headers.insert("grpc-status".to_string(), terminal.grpc_status.to_string());
         headers.insert(
             "grpc-message".to_string(),
-            "Client disconnected".to_string(),
+            terminal.grpc_message.to_string(),
         );
     }
     let mut outcome = write_final_body_reject(
@@ -12943,8 +13400,8 @@ where
         plugins,
         ctx,
         PluginResult::Reject {
-            status_code: 499,
-            body: r#"{"error":"Client disconnected"}"#.to_string(),
+            status_code: terminal.http_status,
+            body: crate::proxy::client_abort::CLIENT_ABORT_HTTP_BODY.to_string(),
             headers,
         },
         response_committed_plugins,
@@ -12956,12 +13413,41 @@ where
         FinalRejectHooks::UploadClientDisconnect,
     )
     .await?;
-    outcome.client_disconnected = true;
-    outcome.error_class = Some(ErrorClass::ClientDisconnect);
-    outcome.body_error_class = Some(ErrorClass::ClientDisconnect);
+    outcome.client_disconnected = terminal.client_disconnected;
+    outcome.error_class = Some(terminal.error_class);
+    outcome.body_error_class = Some(terminal.error_class);
     outcome.body_completed = false;
     outcome.rejection_logged = true;
     Ok(outcome)
+}
+
+/// Settle a buffered bridge upload whose stream the GATEWAY ended (issue
+/// #6772): not a client abort and not malformed input. The stream is reset and
+/// nothing is written; the request is logged as the gateway-closed terminal
+/// (`503`, or `UNAVAILABLE` under HTTP `200` for gRPC) and is not a client
+/// disconnect.
+fn bridge_upload_gateway_closed_outcome<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    grpc: bool,
+    backend_start: Instant,
+) -> CrossProtocolOutcome
+where
+    S: SendStream<Bytes>,
+{
+    let terminal = crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL;
+    crate::http3::stream_util::abort_response_stream(stream);
+    let status = if grpc {
+        crate::proxy::insert_grpc_error_metadata(
+            &mut ctx.metadata,
+            terminal.grpc_status,
+            terminal.grpc_message,
+        );
+        StatusCode::OK.as_u16()
+    } else {
+        terminal.http_status
+    };
+    terminal_deadline_write_aborted_outcome(status, 0, backend_start, 0, false)
 }
 
 /// How [`write_final_body_reject`] runs the reject-path hooks over its terminal.
@@ -13195,6 +13681,20 @@ where
             return result;
         }
         write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
+    } else if hooks == FinalRejectHooks::UploadClientDisconnect {
+        // Plain HTTP (issue #6772): `499` is log vocabulary, never written. The
+        // cleanup hooks and the cancellation log already ran above; the
+        // departed client's response is reset with `H3_REQUEST_CANCELLED` and
+        // the request direction halted, never answered.
+        stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+        crate::http3::stream_util::halt_request_body(stream);
+        Ok(terminal_deadline_write_aborted_outcome(
+            normalized.http_status.as_u16(),
+            0,
+            backend_start,
+            bytes_sent,
+            true,
+        ))
     } else if terminal_gateway_deadline {
         let write = write_reject_with_headers_and_recv_halt(
             stream,

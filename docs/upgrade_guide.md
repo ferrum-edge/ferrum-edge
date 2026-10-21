@@ -753,6 +753,37 @@ live reload. When stream and HTTP port declarations overlap, HTTP policy
 wins. Other stream ports, CONNECT-UDP and Ambient/Waypoint behavior retain
 their separate admission rules.
 
+### Client aborts record `499` / `CANCELLED` on every path (#6772)
+
+A client that resets its request stream, sends `STOP_SENDING`, or closes its
+connection before response headers now gets one terminal on every
+HTTP-family path. It is logged and counted as `499` with
+`error_class: client_disconnect` and `client_disconnected: true`, and native
+gRPC records `CANCELLED`. Before this change, the streamed HTTP/3 paths
+recorded these aborts differently. The native HTTP/3 backend path wrote and
+counted a gateway `502`. Native HTTP/3 gRPC and the HTTP/3-to-gRPC bridge
+answered `UNAVAILABLE`. The plain HTTP/3-to-HTTP bridge logged status `0`.
+The aborted client is no longer sent a `502`: its HTTP/3 response is reset
+with `H3_REQUEST_CANCELLED`, and gRPC clients still on the response direction
+receive `CANCELLED` trailers. Backend health stays neutral.
+
+Alerts and dashboards keyed on `5xx`, on gRPC `UNAVAILABLE`, or on status `0`
+see fewer of these requests, and those keyed on `499` or `CANCELLED` see
+more. Only proven client actions count. A stream or connection the gateway
+closed itself (a shutdown, its own graceful or error close, or its own
+idle-timeout expiry) is logged as the
+gateway's `503` / `UNAVAILABLE` and is not a client disconnect. This applies
+to the buffered HTTP/3 drains too, under the new rejection phase
+`gateway_closed_h3_upload`. An HTTP/3 framing violation (an undecodable
+trailer section, a frame after it, or a frame error) is `400` /
+`INVALID_ARGUMENT`. The plain bridge previously recorded it as a client
+disconnect, and the gRPC paths as `UNAVAILABLE`. A client that cancels a native
+HTTP/3 request while the backend withholds its response head is now a client
+abort, not a backend timeout. The buffered plain and mesh bridges no longer
+write a `499` response to a departed client; they reset the response.
+Deadlines, authorization-lifetime terminals, and backend failures keep their
+status.
+
 ### Upload completion and error accounting (#6022)
 
 Sending trailers no longer proves that a request stream ended. H2/H3
@@ -772,7 +803,10 @@ health, breakers or H3 capability. Alerts can see more `5xx`/`UNAVAILABLE`
 and fewer of the previous `400`/`INVALID_ARGUMENT` responses. Undecodable
 trailers or illegal frames after trailers are recorded as client disconnects
 on the plain streamed bridge; a buffered H3 drain can instead raise an H3
-connection error and close the whole connection.
+connection error and close the whole connection. #6772 (above) replaces the
+streamed-path accounting in this paragraph with the shared `499` /
+`CANCELLED` client-abort terminal and `400` / `INVALID_ARGUMENT` for
+malformed uploads.
 
 Early H1/H2 prebuffers, terminal-body drains and buffered H3/gRPC bridges
 finalize cancelled uploads exactly once, run cleanup/committed hooks, and

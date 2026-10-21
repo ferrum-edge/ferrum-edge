@@ -342,11 +342,53 @@ committed is never rewritten to `499` (RFC 9112 §8).
 Upload cancellations use dedicated `client_disconnect_*` rejection phases,
 including `client_disconnect_buffered_grpc_upload`,
 `client_disconnect_buffered_h3_upload`, and
-`client_disconnect_buffered_h3_bridge_upload`. The buffered native-gRPC collect
-and H3 gRPC bridge report `CANCELLED`; plain HTTP records 499. These events are neutral to backend health
-and never cause a retry. H3 framing/header violations remain malformed-input
-errors (`invalid_h3_upload` on native drains), and an operator body-read timeout
-keeps its timeout classification.
+`client_disconnect_buffered_h3_bridge_upload`. These events are neutral to
+backend health and never cause a retry. H3 framing/header violations remain
+malformed-input errors (`invalid_h3_upload` on native drains), and an operator
+body-read timeout keeps its timeout classification.
+
+### Client-abort terminal
+
+A proven client-origin abort before response headers are committed has one
+terminal on every HTTP-family path, buffered or streamed (issue #6772). A
+proven abort is a request-stream reset with any code, `STOP_SENDING` on the
+response, or a connection the client closed (a close it sent, or a stateless
+reset). An idle-timeout expiry fires locally even while the client is still
+reachable, so it is the gateway-closed terminal, not a client abort. The gateway's own close, including a
+graceful `H3_NO_ERROR` close or Quinn's `LocallyClosed`, is never one. A
+client close is proven by the connection's own close reason too: Quinn can
+report a read on a connection the client closed as a bare closed stream, so a
+read failure the gateway cannot attribute is settled against that close reason
+before the gateway-closed terminal is recorded. A close the client sent, with
+any application code (`0x0` or `H3_NO_ERROR` included), is an abort. The
+terminal is defined once in
+[`src/proxy/client_abort.rs`](../src/proxy/client_abort.rs):
+
+| Field | Value |
+|---|---|
+| `response_status_code` and request metrics | `499`, nginx's "client closed request". This is log vocabulary: the departed client is never sent a `499`. |
+| Native gRPC outcome | `CANCELLED` (1) in `metadata.grpc_status`, under HTTP `200`. Never `UNAVAILABLE` (14). |
+| `error_class` | `client_disconnect` |
+| `client_disconnected` | `true`, counted once in `client_disconnects` and `ferrum_client_disconnects_total` |
+| Backend health | neutral: `ClientDisconnect` is a `client_side_no_backend_signal` class |
+
+The terminal comes from the typed `ProvenClientAbort` evidence, never from
+`ErrorClass::ClientDisconnect` alone. That class also marks health-neutral
+terminals the gateway chose while the client may still be connected: a client
+RPC deadline or stalled upload (`504` / `DEADLINE_EXCEEDED`), an expired
+authorization lifetime (`401` / `UNAUTHENTICATED`), and a malformed upload
+(`400` / `INVALID_ARGUMENT`). Each keeps its own status. A stream or connection
+the gateway ended itself is the gateway-closed terminal: `503` / `UNAVAILABLE`,
+`client_disconnected` unset, neutral for backend health, rejection phase
+`gateway_closed_h3_upload` on the buffered native drains. A backend failure stays
+`502` / `UNAVAILABLE` (`504` / `DEADLINE_EXCEEDED` for a backend timeout).
+
+After response headers are committed, the committed status stands and a client
+abort only sets `client_disconnected` and leaves the body incomplete. A gRPC
+status is committed with the trailers, so a native gRPC RPC whose client aborts
+its upload mid-response still ends `CANCELLED`. See
+[request lifetime → client-abort terminal convention](request_lifetime_dispatch.md#client-abort-terminal-convention)
+for the per-path behavior.
 
 ### `StreamTransactionSummary` (TCP / UDP / DTLS)
 

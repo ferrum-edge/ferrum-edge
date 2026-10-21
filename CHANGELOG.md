@@ -28,6 +28,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **Client aborts record one terminal on every HTTP/3 and gRPC path**
+  (issue #6772). A client that resets its request stream, sends
+  `STOP_SENDING`, or closes its connection before response headers is now
+  logged and counted as `499` with `client_disconnect` and
+  `client_disconnected`, and native gRPC records `CANCELLED`. Before, the
+  native HTTP/3 backend path wrote and counted a gateway `502`, native
+  HTTP/3 gRPC and the HTTP/3-to-gRPC bridge answered `UNAVAILABLE`, and the
+  plain HTTP/3-to-HTTP bridge logged status `0`. The `499` is keyed on typed
+  client-abort evidence, never on the `ClientDisconnect` class, so deadline
+  and authorization-lifetime terminals keep their status. A stream the
+  gateway closed itself is its own `503` / `UNAVAILABLE`. An HTTP/3 framing
+  violation is `400` / `INVALID_ARGUMENT`. Neither is a client disconnect.
+  Backend health stays neutral, and a backend failure that coincides with a
+  client abort keeps its own classification. An idle-timeout expiry is the
+  gateway's own close, never a client abort. The 499 / `CANCELLED` status,
+  body, and message are defined once in `proxy::client_abort` and shared with
+  the #6776 dispatcher terminal below. See the upgrade guide.
 - **An H1/H2 client that cancels before the response head leaves one
   terminal record** (issue #6768). hyper drops the pending handler on an
   HTTP/2 `RST_STREAM` or an HTTP/1.1 connection close, which used to skip

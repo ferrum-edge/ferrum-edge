@@ -2009,6 +2009,15 @@ pub trait PeerConnectionWatch: Send + Sync {
 
     /// Non-blocking check for an already-closed transport.
     fn is_closed(&self) -> bool;
+
+    /// Whether an already-closed transport was ended by the client (a close it
+    /// sent, or a stateless reset) rather than by the gateway. An idle-timeout
+    /// expiry is local and never counts.
+    /// Only this proves a client abort (issue #6772); the default, for a
+    /// transport that cannot tell, is `false`.
+    fn closed_by_peer(&self) -> bool {
+        false
+    }
 }
 
 /// Cloneable handle to a [`PeerConnectionWatch`].
@@ -2028,6 +2037,11 @@ impl PeerConnectionSignal {
     /// See [`PeerConnectionWatch::is_closed`].
     pub fn is_closed(&self) -> bool {
         self.0.is_closed()
+    }
+
+    /// See [`PeerConnectionWatch::closed_by_peer`].
+    pub fn closed_by_peer(&self) -> bool {
+        self.0.closed_by_peer()
     }
 }
 

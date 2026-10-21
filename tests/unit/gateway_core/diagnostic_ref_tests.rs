@@ -1145,6 +1145,7 @@ fn rejection_detail_carries_only_bounded_labels() {
         "client_disconnect_buffered_h3_bridge_upload",
         "authorization_expired_buffered_grpc_upload",
         "invalid_h3_upload",
+        "gateway_closed_h3_upload",
     ] {
         let rejection = DiagnosticRejection::new(phase, None, 499);
         assert_eq!(rejection.phase, phase);
