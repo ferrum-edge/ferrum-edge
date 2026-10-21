@@ -470,9 +470,5 @@ pub(crate) async fn handle_config_export(
         .header("Cache-Control", "no-store")
         .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+        .unwrap_or_else(|_| super::admin_builder_failure_response())
 }

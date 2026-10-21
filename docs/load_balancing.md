@@ -712,7 +712,7 @@ The header is omitted on 2xx/3xx/4xx.
 
 | Value | Meaning |
 |-------|---------|
-| `connection_failure` | TCP connection refused, DNS resolution failure, TLS handshake error, or connect timeout — the gateway could not reach the backend at all |
+| `connection_failure` | TCP connection refused, DNS resolution failure, TLS handshake error (`502`), connect timeout (`504`), or a pooled-transport (direct H2, native H3, HBONE, sidecar mTLS) DestinationRule `maxConnections` refusal before dialing (`503`) — the gateway could not reach the backend at all |
 | `backend_timeout` | The backend dispatch attempt did not produce an answer before its deadline (504 Gateway Timeout). The attempt counts as dispatched once the gateway begins the send, which can include TCP/TLS connection setup, so this does not prove the backend accepted the connection or received the request |
 | `backend_error` | The backend returned a 5xx error response (500, 502, 503, etc.) |
 | `circuit_breaker_open` | The circuit breaker is open; the gateway returned 503 without contacting a backend |

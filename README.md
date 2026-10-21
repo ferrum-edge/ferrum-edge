@@ -544,8 +544,9 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | `Database connection failed` | Verify `FERRUM_DB_TYPE` and `FERRUM_DB_URL` |
 | `401 on Admin API` | Check JWT is signed with `FERRUM_ADMIN_JWT_SECRET` |
 | `404 on proxy request` | Verify request path matches a configured `listen_path` |
-| `502 Bad Gateway` | Backend unreachable — check `X-Gateway-Error` header for details |
-| `504 Gateway Timeout` | Increase `backend_read_timeout_ms` |
+| `502 Bad Gateway` | Backend unreachable or returned an invalid response — check `X-Gateway-Error` header for details |
+| `503 Service Unavailable` | Gateway-side capacity refusal (overload, open circuit breaker, DestinationRule `maxConnections`) — check `X-Gateway-Error` |
+| `504 Gateway Timeout` | Backend did not answer in time: `X-Gateway-Error: backend_timeout` → raise `backend_read_timeout_ms`; `connection_failure` → the connect timed out (`backend_connect_timeout_ms`) |
 | `429 Too Many Requests` | Rate limit exceeded — check plugin config |
 | DP not receiving config | Verify `FERRUM_CP_DP_GRPC_JWT_SECRET` matches on both CP and DP |
 
