@@ -431,8 +431,9 @@ fn deliver(
 ///
 /// Explicit stream-level evidence wins: the HTTP/2 peer's own `RST_STREAM` or
 /// `GOAWAY` is a client cancellation even while the gateway is closing the
-/// connection (a sibling's authorization close, shutdown), and a reset the
-/// local HTTP/2 stack sent is a protocol rejection. Only an otherwise
+/// connection (a sibling's authorization close, shutdown), a reset the local
+/// HTTP/2 stack sent is a protocol rejection, and a dispatcher's proof that the
+/// client abandoned its upload (issue #6776) is a client cancellation. Only an otherwise
 /// ambiguous loss — a lost HTTP/2 transport, an HTTP/2 drop with no published
 /// cause, or an HTTP/1.1 dispatcher dropping an in-flight request — is
 /// attributed to a gateway-initiated close when one is in progress:
@@ -455,6 +456,11 @@ fn termination_cause(
             return TerminationCause::LocalProtocolReset;
         }
         _ => {}
+    }
+    // A mesh, HBONE, or Unix-socket dispatcher already proved the client
+    // abandoned its upload (issue #6776): that is the client's cancellation.
+    if ctx.proven_client_upload_abort() {
+        return TerminationCause::PeerCancelled;
     }
     if ctx
         .client_trust_session

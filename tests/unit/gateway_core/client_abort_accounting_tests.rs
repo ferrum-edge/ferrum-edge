@@ -30,6 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use ferrum_edge::_test_support::CLIENT_CLOSED_REQUEST_STATUS;
 use ferrum_edge::config::types::{GatewayConfig, Proxy};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::{
@@ -40,7 +41,6 @@ use ferrum_edge::proxy::client_abort_scope::{
     CLIENT_ABORT_REJECTION_PHASE, ClientAbortScope, GATEWAY_CLOSED_REQUEST_STATUS,
     PROTOCOL_RESET_REJECTION_PHASE, PROTOCOL_RESET_REQUEST_STATUS, TerminationCause,
 };
-use ferrum_edge::proxy::grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS;
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
 use ferrum_edge::retry::ErrorClass;
 
@@ -377,6 +377,45 @@ async fn h1_close_during_websocket_upgrade_handshake_records_one_client_abort() 
 
     gateway.settled_single_terminal("websocket handshake").await;
     assert_eq!(gateway.status_count(CLIENT_CLOSED_REQUEST_STATUS), 1);
+    gateway.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_drain_end_closes_pending_requests_and_settles_their_terminals() {
+    // A connection gracefully shutting down keeps serving its in-flight
+    // request. When the serving mode stops waiting, the connection closes and
+    // the dropped request settles its one `444` before
+    // `end_shutdown_drain_wait` returns, which is before the mode closes
+    // observability delivery.
+    let (backend_port, mut backend_seen) = start_silent_backend().await;
+    let gateway = Gateway::start(backend_port, false).await;
+
+    let _request = h2_request(gateway.addr, "GET", true).await;
+    backend_saw_request(&mut backend_seen, "shutdown drain end").await;
+    // The drain flag only, not `begin_shutdown_drain`, whose fault-delay
+    // cancellation is process-global.
+    gateway
+        .state
+        .overload
+        .draining
+        .store(true, Ordering::Release);
+    let _ = gateway.shutdown_tx.send(true);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        gateway.request_count(),
+        0,
+        "graceful shutdown keeps waiting for the in-flight request"
+    );
+
+    ferrum_edge::overload::end_shutdown_drain_wait(&gateway.state.overload).await;
+    assert_eq!(
+        gateway.active_requests(),
+        0,
+        "the request was released before the wait returned"
+    );
+    assert_eq!(gateway.request_count(), 1);
+    assert_eq!(gateway.status_count(GATEWAY_CLOSED_REQUEST_STATUS), 1);
+    assert_eq!(gateway.status_count(CLIENT_CLOSED_REQUEST_STATUS), 0);
     gateway.shutdown().await;
 }
 

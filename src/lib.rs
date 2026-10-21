@@ -113,6 +113,11 @@ pub mod _test_support {
         ctx.authorization_connection_closer = Some(closer);
     }
 
+    /// The gateway's `499` client-closed-request logging status (issue #6768
+    /// client-abort scope tests).
+    pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =
+        crate::proxy::grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS;
+
     /// Mark a request context as already counted by its handler, as every
     /// H1/H2 handler counting site does (issue #6768 client-abort scope tests).
     pub fn mark_terminal_status_counted_for_test(ctx: &crate::plugins::RequestContext) {
@@ -14992,6 +14997,146 @@ pub mod _test_support {
             body_outcome,
             upload_pumped,
             pump_outcome.map(upload_pump_outcome_from_test),
+        )
+    }
+
+    /// Public mirror of the crate-private attribution of a pre-response-head
+    /// `send_request` failure on the sidecar mesh-mTLS, HBONE, and Unix-socket
+    /// dispatchers (issue #6776).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PreHeaderSendTerminationForTest {
+        Transport,
+        ClientAbort,
+        MalformedUpload,
+        BackendWriteTimeout,
+        AuthorizationExpired,
+    }
+
+    /// Public mirror of the crate-private typed client upload fault (issue
+    /// #6776).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ClientUploadFaultForTest {
+        Disconnected,
+        Malformed,
+    }
+
+    fn client_upload_fault_from_test(
+        fault: ClientUploadFaultForTest,
+    ) -> crate::proxy::upload_pump::ClientUploadFault {
+        use crate::proxy::upload_pump::ClientUploadFault;
+        match fault {
+            ClientUploadFaultForTest::Disconnected => ClientUploadFault::Disconnected,
+            ClientUploadFaultForTest::Malformed => ClientUploadFault::Malformed,
+        }
+    }
+
+    /// The typed fault the upload pump and the unpumped size-limit adapter
+    /// record for a failed read of the client's upload.
+    pub fn client_upload_error_fault_for_test(
+        error: &(dyn std::error::Error + 'static),
+    ) -> ClientUploadFaultForTest {
+        match crate::proxy::upload_pump::client_upload_error_fault(error) {
+            crate::proxy::upload_pump::ClientUploadFault::Disconnected => {
+                ClientUploadFaultForTest::Disconnected
+            }
+            crate::proxy::upload_pump::ClientUploadFault::Malformed => {
+                ClientUploadFaultForTest::Malformed
+            }
+        }
+    }
+
+    /// Record a buffered native-gRPC terminal's header status into transaction
+    /// metadata, exactly as the generic dispatch handler does before it builds
+    /// the terminal summary (issue #6776).
+    pub fn record_buffered_native_grpc_header_status_for_test(
+        metadata: &mut std::collections::HashMap<String, String>,
+        native_grpc_request: bool,
+        response_is_buffered: bool,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) {
+        crate::proxy::record_buffered_native_grpc_header_status(
+            metadata,
+            native_grpc_request,
+            response_is_buffered,
+            response_headers,
+        )
+    }
+
+    fn pre_header_send_termination_from_test(
+        termination: PreHeaderSendTerminationForTest,
+    ) -> crate::proxy::upload_pump::PreHeaderSendTermination {
+        use crate::proxy::upload_pump::PreHeaderSendTermination;
+        match termination {
+            PreHeaderSendTerminationForTest::Transport => PreHeaderSendTermination::Transport,
+            PreHeaderSendTerminationForTest::ClientAbort => PreHeaderSendTermination::ClientAbort,
+            PreHeaderSendTerminationForTest::MalformedUpload => {
+                PreHeaderSendTermination::MalformedUpload
+            }
+            PreHeaderSendTerminationForTest::BackendWriteTimeout => {
+                PreHeaderSendTermination::BackendWriteTimeout
+            }
+            PreHeaderSendTerminationForTest::AuthorizationExpired => {
+                PreHeaderSendTermination::AuthorizationExpired
+            }
+        }
+    }
+
+    /// How the sidecar mesh-mTLS, HBONE, and Unix-socket dispatchers attribute
+    /// a `send_request` failure before the backend response head: whether the
+    /// transport error proves the gateway's body ended the exchange, whether
+    /// the authorization lifetime ended it, whether the transport read a
+    /// streaming client body, whether a gateway-owned pump fed it, and the
+    /// joined pump terminal, and the recorded typed client upload fault.
+    pub fn pre_header_send_termination_for_test(
+        gateway_ended_upload: bool,
+        authorization_ended: bool,
+        client_body_streamed: bool,
+        upload_pumped: bool,
+        pump_outcome: Option<UploadPumpOutcomeForTest>,
+        client_fault: Option<ClientUploadFaultForTest>,
+    ) -> PreHeaderSendTerminationForTest {
+        use crate::proxy::upload_pump::PreHeaderSendTermination;
+        match crate::proxy::upload_pump::pre_header_send_termination(
+            gateway_ended_upload,
+            authorization_ended,
+            client_body_streamed,
+            upload_pumped,
+            pump_outcome.map(upload_pump_outcome_from_test),
+            client_fault.map(client_upload_fault_from_test),
+        ) {
+            PreHeaderSendTermination::Transport => PreHeaderSendTerminationForTest::Transport,
+            PreHeaderSendTermination::ClientAbort => PreHeaderSendTerminationForTest::ClientAbort,
+            PreHeaderSendTermination::MalformedUpload => {
+                PreHeaderSendTerminationForTest::MalformedUpload
+            }
+            PreHeaderSendTermination::BackendWriteTimeout => {
+                PreHeaderSendTerminationForTest::BackendWriteTimeout
+            }
+            PreHeaderSendTermination::AuthorizationExpired => {
+                PreHeaderSendTerminationForTest::AuthorizationExpired
+            }
+        }
+    }
+
+    /// Whether a hyper `send_request` failure is typed proof that the
+    /// gateway's own request body ended the exchange (issue #6776).
+    pub fn hyper_send_error_ended_by_gateway_upload_for_test(err: &hyper::Error) -> bool {
+        crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(err)
+    }
+
+    /// The dispatch response the sidecar mesh-mTLS, HBONE, and Unix-socket
+    /// dispatchers return for an attributed pre-response-head send failure.
+    pub fn pre_header_upload_termination_response_for_test(
+        termination: PreHeaderSendTerminationForTest,
+        is_grpc_flavored: bool,
+        resolved_ip: Option<String>,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::pre_header_upload_termination_response(
+            "issue-6776-test",
+            "test",
+            pre_header_send_termination_from_test(termination),
+            is_grpc_flavored,
+            resolved_ip,
         )
     }
 

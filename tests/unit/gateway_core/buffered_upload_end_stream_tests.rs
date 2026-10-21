@@ -37,6 +37,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::sync::oneshot;
 
+use ferrum_edge::_test_support::CLIENT_CLOSED_REQUEST_STATUS;
 use ferrum_edge::_test_support::{
     EarlyBodyCollectOutcomeForTest as EarlyOutcome,
     GrpcBufferedCollectOutcomeForTest as GrpcOutcome, buffer_early_request_body_for_test,
@@ -45,7 +46,6 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::plugins::RequestContext;
 use ferrum_edge::proxy::ProxyState;
 use ferrum_edge::proxy::client_abort_scope::ClientAbortScope;
-use ferrum_edge::proxy::grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS;
 
 use super::client_abort_accounting_tests::{scope_state, status_count};
 
