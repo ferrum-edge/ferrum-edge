@@ -77,14 +77,17 @@ nothing is dispatched: a `499` on the HTTP paths, and gRPC `CANCELLED` on the na
 
 When hyper drops the service future instead — the reset arrives while the handler is pending, or an
 HTTP/1.1 client closes its connection — no handler code runs at all. The request's
-`ClientAbortScope` (`src/proxy/client_abort.rs`, issue #6768) owns the request context for the
-handler's lifetime, so the drop still records the request's one terminal: a `499` client abort with
-the `client_disconnect` error class (gRPC: `CANCELLED`), through the plugin `log` chain when the route
-has plugins and the runtime terminal counters otherwise. It applies to every cancellation point before
-the response head: the upload, plugin phases, backend acquisition, and the wait for backend response
-headers. The scope settles in the same poll the handler returns in and yields to a terminal log that
-already started, so a request never gets two records, and a drop caused by the gateway closing the
-connection itself is not recorded as a client abort.
+`ClientAbortScope` (`src/proxy/client_abort_scope.rs`, issue #6768) owns the request context for the
+handler's lifetime (the WebSocket upgrade handler borrows it too), so the drop still settles the
+request's one terminal: a `499` client abort with the `client_disconnect` error class (gRPC:
+`CANCELLED`), through the plugin `log` chain when the route has plugins and the runtime terminal
+counters otherwise. It applies to every cancellation point before the response head: the upload,
+plugin phases, backend acquisition, the WebSocket upgrade handshake, and the wait for backend
+response headers. The scope settles in the same poll the handler returns in. A request whose own
+terminal log was being delivered keeps that record (the log funnel finishes its sinks in detached
+delivery) and has its status counted once. A drop caused by the gateway closing the connection
+itself (withdrawn trust, an authorization-lifetime close, shutdown drain) is recorded as a `444`
+gateway close, never as a client abort.
 
 When the dispatcher cancels a pump whose client has already reset, the pump looks past the DATA
 still buffered ahead of that reset, so the backend gets the client's `CANCEL` rather than the

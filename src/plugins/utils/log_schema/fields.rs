@@ -1230,7 +1230,7 @@ mod tests {
         // tests/integration/log_schema_registry_tests.rs verifies the
         // actual serde output keys match these. This is the cheap
         // unit-test guard against accidental deletions.
-        assert_eq!(HTTP_FIELDS.len(), 32);
+        assert_eq!(HTTP_FIELDS.len(), 33);
     }
 
     #[test]

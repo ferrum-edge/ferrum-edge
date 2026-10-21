@@ -8519,6 +8519,8 @@ async fn handle_h3_request(
                     error_class: Some(h3_error_class),
                     body_completed: reject_sent,
                     client_disconnected: !reject_sent,
+                    // Built after the H3 reject send settled.
+                    response_delivery: crate::plugins::ResponseDelivery::Observed,
                     bytes_received: if reject_sent {
                         reject_body.len() as u64
                     } else {
@@ -11542,6 +11544,8 @@ async fn handle_h3_request(
             client_disconnected,
             body_error_class,
             body_completed,
+            // Built after the downstream HEADERS/DATA/trailers/FIN writes.
+            response_delivery: crate::plugins::ResponseDelivery::Observed,
             bytes_sent: raw_request_body_bytes,
             bytes_received,
             metadata: crate::proxy::clone_log_metadata(&ctx),

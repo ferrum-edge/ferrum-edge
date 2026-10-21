@@ -1923,11 +1923,19 @@ transaction hook sequentially:
   `client_disconnect_before_response`) to the same detached terminal delivery
   the streamed body uses, so the `log` hooks still run exactly once (issue
   #6768). Only `log` / `log_with_mesh_key` run for it: there is no response, so
-  no response-phase or streaming terminal hook does.
+  no response-phase or streaming terminal hook does. A connection the gateway
+  closes itself is recorded the same way as a `444` gateway close.
+- `log_with_mirror` is cancellation-safe: if the task awaiting it is dropped
+  while a sink's `log` is pending, the summary, context, and remaining plugin
+  list move to detached terminal delivery, which invokes the interrupted sink
+  again and the later sinks once, then records the runtime counters and
+  mirrors. A sink must therefore tolerate a repeated `log` for a summary whose
+  first call was cancelled before it returned.
 
 A buffered record is built before the response is handed to the transport and
-says so with `response_delivery: not_observed`; streamed and client-abort
-records carry `response_delivery: observed` (issue #6769).
+says so with `response_delivery: not_observed`; streamed, HTTP/3 post-send,
+client-abort, and gateway-close records carry `response_delivery: observed`
+(issue #6769).
 
 Potentially slow sinks should use an explicitly bounded, plugin-owned handoff.
 Own the queue, worker, cancellation state, and retry budget in the plugin;

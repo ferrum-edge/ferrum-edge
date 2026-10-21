@@ -28,7 +28,7 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### HTTP transaction logs: `response_delivery` and client-abort `499` records (#6768, #6769)
+### HTTP transaction logs: `response_delivery`, client-abort `499` and gateway-close `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
 (`not_observed` or `observed`). Log pipelines with a closed column set must
@@ -37,7 +37,12 @@ request whose client resets or disconnects before any response head now
 produces a transaction record and a `499` status sample (rejection phase
 `client_disconnect_before_response`) where it previously produced none;
 dashboards that treat every `4xx` as a client error will start counting these
-cancellations.
+cancellations. A request still pending when the gateway itself closes its
+connection (withdrawn client-certificate trust, an authorization-lifetime
+close, shutdown drain) is recorded as `444` with a `gateway_close_*` rejection
+phase. A logging sink whose `log` is cancelled mid-call (the client left while
+the buffered terminal log was being written) is invoked again by detached
+delivery.
 
 ### Plugin-config writes require `expected_proxy_ids` (forge-ops #569, PR #6744)
 

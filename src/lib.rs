@@ -104,6 +104,15 @@ pub use router_cache::{RouteMatch, RouterCache};
 /// The leading underscore signals that this module is not part of the public API.
 #[doc(hidden)]
 pub mod _test_support {
+    /// Attach a connection's authorization closer to a request context, as the
+    /// H1/H2 accept loop does (issue #6768 client-abort scope tests).
+    pub fn attach_authorization_connection_closer_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) {
+        ctx.authorization_connection_closer = Some(closer);
+    }
+
     /// Bind a caller-owned shutdown broadcaster exactly as the serving modes do.
     pub fn shutdown_overload_for_test(
         shutdown: &crate::overload::ShutdownSender,

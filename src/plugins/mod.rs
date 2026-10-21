@@ -3554,14 +3554,16 @@ pub struct RequestContext {
     /// Set once this request's terminal transaction record has started: the
     /// shared log funnel ([`log_with_mirror`]) or a detached delivery of it
     /// took the request's terminal summary (issue #6768). The H1/H2 frontend's
-    /// [`crate::proxy::client_abort::ClientAbortScope`] reads it when hyper
+    /// [`crate::proxy::client_abort_scope::ClientAbortScope`] reads it when hyper
     /// drops the handler future, so a request cancelled while its own terminal
     /// log is in flight never also gets a client-abort record.
     terminal_record_started: TerminalRecordLatch,
 }
 
-/// One-way latch recording that a request's terminal transaction record has
-/// started (see `RequestContext::terminal_record_started`).
+/// Latch recording how far a request's terminal transaction record has got
+/// (see [`TerminalRecordState`]): the logged status and a "started" bit set when
+/// the shared log funnel takes the summary, plus a "finished" bit once every
+/// inline sink and the runtime counters are settled.
 ///
 /// Atomic only because the log funnel holds the context by shared reference;
 /// a request's handler, its funnel, and the client-abort scope all run on the
@@ -3569,7 +3571,26 @@ pub struct RequestContext {
 /// authoritative request, so whatever it logs cannot stand in for the
 /// request's own terminal record.
 #[derive(Debug, Default)]
-pub(crate) struct TerminalRecordLatch(std::sync::atomic::AtomicBool);
+pub(crate) struct TerminalRecordLatch(std::sync::atomic::AtomicU32);
+
+const TERMINAL_RECORD_STARTED: u32 = 1 << 16;
+const TERMINAL_RECORD_FINISHED: u32 = 1 << 17;
+
+/// How far a request's own terminal transaction record has got when its
+/// handler stops (issue #6768).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRecordState {
+    /// No terminal summary was handed to the log funnel.
+    NotStarted,
+    /// The funnel took a summary with this status, and its inline delivery had
+    /// not finished. A cancellation now leaves the remaining sinks to detached
+    /// delivery, but the handler's own status count, which follows the log, is
+    /// still owed.
+    InFlight { status: u16 },
+    /// The summary's inline delivery finished, or it was handed to detached
+    /// delivery whole.
+    Finished,
+}
 
 impl Clone for TerminalRecordLatch {
     fn clone(&self) -> Self {
@@ -3844,15 +3865,49 @@ impl RequestContext {
         self.backend_dispatch_state
     }
 
-    /// Note that this request's terminal transaction record has started
-    /// (issue #6768). Called by the shared terminal log funnel before it can
-    /// first suspend, so the H1/H2 client-abort scope never records a second
-    /// terminal for a request whose own record is already in flight.
+    /// Note that this request's terminal transaction record, logged with
+    /// `status`, has started (issue #6768). Called by the shared terminal log
+    /// funnel before it can first suspend, so the H1/H2 client-abort scope never
+    /// records a second terminal for a request whose own record is in flight. A
+    /// record that already finished stays finished.
     #[inline]
-    pub(crate) fn mark_terminal_record_started(&self) {
-        self.terminal_record_started
+    pub(crate) fn mark_terminal_record_started(&self, status: u16) {
+        let _ = self.terminal_record_started.0.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |state| {
+                (state & TERMINAL_RECORD_FINISHED == 0)
+                    .then_some(TERMINAL_RECORD_STARTED | u32::from(status))
+            },
+        );
+    }
+
+    /// Note that this request's terminal record is settled: every inline sink
+    /// ran and the runtime counters were recorded, or the whole summary went to
+    /// detached delivery.
+    #[inline]
+    pub(crate) fn mark_terminal_record_finished(&self) {
+        self.terminal_record_started.0.fetch_or(
+            TERMINAL_RECORD_STARTED | TERMINAL_RECORD_FINISHED,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// How far this context's own terminal record has got.
+    pub fn terminal_record_state(&self) -> TerminalRecordState {
+        let state = self
+            .terminal_record_started
             .0
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if state & TERMINAL_RECORD_FINISHED != 0 {
+            TerminalRecordState::Finished
+        } else if state & TERMINAL_RECORD_STARTED != 0 {
+            TerminalRecordState::InFlight {
+                status: (state & 0xFFFF) as u16,
+            }
+        } else {
+            TerminalRecordState::NotStarted
+        }
     }
 
     /// Whether this context's terminal transaction record has started: the
@@ -3860,9 +3915,7 @@ impl RequestContext {
     /// a clone.
     #[inline]
     pub fn terminal_record_started(&self) -> bool {
-        self.terminal_record_started
-            .0
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.terminal_record_state() != TerminalRecordState::NotStarted
     }
 
     /// Record one completed backend attempt in the request's diagnostic
@@ -8654,9 +8707,11 @@ pub const LATENCY_UNKNOWN_MS: f64 = -1.0;
 ///   is not reflected.
 /// * [`Self::Observed`] — the record was finalized at the response's terminal
 ///   transport boundary: a streamed body ended, failed, or was dropped by the
-///   transport (`DeferredTransactionLogger`), a relay or session ended, or the
-///   transport cancelled the request before any response was produced (the H1/H2
-///   client-abort `499`). `client_disconnected` and `body_completed` describe
+///   transport (`DeferredTransactionLogger`), an HTTP/3 send settled, or the
+///   transport ended the request before any response was produced (the H1/H2
+///   client-abort `499` or gateway-close `444`). A streamed record whose
+///   response builder failed before hyper saw it stays `NotObserved`.
+///   `client_disconnected` and `body_completed` describe
 ///   that boundary. Even then the gateway only knows what the transport
 ///   accepted: bytes the transport accepted can still be lost before the client
 ///   reads them, so `Observed` is not proof of end-to-end receipt.
@@ -8785,7 +8840,7 @@ pub struct TransactionSummary {
     /// * **Client abort before any response** (`response_delivery: observed`):
     ///   `true`, with the `499` status and `client_disconnect` error class, when
     ///   an H1/H2 client reset the stream or closed the connection while the
-    ///   handler was still pending (`proxy::client_abort`).
+    ///   handler was still pending (`proxy::client_abort_scope`).
     /// * **Buffered responses and rejections** (`response_delivery:
     ///   not_observed`): the summary is emitted before the transport takes the
     ///   response, so a disconnect while the transport writes it is not
@@ -9183,11 +9238,31 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
+    log_with_mirror_inner(plugins, summary, ctx, true).await;
+}
+
+/// [`log_with_mirror`] for detached delivery that already runs under its own
+/// finite cleanup timeout. When that timeout cancels a blocked sink, the
+/// summary must not be resumed in further, unbounded detached work.
+pub(crate) async fn log_with_mirror_bounded(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+) {
+    log_with_mirror_inner(plugins, summary, ctx, false).await;
+}
+
+async fn log_with_mirror_inner(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+    resume_on_cancel: bool,
+) {
     // The request's terminal record is now in flight. Latch it before the
     // first suspension point so a client abort that drops the handler while a
     // logging plugin awaits cannot add a second, client-abort record for the
     // same request (issue #6768).
-    ctx.mark_terminal_record_started();
+    ctx.mark_terminal_record_started(summary.response_status_code);
     // Copy the memoized per-instance execution-trigger decisions from the
     // authoritative request context onto the terminal summary, so `log` /
     // `log_with_mesh_key` decide exactly as the instance's request and response
@@ -9267,13 +9342,39 @@ pub async fn log_with_mirror(
             mesh_key.as_ref(),
         );
     }
-    for plugin in plugins {
+    // Cancellation-safe delivery (issue #6768): when the request task is
+    // dropped while a sink awaits — hyper drops an H1/H2 handler whose client
+    // reset or disconnected during an awaited buffered log — the guard hands
+    // this summary to detached terminal delivery so the remaining sinks, the
+    // runtime transaction counters, and the mirror collectors still run once.
+    let mut delivery = TerminalDeliveryGuard {
+        plugins,
+        summary,
+        ctx,
+        next: 0,
+        armed: resume_on_cancel,
+    };
+    for (index, plugin) in plugins.iter().enumerate() {
+        delivery.next = index;
         // Transaction logging is gateway cleanup after the client-visible
         // outcome is final. A client RPC deadline must bound request handling,
         // but it must not suppress the audit/transaction record for the
         // deadline outcome itself.
         plugin.log_with_mesh_key(summary, mesh_key.as_ref()).await;
     }
+    delivery.armed = false;
+    finish_terminal_delivery(plugins, summary, ctx, precompute_mesh_key);
+    ctx.mark_terminal_record_finished();
+}
+
+/// Settle what follows the primary sinks of one terminal summary: the runtime
+/// transaction counters and the detached mirror collectors.
+fn finish_terminal_delivery(
+    plugins: &[Arc<dyn Plugin>],
+    summary: &TransactionSummary,
+    ctx: &RequestContext,
+    precompute_mesh_key: bool,
+) {
     crate::runtime_metrics::global_ref().record_transaction(summary);
 
     // Mirror completion and mirror-summary logging stay detached from the
@@ -9306,6 +9407,48 @@ pub async fn log_with_mirror(
                     .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
                     .await;
             }
+        });
+    }
+}
+
+/// Continues one terminal summary's delivery if [`log_with_mirror`] is
+/// cancelled mid-way (issue #6768).
+///
+/// Holds only borrows on the normal path, so it costs nothing until it fires.
+/// On drop while armed it clones the summary, context, and plugin list into a
+/// detached terminal-delivery task that resumes at the sink whose `log` was
+/// interrupted (its record never completed, so it is invoked again), then
+/// settles the runtime counters and mirrors exactly as the inline path does.
+struct TerminalDeliveryGuard<'a> {
+    plugins: &'a [Arc<dyn Plugin>],
+    summary: &'a TransactionSummary,
+    ctx: &'a RequestContext,
+    next: usize,
+    armed: bool,
+}
+
+impl Drop for TerminalDeliveryGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed || std::thread::panicking() {
+            return;
+        }
+        let plugins: Vec<Arc<dyn Plugin>> = self.plugins.to_vec();
+        let next = self.next.min(plugins.len());
+        let summary = self.summary.clone();
+        let ctx = self.ctx.clone();
+        let _ = crate::observability_delivery::spawn_terminal(async move {
+            let precompute_mesh_key = plugins
+                .iter()
+                .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+            let mesh_key = if precompute_mesh_key {
+                crate::plugins::mesh::prometheus_helpers::mesh_request_key(&summary)
+            } else {
+                None
+            };
+            for plugin in plugins.iter().skip(next) {
+                plugin.log_with_mesh_key(&summary, mesh_key.as_ref()).await;
+            }
+            finish_terminal_delivery(&plugins, &summary, &ctx, precompute_mesh_key);
         });
     }
 }
@@ -9360,8 +9503,10 @@ pub fn spawn_bounded_terminal_summary_log(
     ctx: &RequestContext,
 ) {
     // The detached task logs a clone, so latch the authoritative context here:
-    // this summary is the request's terminal record (issue #6768).
-    ctx.mark_terminal_record_started();
+    // this summary is the request's terminal record, handed off whole, and the
+    // caller counts it synchronously next (issue #6768).
+    ctx.mark_terminal_record_started(summary.response_status_code);
+    ctx.mark_terminal_record_finished();
     // Gateway diagnostic reference (issue #5767): record the detail on the
     // request task, before admission, so a delivery refused by
     // `FERRUM_LOG_DELIVERY_MAX_TASKS` cannot leave the client's reference
@@ -9374,7 +9519,7 @@ pub fn spawn_bounded_terminal_summary_log(
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
         if tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            log_with_mirror(&plugins, &summary, &ctx),
+            log_with_mirror_bounded(&plugins, &summary, &ctx),
         )
         .await
         .is_err()

@@ -39,7 +39,7 @@ pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod backend_send_queue;
 pub mod body;
-pub mod client_abort;
+pub mod client_abort_scope;
 pub mod client_ip;
 pub mod datagram_client_address;
 pub mod deferred_log;
@@ -15736,13 +15736,24 @@ fn build_websocket_error_fallback_response(status: StatusCode) -> Response<Proxy
 /// Supports both HTTP/1.1 Upgrade (101 Switching Protocols) and HTTP/2 Extended CONNECT
 /// (RFC 8441, 200 OK). The `is_h2_websocket` flag selects the response path; the backend
 /// connection, bidirectional relay, and frame-level plugins are identical for both.
-#[allow(clippy::too_many_arguments)]
+///
+/// `ctx` is borrowed from the generic handler's client-abort scope, which keeps
+/// owning it through backend admission, the dial, and the upgrade handshake, so
+/// a client that resets or closes before the upgrade response still leaves its
+/// one terminal record (issue #6768). The existing `&ctx` / `&mut ctx` call
+/// sites deref-coerce through that borrow, hence the borrow-style allowances.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_borrow,
+    clippy::borrow_deref_ref,
+    clippy::explicit_auto_deref
+)]
 async fn handle_websocket_request_authenticated(
     req: Request<Incoming>,
     state: Arc<ProxyState>,
     remote_addr: SocketAddr,
     proxy: Arc<Proxy>,
-    ctx: RequestContext,
+    ctx: &mut RequestContext,
     proxy_headers: HashMap<String, String>,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
     initial_response_header_policy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -33016,8 +33027,8 @@ pub mod request_stack_test_support {
     /// Frontend boundary, concrete frontend, concrete routing handler, and
     /// concrete backend attempt sizes, including their awaited child state.
     pub fn future_sizes() -> [usize; 4] {
-        let mut client_abort_scope = client_abort::ClientAbortScope::new();
-        let client_abort = &mut client_abort_scope;
+        let mut abort_scope = client_abort_scope::ClientAbortScope::new();
+        let client_abort = &mut abort_scope;
         [
             request_size(|req, state| {
                 construct_frontend_proxy_request(
@@ -33461,7 +33472,7 @@ async fn admit_proxy_request_on_frontend_port(
 /// to the response body. Large dispatch children remain boxed separately;
 /// bounded direct HTTP children stay inline under the backend state budget.
 ///
-/// The request's [`client_abort::ClientAbortScope`] lives in the same
+/// The request's [`client_abort_scope::ClientAbortScope`] lives in the same
 /// allocation, beside the handler that borrows its context (issue #6768). The
 /// scope settles in the same poll the handler returns in, so only a handler
 /// hyper drops before it returned (an HTTP/2 `RST_STREAM`, or an HTTP/1.1
@@ -33479,7 +33490,7 @@ fn boxed_handle_proxy_request_inner(
     connection_metadata: RequestConnectionMetadata,
 ) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
     Box::pin(async move {
-        let mut client_abort = client_abort::ClientAbortScope::new();
+        let mut client_abort = client_abort_scope::ClientAbortScope::new();
         let response = handle_proxy_request_inner(
             req,
             state,
@@ -33519,7 +33530,7 @@ async fn handle_proxy_request_inner(
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
-    client_abort: &mut client_abort::ClientAbortScope,
+    client_abort: &mut client_abort_scope::ClientAbortScope,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
     let http1_framing_result = connection_metadata.http1_framing_result;
@@ -34964,7 +34975,6 @@ async fn handle_proxy_request_inner(
         } else {
             reject.http_status.as_u16()
         };
-        record_request(&state, wire_status);
         let logging_plugins = plugin_cache_view.plugins();
         log_pre_backend_rejected_request(
             &logging_plugins,
@@ -34975,6 +34985,9 @@ async fn handle_proxy_request_inner(
             0,
         )
         .await;
+        // Counted after the log, like every other terminal: a client abort
+        // during that log is settled by the client-abort scope (issue #6768).
+        record_request(&state, wire_status);
         if let Some(response) = grpc_web_response {
             return Ok(response);
         }
@@ -37570,20 +37583,8 @@ async fn handle_proxy_request_inner(
             ctx.request_is_secure,
             state.add_forwarded_header,
         );
-        // The upgrade handler owns the context, and with it the request's
-        // terminal record, from here (issue #6768).
-        let Some(ctx) = client_abort.hand_off() else {
-            debug_assert!(
-                false,
-                "the client-abort scope owns the handler's context until hand-off"
-            );
-            record_request(&state, 500);
-            return Ok(build_websocket_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"WebSocket request context invariant violated"}"#,
-                &initial_response_header_policy_plugins,
-            ));
-        };
+        // The upgrade handler borrows the context; the client-abort scope keeps
+        // owning it until the upgrade response is returned (issue #6768).
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -40403,6 +40404,8 @@ async fn handle_proxy_request_inner(
                     }
                     Err(_) => {
                         if let Some(logger) = logger {
+                            // The fallback, not this response, reaches hyper (issue #6769).
+                            logger.mark_response_not_handed_off();
                             // Classify as `ProtocolError` (not `RequestError`)
                             // because gRPC errors ride on HTTP/2 and this is
                             // a framing/build failure on the response stream,
@@ -45240,6 +45243,8 @@ async fn handle_proxy_request_inner(
         }
         Err(_) => {
             if let Some(logger) = logger {
+                // The fallback, not this response, reaches hyper (issue #6769).
+                logger.mark_response_not_handed_off();
                 logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
                     crate::retry::ErrorClass::RequestError,
                     0,
@@ -47623,8 +47628,10 @@ fn spawn_buffered_summary_after_passthrough_bytes(
     latch: Arc<body::DirectH2BytesLatch>,
 ) {
     // The detached task logs a clone; this summary is the request's terminal
-    // record, so latch the authoritative context now (issue #6768).
-    ctx.mark_terminal_record_started();
+    // record, handed off whole, so latch the authoritative context now (issue
+    // #6768).
+    ctx.mark_terminal_record_started(summary.response_status_code);
+    ctx.mark_terminal_record_finished();
     let plugins = plugins.to_vec();
     let observed = Arc::clone(&ctx.bytes_sent_observed);
     let ctx = ctx.clone();
@@ -47635,7 +47642,7 @@ fn spawn_buffered_summary_after_passthrough_bytes(
             .max(summary.bytes_sent);
         if tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            crate::plugins::log_with_mirror(&plugins, &summary, &ctx),
+            crate::plugins::log_with_mirror_bounded(&plugins, &summary, &ctx),
         )
         .await
         .is_err()

@@ -172,6 +172,10 @@ pub async fn run_response_stream_termination_hooks(
 pub struct DeferredTransactionLogger {
     state: Mutex<Option<Captured>>,
     fired: AtomicBool,
+    /// Set when the response this logger was attached to never reached the
+    /// transport (a response-builder failure replaced it), so the terminal
+    /// record observed no delivery boundary (issue #6769).
+    response_not_handed_off: AtomicBool,
     // Test-only owned delivery lifecycle. Production paths leave this unset and
     // dispatch through the process-global structured lifecycle.
     #[cfg(test)]
@@ -341,6 +345,7 @@ impl DeferredTransactionLogger {
                 request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
         })
@@ -371,6 +376,7 @@ impl DeferredTransactionLogger {
                 error_class,
             }))),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
         })
@@ -414,6 +420,7 @@ impl DeferredTransactionLogger {
                 request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             #[cfg(test)]
             delivery: None,
         })
@@ -440,6 +447,15 @@ impl DeferredTransactionLogger {
             }
         }
         self
+    }
+
+    /// Record that the response this logger was attached to never reached the
+    /// transport: the response builder failed and a fallback replaced it. The
+    /// terminal record then reports `response_delivery: not_observed` instead
+    /// of describing a body boundary the transport never saw (issue #6769).
+    /// Call before firing.
+    pub fn mark_response_not_handed_off(&self) {
+        self.response_not_handed_off.store(true, Ordering::Release);
     }
 
     /// Fire the deferred log with the given outcome. Only the first call
@@ -492,7 +508,11 @@ impl DeferredTransactionLogger {
         summary.client_disconnected = outcome.client_disconnected;
         // This record is finalized at the body's transport terminal, so the
         // fields above describe what the transport consumed (issue #6769).
-        summary.response_delivery = crate::plugins::ResponseDelivery::Observed;
+        summary.response_delivery = if self.response_not_handed_off.load(Ordering::Acquire) {
+            crate::plugins::ResponseDelivery::NotObserved
+        } else {
+            crate::plugins::ResponseDelivery::Observed
+        };
         // Streaming responses only learn their final byte count when the
         // body wrapper finishes or is dropped. Buffered responses populate
         // `bytes_received` synchronously and never reach the deferred logger.
@@ -634,6 +654,7 @@ impl DeferredTransactionLogger {
                 request_protocol_is_grpc,
             })))),
             fired: AtomicBool::new(false),
+            response_not_handed_off: AtomicBool::new(false),
             delivery: Some(delivery),
         })
     }

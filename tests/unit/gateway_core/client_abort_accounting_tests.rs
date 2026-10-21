@@ -36,9 +36,11 @@ use ferrum_edge::plugins::{
     Plugin, RequestContext, ResponseDelivery, TransactionSummary, log_with_mirror,
     spawn_bounded_terminal_summary_log,
 };
-use ferrum_edge::proxy::client_abort::{
-    CLIENT_ABORT_REJECTION_PHASE, CLIENT_CLOSED_REQUEST_STATUS, ClientAbortScope,
+use ferrum_edge::proxy::client_abort_scope::{
+    CLIENT_ABORT_REJECTION_PHASE, ClientAbortScope, GATEWAY_CLOSED_REQUEST_STATUS,
+    GatewayCloseCause,
 };
+use ferrum_edge::proxy::grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS;
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
 use ferrum_edge::retry::ErrorClass;
 
@@ -237,11 +239,29 @@ struct H2Request {
     _client: h2::client::SendRequest<Bytes>,
     _response: h2::client::ResponseFuture,
     stream: h2::SendStream<Bytes>,
+    ping_pong: h2::PingPong,
+}
+
+impl H2Request {
+    /// Barrier: the gateway has accepted this stream, so the request is
+    /// admitted. HTTP/2 frames are processed in order. The first PING may be
+    /// flushed ahead of the request's frames, but the second is sent after the
+    /// first PONG arrived and so after those frames, and the server accepts a
+    /// stream in the same connection poll that reads its HEADERS.
+    async fn admitted(&mut self) {
+        for _ in 0..2 {
+            tokio::time::timeout(WAIT, self.ping_pong.ping(h2::Ping::opaque()))
+                .await
+                .expect("PONG before the deadline")
+                .expect("PING round trip");
+        }
+    }
 }
 
 async fn h2_request(addr: SocketAddr, method: &str, end_of_stream: bool) -> H2Request {
     let io = TcpStream::connect(addr).await.expect("connect gateway");
-    let (client, connection) = h2::client::handshake(io).await.expect("h2c handshake");
+    let (client, mut connection) = h2::client::handshake(io).await.expect("h2c handshake");
+    let ping_pong = connection.ping_pong().expect("user PING handle");
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -258,6 +278,7 @@ async fn h2_request(addr: SocketAddr, method: &str, end_of_stream: bool) -> H2Re
         _client: client,
         _response: response,
         stream,
+        ping_pong,
     }
 }
 
@@ -285,9 +306,11 @@ async fn h2_reset_while_waiting_for_response_headers_records_one_client_abort() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_reset_during_buffered_upload_records_one_client_abort() {
-    // The route collects the body before dispatch, so the reset races the
-    // handler's own client-disconnect terminal against hyper dropping the
-    // handler. Either way the request ends as exactly one `499`.
+    // The route collects the body before dispatch. Once the stream is
+    // admitted, every cancellation point ends as exactly one `499`: before the
+    // collect and while hyper drops the handler, the client-abort scope
+    // records it; when the collect reads the reset first, the handler's own
+    // client-disconnect terminal does, and the scope settles silently.
     let (backend_port, _backend_seen) = start_silent_backend().await;
     let gateway = Gateway::start(backend_port, true).await;
 
@@ -296,8 +319,7 @@ async fn h2_reset_during_buffered_upload_records_one_client_abort() {
         .stream
         .send_data(Bytes::from_static(b"partial upload"), false)
         .expect("partial DATA");
-    // Let the handler reach the body collect before the client gives up.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    request.admitted().await;
     request.stream.send_reset(h2::Reason::CANCEL);
 
     gateway.settled_single_terminal("h2 buffered upload").await;
@@ -327,6 +349,33 @@ async fn h1_close_while_waiting_for_response_headers_records_one_client_abort() 
     gateway
         .settled_single_terminal("h1 response-header wait")
         .await;
+    assert_eq!(gateway.status_count(CLIENT_CLOSED_REQUEST_STATUS), 1);
+    gateway.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h1_close_during_websocket_upgrade_handshake_records_one_client_abort() {
+    // The upgrade handler dials the backend and awaits its handshake response
+    // while borrowing the request context from the scope, so a client that
+    // leaves first is still one terminal.
+    let (backend_port, mut backend_seen) = start_silent_backend().await;
+    let gateway = Gateway::start(backend_port, false).await;
+
+    let mut client = TcpStream::connect(gateway.addr)
+        .await
+        .expect("connect gateway");
+    client
+        .write_all(
+            b"GET /slow HTTP/1.1\r\nhost: edge.example\r\nconnection: Upgrade\r\n\
+              upgrade: websocket\r\nsec-websocket-version: 13\r\n\
+              sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .expect("upgrade request head");
+    backend_saw_request(&mut backend_seen, "websocket handshake").await;
+    drop(client);
+
+    gateway.settled_single_terminal("websocket handshake").await;
     assert_eq!(gateway.status_count(CLIENT_CLOSED_REQUEST_STATUS), 1);
     gateway.shutdown().await;
 }
@@ -589,10 +638,10 @@ async fn handed_off_context_is_not_recorded_by_the_scope() {
 }
 
 #[tokio::test]
-async fn abort_while_the_terminal_log_is_in_flight_adds_no_second_record() {
-    // The race with completion: the handler's own terminal log has started
-    // (here it has finished) when hyper drops the handler. The scope must not
-    // add a client-abort record on top of it.
+async fn abort_after_the_terminal_log_finished_adds_no_second_record() {
+    // The race with completion: the handler's own terminal log has finished
+    // when hyper drops the handler. The scope must not add a client-abort
+    // record on top of it, nor count a status the handler counts itself.
     let state = scope_state();
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
@@ -612,6 +661,7 @@ async fn abort_while_the_terminal_log_is_in_flight_adds_no_second_record() {
     assert_eq!(summaries.len(), 1, "only the handler's own record");
     assert_eq!(summaries[0].response_status_code, 200);
     assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
+    assert_eq!(state.request_count.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -636,4 +686,185 @@ async fn detached_terminal_delivery_latches_the_authoritative_context() {
     spawn_bounded_terminal_summary_log(plugins.as_slice(), TransactionSummary::default(), &ctx);
     assert!(ctx.terminal_record_started());
     assert_eq!(captured_after(&captured, 1).await.len(), 1);
+}
+
+/// A sink whose first `log` parks until released; later calls return at once.
+struct ParkingPlugin {
+    calls: Arc<Mutex<Vec<u16>>>,
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for ParkingPlugin {
+    fn name(&self) -> &str {
+        "client-abort-parking"
+    }
+
+    fn priority(&self) -> u16 {
+        9000
+    }
+
+    async fn log(&self, summary: &TransactionSummary) {
+        let first = {
+            let mut calls = self.calls.lock().expect("parking calls");
+            calls.push(summary.response_status_code);
+            calls.len() == 1
+        };
+        if first {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_while_a_sink_is_pending_still_delivers_and_counts_once() {
+    // hyper drops the handler while the first logging sink is genuinely
+    // pending. The interrupted sink is invoked again, the later sink still
+    // receives the summary, and the status the handler would have counted
+    // after its log is counted exactly once, with no client-abort record.
+    let state = scope_state();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+    let plugins: PluginChain = Arc::new(vec![
+        Arc::new(ParkingPlugin {
+            calls: Arc::clone(&calls),
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        }),
+        Arc::new(CapturingPlugin {
+            captured: Arc::clone(&captured),
+        }),
+    ]);
+
+    let handler_state = Arc::clone(&state);
+    let handler_plugins = Arc::clone(&plugins);
+    let handler = tokio::spawn(async move {
+        let mut scope = ClientAbortScope::new();
+        {
+            let (ctx, record) = scope.install(&handler_state, Instant::now(), request_context());
+            record.observe_plugins(&handler_plugins);
+            let summary = TransactionSummary {
+                response_status_code: 201,
+                ..TransactionSummary::default()
+            };
+            log_with_mirror(handler_plugins.as_slice(), &summary, ctx).await;
+        }
+        scope.complete();
+    });
+    tokio::time::timeout(WAIT, started.notified())
+        .await
+        .expect("the first sink started");
+    handler.abort();
+    let _ = handler.await;
+
+    let summaries = captured_after(&captured, 1).await;
+    assert_eq!(
+        summaries.len(),
+        1,
+        "the later sink still receives the summary"
+    );
+    assert_eq!(summaries[0].response_status_code, 201);
+    assert_eq!(
+        calls.lock().expect("parking calls").as_slice(),
+        [201, 201],
+        "the interrupted sink is invoked again"
+    );
+    assert_eq!(status_count(&state, 201), 1, "the handler's status, once");
+    assert_eq!(state.request_count.load(Ordering::Relaxed), 1);
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
+    release.notify_waiters();
+}
+
+#[tokio::test]
+async fn cancelled_grpc_overrides_a_stale_backend_status() {
+    // A buffered native-gRPC path copies the backend's trailers into the
+    // context before its response hooks; a reset during those hooks means the
+    // client never received that outcome.
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let mut scope = ClientAbortScope::new();
+    {
+        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        ctx.metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        ctx.metadata
+            .insert("grpc_status".to_string(), "0".to_string());
+        record.observe_plugins(&plugins);
+    }
+    drop(scope);
+
+    let summaries = captured_after(&captured, 1).await;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].grpc_status(), Some(1));
+    assert_eq!(
+        summaries[0].response_status_code,
+        CLIENT_CLOSED_REQUEST_STATUS
+    );
+}
+
+#[tokio::test]
+async fn shutdown_drain_drop_is_a_gateway_close_not_a_client_abort() {
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let mut scope = ClientAbortScope::new();
+    {
+        let (_ctx, record) = scope.install(&state, Instant::now(), request_context());
+        record.observe_plugins(&plugins);
+    }
+    state.overload.draining.store(true, Ordering::Release);
+    drop(scope);
+
+    let summaries = captured_after(&captured, 1).await;
+    assert_eq!(summaries.len(), 1);
+    let summary = &summaries[0];
+    assert_eq!(summary.response_status_code, GATEWAY_CLOSED_REQUEST_STATUS);
+    assert!(
+        !summary.client_disconnected,
+        "no client cancellation proven"
+    );
+    assert_eq!(summary.error_class, None);
+    assert_eq!(
+        summary.rejection_phase(),
+        Some(GatewayCloseCause::Shutdown.rejection_phase())
+    );
+    assert_eq!(status_count(&state, GATEWAY_CLOSED_REQUEST_STATUS), 1);
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
+    assert_eq!(state.request_count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn authorization_close_drops_a_sibling_stream_as_a_gateway_close() {
+    // One stream's authorization lifetime closed the connection; a sibling
+    // stream still waiting on its backend is dropped by that close.
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let closer = ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
+    let mut scope = ClientAbortScope::new();
+    {
+        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        ferrum_edge::_test_support::attach_authorization_connection_closer_for_test(
+            ctx,
+            closer.clone(),
+        );
+        record.observe_plugins(&plugins);
+    }
+    closer.request_close();
+    drop(scope);
+
+    let summaries = captured_after(&captured, 1).await;
+    assert_eq!(summaries.len(), 1, "the sibling still gets one terminal");
+    assert_eq!(
+        summaries[0].response_status_code,
+        GATEWAY_CLOSED_REQUEST_STATUS
+    );
+    assert_eq!(
+        summaries[0].rejection_phase(),
+        Some(GatewayCloseCause::AuthorizationLifetime.rejection_phase())
+    );
+    assert_eq!(status_count(&state, GATEWAY_CLOSED_REQUEST_STATUS), 1);
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
 }

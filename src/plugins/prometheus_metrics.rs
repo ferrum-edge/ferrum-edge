@@ -152,7 +152,7 @@ pub struct WsTrafficKey {
 ///
 /// An H1/H2 client that resets or closes before any response head is counted
 /// once through the client-abort `499` summary
-/// ([`crate::proxy::client_abort`]), which carries `client_disconnected ==
+/// ([`crate::proxy::client_abort_scope`]), which carries `client_disconnected ==
 /// true`.
 ///
 /// WebSocket sessions are not counted here; their terminal classification has a
