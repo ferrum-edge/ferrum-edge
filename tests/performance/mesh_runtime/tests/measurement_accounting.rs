@@ -26,6 +26,11 @@ fn common_window_excludes_deadline_and_drain_from_throughput_and_latency() {
     assert_eq!(report.latency_max_us, 200);
     assert_eq!(report.drained_requests, 2);
     assert_eq!(report.drained_bytes, 192);
+    assert_eq!(report.cohort_requests, 4);
+    assert_eq!(report.cohort_p50_us, 200);
+    assert!(report.cohort_p95_us >= 2_000_000);
+    assert_eq!(report.cohort_p95_us, report.cohort_p99_us);
+    assert_eq!(report.cohort_p99_us, report.cohort_latency_max_us);
     assert_eq!(report.total_errors, 0);
 }
 
@@ -51,10 +56,31 @@ fn merged_workers_preserve_drain_warmup_and_cell_errors_separately() {
     assert_eq!(report.latency_max_us, 100);
     assert_eq!(report.drained_requests, 2);
     assert_eq!(report.drained_bytes, 64);
+    assert_eq!(report.cohort_requests, 4);
+    assert_eq!(report.cohort_p50_us, 100);
+    assert!(report.cohort_p95_us >= 2_000_000);
+    assert_eq!(report.cohort_p95_us, report.cohort_p99_us);
+    assert_eq!(report.cohort_p99_us, report.cohort_latency_max_us);
     assert_eq!(report.warmup_requests, 2);
     assert_eq!(report.warmup_errors, 2);
     assert_eq!(
         report.total_errors, 4,
         "warmup failures invalidate the cell"
     );
+}
+
+#[test]
+fn configurable_long_exchange_is_not_lost_from_the_cohort_histogram() {
+    let epoch = Instant::now();
+    let window = MeasurementWindow::new(epoch, Duration::from_secs(1));
+    let mut metrics = BenchMetrics::new();
+    metrics.record_completion(window, epoch, 100, 16);
+    metrics.record_completion(window, epoch + Duration::from_secs(120), 120_000_000, 16);
+    let report = metrics.json("test", "http://example/echo", 1, 1, 16);
+    assert_eq!(report.total_requests, 1);
+    assert_eq!(report.rps, 1.0);
+    assert_eq!(report.p99_us, 100);
+    assert_eq!(report.cohort_requests, 2);
+    assert!(report.cohort_p99_us >= 120_000_000);
+    assert_eq!(report.cohort_p99_us, report.cohort_latency_max_us);
 }

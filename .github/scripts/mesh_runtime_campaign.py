@@ -46,8 +46,6 @@ def build(args):
         raise ValueError("unsupported features")
     if baseline and not re.fullmatch(r"[0-9a-f]{40}", baseline):
         raise ValueError("baseline must be an exact lowercase 40-hex commit SHA")
-    subprocess.run(["bash", "tests/performance/mesh_runtime/run_mesh_runtime_bench.sh", "--build-only",
-          "--output-dir", str(results / "images")], check=True)
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     provenance = {"candidate_sha": revision, "baseline_sha": baseline or None,
                   "profile": profile, "features": features, "runner": os.environ.get("RUNNER_OS"),
@@ -60,17 +58,7 @@ def build(args):
                   "consul": "L4 TCP mTLS (legacy control)", "consulhttp": "L7 HTTP mTLS (explicit service-defaults)",
                   "envoy": "static Envoy H2 mTLS, not full Istio", "ferrum": "full mesh Sidecar H2 mTLS"}
     if baseline:
-        # This worktree and its build output belong solely to this one run.
-        source = results.parent / "mesh-baseline-source"
-        subprocess.run(["git", "worktree", "add", "--detach", str(source), baseline], check=True)
-        try:
-            with (results / "images" / "baseline-build.log").open("w") as log:
-                subprocess.run(["docker", "build", "--build-arg", f"CARGO_PROFILE={profile}", "--build-arg", f"FEATURES={features}",
-                      "-t", "ferrum-edge:baseline", "-f", str(source / "Dockerfile"), str(source)],
-                     check=True, stdout=log, stderr=subprocess.STDOUT)
-            provenance["baseline_image_id"] = subprocess.check_output(["docker", "image", "inspect", "ferrum-edge:baseline", "--format", "{{.Id}}"], text=True).strip()
-        finally:
-            subprocess.run(["git", "worktree", "remove", str(source)], check=True)
+        provenance["baseline_image_id"] = subprocess.check_output(["docker", "image", "inspect", "ferrum-edge:baseline", "--format", "{{.Id}}"], text=True).strip()
     (results / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     (results / "lscpu.txt").write_text(subprocess.check_output(["lscpu"], text=True))
     (results / "uname.txt").write_text(subprocess.check_output(["uname", "-a"], text=True))
@@ -90,47 +78,33 @@ def measure(args):
     duration = int(os.environ.get("BENCH_DURATION", "30"))
     concurrency = int(os.environ.get("BENCH_CONCURRENCY", "100"))
     iterations = int(os.environ.get("BENCH_ITERATIONS", "3"))
-    if not arms or not sizes or duration <= 0 or concurrency <= 0 or iterations not in (1, 3):
+    if not arms or not sizes or duration <= 0 or concurrency <= 0 or iterations not in (1, 3, 4):
         raise ValueError("empty or invalid campaign")
     sequence = plan(arms, sizes, iterations, bool(provenance["baseline_sha"]))
     (results / "campaign.json").write_text(json.dumps({"cells": sequence, "duration": duration,
         "concurrency": concurrency, "order": "balanced round blocks; paired AB/BA Ferrum images"}, indent=2) + "\n")
-    failed = False
-    for index, cell in enumerate(sequence, 1):
-        arm, payload, repetition = cell["arm"], cell["payload"], cell["repetition"]
-        measured_arm = "ferrum" if arm == "ferrumbaseline" else arm
-        directory = results / arm / f"run_{repetition}" / f"payload_{payload}"
-        directory.mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ, FERRUM_IMAGE="ferrum-edge:baseline" if arm == "ferrumbaseline" else "ferrum-edge:bench")
-        print(f"cell {index}/{len(sequence)} {cell}", flush=True)
-        with (directory / "run.log").open("w") as log:
-            status = subprocess.run(["bash", "tests/performance/mesh_runtime/run_mesh_runtime_bench.sh", measured_arm,
-                "--payload-sizes", str(payload), "--duration", str(duration), "--concurrency", str(concurrency),
-                "--output-dir", str(directory), "--skip-build"], env=env, stdout=log, stderr=subprocess.STDOUT).returncode
-        failed |= bool(status)
-        # Distinct baseline identity in every machine-readable record and path.
-        if arm == "ferrumbaseline":
-            for file in list(directory.glob("ferrum*.json")):
-                document = json.loads(file.read_text())
-                if document.get("mesh") == "ferrum":
-                    document["mesh"] = arm
-                if document.get("gateway") == "ferrum":
-                    document["gateway"] = arm
-                renamed = file.with_name(file.name.replace("ferrum", arm, 1))
-                renamed.write_text(json.dumps(document, indent=2) + "\n")
-                file.unlink()
-        if status:
-            print(f"arm failed ({status}): {directory / 'run.log'}", flush=True)
-            print((directory / "run.log").read_text()[-5000:], flush=True)
-    return int(failed)
+    (results / "plan.txt").write_text("".join(f"{c['arm']} {c['payload']} {c['repetition']}\n" for c in sequence))
+
+
+def relabel(directory):
+    for file in list(directory.glob("ferrum*.json")):
+        document = json.loads(file.read_text())
+        for key in ("mesh", "gateway"):
+            if document.get(key) == "ferrum":
+                document[key] = "ferrumbaseline"
+        renamed = file.with_name(file.name.replace("ferrum", "ferrumbaseline", 1))
+        renamed.write_text(json.dumps(document, indent=2) + "\n")
+        file.unlink()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("build", "measure"))
+    parser.add_argument("mode", choices=("provenance", "plan", "relabel"))
     parser.add_argument("--results", type=Path, default=Path("results"))
     args = parser.parse_args()
-    return build(args) if args.mode == "build" else measure(args)
+    if args.mode == "relabel":
+        return relabel(args.results)
+    return build(args) if args.mode == "provenance" else measure(args)
 
 
 if __name__ == "__main__":

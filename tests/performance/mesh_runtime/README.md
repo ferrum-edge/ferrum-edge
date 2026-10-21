@@ -26,7 +26,8 @@ mesh_loadgen ──────────────────────�
 | `direct` | none | same-runner overhead baseline |
 | `ferrum` | 2× `ferrum-edge`, `FERRUM_MODE=mesh`, Sidecar topology, `FERRUM_MESH_CONFIG_PROTOCOL=file` | file SVIDs, STRICT `PeerAuthentication`, destination SPIFFE ID pinned |
 | `envoy` | 2× `envoyproxy/envoy:v1.39.1` hand-configured H2/mTLS pair | client cert required, SPIFFE URI SAN pinned both directions |
-| `consul` | Consul 1.21.4 dev agent + 2× Envoy sidecars from `consul connect envoy` | Consul Connect CA mTLS; deny-intention auth probe |
+| `consul` | Consul 1.21.4 dev agent + 2× Envoy sidecars from `consul connect envoy`, default TCP protocol | L4 control: Consul Connect CA mTLS; deny-intention auth probe |
+| `consulhttp` | Same Consul/Envoy pair with explicit HTTP service-defaults | L7: active measured listeners must contain HTTP connection managers; same intention probe |
 | `linkerd` | 2× `ghcr.io/linkerd/proxy` standalone probe | records `unsupported-standalone` with logs unless the echo probe passes (the proxy requires the Destination control-plane service) |
 
 `envoy` is the Istio sidecar **data-plane proxy**, hand-configured: it is

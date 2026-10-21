@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
             args.payload_size,
         );
         println!(
-            "  {} target={} concurrency={}\n  Latency avg {}us p50 {}us p95 {}us p99 {}us max {}us\n  {} requests, {} errors, {} drained after window\n  {} warmup requests, {} warmup errors\nRequests/sec: {:.2}",
+            "  {} target={} concurrency={}\n  In-window latency avg {}us p50 {}us p95 {}us p99 {}us max {}us\n  Successful cohort {} requests: p50 {}us p95 {}us p99 {}us max {}us\n  {} requests, {} errors, {} drained after window\n  {} warmup requests, {} warmup errors\nRequests/sec: {:.2}",
             r.mesh,
             r.target,
             r.concurrency,
@@ -143,6 +143,11 @@ async fn main() -> Result<()> {
             r.p95_us,
             r.p99_us,
             r.latency_max_us,
+            r.cohort_requests,
+            r.cohort_p50_us,
+            r.cohort_p95_us,
+            r.cohort_p99_us,
+            r.cohort_latency_max_us,
             r.total_requests,
             r.total_errors,
             r.drained_requests,

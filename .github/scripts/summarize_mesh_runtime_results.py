@@ -118,10 +118,13 @@ def collect(results_root: Path) -> dict:
         try:
             data = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError) as e:
-            warnings.append(f"unparsable cell {f}: {e}")
+            warnings.append(f"unpublishable cell {f}: unparsable JSON: {e}")
             continue
-        mesh = data.get("mesh") or m.group("mesh")
-        payload = int(data.get("payload_size") or m.group("payload"))
+        mesh = m.group("mesh")
+        payload = int(m.group("payload"))
+        if not isinstance(data, dict) or data.get("mesh") != mesh or data.get("gateway") != mesh or data.get("payload_size") != payload:
+            warnings.append(f"unpublishable cell {f}: metadata does not match its planned identity")
+            continue
         record = dict(data)
         stats = parse_stats(f.with_name(f.name.replace(".json", ".stats.jsonl")))
         if stats is not None:
@@ -221,6 +224,11 @@ def collect(results_root: Path) -> dict:
                 "p50_us": r.get("p50_us"),
                 "p95_us": r.get("p95_us"),
                 "p99_us": r.get("p99_us"),
+                "cohort_requests": r.get("cohort_requests"),
+                "cohort_p50_us": r.get("cohort_p50_us"),
+                "cohort_p95_us": r.get("cohort_p95_us"),
+                "cohort_p99_us": r.get("cohort_p99_us"),
+                "cohort_latency_max_us": r.get("cohort_latency_max_us"),
                 "resources": r.get("resources"),
                 "drained_requests": r.get("drained_requests"),
                 "warmup_requests": r.get("warmup_requests"),
@@ -245,7 +253,7 @@ def collect(results_root: Path) -> dict:
             cell["median_run_rps"] = median_run.get("rps")
             cell["rps_min"] = rps_values[0]
             cell["rps_max"] = rps_values[-1]
-            for key in ("latency_avg_us", "p50_us", "p95_us", "p99_us"):
+            for key in ("latency_avg_us", "p50_us", "p95_us", "p99_us", "cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_latency_max_us"):
                 cell[key] = median_run.get(key)
             if median_run.get("resources"):
                 cell["resources"] = median_run["resources"]
@@ -303,7 +311,8 @@ def render_markdown(summary: dict) -> str:
         "Topology: loadgen -> client proxy -> **mTLS east-west hop** -> "
         "server proxy -> echo backend. `direct` skips both proxies. "
         "Median RPS across iterations; latency from the median-RPS run. "
-        "Cells with errors are excluded and listed under Warnings.\n"
+        "Cells with errors fail acceptance and are listed under Warnings. "
+        "`consul` is a separate L4 TCP control; `consulhttp` is the verified L7 HTTP arm.\n"
     )
     for arm, st in sorted(summary["arm_status"].items()):
         if st.get("status") != "ready":
@@ -363,7 +372,7 @@ def render_markdown(summary: dict) -> str:
                 f"| {fmt_us(c.get('p99_us'))} |"
             )
 
-    lines.append("\n## Proxy-pair CPU / memory (docker stats cgroup usage, measured window)\n")
+    lines.append("\n## Proxy-pair resources (/proc process CPU/RSS for new campaigns; legacy docker stats where present)\n")
     lines.append("| Mesh | Payload | CPU mean | CPU peak (Σ) | Mem mean | Mem peak (Σ) |")
     lines.append("|------|---------|---------:|---------:|---------:|---------:|")
     for mesh in meshes:
