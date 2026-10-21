@@ -11703,11 +11703,11 @@ components:
         succeeds, a server rejection takes precedence over the last ordinary
         rejection.
         In either mode a `401` from the authentication phase carries a
-        `WWW-Authenticate` field listing, one challenge per protection space
-        (auth-scheme plus realm), every challenge each rejecting mechanism
-        carried in chain order and then every other applicable auth plugin's
-        advertised challenge in priority order, falling back to the generic
-        `ferrum-edge` challenge.
+        `WWW-Authenticate` field listing every challenge each rejecting
+        mechanism carried in chain order and then every other applicable auth
+        plugin's advertised challenge in priority order, merging only
+        equivalent challenges (same scheme and parameters), falling back to the
+        generic `ferrum-edge` challenge.
 
     PluginAssociation:
       type: object

@@ -747,24 +747,32 @@ struct ParsedChallenge<'a> {
     /// whitespace or list commas.
     text: &'a str,
     scheme: &'a str,
-    /// Unescaped `realm` parameter, which together with the scheme names the
-    /// protection space (RFC 9110 §11.5).
-    realm: Option<String>,
+    /// The `token68` form, when the challenge uses it.
+    token68: Option<&'a str>,
+    /// Auth-params as (lowercased name, unescaped value), sorted by name.
+    params: Vec<(String, String)>,
 }
 
 impl ParsedChallenge<'_> {
-    /// Whether two challenges describe the same protection space: the same
-    /// auth-scheme (case-insensitive) and the same realm (case-sensitive).
-    fn same_protection_space(&self, other: &ParsedChallenge<'_>) -> bool {
-        self.scheme.eq_ignore_ascii_case(other.scheme) && self.realm == other.realm
+    /// Whether two challenges are equivalent: the same auth-scheme
+    /// (case-insensitive) and the same `token68` or the same parameter set
+    /// (names case-insensitive, values exact, order-insensitive). Challenges
+    /// that differ in any parameter — two `Digest` challenges for one realm
+    /// with different `algorithm`s (RFC 7616 §3.7), for example — are distinct
+    /// alternatives and are both kept.
+    fn equivalent(&self, other: &ParsedChallenge<'_>) -> bool {
+        self.scheme.eq_ignore_ascii_case(other.scheme)
+            && self.token68 == other.token68
+            && self.params == other.params
     }
 }
 
 /// Parse a `WWW-Authenticate` field value as the RFC 9110 §11.6.1
 /// `#challenge` list. `None` when any part of the value is malformed: a
 /// missing or invalid auth-scheme, an auth-param without `=` or value, an
-/// unterminated quoted-string, a repeated `realm`, or any control or non-ASCII
-/// byte. Every challenge text a successful parse returns is therefore a valid
+/// unterminated quoted-string, an auth-param name repeated within one
+/// challenge (compared case-insensitively, RFC 9110 §11.2), or any control or
+/// non-ASCII byte. Every challenge text a successful parse returns is therefore a valid
 /// HTTP field value on its own.
 fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_>>> {
     let bytes = value.as_bytes();
@@ -777,7 +785,8 @@ fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_
             return None;
         }
         let scheme = &value[start..scheme_end];
-        let mut realm = None;
+        let mut token68 = None;
+        let mut params: Vec<(String, String)> = Vec::new();
         let mut end = scheme_end;
         let after_scheme = skip_whitespace(bytes, scheme_end);
         if after_scheme == bytes.len() || bytes[after_scheme] == b',' {
@@ -787,6 +796,7 @@ fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_
             // Parameters must be separated from the scheme by whitespace.
             return None;
         } else if let Some(token68_end) = scan_token68(bytes, after_scheme) {
+            token68 = Some(&value[after_scheme..token68_end]);
             end = token68_end;
             pos = token68_end;
         } else {
@@ -811,12 +821,11 @@ fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_
                     }
                     (token_end, value[value_start..token_end].to_string())
                 };
-                if name.eq_ignore_ascii_case("realm") {
-                    if realm.is_some() {
-                        return None;
-                    }
-                    realm = Some(param_value);
+                let name = name.to_ascii_lowercase();
+                if params.iter().any(|(existing, _)| *existing == name) {
+                    return None;
                 }
+                params.push((name, param_value));
                 end = value_end;
                 let after_value = skip_whitespace(bytes, value_end);
                 if after_value == bytes.len() {
@@ -838,10 +847,12 @@ fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_
                 }
             }
         }
+        params.sort_unstable();
         challenges.push(ParsedChallenge {
             text: &value[start..end],
             scheme,
-            realm,
+            token68,
+            params,
         });
         pos = skip_list_separators(bytes, pos);
     }
@@ -864,10 +875,9 @@ pub fn is_valid_authentication_challenge(value: &str) -> bool {
 }
 
 /// Append every challenge in the field value `value` to an ordered challenge
-/// list, skipping one that names a protection space (auth-scheme plus realm)
-/// the list already holds. The first challenge per protection space wins, so
-/// callers add a rejection's specific challenge before the advertised ones;
-/// challenges with distinct realms are all kept.
+/// list, skipping only a challenge equivalent to one the list already holds
+/// (same scheme and the same parameters or `token68`). Challenges with
+/// distinct realms or parameters are distinct alternatives and are all kept.
 ///
 /// Returns `false`, adding nothing, when `value` is malformed.
 pub fn push_authentication_challenge(challenges: &mut Vec<String>, value: &str) -> bool {
@@ -880,9 +890,9 @@ pub fn push_authentication_challenge(challenges: &mut Vec<String>, value: &str) 
     for challenge in parsed {
         let duplicate = challenges.iter().any(|collected| {
             parse_authentication_challenges(collected).is_some_and(|collected_challenges| {
-                collected_challenges.iter().any(|collected_challenge| {
-                    collected_challenge.same_protection_space(&challenge)
-                })
+                collected_challenges
+                    .iter()
+                    .any(|collected_challenge| collected_challenge.equivalent(&challenge))
             })
         });
         if !duplicate {
@@ -927,12 +937,17 @@ pub fn set_response_authentication_challenge(headers: &mut HashMap<String, Strin
 /// its credential expired or its authorization lifetime elapsed (issue
 /// #3815), or because the client certificate it was admitted on lost trust.
 ///
-/// Names the scheme of the mechanism that committed the principal
+/// Names the scheme the committing mechanism recorded at commit (a DPoP-bound
+/// `jwks_auth` principal answers `DPoP error="invalid_token"`), otherwise the
+/// scheme of the mechanism that committed the principal
 /// ([`RequestContext::auth_method`]); a certificate-admitted principal with no
 /// committing mechanism (`spiffe_identity`) answers `ClientCertificate`, and
 /// anything else the generic gateway challenge. A fixed literal: nothing about
 /// the credential or the expiry reaches the header.
 pub fn reauthentication_challenge(ctx: &RequestContext) -> &'static str {
+    if let Some(challenge) = ctx.reauthentication_challenge {
+        return challenge;
+    }
     match ctx.auth_method {
         Some("basic_auth" | "ldap_auth") => BASIC_AUTHENTICATION_CHALLENGE,
         Some("jwt_auth" | "jwks_auth" | "oauth2_introspection") => BEARER_INVALID_TOKEN_CHALLENGE,

@@ -303,44 +303,69 @@ fn builtin_challenges_are_header_valid_and_name_the_applicable_scheme() {
 }
 
 #[test]
-fn challenge_lists_keep_one_challenge_per_protection_space() {
+fn challenge_lists_drop_only_equivalent_challenges() {
     let mut challenges = Vec::new();
-    assert!(auth_flow::push_authentication_challenge(
-        &mut challenges,
+    for value in [
         auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
-    ));
-    // Same scheme (case-insensitive) and same (absent) realm: the first, more
-    // specific challenge already names this protection space.
-    assert!(auth_flow::push_authentication_challenge(
-        &mut challenges,
-        "bearer"
-    ));
-    // A distinct realm is a distinct protection space and is kept.
-    assert!(auth_flow::push_authentication_challenge(
-        &mut challenges,
+        // Equivalent: same scheme (case-insensitive) and the same parameters.
+        r#"bearer error="invalid_token""#,
+        // A different parameter set is a distinct alternative.
+        auth_flow::BEARER_AUTHENTICATION_CHALLENGE,
         auth_flow::OIDC_AUTHENTICATION_CHALLENGE,
-    ));
-    assert!(auth_flow::push_authentication_challenge(
-        &mut challenges,
         r#"Basic realm="tenant-a""#,
-    ));
-    assert!(auth_flow::push_authentication_challenge(
-        &mut challenges,
+        // Parameter order and name case do not matter.
+        r#"Basic charset="UTF-8", REALM="ferrum-edge""#,
         auth_flow::BASIC_AUTHENTICATION_CHALLENGE,
-    ));
-    // Realms compare case-sensitively; the same realm is a duplicate.
-    assert!(auth_flow::push_authentication_challenge(
-        &mut challenges,
-        r#"basic realm="tenant-a", charset="UTF-8""#,
-    ));
+        // Realm values compare case-sensitively.
+        r#"Basic realm="Tenant-A""#,
+    ] {
+        assert!(
+            auth_flow::push_authentication_challenge(&mut challenges, value),
+            "{value}"
+        );
+    }
     assert_eq!(
         auth_flow::render_authentication_challenges(&challenges),
-        r#"Bearer error="invalid_token", Bearer realm="oidc", Basic realm="tenant-a", Basic realm="ferrum-edge", charset="UTF-8""#
+        r#"Bearer error="invalid_token", Bearer, Bearer realm="oidc", Basic realm="tenant-a", Basic charset="UTF-8", REALM="ferrum-edge", Basic realm="Tenant-A""#
     );
     assert_eq!(
         auth_flow::render_authentication_challenges(&[]),
         auth_flow::GENERIC_AUTHENTICATION_CHALLENGE
     );
+}
+
+/// RFC 7616 §3.7: one realm may offer several `Digest` algorithms; each is a
+/// distinct alternative a client may need.
+#[test]
+fn digest_algorithm_alternatives_in_one_realm_are_all_kept() {
+    let mut challenges = Vec::new();
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        r#"Digest realm="api", qop="auth", algorithm=SHA-256, nonce="n1", Digest realm="api", qop="auth", algorithm=MD5, nonce="n1""#,
+    ));
+    assert_eq!(challenges.len(), 2, "{challenges:?}");
+    // A token68 challenge is equivalent only to the same token68.
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        "Negotiate abc==, Negotiate abc==, Negotiate def=="
+    ));
+    assert_eq!(challenges.len(), 4, "{challenges:?}");
+}
+
+/// RFC 9110 §11.2: `token68` may end in `=` padding, so `Basic realm=` is a
+/// well-formed token68 challenge, not a parameter without a value.
+#[test]
+fn token68_with_padding_is_well_formed() {
+    for value in ["Basic realm=", "Negotiate abc==", "Bearer mF_9.B5f-4.1JqM"] {
+        assert!(
+            auth_flow::is_valid_authentication_challenge(value),
+            "{value}"
+        );
+    }
+    // A parameter followed by stray text without a list comma is not.
+    assert!(!auth_flow::is_valid_authentication_challenge(
+        "Basic realm=\"\" x"
+    ));
 }
 
 #[test]
@@ -383,8 +408,11 @@ fn malformed_challenges_are_refused_whole() {
         "realm=\"no-scheme\"",
         "Basic realm=\"unterminated",
         "Basic realm=\"bad\\\u{1}escape\"",
-        "Basic realm=",
         "Basic realm=\"a\", realm=\"b\"",
+        // Any repeated auth-param name is ambiguous, compared case-insensitively.
+        "Bearer error=\"invalid_token\", error=\"invalid_request\"",
+        "Basic realm=\"a\", REALM=\"b\"",
+        "Digest algorithm=MD5, Algorithm=SHA-256",
         "Basic realm=\"x\" charset=\"UTF-8\"",
         "Basic=",
         "Basic realm=\"caf\u{e9}\"",
@@ -911,7 +939,7 @@ async fn a_plugin_401_with_a_malformed_challenge_is_repaired() {
         // drop this value and send a challenge-less 401.
         "Bearer\r\n",
         "Basic realm=\"unterminated",
-        "Basic realm=",
+        "Bearer error=\"invalid_token\", error=\"invalid_request\"",
         "Basic realm=\"ok\", Bearer\u{7}",
     ] {
         let (status, headers) = finalize_401(
@@ -1157,5 +1185,142 @@ async fn a_non_401_plugin_rejection_gets_no_challenge() {
         let (status, headers) = finalize_401(&plugins, status_code, HashMap::new()).await;
         assert_eq!(status, status_code);
         assert_eq!(challenge_header(&headers), None, "status {status_code}");
+    }
+}
+
+/// A response-phase plugin that replaces a backend response with a `401`
+/// carrying no challenge (a WAF response refusal configured for `401`, say).
+struct ResponseRefusal401;
+
+#[async_trait]
+impl Plugin for ResponseRefusal401 {
+    fn name(&self) -> &str {
+        "response_refusal_401"
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"response refused"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_response_phase_401_rejection_carries_a_challenge() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(KeyAuth::new(&json!({})).unwrap()),
+        Arc::new(ResponseRefusal401),
+    ];
+    let mut ctx = ctx();
+    let mut backend_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let (status, _, headers) = ferrum_edge::_test_support::run_after_proxy_hooks_reject_for_test(
+        &plugins,
+        &mut ctx,
+        200,
+        &mut backend_headers,
+    )
+    .await
+    .expect("the response-phase plugin refuses the backend response");
+    assert_eq!(status, 401);
+    assert_eq!(
+        challenge_header(&headers),
+        Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE)
+    );
+}
+
+#[tokio::test]
+async fn an_accepted_backend_401_is_left_as_the_backend_sent_it() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(KeyAuth::new(&json!({})).unwrap())];
+    let mut ctx = ctx();
+    let mut backend_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    assert!(
+        ferrum_edge::_test_support::run_after_proxy_hooks_reject_for_test(
+            &plugins,
+            &mut ctx,
+            401,
+            &mut backend_headers,
+        )
+        .await
+        .is_none()
+    );
+    assert_eq!(challenge_header(&backend_headers), None);
+}
+
+/// A body policy that refuses a buffered synthetic response with a `401`.
+struct SyntheticBodyRefusal401;
+
+#[async_trait]
+impl Plugin for SyntheticBodyRefusal401 {
+    fn name(&self) -> &str {
+        "synthetic_body_refusal_401"
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        true
+    }
+
+    async fn on_final_response_body(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"body refused"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// An origin short-circuit that gateway policy replaced is gateway-authored:
+/// the replacement `401` gets its challenge (issue #6774).
+#[tokio::test]
+async fn a_gateway_replacement_of_an_origin_response_carries_a_challenge() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(KeyAuth::new(&json!({})).unwrap()),
+        Arc::new(SyntheticBodyRefusal401),
+    ];
+    let mut serverless = ctx();
+    ferrum_edge::_test_support::set_serverless_terminate_response_for_test(&mut serverless, true);
+    let (status, headers) = finalize_with(
+        &plugins,
+        &mut serverless,
+        200,
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        challenge_header(&headers),
+        Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE),
+        "{headers:?}"
+    );
+}
+
+/// Several `Digest` alternatives one custom mechanism offers for one realm
+/// survive authentication-phase aggregation (RFC 7616 §3.7).
+#[tokio::test]
+async fn digest_alternatives_survive_authentication_phase_aggregation() {
+    let digest = r#"Digest realm="api", algorithm=SHA-256, nonce="n1", Digest realm="api", algorithm=MD5, nonce="n1""#;
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ChallengelessAuth {
+        rejection_headers: HashMap::from([("WWW-Authenticate".to_string(), digest.to_string())]),
+    })];
+    for mode in [AuthMode::Single, AuthMode::Multi] {
+        let mut ctx = ctx();
+        assert_phase_unauthorized_with_challenge(
+            run_authentication_phase(mode, &auth_plugins, &mut ctx, &consumers()).await,
+            digest,
+        );
     }
 }

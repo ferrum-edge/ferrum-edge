@@ -2868,6 +2868,17 @@ pub struct RequestContext {
     /// `WWW-Authenticate` challenge guarantee (issue #6774) — skip such a
     /// response. Kept private so request metadata cannot forge it.
     pub(crate) origin_rejection: std::sync::OnceLock<()>,
+    /// Set when gateway policy replaced the response this request was about
+    /// to send — a body-policy, size, representation, header-policy, or
+    /// `after_proxy` rejection — so an origin short-circuit that was replaced
+    /// is no longer treated as origin-authored (issue #6774).
+    pub(crate) gateway_response_replacement: std::sync::OnceLock<()>,
+    /// `WWW-Authenticate` challenge for re-authenticating the committed
+    /// principal, recorded by the committing mechanism when the mechanism name
+    /// alone does not decide it — a `jwks_auth` principal authenticated with a
+    /// DPoP-bound token answers `DPoP error="invalid_token"` (RFC 9449 §7.1).
+    /// Read by the authorization-expiry terminals (issue #6774).
+    pub(crate) reauthentication_challenge: Option<&'static str>,
     /// The framed unary DATA payload and terminal trailers a validated
     /// `serverless_function` terminate invocation authored for this request.
     ///
@@ -3913,13 +3924,22 @@ impl RequestContext {
         let _ = self.origin_rejection.set(());
     }
 
-    /// Whether this request's short-circuit response was authored by an
+    /// Whether the response this request is about to send was authored by an
     /// origin (a replayed or relayed backend, provider, or function response)
-    /// rather than by the gateway. Such a response is carried as authored: the
+    /// rather than by the gateway: an origin short-circuit that no gateway
+    /// policy has since replaced. Such a response is carried as authored: the
     /// gateway never adds a `WWW-Authenticate` challenge to an origin `401`
     /// (issue #6774).
     pub(crate) fn response_is_origin_authored(&self) -> bool {
-        self.serves_origin_representation() || self.origin_rejection.get().is_some()
+        (self.serves_origin_representation() || self.origin_rejection.get().is_some())
+            && self.gateway_response_replacement.get().is_none()
+    }
+
+    /// Record that gateway policy replaced the response this request was
+    /// about to send. The replacement is gateway-authored whatever the
+    /// request's short-circuit was.
+    pub(crate) fn note_gateway_response_replacement(&self) {
+        let _ = self.gateway_response_replacement.set(());
     }
 
     /// Phase of the matched route rule's total request deadline that produced
@@ -4130,6 +4150,8 @@ impl RequestContext {
             response_presentation_policy_digest: None,
             serverless_terminate_response: false,
             origin_rejection: std::sync::OnceLock::new(),
+            gateway_response_replacement: std::sync::OnceLock::new(),
+            reauthentication_challenge: None,
             serverless_grpc_terminate_frame: None,
             serverless_owned_dedup_publication: None,
             ai_prompt_compressor_classification_path: None,
@@ -5692,6 +5714,8 @@ impl RequestContext {
             response_presentation_policy_digest: self.response_presentation_policy_digest,
             serverless_terminate_response: self.serverless_terminate_response,
             origin_rejection: self.origin_rejection.clone(),
+            gateway_response_replacement: self.gateway_response_replacement.clone(),
+            reauthentication_challenge: self.reauthentication_challenge,
             serverless_grpc_terminate_frame: self.serverless_grpc_terminate_frame.clone(),
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             ai_prompt_compressor_classification_path: std::mem::take(

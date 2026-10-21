@@ -1659,6 +1659,9 @@ impl JwksAuth {
                     stage_original_token_stripping(&mut attempt, provider);
                 }
 
+                // RFC 9449 §7.1: a principal admitted on a DPoP-bound token is
+                // re-challenged under `DPoP` when its credential later expires.
+                let dpop_bound = dpop_scheme || provider.require_dpop;
                 match commit_authentication_attempt(
                     ctx,
                     attempt,
@@ -1666,7 +1669,13 @@ impl JwksAuth {
                     "jwks_auth",
                     true,
                 ) {
-                    Ok(_) => PluginResult::Continue,
+                    Ok(committed) => {
+                        if committed && dpop_bound && ctx.auth_method == Some("jwks_auth") {
+                            ctx.reauthentication_challenge =
+                                Some(auth_flow::DPOP_INVALID_TOKEN_CHALLENGE);
+                        }
+                        PluginResult::Continue
+                    }
                     Err(VerifyOutcome::InvalidFormat(body)) => reject(
                         401,
                         body,

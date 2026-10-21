@@ -5985,3 +5985,114 @@ async fn jwks_dpop_token_failures_answer_invalid_token_under_the_dpop_scheme() {
         );
     }
 }
+
+/// RFC 9449 §7.1: a principal admitted on a DPoP-bound token is re-challenged
+/// under `DPoP` when its credential later expires (issue #6774), while a
+/// plain bearer principal keeps the `Bearer` challenge.
+#[tokio::test]
+async fn jwks_dpop_principal_reauthenticates_under_the_dpop_scheme() {
+    use ferrum_edge::plugins::utils::auth_flow::{
+        BEARER_INVALID_TOKEN_CHALLENGE, DPOP_INVALID_TOKEN_CHALLENGE, reauthentication_challenge,
+    };
+    use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let jwk_value = build_rsa_jwks_from_pem(public_key_pem)["keys"][0].clone();
+    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value).unwrap();
+    let jkt = jwk_thumbprint_sha256(&jwk).unwrap();
+
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    for (scheme, jti) in [
+        ("DPoP", "reauth-proof-dpop"),
+        ("Bearer", "reauth-proof-bearer"),
+    ] {
+        let access_token = create_rs256_token(
+            &json!({"sub": "idp-user", "iss": "https://idp.example.com", "cnf": {"jkt": jkt}}),
+            private_key_pem,
+        );
+        let now = chrono::Utc::now().timestamp();
+        let ath = {
+            use base64::Engine;
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(access_token.as_bytes());
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+        };
+        let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
+        dpop_header.typ = Some("dpop+jwt".to_string());
+        dpop_header.jwk = Some(jwk.clone());
+        let proof = encode(
+            &dpop_header,
+            &json!({
+                "htm": "GET",
+                "htu": "http://example.com/test",
+                "iat": now,
+                "exp": now + 60,
+                "jti": jti,
+                "ath": ath
+            }),
+            &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            format!("{scheme} {access_token}"),
+        );
+        ctx.headers.insert("dpop".to_string(), proof);
+        ctx.headers
+            .insert("host".to_string(), "example.com".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+        assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+        assert_eq!(
+            reauthentication_challenge(&ctx),
+            DPOP_INVALID_TOKEN_CHALLENGE,
+            "{scheme}-presented DPoP-bound principal"
+        );
+    }
+
+    // A bearer-only provider's principal keeps the bearer challenge.
+    let (_bearer_server, bearer_jwks_uri) = start_jwks_server(public_key_pem).await;
+    let bearer_plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": bearer_jwks_uri,
+                "issuer": "https://idp.example.com"
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    bearer_plugin.warmup_jwks().await;
+    let token = create_rs256_token(
+        &json!({"sub": "idp-user", "iss": "https://idp.example.com"}),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    assert_continue(bearer_plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        reauthentication_challenge(&ctx),
+        BEARER_INVALID_TOKEN_CHALLENGE
+    );
+}
