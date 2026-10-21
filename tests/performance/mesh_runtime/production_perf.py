@@ -389,7 +389,8 @@ class PerfCapture:
         # <symfs>/.debug. Build-ID candidates are opened outside the target
         # mount namespace, unlike ordinary symfs paths for a live container.
         role["report"]["symbol_lookup"] = {"symfs": str(symfs), "symfs_debug": str(debug),
-                                           "private_buildid_cache": str(cache)}
+                                           "private_buildid_cache": str(cache),
+                                           "buildid_entry_layout": "directory/elf"}
 
     def retain(self, role):
         pid = role["container"]["pid"]
@@ -468,11 +469,24 @@ class PerfCapture:
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.symlink_to(symbol)
             cached = self.output / "buildid-cache/.build-id" / build_id[:2] / build_id[2:]
-            cached.parent.mkdir(parents=True, exist_ok=True)
-            if not cached.exists():
-                # perf supports this original regular-file build-id cache form.
-                # A verified ELF link avoids copying multi-GiB companions.
-                cached.symlink_to(symbol)
+            if cached.is_symlink():
+                raise ValueError("unsafe build-ID cache directory")
+            cached.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # perf 7.0.14 symbol.c:1773-1778 computes this filename before
+            # leaving the target mount namespace. build-id.c:266-272 then
+            # selects <entry>/elf when the host cache is invisible there.
+            # A native directory works in either namespace; a flat ELF link
+            # would instead produce an unopenable <ELF-file>/elf candidate.
+            cached_elf = cached / "elf"
+            if cached_elf.is_symlink():
+                if os.readlink(cached_elf) != str(symbol):
+                    raise ValueError("build-ID cache ELF binding changed")
+            elif cached_elf.exists():
+                raise ValueError("unexpected build-ID cache ELF entry")
+            else:
+                # Link only the qualified companion or pinned mapped ELF.
+                cached_elf.symlink_to(symbol)
+            retained["buildid_cache_elf"] = str(cached_elf)
             role["mappings"][mapping["path"]] = retained
         role["report"]["mapped_elfs"] = list(role["mappings"].values())
         if not any(item["sha256"] == role["report"]["identity_before"]["process"]["exe_sha256"] for item in role["mappings"].values()):

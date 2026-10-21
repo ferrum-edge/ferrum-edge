@@ -325,19 +325,46 @@ class ProductionPerf(unittest.TestCase):
                 binding = role["report"]["symbol_binding"]
                 debug = directory / "symfs/.debug"
                 # symbol__config_symfs replaces the global cache with this
-                # path; __dso__build_id_filename accepts its ELF symlink via stat.
-                selected = debug / ".build-id" / binding["build_id"][:2] / binding["build_id"][2:]
+                # path. The initial stat occurs inside the target namespace;
+                # both an invisible entry and a visible directory select /elf.
+                entry = debug / ".build-id" / binding["build_id"][:2] / binding["build_id"][2:]
+                selected = entry / "elf"
                 self.assertTrue(debug.is_symlink())
                 self.assertEqual(debug.resolve(), (capture.output / "buildid-cache").resolve())
+                self.assertTrue(entry.is_dir())
+                self.assertFalse(entry.is_symlink())
                 self.assertTrue(selected.is_file())
                 self.assertEqual(selected.resolve(), companion.resolve())
                 self.assertEqual(M.sha256(selected), binding["sha256"])
+                self.assertEqual(Path(role["mappings"]["/bin/proxy"]["buildid_cache_elf"]).resolve(), companion.resolve())
                 self.assertFalse(binding["exact_elf_sha_match"])
                 capture.prepare_symbol_lookup(role)  # repeated retention is safe
                 debug.unlink()
                 debug.symlink_to(root)
                 with self.assertRaisesRegex(ValueError, "cache link changed"):
                     capture.prepare_symbol_lookup(role)
+
+    def test_perf_namespace_lookup_requires_native_directory_entry(self):
+        # Model the external perf 7.0.14 build-id.c:266-272 decision, called
+        # before symbol.c:1778 exits the target namespace. This specifically
+        # reproduces why a host-visible old-style file passes a simple FS test
+        # but fails live-container lookup when its initial stat sees ENOENT.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            symbol = root / "qualified.elf"
+            symbol.write_bytes(b"synthetic qualified ELF")
+            old = root / "old-flat-entry"
+            old.symlink_to(symbol)
+            native = root / "native-entry"
+            native.mkdir()
+            (native / "elf").symlink_to(symbol)
+            for initially_visible in (False, True):
+                with self.subTest(initially_visible=initially_visible):
+                    old_selected = old if initially_visible and old.is_file() else old / "elf"
+                    native_selected = native if initially_visible and native.is_file() else native / "elf"
+                    self.assertEqual(old_selected.is_file(), initially_visible)
+                    self.assertTrue(native_selected.is_file())
+                    self.assertEqual(native_selected.resolve(), symbol.resolve())
 
     def test_symbol_cache_rejects_missing_or_replaced_private_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
