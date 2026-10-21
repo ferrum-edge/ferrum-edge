@@ -2,8 +2,9 @@
 """Run a balanced mesh campaign; adjacent same-payload baseline/candidate pairs.
 
 The harness and load generator always come from the dispatched revision. The
-optional baseline changes only the Ferrum image, built with the same Dockerfile,
-features and profile as the candidate. Every raw cell and failed arm is retained.
+optional baseline changes only the Ferrum image, built with its revision's
+Dockerfile and the same features and profile as the candidate. Build-recipe drift
+must be checked before attributing an effect. Every raw cell and failed arm is retained.
 """
 from __future__ import annotations
 

@@ -65,7 +65,7 @@ on:
         default: ""
         type: string
       baseline_sha:
-        description: "Optional exact Ferrum baseline SHA; built identically and paired AB/BA"
+        description: "Optional exact Ferrum baseline SHA; matched profile/features, paired AB/BA"
         required: false
         default: ""
         type: string

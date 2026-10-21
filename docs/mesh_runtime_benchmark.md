@@ -23,15 +23,21 @@ filter check requiring an HTTP connection manager on the active client
 listeners cannot satisfy it. The L4 arm requires TCP proxy filters and no
 HTTP connection manager on those same chains. Artifacts
 include listener-only config dumps; SDS secrets are never collected.
-These distinct paths were verified from retained listener dumps in
+These distinct paths were first verified from retained listener dumps in
 [qualification run 39566902232](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39566902232).
-That campaign failed fixture qualification and is not a performance ranking:
-Ferrum and static Envoy could not read host-owned synthetic private keys.
+That campaign failed fixture qualification because Ferrum and static Envoy
+could not read host-owned synthetic private keys. After the fixture repair,
+[qualification run 39577108262](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39577108262)
+completed all 48 planned cells, including all 16 Consul listener pairs. Its
+instrumented Ferrum diagnostic build still cannot establish a shipping-product
+ranking.
 
 The campaign now reverses arm and payload blocks every other repetition.
-An optional exact `baseline_sha` builds a second Ferrum image with the same
-Dockerfile, features and build profile, then runs adjacent same-payload
-baseline/candidate pairs in AB/BA order. Both use the dispatched harness.
+An optional exact `baseline_sha` builds a second Ferrum image with that
+revision's Dockerfile and the same features and build profile, then runs adjacent
+same-payload baseline/candidate pairs in AB/BA order. Both use the dispatched
+harness. Check Dockerfile and dependency changes before attributing an effect;
+the workflow does not enforce identical build recipes across arbitrary SHAs.
 `provenance.json` records exact SHAs, image IDs, configuration hashes and
 build profile; `campaign.json` retains the full schedule and required cells.
 `ci-release` is a diagnostic profile and cannot establish shipping-profile
