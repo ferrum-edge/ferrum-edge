@@ -3958,3 +3958,51 @@ fn internal_gateway_error_is_grpc_internal_on_every_native_grpc_builder() {
         "both HTTP/3 native-gRPC builders must use the shared INTERNAL message"
     );
 }
+
+#[test]
+fn h3_grpc_bridge_internal_failure_is_backend_health_neutral() {
+    // #6773 review: a gateway-side construction failure on the H3→gRPC bridge
+    // must not trip the breaker / passive health / adaptive concurrency, as on
+    // HTTP/1.1-HTTP/2 (neutral) and native HTTP/3.
+    use ferrum_edge::_test_support::{
+        error_class_is_health_neutral_for_test, grpc_bridge_failure_health_for_test,
+    };
+    use ferrum_edge::retry::ErrorClass;
+
+    let internal = grpc_proxy::GrpcProxyError::Internal("bad backend CA".to_string());
+    let (status, class) = grpc_bridge_failure_health_for_test(&internal, ErrorClass::RequestError);
+    assert_eq!(status, 500);
+    assert_eq!(class, ErrorClass::DispatchPolicyRejected);
+    assert!(error_class_is_health_neutral_for_test(class));
+
+    let unavailable = grpc_proxy::GrpcProxyError::backend_unavailable(
+        grpc_proxy::GrpcBackendUnavailableKind::Connect,
+        "refused".to_string(),
+    );
+    assert_eq!(
+        grpc_bridge_failure_health_for_test(&unavailable, ErrorClass::ConnectionRefused),
+        (502, ErrorClass::ConnectionRefused),
+        "a real backend failure keeps training backend health"
+    );
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    assert_eq!(
+        bridge
+            .matches("grpc_bridge_failure_health(&err, error_class)")
+            .count(),
+        2,
+        "buffered and streaming H3→gRPC bridge arms must both settle health through the helper"
+    );
+}
+
+#[test]
+fn native_h3_grpc_connect_timeout_is_deadline_exceeded() {
+    // A native-H3 backend connect timeout (or post-wire QUIC idle timeout) is
+    // a backend deadline: DEADLINE_EXCEEDED like the HTTP/1.1-HTTP/2
+    // `BackendTimeout` mapping, not UNAVAILABLE.
+    let server = include_str!("../../../src/http3/server.rs");
+    assert!(server.contains(
+        "is_read_timeout || h3_error_class == crate::retry::ErrorClass::ConnectionTimeout"
+    ));
+    assert!(server.contains("} else if is_backend_timeout {"));
+}

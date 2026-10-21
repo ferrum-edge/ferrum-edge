@@ -2972,6 +2972,18 @@ fn test_websocket_backend_failure_status_follows_shared_mapper() {
     let h3_ws = include_str!("../../../src/http3/websocket.rs");
     assert!(h3_ws.contains("websocket_backend_failure_status_and_body(ws_error_class)"));
     assert!(!h3_ws.contains("cb.record_failure(502, ws_is_pre_wire"));
+    // ...and both stamp the authoritative X-Gateway-Error for the failure.
+    assert_eq!(
+        proxy
+            .matches("Ok(build_websocket_backend_failure_response(")
+            .count(),
+        2
+    );
+    assert!(h3_ws.contains("send_h3_backend_failure_body(\n"));
+    // An inbound HBONE kernel ETIMEDOUT is the same cause as the gateway's own
+    // connect timer, so it is 504 too.
+    let hbone = include_str!("../../../src/proxy/hbone_proxy.rs");
+    assert!(hbone.contains("if class == retry::ErrorClass::ConnectionTimeout {"));
 }
 
 #[test]

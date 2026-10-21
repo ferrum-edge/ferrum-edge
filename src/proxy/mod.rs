@@ -15698,6 +15698,39 @@ fn build_websocket_error_response(
     body: &str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
+    build_websocket_error_response_with_gateway_error(
+        status,
+        body,
+        initial_response_header_policy_plugins,
+        None,
+    )
+}
+
+/// [`build_websocket_error_response`] for a failed backend dial/handshake:
+/// after the header policies run, stamps the authoritative `X-Gateway-Error`
+/// for the classified failure (`connection_failure` when nothing reached the
+/// backend, otherwise `backend_timeout` / `backend_error` by status), exactly
+/// as the HTTP dispatch paths do.
+fn build_websocket_backend_failure_response(
+    status: StatusCode,
+    body: &str,
+    connection_error: bool,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    build_websocket_error_response_with_gateway_error(
+        status,
+        body,
+        initial_response_header_policy_plugins,
+        Some(connection_error),
+    )
+}
+
+fn build_websocket_error_response_with_gateway_error(
+    status: StatusCode,
+    body: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    backend_failure_connection_error: Option<bool>,
+) -> Response<ProxyBody> {
     let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     // Strips WebSocket negotiation / hop-by-hop fields *and* any policy-authored
@@ -15706,6 +15739,13 @@ fn build_websocket_error_response(
         initial_response_header_policy_plugins,
         &mut response_headers,
     );
+    if let Some(connection_error) = backend_failure_connection_error {
+        insert_x_gateway_error_for_backend_failure(
+            &mut response_headers,
+            connection_error,
+            status.as_u16(),
+        );
+    }
     // A failed handshake is an ordinary HTTP response (RFC 6455 §4.2.2): it keeps
     // the negotiated HTTP version and an authoritative `Content-Length` derived
     // from the error body. Only the transport-owned negotiation fields above are
@@ -16522,9 +16562,10 @@ async fn handle_websocket_request_authenticated(
                     let retry_config = match proxy.retry.as_ref() {
                         Some(rc) => rc,
                         None => {
-                            return Ok(build_websocket_error_response(
+                            return Ok(build_websocket_backend_failure_response(
                                 ws_failure_status,
                                 ws_failure_body,
+                                ws_is_pre_wire && !ws_egress_denied,
                                 &initial_response_header_policy_plugins,
                             ));
                         }
@@ -16824,9 +16865,10 @@ async fn handle_websocket_request_authenticated(
                         .record_http_error(Some(&proxy.id), ws_error_class);
                 }
 
-                return Ok(build_websocket_error_response(
+                return Ok(build_websocket_backend_failure_response(
                     ws_failure_status,
                     ws_failure_body,
+                    ws_is_pre_wire && !ws_egress_denied,
                     &initial_response_header_policy_plugins,
                 ));
             }

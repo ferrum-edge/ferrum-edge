@@ -455,6 +455,7 @@ fn admin_builder_fallback_is_500_not_default_200() {
     for source in [
         include_str!("../../../src/admin/mod.rs"),
         include_str!("../../../src/admin/config_export.rs"),
+        include_str!("../../../src/admin/api_specs/handlers.rs"),
     ] {
         assert!(
             !source.contains("unwrap_or_else(|_| Response::new("),

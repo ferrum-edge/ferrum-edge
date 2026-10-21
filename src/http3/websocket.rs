@@ -346,6 +346,33 @@ pub(crate) async fn send_h3_error_body<S>(
     .await;
 }
 
+/// [`send_h3_error_body`] for a failed backend dial/handshake: after the
+/// header policies run, stamps the authoritative `X-Gateway-Error` for the
+/// classified failure, as the HTTP/1.1-HTTP/2 WebSocket path does.
+async fn send_h3_backend_failure_body<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &'static str,
+    connection_error: bool,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let mut headers = HashMap::new();
+    ensure_h3_reject_content_type(&mut headers);
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        &mut headers,
+    );
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        connection_error,
+        status.as_u16(),
+    );
+    write_h3_finalized_reject_body(stream, status, Bytes::from_static(body.as_bytes()), headers)
+        .await;
+}
+
 pub(crate) async fn send_h3_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -1386,10 +1413,11 @@ pub(crate) async fn handle_h3_websocket(
                 } else {
                     ws_failure_body
                 };
-                send_h3_error_body(
+                send_h3_backend_failure_body(
                     &mut stream,
                     ws_failure_status,
                     ws_body,
+                    ws_is_pre_wire && !ws_egress_denied,
                     &initial_response_header_policy_plugins,
                 )
                 .await;

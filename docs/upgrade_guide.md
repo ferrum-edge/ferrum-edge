@@ -51,7 +51,12 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
   URL/authority could not be built) now carries `grpc-status: 13` (`INTERNAL`)
   with `grpc-message: Internal gateway error` on HTTP/1.1, HTTP/2 and the
   native-HTTP/3 backend dispatch, as the HTTP/3 bridges already did, instead of
-  `14` (`UNAVAILABLE`). It stays neutral for backend health.
+  `14` (`UNAVAILABLE`). It stays neutral for backend health on every path,
+  including the HTTP/3 → gRPC bridges, which used to charge it as a `502`.
+- A native-HTTP/3 gRPC backend connect timeout answers `DEADLINE_EXCEEDED`
+  (`4`) like HTTP/1.1 / HTTP/2, instead of `UNAVAILABLE` (`14`).
+- A failed WebSocket backend dial or handshake now carries `X-Gateway-Error`
+  (`connection_failure`, `backend_timeout` or `backend_error`).
 - A response the proxy or admin API response builder rejects now answers an
   explicit `500` (it used to fall back to a `200` carrying an error body).
 - `FERRUM_VIA_PSEUDONYM` must be an RFC 9110 token, optionally followed by

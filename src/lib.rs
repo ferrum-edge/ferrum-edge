@@ -2457,6 +2457,13 @@ pub mod _test_support {
         crate::proxy::websocket_backend_failure_status_and_body(class)
     }
 
+    pub fn grpc_bridge_failure_health_for_test(
+        err: &crate::proxy::grpc_proxy::GrpcProxyError,
+        error_class: crate::retry::ErrorClass,
+    ) -> (u16, crate::retry::ErrorClass) {
+        crate::http3::cross_protocol::grpc_bridge_failure_health(err, error_class)
+    }
+
     pub fn admin_builder_failure_response_for_test()
     -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
         crate::admin::admin_builder_failure_response()

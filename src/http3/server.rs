@@ -14506,6 +14506,13 @@ where
     // the wire, as on the HTTP/1.1-HTTP/2 and cross-protocol builders, and
     // neutral for backend health / capability (nothing was dialed).
     let is_gateway_internal = e.is_gateway_internal();
+    // A backend connect timeout (pre-wire) or an established QUIC connection
+    // timing out while waiting on the backend is a backend deadline, exactly
+    // like `backend_read_timeout_ms`: DEADLINE_EXCEEDED on the wire and a 504
+    // health status, matching the HTTP/1.1-HTTP/2 `BackendTimeout` mapping
+    // and the HTTP-family 504 (#6770).
+    let is_backend_timeout =
+        is_read_timeout || h3_error_class == crate::retry::ErrorClass::ConnectionTimeout;
 
     // gRPC error signalling mirrors the cross-protocol bridge's
     // dispatch-failure mapping: oversized upload -> RESOURCE_EXHAUSTED,
@@ -14527,7 +14534,7 @@ where
             crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
         )
-    } else if is_read_timeout {
+    } else if is_backend_timeout {
         (
             crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             "Backend deadline exceeded",
@@ -14603,7 +14610,7 @@ where
         // (`DispatchPolicyRejected` is health-neutral and non-retryable).
         (500, Some(crate::retry::ErrorClass::DispatchPolicyRejected))
     } else {
-        let status = if is_read_timeout { 504 } else { 502 };
+        let status = if is_backend_timeout { 504 } else { 502 };
         let (_, error_class) = h3_streaming_body_failure_outcome(
             is_client_request_body_disconnect,
             is_read_timeout,
