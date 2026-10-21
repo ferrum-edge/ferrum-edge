@@ -16,6 +16,8 @@
 #   --output-dir /tmp/gateway-protocol-results
 #   --skip-build                (reuse existing proto_bench binaries + ferrum docker image)
 #   --skip-direct               (accepted for frozen workflow; pairs always include direct)
+#   --owned-run-id ID          (bounded optional regression lane; requires fixture root)
+#   --regression-fixture-root PATH (new disposable fixture prepared by gateway_regression.py)
 #   --pairs N                   (even integer 2..12, default 2)
 #   --baseline-image IMAGE      (optional pinned Ferrum reference image)
 #   --adaptive                  (opt in to one budget-gated extension)
@@ -85,6 +87,9 @@ BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
 HOST_ID=""
+OWNED_RUN_ID=""
+REGRESSION_FIXTURE_ROOT=""
+TAIL_CONFIRM_PAIR=""
 EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
@@ -104,6 +109,9 @@ GRPC_CLIENT_CONNECTIONS="${BENCH_GRPC_CLIENT_CONNECTIONS:-pooled}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --tail-confirm-pair) TAIL_CONFIRM_PAIR="$2"; shift 2 ;;
+        --owned-run-id) OWNED_RUN_ID="$2"; shift 2 ;;
+        --regression-fixture-root) REGRESSION_FIXTURE_ROOT="$2"; shift 2 ;;
         --experiment-manifest) EXPERIMENT_MANIFEST="$2"; shift 2 ;;
         --gateways) GATEWAYS="$2"; shift 2 ;;
         --payload-sizes) PAYLOAD_SIZES="$2"; shift 2 ;;
@@ -130,6 +138,45 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# This finite mode is only used by the optional same-image regression lane.
+# The supervisor validates image users and owns this new disposable fixture.
+if [ -n "$OWNED_RUN_ID$REGRESSION_FIXTURE_ROOT" ]; then
+    [[ "$OWNED_RUN_ID" =~ ^[a-z0-9-]{1,64}$ ]] \
+        && [[ "$REGRESSION_FIXTURE_ROOT" = /* ]] \
+        && [[ "$PROTOCOL" = http1-tls || "$PROTOCOL" = http2 ]] \
+        && [ "$SKIP_BUILD" = true ] && [ "$GATEWAYS" = ferrum ] \
+        && [ -n "$BASELINE_IMAGE" ] && [ "$PROCESS_USAGE" = true ] \
+        && [ -z "$H1_PROFILE$H2_CPU_PROFILE$POOL_PROFILE$UDP_PROFILE" ] \
+        && [ "$ADAPTIVE" = false ] || exit 2
+    command -v timeout >/dev/null || exit 2
+fi
+# Bound every Docker operation in the owned mode, including startup/logging and
+# teardown. Never change Docker settings or touch another lane's containers.
+docker() {
+    if [ -n "$OWNED_RUN_ID" ]; then
+        if [ -n "${OWNED_READY_DEADLINE:-}" ]; then
+            local remaining=$((OWNED_READY_DEADLINE - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            [ "$remaining" -le 10 ] || remaining=10
+            timeout --signal=TERM --kill-after=2s "${remaining}s" docker "$@"
+            return
+        fi
+        timeout --signal=TERM --kill-after=2s 10s docker "$@"
+    else
+        command docker "$@"
+    fi
+}
+
+# One prespecified confirmation pair, supervised by the branch-local campaign.
+# This never changes ordinary suites or runs without an owned private fixture.
+if [ -n "$TAIL_CONFIRM_PAIR" ]; then
+    [[ "$TAIL_CONFIRM_PAIR" =~ ^[1-8]$ ]] && [ -n "$OWNED_RUN_ID" ] \
+        && [ "$PAIRS" = 1 ] && [ "$SKIP_DIRECT" = true ] \
+        && [ "$DURATION" = 30 ] && [ "$CONCURRENCY" = 100 ] \
+        && [ "$PAYLOAD_SIZES" = 1048576 ] && [ "$H2_WINDOW" = default ] \
+        && [ "$EXPERIMENT_MANIFEST" = /dev/null ] || exit 2
+fi
+
 # DURATION and PAYLOAD_SIZES reach Bash arithmetic below. Validate first so
 # caller-controlled values cannot be evaluated as expressions.
 if [[ ! $DURATION =~ ^[0-9]+$ ]]; then
@@ -141,7 +188,8 @@ if [[ ! $PAYLOAD_SIZES =~ ^[0-9]+( [0-9]+)*$ ]]; then
     exit 2
 fi
 
-if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]] && ! { [ "$H1_PROFILE" = diagnostic ] && [ "$PAIRS" = 1 ]; }; then
+if [[ ! $PAIRS =~ ^(2|4|6|8|10|12)$ ]] && ! { [ "$H1_PROFILE" = diagnostic ] && [ "$PAIRS" = 1 ]; } \
+    && ! { [ -n "$TAIL_CONFIRM_PAIR" ] && [ "$PAIRS" = 1 ]; }; then
     echo "--pairs must be an EVEN integer from 2 through 12 for exact position balance" >&2
     exit 2
 fi
@@ -378,6 +426,7 @@ GATEWAY_CID=""
 sampler_pid=""
 sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
+if [ -n "$OWNED_RUN_ID" ]; then CERT_DIR="$REGRESSION_FIXTURE_ROOT/certs"; fi
 # Every fixed port this runner's backend/gateways/Redis/Envoy bind. The startup
 # conflict check and cleanup share this list so they cannot drift apart.
 BENCH_PORTS="3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
@@ -499,7 +548,7 @@ ensure_baseline_image() {
 start_backend() {
     echo "[backend] starting proto_backend..."
     local backend_log="$SCRIPT_DIR/backend.log"
-    if [ "$H1_PROFILE" = diagnostic ]; then
+    if [ "$H1_PROFILE" = diagnostic ] || [ -n "$OWNED_RUN_ID" ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         backend_log="$OUTPUT_DIR/diagnostics/${gw}_backend.raw.log"
     fi
@@ -513,16 +562,25 @@ start_backend() {
     # writes to $OUTPUT_DIR/*.json would fail.
     local saved_pwd
     saved_pwd="$(pwd)"
-    cd "$SCRIPT_DIR"
+    if [ -n "$OWNED_RUN_ID" ]; then cd "$REGRESSION_FIXTURE_ROOT"; else cd "$SCRIPT_DIR"; fi
     BENCH_H2_OBSERVE="$H2_OBSERVE" H3_PROFILE="$H3_BUDGET" \
         BENCH_H2_STREAM_WINDOW="$H2_STREAM_WINDOW" \
-        ./target/release/proto_backend > "$backend_log" 2>&1 &
+        "$SCRIPT_DIR/target/release/proto_backend" > "$backend_log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
 
+    local ready_deadline=$((SECONDS + 30)) curl_timeout=2
+    local curl_args=()
     for i in $(seq 1 20); do
-        if curl -sf http://127.0.0.1:3010/health >/dev/null 2>&1; then
+        if [ -n "$OWNED_RUN_ID" ]; then
+            kill -0 "$BACKEND_PID" 2>/dev/null && [ "$SECONDS" -lt "$ready_deadline" ] || break
+            curl_timeout=$((ready_deadline - SECONDS))
+            [ "$curl_timeout" -le 2 ] || curl_timeout=2
+            curl_args=(--connect-timeout 1 --max-time "$curl_timeout")
+        fi
+        if curl "${curl_args[@]}" -sf http://127.0.0.1:3010/health >/dev/null 2>&1; then
             echo "[backend] healthy (pid $BACKEND_PID)"
+            if [ -n "$OWNED_RUN_ID" ]; then kill -0 "$BACKEND_PID" 2>/dev/null || return 1; fi
             # Wait for cert generation
             for j in $(seq 1 10); do
                 [ -f "$CERT_DIR/ca.pem" ] && [ -f "$CERT_DIR/cert.pem" ] && break
@@ -581,6 +639,11 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    if [ -n "$OWNED_RUN_ID" ]; then
+        extra_env+=(--user 65532:65532 --group-add 65532
+                    --name "gateway-regression-$OWNED_RUN_ID-$gw"
+                    --label "ferrum.gateway-regression=$OWNED_RUN_ID")
+    fi
     if [ -n "$H2_CPU_PROFILE" ]; then extra_env+=(--user 65532:65532 --cap-drop ALL); fi
     local response_cutoff=0
     case "$PROTOCOL" in
@@ -1012,7 +1075,23 @@ wait_for_gateway() {
         *) target_port=$GATEWAY_HTTPS_PORT ;;
     esac
 
+    local ready_deadline=$((SECONDS + 30)) curl_timeout=2
+    local OWNED_READY_DEADLINE="$ready_deadline"
     for i in $(seq 1 40); do
+        if [ -n "$OWNED_RUN_ID" ]; then
+            [ "$SECONDS" -lt "$ready_deadline" ] && container_alive || return 1
+            curl_timeout=$((ready_deadline - SECONDS))
+            [ "$curl_timeout" -gt 0 ] || return 1
+            [ "$curl_timeout" -le 2 ] || curl_timeout=2
+            if curl --fail --silent --show-error --connect-timeout 1 --max-time "$curl_timeout" \
+                --cacert "$CERT_DIR/ca.pem" "https://127.0.0.1:$target_port/health" >/dev/null 2>&1; then
+                container_alive && [ "$SECONDS" -lt "$ready_deadline" ] || return 1
+                echo "[gateway] owned container $GATEWAY_CID ready (verified TLS health)"
+                return 0
+            fi
+            sleep 0.2
+            continue
+        fi
         case "$PROTOCOL" in
             udp)
                 # Plain UDP: container-alive check is not enough because
@@ -1314,10 +1393,12 @@ run_bench() {
         curl -sf --max-time 5 http://127.0.0.1:3010/bench-stats \
             > "$backend_stats_before" 2>/dev/null || true
     fi
-    if [ "$H1_PROFILE" = diagnostic ]; then
+    if [ "$H1_PROFILE" = diagnostic ] || [ -n "$OWNED_RUN_ID" ]; then
         # Write directly to retained raw stdout so campaign termination during
         # the client/readers/logging cannot lose the original partial output.
-        timeout "${bench_wallclock}s" \
+        local timeout_grace=()
+        if [ -n "$OWNED_RUN_ID" ]; then timeout_grace=(--signal=TERM --kill-after=5s); fi
+        timeout "${timeout_grace[@]}" "${bench_wallclock}s" \
             "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
             --target "$bench_target" --duration "$DURATION" \
             --concurrency "$effective_concurrency" --payload-size "$payload" \
@@ -1367,7 +1448,7 @@ run_bench() {
     mkdir -p "$diagnostics"
     # `set -e` is on: a best-effort capture must never abort the matrix that
     # the capture exists to diagnose.
-    if [ "$H1_PROFILE" = diagnostic ]; then
+    if [ "$H1_PROFILE" = diagnostic ] || [ -n "$OWNED_RUN_ID" ]; then
         cp "$diagnostics/${gateway}_backend.raw.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     else
         cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
@@ -1455,12 +1536,13 @@ main() {
 
     # A paired suite is self-contained even when the frozen caller passes
     # --skip-direct after iteration one. Every pair measures direct again.
-    if $SKIP_DIRECT; then
+    if $SKIP_DIRECT && [ -z "$TAIL_CONFIRM_PAIR" ]; then
         echo "[main] --skip-direct ignored: each pair requires its own direct baseline"
     fi
     local expected_gateways="direct"
+    if [ -n "$TAIL_CONFIRM_PAIR" ]; then expected_gateways=""; fi
     for gw in $GATEWAYS; do
-        if supports "$gw" "$PROTOCOL"; then expected_gateways+=" $gw"; fi
+        if supports "$gw" "$PROTOCOL"; then expected_gateways+="${expected_gateways:+ }$gw"; fi
     done
     if [ -n "$BASELINE_IMAGE" ] && [[ " $expected_gateways " == *" ferrum "* ]]; then
         expected_gateways+=" ferrum-baseline"
@@ -1525,7 +1607,7 @@ main() {
     if [ -n "$H1_PROFILE" ]; then
         h1_revision=$(git -C "$PROJECT_ROOT" rev-parse HEAD) || return 2
     fi
-    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" "$H1_TRACE" "$H2_WINDOW" "$H2_STREAM_WINDOW" "$GRPC_CLIENT_CONNECTIONS" "$BASELINE_IMAGE" <<'PYEOF'
+    python3 - "$root_output/manifest.json" "$expected_gateways" "$PAYLOAD_SIZES" "$PAIRS" "$HOST_ID" "$H2_OBSERVE" "$H1_PROFILE" "$PROTOCOL" "$DURATION" "$CONCURRENCY" "$h1_revision" "$H1_TRACE" "$H2_WINDOW" "$H2_STREAM_WINDOW" "$GRPC_CLIENT_CONNECTIONS" "$BASELINE_IMAGE" "$TAIL_CONFIRM_PAIR" <<'PYEOF'
 import json, sys
 with open(sys.argv[1], "w") as manifest:
     json.dump({"gateways": sys.argv[2].split(),
@@ -1542,6 +1624,8 @@ with open(sys.argv[1], "w") as manifest:
                "h2_window": sys.argv[13], "h2_stream_window_bytes": int(sys.argv[14]),
                "grpc_client_connections": sys.argv[15],
                "baseline_image": sys.argv[16] or None,
+               **({"tail_confirm_pair": int(sys.argv[17]), "duration": int(sys.argv[9]),
+                   "offered_workers": int(sys.argv[10]), "protocol": sys.argv[8]} if sys.argv[17] else {}),
                "sample_schema": 2}, manifest)
 PYEOF
     if [ "$H3_BUDGET" -ne 0 ]; then
@@ -1617,6 +1701,7 @@ PYEOF
     local final_pairs="$PAIRS"
     local extended=false
     local first_pair=1
+    if [ -n "$TAIL_CONFIRM_PAIR" ]; then first_pair="$TAIL_CONFIRM_PAIR"; final_pairs="$TAIL_CONFIRM_PAIR"; fi
     local base_started=$SECONDS
     while true; do
         for PAIR in $(seq "$first_pair" "$final_pairs"); do
@@ -1632,7 +1717,7 @@ PYEOF
                     kill "$BACKEND_PID" 2>/dev/null || true
                     wait "$BACKEND_PID" 2>/dev/null || true
                 fi
-                start_backend
+                start_backend || exit 1
                 h1_trace_start || { stop_gateway; continue; }
                 case "$gw" in
                     direct) ;;
@@ -1657,6 +1742,9 @@ PYEOF
                     mkdir -p "$OUTPUT_DIR/diagnostics"
                     docker logs --timestamps "$GATEWAY_CID" \
                         > "$OUTPUT_DIR/diagnostics/${gw}_startup.log" 2>&1 || true
+                    if [ -n "$TAIL_CONFIRM_PAIR" ]; then
+                        docker inspect "$GATEWAY_CID" > "$OUTPUT_DIR/diagnostics/${gw}_runtime.json"
+                    fi
                     if [[ "$gw" == envoy* ]]; then
                         cp "$SCRIPT_DIR/envoy_runtime.yaml" "$OUTPUT_DIR/diagnostics/${gw}_config.yaml"
                     fi
@@ -1685,6 +1773,10 @@ PYEOF
             done
         done
         OUTPUT_DIR="$root_output"
+        if [ -n "$TAIL_CONFIRM_PAIR" ]; then
+            echo "[main] confirmation pair $TAIL_CONFIRM_PAIR complete; supervisor retains raw cells"
+            return
+        fi
         if [ "$H1_PROFILE" = diagnostic ]; then
             # One pass only: never pair, extend, rerun, or promote a comparison.
             break

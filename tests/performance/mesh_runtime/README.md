@@ -26,7 +26,8 @@ mesh_loadgen ──────────────────────�
 | `direct` | none | same-runner overhead baseline |
 | `ferrum` | 2× `ferrum-edge`, `FERRUM_MODE=mesh`, Sidecar topology, `FERRUM_MESH_CONFIG_PROTOCOL=file` | file SVIDs, STRICT `PeerAuthentication`, destination SPIFFE ID pinned |
 | `envoy` | 2× `envoyproxy/envoy:v1.39.1` hand-configured H2/mTLS pair | client cert required, SPIFFE URI SAN pinned both directions |
-| `consul` | Consul 1.21.4 dev agent + 2× Envoy sidecars from `consul connect envoy` | Consul Connect CA mTLS; deny-intention auth probe |
+| `consul` | Consul 1.21.4 dev agent + 2× Envoy sidecars from `consul connect envoy`, default TCP protocol | L4 control: Consul Connect CA mTLS; deny-intention auth probe |
+| `consulhttp` | Same Consul/Envoy pair with explicit HTTP service-defaults | L7: active measured listeners must contain HTTP connection managers; same intention probe |
 | `linkerd` | 2× `ghcr.io/linkerd/proxy` standalone probe | records `unsupported-standalone` with logs unless the echo probe passes (the proxy requires the Destination control-plane service) |
 
 `envoy` is the Istio sidecar **data-plane proxy**, hand-configured: it is
@@ -52,8 +53,8 @@ python3 ../../../.github/scripts/summarize_mesh_runtime_results.py \
 ```
 
 In CI: Actions → “Mesh Runtime Benchmark” → Run workflow (defaults:
-10s × concurrency 100 × payloads 1KB–5MB, 1 iteration; use 3 iterations
-for publishable numbers).
+10s × concurrency 100 × payloads 1KB–5MB, 1 iteration; use 30s and four
+balanced rounds for comparisons, with an identical-image A/A control).
 
 ## Builds and images
 
@@ -76,17 +77,21 @@ what it needs; use `--build-only` to prebuild both images.
 Per cell `<mesh>_http1_<payload>.json` carries the gateway-bench fields
 (`gateway`, `protocol`, `payload_size`, `rps`, `latency_avg_us`, `p50_us`,
 `p95_us`, `p99_us`, `total_requests`, `total_errors`, `total_bytes`) plus
-`mesh`; the sibling `.stats.jsonl` holds `docker stats` samples of the two
-proxy containers taken during the measured window. `<mesh>_arm_status.json`
+`mesh`; the sibling `.resources.json` holds marker-bracketed Linux `/proc`
+CPU deltas, mean/peak sampled process RSS, steal and raw boundaries.
+In-window latency and admitted-cohort latency (including successful drain)
+are separate fields. Historical `.stats.jsonl` files are cgroup samples,
+not process RSS. `<mesh>_arm_status.json`
 records `ready` / `unsupported-standalone` / `failed`. A response only
-counts toward RPS when status is 200 **and** the echoed body length equals
-the payload length. The summarizer reports medians across iterations and
-refuses to present error cells as results.
+counts toward RPS when status is 200 **and** the echoed bytes exactly match
+the payload inside the common window. The summary reports descriptive
+medians; optimization claims require every adjacent baseline/candidate pair.
+Missing, malformed, mismatched or error cells fail campaign acceptance.
 
 ## Fairness controls
 
-- One EC P-256 CA; the same svc/client certificates are presented by every
-  arm's proxies (Ferrum consumes them as SVIDs).
+- One synthetic EC P-256 CA supplies Ferrum and static Envoy workload
+  certificates; Consul issues its own Connect CA leaves.
 - Same client (`mesh_loadgen`, one keep-alive connection per worker) and
   same echo backend in every arm, `direct` included.
 - All containers (backend, proxies, load generator) run `--network host`,
