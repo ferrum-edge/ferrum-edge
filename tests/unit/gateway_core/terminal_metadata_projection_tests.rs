@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,7 +28,8 @@ use ferrum_edge::plugins::correlation_id::CorrelationId;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::trigger::{PluginTriggerGate, TriggerPhase};
 use ferrum_edge::plugins::{
-    MirrorResponseMeta, Plugin, PluginResult, RequestContext, TransactionSummary,
+    MirrorResponseMeta, Plugin, PluginResult, RequestContext, ResponseDelivery, TransactionSummary,
+    log_with_mirror,
 };
 use ferrum_edge::proxy::auth_lifetime::StreamAuthTermination;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
@@ -346,6 +347,7 @@ async fn terminal_metadata_projection_deferred_hooks_keep_order_and_move_final_s
         assert_eq!(summary.metadata["stream.second"], "finalized");
         assert!(!summary.metadata.contains_key("request_body"));
         assert_eq!(summary.bytes_received, 77);
+        assert_eq!(summary.response_delivery, ResponseDelivery::Observed);
     }
     assert!(matches!(
         rx.try_recv(),
@@ -410,6 +412,7 @@ async fn terminal_metadata_projection_preserves_terminal_typed_state_and_mirrors
         logger.fire(BodyOutcome::success(77));
         let (_, primary, _, decision) = receive(&mut rx).await;
         assert!(!primary.mirror);
+        assert_eq!(primary.response_delivery, ResponseDelivery::Observed);
         assert_eq!(
             decision,
             Some(false),
@@ -425,6 +428,7 @@ async fn terminal_metadata_projection_preserves_terminal_typed_state_and_mirrors
         );
         let (_, mirrored, _, mirror_decision) = receive(&mut rx).await;
         assert!(mirrored.mirror);
+        assert_eq!(mirrored.response_delivery, ResponseDelivery::NotObserved);
         assert_eq!(mirrored.response_status_code, 202);
         assert_eq!(
             mirrored.metadata[RETAINED_KEY],
@@ -432,6 +436,125 @@ async fn terminal_metadata_projection_preserves_terminal_typed_state_and_mirrors
         );
         assert_eq!(mirror_decision, Some(false));
     }
+}
+
+struct ParkingTerminalLog {
+    primary_calls: Arc<AtomicUsize>,
+    mirror_calls: Arc<AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Plugin for ParkingTerminalLog {
+    fn name(&self) -> &str {
+        "terminal_metadata_parking"
+    }
+
+    fn priority(&self) -> u16 {
+        100
+    }
+
+    async fn log(&self, summary: &TransactionSummary) {
+        if summary.mirror {
+            self.mirror_calls.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.primary_calls.fetch_add(1, Ordering::Relaxed);
+        self.started.notify_one();
+        std::future::pending::<()>().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_metadata_projection_cancelled_log_keeps_owned_summary_and_mirror() {
+    let _env = EnvGuard::new(&[]);
+    ferrum_edge::observability_delivery::begin_serving_cycle();
+    let mut ctx = mesh_context(MeshTrafficDirection::Inbound, true).await;
+    ctx.metadata.insert("request_body".into(), "private".into());
+    ctx.metadata
+        .insert("custom.retained".into(), "observer value".into());
+    let expected_metadata = clone_log_metadata_for_test(&ctx);
+    let (mirror_tx, mirror_rx) = tokio::sync::watch::channel(None);
+    ctx.mirror_result_rxs.push(mirror_rx);
+    let summary = TransactionSummary {
+        response_status_code: 201,
+        response_delivery: ResponseDelivery::Observed,
+        metadata: take_terminal_log_metadata_for_test(&mut ctx),
+        ..TransactionSummary::default()
+    };
+    assert!(ctx.metadata.is_empty());
+    let ctx = Arc::new(ctx);
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let mirror_calls = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(ParkingTerminalLog {
+            primary_calls: Arc::clone(&primary_calls),
+            mirror_calls: Arc::clone(&mirror_calls),
+            started: Arc::clone(&started),
+        }),
+        Arc::new(TerminalProbe {
+            label: "survivor",
+            gate: None,
+            tx,
+        }),
+    ];
+
+    // The production deferred boundary is covered above. Exercise its owned
+    // projection followed by the actual cancellation-safe log funnel here,
+    // with a task we can cancel without stopping the global delivery lifecycle.
+    let task_ctx = Arc::clone(&ctx);
+    let handler = tokio::spawn(async move {
+        log_with_mirror(&plugins, &summary, &task_ctx).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("primary sink started");
+    assert!(ctx.terminal_record_started());
+    handler.abort();
+    assert!(
+        handler
+            .await
+            .expect_err("log task cancelled")
+            .is_cancelled()
+    );
+
+    let (_, primary, _, _) = receive(&mut rx).await;
+    assert!(!primary.mirror);
+    assert_eq!(primary.response_status_code, 201);
+    assert_eq!(primary.response_delivery, ResponseDelivery::Observed);
+    assert_eq!(primary.metadata, expected_metadata);
+    // Publish only after cancellation and resumed primary delivery, so the
+    // continuation must retain its cloned context's pending mirror receiver.
+    mirror_tx
+        .send(Some(MirrorResponseMeta {
+            mirror_plugin_id: Some("cancelled-projection-mirror".into()),
+            mirror_target_url: "http://mirror.test/".into(),
+            mirror_response_status_code: Some(202),
+            mirror_response_size_bytes: Some(9),
+            mirror_response_advertised_size_bytes: Some(9),
+            mirror_latency_ms: 1.0,
+            mirror_error: None,
+        }))
+        .expect("mirror receiver");
+    let (_, mirrored, _, _) = receive(&mut rx).await;
+    assert!(mirrored.mirror);
+    assert_eq!(mirrored.response_status_code, 202);
+    assert_eq!(mirrored.response_delivery, ResponseDelivery::NotObserved);
+    assert_eq!(
+        mirrored.metadata[RETAINED_KEY],
+        primary.metadata[RETAINED_KEY]
+    );
+    assert_eq!(mirrored.metadata["custom.retained"], "observer value");
+    assert!(!mirrored.metadata.contains_key("request_body"));
+    assert_eq!(primary_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(mirror_calls.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty
+            | tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
