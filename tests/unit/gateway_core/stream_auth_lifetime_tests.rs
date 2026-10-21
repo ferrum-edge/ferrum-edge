@@ -5114,7 +5114,7 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
             .next()
             .unwrap_or_else(|| panic!("bounded {label} streaming dispatcher"));
         assert!(
-            dispatch.contains("let (mut parts, body, mut upload_pump)")
+            dispatch.contains("let (mut parts, body, mut upload_pump, client_fault_latch)")
                 && dispatch.contains("await_upload_write_watermark_first(")
                 && dispatch.contains("upload_pump.as_mut()")
                 && dispatch.contains("pump.cancel_and_join().await;")

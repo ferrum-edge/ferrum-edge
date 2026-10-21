@@ -3162,6 +3162,10 @@ pub struct RequestContext {
     /// times these hooks inline. Clone-safe via Arc; stays 0 on the H3 path
     /// (which never calls the finalizer), so it never double-counts there.
     pub reject_hook_execution_ns: Arc<std::sync::atomic::AtomicU64>,
+    /// Set once a sidecar mesh-mTLS, HBONE, or Unix-socket dispatcher proved
+    /// the client abandoned its upload before the backend response head
+    /// (issue #6776). Read into the terminal summary's `client_disconnected`.
+    pub(crate) proven_client_upload_abort: crate::proxy::upload_pump::ProvenClientUploadAbort,
     /// Receivers for mirror response metadata from every dispatched
     /// `request_mirror` instance on this request.
     ///
@@ -4148,6 +4152,7 @@ impl RequestContext {
             peer_spiffe_certificate_principal: false,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            proven_client_upload_abort: Default::default(),
             mirror_result_rxs: Vec::new(),
             request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
@@ -4438,6 +4443,20 @@ impl RequestContext {
         &self,
     ) -> crate::proxy::auth_lifetime::StreamAuthTerminationLatch {
         self.authorization_termination_latch.clone()
+    }
+
+    /// Record that a dispatcher proved the client abandoned its upload before
+    /// the backend response head (issue #6776).
+    pub(crate) fn record_proven_client_upload_abort(&self) {
+        self.proven_client_upload_abort.record();
+    }
+
+    /// Whether a dispatcher proved the client abandoned its upload before the
+    /// backend response head (issue #6776). Not derived from the
+    /// `ClientDisconnect` class, which authorization and client-deadline
+    /// terminals also carry.
+    pub(crate) fn proven_client_upload_abort(&self) -> bool {
+        self.proven_client_upload_abort.observed()
     }
 
     /// The latched authorization-lifetime termination class, if this request's
@@ -5744,6 +5763,7 @@ impl RequestContext {
             peer_spiffe_certificate_principal: self.peer_spiffe_certificate_principal,
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
+            proven_client_upload_abort: self.proven_client_upload_abort.clone(),
             // Watch receivers are clone-safe. Preserve them so the detached
             // gRPC-deadline logging path (which intentionally clones the
             // context before spawning cleanup) still emits every dispatched
