@@ -227,8 +227,7 @@ mesh_l4_prove() {
     mesh_l4_wait_binary 0 restored || return 1
     mesh_l4_snapshot restored || return 1
     if [ "$MESH" = ferrumtcp ]; then
-        python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-ferrum "$OUTPUT_DIR/logs/l4-restored/source.metrics" \
-            "$OUTPUT_DIR/logs/l4-restored/destination.metrics" > "$OUTPUT_DIR/logs/l4-transport-proof.json" || return 1
+        python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-ferrum "$OUTPUT_DIR/logs" > "$OUTPUT_DIR/logs/l4-transport-proof.json" || return 1
     else
         python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-consul "$OUTPUT_DIR/logs/l4-restored" \
             > "$OUTPUT_DIR/logs/l4-transport-proof.json" || return 1
@@ -236,7 +235,10 @@ mesh_l4_prove() {
     fi
     # The caller now requires byte-exact H1 readiness again before measuring.
     # Probe-only Python echo stays idle; cleanup owns its exact child PID.
-    echo '[l4] binary keepalive/half-close, mTLS stream metrics, destination deny/restore proved' >&2
+    echo '[l4] binary keepalive/half-close, mTLS transport/auth, destination deny/restore proved' >&2
+    if [ "$MESH" = ferrumtcp ]; then
+        echo '[l4] workload telemetry UNQUALIFIED: localized exporter absent; captured source observer gap; destination CONNECT uses HTTP families (see proof JSON)' >&2
+    fi
 }
 
 mesh_l4_cleanup() {

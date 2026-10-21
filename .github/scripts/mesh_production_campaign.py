@@ -53,14 +53,17 @@ def provenance():
         "phase": os.environ.get("BENCH_PHASE", "smoke-l7"), "profile": "release", "features": "cloud-secrets",
         "allocation_instrumentation": False, "ferrum_build_run": "https://github.com/ferrum-edge/ferrum-edge/actions/runs/39611137595",
         "images": image_info, "workers_requested": 4, "concurrency_1KiB": 100, "concurrency_1MiB": 50,
-        "warmup_seconds": 3, "source_mode": "file config and file SVIDs; no Kubernetes/cross-node capture",
+        "warmup_seconds": 3, "source_mode": "localized file config and file SVIDs; synthetic local capture only, no Kubernetes/cross-node deployment",
         "l7_topology": "two sidecars; H1 frontend/backend, Ferrum and static Envoy H2 mTLS peers; Consul explicit HTTP xDS",
-        "l4_topology": "same source namespace bridge/VIP capture, declared TCP; Ferrum per-connection mTLS H2 CONNECT, Consul native TCP mTLS",
+        "l4_topology": "matched L4 source namespace bridge/VIP capture, declared TCP; Ferrum per-connection mTLS H2 CONNECT, Consul native TCP mTLS",
+        "telemetry_scope": "access logging disabled; native operational counters enabled; full identity-bound workload telemetry not qualified",
+        "ferrum_l4_workload_telemetry_qualified": False,
+        "telemetry_limits": ["localized file fixture does not inject Prometheus exporter", "captured egress selects only workload_metrics and omits required Prometheus observation/completion hooks", "destination HBONE CONNECT uses HTTP telemetry families, not raw TCP lifecycle families"],
         "fixed_load_rates": {"1024": 2000, "1048576": 200},
         "fixed_boundary_loss_gate": {"max_missed": 2, "all_missed_due_in_final_nanoseconds": 1000000,
             "requires_exact_missed_ordinal_and_count_accounting": True,
             "note": "bounded end-window admission loss, not proof of timer-only cause or zero overload; preserve every miss and successful-cohort latency"},
-        "limits": ["one shared runner, backend/loadgen/proxies share CPU", "static Envoy is not full Istio and policy/telemetry work differs", "socket samples are not complete connection churn counters", "thread context switches are not logical task wakes", "saturated latency and fixed scheduled latency are separate populations"],
+        "limits": ["one shared runner, backend/loadgen/proxies share CPU", "L4 bridge/capture differs from L7 host-network placement; cross-layer differences do not isolate HTTP overhead", "static Envoy is not full Istio and policy/telemetry work differs", "socket samples are not complete connection churn counters", "thread context switches are not logical task wakes", "saturated latency and fixed scheduled latency are separate populations"],
         "config_sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path("tests/performance/mesh_runtime/configs").rglob("*")) if p.is_file()}}
     (ROOT/"production-provenance.json").write_text(json.dumps(data, indent=2)+"\n")
 
@@ -183,7 +186,8 @@ def summarize():
     (ROOT/"production-summary.json").write_text(json.dumps(result, indent=2)+"\n")
     text = ["Production mesh campaign", "", f"Planned: {len(planned)}; parsed: {len(rows)}; invalid/missing: {len(errors)}.",
         f"Strict zero-missed-arrival result: {result['strict_zero_miss_valid']}.",
-        "All outcomes retained. L4 and L7 are separate product paths. Fixed scheduled latency includes admission delay. Up to two missed arrivals are qualified only with ordinal proof that every missed due time was in the final 1 ms; all misses remain reported.", "",
+        "Telemetry scope: access logging disabled, native operational counters enabled. Full identity-bound workload telemetry is UNQUALIFIED; localized Ferrum configuration lacks an exporter and captured-egress Prometheus hooks are omitted. Destination CONNECT uses HTTP telemetry families. No full feature parity claim.",
+        "All outcomes retained. L4 and L7 are separate product paths with different network placement; cross-layer differences do not isolate HTTP overhead. Fixed scheduled latency includes admission delay. Up to two missed arrivals are qualified only with ordinal proof that every missed due time was in the final 1 ms; all misses remain reported.", "",
         "| Arm | Bytes | Load | N | RPS median | successful cohort p50/p95/p99 us (fixed: scheduled; saturated: service) | CPU us/completion | Missed arrivals (all repetitions) |", "|---|---:|---|---:|---:|---|---:|---|"]
     for group in groups:
         m=group["metrics"]

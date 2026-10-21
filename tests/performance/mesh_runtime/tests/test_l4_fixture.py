@@ -64,21 +64,87 @@ class CapturedL4Fixture(unittest.TestCase):
         self.assertEqual(shell.count('config_dump?resource=dynamic_listeners'), 2)
         self.assertEqual(shell.count('public-config >'), 2)
 
-    def test_metrics_require_actual_tcp_transport_and_stream_identities(self):
+    def ferrum_evidence(self, directory):
+        fixture.render(directory / "l4-fixture-configs", "172.25.0.1", "192.0.2.50", 18080, 18082)
+        passed = {"ok": True, "peer": ["192.0.2.50", 18082], "connections": 1,
+                  "exchanges": 5, "payload_bytes": 272, "byte_exact": True, "half_close": True,
+                  "whole_exchange_timeout_secs": 2}
+        refused = {"ok": False, "kind": "ConnectionResetError", "error": "Connection reset by peer"}
+        for phase, rows in (("allowed", [passed]), ("restored", [passed]),
+                            ("denied", [passed, refused, refused]), ("bypass-blocked", [refused]),
+                            ("raw-direct", [dict(passed, peer=["172.25.0.1", 18082])])):
+            (directory / f"l4-{phase}.jsonl").write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        (directory / "auth_probes.log").write_text(''.join(f"[auth-probe] ok: {proof}\n" for proof in (
+            "plaintext refused", "valid client certificate handshake", "no-client-cert refused",
+            "rogue-CA client certificate refused")))
+        for phase, count in (("allowed", 2), ("denied", 2), ("restored", 3)):
+            snapshot = directory / f"l4-{phase}"
+            snapshot.mkdir()
+            (snapshot / "source.metrics").write_text(
+                f'ferrum_mesh_tcp_egress_connections_total{{transport="mtls",result="success"}} {count}\n')
+            (snapshot / "destination.metrics").write_text('')
+
+    def test_shipping_transport_pass_preserves_telemetry_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            source, destination = Path(tmp) / "s", Path(tmp) / "d"
-            names = ["ferrum_mesh_tcp_connections_opened_total", "ferrum_mesh_tcp_connections_closed_total",
-                     "ferrum_mesh_tcp_sent_bytes_total", "ferrum_mesh_tcp_received_bytes_total"]
-            labels = f'connection_security_policy="mutual_tls",source_principal="{fixture.SOURCE}",destination_principal="{fixture.DESTINATION}"'
-            records = '\n'.join(f'{name}{{{labels}}} 7' for name in names)
-            destination.write_text(records)
-            source.write_text(records + '\nferrum_mesh_tcp_egress_connections_total{transport="mtls",result="success"} 2\n')
-            self.assertTrue(fixture.verify_ferrum(source, destination)["accepted"])
-            source.write_text(source.read_text().replace('transport="mtls"', 'transport="hbone"'))
-            self.assertFalse(fixture.verify_ferrum(source, destination)["accepted"])
-            source.write_text(records + '\nferrum_mesh_tcp_egress_connections_total{transport="mtls",result="success"} 2\n')
-            destination.write_text(records.replace(fixture.SOURCE, "unknown"))
-            self.assertFalse(fixture.verify_ferrum(source, destination)["accepted"])
+            directory = Path(tmp)
+            self.ferrum_evidence(directory)
+            result = fixture.verify_ferrum(directory)
+            self.assertTrue(result["accepted"])
+            self.assertTrue(result["transport_auth_qualified"])
+            self.assertFalse(result["workload_telemetry_qualified"])
+            self.assertEqual(result["restored_minus_denied_mtls_successes"], 1)
+            self.assertEqual(len(result["workload_telemetry_findings"]), 8)
+            self.assertEqual(len(result["workload_telemetry_reasons"]), 3)
+            self.assertIn('verify-ferrum "$OUTPUT_DIR/logs"', shell)
+            self.assertIn('workload telemetry UNQUALIFIED', shell)
+
+    def test_positive_binary_proof_requires_exact_peer_payload_and_half_close(self):
+        for field, value in (("exchanges", 4), ("payload_bytes", 271), ("byte_exact", False),
+                             ("half_close", False), ("connections", 2), ("whole_exchange_timeout_secs", 60),
+                             ("peer", ["172.25.0.1", 18082])):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.ferrum_evidence(directory)
+                path = directory / "l4-restored.jsonl"
+                row = json.loads(path.read_text())
+                row[field] = value
+                path.write_text(json.dumps(row) + '\n')
+                self.assertFalse(fixture.verify_ferrum(directory)["accepted"])
+
+    def test_negative_probes_require_real_refusals_and_two_denied_records(self):
+        for phase, records in (("denied", [{"ok": False, "kind": "ConnectionResetError"}]),
+                               ("denied", [{"ok": False, "kind": "timeout"}] * 2),
+                               ("denied", [{"ok": False, "kind": "ConnectionError", "error": "binary echo mismatch"}] * 2),
+                               ("bypass-blocked", [{"ok": False, "kind": "timeout"}]),
+                               ("bypass-blocked", [{"ok": False, "kind": "OSError"}])):
+            with self.subTest(phase=phase, records=records), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.ferrum_evidence(directory)
+                (directory / f"l4-{phase}.jsonl").write_text(''.join(json.dumps(row) + '\n' for row in records))
+                self.assertFalse(fixture.verify_ferrum(directory)["accepted"])
+
+    def test_mtls_counter_requires_matching_transport_and_positive_restore_delta(self):
+        for value in ('transport="hbone",result="success"} 3', 'transport="mtls",result="error"} 3',
+                      'transport="mtls",result="success"} 2', 'transport="mtls",result="success"} 1',
+                      'transport="mtls",result="success"} NaN', 'transport="mtls",result="success"} 3.5'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.ferrum_evidence(directory)
+                (directory / 'l4-restored/source.metrics').write_text('ferrum_mesh_tcp_egress_connections_total{' + value + '\n')
+                self.assertFalse(fixture.verify_ferrum(directory)["accepted"])
+
+    def test_missing_or_malformed_probe_and_auth_evidence_fails_closed(self):
+        for filename, contents in (("l4-allowed.jsonl", ''), ("l4-denied.jsonl", 'not json'),
+                                   ("l4-bypass-blocked.jsonl", '[]'), ("auth_probes.log", ''),
+                                   ("l4-fixture-configs/topology.json", '[]')):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.ferrum_evidence(directory)
+                (directory / filename).write_text(contents)
+                result = fixture.verify_ferrum(directory)
+                self.assertFalse(result["accepted"])
+                self.assertFalse(result["transport_auth_qualified"])
+                self.assertFalse(result["workload_telemetry_qualified"])
 
     def test_consul_requires_active_tcp_mutual_tls_and_issued_identity(self):
         with tempfile.TemporaryDirectory() as tmp:

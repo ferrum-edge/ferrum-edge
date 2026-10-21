@@ -192,25 +192,135 @@ def samples(path: Path):
         yield match[1], labels, value
 
 
-def verify_ferrum(source: Path, destination: Path) -> dict:
-    errors = []
-    src, dst = list(samples(source)), list(samples(destination))
-    if not any(name == "ferrum_mesh_tcp_egress_connections_total" and labels.get("transport") == "mtls"
-               and labels.get("result") == "success" and value > 0 for name, labels, value in src):
-        errors.append("no successful captured mtls TCP egress completion")
-    for role, records in (("source", src), ("destination", dst)):
-        def matching(name):
-            return sum(value for metric, labels, value in records if metric == name
-                       and labels.get("connection_security_policy") == "mutual_tls"
-                       and labels.get("destination_principal") == DESTINATION
-                       and (role == "source" or labels.get("source_principal") == SOURCE))
+def verify_ferrum(directory: Path) -> dict:
+    """Qualify shipping transport/auth only; retain the separate telemetry gap.
+
+    Captured egress invokes workload_metrics but never the Prometheus observer.
+    The destination is an HTTP HBONE CONNECT, not a stream-plugin TCP endpoint.
+    Requiring eight TCP series here therefore cannot qualify this shipping
+    localized-file configuration. Do not turn this into a telemetry/parity pass.
+    """
+    errors, observations = [], {}
+
+    def read_json(path):
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            errors.append(f"{path.name}: missing or invalid evidence ({type(error).__name__})")
+            return {}
+
+    topology = read_json(directory / "l4-fixture-configs/topology.json")
+    if not isinstance(topology, dict):
+        errors.append("topology.json: expected object")
+        topology = {}
+    vip, endpoint, port = topology.get("vip"), topology.get("endpoint"), topology.get("binary_proof_port")
+    try:
+        ipaddress.IPv4Address(vip)
+        ipaddress.IPv4Address(endpoint)
+        if type(port) is not int or not 1024 <= port <= 65535 or vip == endpoint:
+            raise ValueError("invalid fixture endpoint/port")
+    except (ValueError, TypeError):
+        errors.append("topology.json: invalid fixture endpoint/port")
+
+    for phase in ("raw-direct", "allowed", "denied", "restored", "bypass-blocked"):
+        path = directory / f"l4-{phase}.jsonl"
+        try:
+            rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            if not rows or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("expected nonempty JSON object records")
+        except (OSError, ValueError) as error:
+            errors.append(f"{path.name}: missing or invalid evidence ({type(error).__name__})")
+            rows = []
+        observations[phase] = rows
+
+    def success(row, host):
+        timeout = row.get("whole_exchange_timeout_secs")
+        return (row.get("ok") is True and row.get("byte_exact") is True
+                and row.get("half_close") is True and type(row.get("connections")) is int
+                and row["connections"] == 1 and type(row.get("exchanges")) is int
+                and row["exchanges"] == 5 and type(row.get("payload_bytes")) is int
+                and row["payload_bytes"] == len(PAYLOAD) and row.get("peer") == [host, port]
+                and type(timeout) in (int, float) and math.isfinite(timeout) and 0 < timeout <= 2)
+
+    def refusal(row):
+        # A timeout, harness error, or corrupt echo is not a policy refusal.
+        return row.get("ok") is False and (
+            row.get("kind") in ("ConnectionRefusedError", "ConnectionResetError",
+                                "ConnectionAbortedError", "BrokenPipeError")
+            or (row.get("kind") == "ConnectionError" and row.get("error") == "binary reply truncated"))
+
+    for phase, host in (("raw-direct", endpoint), ("allowed", vip), ("restored", vip)):
+        rows = observations[phase]
+        if not rows or not success(rows[-1], host):
+            errors.append(f"{phase}: no final one-connection five-exchange byte-exact half-close success")
+    denied = observations["denied"]
+    if len(denied) < 2 or not all(refusal(row) for row in denied[-2:]):
+        errors.append("denied: require two consecutive real connection refusals/resets/EOFs")
+    bypass = observations["bypass-blocked"]
+    if not bypass or not refusal(bypass[-1]):
+        errors.append("bypass-blocked: source proxy direct backend refusal not proved")
+
+    # These are written only after the existing fail-closed shell TLS probes.
+    # Check their retained evidence too so a standalone verifier cannot imply
+    # that binary transport successes proved the whole authentication matrix.
+    try:
+        auth = (directory / "auth_probes.log").read_text().splitlines()
+    except OSError:
+        auth = []
+    for proof in ("plaintext refused", "valid client certificate handshake",
+                  "no-client-cert refused", "rogue-CA client certificate refused"):
+        if f"[auth-probe] ok: {proof}" not in auth:
+            errors.append(f"authentication matrix: missing {proof}")
+    if any("[auth-probe] FAIL:" in line or "[auth-probe] infrastructure failure" in line for line in auth):
+        errors.append("authentication matrix contains a failed probe")
+
+    snapshots, successes = {}, {}
+    for phase in ("allowed", "denied", "restored"):
+        try:
+            records = list(samples(directory / f"l4-{phase}/source.metrics"))
+        except (OSError, ValueError):
+            records = []
+        snapshots[phase] = records
+        values = [value for name, labels, value in records
+                  if name == "ferrum_mesh_tcp_egress_connections_total"
+                  and labels.get("transport") == "mtls" and labels.get("result") == "success"]
+        if len(values) != 1 or values[0] < 0 or not values[0].is_integer():
+            errors.append(f"{phase}: missing/invalid successful captured mtls TCP egress counter")
+        else:
+            successes[phase] = values[0]
+    delta = None
+    if len(successes) == 3:
+        delta = successes["restored"] - successes["denied"]
+        if not 0 < successes["allowed"] <= successes["denied"] or delta < 1:
+            errors.append("mtls success counters must be monotonic with restored-minus-denied >= 1")
+
+    # Preserve the original missing-series observation as a finding, not as an
+    # impossible shipping transport gate or an assertion of feature parity.
+    telemetry_findings = []
+    try:
+        destination = list(samples(directory / "l4-restored/destination.metrics"))
+    except (OSError, ValueError):
+        destination = []
+    for role, records in (("source", snapshots["restored"]), ("destination", destination)):
         for name in ("ferrum_mesh_tcp_connections_opened_total", "ferrum_mesh_tcp_connections_closed_total",
                      "ferrum_mesh_tcp_sent_bytes_total", "ferrum_mesh_tcp_received_bytes_total"):
-            if matching(name) <= 0:
-                errors.append(f"{role}: missing authenticated identity-bound {name}")
-    return {"accepted": not errors, "errors": errors, "expected_transport": "mtls",
-            "source_identity": SOURCE, "destination_identity": DESTINATION,
-            "note": "proof counters include fixture probes; measured-cell connection deltas are reported separately"}
+            if not any(metric == name and labels.get("connection_security_policy") == "mutual_tls"
+                       and labels.get("destination_principal") == DESTINATION
+                       and (role == "source" or labels.get("source_principal") == SOURCE)
+                       and value > 0 for metric, labels, value in records):
+                telemetry_findings.append(f"{role}: missing authenticated identity-bound {name}")
+    return {"accepted": not errors, "transport_auth_qualified": not errors,
+            "workload_telemetry_qualified": False, "errors": errors,
+            "qualification_scope": "shipping localized-file transport/auth; operational metrics only",
+            "workload_telemetry_reasons": [
+                "Localized mesh file mode does not inject or carry a configured prometheus_metrics exporter; workload_metrics only annotates identity/policy.",
+                "Captured source egress filters hooks to builtin workload_metrics, so the required Prometheus observation marker and registry completion hook never run, even with an exporter.",
+                "Destination mTLS HBONE CONNECT is an HTTP request/response telemetry path, not a TCP stream-plugin lifecycle path."],
+            "workload_telemetry_findings": telemetry_findings,
+            "mtls_success_counts": successes, "restored_minus_denied_mtls_successes": delta,
+            "probe_record_counts": {phase: len(rows) for phase, rows in observations.items()},
+            "expected_transport": "mtls", "source_identity": SOURCE, "destination_identity": DESTINATION,
+            "note": "All raw probes/snapshots retained. Transport/auth acceptance does not qualify workload telemetry or full feature parity; counters include fixture probes."}
 
 
 def public_config(value):
@@ -287,8 +397,7 @@ def main() -> int:
     binary.add_argument("--port", type=int, required=True)
     binary.add_argument("--timeout", type=float, default=2)
     verify = sub.add_parser("verify-ferrum")
-    verify.add_argument("source", type=Path)
-    verify.add_argument("destination", type=Path)
+    verify.add_argument("directory", type=Path)
     sub.add_parser("public-config")
     consul = sub.add_parser("verify-consul")
     consul.add_argument("directory", type=Path)
@@ -311,7 +420,7 @@ def main() -> int:
             print(json.dumps({"ok": False, "error": str(error), "kind": type(error).__name__}), flush=True)
             return 1
     else:
-        result = verify_consul(args.directory) if args.command == "verify-consul" else verify_ferrum(args.source, args.destination)
+        result = verify_consul(args.directory) if args.command == "verify-consul" else verify_ferrum(args.directory)
         print(json.dumps(result, indent=2, allow_nan=False))
         return 0 if result["accepted"] else 1
     return 0

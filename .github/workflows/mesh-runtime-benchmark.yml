@@ -65,7 +65,7 @@ jobs:
         run: python3 .github/scripts/mesh_production_campaign.py accept
   symbol-preflight:
     name: Qualify Envoy production symbol companion
-    if: inputs.phase == 'smoke' || inputs.phase == 'symbols'
+    if: inputs.phase == 'symbols'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
