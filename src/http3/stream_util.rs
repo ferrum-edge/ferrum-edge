@@ -647,7 +647,7 @@ pub(crate) fn h3_request_read_error_is_client_abort(error: &h3::error::StreamErr
 /// still polled or the send half is later used to write a response.
 pub(crate) fn peer_response_stopped<S>(
     stream: &RequestStream<S, Bytes>,
-) -> impl Future<Output = bool> + Send + 'static + use<S>
+) -> impl Future<Output = bool> + Send + 'static
 where
     S: SendStreamStopped,
 {
@@ -667,15 +667,18 @@ where
 /// [`peer_response_stopped`] does, and records WHICH in `stop_sending` (issue
 /// #6772) so the typed result survives a later teardown: a gateway close during
 /// the backend teardown grace cannot then turn a proven `STOP_SENDING` into a
-/// gateway close. The future borrows only `stop_sending`, never `stream`.
-pub(crate) fn peer_response_cancelled<'a, S>(
-    stream: &RequestStream<S, Bytes>,
+/// gateway close. Takes the already-built [`peer_response_stopped`] watcher
+/// (a `'static` future) rather than the stream, so the returned future borrows
+/// only `stop_sending`, never `stream`: h3's `stopped()` is a trait-returned
+/// future that names the stream borrow, which no precise-capture bound here
+/// could exclude.
+pub(crate) fn peer_response_cancelled<'a, F>(
+    stopped: F,
     stop_sending: &'a std::sync::atomic::AtomicBool,
-) -> impl Future<Output = ()> + Send + use<'a, S>
+) -> impl Future<Output = ()> + Send + 'a
 where
-    S: SendStreamStopped,
+    F: Future<Output = bool> + Send + 'static,
 {
-    let stopped = peer_response_stopped(stream);
     async move {
         if stopped.await {
             stop_sending.store(true, std::sync::atomic::Ordering::Release);

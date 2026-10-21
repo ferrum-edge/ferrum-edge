@@ -591,8 +591,12 @@ fn the_plain_bridge_reader_records_one_classified_cause() {
     assert!(dispatch.contains(
         "letcause=PlainPeerGone::from_reader(reader_upload_failure.load(Ordering::Acquire),response_stop_sending.load(Ordering::Acquire),ctx.peer_connection.as_ref(),);"
     ));
-    assert!(dispatch.contains("peer_response_cancelled(stream,&plain_stop_sending,)"));
-    assert!(dispatch.contains("peer_response_cancelled(stream,&response_stop_sending,)"));
+    assert!(dispatch.contains(
+        "peer_response_cancelled(crate::http3::stream_util::peer_response_stopped(stream),&plain_stop_sending,)"
+    ));
+    assert!(dispatch.contains(
+        "peer_response_cancelled(crate::http3::stream_util::peer_response_stopped(stream),&response_stop_sending,)"
+    ));
     assert_eq!(dispatch.matches("cause.reset_response(stream);").count(), 2);
 }
 

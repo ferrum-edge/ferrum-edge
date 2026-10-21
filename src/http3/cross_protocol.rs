@@ -4410,7 +4410,7 @@ where
                         let header_bound = loop {
                             let stream_cancelled =
                                 crate::http3::stream_util::peer_response_cancelled(
-                                    stream,
+                                    crate::http3::stream_util::peer_response_stopped(stream),
                                     &plain_stop_sending,
                                 );
                             let attempt = crate::plugins::await_deadline_first(
@@ -5304,7 +5304,7 @@ where
                 // `STOP_SENDING` ended the wait (issue #6772).
                 let response_stop_sending = AtomicBool::new(false);
                 let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(
-                    stream,
+                    crate::http3::stream_util::peer_response_stopped(stream),
                     &response_stop_sending,
                 );
                 let reader_reset_flag = Arc::clone(&reader_peer_reset);
