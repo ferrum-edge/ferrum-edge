@@ -24,6 +24,11 @@ on:
       - .github/workflows/mesh-runtime-benchmark.yml
       - .github/workflows/mesh-runtime-harness-tests.yml
   workflow_dispatch:
+    inputs:
+      projection_checks:
+        description: "Run owned terminal metadata allocation and regression checks"
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -36,7 +41,7 @@ jobs:
   harness-tests:
     name: Mesh runtime harness tests
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 90
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
@@ -63,3 +68,26 @@ jobs:
 
       - name: Crate formatting
         run: cargo fmt --manifest-path tests/performance/mesh_runtime/Cargo.toml -- --check
+
+      - name: Runtime test prerequisites
+        if: inputs.projection_checks == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang cmake libssl-dev libcurl4-openssl-dev
+
+      - name: Terminal metadata allocation and regression checks
+        if: inputs.projection_checks == true
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          result=0
+          cargo test --locked --profile pr-build --test unit_gateway_core_tests terminal_metadata_projection -- --nocapture || result=1
+          cargo test --locked --profile pr-build --test unit_gateway_core_tests request_context_tests || result=1
+          cargo test --locked --profile pr-build --test unit_gateway_core_tests response_representation_tests || result=1
+          cargo test --locked --profile pr-build --test unit_gateway_core_tests stream_auth_lifetime_tests || result=1
+          cargo test --locked --profile pr-build --test unit_gateway_core_tests client_abort_accounting_tests || result=1
+          cargo test --locked --profile pr-build --test unit_gateway_core_tests client_abort_terminal_tests || result=1
+          cargo test --locked --profile pr-build --test integration_tests deferred_log_tests || result=1
+          cargo clippy --locked --profile pr-build --lib -- -D warnings || result=1
+          cargo fmt --all -- --check || result=1
+          exit "$result"
