@@ -1,10 +1,11 @@
-//! HTTP/1.1 closed-loop load generator for the mesh-runtime benchmark.
+//! HTTP/1.1 load generator for the mesh-runtime benchmark.
 //!
 //! One keep-alive connection per worker, fixed payload, explicit
 //! `--host-header` so mesh outbound (host-routed) listeners can be driven
 //! through an IP-literal dial. A response only counts when the status is
 //! 200 AND the echoed body bytes equal the request payload bytes.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -14,7 +15,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::SendRequest;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use mesh_runtime_perf::{BenchMetrics, MeasurementWindow};
+use mesh_runtime_perf::{BenchMetrics, FixedRateSchedule, MeasurementWindow};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 
@@ -37,6 +38,11 @@ struct Cli {
     warmup: u64,
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
     concurrency: u64,
+    /// Aggregate scheduled requests/sec across all workers. Zero keeps the
+    /// saturated closed-loop mode. Late requests retain their original due
+    /// time; slots not admitted by the common deadline are reported missed.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1_000_000_000))]
+    rate: u64,
     #[arg(long, default_value_t = 1024)]
     payload_size: usize,
     /// Deadline for one complete request/response exchange: sending the
@@ -44,6 +50,11 @@ struct Cli {
     /// exchange is recorded as a cell error and the connection is dropped.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     exchange_timeout_secs: u64,
+    /// Keep the process available for resource sampling until this many
+    /// milliseconds after the END marker. The wait follows worker drains
+    /// and is outside the measured interval; duration and RPS are unchanged.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1000))]
+    resource_end_grace_ms: u64,
     #[arg(long, default_value_t = false)]
     json: bool,
 }
@@ -72,6 +83,11 @@ async fn main() -> Result<()> {
     let (window_tx, window_rx) = watch::channel(None);
     let duration = Duration::from_secs(args.duration);
     let warmup = Duration::from_secs(args.warmup);
+    let schedule = if args.rate == 0 {
+        None
+    } else {
+        Some(Arc::new(FixedRateSchedule::new(args.rate, args.duration)?))
+    };
     let target = ExchangeTarget {
         host,
         port,
@@ -85,8 +101,9 @@ async fn main() -> Result<()> {
         let target = target.clone();
         let barrier = barrier.clone();
         let window_rx = window_rx.clone();
+        let schedule = schedule.clone();
         handles.push(tokio::spawn(async move {
-            worker(target, barrier, window_rx, warmup).await
+            worker(target, barrier, window_rx, warmup, schedule).await
         }));
     }
     barrier.wait().await;
@@ -97,6 +114,8 @@ async fn main() -> Result<()> {
     // worker drains. Host CPU samplers can exclude both warmup and drain.
     tokio::time::sleep_until(tokio::time::Instant::from_std(epoch + duration)).await;
     eprintln!("MESH_BENCH_MEASUREMENT_END");
+    let resource_end_grace_deadline =
+        Instant::now() + Duration::from_millis(args.resource_end_grace_ms);
 
     let mut combined = BenchMetrics::new();
     let mut worker_join_failed = false;
@@ -109,8 +128,17 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // Host observers may receive END after every worker has already finished.
+    // Preserve the process for their final /proc sample without adding time
+    // to the common measurement window or delaying in-flight worker drains.
+    if args.resource_end_grace_ms > 0 {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(resource_end_grace_deadline)).await;
+    }
     if worker_join_failed {
         return Err(anyhow::anyhow!("one or more load-generator workers failed"));
+    }
+    if let Some(schedule) = &schedule {
+        combined.configure_fixed_rate(schedule);
     }
 
     if args.json {
@@ -155,6 +183,26 @@ async fn main() -> Result<()> {
             r.warmup_errors,
             r.rps
         );
+        if args.rate > 0 {
+            println!(
+                "  Scheduled {} req/s: {} offered, {} admitted, {} missed\n  Scheduled latency p50 {}us p95 {}us p99 {}us max {}us\n  Scheduled successful cohort {} requests: p50 {}us p95 {}us p99 {}us max {}us\n  Admission delay p99 {}us max {}us",
+                r.rate,
+                r.offered_requests,
+                r.admitted_requests,
+                r.missed_requests,
+                r.scheduled_p50_us,
+                r.scheduled_p95_us,
+                r.scheduled_p99_us,
+                r.scheduled_latency_max_us,
+                r.cohort_scheduled_requests,
+                r.cohort_scheduled_p50_us,
+                r.cohort_scheduled_p95_us,
+                r.cohort_scheduled_p99_us,
+                r.cohort_scheduled_latency_max_us,
+                r.admission_delay_p99_us,
+                r.admission_delay_max_us,
+            );
+        }
     }
     Ok(())
 }
@@ -164,6 +212,7 @@ async fn worker(
     barrier: std::sync::Arc<tokio::sync::Barrier>,
     mut window_rx: watch::Receiver<Option<MeasurementWindow>>,
     warmup: Duration,
+    schedule: Option<Arc<FixedRateSchedule>>,
 ) -> BenchMetrics {
     let mut metrics = BenchMetrics::new();
     // Setup and optional warmup are excluded from throughput and latency.
@@ -197,7 +246,11 @@ async fn worker(
     }
     let window = *window_rx.borrow_and_update();
     if let Some(window) = window {
-        run_phase(&target, &mut sender, window, Phase::Measured, &mut metrics).await;
+        if let Some(schedule) = schedule {
+            run_scheduled_phase(&target, &mut sender, window, &schedule, &mut metrics).await;
+        } else {
+            run_phase(&target, &mut sender, window, Phase::Measured, &mut metrics).await;
+        }
     } else {
         metrics.record_error();
     }
@@ -259,6 +312,9 @@ async fn run_phase(
             *sender = Some(send);
             break;
         }
+        if matches!(phase, Phase::Measured) {
+            metrics.record_admission();
+        }
         match complete_exchange(send, target).await {
             Ok((send, bytes)) => {
                 let completed_at = Instant::now();
@@ -273,7 +329,76 @@ async fn run_phase(
                 }
                 *sender = Some(send);
             }
-            Err(_) => phase.record_error(metrics),
+            Err(_) => match phase {
+                Phase::Warmup => metrics.record_warmup_error(),
+                Phase::Measured => metrics.record_admitted_error(),
+            },
+        }
+    }
+}
+
+async fn run_scheduled_phase(
+    target: &ExchangeTarget,
+    sender: &mut Option<SendRequest<Full<Bytes>>>,
+    window: MeasurementWindow,
+    schedule: &FixedRateSchedule,
+    metrics: &mut BenchMetrics,
+) {
+    while window.contains(Instant::now()) {
+        let Some(offset) = schedule.claim() else {
+            break;
+        };
+        let due = window.start() + offset;
+        // One future reservation per worker spreads low aggregate rates
+        // across the exact same global schedule regardless of concurrency.
+        // No busy wait and no relative sleep that drifts with service time.
+        tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
+        if !window.contains(Instant::now()) {
+            break;
+        }
+
+        let send = match sender.take() {
+            Some(s) if !s.is_closed() => s,
+            _ => {
+                // Connection admission also ends at the shared deadline.
+                // The exchange deadline starts only after admission, and
+                // bounds any successful or failed postdeadline drain.
+                match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(window.deadline()),
+                    open_conn(&target.host, target.port),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => {
+                        metrics.record_error();
+                        // Refused connects may complete immediately; retain
+                        // the saturated path's bounded retry backoff.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        let admitted_at = Instant::now();
+        if !window.contains(admitted_at) {
+            *sender = Some(send);
+            break;
+        }
+        metrics.record_scheduled_admission(due, admitted_at);
+        match complete_exchange(send, target).await {
+            Ok((send, bytes)) => {
+                metrics.record_scheduled_completion(
+                    window,
+                    due,
+                    admitted_at,
+                    Instant::now(),
+                    bytes,
+                );
+                *sender = Some(send);
+            }
+            Err(_) => metrics.record_admitted_error(),
         }
     }
 }

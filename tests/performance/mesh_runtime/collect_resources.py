@@ -71,6 +71,20 @@ def run(args: argparse.Namespace) -> int:
         report["idle_alloc_begin"] = allocation_snapshot(args.allocation_url)
         time.sleep(1)
         report["idle_alloc_end"] = allocation_snapshot(args.allocation_url)
+    observer = None
+    observed = []
+    auxiliary = []
+    observations = []
+    detail_begin = detail_end = None
+    if args.production_observe:
+        import production_observer as observer
+        observed = [observer.inspect_container(c["name"]) for c in containers]
+        auxiliary = [observer.inspect_container(name) for name in args.aux_container]
+        report["production"] = {"proxy_containers": observed, "auxiliary_containers": auxiliary,
+            "limits": "shared runner; no CPU quota; thread scheduling is not Tokio task wakes; sampled sockets can miss churn",
+            "metric_scope": "before loadgen launch through completed drain (includes warmup)",
+            "socket_interval_seconds": 1.0}
+        observer.metrics(args.mesh, observed, args.resources.parent, "before")
     begin = None
     finish = None
     samples: list[int] = []
@@ -79,12 +93,17 @@ def run(args: argparse.Namespace) -> int:
     def snapshot() -> dict:
         return {"monotonic": time.monotonic(), "host": host_snapshot(),
                 "processes": [process_snapshot(c["pid"]) for c in containers],
+                "auxiliary": [process_snapshot(c["pid"]) for c in auxiliary],
                 "allocation_counters": allocation_snapshot(args.allocation_url) if args.allocation_url else []}
 
     def sample() -> None:
+        next_detail = time.monotonic() + 1.0
         while not stop.wait(0.1):
             try:
                 samples.append(sum(process_snapshot(c["pid"])["rss_bytes"] for c in containers))
+                if observer is not None and time.monotonic() >= next_detail:
+                    observations.append(observer.snapshot(observed))
+                    next_detail += 1.0
             except (OSError, ValueError, IndexError) as exc:
                 report["errors"].append(str(exc))
                 return
@@ -92,12 +111,28 @@ def run(args: argparse.Namespace) -> int:
     sampler = None
     print(f"[measure] starting {args.mesh}: warmup={args.warmup}s duration={args.duration}s", file=sys.stderr, flush=True)
     with args.output.open("w") as output:
-        child = subprocess.Popen(["docker", "run", "--rm", "--network", "host", "--name", args.loadgen_name, args.image,
+        network_args = ["--network", args.loadgen_network]
+        if args.loadgen_user:
+            network_args += ["--user", args.loadgen_user]
+        child = subprocess.Popen(["docker", "run", "--rm", *network_args, "--name", args.loadgen_name, args.image,
             "--target", args.target, "--host-header", args.host_header, "--mesh", args.mesh,
             "--duration", args.duration, "--concurrency", args.concurrency,
             "--warmup", args.warmup, "--payload-size", args.payload_size,
-            "--exchange-timeout-secs", str(args.exchange_timeout_secs), "--json"],
+            "--exchange-timeout-secs", str(args.exchange_timeout_secs), "--rate", str(args.rate), "--resource-end-grace-ms", "250", "--json"],
             stdout=output, stderr=subprocess.PIPE, text=True, bufsize=1)
+        if observer is not None:
+            # Discover the child during warmup, before the CPU boundary. The
+            # retry budget is bounded; a missing child invalidates observations.
+            for attempt in range(20):
+                try:
+                    child_info = observer.inspect_container(args.loadgen_name)
+                    auxiliary.append(child_info)
+                    report["production"]["auxiliary_containers"] = auxiliary
+                    break
+                except (subprocess.CalledProcessError, ValueError):
+                    time.sleep(0.05)
+            else:
+                report["errors"].append("loadgen PID unavailable during warmup")
         assert child.stderr is not None
         for line in child.stderr:
             sys.stderr.write(line)
@@ -106,11 +141,15 @@ def run(args: argparse.Namespace) -> int:
             try:
                 if marker == START and begin is None:
                     begin = snapshot()
+                    if observer is not None:
+                        detail_begin = observer.snapshot(observed)
                     sampler = threading.Thread(target=sample, daemon=True)
                     sampler.start()
                 elif marker == END and begin is not None and finish is None:
                     finish = snapshot()
                     stop.set()
+                    if observer is not None:
+                        detail_end = observer.snapshot(observed)
             except (OSError, ValueError, IndexError) as exc:
                 report["errors"].append(str(exc))
         status = child.wait()
@@ -118,6 +157,12 @@ def run(args: argparse.Namespace) -> int:
     stop.set()
     if sampler is not None:
         sampler.join(timeout=2)
+    if observer is not None:
+        observer.metrics(args.mesh, observed, args.resources.parent, "after")
+        report["production"].update({"begin": detail_begin, "end": detail_end,
+                                     "socket_samples": observations})
+        if detail_begin is not None and detail_end is not None:
+            report["production"]["scheduler_deltas"] = observer.scheduler_deltas(detail_begin, detail_end)
     if begin is None or finish is None:
         report["errors"].append("missing measurement phase marker")
     else:
@@ -131,7 +176,17 @@ def run(args: argparse.Namespace) -> int:
             ticks += after["cpu_ticks"] - before["cpu_ticks"]
         total = finish["host"]["total_ticks"] - begin["host"]["total_ticks"]
         steal = finish["host"]["steal_ticks"] - begin["host"]["steal_ticks"]
+        auxiliary_cpu = []
+        for index, (before, after) in enumerate(zip(begin["auxiliary"], finish["auxiliary"])):
+            if before["starttime"] != after["starttime"]:
+                report["errors"].append("auxiliary PID changed during measurement")
+            auxiliary_cpu.append({"name": auxiliary[index]["name"],
+                "cpu_seconds": (after["cpu_ticks"]-before["cpu_ticks"])/report["clock_ticks_per_second"],
+                "rss_bytes_end": after["rss_bytes"]})
+        deviation = elapsed - float(args.duration)
         report.update({"elapsed_seconds": elapsed,
+                       "interval_deviation_seconds": deviation,
+                       "auxiliary_cpu": auxiliary_cpu,
                        "proxy_cpu_seconds": ticks / report["clock_ticks_per_second"],
                        "host_cpu_steal_percent": 100 * steal / total if total > 0 else None,
                        "proxy_rss_bytes_peak": max(samples, default=0),
@@ -139,6 +194,8 @@ def run(args: argparse.Namespace) -> int:
                        "rss_samples": len(samples)})
         if elapsed <= 0 or total <= 0 or steal < 0 or ticks < 0:
             report["errors"].append("invalid counter interval")
+        if abs(deviation) > max(0.25, float(args.duration)*0.02):
+            report["errors"].append("CPU interval exceeds marker jitter budget")
         report["valid"] = not report["errors"]
     args.resources.write_text(json.dumps(report, indent=2) + "\n")
     return status if status else (0 if report["valid"] else 1)
@@ -147,6 +204,13 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--container", action="append", default=[])
+    parser.add_argument("--production-observe", action="store_true")
+    parser.add_argument("--aux-container", action="append", default=[])
+    parser.add_argument("--client-name")
+    parser.add_argument("--server-name")
+    parser.add_argument("--rate", type=int, default=0)
+    parser.add_argument("--loadgen-network", default="host")
+    parser.add_argument("--loadgen-user", default="")
     parser.add_argument("--allocation-url", action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resources", type=Path, required=True)

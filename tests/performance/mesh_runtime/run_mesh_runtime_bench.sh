@@ -369,6 +369,7 @@ start_ferrum() {
     docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/ferrum/svid:ro" \
+        -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
         -e FERRUM_MODE=mesh \
         -e FERRUM_NAMESPACE=ferrum \
         -e FERRUM_MESH_TOPOLOGY=sidecar \
@@ -393,6 +394,7 @@ start_ferrum() {
     docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/client:/etc/ferrum/svid:ro" \
+        -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
         -e FERRUM_MODE=mesh \
         -e FERRUM_NAMESPACE=ferrum \
         -e FERRUM_MESH_TOPOLOGY=sidecar \
@@ -430,11 +432,11 @@ start_envoy() {
     docker run -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/server.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/mesh-certs/svc:ro" \
-        "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 0 -l error >/dev/null
+        "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 0 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
     docker run -d --network host --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/client.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/client:/etc/mesh-certs/client:ro" \
-        "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 1 -l error >/dev/null
+        "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 1 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
 }
 
 start_consul() {
@@ -484,10 +486,10 @@ start_consul() {
     # otherwise collide on the base-id domain socket.
     docker run -d --network host --name "$SERVER_NAME" \
         -v "$RUNTIME_DIR/consul/svc-bootstrap.json:/bootstrap.json:ro" \
-        "$ENVOY_IMAGE" -c /bootstrap.json --base-id 0 -l error >/dev/null
+        "$ENVOY_IMAGE" -c /bootstrap.json --base-id 0 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
     docker run -d --network host --name "$CLIENT_NAME" \
         -v "$RUNTIME_DIR/consul/client-bootstrap.json:/bootstrap.json:ro" \
-        "$ENVOY_IMAGE" -c /bootstrap.json --base-id 1 -l error >/dev/null
+        "$ENVOY_IMAGE" -c /bootstrap.json --base-id 1 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
 }
 
 # Consul-native authorization probe: a deny intention for client->svc
@@ -592,11 +594,21 @@ run_cell() {
     if [ "$MESH" = ferrum ] && [ "$BENCH_FERRUM_FEATURES" = cloud-secrets,bench-h1-profile ]; then
         resource_args+=(--allocation-url http://127.0.0.1:15120/metrics --allocation-url http://127.0.0.1:15020/metrics)
     fi
+    if [ "${BENCH_PRODUCTION_OBSERVE:-false}" = true ]; then
+        resource_args+=(--production-observe --aux-container "$BACKEND_NAME"
+            --client-name "$CLIENT_NAME" --server-name "$SERVER_NAME")
+        if [ "$MESH" = consul ] || [ "$MESH" = consulhttp ]; then
+            resource_args+=(--aux-container "$AGENT_NAME")
+        fi
+    fi
+    resource_args+=(--rate "${BENCH_RATE:-0}" --loadgen-network "${LOADGEN_NETWORK:-host}" --loadgen-user "${LOADGEN_USER:-}")
+    local runner_prefix=()
+    if [ "${BENCH_PRODUCTION_OBSERVE:-false}" = true ]; then runner_prefix=(sudo -n); fi
     local rc=0
     local cell_budget=$((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))
     echo "[bench] cell wall budget=${cell_budget}s exchange budget=${EXCHANGE_TIMEOUT_SECS}s"
     timeout --signal=TERM --kill-after=5s "${cell_budget}s" \
-        python3 -u "$SCRIPT_DIR/collect_resources.py" "${resource_args[@]}" \
+        "${runner_prefix[@]}" python3 -u "$SCRIPT_DIR/collect_resources.py" "${resource_args[@]}" \
         --output "$out" --resources "${out%.json}.resources.json" --image "$TOOLS_IMAGE" \
         --loadgen-name "$LOADGEN_NAME" --exchange-timeout-secs "$EXCHANGE_TIMEOUT_SECS" \
         --target "$target" --host-header "$HOST_HEADER" --mesh "$MESH" \

@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -88,7 +88,27 @@ impl EchoPeer {
     }
 
     fn spawn_loadgen(&self, warmup: &str, concurrency: &str) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_mesh_loadgen"))
+        self.spawn_loadgen_with_rate(warmup, concurrency, None)
+    }
+
+    fn spawn_loadgen_with_rate(
+        &self,
+        warmup: &str,
+        concurrency: &str,
+        rate: Option<&str>,
+    ) -> Child {
+        self.spawn_loadgen_with_rate_and_grace(warmup, concurrency, rate, None)
+    }
+
+    fn spawn_loadgen_with_rate_and_grace(
+        &self,
+        warmup: &str,
+        concurrency: &str,
+        rate: Option<&str>,
+        resource_end_grace_ms: Option<&str>,
+    ) -> Child {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mesh_loadgen"));
+        command
             .kill_on_drop(true)
             .args([
                 "--target",
@@ -106,9 +126,14 @@ impl EchoPeer {
                 "--json",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run mesh_loadgen")
+            .stderr(Stdio::piped());
+        if let Some(rate) = rate {
+            command.args(["--rate", rate]);
+        }
+        if let Some(grace) = resource_end_grace_ms {
+            command.args(["--resource-end-grace-ms", grace]);
+        }
+        command.spawn().expect("run mesh_loadgen")
     }
 }
 
@@ -237,6 +262,11 @@ async fn warmup_and_measurement_reuse_each_workers_connection() {
     assert_eq!(report["warmup_errors"], 0);
     assert_eq!(report["total_errors"], 0);
     assert_eq!(report["cohort_requests"], useful + drained);
+    assert_eq!(report["admitted_requests"], useful + drained);
+    assert_eq!(report["rate"], 0);
+    assert_eq!(report["offered_requests"], 0);
+    assert_eq!(report["missed_requests"], 0);
+    assert_eq!(report["cohort_scheduled_requests"], 0);
     assert_eq!(
         peer.connections.load(Ordering::SeqCst),
         2,
@@ -263,4 +293,109 @@ async fn wrong_status_or_equal_length_wrong_body_is_an_error() {
         assert_eq!(report["cohort_requests"], 0);
         assert!(report["total_errors"].as_u64().expect("errors") > 0);
     }
+}
+
+#[tokio::test]
+async fn fixed_rate_overload_counts_every_unstarted_slot_and_drains_admitted_echo() {
+    let gate = Arc::new(Semaphore::new(0));
+    let peer = EchoPeer::new(ResponseMode::Held(gate.clone())).await;
+    let mut child = peer.spawn_loadgen_with_rate("0", "1", Some("10"));
+    wait_for_measurement_end(&mut child).await;
+    assert!(child.try_wait().expect("check loadgen process").is_none());
+    assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
+    gate.add_permits(1);
+
+    let report = report(child).await;
+    assert_eq!(report["rate"], 10);
+    assert_eq!(report["offered_requests"], 10);
+    assert_eq!(report["admitted_requests"], 1);
+    assert_eq!(report["missed_requests"], 9);
+    assert_eq!(report["total_requests"], 0);
+    assert_eq!(report["scheduled_requests"], 0);
+    assert_eq!(report["drained_requests"], 1);
+    assert_eq!(report["cohort_requests"], 1);
+    assert_eq!(report["cohort_scheduled_requests"], 1);
+    assert_eq!(report["admitted_errors"], 0);
+    assert_eq!(report["total_errors"], 0);
+    assert!(
+        report["cohort_scheduled_p99_us"].as_u64().unwrap()
+            >= report["cohort_p99_us"].as_u64().unwrap()
+    );
+    assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn low_aggregate_rate_reuses_warmup_connections_with_more_workers_than_slots() {
+    let peer = EchoPeer::new(ResponseMode::Echo).await;
+    let report = report(peer.spawn_loadgen_with_rate("1", "4", Some("2"))).await;
+    let warmup = report["warmup_requests"].as_u64().unwrap();
+    assert!(warmup >= 4);
+    assert_eq!(report["rate"], 2);
+    assert_eq!(report["offered_requests"], 2);
+    assert_eq!(report["admitted_requests"], 2);
+    assert_eq!(report["missed_requests"], 0);
+    assert_eq!(report["cohort_requests"], 2);
+    assert_eq!(report["cohort_scheduled_requests"], 2);
+    assert_eq!(report["admitted_errors"], 0);
+    assert_eq!(report["warmup_errors"], 0);
+    assert_eq!(report["total_errors"], 0);
+    assert_eq!(peer.connections.load(Ordering::SeqCst), 4);
+    assert_eq!(peer.requests.load(Ordering::SeqCst), warmup + 2);
+}
+
+#[tokio::test]
+async fn fixed_rate_invalid_echo_is_an_admitted_error_without_latency_samples() {
+    for mode in [ResponseMode::WrongStatus, ResponseMode::WrongBody] {
+        let peer = EchoPeer::new(mode).await;
+        let report = report(peer.spawn_loadgen_with_rate("0", "1", Some("2"))).await;
+        assert_eq!(report["offered_requests"], 2);
+        assert_eq!(report["admitted_requests"], 2);
+        assert_eq!(report["admitted_errors"], 2);
+        assert_eq!(report["missed_requests"], 0);
+        assert_eq!(report["total_errors"], 2);
+        assert_eq!(report["cohort_requests"], 0);
+        assert_eq!(report["cohort_scheduled_requests"], 0);
+        assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn explicit_zero_rate_keeps_saturated_admission_and_service_accounting() {
+    let peer = EchoPeer::new(ResponseMode::Echo).await;
+    let report = report(peer.spawn_loadgen_with_rate("0", "1", Some("0"))).await;
+    let cohort = report["cohort_requests"].as_u64().unwrap();
+    assert!(cohort > 2, "zero rate should continue saturated traffic");
+    assert_eq!(report["admitted_requests"], cohort);
+    assert_eq!(report["rate"], 0);
+    assert_eq!(report["offered_requests"], 0);
+    assert_eq!(report["missed_requests"], 0);
+    assert_eq!(report["cohort_scheduled_requests"], 0);
+    assert_eq!(report["admission_delay_max_us"], 0);
+    assert_eq!(report["total_errors"], 0);
+}
+
+#[tokio::test]
+async fn resource_end_grace_preserves_process_after_end_without_extending_measurement() {
+    let peer = EchoPeer::new(ResponseMode::Echo).await;
+    let spawned_at = Instant::now();
+    let mut child = peer.spawn_loadgen_with_rate_and_grace("0", "1", Some("1"), Some("1000"));
+    wait_for_measurement_end(&mut child).await;
+    assert!(
+        child.try_wait().expect("check loadgen process").is_none(),
+        "resource observer must be able to inspect the process after END"
+    );
+
+    let report = report(child).await;
+    // One second of measurement plus one second of grace, independent of
+    // how promptly this test task receives the child's buffered END marker.
+    assert!(spawned_at.elapsed() >= Duration::from_secs(2));
+    assert_eq!(report["duration_secs"], 1);
+    assert_eq!(report["offered_requests"], 1);
+    assert_eq!(report["admitted_requests"], 1);
+    assert_eq!(report["total_requests"], 1);
+    assert_eq!(report["rps"], 1.0);
+    assert_eq!(report["missed_requests"], 0);
+    assert_eq!(report["drained_requests"], 0);
+    assert_eq!(report["total_errors"], 0);
+    assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
 }

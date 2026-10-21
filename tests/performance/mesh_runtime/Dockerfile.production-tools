@@ -1,0 +1,12 @@
+# Standalone load tools only. All compilation and tests run in remote CI.
+FROM rust:1-slim-bookworm@sha256:f48da6dc0c99631cb89cc86b041e3ba8bc17dfab112e9ce85176d02cf220d660 AS builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY tests ./tests
+RUN rustc --version && cargo --version && cargo test --locked && cargo build --locked --release --bins
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /build/target/release/mesh_loadgen /usr/local/bin/mesh_loadgen
+COPY --from=builder /build/target/release/mesh_backend /usr/local/bin/mesh_backend
+COPY --from=builder /build/target/release/mesh_tls_probe /usr/local/bin/mesh_tls_probe
+ENTRYPOINT ["/usr/local/bin/mesh_loadgen"]
