@@ -2432,6 +2432,12 @@ pub mod _test_support {
         crate::proxy::http_backend_failure_status_and_body(class)
     }
 
+    pub fn internal_error_fallback_response_for_test(
+        body: &'static str,
+    ) -> hyper::Response<crate::proxy::ProxyBody> {
+        crate::proxy::internal_error_fallback_response(body)
+    }
+
     pub fn x_gateway_error_for_backend_failure_for_test(
         connection_error: bool,
         status: u16,

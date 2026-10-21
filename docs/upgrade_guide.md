@@ -28,6 +28,37 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Gateway-authored status codes follow the failure cause (issues #6770, #6771, #6773, #6775)
+
+- A backend **connect timeout** now answers `504` `{"error":"Backend timeout"}`
+  instead of `502` `{"error":"Backend unavailable"}` on every HTTP-family
+  transport (reqwest, direct HTTP/2, native HTTP/3, the HTTP/3 bridge, HBONE,
+  sidecar mTLS). It is still a pre-wire connection failure:
+  `error_class=connection_timeout`, `X-Gateway-Error: connection_failure`,
+  `retry_on_connect_failure` replay, target rotation, and circuit-breaker
+  accounting are unchanged. A `retryable_status_codes` list containing `504`
+  does not make it status-retryable.
+- A DestinationRule `maxConnections` refusal on the pooled transports (direct
+  HTTP/2, native HTTP/3, HBONE, sidecar mTLS) now answers `503`
+  `{"error":"Backend connection limit exceeded"}`, matching reqwest, the
+  Unix-socket pool, and raw TCP. `error_class=backend_connection_limit` stays
+  pre-wire and backend-health-neutral.
+- A native gRPC `GrpcProxyError::Internal` terminal (backend TLS config or
+  backend URL/authority could not be built) on HTTP/1.1 and HTTP/2 now carries
+  `grpc-status: 13` (`INTERNAL`) with `grpc-message: Internal gateway error`,
+  as HTTP/3 already did, instead of `14` (`UNAVAILABLE`).
+- A response the HTTP/1.1 / HTTP/2 response builder rejects now answers an
+  explicit `500` (it used to fall back to a `200` carrying an error body), and
+  the transaction log records `500`.
+- `FERRUM_VIA_PSEUDONYM` must be an RFC 9110 token, optionally followed by
+  `:<port>`; startup rejects other values.
+
+**Operator action:** dashboards or alerts that count connect timeouts by
+`502`, or `maxConnections` saturation by `502`, should select by `error_class`
+(`connection_timeout`, `backend_connection_limit`) or the new status. gRPC
+clients that retried `UNAVAILABLE` will no longer retry a deterministic
+gateway configuration fault.
+
 ### Plugin-config writes require `expected_proxy_ids` (forge-ops #569, PR #6744)
 
 `PUT` and `DELETE /plugins/config/{id}` now require the

@@ -9912,9 +9912,10 @@ where
                     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
                     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                 ),
-                grpc_proxy::GrpcProxyError::Internal(_) => {
-                    (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
-                }
+                grpc_proxy::GrpcProxyError::Internal(_) => (
+                    grpc_proxy::grpc_status::INTERNAL,
+                    grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
+                ),
                 grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
@@ -10574,9 +10575,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
                         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                     ),
-                    grpc_proxy::GrpcProxyError::Internal(_) => {
-                        (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
-                    }
+                    grpc_proxy::GrpcProxyError::Internal(_) => (
+                        grpc_proxy::grpc_status::INTERNAL,
+                        grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
+                    ),
                     grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                     }

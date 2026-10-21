@@ -13,7 +13,7 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | Variant | Meaning | `request_reached_wire`? |
 |---|---|---|
 | `ConnectionRefused` | TCP connect refused (port not listening, firewall RST). Includes connect-phase RSTs (functionally indistinguishable from ECONNREFUSED). A TLS handshake failure that a setup-phase caller observes after TCP connect — including `rustls::Error` wrapped as `io::Error` with `ConnectionReset` — is **not** this class; that is `TlsError`. Without independent setup-phase evidence a rustls error is `ConnectionReset` (see the phase rule below). | `false` (pre-wire) |
-| `ConnectionTimeout` | TCP connect did not complete before the configured timeout. | `false` (pre-wire) |
+| `ConnectionTimeout` | TCP connect did not complete before the configured timeout. Client-visible HTTP `504` `{"error":"Backend timeout"}` (issue #6770); still pre-wire, so `retry_on_connect_failure`, target rotation, the circuit-breaker connect path and `X-Gateway-Error: connection_failure` are unchanged. | `false` (pre-wire) |
 | `ConnectionReset` | Mid-stream RST received after the connection was established **and** (for TLS) after the handshake completed. A typed rustls handshake/alert/certificate error is `TlsError` only when the caller independently knows it is still in setup (`phase_is_connect`); otherwise — for example a rustls error surfacing after reqwest's TCP-only connect phase — it is conservatively this class, because the alert kind does not prove the request was never sent. An origin that RSTs during handshake with **no** rustls error in the chain is indistinguishable from a mid-stream RST and stays here. | `true` (post-wire) |
 | `ConnectionClosed` | Peer sent FIN before a response was completed; broken pipe; aborted connection; post-connect `UnexpectedEof` / hyper incomplete message (truncated HTTP body). | `true` (post-wire) |
 | `DnsLookupError` | Hostname could not be resolved. | `false` (pre-wire) |
@@ -28,7 +28,7 @@ Every classifier funnels its result into [`crate::retry::ErrorClass`](../src/ret
 | `ClientDisconnect` | Client gave up before the gateway could complete the response. | `true` (post-wire) |
 | `GracefulRemoteClose` | Peer closed the session cleanly: HTTP/3 `H3_NO_ERROR`/GOAWAY at the response read boundary, or RFC 6455 Close frame on a WebSocket. Excluded from H3 capability downgrades so a backend that closes after every response stays on H3. | `true` (post-wire) |
 | `DispatchPolicyRejected` | Terminal gateway policy decision, including pre-dial egress/SNI policy, opaque-TLS SNI admission refusals (issue #4407), admission overflow, final request-body hook rejection, and response-transformer output above the effective response ceiling (issue #4784). It is non-retryable and backend-health-neutral. | `true` (gateway-local terminal) |
-| `BackendConnectionLimit` | The gateway refused to open a NEW physical backend connection because the destination is already at its DestinationRule `connectionPool.tcp.maxConnections` ceiling (`src/backend_conn_limit.rs`). Emitted by direct H2, gRPC, native H3, HBONE, and Sidecar mesh-mTLS. With `TrustWithdrawn` (the other gateway-side policy refusal) it is one of only two classes that are simultaneously pre-wire (so `retry_on_connect_failure` may rotate to another target with its own admission lane) and backend-health-neutral (`client_side_no_backend_signal`) — a saturated operator-configured ceiling is gateway policy, not evidence about the backend, so it must not trip the circuit breaker, ding passive health, penalize the load balancer, or shrink the adaptive-concurrency permit. The raw-TCP over-cap path records `cb.record_neutral()` for the same reason. The reqwest/HTTP-1.1 and WebSocket lanes instead answer `503` / `DispatchPolicyRejected` because they do not rotate. | `false` (pre-wire) |
+| `BackendConnectionLimit` | The gateway refused to open a NEW physical backend connection because the destination is already at its DestinationRule `connectionPool.tcp.maxConnections` ceiling (`src/backend_conn_limit.rs`). Emitted by direct H2, gRPC, native H3, HBONE, and Sidecar mesh-mTLS. With `TrustWithdrawn` (the other gateway-side policy refusal) it is one of only two classes that are simultaneously pre-wire (so `retry_on_connect_failure` may rotate to another target with its own admission lane) and backend-health-neutral (`client_side_no_backend_signal`) — a saturated operator-configured ceiling is gateway policy, not evidence about the backend, so it must not trip the circuit breaker, ding passive health, penalize the load balancer, or shrink the adaptive-concurrency permit. The raw-TCP over-cap path records `cb.record_neutral()` for the same reason. Every HTTP-family transport answers the terminal refusal with HTTP `503` `{"error":"Backend connection limit exceeded"}` (issue #6771) — no upstream response was invalid, so it is never a `502`; native gRPC keeps `RESOURCE_EXHAUSTED`/its capacity terminal. The reqwest/HTTP-1.1 and WebSocket lanes answer the same `503` but classify it `DispatchPolicyRejected` because they do not rotate. | `false` (pre-wire) |
 | `TrustWithdrawn` | An accepted gateway trust publication withdrew an authority, so a gateway-to-mesh TLS transport was refused (`src/proxy/mesh_trust_registry.rs`, issue #3859): either the connection was dialed under the outgoing trust generation and refused at registration, or a checked-out HBONE tunnel / mesh-mTLS sender was retired before it could open the next stream. Emitted by the HBONE and Sidecar mesh-mTLS pools and by native gRPC over either. Like `BackendConnectionLimit` it is simultaneously pre-wire (so `retry_on_connect_failure` may re-dial — and the redial succeeds, because the accepted generation is already published) and backend-health-neutral (`client_side_no_backend_signal`) — withdrawing a root is gateway policy, not evidence about the destination workload, so it must not trip the circuit breaker, ding passive health, penalize the load balancer, or shrink the adaptive-concurrency permit. The generic `ConnectionPoolError` would open breakers across every mesh destination live at the instant of a revocation. | `false` (pre-wire) |
 | `RequestError` | Catch-all for unclassified gateway-side rejections and unknown failure modes. | `true` (post-wire) |
 
@@ -211,7 +211,7 @@ Construction sites attach a typed `source` so [`is_port_exhaustion`](../src/retr
 
 A body-read failure after the response headers arrived is always post-wire: `connection_error` stays `false` and `retry_on_connect_failure` can never replay a request the backend already processed.
 
-The same mapping applies when the backend never produces response headers at all. Live HTTP-family dispatch (reqwest streaming and retry, H3 cross-protocol reqwest, direct H2 send, native H3, and the dedicated H2/HBONE/sidecar/unix header-wait and body-collect timeout arms) classifies through `ErrorClass` and then [`http_backend_failure_status_and_body`](../src/proxy/mod.rs) / [`http_backend_dispatch_error_response`](../src/proxy/mod.rs). `ReadWriteTimeout` is **504** with `{"error":"Backend timeout"}` (and `X-Gateway-Error: backend_timeout`); connect/refused/unavailable classes stay **502** with `{"error":"Backend unavailable"}` (and `X-Gateway-Error: connection_failure` when `connection_error` is set). A route-total deadline that expires after dispatch begins is `ReadWriteTimeout` even if the `send()` call is still establishing the TCP/TLS connection; this handoff marker is set immediately before `send()`, not after the backend accepts the connection or receives request bytes. That is the public pair README Troubleshooting documents.
+The same mapping applies when the backend never produces response headers at all. Live HTTP-family dispatch (reqwest streaming and retry, H3 cross-protocol reqwest, direct H2 send, native H3, and the dedicated H2/HBONE/sidecar/unix header-wait and body-collect timeout arms) classifies through `ErrorClass` and then [`http_backend_failure_status_and_body`](../src/proxy/mod.rs) / [`http_backend_dispatch_error_response`](../src/proxy/mod.rs). `ReadWriteTimeout` is **504** with `{"error":"Backend timeout"}` (and `X-Gateway-Error: backend_timeout`). `ConnectionTimeout` is also **504** with the same body (issue #6770) but stays a pre-wire connection failure, so it carries `X-Gateway-Error: connection_failure` and keeps its connect-failure retry/circuit-breaker semantics. `BackendConnectionLimit` (a DestinationRule `maxConnections` refusal before any dial) is **503** with `{"error":"Backend connection limit exceeded"}` (issue #6771). Refused/DNS/TLS/pool/protocol classes stay **502** with `{"error":"Backend unavailable"}` (and `X-Gateway-Error: connection_failure` when `connection_error` is set). A route-total deadline that expires after dispatch begins is `ReadWriteTimeout` even if the `send()` call is still establishing the TCP/TLS connection; this handoff marker is set immediately before `send()`, not after the backend accepts the connection or receives request bytes. That is the public pair README Troubleshooting documents.
 
 The eager-buffer path (`buffered_backend_response_from_eager_collect` in [`src/proxy/mod.rs`](../src/proxy/mod.rs)) and the buffered reqwest collector (`collect_response_with_limit`) both classify through `classify_reqwest_error` rather than hardcoding one class. Idle `backend_read_timeout_ms` between buffered chunks (`next_reqwest_chunk_idle`) surfaces here as `ReadWriteTimeout` and uses the same 504 mapping as the dispatch-level helper, matching the direct-H2 arm's `HyperBodyCollectError::ReadTimeout` and the native-H3 read-timeout arm. Every other class keeps the 502. Identical backend behavior therefore produces the same status and `error_class` on every transport, so `TransactionSummary`, operator dashboards, and circuit-breaker `failure_status_codes` matching cannot diverge by dispatch path.
 
@@ -343,8 +343,9 @@ cannot make a response look gateway-attributed.
 The gateway then writes its own `X-Gateway-Error` only where that path
 classifies the response:
 
-- Gateway-synthesized failures (pre-wire connect/DNS/TLS `502`, backend
-  timeout and route-deadline `504`, reject-path `503`s, response-transformer
+- Gateway-synthesized failures (pre-wire connect-refused/DNS/TLS `502`,
+  connect timeout, backend timeout and route-deadline `504`, `maxConnections`
+  and reject-path `503`s, response-transformer
   output-ceiling refusals) carry their token on every protocol.
 - A backend-returned 5xx carries `backend_error` on every path that relays
   it: the HTTP/1.1 and HTTP/2 response builder, the HTTP/1.1 and HTTP/2
@@ -388,11 +389,30 @@ The headers are not authenticated, though: a client should trust them only on
 a response it received from a gateway it authenticated. When a client needs to
 confirm what the gateway saw, use a diagnostic reference (below).
 
+### Gateway-authored status codes
+
+The gateway picks the status of a response it authors from what actually
+happened, following RFC 9110 and common reverse-proxy practice:
+
+| Situation | HTTP status | Native gRPC `grpc-status` |
+|---|---|---|
+| Backend refused / reset the connection, DNS or TLS failure, invalid upstream response | `502` | `UNAVAILABLE` (14) |
+| Backend connect timeout or backend read/write timeout (the upstream did not answer in time) | `504` | `DEADLINE_EXCEEDED` (4) for a backend deadline; a connect failure, timeout included, stays `UNAVAILABLE` (14) |
+| Local capacity refusal before any dial (DestinationRule `maxConnections`, `http1MaxPendingRequests`, retained-response budget, overload, open circuit breaker) | `503` | `RESOURCE_EXHAUSTED` (8) or `UNAVAILABLE` (14), as each capacity path documents |
+| Internal gateway failure | `500` for a response-builder failure; a backend client/TLS-config build failure is a dispatch failure answered `502` | `INTERNAL` (13) on every native-gRPC frontend for `GrpcProxyError::Internal` (backend TLS config, backend URL/authority could not be built — issue #6773) |
+
+A response the gateway builds but the HTTP response builder rejects (an
+invalid header value reached it) is answered with an explicit `500` and a
+fixed body; it never falls back to `http::Response::new`'s default `200`,
+and the single terminal transaction record carries that `500` (issue #6775).
+`FERRUM_VIA_PSEUDONYM` is validated at startup for the same reason: it is
+written verbatim into every `Via` header.
+
 ### Header tokens (`X-Gateway-Error`)
 
 | Token | When |
 |---|---|
-| `connection_failure` | Pre-wire connect/DNS/TLS failure (502) |
+| `connection_failure` | Pre-wire connect-refused/DNS/TLS/pool failure (502), connect timeout (504), or a pooled-transport (direct H2, native H3, HBONE, sidecar mTLS) DestinationRule `maxConnections` refusal before dialing (503) |
 | `backend_timeout` | The backend dispatch attempt did not produce an answer before its deadline (504). A route-total deadline counts as a backend timeout once the dispatch begins `send()`, including while TCP/TLS connection establishment is still in progress; this does not mean the backend accepted the connection or received request bytes |
 | `backend_error` | Backend returned 5xx, or a post-wire 5xx without a more specific token |
 | `circuit_breaker_open` | Open-breaker 503; never reached a backend |

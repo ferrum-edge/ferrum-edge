@@ -7334,6 +7334,18 @@ impl EnvConfig {
             crate::proxy::stream_match::validate_canonical_gateway_ref(gateway_ref)
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
         }
+        // The pseudonym is written verbatim as the `received-by` element of
+        // every `Via` header the gateway emits (`1.1 <pseudonym>`). A value
+        // outside RFC 9110 §7.6.3 (`pseudonym [":" port]`, pseudonym a token)
+        // is not a valid header value at all, so the response builder would
+        // reject every response that carries it (#6775). Fail at startup.
+        if !is_valid_via_received_by(&self.via_pseudonym) {
+            return Err(
+                "FERRUM_VIA_PSEUDONYM must be an RFC 9110 token, optionally followed by \
+                 ':<port>' (letters, digits and !#$%&'*+-.^_`|~ only; no spaces)"
+                    .into(),
+            );
+        }
         // Sidecar-ingress Unix transport capacity (issue #3731). `0` is the
         // explicit "no bound" opt-out; anything above the ceiling could not be
         // reached before the process file-descriptor limit anyway, so accepting
@@ -9424,6 +9436,24 @@ impl EnvConfig {
 
         Ok(())
     }
+}
+
+/// RFC 9110 §7.6.3 `received-by` as Ferrum emits it from
+/// `FERRUM_VIA_PSEUDONYM`: a non-empty `token`, optionally followed by
+/// `:<port>` (1-5 ASCII digits).
+fn is_valid_via_received_by(value: &str) -> bool {
+    fn is_tchar(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+    let (pseudonym, port) = match value.split_once(':') {
+        Some((pseudonym, port)) => (pseudonym, Some(port)),
+        None => (value, None),
+    };
+    !pseudonym.is_empty()
+        && pseudonym.bytes().all(is_tchar)
+        && port.is_none_or(|port| {
+            (1..=5).contains(&port.len()) && port.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 /// Resolve the effective authoritative client-IP header for cold paths that

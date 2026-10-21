@@ -76,6 +76,13 @@ pub(crate) const GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER: &str =
 /// Canonical serialized `grpc-status` paired with the gateway message above.
 pub(crate) const GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER: &str = "4";
 
+/// Fixed, redaction-safe `grpc-message` for a [`GrpcProxyError::Internal`]
+/// terminal (`INTERNAL`). Shared by the HTTP/1.1-HTTP/2 and HTTP/3 native-gRPC
+/// builders so the same gateway-side failure reads the same on every frontend
+/// (#6773); the underlying error (TLS material source, URL parse text) is only
+/// logged for operators.
+pub(crate) const GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE: &str = "Internal gateway error";
+
 /// Observer fired exactly when the streaming gRPC **request source** reaches a
 /// terminal state — clean EOF, overflow abort, or stream drop (client/backend
 /// reset). Attached to the `GrpcBody::Streaming` request-body wrapper and

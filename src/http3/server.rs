@@ -12321,10 +12321,11 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
 /// Select the client-facing status + JSON body for a native-H3 backend
 /// dispatch failure. Classification is the shared HTTP-family mapper
 /// (`crate::proxy::http_backend_failure_status_and_body`): a
-/// `backend_read_timeout_ms` deadline expiry (`ReadWriteTimeout`) maps to
-/// 504 `{"error":"Backend timeout"}`, matching the reqwest / direct-H2 /
-/// HBONE / sidecar-mTLS arms, while every other failure keeps the generic
-/// 502 `{"error":"Backend unavailable"}`.
+/// `backend_read_timeout_ms` deadline expiry (`ReadWriteTimeout`) or a connect
+/// timeout (`ConnectionTimeout`) maps to 504 `{"error":"Backend timeout"}`, a
+/// DestinationRule `maxConnections` refusal (`BackendConnectionLimit`) to 503,
+/// matching the reqwest / direct-H2 / HBONE / sidecar-mTLS arms, while every
+/// other failure keeps the generic 502 `{"error":"Backend unavailable"}`.
 ///
 /// The body is deliberately `&'static str`: the `send_h3_response`
 /// consumers want a string, and the buffered-dispatch consumers can reach
@@ -12351,11 +12352,9 @@ fn h3_backend_failure_status_body(
     }
     let (status_code, body) =
         crate::proxy::http_backend_failure_status_and_body(classify_h3_error(e));
-    let status = if status_code == 504 {
-        StatusCode::GATEWAY_TIMEOUT
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
+    // The shared mapper only yields 502 / 503 / 504, all valid status codes;
+    // 502 is the fail-safe should that ever change.
+    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     (status, body)
 }
 

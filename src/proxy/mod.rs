@@ -268,6 +268,7 @@ use self::backend_capabilities::{
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+    GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
 };
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
@@ -41327,7 +41328,11 @@ async fn handle_proxy_request_inner(
                     GrpcProxyError::ResponseBufferCapacity(_) => {
                         response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS
                     }
-                    GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
+                    // A gateway-side construction failure (backend TLS config,
+                    // invalid backend URL/authority), not a transient backend
+                    // outage: INTERNAL, as on the HTTP/3 builders (#6773), so
+                    // callers do not retry it as UNAVAILABLE.
+                    GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::INTERNAL,
                     // Answered by its own arm above; listed for exhaustiveness.
                     GrpcProxyError::AuthorizationExpired { .. } => {
                         grpc_proxy::grpc_status::UNAUTHENTICATED
@@ -41337,6 +41342,7 @@ async fn handle_proxy_request_inner(
                 // internal backend details (hostnames, DNS errors, etc.).
                 let msg = match &e {
                     GrpcProxyError::ClientDeadlineExceeded(_) => GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                    GrpcProxyError::Internal(_) => GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
                     // Fixed, redaction-safe, and deliberately distinguishable
                     // from the backend's own "payload too large" refusal.
                     GrpcProxyError::ResponseBufferCapacity(_) => {
@@ -45173,16 +45179,22 @@ async fn handle_proxy_request_inner(
             Ok(resp)
         }
         Err(_) => {
+            // The prepared response never reaches the wire, so log the 500 the
+            // client actually receives rather than the status captured at
+            // header commit (#6775).
             if let Some(logger) = logger {
-                logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
-                    crate::retry::ErrorClass::RequestError,
-                    0,
-                    false,
-                ));
+                logger.fire_with_response_status(
+                    crate::proxy::deferred_log::BodyOutcome::error(
+                        crate::retry::ErrorClass::RequestError,
+                        0,
+                        false,
+                    ),
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                );
             }
-            Ok(Response::new(ProxyBody::from_string(
-                "Internal Server Error",
-            )))
+            Ok(internal_error_fallback_response(
+                r#"{"error":"Internal server error"}"#,
+            ))
         }
     }
 }
@@ -46694,7 +46706,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 return retry::BackendResponse {
                     status_code: 503,
                     body: ResponseBody::buffered(
-                        r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                        BACKEND_CONNECTION_LIMIT_ERROR_BODY.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
                     connection_error: false,
@@ -47808,24 +47820,44 @@ fn buffered_backend_response_from_eager_collect(
 /// Client-visible HTTP status + redacted JSON body for a classified
 /// HTTP-family backend dispatch failure (#3922).
 ///
-/// Post-wire `ReadWriteTimeout` (`backend_read_timeout_ms` /
-/// `backend_write_timeout_ms` expiry after the request reached the backend)
-/// is 504 with a timeout-specific body. Genuine connect/refused/unavailable
-/// failures stay 502 with the generic unavailable body. Path-specific
-/// overlays (DNS wording, H3 "request failed") may replace the 502 body;
-/// they must not override the 504 timeout pair.
+/// * `ReadWriteTimeout` (`backend_read_timeout_ms` / `backend_write_timeout_ms`
+///   expiry after the request reached the backend) and `ConnectionTimeout`
+///   (`backend_connect_timeout_ms` expiry while establishing the backend
+///   connection) are both 504 with the timeout body (#6770): the upstream did
+///   not answer in time (RFC 9110 §15.6.5). Only the status changes for a
+///   connect timeout — it stays a pre-wire `connection_error`, so
+///   `retry_on_connect_failure`, target rotation, circuit-breaker and
+///   `X-Gateway-Error: connection_failure` keep their connect-class meaning.
+/// * `BackendConnectionLimit` is 503 (#6771): the gateway refused locally at
+///   the destination's DestinationRule `maxConnections` ceiling before dialing,
+///   so no upstream response was invalid. It matches the reqwest, Unix-socket
+///   and raw-TCP over-cap answers and stays pre-wire and health-neutral.
+/// * Genuine connect-refused / DNS / TLS / pool / protocol failures stay 502
+///   with the generic unavailable body.
+///
+/// Path-specific overlays (DNS wording, H3 "request failed") may replace the
+/// 502 body; they must not override the 503/504 pairs.
 ///
 /// gRPC keeps its protocol-appropriate Trailers-Only / `DEADLINE_EXCEEDED`
 /// shape and does not use this mapper.
 pub(crate) fn http_backend_failure_status_and_body(
     class: retry::ErrorClass,
 ) -> (u16, &'static str) {
-    if class == retry::ErrorClass::ReadWriteTimeout {
-        (504, r#"{"error":"Backend timeout"}"#)
-    } else {
-        (502, r#"{"error":"Backend unavailable"}"#)
+    match class {
+        retry::ErrorClass::ReadWriteTimeout | retry::ErrorClass::ConnectionTimeout => {
+            (504, r#"{"error":"Backend timeout"}"#)
+        }
+        retry::ErrorClass::BackendConnectionLimit => (503, BACKEND_CONNECTION_LIMIT_ERROR_BODY),
+        _ => (502, r#"{"error":"Backend unavailable"}"#),
     }
 }
+
+/// Fixed client-visible body for a dispatch the gateway refused because the
+/// destination is at its DestinationRule `maxConnections` ceiling. Shared by
+/// the reqwest admission refusal and [`http_backend_failure_status_and_body`]
+/// so every HTTP-family transport answers the same 503 pair.
+pub(crate) const BACKEND_CONNECTION_LIMIT_ERROR_BODY: &str =
+    r#"{"error":"Backend connection limit exceeded"}"#;
 
 /// Fixed client-visible body for a reqwest connection-pool client that could
 /// not be built (backend TLS material unreadable or invalid, egress refusal,
@@ -50965,7 +50997,7 @@ async fn proxy_to_backend(
                     retry::BackendResponse {
                         status_code: 503,
                         body: ResponseBody::buffered(
-                            r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                            BACKEND_CONNECTION_LIMIT_ERROR_BODY.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
@@ -53745,6 +53777,26 @@ fn check_protocol_headers_with_wire_framing(
     None
 }
 
+/// Last-resort answer when `http::response::Builder` rejects an otherwise
+/// prepared response (an invalid header value reached it). `Response::new`
+/// defaults to `200 OK`, so a bare fallback would present an internal failure
+/// as success to the client, caches and status-keyed metrics (#6775). The
+/// body is a fixed literal: nothing from the failed response is propagated.
+pub(crate) fn internal_error_fallback_response(body: &'static str) -> Response<ProxyBody> {
+    let content_type = if body.starts_with('{') {
+        "application/json"
+    } else {
+        "text/plain"
+    };
+    let mut response = Response::new(ProxyBody::from_string(body));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static(content_type),
+    );
+    response
+}
+
 fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     // Response::builder with a valid status and static header name cannot fail
     Response::builder()
@@ -53752,9 +53804,7 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
         .header("Content-Type", "application/json")
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
-            Response::new(ProxyBody::from_string(
-                r#"{"error":"Internal server error"}"#,
-            ))
+            internal_error_fallback_response(r#"{"error":"Internal server error"}"#)
         })
 }
 
@@ -53769,9 +53819,7 @@ fn build_response_with_gateway_error(
         .header("X-Gateway-Error", error)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
-            Response::new(ProxyBody::from_string(
-                r#"{"error":"Internal server error"}"#,
-            ))
+            internal_error_fallback_response(r#"{"error":"Internal server error"}"#)
         })
 }
 
@@ -53786,9 +53834,7 @@ fn build_method_not_allowed_response_with_allow(body: &str, allow: &str) -> Resp
         .header("Allow", allow)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
-            Response::new(ProxyBody::from_string(
-                r#"{"error":"Internal server error"}"#,
-            ))
+            internal_error_fallback_response(r#"{"error":"Internal server error"}"#)
         })
 }
 
@@ -53986,7 +54032,7 @@ fn build_plain_text_response(status: StatusCode, body: &str) -> Response<ProxyBo
         .header("Content-Type", "text/plain")
         .header("Cache-Control", "no-store")
         .body(ProxyBody::from_string(body))
-        .unwrap_or_else(|_| Response::new(ProxyBody::from_string("Internal server error")))
+        .unwrap_or_else(|_| internal_error_fallback_response("Internal server error"))
 }
 
 /// Client-visible dispatch failure for a mesh transport pool.
