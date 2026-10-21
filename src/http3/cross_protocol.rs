@@ -12536,7 +12536,9 @@ async fn write_plain_authorization_expired_terminal<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let headers = HashMap::new();
+    // RFC 9110 §15.5.2 (issue #6774): the committing mechanism's scheme.
+    let mut headers = HashMap::with_capacity(1);
+    crate::proxy::insert_reauthentication_challenge(&mut headers, ctx);
     let write = write_plain_gateway_reject_with_recv_halt(
         stream,
         ctx,

@@ -5896,3 +5896,92 @@ async fn jwks_sender_constraint_401s_name_the_failed_constraint() {
         DPOP_AUTHENTICATION_CHALLENGE,
     );
 }
+
+/// RFC 9449 §7.1: a rejected DPoP-bound access token — expired, or bound to a
+/// different key than the proof's — answers `DPoP error="invalid_token"`, not a
+/// `Bearer` challenge and not `invalid_dpop_proof`.
+#[tokio::test]
+async fn jwks_dpop_token_failures_answer_invalid_token_under_the_dpop_scheme() {
+    use super::plugin_utils::assert_unauthorized_with_challenge;
+    use ferrum_edge::plugins::utils::auth_flow::DPOP_INVALID_TOKEN_CHALLENGE;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{
+                "jwks_uri": jwks_uri,
+                "issuer": "https://idp.example.com",
+                "require_dpop": true,
+                "dpop_replay_scope": "process"
+            }]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.warmup_jwks().await;
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    // An expired token presented under the `DPoP` authorization scheme.
+    let expired = create_rs256_token(
+        &json!({
+            "sub": "idp-user",
+            "iss": "https://idp.example.com",
+            "cnf": {"jkt": "any"},
+            "exp": 1
+        }),
+        private_key_pem,
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("DPoP {expired}"));
+    assert_unauthorized_with_challenge(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        DPOP_INVALID_TOKEN_CHALLENGE,
+    );
+
+    // A well-formed proof whose key is not the key the token is bound to.
+    let jwk_value = build_rsa_jwks_from_pem(public_key_pem)["keys"][0].clone();
+    let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value).unwrap();
+    let access_token = create_rs256_token(
+        &json!({
+            "sub": "idp-user",
+            "iss": "https://idp.example.com",
+            "cnf": {"jkt": "a-different-key-thumbprint"}
+        }),
+        private_key_pem,
+    );
+    let now = chrono::Utc::now().timestamp();
+    let mut dpop_header = Header::new(jsonwebtoken::Algorithm::RS256);
+    dpop_header.typ = Some("dpop+jwt".to_string());
+    dpop_header.jwk = Some(jwk);
+    let proof = encode(
+        &dpop_header,
+        &json!({
+            "htm": "GET",
+            "htu": "http://example.com/test",
+            "iat": now,
+            "jti": "proof-6774"
+        }),
+        &EncodingKey::from_rsa_pem(private_key_pem).unwrap(),
+    )
+    .unwrap();
+    for scheme in ["Bearer", "DPoP"] {
+        let mut ctx = make_ctx();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            format!("{scheme} {access_token}"),
+        );
+        ctx.headers.insert("dpop".to_string(), proof.clone());
+        ctx.headers
+            .insert("host".to_string(), "example.com".to_string());
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+        assert_unauthorized_with_challenge(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            DPOP_INVALID_TOKEN_CHALLENGE,
+        );
+    }
+}

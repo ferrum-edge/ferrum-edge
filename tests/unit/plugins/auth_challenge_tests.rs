@@ -273,6 +273,9 @@ fn builtin_challenges_are_header_valid_and_name_the_applicable_scheme() {
         (auth_flow::BEARER_INVALID_TOKEN_CHALLENGE, "Bearer"),
         (auth_flow::DPOP_AUTHENTICATION_CHALLENGE, "DPoP"),
         (auth_flow::DPOP_INVALID_PROOF_CHALLENGE, "DPoP"),
+        (auth_flow::DPOP_INVALID_TOKEN_CHALLENGE, "DPoP"),
+        (auth_flow::OIDC_AUTHENTICATION_CHALLENGE, "Bearer"),
+        (auth_flow::OIDC_INVALID_SESSION_CHALLENGE, "Bearer"),
         (auth_flow::API_KEY_AUTHENTICATION_CHALLENGE, "ApiKey"),
         (auth_flow::HMAC_AUTHENTICATION_CHALLENGE, "hmac"),
         (
@@ -288,6 +291,10 @@ fn builtin_challenges_are_header_valid_and_name_the_applicable_scheme() {
             auth_flow::is_valid_authentication_challenge(challenge),
             "{challenge}"
         );
+        assert!(
+            http::HeaderValue::from_str(challenge).is_ok(),
+            "{challenge}"
+        );
         assert_eq!(
             auth_flow::authentication_challenge_scheme(challenge),
             scheme
@@ -296,30 +303,153 @@ fn builtin_challenges_are_header_valid_and_name_the_applicable_scheme() {
 }
 
 #[test]
-fn challenge_lists_keep_one_challenge_per_scheme_and_drop_invalid_values() {
+fn challenge_lists_keep_one_challenge_per_protection_space() {
     let mut challenges = Vec::new();
-    auth_flow::push_authentication_challenge(
+    assert!(auth_flow::push_authentication_challenge(
         &mut challenges,
         auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
-    );
-    // Same scheme, compared case-insensitively: the first, more specific one wins.
-    auth_flow::push_authentication_challenge(&mut challenges, "bearer");
-    // Header-invalid or empty values are never emitted.
-    auth_flow::push_authentication_challenge(&mut challenges, "Basic\r\nX-Injected: 1");
-    auth_flow::push_authentication_challenge(&mut challenges, "   ");
-    auth_flow::push_authentication_challenge(&mut challenges, "realm=\"no-scheme\"");
-    auth_flow::push_authentication_challenge(
+    ));
+    // Same scheme (case-insensitive) and same (absent) realm: the first, more
+    // specific challenge already names this protection space.
+    assert!(auth_flow::push_authentication_challenge(
         &mut challenges,
-        auth_flow::API_KEY_AUTHENTICATION_CHALLENGE,
-    );
+        "bearer"
+    ));
+    // A distinct realm is a distinct protection space and is kept.
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        auth_flow::OIDC_AUTHENTICATION_CHALLENGE,
+    ));
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        r#"Basic realm="tenant-a""#,
+    ));
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        auth_flow::BASIC_AUTHENTICATION_CHALLENGE,
+    ));
+    // Realms compare case-sensitively; the same realm is a duplicate.
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        r#"basic realm="tenant-a", charset="UTF-8""#,
+    ));
     assert_eq!(
         auth_flow::render_authentication_challenges(&challenges),
-        r#"Bearer error="invalid_token", ApiKey realm="ferrum-edge""#
+        r#"Bearer error="invalid_token", Bearer realm="oidc", Basic realm="tenant-a", Basic realm="ferrum-edge", charset="UTF-8""#
     );
     assert_eq!(
         auth_flow::render_authentication_challenges(&[]),
         auth_flow::GENERIC_AUTHENTICATION_CHALLENGE
     );
+}
+
+#[test]
+fn every_challenge_in_a_supplied_list_is_kept() {
+    let mut challenges = Vec::new();
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        r#"Newauth realm="apps", type=1, title="Login to \"apps\"", Basic realm="simple""#,
+    ));
+    assert!(auth_flow::push_authentication_challenge(
+        &mut challenges,
+        " , Negotiate abc+/def==, , ",
+    ));
+    assert_eq!(
+        challenges,
+        vec![
+            r#"Newauth realm="apps", type=1, title="Login to \"apps\"""#.to_string(),
+            r#"Basic realm="simple""#.to_string(),
+            "Negotiate abc+/def==".to_string(),
+        ]
+    );
+    for challenge in &challenges {
+        assert!(
+            http::HeaderValue::from_str(challenge).is_ok(),
+            "{challenge}"
+        );
+    }
+}
+
+#[test]
+fn malformed_challenges_are_refused_whole() {
+    for malformed in [
+        "",
+        "   ",
+        " , , ",
+        "Bearer\r\n",
+        "Bearer\r\nX-Injected: 1",
+        "Basic\nrealm=\"x\"",
+        "Bearer\0",
+        "realm=\"no-scheme\"",
+        "Basic realm=\"unterminated",
+        "Basic realm=\"bad\\\u{1}escape\"",
+        "Basic realm=",
+        "Basic realm=\"a\", realm=\"b\"",
+        "Basic realm=\"x\" charset=\"UTF-8\"",
+        "Basic=",
+        "Basic realm=\"caf\u{e9}\"",
+        "B@sic realm=\"x\"",
+        // One malformed challenge spoils the whole list.
+        "Basic realm=\"ok\", Bearer\u{7}",
+    ] {
+        assert!(
+            !auth_flow::is_valid_authentication_challenge(malformed),
+            "{malformed:?} must be refused"
+        );
+        let mut challenges = Vec::new();
+        assert!(
+            !auth_flow::push_authentication_challenge(&mut challenges, malformed),
+            "{malformed:?} must add nothing"
+        );
+        assert!(challenges.is_empty(), "{malformed:?}: {challenges:?}");
+    }
+}
+
+#[test]
+fn reauthentication_challenge_names_the_committing_mechanism() {
+    for (auth_method, expected) in [
+        (
+            Some("basic_auth"),
+            auth_flow::BASIC_AUTHENTICATION_CHALLENGE,
+        ),
+        (Some("ldap_auth"), auth_flow::BASIC_AUTHENTICATION_CHALLENGE),
+        (Some("jwt_auth"), auth_flow::BEARER_INVALID_TOKEN_CHALLENGE),
+        (Some("jwks_auth"), auth_flow::BEARER_INVALID_TOKEN_CHALLENGE),
+        (
+            Some("oauth2_introspection"),
+            auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
+        ),
+        (
+            Some("oidc_relying_party"),
+            auth_flow::OIDC_INVALID_SESSION_CHALLENGE,
+        ),
+        (
+            Some("key_auth"),
+            auth_flow::API_KEY_AUTHENTICATION_CHALLENGE,
+        ),
+        (Some("hmac_auth"), auth_flow::HMAC_AUTHENTICATION_CHALLENGE),
+        (
+            Some("mtls_auth"),
+            auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
+        ),
+        (
+            Some("soap_ws_security"),
+            auth_flow::WS_SECURITY_AUTHENTICATION_CHALLENGE,
+        ),
+        (
+            Some("custom_auth"),
+            auth_flow::GENERIC_AUTHENTICATION_CHALLENGE,
+        ),
+        (None, auth_flow::GENERIC_AUTHENTICATION_CHALLENGE),
+    ] {
+        let mut ctx = ctx();
+        ctx.auth_method = auth_method;
+        assert_eq!(
+            auth_flow::reauthentication_challenge(&ctx),
+            expected,
+            "{auth_method:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -676,15 +806,15 @@ async fn a_non_401_authentication_rejection_gets_no_challenge() {
 // Rejection-finalizer safety net: 401s outside the authentication phase
 // ---------------------------------------------------------------------------
 
-async fn finalize_401(
+async fn finalize_with(
     plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
     status_code: u16,
     headers: HashMap<String, String>,
 ) -> (u16, HashMap<String, String>) {
-    let mut ctx = ctx();
     match finalize_plugin_rejection_without_committed_hooks_for_test(
         plugins,
-        &mut ctx,
+        ctx,
         PluginResult::Reject {
             status_code,
             body: r#"{"error":"rejected"}"#.to_string(),
@@ -700,6 +830,22 @@ async fn finalize_401(
         } => (status_code, headers),
         other => panic!("expected a finalized rejection, got {other:?}"),
     }
+}
+
+async fn finalize_401(
+    plugins: &[Arc<dyn Plugin>],
+    status_code: u16,
+    headers: HashMap<String, String>,
+) -> (u16, HashMap<String, String>) {
+    let mut ctx = ctx();
+    finalize_with(plugins, &mut ctx, status_code, headers).await
+}
+
+fn challenge_field_count(headers: &HashMap<String, String>) -> usize {
+    headers
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case("www-authenticate"))
+        .count()
 }
 
 #[tokio::test]
@@ -757,22 +903,251 @@ async fn a_plugin_401_keeps_its_own_valid_challenge() {
 }
 
 #[tokio::test]
-async fn a_plugin_401_with_an_invalid_challenge_is_repaired() {
+async fn a_plugin_401_with_a_malformed_challenge_is_repaired() {
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(KeyAuth::new(&json!({})).unwrap())];
+    for malformed in [
+        "Bearer\r\nX-Injected: 1",
+        // Validated after trimming but emitted as-is, the wire builder would
+        // drop this value and send a challenge-less 401.
+        "Bearer\r\n",
+        "Basic realm=\"unterminated",
+        "Basic realm=",
+        "Basic realm=\"ok\", Bearer\u{7}",
+    ] {
+        let (status, headers) = finalize_401(
+            &plugins,
+            401,
+            HashMap::from([("WWW-Authenticate".to_string(), malformed.to_string())]),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(challenge_field_count(&headers), 1, "{malformed:?}");
+        let emitted = challenge_header(&headers).expect("a challenge is emitted");
+        assert_eq!(
+            emitted,
+            auth_flow::API_KEY_AUTHENTICATION_CHALLENGE,
+            "{malformed:?}"
+        );
+        assert!(http::HeaderValue::from_str(emitted).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn a_plugin_401_keeps_every_valid_challenge_across_field_spellings() {
     let (status, headers) = finalize_401(
-        &plugins,
+        &[],
         401,
-        HashMap::from([(
-            "WWW-Authenticate".to_string(),
-            "Bearer\r\nX-Injected: 1".to_string(),
-        )]),
+        HashMap::from([
+            (
+                "WWW-Authenticate".to_string(),
+                r#"Basic realm="a""#.to_string(),
+            ),
+            (
+                "www-authenticate".to_string(),
+                r#"Basic realm="b", Bearer"#.to_string(),
+            ),
+            ("Www-Authenticate".to_string(), "Bearer\r\n".to_string()),
+        ]),
     )
     .await;
+    assert_eq!(status, 401);
+    assert_eq!(challenge_field_count(&headers), 1, "{headers:?}");
+    // Spellings are read in a fixed order, so the result is deterministic.
+    assert_eq!(
+        challenge_header(&headers),
+        Some(r#"Basic realm="a", Basic realm="b", Bearer"#)
+    );
+}
+
+/// A header policy that would delete the field cannot leave a gateway `401`
+/// without a challenge: the guarantee is re-asserted over the final map.
+#[tokio::test]
+async fn operator_header_policies_cannot_strip_a_gateway_challenge() {
+    let policies: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(
+            ferrum_edge::plugins::security_headers::SecurityHeaders::new(
+                &json!({"remove": ["WWW-Authenticate"]}),
+            )
+            .unwrap(),
+        ),
+        Arc::new(
+            ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+                "rules": [
+                    {"operation": "remove", "target": "header", "key": "WWW-Authenticate"}
+                ]
+            }))
+            .unwrap(),
+        ),
+    ];
+    for policy in policies {
+        let plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(KeyAuth::new(&json!({})).unwrap()), policy];
+        let (status, headers) = finalize_401(&plugins, 401, HashMap::new()).await;
+        assert_eq!(status, 401);
+        assert_eq!(
+            challenge_header(&headers),
+            Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE)
+        );
+    }
+
+    // The same `security_headers` policy still governs every other status.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+        ferrum_edge::plugins::security_headers::SecurityHeaders::new(
+            &json!({"remove": ["WWW-Authenticate"]}),
+        )
+        .unwrap(),
+    )];
+    let (status, headers) = finalize_401(
+        &plugins,
+        403,
+        HashMap::from([("WWW-Authenticate".to_string(), "Bearer".to_string())]),
+    )
+    .await;
+    assert_eq!(status, 403);
+    assert_eq!(challenge_header(&headers), None);
+}
+
+/// Adding the challenge leaves the CORS decoration of the rejection intact.
+#[tokio::test]
+async fn the_challenge_preserves_cors_decoration() {
+    let cors_config = json!({"allowed_origins": ["https://app.example"]});
+    let mut access_control_headers = Vec::new();
+    for status_code in [403, 401] {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(KeyAuth::new(&json!({})).unwrap()),
+            Arc::new(ferrum_edge::plugins::cors::CorsPlugin::new(&cors_config).unwrap()),
+        ];
+        let mut ctx = ctx_with_header("origin", "https://app.example");
+        for plugin in &plugins {
+            assert_continue(plugin.on_request_received(&mut ctx).await);
+        }
+        let (status, headers) =
+            finalize_with(&plugins, &mut ctx, status_code, HashMap::new()).await;
+        assert_eq!(status, status_code);
+        if status_code == 401 {
+            assert_eq!(
+                challenge_header(&headers),
+                Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE)
+            );
+        }
+        let mut cors: Vec<(String, String)> = headers
+            .iter()
+            .filter(|(name, _)| {
+                let name = name.to_ascii_lowercase();
+                name.starts_with("access-control-") || name == "vary"
+            })
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
+            .collect();
+        cors.sort();
+        access_control_headers.push(cors);
+    }
+    assert_eq!(access_control_headers[0], access_control_headers[1]);
+}
+
+/// A plugin that relays an origin-authored response (a cached, federated, or
+/// function response) as its short-circuit.
+struct OriginRelay;
+
+#[async_trait]
+impl Plugin for OriginRelay {
+    fn name(&self) -> &str {
+        "origin_relay"
+    }
+
+    fn rejects_with_origin_response(&self) -> bool {
+        true
+    }
+}
+
+/// An origin `401` carried by a plugin short-circuit is passed through as the
+/// origin authored it: the gateway did not author it, so it adds no challenge.
+#[tokio::test]
+async fn an_origin_authored_401_is_never_given_a_gateway_challenge() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(KeyAuth::new(&json!({})).unwrap())];
+
+    let mut serverless = ctx();
+    ferrum_edge::_test_support::set_serverless_terminate_response_for_test(&mut serverless, true);
+    let (status, headers) = finalize_with(&plugins, &mut serverless, 401, HashMap::new()).await;
+    assert_eq!(status, 401);
+    assert_eq!(challenge_header(&headers), None, "{headers:?}");
+
+    let mut relayed = ctx();
+    ferrum_edge::_test_support::note_rejecting_plugin_for_test(&relayed, &OriginRelay);
+    let (status, headers) = finalize_with(&plugins, &mut relayed, 401, HashMap::new()).await;
+    assert_eq!(status, 401);
+    assert_eq!(challenge_header(&headers), None, "{headers:?}");
+
+    // A gateway rejection on the same route still gets one.
+    let (status, headers) = finalize_401(&plugins, 401, HashMap::new()).await;
     assert_eq!(status, 401);
     assert_eq!(
         challenge_header(&headers),
         Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE)
     );
+}
+
+#[tokio::test]
+async fn distinct_realms_from_several_mechanisms_are_all_advertised() {
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(ChallengelessAuth {
+            rejection_headers: HashMap::from([(
+                "www-authenticate".to_string(),
+                r#"Basic realm="tenant-a""#.to_string(),
+            )]),
+        }),
+        Arc::new(basic_auth()),
+    ];
+    let mut ctx = ctx();
+    assert_phase_unauthorized_with_challenge(
+        run_authentication_phase(AuthMode::Single, &auth_plugins, &mut ctx, &consumers()).await,
+        r#"Basic realm="tenant-a", Basic realm="ferrum-edge", charset="UTF-8""#,
+    );
+}
+
+/// The fixed pre-commitment authorization-expiry terminal (issue #3815) names
+/// the committing mechanism's scheme.
+#[tokio::test]
+async fn the_authorization_expiry_terminal_carries_a_challenge() {
+    use ferrum_edge::proxy::auth_lifetime::StreamAuthTermination;
+
+    for (auth_method, expected) in [
+        (Some("jwt_auth"), auth_flow::BEARER_INVALID_TOKEN_CHALLENGE),
+        (
+            Some("mtls_auth"),
+            auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
+        ),
+        (None, auth_flow::GENERIC_AUTHENTICATION_CHALLENGE),
+    ] {
+        let mut ctx = ctx();
+        ctx.identified_consumer = Some(Arc::new(create_test_consumer()));
+        ctx.auth_method = auth_method;
+        for termination in [
+            StreamAuthTermination::CredentialExpired,
+            StreamAuthTermination::AuthenticatedStreamMaxLifetime,
+        ] {
+            let (status, headers, _) =
+                ferrum_edge::_test_support::authorization_expired_pre_commitment_response_for_test(
+                    &ctx,
+                    termination,
+                    false,
+                );
+            assert_eq!(status, 401);
+            assert_eq!(
+                challenge_header(&headers),
+                Some(expected),
+                "{auth_method:?}"
+            );
+        }
+        // Native gRPC keeps its trailers-only UNAUTHENTICATED framing.
+        let (status, headers, _) =
+            ferrum_edge::_test_support::authorization_expired_pre_commitment_response_for_test(
+                &ctx,
+                StreamAuthTermination::CredentialExpired,
+                true,
+            );
+        assert_eq!(status, 200);
+        assert_eq!(challenge_header(&headers), None);
+    }
 }
 
 #[tokio::test]

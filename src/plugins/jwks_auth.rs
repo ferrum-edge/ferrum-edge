@@ -1340,12 +1340,12 @@ impl JwksAuth {
         claims: &Value,
         provider: &JwksProvider,
         token: &str,
-    ) -> Result<Option<ReplayMarker>, (u16, String, &'static str)> {
+    ) -> Result<Option<ReplayMarker>, (u16, String, ConstraintFailure)> {
         // RFC 8705 §3: a certificate-bound token presented without the bound
         // certificate is an `invalid_token`.
-        const MTLS: &str = auth_flow::BEARER_INVALID_TOKEN_CHALLENGE;
+        const MTLS: ConstraintFailure = ConstraintFailure::Token;
         // RFC 9449 §7.1: an absent or rejected proof is an `invalid_dpop_proof`.
-        const DPOP: &str = auth_flow::DPOP_INVALID_PROOF_CHALLENGE;
+        const DPOP: ConstraintFailure = ConstraintFailure::Proof;
         if provider.require_mtls_binding {
             let Some(cert_der) = ctx.tls_client_cert_der.as_ref() else {
                 return Err((
@@ -1393,11 +1393,13 @@ impl JwksAuth {
         let Some(domain) = provider.dpop_replay_domain.as_ref() else {
             return Err((401, r#"{"error":"DPoP proof required"}"#.to_string(), DPOP));
         };
+        // A DPoP-bound token must name its issuer and principal: missing
+        // claims fault the token, not the proof.
         let Some(issuer) = extract_claim_string(claims, "iss") else {
             return Err((
                 401,
                 r#"{"error":"DPoP validation failed"}"#.to_string(),
-                DPOP,
+                ConstraintFailure::Token,
             ));
         };
         let Some(token_identity) = extract_claim_string(claims, "sub")
@@ -1406,7 +1408,7 @@ impl JwksAuth {
             return Err((
                 401,
                 r#"{"error":"DPoP validation failed"}"#.to_string(),
-                DPOP,
+                ConstraintFailure::Token,
             ));
         };
         let Some(host) = ctx
@@ -1435,10 +1437,18 @@ impl JwksAuth {
             domain,
         }) {
             Ok(marker) => Ok(Some(marker)),
-            Err(_) => Err((
+            // RFC 9449 §7.1: a token not bound to the proof's key (missing or
+            // mismatched `cnf.jkt`) is an `invalid_token`; every other proof
+            // failure is an `invalid_dpop_proof`. The client body stays the
+            // same fixed literal either way.
+            Err(reason) => Err((
                 401,
                 r#"{"error":"DPoP validation failed"}"#.to_string(),
-                DPOP,
+                if dpop::is_token_binding_failure(reason) {
+                    ConstraintFailure::Token
+                } else {
+                    DPOP
+                },
             )),
         }
     }
@@ -1571,19 +1581,22 @@ impl JwksAuth {
             JwksExtractedCredential::BearerToken {
                 token,
                 provider_indices,
-                ..
+                dpop_scheme,
             } => {
+                // RFC 9449 §7.1: a token presented under the `DPoP` scheme is
+                // challenged under that scheme.
+                let invalid_token = if dpop_scheme {
+                    auth_flow::DPOP_INVALID_TOKEN_CHALLENGE
+                } else {
+                    auth_flow::BEARER_INVALID_TOKEN_CHALLENGE
+                };
                 let (claims, provider_idx) = match self
                     .validate_token_for_providers(&token, &provider_indices)
                     .await
                 {
                     Ok(result) => result,
                     Err((status, body)) => {
-                        return reject(
-                            status,
-                            body.to_string(),
-                            auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
-                        );
+                        return reject(status, body.to_string(), invalid_token);
                     }
                 };
 
@@ -1596,10 +1609,22 @@ impl JwksAuth {
                 let pending_dpop_marker =
                     match self.check_sender_constraints(ctx, &claims, provider, &token) {
                         Ok(marker) => marker,
-                        Err((status, body, challenge)) => return reject(status, body, challenge),
+                        Err((status, body, failure)) => {
+                            let challenge = match failure {
+                                ConstraintFailure::Proof => auth_flow::DPOP_INVALID_PROOF_CHALLENGE,
+                                // A provider that demands a proof challenges a
+                                // rejected token under `DPoP` whichever scheme
+                                // presented it.
+                                ConstraintFailure::Token if provider.require_dpop => {
+                                    auth_flow::DPOP_INVALID_TOKEN_CHALLENGE
+                                }
+                                ConstraintFailure::Token => invalid_token,
+                            };
+                            return reject(status, body, challenge);
+                        }
                     };
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-                    return reject(status, body, auth_flow::BEARER_INVALID_TOKEN_CHALLENGE);
+                    return reject(status, body, invalid_token);
                 }
                 if let Some(marker) = pending_dpop_marker {
                     let admission = self.admit_dpop_marker(provider, marker).await;
@@ -1649,11 +1674,9 @@ impl JwksAuth {
                     ),
                     Err(VerifyOutcome::Invalid(body))
                     | Err(VerifyOutcome::ConsumerNotFound(body))
-                    | Err(VerifyOutcome::VerificationFailed(body)) => reject(
-                        401,
-                        body,
-                        self.rejection_challenge(CredentialRejection::InvalidCredential),
-                    ),
+                    | Err(VerifyOutcome::VerificationFailed(body)) => {
+                        reject(401, body, invalid_token)
+                    }
                     Err(VerifyOutcome::Forbidden(body)) => {
                         reject(403, body, self.advertised_challenge)
                     }
@@ -1852,6 +1875,18 @@ impl AuthMechanism for JwksAuth {
             other => other,
         }
     }
+}
+
+/// Which credential a sender-constraint rejection faults (RFC 9449 §7.1),
+/// so the `401` names the right `error` code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConstraintFailure {
+    /// The access token: a missing or mismatched certificate or proof-key
+    /// binding, or a claim the proof check requires (`invalid_token`).
+    Token,
+    /// The DPoP proof: absent, malformed, invalid, bound to another request,
+    /// or replayed (`invalid_dpop_proof`).
+    Proof,
 }
 
 enum JwksExtractedCredential {

@@ -606,6 +606,17 @@ pub const DPOP_AUTHENTICATION_CHALLENGE: &str = "DPoP";
 /// RFC 9449 §7.1 `invalid_dpop_proof`: the DPoP proof was absent or rejected.
 pub const DPOP_INVALID_PROOF_CHALLENGE: &str = r#"DPoP error="invalid_dpop_proof""#;
 
+/// RFC 9449 §7.1 `invalid_token` under the `DPoP` scheme: the DPoP-bound
+/// access token itself was rejected (invalid, expired, or not bound to the
+/// presented proof key).
+pub const DPOP_INVALID_TOKEN_CHALLENGE: &str = r#"DPoP error="invalid_token""#;
+
+/// `oidc_relying_party`, advertised beside another mechanism's `401`.
+pub const OIDC_AUTHENTICATION_CHALLENGE: &str = r#"Bearer realm="oidc""#;
+
+/// `oidc_relying_party` session `401` (RFC 6750 §3.1 `invalid_token`).
+pub const OIDC_INVALID_SESSION_CHALLENGE: &str = r#"Bearer realm="oidc", error="invalid_token""#;
+
 /// `key_auth`. API keys travel in an operator-configured header or query
 /// parameter, not under an HTTP authentication scheme, so the mechanism
 /// advertises the conventional `ApiKey` scheme token (the name OpenAPI's
@@ -661,41 +672,224 @@ fn is_auth_scheme_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
+fn is_token68_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+fn skip_whitespace(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
+        pos += 1;
+    }
+    pos
+}
+
+fn skip_list_separators(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b',') {
+        pos += 1;
+    }
+    pos
+}
+
+fn scan_token(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_auth_scheme_token_byte(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+/// `token68` (RFC 9110 §11.2) ending a challenge: followed only by whitespace
+/// and then the end of the value or a list comma.
+fn scan_token68(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut end = pos;
+    while end < bytes.len() && is_token68_byte(bytes[end]) {
+        end += 1;
+    }
+    if end == pos {
+        return None;
+    }
+    while end < bytes.len() && bytes[end] == b'=' {
+        end += 1;
+    }
+    let next = skip_whitespace(bytes, end);
+    (next == bytes.len() || bytes[next] == b',').then_some(end)
+}
+
+/// RFC 9110 §5.6.4 `quoted-string` starting at the opening quote. Returns the
+/// position after the closing quote and the unescaped value. Unterminated
+/// strings, control bytes, and non-ASCII bytes (`obs-text`) are rejected.
+fn scan_quoted_string(bytes: &[u8], pos: usize) -> Option<(usize, String)> {
+    let mut value = String::new();
+    let mut index = pos + 1;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'"' => return Some((index + 1, value)),
+            b'\\' => {
+                let escaped = *bytes.get(index + 1)?;
+                if !(escaped == b'\t' || (0x20..=0x7e).contains(&escaped)) {
+                    return None;
+                }
+                value.push(char::from(escaped));
+                index += 2;
+            }
+            b'\t' | 0x20..=0x7e => {
+                value.push(char::from(byte));
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// One challenge parsed from a `WWW-Authenticate` field value.
+struct ParsedChallenge<'a> {
+    /// The challenge exactly as it appears in the field, without surrounding
+    /// whitespace or list commas.
+    text: &'a str,
+    scheme: &'a str,
+    /// Unescaped `realm` parameter, which together with the scheme names the
+    /// protection space (RFC 9110 §11.5).
+    realm: Option<String>,
+}
+
+impl ParsedChallenge<'_> {
+    /// Whether two challenges describe the same protection space: the same
+    /// auth-scheme (case-insensitive) and the same realm (case-sensitive).
+    fn same_protection_space(&self, other: &ParsedChallenge<'_>) -> bool {
+        self.scheme.eq_ignore_ascii_case(other.scheme) && self.realm == other.realm
+    }
+}
+
+/// Parse a `WWW-Authenticate` field value as the RFC 9110 §11.6.1
+/// `#challenge` list. `None` when any part of the value is malformed: a
+/// missing or invalid auth-scheme, an auth-param without `=` or value, an
+/// unterminated quoted-string, a repeated `realm`, or any control or non-ASCII
+/// byte. Every challenge text a successful parse returns is therefore a valid
+/// HTTP field value on its own.
+fn parse_authentication_challenges(value: &str) -> Option<Vec<ParsedChallenge<'_>>> {
+    let bytes = value.as_bytes();
+    let mut challenges = Vec::new();
+    let mut pos = skip_list_separators(bytes, 0);
+    while pos < bytes.len() {
+        let start = pos;
+        let scheme_end = scan_token(bytes, pos);
+        if scheme_end == pos {
+            return None;
+        }
+        let scheme = &value[start..scheme_end];
+        let mut realm = None;
+        let mut end = scheme_end;
+        let after_scheme = skip_whitespace(bytes, scheme_end);
+        if after_scheme == bytes.len() || bytes[after_scheme] == b',' {
+            // A bare auth-scheme.
+            pos = after_scheme;
+        } else if after_scheme == scheme_end {
+            // Parameters must be separated from the scheme by whitespace.
+            return None;
+        } else if let Some(token68_end) = scan_token68(bytes, after_scheme) {
+            end = token68_end;
+            pos = token68_end;
+        } else {
+            pos = after_scheme;
+            loop {
+                let name_end = scan_token(bytes, pos);
+                if name_end == pos {
+                    return None;
+                }
+                let name = &value[pos..name_end];
+                let equals = skip_whitespace(bytes, name_end);
+                if bytes.get(equals) != Some(&b'=') {
+                    return None;
+                }
+                let value_start = skip_whitespace(bytes, equals + 1);
+                let (value_end, param_value) = if bytes.get(value_start) == Some(&b'"') {
+                    scan_quoted_string(bytes, value_start)?
+                } else {
+                    let token_end = scan_token(bytes, value_start);
+                    if token_end == value_start {
+                        return None;
+                    }
+                    (token_end, value[value_start..token_end].to_string())
+                };
+                if name.eq_ignore_ascii_case("realm") {
+                    if realm.is_some() {
+                        return None;
+                    }
+                    realm = Some(param_value);
+                }
+                end = value_end;
+                let after_value = skip_whitespace(bytes, value_end);
+                if after_value == bytes.len() {
+                    pos = after_value;
+                    break;
+                }
+                if bytes[after_value] != b',' {
+                    return None;
+                }
+                let next = skip_list_separators(bytes, after_value);
+                let next_name_end = scan_token(bytes, next);
+                pos = next;
+                // `token BWS "="` continues this challenge's parameters;
+                // anything else starts the next challenge.
+                if next_name_end == next
+                    || bytes.get(skip_whitespace(bytes, next_name_end)) != Some(&b'=')
+                {
+                    break;
+                }
+            }
+        }
+        challenges.push(ParsedChallenge {
+            text: &value[start..end],
+            scheme,
+            realm,
+        });
+        pos = skip_list_separators(bytes, pos);
+    }
+    Some(challenges)
+}
+
 /// The auth-scheme token that opens a challenge (RFC 9110 §11.1).
 pub fn authentication_challenge_scheme(challenge: &str) -> &str {
-    let challenge = challenge.trim_start_matches([' ', '\t']);
-    let end = challenge.find([' ', '\t', ',']).unwrap_or(challenge.len());
+    let challenge = challenge.trim_start_matches([' ', '\t', ',']);
+    let end = scan_token(challenge.as_bytes(), 0);
     &challenge[..end]
 }
 
-/// Whether `challenge` may be emitted as a `WWW-Authenticate` field value: it
-/// opens with a well-formed auth-scheme token and is a valid HTTP field value
-/// (no CR, LF, NUL, or other control bytes). A plugin-supplied value that fails
-/// this is discarded rather than sent.
-pub fn is_valid_authentication_challenge(challenge: &str) -> bool {
-    let scheme = authentication_challenge_scheme(challenge);
-    !scheme.is_empty()
-        && scheme.bytes().all(is_auth_scheme_token_byte)
-        && http::HeaderValue::from_str(challenge).is_ok()
+/// Whether `value` may be emitted as a `WWW-Authenticate` field value: a
+/// well-formed, non-empty RFC 9110 §11.6.1 challenge list containing no
+/// control or non-ASCII byte. A plugin-supplied value that fails this is
+/// discarded rather than sent, because the wire builder would drop it.
+pub fn is_valid_authentication_challenge(value: &str) -> bool {
+    parse_authentication_challenges(value).is_some_and(|challenges| !challenges.is_empty())
 }
 
-/// Append `challenge` to an ordered challenge list unless it is not
-/// header-valid or the list already holds a challenge for the same auth-scheme.
-/// The first challenge per scheme wins, so callers add a rejection's specific
-/// challenge before the advertised ones.
-pub fn push_authentication_challenge(challenges: &mut Vec<String>, challenge: &str) {
-    let challenge = challenge.trim();
-    if !is_valid_authentication_challenge(challenge) {
-        return;
+/// Append every challenge in the field value `value` to an ordered challenge
+/// list, skipping one that names a protection space (auth-scheme plus realm)
+/// the list already holds. The first challenge per protection space wins, so
+/// callers add a rejection's specific challenge before the advertised ones;
+/// challenges with distinct realms are all kept.
+///
+/// Returns `false`, adding nothing, when `value` is malformed.
+pub fn push_authentication_challenge(challenges: &mut Vec<String>, value: &str) -> bool {
+    let Some(parsed) = parse_authentication_challenges(value) else {
+        return false;
+    };
+    if parsed.is_empty() {
+        return false;
     }
-    let scheme = authentication_challenge_scheme(challenge);
-    if challenges
-        .iter()
-        .any(|existing| authentication_challenge_scheme(existing).eq_ignore_ascii_case(scheme))
-    {
-        return;
+    for challenge in parsed {
+        let duplicate = challenges.iter().any(|collected| {
+            parse_authentication_challenges(collected).is_some_and(|collected_challenges| {
+                collected_challenges.iter().any(|collected_challenge| {
+                    collected_challenge.same_protection_space(&challenge)
+                })
+            })
+        });
+        if !duplicate {
+            challenges.push(challenge.text.to_string());
+        }
     }
-    challenges.push(challenge.to_string());
+    true
 }
 
 /// Render collected challenges as one `WWW-Authenticate` field value (the
@@ -709,13 +903,17 @@ pub fn render_authentication_challenges(challenges: &[String]) -> String {
     }
 }
 
-/// The `WWW-Authenticate` value in a response header map, matched
-/// case-insensitively.
-pub fn response_authentication_challenge(headers: &HashMap<String, String>) -> Option<&str> {
-    headers
+/// Every `WWW-Authenticate` value in a response header map, matched
+/// case-insensitively and ordered by field-name spelling, so a map carrying
+/// several spellings is read deterministically and completely.
+pub fn response_authentication_challenges(headers: &HashMap<String, String>) -> Vec<&str> {
+    let mut fields: Vec<(&str, &str)> = headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
-        .map(|(_, value)| value.as_str())
+        .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    fields.sort_unstable();
+    fields.into_iter().map(|(_, value)| value).collect()
 }
 
 /// Replace every spelling of `WWW-Authenticate` in a response header map with
@@ -723,6 +921,30 @@ pub fn response_authentication_challenge(headers: &HashMap<String, String>) -> O
 pub fn set_response_authentication_challenge(headers: &mut HashMap<String, String>, value: String) {
     headers.retain(|name, _| !name.eq_ignore_ascii_case("www-authenticate"));
     headers.insert("WWW-Authenticate".to_string(), value);
+}
+
+/// Challenge for a `401` that ends an already-authenticated request because
+/// its credential expired or its authorization lifetime elapsed (issue
+/// #3815), or because the client certificate it was admitted on lost trust.
+///
+/// Names the scheme of the mechanism that committed the principal
+/// ([`RequestContext::auth_method`]); a certificate-admitted principal with no
+/// committing mechanism (`spiffe_identity`) answers `ClientCertificate`, and
+/// anything else the generic gateway challenge. A fixed literal: nothing about
+/// the credential or the expiry reaches the header.
+pub fn reauthentication_challenge(ctx: &RequestContext) -> &'static str {
+    match ctx.auth_method {
+        Some("basic_auth" | "ldap_auth") => BASIC_AUTHENTICATION_CHALLENGE,
+        Some("jwt_auth" | "jwks_auth" | "oauth2_introspection") => BEARER_INVALID_TOKEN_CHALLENGE,
+        Some("oidc_relying_party") => OIDC_INVALID_SESSION_CHALLENGE,
+        Some("key_auth") => API_KEY_AUTHENTICATION_CHALLENGE,
+        Some("hmac_auth") => HMAC_AUTHENTICATION_CHALLENGE,
+        Some("mtls_auth") => CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
+        Some("soap_ws_security") => WS_SECURITY_AUTHENTICATION_CHALLENGE,
+        Some(_) => GENERIC_AUTHENTICATION_CHALLENGE,
+        None if ctx.peer_spiffe_id.is_some() => CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
+        None => GENERIC_AUTHENTICATION_CHALLENGE,
+    }
 }
 
 macro_rules! impl_auth_plugin {

@@ -2861,6 +2861,13 @@ pub struct RequestContext {
     /// of public metadata so a custom plugin cannot opt an unrelated rejection
     /// into that contract.
     pub(crate) serverless_terminate_response: bool,
+    /// Set when a plugin whose short-circuit is an origin-authored
+    /// representation ([`Plugin::rejects_with_origin_response`]) rejected
+    /// this request. Noted through `&self` by the rejection funnel. Gateway
+    /// response repairs that apply only to gateway-authored errors — the
+    /// `WWW-Authenticate` challenge guarantee (issue #6774) — skip such a
+    /// response. Kept private so request metadata cannot forge it.
+    pub(crate) origin_rejection: std::sync::OnceLock<()>,
     /// The framed unary DATA payload and terminal trailers a validated
     /// `serverless_function` terminate invocation authored for this request.
     ///
@@ -3900,6 +3907,21 @@ impl RequestContext {
             || self.serverless_grpc_terminate_frame.is_some()
     }
 
+    /// Record that the rejecting plugin answered with an origin-authored
+    /// representation ([`Plugin::rejects_with_origin_response`]).
+    pub(crate) fn note_origin_rejection(&self) {
+        let _ = self.origin_rejection.set(());
+    }
+
+    /// Whether this request's short-circuit response was authored by an
+    /// origin (a replayed or relayed backend, provider, or function response)
+    /// rather than by the gateway. Such a response is carried as authored: the
+    /// gateway never adds a `WWW-Authenticate` challenge to an origin `401`
+    /// (issue #6774).
+    pub(crate) fn response_is_origin_authored(&self) -> bool {
+        self.serves_origin_representation() || self.origin_rejection.get().is_some()
+    }
+
     /// Phase of the matched route rule's total request deadline that produced
     /// this request's gateway-authored `504`, when one did.
     pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {
@@ -4107,6 +4129,7 @@ impl RequestContext {
             response_policy_stamp: None,
             response_presentation_policy_digest: None,
             serverless_terminate_response: false,
+            origin_rejection: std::sync::OnceLock::new(),
             serverless_grpc_terminate_frame: None,
             serverless_owned_dedup_publication: None,
             ai_prompt_compressor_classification_path: None,
@@ -5668,6 +5691,7 @@ impl RequestContext {
             response_policy_stamp: self.response_policy_stamp.clone(),
             response_presentation_policy_digest: self.response_presentation_policy_digest,
             serverless_terminate_response: self.serverless_terminate_response,
+            origin_rejection: self.origin_rejection.clone(),
             serverless_grpc_terminate_frame: self.serverless_grpc_terminate_frame.clone(),
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             ai_prompt_compressor_classification_path: std::mem::take(

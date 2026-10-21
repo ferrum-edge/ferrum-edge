@@ -356,10 +356,31 @@ pub(crate) async fn send_h3_reject_body<S>(
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
     ensure_h3_reject_content_type(&mut headers);
+    // A gateway `401` keeps its `WWW-Authenticate` challenge through the
+    // initial response header policy (RFC 9110 §15.5.2, issue #6774): a policy
+    // may replace it with another well-formed challenge, never remove it.
+    let seeded_challenge = (status == StatusCode::UNAUTHORIZED).then(|| {
+        let mut challenges = Vec::new();
+        for value in crate::plugins::utils::auth_flow::response_authentication_challenges(&headers)
+        {
+            crate::plugins::utils::auth_flow::push_authentication_challenge(&mut challenges, value);
+        }
+        crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges)
+    });
     crate::plugins::apply_initial_response_header_policies(
         initial_response_header_policy_plugins,
         &mut headers,
     );
+    if let Some(seeded_challenge) = seeded_challenge
+        && !crate::plugins::utils::auth_flow::response_authentication_challenges(&headers)
+            .into_iter()
+            .any(crate::plugins::utils::auth_flow::is_valid_authentication_challenge)
+    {
+        crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+            &mut headers,
+            seeded_challenge,
+        );
+    }
     write_h3_finalized_reject_body(stream, status, body, headers).await;
 }
 
@@ -497,6 +518,32 @@ fn h3_websocket_deadline_rejection(
     }
 }
 
+/// Send [`h3_websocket_deadline_rejection`]'s refusal. The credential-expiry
+/// `401` names the committing mechanism's challenge (RFC 9110 §15.5.2, issue
+/// #6774), exactly as the H1/H2 path does.
+async fn send_h3_deadline_rejection<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &RequestContext,
+    status: StatusCode,
+    body: &'static str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let mut headers = HashMap::new();
+    if status == StatusCode::UNAUTHORIZED {
+        crate::proxy::insert_reauthentication_challenge(&mut headers, ctx);
+    }
+    send_h3_reject_body(
+        stream,
+        status,
+        Bytes::from_static(body.as_bytes()),
+        headers,
+        initial_response_header_policy_plugins,
+    )
+    .await;
+}
+
 /// H3 WebSocket entry point. Called from `handle_h3_request` when
 /// `HttpFlavor::WebSocket` is detected on an HTTP/3 request and
 /// `FERRUM_HTTP3_WEBSOCKET_ENABLED` is true.
@@ -603,8 +650,9 @@ pub(crate) async fn handle_h3_websocket(
             Some(&original_request_path),
         )
         .await;
-        send_h3_error_body(
+        send_h3_deadline_rejection(
             &mut stream,
+            &ctx,
             status,
             body,
             &initial_response_header_policy_plugins,
@@ -1411,8 +1459,9 @@ pub(crate) async fn handle_h3_websocket(
             Some(&original_request_path),
         )
         .await;
-        send_h3_error_body(
+        send_h3_deadline_rejection(
             &mut stream,
+            &ctx,
             status,
             body,
             &initial_response_header_policy_plugins,

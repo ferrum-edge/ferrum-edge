@@ -26,9 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects), `mtls_auth` (`ClientCertificate`), `soap_ws_security`
   (`WS-Security`), and `oidc_relying_party` session rejects no longer answer
   `401` without one. An authentication-phase `401` lists every rejecting and
-  applicable mechanism's challenge (one per scheme) instead of letting the
-  last rejection erase earlier ones, and any other plugin `401` lacking a
-  valid challenge gets the route's challenges or the generic `ferrum-edge`.
+  applicable mechanism's challenge (one per scheme-and-realm protection
+  space) instead of letting the last rejection erase earlier ones; any other
+  plugin `401` lacking a well-formed challenge — including one a header
+  policy stripped — gets the route's challenges or the generic `ferrum-edge`,
+  while origin-authored `401`s (cache/dedup replays, serverless, federated
+  providers) pass through untouched. Authorization-expiry terminals (H1, H2,
+  H3, CONNECT-UDP, WebSocket), client-certificate trust withdrawal (proxy and
+  admin), and admin JWT failures now carry challenges too, and `jwks_auth`
+  answers DPoP token failures with `DPoP error="invalid_token"`.
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and
   config-validation resolver used by `Consumer::validate_fields`, the

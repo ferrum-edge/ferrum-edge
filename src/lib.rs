@@ -9813,6 +9813,15 @@ pub mod _test_support {
         ctx.serverless_terminate_response = value;
     }
 
+    /// Note `plugin` as the plugin whose hook rejected the request, exactly as
+    /// the rejection funnel does (origin provenance included, issue #6774).
+    pub fn note_rejecting_plugin_for_test(
+        ctx: &crate::plugins::RequestContext,
+        plugin: &dyn crate::plugins::Plugin,
+    ) {
+        crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin);
+    }
+
     /// The production gate that decides whether a plugin short-circuit runs the
     /// shared response-body policy lifecycle (`on_response_body`,
     /// representation admission, transforms, `on_final_response_body`).
