@@ -81,6 +81,11 @@ on:
         default: cloud-secrets
         type: choice
         options: [cloud-secrets, 'cloud-secrets,bench-h1-profile']
+      gateway_regression:
+        description: "Optional H1 TLS/H2 gateway evidence: 4 pairs, 10KiB/1MiB/5MiB; exact baseline required"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -115,6 +120,10 @@ jobs:
         run: |
           python3 .github/scripts/summarize_mesh_runtime_results.py --self-test
           python3 -m py_compile .github/scripts/summarize_mesh_runtime_results.py
+
+      - name: Validate optional gateway regression inputs
+        if: inputs.gateway_regression
+        run: python3 tests/performance/multi_protocol/gateway_regression.py validate
 
       - name: Install system dependencies
         run: |
@@ -153,6 +162,23 @@ jobs:
         run: |
           bash .github/scripts/mesh_runtime_campaign.sh build
 
+      - name: Build native gateway harness tools only
+        if: inputs.gateway_regression
+        timeout-minutes: 20
+        env:
+          RUSTFLAGS: ""
+          RUSTC_WRAPPER: ""
+          CARGO_BUILD_RUSTC_WRAPPER: ""
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev lsof
+          unset CARGO_TARGET_DIR
+          rustc -Vv > results/images/gateway-tools-rustc.txt
+          cargo -Vv > results/images/gateway-tools-cargo.txt
+          cargo build --locked --release \
+            --manifest-path tests/performance/multi_protocol/Cargo.toml \
+            --bin proto_bench --bin proto_backend 2>&1 | tee results/images/gateway-tools-build.log
+
       - name: Run benchmark (balanced blocks, paired Ferrum images, same runner)
         timeout-minutes: 110
         run: |
@@ -163,6 +189,20 @@ jobs:
         run: |
           leaked=$(docker ps -aq --filter "name=meshbench-")
           if [ -n "$leaked" ]; then docker rm -f $leaked 2>/dev/null || true; fi
+
+      # This optional lane reuses the two exact image IDs in provenance.json;
+      # --skip-build prevents the protocol runner rebuilding either gateway.
+      # Two bounded 30-minute protocol slices plus owned cleanup fit this step.
+      - name: Collect optional gateway regression evidence
+        if: inputs.gateway_regression
+        timeout-minutes: 70
+        run: python3 -u tests/performance/multi_protocol/gateway_regression.py run
+
+      - name: Render optional gateway evidence
+        if: always() && inputs.gateway_regression
+        run: |
+          python3 tests/performance/multi_protocol/gateway_regression.py check || true
+          cat results/gateway_regression/report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Render combined summary
         if: always()
@@ -193,3 +233,7 @@ jobs:
         run: |
           python3 .github/scripts/summarize_mesh_runtime_results.py \
             --check-acceptance --output results/summary.json
+
+      - name: Enforce optional gateway data validity
+        if: always() && inputs.gateway_regression
+        run: python3 tests/performance/multi_protocol/gateway_regression.py check

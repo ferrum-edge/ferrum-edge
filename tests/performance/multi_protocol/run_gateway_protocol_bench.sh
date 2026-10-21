@@ -16,6 +16,8 @@
 #   --output-dir /tmp/gateway-protocol-results
 #   --skip-build                (reuse existing proto_bench binaries + ferrum docker image)
 #   --skip-direct               (accepted for frozen workflow; pairs always include direct)
+#   --owned-run-id ID          (bounded optional regression lane; requires fixture root)
+#   --regression-fixture-root PATH (new disposable fixture prepared by gateway_regression.py)
 #   --pairs N                   (even integer 2..12, default 2)
 #   --baseline-image IMAGE      (optional pinned Ferrum reference image)
 #   --adaptive                  (opt in to one budget-gated extension)
@@ -85,6 +87,8 @@ BASELINE_IMAGE="${FERRUM_BASELINE_IMAGE:-}"
 PAIR=0
 ORDER_POSITION=0
 HOST_ID=""
+OWNED_RUN_ID=""
+REGRESSION_FIXTURE_ROOT=""
 EXPERIMENT_MANIFEST="$SCRIPT_DIR/experiment.json"
 EXPERIMENT_ARMS=""
 H2_OBSERVE=0
@@ -104,6 +108,8 @@ GRPC_CLIENT_CONNECTIONS="${BENCH_GRPC_CLIENT_CONNECTIONS:-pooled}"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --owned-run-id) OWNED_RUN_ID="$2"; shift 2 ;;
+        --regression-fixture-root) REGRESSION_FIXTURE_ROOT="$2"; shift 2 ;;
         --experiment-manifest) EXPERIMENT_MANIFEST="$2"; shift 2 ;;
         --gateways) GATEWAYS="$2"; shift 2 ;;
         --payload-sizes) PAYLOAD_SIZES="$2"; shift 2 ;;
@@ -129,6 +135,35 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+# This finite mode is only used by the optional same-image regression lane.
+# The supervisor validates image users and owns this new disposable fixture.
+if [ -n "$OWNED_RUN_ID$REGRESSION_FIXTURE_ROOT" ]; then
+    [[ "$OWNED_RUN_ID" =~ ^[a-z0-9-]{1,64}$ ]] \
+        && [[ "$REGRESSION_FIXTURE_ROOT" = /* ]] \
+        && [[ "$PROTOCOL" = http1-tls || "$PROTOCOL" = http2 ]] \
+        && [ "$SKIP_BUILD" = true ] && [ "$GATEWAYS" = ferrum ] \
+        && [ -n "$BASELINE_IMAGE" ] && [ "$PROCESS_USAGE" = true ] \
+        && [ -z "$H1_PROFILE$H2_CPU_PROFILE$POOL_PROFILE$UDP_PROFILE" ] \
+        && [ "$ADAPTIVE" = false ] || exit 2
+    command -v timeout >/dev/null || exit 2
+fi
+# Bound every Docker operation in the owned mode, including startup/logging and
+# teardown. Never change Docker settings or touch another lane's containers.
+docker() {
+    if [ -n "$OWNED_RUN_ID" ]; then
+        if [ -n "${OWNED_READY_DEADLINE:-}" ]; then
+            local remaining=$((OWNED_READY_DEADLINE - SECONDS))
+            [ "$remaining" -gt 0 ] || return 124
+            [ "$remaining" -le 10 ] || remaining=10
+            timeout --signal=TERM --kill-after=2s "${remaining}s" docker "$@"
+            return
+        fi
+        timeout --signal=TERM --kill-after=2s 10s docker "$@"
+    else
+        command docker "$@"
+    fi
+}
 
 # DURATION and PAYLOAD_SIZES reach Bash arithmetic below. Validate first so
 # caller-controlled values cannot be evaluated as expressions.
@@ -378,6 +413,7 @@ GATEWAY_CID=""
 sampler_pid=""
 sampler_stop_file=""
 CERT_DIR="$SCRIPT_DIR/certs"
+if [ -n "$OWNED_RUN_ID" ]; then CERT_DIR="$REGRESSION_FIXTURE_ROOT/certs"; fi
 # Every fixed port this runner's backend/gateways/Redis/Envoy bind. The startup
 # conflict check and cleanup share this list so they cannot drift apart.
 BENCH_PORTS="3001 3002 3003 3004 3005 3006 3010 3443 3444 3445 3446 3447 \
@@ -499,7 +535,7 @@ ensure_baseline_image() {
 start_backend() {
     echo "[backend] starting proto_backend..."
     local backend_log="$SCRIPT_DIR/backend.log"
-    if [ "$H1_PROFILE" = diagnostic ]; then
+    if [ "$H1_PROFILE" = diagnostic ] || [ -n "$OWNED_RUN_ID" ]; then
         mkdir -p "$OUTPUT_DIR/diagnostics"
         backend_log="$OUTPUT_DIR/diagnostics/${gw}_backend.raw.log"
     fi
@@ -513,16 +549,25 @@ start_backend() {
     # writes to $OUTPUT_DIR/*.json would fail.
     local saved_pwd
     saved_pwd="$(pwd)"
-    cd "$SCRIPT_DIR"
+    if [ -n "$OWNED_RUN_ID" ]; then cd "$REGRESSION_FIXTURE_ROOT"; else cd "$SCRIPT_DIR"; fi
     BENCH_H2_OBSERVE="$H2_OBSERVE" H3_PROFILE="$H3_BUDGET" \
         BENCH_H2_STREAM_WINDOW="$H2_STREAM_WINDOW" \
-        ./target/release/proto_backend > "$backend_log" 2>&1 &
+        "$SCRIPT_DIR/target/release/proto_backend" > "$backend_log" 2>&1 &
     BACKEND_PID=$!
     cd "$saved_pwd"
 
+    local ready_deadline=$((SECONDS + 30)) curl_timeout=2
+    local curl_args=()
     for i in $(seq 1 20); do
-        if curl -sf http://127.0.0.1:3010/health >/dev/null 2>&1; then
+        if [ -n "$OWNED_RUN_ID" ]; then
+            kill -0 "$BACKEND_PID" 2>/dev/null && [ "$SECONDS" -lt "$ready_deadline" ] || break
+            curl_timeout=$((ready_deadline - SECONDS))
+            [ "$curl_timeout" -le 2 ] || curl_timeout=2
+            curl_args=(--connect-timeout 1 --max-time "$curl_timeout")
+        fi
+        if curl "${curl_args[@]}" -sf http://127.0.0.1:3010/health >/dev/null 2>&1; then
             echo "[backend] healthy (pid $BACKEND_PID)"
+            if [ -n "$OWNED_RUN_ID" ]; then kill -0 "$BACKEND_PID" 2>/dev/null || return 1; fi
             # Wait for cert generation
             for j in $(seq 1 10); do
                 [ -f "$CERT_DIR/ca.pem" ] && [ -f "$CERT_DIR/cert.pem" ] && break
@@ -581,6 +626,11 @@ start_ferrum() {
 
     # FERRUM_POOL_ENABLE_HTTP2 defaults to true (see CLAUDE.md), no need to set.
     local extra_env=()
+    if [ -n "$OWNED_RUN_ID" ]; then
+        extra_env+=(--user 65532:65532 --group-add 65532
+                    --name "gateway-regression-$OWNED_RUN_ID-$gw"
+                    --label "ferrum.gateway-regression=$OWNED_RUN_ID")
+    fi
     if [ -n "$H2_CPU_PROFILE" ]; then extra_env+=(--user 65532:65532 --cap-drop ALL); fi
     local response_cutoff=0
     case "$PROTOCOL" in
@@ -1012,7 +1062,23 @@ wait_for_gateway() {
         *) target_port=$GATEWAY_HTTPS_PORT ;;
     esac
 
+    local ready_deadline=$((SECONDS + 30)) curl_timeout=2
+    local OWNED_READY_DEADLINE="$ready_deadline"
     for i in $(seq 1 40); do
+        if [ -n "$OWNED_RUN_ID" ]; then
+            [ "$SECONDS" -lt "$ready_deadline" ] && container_alive || return 1
+            curl_timeout=$((ready_deadline - SECONDS))
+            [ "$curl_timeout" -gt 0 ] || return 1
+            [ "$curl_timeout" -le 2 ] || curl_timeout=2
+            if curl --fail --silent --show-error --connect-timeout 1 --max-time "$curl_timeout" \
+                --cacert "$CERT_DIR/ca.pem" "https://127.0.0.1:$target_port/health" >/dev/null 2>&1; then
+                container_alive && [ "$SECONDS" -lt "$ready_deadline" ] || return 1
+                echo "[gateway] owned container $GATEWAY_CID ready (verified TLS health)"
+                return 0
+            fi
+            sleep 0.2
+            continue
+        fi
         case "$PROTOCOL" in
             udp)
                 # Plain UDP: container-alive check is not enough because
@@ -1314,10 +1380,12 @@ run_bench() {
         curl -sf --max-time 5 http://127.0.0.1:3010/bench-stats \
             > "$backend_stats_before" 2>/dev/null || true
     fi
-    if [ "$H1_PROFILE" = diagnostic ]; then
+    if [ "$H1_PROFILE" = diagnostic ] || [ -n "$OWNED_RUN_ID" ]; then
         # Write directly to retained raw stdout so campaign termination during
         # the client/readers/logging cannot lose the original partial output.
-        timeout "${bench_wallclock}s" \
+        local timeout_grace=()
+        if [ -n "$OWNED_RUN_ID" ]; then timeout_grace=(--signal=TERM --kill-after=5s); fi
+        timeout "${timeout_grace[@]}" "${bench_wallclock}s" \
             "$SCRIPT_DIR/target/release/proto_bench" "$bench_proto" \
             --target "$bench_target" --duration "$DURATION" \
             --concurrency "$effective_concurrency" --payload-size "$payload" \
@@ -1367,7 +1435,7 @@ run_bench() {
     mkdir -p "$diagnostics"
     # `set -e` is on: a best-effort capture must never abort the matrix that
     # the capture exists to diagnose.
-    if [ "$H1_PROFILE" = diagnostic ]; then
+    if [ "$H1_PROFILE" = diagnostic ] || [ -n "$OWNED_RUN_ID" ]; then
         cp "$diagnostics/${gateway}_backend.raw.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
     else
         cp "$SCRIPT_DIR/backend.log" "$diagnostics/${gateway}_${payload}_backend.log" || true
@@ -1632,7 +1700,7 @@ PYEOF
                     kill "$BACKEND_PID" 2>/dev/null || true
                     wait "$BACKEND_PID" 2>/dev/null || true
                 fi
-                start_backend
+                start_backend || exit 1
                 h1_trace_start || { stop_gateway; continue; }
                 case "$gw" in
                     direct) ;;
