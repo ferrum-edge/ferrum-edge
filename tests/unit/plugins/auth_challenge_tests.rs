@@ -1324,3 +1324,110 @@ async fn digest_alternatives_survive_authentication_phase_aggregation() {
         );
     }
 }
+
+/// A final client-visible response-header policy that refuses a `200` with a
+/// `401` (a `waf` response-header rule with `reject_status_code: 401`, say).
+struct FinalHeaderPolicyRefusal401;
+
+#[async_trait]
+impl Plugin for FinalHeaderPolicyRefusal401 {
+    fn name(&self) -> &str {
+        "final_header_policy_refusal_401"
+    }
+
+    fn enforces_final_client_visible_response_headers(&self, _ctx: &RequestContext) -> bool {
+        true
+    }
+
+    async fn finalize_client_visible_response_headers(
+        &self,
+        _ctx: &mut RequestContext,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        if response_status == 401 {
+            return PluginResult::Continue;
+        }
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"response header refused"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// A reject-path hook opted in to replacing the response, answering with a
+/// `401` of the same status as the response it replaces.
+struct SameStatusReplacer401;
+
+#[async_trait]
+impl Plugin for SameStatusReplacer401 {
+    fn name(&self) -> &str {
+        "same_status_replacer_401"
+    }
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
+    fn may_replace_rejection_response(&self) -> bool {
+        true
+    }
+
+    async fn after_proxy(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 401,
+            body: r#"{"error":"replaced"}"#.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+/// An origin short-circuit replaced by the final header policy is
+/// gateway-authored, so the replacement `401` gets its challenge.
+#[tokio::test]
+async fn a_final_header_policy_replacement_of_an_origin_response_carries_a_challenge() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(KeyAuth::new(&json!({})).unwrap()),
+        Arc::new(FinalHeaderPolicyRefusal401),
+    ];
+    let mut serverless = ctx();
+    ferrum_edge::_test_support::set_serverless_terminate_response_for_test(&mut serverless, true);
+    let (status, headers) = finalize_with(
+        &plugins,
+        &mut serverless,
+        200,
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        challenge_header(&headers),
+        Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE),
+        "{headers:?}"
+    );
+}
+
+/// A same-status replacement by an opted-in reject hook is still a gateway
+/// replacement of the origin `401`.
+#[tokio::test]
+async fn a_same_status_reject_hook_replacement_of_an_origin_401_carries_a_challenge() {
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(KeyAuth::new(&json!({})).unwrap()),
+        Arc::new(SameStatusReplacer401),
+    ];
+    let mut serverless = ctx();
+    ferrum_edge::_test_support::set_serverless_terminate_response_for_test(&mut serverless, true);
+    let (status, headers) = finalize_with(&plugins, &mut serverless, 401, HashMap::new()).await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        challenge_header(&headers),
+        Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE),
+        "{headers:?}"
+    );
+}

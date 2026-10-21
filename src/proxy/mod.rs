@@ -24784,6 +24784,9 @@ fn replace_rejection_with_authorization_terminal(
     response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     let family = request_upload_auth_family(ctx);
     ctx.record_authorization_termination_once(termination, family);
     ctx.retain_deadline_response_gateway_headers(response_headers);
@@ -24827,6 +24830,9 @@ fn replace_rejection_with_gateway_deadline(
     response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     *status_code = StatusCode::OK.as_u16();
     if let Some(body) = response_body {
         // Drop any retained shared capacity; do not clear-in-place.
@@ -24896,11 +24902,6 @@ fn adopt_owned_rejection_hook_result(
     response_headers: &mut HashMap<String, String>,
 ) -> PluginResult {
     *ctx = outcome.ctx;
-    if outcome.status_code != *status_code {
-        // A reject-path hook that changes the status replaced the response:
-        // it is gateway-authored from here on (issue #6774).
-        ctx.note_gateway_response_replacement();
-    }
     *status_code = outcome.status_code;
     if let (Some(body), Some(owned_body)) = (response_body.as_deref_mut(), outcome.response_body) {
         *body = owned_body;
@@ -25380,6 +25381,10 @@ async fn run_after_proxy_hooks_on_rejection(
                 if plugin.may_replace_rejection_response()
                     && let Some(body) = response_body.as_deref_mut()
                 {
+                    // An opted-in reject hook replaced the response, whatever
+                    // its status: it is gateway-authored from here on (issue
+                    // #6774).
+                    ctx.note_gateway_response_replacement();
                     let replaced_status = *status_code;
                     *status_code = reject.status_code;
                     *body = reject.body;
@@ -28638,6 +28643,9 @@ pub(crate) fn replace_buffered_response_with_authorization_terminal(
     response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> u16 {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     let family = request_upload_auth_family(ctx);
     ctx.record_authorization_termination_once(termination, family);
     ctx.retain_deadline_response_gateway_headers(response_headers);
@@ -28701,6 +28709,9 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     ctx.mark_gateway_deadline_response_selected();
     ctx.retain_deadline_response_gateway_headers(response_headers);
     if let Some(content_type) = grpc_web_response_content_type {
@@ -28798,6 +28809,9 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
     response_body: &mut Bytes,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     use crate::proxy::response_buffer_budget as budget;
 
     let policy_refusal = ctx.response_transform_size_refusal_selected();
@@ -29062,6 +29076,9 @@ async fn replace_buffered_response_with_representation_error(
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     warn_sampled!(
         reason = rejection.reason(),
         "Buffered response rejected: configured response body policy could not be enforced"
@@ -29484,6 +29501,9 @@ async fn replace_buffered_response_with_policy_rejection(
     response_body: &mut Bytes,
     reject: RejectedResponseParts,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     // Keep only line-aware gateway output from the accepted backend lifecycle;
     // an identically named backend Set-Cookie/CORS/security field is not enough
     // to cross onto this gateway-authored replacement.
@@ -29572,6 +29592,9 @@ fn install_fixed_buffered_final_policy_terminal(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     let owned_grpc_web_response_content_type =
         crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
     if let Some(content_type) = owned_grpc_web_response_content_type.as_deref() {
@@ -29689,6 +29712,9 @@ fn install_final_header_policy_rejection(
     preserve_decorators: bool,
     preserve_from_gateway_provenance: bool,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     if preserve_decorators {
         if preserve_from_gateway_provenance {
             // Ordinary backend responses have a pristine baseline plus
@@ -56655,6 +56681,9 @@ pub(crate) fn apply_precommit_authorization_terminal(
     response_body: &mut ResponseBody,
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     let termination = request_authorization_termination(ctx, max_lifetime_seconds)?;
+    // The authorization terminal replaces whatever response was selected
+    // (issue #6774).
+    ctx.note_gateway_response_replacement();
     let (terminal_status, terminal_headers, terminal_body) =
         authorization_expired_pre_commitment_response(
             ctx,
