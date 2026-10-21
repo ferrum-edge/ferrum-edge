@@ -28,9 +28,10 @@ class ProductionContracts(unittest.TestCase):
         load=dict(mesh="ferrum",protocol="http1",payload_size=1024,duration_secs=3,rate=2000,concurrency=100,
                   total_errors=0,warmup_errors=0,total_requests=6000,admitted_requests=6000,cohort_requests=6000,
                   admitted_errors=0,missed_requests=0,offered_requests=6000,missed_slot_count=0,missed_reservations=0,unclaimed_requests=0,first_missed_slot=None,last_missed_slot=None)
+        load.update(dict(rps=2000,cohort_p50_us=5,cohort_p95_us=7,cohort_p99_us=8,cohort_scheduled_p50_us=6,cohort_scheduled_p95_us=8,cohort_scheduled_p99_us=9,admission_delay_p99_us=1,admission_delay_max_us=2))
         resource=dict(valid=True,errors=[])
         self.assertEqual(campaign.validate(cell,load,resource),[])
-        for key,value in (("missed_requests",1),("mesh","envoy"),("duration_secs",2),("offered_requests",5999),("warmup_errors",1)):
+        for key,value in (("cohort_p99_us",None),("rps",float("nan")),("missed_requests",1),("mesh","envoy"),("duration_secs",2),("offered_requests",5999),("warmup_errors",1)):
             self.assertTrue(campaign.validate(cell,{**load,key:value},resource))
         self.assertTrue(campaign.validate(cell,load,{"valid":False,"errors":[]}))
         boundary={**load,"admitted_requests":5998,"cohort_requests":5998,"missed_requests":2,"missed_slot_count":2,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -66,6 +67,11 @@ def provenance():
 
 def validate(cell, load, resource):
     errors = []
+    for key in ("cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us", "admission_delay_p99_us", "admission_delay_max_us", "missed_requests"):
+        if type(load.get(key)) is not int or load[key] < 0:
+            errors.append(f"missing or invalid numeric evidence {key}")
+    if type(load.get("rps")) not in (int, float) or not math.isfinite(load["rps"]) or load["rps"] <= 0:
+        errors.append("missing or invalid throughput evidence")
     expected = {"mesh": physical(cell["arm"]), "protocol": "http1", "payload_size": cell["payload"],
                 "duration_secs": cell["duration"], "rate": cell["rate"], "concurrency": 50 if cell["payload"] >= 1048576 else 100}
     for key, value in expected.items():
