@@ -30,7 +30,7 @@ RAW_BYTES = 64 * 1024**2
 DSO_BYTES = 1024**3
 METADATA_BYTES = 16 * 1024**2
 CAPTURE_SECONDS = 300
-FREQUENCY = 49
+FREQUENCY = 19
 KNOWN_FRACTION = 0.80
 HERE = Path(__file__).resolve().parent
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -213,7 +213,7 @@ def validate_attributes(text):
             errors.append(f"unexpected/missing event attribute {key}")
     frequency = re.search(r"\{\s*sample_period\s*,\s*sample_freq\s*\}\s*:\s*(\d+)", line)
     if not frequency or int(frequency[1]) != FREQUENCY:
-        errors.append("actual frequency is not 49 Hz")
+        errors.append(f"actual frequency is not {FREQUENCY} Hz")
     sample = re.search(r"sample_type\s*:\s*([A-Z_|]+)", line)
     bits = set(sample[1].split("|")) if sample else set()
     if not {"IP", "TID", "TIME"} <= bits or bits & {"CALLCHAIN", "STACK_USER", "REGS_USER"}:

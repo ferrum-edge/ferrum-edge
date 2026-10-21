@@ -15,8 +15,8 @@ SPEC = importlib.util.spec_from_file_location("production_perf", HERE / "product
 M = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(M)
 IMAGE = "sha256:" + "a" * 64
-ATTRS = "cpu-clock:u: type: 1 (software), config: 0 (PERF_COUNT_SW_CPU_CLOCK), { sample_period, sample_freq }: 49, sample_type: IP|TID|TIME|CPU, freq: 1, inherit: 1, exclude_kernel: 1, use_clockid: 1, clockid: 1\n"
-DUMMY = "dummy:u: type: 1 (PERF_TYPE_SOFTWARE), config: 0x9 (PERF_COUNT_SW_DUMMY), { sample_period, sample_freq }: 49, sample_type: IP|TID|TIME|ID|CPU|PERIOD, freq: 1, inherit: 1, exclude_kernel: 1, mmap: 1, comm: 1, task: 1, sample_id_all: 1, mmap2: 1, comm_exec: 1, use_clockid: 1, clockid: 1\n"
+ATTRS = "cpu-clock:u: type: 1 (software), config: 0 (PERF_COUNT_SW_CPU_CLOCK), { sample_period, sample_freq }: 19, sample_type: IP|TID|TIME|CPU, freq: 1, inherit: 1, exclude_kernel: 1, use_clockid: 1, clockid: 1\n"
+DUMMY = "dummy:u: type: 1 (PERF_TYPE_SOFTWARE), config: 0x9 (PERF_COUNT_SW_DUMMY), { sample_period, sample_freq }: 19, sample_type: IP|TID|TIME|ID|CPU|PERIOD, freq: 1, inherit: 1, exclude_kernel: 1, mmap: 1, comm: 1, task: 1, sample_id_all: 1, mmap2: 1, comm_exec: 1, use_clockid: 1, clockid: 1\n"
 
 
 def line(pid=101, when=15, symbol="ferrum::request", dso="/usr/local/bin/ferrum-edge"):
@@ -53,7 +53,7 @@ class ProductionPerf(unittest.TestCase):
     def test_command_is_leaf_only_fixed_clock_and_rate_with_raw_cap(self):
         args = M.record_argv("/usr/bin/perf", 101, Path("/tmp/owned"))
         self.assertEqual(args[:4], ["/usr/bin/perf", "--buildid-dir", "/tmp/buildid-cache", "record"])
-        self.assertEqual(args[args.index("-F") + 1], "49")
+        self.assertEqual(args[args.index("-F") + 1], "19")
         self.assertEqual(args[args.index("-e") + 1], "cpu-clock:u")
         self.assertEqual(args[args.index("--clockid") + 1], "mono")
         self.assertEqual(args[args.index("-p") + 1], "101")
@@ -61,7 +61,7 @@ class ProductionPerf(unittest.TestCase):
         self.assertIn("--no-buildid-cache", args)
         self.assertNotIn("--call-graph", args)
         self.assertEqual(M.validate_attributes(ATTRS), [])
-        self.assertTrue(M.validate_attributes(ATTRS.replace("49,", "99,")))
+        self.assertTrue(M.validate_attributes(ATTRS.replace("19,", "99,")))
         self.assertTrue(M.validate_attributes(ATTRS.replace("IP|TID|TIME|CPU", "IP|TID|TIME|STACK_USER")))
         self.assertTrue(M.validate_attributes(ATTRS.replace("clockid: 1", "clockid: 0")))
 
