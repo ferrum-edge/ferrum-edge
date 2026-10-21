@@ -931,7 +931,7 @@ impl UploadFixture {
             h2c,
             sink_port,
         );
-        let mut gateway = spawn_unix_gateway(config, &root).await;
+        let gateway = spawn_unix_gateway(config, &root).await;
         gateway
             .wait_for_proxy_port(Duration::from_secs(10))
             .await
