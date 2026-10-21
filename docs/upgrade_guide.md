@@ -688,11 +688,19 @@ receive `CANCELLED` trailers. Backend health stays neutral.
 
 Alerts and dashboards keyed on `5xx`, on gRPC `UNAVAILABLE`, or on status `0`
 see fewer of these requests, and those keyed on `499` or `CANCELLED` see
-more. On the streamed HTTP/3 paths, an upload read the client did not cause
-(an undecodable trailer section, a frame after it, or a refused DATA frame) is
-now `400` / `INVALID_ARGUMENT`. The plain bridge previously recorded it as a
-client disconnect, and the gRPC paths as `UNAVAILABLE`. Deadlines,
-authorization-lifetime terminals, and backend failures keep their status.
+more. Only proven client actions count. A stream or connection the gateway
+closed itself (a shutdown, its own graceful or error close) is logged as the
+gateway's `503` / `UNAVAILABLE` and is not a client disconnect. This applies
+to the buffered HTTP/3 drains too, under the new rejection phase
+`gateway_closed_h3_upload`. An HTTP/3 framing violation (an undecodable
+trailer section, a frame after it, or a frame error) is `400` /
+`INVALID_ARGUMENT`. The plain bridge previously recorded it as a client
+disconnect, and the gRPC paths as `UNAVAILABLE`. A client that cancels a native
+HTTP/3 request while the backend withholds its response head is now a client
+abort, not a backend timeout. The buffered plain and mesh bridges no longer
+write a `499` response to a departed client; they reset the response.
+Deadlines, authorization-lifetime terminals, and backend failures keep their
+status.
 
 ### Upload completion and error accounting (#6022)
 

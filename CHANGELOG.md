@@ -28,9 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/3 gRPC and the HTTP/3-to-gRPC bridge answered `UNAVAILABLE`, and the
   plain HTTP/3-to-HTTP bridge logged status `0`. The `499` is keyed on typed
   client-abort evidence, never on the `ClientDisconnect` class, so deadline
-  and authorization-lifetime terminals keep their status. A streamed upload
-  read the client did not cause is `400` / `INVALID_ARGUMENT`. Backend
-  health stays neutral. See the upgrade guide.
+  and authorization-lifetime terminals keep their status. A stream the
+  gateway closed itself is its own `503` / `UNAVAILABLE`. An HTTP/3 framing
+  violation is `400` / `INVALID_ARGUMENT`. Neither is a client disconnect.
+  Backend health stays neutral, and a backend failure that coincides with a
+  client abort keeps its own classification. See the upgrade guide.
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and
   config-validation resolver used by `Consumer::validate_fields`, the

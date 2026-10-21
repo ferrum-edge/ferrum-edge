@@ -308,7 +308,10 @@ body-read timeout keeps its timeout classification.
 A proven client-origin abort before response headers are committed has one
 terminal on every HTTP-family path, buffered or streamed (issue #6772). A
 proven abort is a request-stream reset with any code, `STOP_SENDING` on the
-response, or a lost connection. The terminal is defined once in
+response, or a connection the client closed or lost (a close it sent, a
+stateless reset, or an idle timeout). The gateway's own close, including a
+graceful `H3_NO_ERROR` close or Quinn's `LocallyClosed`, is never one. The
+terminal is defined once in
 [`src/proxy/client_abort.rs`](../src/proxy/client_abort.rs):
 
 | Field | Value |
@@ -324,7 +327,10 @@ The terminal comes from the typed `ProvenClientAbort` evidence, never from
 terminals the gateway chose while the client may still be connected: a client
 RPC deadline or stalled upload (`504` / `DEADLINE_EXCEEDED`), an expired
 authorization lifetime (`401` / `UNAUTHENTICATED`), and a malformed upload
-(`400` / `INVALID_ARGUMENT`). Each keeps its own status. A backend failure stays
+(`400` / `INVALID_ARGUMENT`). Each keeps its own status. A stream or connection
+the gateway ended itself is the gateway-closed terminal: `503` / `UNAVAILABLE`,
+`client_disconnected` unset, neutral for backend health, rejection phase
+`gateway_closed_h3_upload` on the buffered native drains. A backend failure stays
 `502` / `UNAVAILABLE` (`504` / `DEADLINE_EXCEEDED` for a backend timeout).
 
 After response headers are committed, the committed status stands and a client

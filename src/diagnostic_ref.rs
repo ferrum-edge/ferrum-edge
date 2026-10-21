@@ -263,6 +263,7 @@ const GATEWAY_REJECTION_PHASES: &[&str] = &[
     "client_disconnect_buffered_h3_bridge_upload",
     "authorization_expired_buffered_grpc_upload",
     "invalid_h3_upload",
+    "gateway_closed_h3_upload",
     "mesh_inbound_peer_auth_initial_route_mismatch",
     "mesh_inbound_peer_auth_transport_mismatch",
     "mesh_inbound_peer_auth_retry_target_mismatch",

@@ -103,8 +103,9 @@ records the same outcome as for a reset in the middle of the body.
 
 A client-origin abort before response headers are committed is recorded the same way on every
 HTTP-family path (issue #6772). The cases are a request-stream reset with any code (`H3_NO_ERROR`
-included), `STOP_SENDING` on the response, or a lost connection. The paths are H1/H2 buffered
-intake, the native HTTP/3 backend, both HTTP/3 bridges, and native gRPC:
+included), `STOP_SENDING` on the response, or a connection the client closed or lost (a close it
+sent, a stateless reset, or an idle timeout). The paths are H1/H2 buffered intake, the native
+HTTP/3 backend, both HTTP/3 bridges, and native gRPC:
 
 | Signal | Recorded value |
 |---|---|
@@ -119,25 +120,44 @@ the client is still reachable on the response direction, gRPC paths send `CANCEL
 plain HTTP paths reset the HTTP/3 response with `H3_REQUEST_CANCELLED`. Neither reports an upstream
 `502` or `UNAVAILABLE`.
 
-Only a proven client action selects this terminal. The predicate is the same for buffered and
-streamed uploads (`ProvenClientAbort` in `src/proxy/client_abort.rs`): a peer reset or a closed
-connection is an abort, and any other read failure is malformed input. The `client_disconnect`
-class alone does not select it, because that class also marks terminals the gateway chose while the
-client may still be connected. Those keep their own status:
+Only a proven client action selects this terminal (`ProvenClientAbort` in
+`src/proxy/client_abort.rs`). A failed read of the upload is classified positively by one shared
+classifier (`stream_util::classify_h3_request_read_error`) on buffered and streamed paths alike. A
+peer reset, or a connection the peer closed or lost, is an abort. A frame error h3 closes with a
+protocol error code, or an undecodable or oversized trailer section, is malformed input. Anything
+else, including the gateway's own graceful `H3_NO_ERROR` close and Quinn's `LocallyClosed`, is the
+gateway's own close. A response-direction or connection watcher proves an abort only through a
+`STOP_SENDING` or a close the peer caused (`PeerConnectionSignal::closed_by_peer`). On the HTTP/3
+to gRPC bridge, the frontend terminal applies only when the channel body actually handed the upload
+failure to the backend exchange. A backend failure that happened on its own keeps its status and its
+health charge.
+
+The `client_disconnect` class alone does not select the client-abort terminal, because that class
+also marks terminals the gateway chose while the client may still be connected. Each terminal keeps
+its own status:
 
 | Terminal | HTTP | gRPC |
 |---|---|---|
 | Client abort before response headers | `499` | `CANCELLED` |
 | Malformed upload (undecodable DATA or trailers, or a frame after the trailers) | `400` | `INVALID_ARGUMENT` |
+| Gateway closed the client's stream or connection | `503` | `UNAVAILABLE` |
 | Client RPC deadline or stalled client upload | `504` | `DEADLINE_EXCEEDED` |
 | Expired authorization lifetime | `401` | `UNAUTHENTICATED` |
 | Backend failure | `502` (`504` for a backend timeout) | `UNAVAILABLE` (`DEADLINE_EXCEEDED`) |
 
+The client-abort, malformed, and gateway-closed terminals are all neutral for backend health, and
+each request is recorded once. The native HTTP/3 paths watch the client's response direction until
+the backend's response head arrives. A client that cancels after a clean upload FIN, while the
+backend withholds its head, is a client abort, not a backend timeout. A settled backend result or
+route deadline wins a simultaneous cancel.
+
 After response headers are committed, the committed status stays. A later client abort only marks
 the transaction `client_disconnected` and incomplete. A gRPC status is committed with the trailers,
-so a native gRPC RPC whose client aborts its upload mid-response still ends `CANCELLED`, logged under
-the committed HTTP `200`. A failed write of response headers the backend already produced keeps the
-backend's status, as nginx does.
+so a native gRPC RPC whose client aborts its upload mid-response still ends `CANCELLED`, and the log
+records that status under the committed HTTP `200`, never a fallback `UNKNOWN`. On the HTTP/3 to gRPC
+bridge the relay has already reset the response when the backend body fails, so `CANCELLED` is
+recorded but cannot be written. A failed write of response headers the backend already produced
+keeps the backend's status, as nginx does.
 
 Per path, for a streamed upload:
 
@@ -154,8 +174,11 @@ Per path, for a streamed upload:
   reset. The client's response is reset with `H3_REQUEST_CANCELLED`, and the request is recorded as
   `499` / `client_disconnect`. Before #6772 it was recorded with status `0`.
 
-A malformed upload on these paths is `400` / `INVALID_ARGUMENT`, still neutral for backend health.
-On the plain bridge it is logged as `400` and the response is reset, because the stream has failed.
+A malformed upload on these paths is `400` / `INVALID_ARGUMENT`, and a stream the gateway ended is
+`503` / `UNAVAILABLE`. Both are neutral for backend health. On the plain bridge both are logged
+without a write, and the response is reset because the stream has failed. The buffered plain and
+mesh bridges reset a departed plain-HTTP client's response too: they run the cancellation hooks and
+log `499`, but never write it.
 Before #6772 the native HTTP/3 backend answered a mid-upload reset with a gateway `502`, and the
 gRPC paths answered `UNAVAILABLE`. Alerts keyed on `5xx` or `UNAVAILABLE` therefore see fewer of
 these requests, and alerts keyed on `499` or `CANCELLED` see more. Before #6022 the native paths and

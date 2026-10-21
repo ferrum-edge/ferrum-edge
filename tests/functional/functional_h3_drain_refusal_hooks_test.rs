@@ -506,6 +506,63 @@ async fn wait_for_status(harness: &GatewayHarness, path: &str, status: u64) -> V
     .await
 }
 
+/// Every `stdout_logging` transaction entry logged for this proxy's `path`.
+fn transactions_for(harness: &GatewayHarness, path: &str) -> Vec<Value> {
+    harness
+        .captured_combined()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter(|entry| {
+            entry.get("proxy_id").and_then(Value::as_str) == Some(PROXY_ID)
+                && entry.get("request_path").and_then(Value::as_str) == Some(path)
+        })
+        .collect()
+}
+
+/// Each request gets exactly one terminal record (issue #6772): after the
+/// expected entries appeared, no second record follows for the same requests.
+async fn assert_transaction_count(harness: &GatewayHarness, path: &str, expected: usize) {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let entries = transactions_for(harness, path);
+    assert_eq!(
+        entries.len(),
+        expected,
+        "each request to {path} must be logged exactly once: {entries:#?}"
+    );
+}
+
+/// The gateway's runtime `client_disconnects` counter.
+async fn client_disconnect_count(harness: &GatewayHarness) -> u64 {
+    harness
+        .get_admin_json("/metrics/runtime")
+        .await
+        .expect("runtime metrics")["http"]["client_disconnects"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// The runtime disconnect counter reaches exactly `expected` and stays there.
+/// `/metrics/runtime` is cached briefly, so poll, then re-read past the cache.
+async fn assert_client_disconnects(harness: &GatewayHarness, expected: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = client_disconnect_count(harness).await;
+    while seen < expected && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        seen = client_disconnect_count(harness).await;
+    }
+    assert_eq!(
+        seen, expected,
+        "client_disconnects must count each abort once"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        client_disconnect_count(harness).await,
+        expected,
+        "a terminal must not be counted twice"
+    );
+}
+
 /// Issue #6772: the shared pre-header client-abort terminal, as logged.
 fn assert_client_abort_entry(entry: &Value) {
     assert_eq!(entry["response_status_code"], 499, "{entry}");
@@ -1452,10 +1509,13 @@ async fn h3_streamed_upload_client_abort_logs_499_and_leaves_backend_health_neut
     let (harness, https_port) = spawn_streamed_upload_gateway(proxy).await;
     let url = proxy_url(https_port, UPLOAD_PATH);
 
+    let disconnects_before = client_disconnect_count(&harness).await;
     let mut reset = upload_through_trailers(&url, &[], &harness, &ends).await;
     reset.reset_request_upload(h3::error::Code::H3_NO_ERROR);
     assert_upload_aborted(&harness, &ends).await;
     assert_client_abort_entry(&wait_for_status(&harness, UPLOAD_PATH, 499).await);
+    assert_transaction_count(&harness, UPLOAD_PATH, 1).await;
+    assert_client_disconnects(&harness, disconnects_before + 1).await;
     drop(reset);
 
     let mut complete = open_upload_stream(&url, "application/octet-stream").await;
@@ -1472,6 +1532,8 @@ async fn h3_streamed_upload_client_abort_logs_499_and_leaves_backend_health_neut
     );
     let entry = wait_for_status(&harness, UPLOAD_PATH, 200).await;
     assert_ne!(entry["client_disconnected"], true, "{entry}");
+    assert_transaction_count(&harness, UPLOAD_PATH, 2).await;
+    assert_client_disconnects(&harness, disconnects_before + 1).await;
     assert_eq!(
         count(&ends.completed),
         1,
@@ -1533,6 +1595,7 @@ async fn h3_native_streamed_upload_client_abort_logs_499_without_a_gateway_502()
     upload.reset_request_upload(h3::error::Code::H3_REQUEST_CANCELLED);
 
     assert_client_abort_entry(&wait_for_status(&harness, UPLOAD_PATH, 499).await);
+    assert_transaction_count(&harness, UPLOAD_PATH, 1).await;
     match upload.recv_response().await {
         Ok((status, headers)) => panic!(
             "a departed client must not be answered with a gateway status; got {status} {headers:?}"
@@ -1622,6 +1685,7 @@ async fn h3_streaming_grpc_bridge_client_abort_is_cancelled_not_unavailable() {
     assert_eq!(entry["response_status_code"], 200, "{entry}");
     assert_eq!(entry["error_class"], "client_disconnect", "{entry}");
     assert_eq!(entry["client_disconnected"], true, "{entry}");
+    assert_transaction_count(&harness, GRPC_PATH, 1).await;
 }
 
 /// After the response head is committed, a client that goes away keeps the
@@ -1700,4 +1764,162 @@ async fn h3_client_abort_after_response_headers_keeps_the_committed_status() {
     );
     drop(download);
     backend_task.abort();
+}
+
+/// Open a native gRPC request stream, retrying the QUIC handshake briefly.
+async fn open_grpc_rpc(url: &str) -> Http3GrpcStream {
+    let client = Http3Client::insecure().expect("H3 client");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match client.open_grpc_stream(url).await {
+            Ok(stream) => return stream,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the H3 gRPC stream never opened: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+}
+
+/// Wait until the native-H3 backend has the RPC and its first request message.
+async fn wait_for_h3_backend_upload(harness: &GatewayHarness, backend: &ScriptedH3Backend) {
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    loop {
+        if backend
+            .received_requests()
+            .await
+            .iter()
+            .any(|request| request.path.starts_with(GRPC_PATH) && !request.body.is_empty())
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the H3 backend must receive the RPC before the client cancels it; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Native HTTP/3 gRPC: a client that resets its upload before the backend's
+/// response head cancels the RPC. It is answered and logged `CANCELLED` (1),
+/// never `UNAVAILABLE` (14), as one `client_disconnect` record, and the
+/// target's HTTP/3 capability is not downgraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_native_grpc_client_abort_before_headers_is_cancelled() {
+    let (backend_port, h3_backend) = spawn_native_h3_backend(
+        "h3-native-grpc-abort",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::ReadRequestData,
+            H3Step::StallFor(Duration::from_secs(30)),
+        ],
+    )
+    .await;
+    let yaml = gateway_yaml(
+        with_one_strike_breaker(base_proxy("https", backend_port)),
+        Vec::new(),
+    );
+    let (harness, https_port) = spawn_h3_gateway(yaml, &[]).await;
+    wait_for_h3_supported(&harness).await;
+
+    let mut rpc = open_grpc_rpc(&proxy_url(https_port, GRPC_PATH)).await;
+    rpc.send_message(b"cancelled")
+        .await
+        .expect("request message");
+    wait_for_h3_backend_upload(&harness, &h3_backend).await;
+    rpc.cancel_request_upload();
+
+    let (status, headers) = rpc.recv_response().await.expect("cancellation response");
+    assert_eq!(status, StatusCode::OK, "gRPC errors ride on HTTP 200");
+    assert_eq!(
+        headers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "a client abort is CANCELLED, never UNAVAILABLE; got {headers:?}"
+    );
+    let entry = wait_for_transaction(&harness, GRPC_PATH, "a CANCELLED RPC", |entry| {
+        entry
+            .pointer("/metadata/grpc_status")
+            .and_then(Value::as_str)
+            == Some("1")
+    })
+    .await;
+    assert_eq!(entry["response_status_code"], 200, "{entry}");
+    assert_eq!(entry["error_class"], "client_disconnect", "{entry}");
+    assert_eq!(entry["client_disconnected"], true, "{entry}");
+    assert_transaction_count(&harness, GRPC_PATH, 1).await;
+    let capability = fetch_capability_entry(&harness)
+        .await
+        .expect("capability entry");
+    assert_eq!(
+        capability["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "a client abort must not downgrade the target's HTTP/3 capability: {capability}"
+    );
+}
+
+/// Native HTTP/3 gRPC after the response head: the HTTP `200` is committed, so
+/// it stays; the client's upload reset still ends the RPC `CANCELLED` on the
+/// wire AND in the transaction log, never a fallback `UNKNOWN`, and the RPC is
+/// recorded `client_disconnected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_native_grpc_client_abort_after_headers_logs_cancelled() {
+    let (backend_port, h3_backend) = spawn_native_h3_backend(
+        "h3-native-grpc-abort-after-head",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::ReadRequestData,
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-type", "application/grpc".to_string()),
+            ]),
+            H3Step::StallFor(Duration::from_secs(30)),
+        ],
+    )
+    .await;
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(base_proxy("https", backend_port), Vec::new()),
+        &[],
+    )
+    .await;
+    wait_for_h3_supported(&harness).await;
+
+    let mut rpc = open_grpc_rpc(&proxy_url(https_port, GRPC_PATH)).await;
+    rpc.send_message(b"cancelled")
+        .await
+        .expect("request message");
+    let (status, _) = rpc.recv_response().await.expect("response head");
+    assert_eq!(status, StatusCode::OK);
+    wait_for_h3_backend_upload(&harness, &h3_backend).await;
+    rpc.cancel_request_upload();
+
+    let (body, trailers) = rpc
+        .recv_body_and_trailers()
+        .await
+        .expect("terminal trailers");
+    assert!(body.is_empty(), "the backend sent no message");
+    assert_eq!(
+        trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "a client upload abort ends the RPC CANCELLED; got {trailers:?}"
+    );
+    let entry = wait_for_transaction(&harness, GRPC_PATH, "a CANCELLED RPC", |entry| {
+        entry.get("response_status_code").and_then(Value::as_u64) == Some(200)
+    })
+    .await;
+    assert_eq!(
+        entry
+            .pointer("/metadata/grpc_status")
+            .and_then(Value::as_str),
+        Some("1"),
+        "the log records the CANCELLED the client got, never UNKNOWN: {entry}"
+    );
+    assert_eq!(entry["client_disconnected"], true, "{entry}");
+    assert_transaction_count(&harness, GRPC_PATH, 1).await;
 }

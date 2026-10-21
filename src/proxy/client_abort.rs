@@ -29,8 +29,11 @@
 //! terminals the gateway itself chose while the client may still be connected
 //! (a client RPC deadline, an expired authorization lifetime, a stalled
 //! upload), and those keep their own `504` / `401` / `DEADLINE_EXCEEDED`
-//! accounting. A read failure the client did not cause (an undecodable frame
-//! or trailer section) is malformed input: `400` / `INVALID_ARGUMENT`.
+//! accounting. A read failure is classified positively
+//! (`crate::http3::stream_util::classify_h3_request_read_error`): a request that
+//! violated HTTP/3 framing is malformed input (`400` / `INVALID_ARGUMENT`), and a
+//! stream or connection the gateway ended itself is
+//! [`GATEWAY_CLOSED_UPLOAD_TERMINAL`], never a client abort.
 
 use crate::retry::ErrorClass;
 
@@ -73,6 +76,29 @@ pub const PRE_HEADER_CLIENT_ABORT_TERMINAL: ClientAbortTerminal = ClientAbortTer
     client_disconnected: true,
 };
 
+/// Terminal for a request stream the GATEWAY ended before response headers:
+/// its own graceful or error close, a local QUIC failure, or a cause that is not
+/// observable. Not a client abort and not a backend fault, so backend health
+/// stays neutral, but it is logged as the gateway's `503` / `UNAVAILABLE` with
+/// `client_disconnected` unset. Nothing is written to the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatewayClosedUploadTerminal {
+    /// Status for HTTP logs and request metrics.
+    pub http_status: u16,
+    /// gRPC outcome for a native gRPC RPC.
+    pub grpc_status: u32,
+    /// Fixed `grpc-message` for that outcome.
+    pub grpc_message: &'static str,
+}
+
+/// The one gateway-closed upload terminal every streamed path records.
+pub const GATEWAY_CLOSED_UPLOAD_TERMINAL: GatewayClosedUploadTerminal =
+    GatewayClosedUploadTerminal {
+        http_status: 503,
+        grpc_status: crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
+        grpc_message: "Request stream closed by the gateway",
+    };
+
 /// Evidence that the client, not the gateway or the backend, ended a request.
 ///
 /// Only the constructors below mint one, each named for the evidence it
@@ -85,26 +111,36 @@ pub struct ProvenClientAbort {
 
 impl ProvenClientAbort {
     /// A failed read of the client's HTTP/3 request stream that the client
-    /// caused: a peer reset with any code (`H3_NO_ERROR` included) or a closed
-    /// connection. The predicate is the one the buffered HTTP/3 drains use, so
-    /// buffered and streamed uploads can never disagree about the same error.
-    /// Any other read error is malformed input and returns `None`.
+    /// caused: a peer reset with any code (`H3_NO_ERROR` included), or a
+    /// connection the peer closed or lost. The classifier is the one every
+    /// buffered drain and streamed upload uses, so buffered and streamed uploads
+    /// can never disagree about the same error. Malformed input and a stream or
+    /// connection the gateway ended itself return `None`.
     pub fn from_h3_request_read_error(error: &h3::error::StreamError) -> Option<Self> {
         crate::http3::stream_util::h3_request_read_error_is_client_abort(error)
             .then_some(Self { _evidence: () })
     }
 
-    /// The client sent `STOP_SENDING` on the response, or its connection
-    /// closed, while the gateway was still waiting for the backend's response
-    /// head. Callers mint this only from the per-stream cancellation and
-    /// connection-close watchers.
-    pub const fn peer_gone_before_response_headers() -> Self {
-        Self { _evidence: () }
+    /// The client's response direction or connection ended while the gateway
+    /// still owed it a response head. `peer_stop_sending` is true when the
+    /// client sent `STOP_SENDING` on the response, which only the client can
+    /// do. Otherwise the connection ended, and only a close the peer sent, a
+    /// stateless reset, or an idle timeout is the client's
+    /// ([`crate::plugins::PeerConnectionSignal::closed_by_peer`]); the gateway's
+    /// own close returns `None`.
+    pub fn from_response_cancellation(
+        peer_stop_sending: bool,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Option<Self> {
+        let proven = peer_stop_sending
+            || peer.is_some_and(|signal| signal.is_closed() && signal.closed_by_peer());
+        proven.then_some(Self { _evidence: () })
     }
 
-    /// An upload fault an upload pump latched only after
-    /// [`Self::from_h3_request_read_error`] accepted the read error. The latch
-    /// carries the evidence across the task boundary.
+    /// A client abort the shared H3 read-failure classifier already accepted,
+    /// carried across a task or a typed latch (an upload pump's fault, a
+    /// reader's failure code, a typed pool error). Mint it only behind such a
+    /// latch.
     pub const fn latched_upload_abort() -> Self {
         Self { _evidence: () }
     }

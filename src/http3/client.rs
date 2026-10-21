@@ -1097,16 +1097,56 @@ pub struct H3PoolError {
 /// Typed so the gateway terminal is keyed on the observed cause rather than on
 /// the error text: only [`Self::Abort`] carries the
 /// [`ProvenClientAbort`](crate::proxy::client_abort::ProvenClientAbort) that
-/// reaches the `499` / `CANCELLED` client-abort terminal. Both malformed
-/// variants are client-caused too, so all three are neutral for backend health.
+/// reaches the `499` / `CANCELLED` client-abort terminal. None of the variants
+/// is a backend fault, so all of them are neutral for backend health.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum H3ClientRequestFault {
-    /// The client reset its request stream or lost its connection.
+    /// The client reset its request stream, or closed or lost its connection.
     Abort(ProvenClientAbort),
-    /// A request-body read failed on input the gateway refused (`400`).
+    /// A request DATA read failed on a framing violation (`400`).
     MalformedBody,
     /// The trailer section could not be decoded, or a frame followed it (`400`).
     MalformedTrailers,
+    /// The gateway ended the client's request stream or connection itself, or
+    /// the cause is not observable: the gateway-closed `503` / `UNAVAILABLE`
+    /// terminal, never a client abort.
+    GatewayTerminated,
+}
+
+/// The typed [`H3PoolError`] for a failed read of the client's own upload.
+///
+/// The cause is classified positively by
+/// [`crate::http3::stream_util::classify_h3_request_read_error`], the predicate
+/// the buffered drains use too (issue #6772). `malformed` names the malformed
+/// variant for the read that failed (DATA or the trailer section).
+fn h3_client_upload_read_error(
+    error: &h3::error::StreamError,
+    malformed: H3ClientRequestFault,
+) -> H3PoolError {
+    use crate::http3::stream_util::H3RequestReadFailure;
+    match crate::http3::stream_util::classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => H3PoolError::client_request(
+            H3ClientRequestFault::Abort(ProvenClientAbort::latched_upload_abort()),
+            anyhow::anyhow!("client disconnected while sending request body: {}", error),
+        ),
+        H3RequestReadFailure::Malformed => {
+            if malformed == H3ClientRequestFault::MalformedTrailers {
+                H3PoolError::client_request(
+                    malformed,
+                    anyhow::anyhow!("malformed client request trailers: {}", error),
+                )
+            } else {
+                H3PoolError::client_request(
+                    malformed,
+                    anyhow::anyhow!("malformed client request body: {}", error),
+                )
+            }
+        }
+        H3RequestReadFailure::GatewayTerminated => H3PoolError::client_request(
+            H3ClientRequestFault::GatewayTerminated,
+            anyhow::anyhow!("client request stream closed by the gateway: {}", error),
+        ),
+    }
 }
 
 impl H3PoolError {
@@ -1259,6 +1299,19 @@ impl H3PoolError {
     ) -> Self {
         let mut error = Self::post_wire(error);
         error.client_request_fault = Some(fault);
+        error
+    }
+
+    /// [`Self::client_request`] for a client fault observed while the dispatch
+    /// may not have handed the request to the backend yet: `request_on_wire`
+    /// is whether the backend stream had opened.
+    pub(crate) fn client_request_at_handoff(
+        fault: H3ClientRequestFault,
+        error: impl Into<anyhow::Error>,
+        request_on_wire: bool,
+    ) -> Self {
+        let mut error = Self::client_request(fault, error);
+        error.request_on_wire = request_on_wire;
         error
     }
 
@@ -3663,19 +3716,10 @@ impl Http3ConnectionPool {
             let chunk_opt = match recv_res {
                 Ok(c) => c,
                 Err(e) => {
-                    return Err(match ProvenClientAbort::from_h3_request_read_error(&e) {
-                        Some(abort) => H3PoolError::client_request(
-                            H3ClientRequestFault::Abort(abort),
-                            anyhow::anyhow!(
-                                "client disconnected while sending request body: {}",
-                                e
-                            ),
-                        ),
-                        None => H3PoolError::client_request(
-                            H3ClientRequestFault::MalformedBody,
-                            anyhow::anyhow!("malformed client request body: {}", e),
-                        ),
-                    });
+                    return Err(h3_client_upload_read_error(
+                        &e,
+                        H3ClientRequestFault::MalformedBody,
+                    ));
                 }
             };
             let Some(mut chunk) = chunk_opt else { break };
@@ -3749,16 +3793,10 @@ impl Http3ConnectionPool {
             }
             Ok(_) => {}
             Err(e) => {
-                return Err(match ProvenClientAbort::from_h3_request_read_error(&e) {
-                    Some(abort) => H3PoolError::client_request(
-                        H3ClientRequestFault::Abort(abort),
-                        anyhow::anyhow!("client disconnected while sending request body: {}", e),
-                    ),
-                    None => H3PoolError::client_request(
-                        H3ClientRequestFault::MalformedTrailers,
-                        anyhow::anyhow!("malformed client request trailers: {}", e),
-                    ),
-                });
+                return Err(h3_client_upload_read_error(
+                    &e,
+                    H3ClientRequestFault::MalformedTrailers,
+                ));
             }
         }
         await_h3_write_under_authorization(

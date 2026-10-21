@@ -531,24 +531,128 @@ where
     stream.stop_sending(Code::H3_NO_ERROR);
 }
 
-/// Whether a failed request-stream read means the client abandoned the upload
-/// rather than sent a malformed one.
+/// Why a read of the client's HTTP/3 request stream failed (issue #6772).
 ///
 /// After a trailer section the request-upload paths read on to the stream's own
-/// end (`recv_trailers` waits for it). A client that resets the stream there
-/// (any code, `H3_NO_ERROR` included) or loses its connection has cancelled the
-/// request: a client disconnect, not a malformed trailer block (issue #6022).
-/// A locally detected protocol error (an undecodable trailer section, a known
-/// frame after the trailers) stays malformed, unless the local close was the
-/// gateway's own graceful `H3_NO_ERROR`.
-pub(crate) fn h3_request_read_error_is_client_abort(error: &h3::error::StreamError) -> bool {
+/// end (`recv_trailers` waits for it), so a reset there is classified exactly
+/// like one in the middle of the body (issue #6022).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum H3RequestReadFailure {
+    /// The client ended the request: it reset the request stream (any code,
+    /// `H3_NO_ERROR` included), closed its connection, or its connection was
+    /// lost (idle timeout or stateless reset).
+    ClientAbort,
+    /// The request violated HTTP/3 framing or field rules: an undecodable or
+    /// oversized trailer section, a known frame after it, or a frame error h3
+    /// detected and answered with a protocol error code.
+    Malformed,
+    /// The gateway ended the stream or connection itself (its own graceful or
+    /// error close, a local QUIC failure, a stream it already stopped), or the
+    /// cause is not observable. Never proof of a client abort.
+    GatewayTerminated,
+}
+
+/// HTTP/3 / QPACK error codes that name a protocol violation by the peer.
+fn h3_code_is_peer_protocol_violation(code: Code) -> bool {
+    code == Code::H3_GENERAL_PROTOCOL_ERROR
+        || code == Code::H3_STREAM_CREATION_ERROR
+        || code == Code::H3_CLOSED_CRITICAL_STREAM
+        || code == Code::H3_FRAME_UNEXPECTED
+        || code == Code::H3_FRAME_ERROR
+        || code == Code::H3_ID_ERROR
+        || code == Code::H3_SETTINGS_ERROR
+        || code == Code::H3_MISSING_SETTINGS
+        || code == Code::H3_MESSAGE_ERROR
+        || code == Code::QPACK_DECOMPRESSION_FAILED
+        || code == Code::QPACK_ENCODER_STREAM_ERROR
+        || code == Code::QPACK_DECODER_STREAM_ERROR
+}
+
+/// Classify a QUIC connection error h3 reported as `Undefined` (vendored
+/// h3-quinn folds several Quinn errors into it). Only a close the peer sent, a
+/// stateless reset, or an idle timeout is the client's; the gateway's own
+/// `LocallyClosed`, a transport error it detected, and resource exhaustion are
+/// not.
+fn classify_undefined_connection_error(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> H3RequestReadFailure {
+    match error.downcast_ref::<quinn::ConnectionError>() {
+        Some(
+            quinn::ConnectionError::ApplicationClosed(_)
+            | quinn::ConnectionError::ConnectionClosed(_)
+            | quinn::ConnectionError::Reset
+            | quinn::ConnectionError::TimedOut,
+        ) => H3RequestReadFailure::ClientAbort,
+        _ => H3RequestReadFailure::GatewayTerminated,
+    }
+}
+
+/// Classify a failed read of the client's request stream.
+///
+/// The ONE predicate every buffered drain and streamed upload uses, so the same
+/// error can never be a client abort on one path and something else on
+/// another. Only positive evidence selects [`H3RequestReadFailure::ClientAbort`]
+/// or [`H3RequestReadFailure::Malformed`]; everything else is
+/// [`H3RequestReadFailure::GatewayTerminated`].
+pub(crate) fn classify_h3_request_read_error(
+    error: &h3::error::StreamError,
+) -> H3RequestReadFailure {
+    use h3::error::{ConnectionError, LocalError, StreamError};
+    use h3::quic::ConnectionErrorIncoming;
     match error {
-        h3::error::StreamError::RemoteTerminate { .. } => true,
-        h3::error::StreamError::ConnectionError { 0: connection, .. } => {
-            !matches!(connection, h3::error::ConnectionError::Local { .. })
-                || connection.is_h3_no_error()
+        StreamError::RemoteTerminate { .. } => H3RequestReadFailure::ClientAbort,
+        StreamError::ConnectionError { 0: connection, .. } => match connection {
+            ConnectionError::Remote { 0: incoming, .. } => match incoming {
+                ConnectionErrorIncoming::ApplicationClose { .. }
+                | ConnectionErrorIncoming::Timeout => H3RequestReadFailure::ClientAbort,
+                ConnectionErrorIncoming::InternalError(_) => {
+                    H3RequestReadFailure::GatewayTerminated
+                }
+                ConnectionErrorIncoming::Undefined(error) => {
+                    classify_undefined_connection_error(&**error)
+                }
+            },
+            ConnectionError::Timeout { .. } => H3RequestReadFailure::ClientAbort,
+            ConnectionError::Local {
+                error: LocalError::Application { code, .. },
+                ..
+            } if h3_code_is_peer_protocol_violation(*code) => H3RequestReadFailure::Malformed,
+            _ => H3RequestReadFailure::GatewayTerminated,
+        },
+        StreamError::StreamError { code, .. } if h3_code_is_peer_protocol_violation(*code) => {
+            H3RequestReadFailure::Malformed
         }
-        _ => false,
+        StreamError::HeaderTooBig { .. } => H3RequestReadFailure::Malformed,
+        _ => H3RequestReadFailure::GatewayTerminated,
+    }
+}
+
+/// Whether a failed request-stream read is the client's own abort (see
+/// [`classify_h3_request_read_error`]).
+pub(crate) fn h3_request_read_error_is_client_abort(error: &h3::error::StreamError) -> bool {
+    classify_h3_request_read_error(error) == H3RequestReadFailure::ClientAbort
+}
+
+/// Observe the client's response (send) direction ending before the gateway
+/// finished it: `true` for a peer `STOP_SENDING`, `false` when the connection
+/// ended (closed or lost by either side). A clean local finish acknowledgement
+/// (`Ok(None)`) is not cancellation and never resolves.
+///
+/// Like [`peer_response_cancelled`], the future is `'static` and does not
+/// borrow `stream`.
+pub(crate) fn peer_response_stopped<S>(
+    stream: &RequestStream<S, Bytes>,
+) -> impl Future<Output = bool> + Send + 'static
+where
+    S: SendStreamStopped,
+{
+    let stopped = stream.stopped();
+    async move {
+        match stopped.await {
+            Ok(Some(_)) => true,
+            Err(_) => false,
+            Ok(None) => std::future::pending::<bool>().await,
+        }
     }
 }
 

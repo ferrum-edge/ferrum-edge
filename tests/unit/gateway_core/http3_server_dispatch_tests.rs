@@ -4270,6 +4270,12 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::ClientAbort),
         Some((1, "Client disconnected")),
     );
+    // A stream the gateway ended itself is never laundered into a client
+    // cancellation: it is the gateway's own UNAVAILABLE.
+    assert_eq!(
+        h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::GatewayTerminated),
+        Some((14, "Request stream closed by the gateway")),
+    );
     assert_eq!(
         h3_grpc_upload_fault_signal_for_test(H3GrpcUploadFaultKind::AuthorizationExpired),
         Some((16, "credential expired")),
@@ -4280,6 +4286,7 @@ fn h3_native_grpc_upload_fault_signalling_matches_the_h2_bridge() {
         H3GrpcUploadFaultKind::ClientAbort,
         H3GrpcUploadFaultKind::MalformedTrailers,
         H3GrpcUploadFaultKind::MalformedBody,
+        H3GrpcUploadFaultKind::GatewayTerminated,
         H3GrpcUploadFaultKind::Oversize,
         H3GrpcUploadFaultKind::AuthorizationExpired,
     ] {

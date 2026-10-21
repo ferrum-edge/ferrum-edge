@@ -54,75 +54,114 @@ fn find_after(src: &str, from: usize, needle: &str) -> usize {
 }
 
 #[test]
-fn every_reset_and_every_lost_connection_is_a_client_abort() {
+fn every_peer_reset_and_peer_lost_connection_is_a_client_abort() {
+    // Issue #6772: the read failure is classified positively. A peer reset or a
+    // connection the peer closed or lost is the client's abort; a framing
+    // violation is malformed; everything else is the gateway's own close.
     let helper = region(
         STREAM_UTIL,
-        "pub(crate) fn h3_request_read_error_is_client_abort(",
+        "pub(crate) fn classify_h3_request_read_error(",
         "\n}\n",
     );
     assert!(
-        helper.contains("h3::error::StreamError::RemoteTerminate { .. } => true,"),
+        helper
+            .contains("StreamError::RemoteTerminate { .. } => H3RequestReadFailure::ClientAbort,"),
         "a peer reset with any code, H3_NO_ERROR included, is a client abort"
     );
     assert!(
-        helper.contains("!matches!(connection, h3::error::ConnectionError::Local { .. })"),
-        "a remote close or a timed-out connection is a client abort"
+        helper.contains("ConnectionErrorIncoming::ApplicationClose { .. }")
+            && helper
+                .contains("ConnectionError::Timeout { .. } => H3RequestReadFailure::ClientAbort,"),
+        "a close the peer sent or a timed-out connection is a client abort"
     );
     assert!(
-        helper.contains("|| connection.is_h3_no_error()"),
-        "the gateway's own graceful close is not a malformed request"
+        helper.contains("ConnectionErrorIncoming::InternalError(_) => {"),
+        "a gateway-internal failure is classified on its own"
     );
     assert!(
-        helper.contains("_ => false,"),
-        "every other read error stays a malformed request"
+        helper.contains(
+            "if h3_code_is_peer_protocol_violation(*code) => H3RequestReadFailure::Malformed,"
+        ),
+        "only a protocol-violation close is malformed input"
     );
+    assert!(
+        helper.contains("StreamError::HeaderTooBig { .. } => H3RequestReadFailure::Malformed,"),
+        "an oversized trailer section is malformed input"
+    );
+    assert!(
+        helper
+            .trim_end()
+            .ends_with("_ => H3RequestReadFailure::GatewayTerminated,\n    }"),
+        "every other read error is the gateway's own close, never a client abort"
+    );
+    assert!(
+        !helper.contains("is_h3_no_error"),
+        "the gateway's own graceful H3_NO_ERROR close is not a client abort"
+    );
+    let quic = region(
+        STREAM_UTIL,
+        "fn classify_undefined_connection_error(",
+        "\n}\n",
+    );
+    assert!(
+        !quic.contains("LocallyClosed"),
+        "Quinn's LocallyClosed (the gateway's own close) is never a client abort"
+    );
+    for peer in [
+        "ApplicationClosed(_)",
+        "ConnectionClosed(_)",
+        "Reset",
+        "TimedOut",
+    ] {
+        assert!(quic.contains(peer), "{peer} is the peer's close or loss");
+    }
 }
 
 #[test]
 fn the_native_h3_upload_finishes_the_backend_only_after_the_stream_ends() {
     let upload = region(CLIENT, "async fn do_request_streaming_body(", "\n    }\n");
     let end_of_stream = find_after(upload, 0, "frontend_stream.recv_trailers().await");
-    // Issue #6772: the arm mints the typed client-abort evidence with the
-    // shared predicate; everything else is malformed trailers.
-    let abort_arm = find_after(
+    // Issue #6772: the arm classifies the failed end-of-stream read with the
+    // shared classifier; a framing violation there is malformed trailers.
+    let classified = find_after(upload, end_of_stream, "h3_client_upload_read_error(");
+    let trailers = find_after(
         upload,
-        end_of_stream,
-        "ProvenClientAbort::from_h3_request_read_error(&e)",
-    );
-    let abort_error = find_after(
-        upload,
-        abort_arm,
-        "\"client disconnected while sending request body: {}\"",
-    );
-    let malformed_error = find_after(
-        upload,
-        abort_arm,
-        "\"malformed client request trailers: {}\"",
+        classified,
+        "H3ClientRequestFault::MalformedTrailers",
     );
     let finish = find_after(upload, end_of_stream, "upload.stream.finish()");
     assert!(
-        abort_error < malformed_error && malformed_error < finish,
-        "a reset after the trailers must take the client-disconnect arm before the \
-         malformed-trailer arm, and both must return before the backend FIN"
+        classified < trailers && trailers < finish,
+        "a failed read after the trailers must return its typed fault before the backend FIN"
     );
+    let helper = region(CLIENT, "fn h3_client_upload_read_error(", "\n}\n");
+    let abort = find_after(helper, 0, "H3RequestReadFailure::ClientAbort =>");
+    find_after(
+        helper,
+        abort,
+        "\"client disconnected while sending request body: {}\"",
+    );
+    find_after(helper, abort, "\"malformed client request trailers: {}\"");
+    find_after(helper, abort, "H3RequestReadFailure::GatewayTerminated =>");
 }
 
 #[test]
 fn the_native_h3_grpc_pump_reports_a_reset_after_the_trailers_as_a_client_abort() {
     let pump = region(SERVER, "async fn run_h3_grpc_upload_pump(", "\n}\n");
     let end_of_stream = find_after(pump, 0, "frontend_recv.recv_trailers()");
-    let abort_guard = find_after(
-        pump,
-        end_of_stream,
-        "crate::http3::stream_util::h3_request_read_error_is_client_abort(&error)",
-    );
-    let abort_fault = find_after(pump, abort_guard, "H3GrpcUploadFault::ClientAbort");
-    let malformed_fault = find_after(pump, abort_guard, "H3GrpcUploadFault::MalformedTrailers");
+    let classified = find_after(pump, end_of_stream, "H3GrpcUploadFault::from_read_error(");
+    let trailers = find_after(pump, classified, "H3GrpcUploadFault::MalformedTrailers");
     let finish = find_after(pump, end_of_stream, "backend_send.finish()");
     assert!(
-        abort_fault < malformed_fault && malformed_fault < finish,
-        "a reset after the trailers must publish ClientAbort, not MalformedTrailers, \
-         before the pump could FIN the backend"
+        classified < trailers && trailers < finish,
+        "a failed read after the trailers must publish its classified fault before the \
+         pump could FIN the backend"
+    );
+    let from_read_error = region(SERVER, "fn from_read_error(", "\n    }\n");
+    assert!(
+        from_read_error.contains("H3RequestReadFailure::ClientAbort => Self::ClientAbort,")
+            && from_read_error.contains("H3RequestReadFailure::Malformed => malformed,"),
+        "a reset after the trailers is ClientAbort; only a framing violation is malformed"
     );
 }
 
@@ -134,22 +173,20 @@ fn the_grpc_bridge_pump_flags_a_reset_after_the_trailers_as_a_client_abort() {
         "crate::http3::stream_util::halt_request_body(&mut recv_half);",
     );
     let error_arm = find_after(pump, 0, "Err(e) => {");
-    let guard = find_after(
-        pump,
-        error_arm,
-        "if !h3_request_read_error_is_client_abort(&e) {",
-    );
-    let malformed = find_after(pump, guard, "GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS,");
-    let failed = find_after(
-        pump,
-        malformed,
-        "pump_frontend_failed.store(true, Ordering::Release);",
-    );
-    let reset_backend = find_after(pump, failed, "tx.send(Err(()))");
+    let published = find_after(pump, error_arm, "pump_frontend_fault.store(");
+    let classified = find_after(pump, published, "grpc_bridge_upload_fault(&e, true)");
+    let reset_backend = find_after(pump, classified, "tx.send(Err(()))");
     assert!(
-        error_arm < guard && guard < malformed && malformed < failed && failed < reset_backend,
-        "only a malformed trailer section may be flagged malformed; every trailer-phase \
-         failure still fails the upload and resets the backend"
+        error_arm < published && published < classified && classified < reset_backend,
+        "every trailer-phase failure publishes ONE classified fault before it fails the \
+         upload and resets the backend"
+    );
+    let classifier = region(CROSS_PROTOCOL, "fn grpc_bridge_upload_fault(", "\n}\n");
+    assert!(
+        classifier.contains("H3RequestReadFailure::ClientAbort => GRPC_BRIDGE_UPLOAD_CLIENT_ABORT,")
+            && classifier
+                .contains("H3RequestReadFailure::Malformed if trailers => GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS,"),
+        "a reset after the trailers is a client abort; only a framing violation is malformed"
     );
 }
 
