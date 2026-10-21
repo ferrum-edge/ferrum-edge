@@ -27338,6 +27338,31 @@ pub(crate) async fn run_after_proxy_hooks(
     None
 }
 
+/// The single final repair point for a backend-path response on every
+/// frontend — the H1/H2 response builder, the native H3 buffered send, and the
+/// H3 cross-protocol bridge — after every replacement and policy stage and
+/// before the committed observers and the wire (issue #6774).
+///
+/// Only a response gateway policy replaced is gateway-authored here: an
+/// accepted backend `401` and an unreplaced origin short-circuit are forwarded
+/// as authored. Any current or future replacement funnel that records its
+/// provenance (`RequestContext::note_gateway_response_replacement`) therefore
+/// cannot emit a challenge-free `401`. Native gRPC keeps its trailers-only
+/// `UNAUTHENTICATED` framing.
+pub(crate) fn ensure_replaced_response_challenge(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status: u16,
+    headers: &mut HashMap<String, String>,
+) {
+    if status == StatusCode::UNAUTHORIZED.as_u16()
+        && ctx.response_replaced_by_gateway()
+        && !is_native_grpc_request(ctx)
+    {
+        ensure_unauthorized_response_challenge(plugins, ctx, status, headers);
+    }
+}
+
 /// [`ensure_unauthorized_response_challenge`] for a rejection that replaced a
 /// backend response in `after_proxy` or the final header policy. Native gRPC
 /// keeps its trailers-only `UNAUTHENTICATED` framing untouched.
@@ -43966,6 +43991,10 @@ async fn handle_proxy_request_inner(
         .await;
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
+
+    // Every replacement and policy stage has run: a gateway-replaced `401`
+    // gets its challenge before committed observers and the wire (#6774).
+    ensure_replaced_response_challenge(&plugins, &ctx, response_status, &mut response_headers);
 
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so

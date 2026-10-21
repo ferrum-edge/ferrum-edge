@@ -7103,6 +7103,15 @@ pub(crate) async fn run_plain_buffered_response_plugin_pipeline(
         }
     }
 
+    // Every replacement and policy stage has run: a gateway-replaced `401`
+    // gets its challenge before committed observers and the wire (#6774).
+    crate::proxy::ensure_replaced_response_challenge(
+        plugins,
+        ctx,
+        *response_status,
+        response_headers,
+    );
+
     if !response_committed_plugins.is_empty() {
         crate::proxy::run_deadline_bounded_response_committed_hooks(
             response_committed_plugins,

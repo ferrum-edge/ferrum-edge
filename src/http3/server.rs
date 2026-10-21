@@ -11217,6 +11217,15 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        // Every replacement and policy stage has run: a gateway-replaced `401`
+        // gets its challenge before committed observers and the wire (#6774).
+        crate::proxy::ensure_replaced_response_challenge(
+            &plugins,
+            &ctx,
+            response_status,
+            &mut response_headers,
+        );
+
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
             if crate::proxy::run_deadline_bounded_response_committed_hooks(

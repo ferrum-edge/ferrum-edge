@@ -1431,3 +1431,83 @@ async fn a_same_status_reject_hook_replacement_of_an_origin_401_carries_a_challe
         "{headers:?}"
     );
 }
+
+/// A WAF response-body refusal configured for `401` replaces a buffered
+/// backend response; the final per-frontend repair point gives that
+/// gateway-authored `401` its challenge (issue #6774), while an accepted
+/// backend `401` on the same path is left as the backend sent it.
+#[tokio::test]
+async fn a_buffered_waf_body_refusal_401_carries_a_challenge() {
+    let waf = ferrum_edge::plugins::create_plugin(
+        "waf",
+        &json!({
+            "include_default_rules": false,
+            "response_inspection": true,
+            "response_body_inspection": true,
+            "reject_status_code": 401,
+            "custom_rules": [{
+                "id": "R-6774",
+                "name": "response secret",
+                "category": "test",
+                "severity": "high",
+                "target": "response_body",
+                "match_kind": "contains",
+                "pattern": "secret",
+                "action": "enforce"
+            }]
+        }),
+    )
+    .expect("valid waf config")
+    .expect("waf is a built-in plugin");
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(KeyAuth::new(&json!({})).unwrap()), waf];
+
+    let mut ctx = ctx();
+    let mut status = 200;
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut body = bytes::Bytes::from_static(br#"{"message":"secret"}"#);
+    ferrum_edge::_test_support::transform_buffered_response_body_with_deadline_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+    )
+    .await;
+    assert_eq!(status, 401, "the WAF refuses the buffered body with 401");
+    ferrum_edge::_test_support::ensure_replaced_response_challenge_for_test(
+        &plugins,
+        &ctx,
+        status,
+        &mut headers,
+    );
+    assert_eq!(
+        challenge_header(&headers),
+        Some(auth_flow::API_KEY_AUTHENTICATION_CHALLENGE),
+        "{headers:?}"
+    );
+
+    // An accepted backend 401 is never touched by the same repair point.
+    let mut accepted_ctx = ctx_with_header("x-trace", "accepted");
+    let mut accepted_status = 401;
+    let mut accepted_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let mut accepted_body = bytes::Bytes::from_static(br#"{"message":"fine"}"#);
+    ferrum_edge::_test_support::transform_buffered_response_body_with_deadline_for_test(
+        &plugins,
+        &mut accepted_ctx,
+        &mut accepted_status,
+        &mut accepted_headers,
+        &mut accepted_body,
+        None,
+    )
+    .await;
+    assert_eq!(accepted_status, 401);
+    ferrum_edge::_test_support::ensure_replaced_response_challenge_for_test(
+        &plugins,
+        &accepted_ctx,
+        accepted_status,
+        &mut accepted_headers,
+    );
+    assert_eq!(challenge_header(&accepted_headers), None);
+}

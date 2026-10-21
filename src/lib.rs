@@ -9137,6 +9137,23 @@ pub mod _test_support {
         .0
     }
 
+    /// The final per-frontend repair point for a gateway-replaced `401`
+    /// (issue #6774), run where every frontend runs it: after the buffered
+    /// transform and policy stages, before committed observers and the wire.
+    pub fn ensure_replaced_response_challenge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::ensure_replaced_response_challenge(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+        );
+    }
+
     pub fn strip_content_length_for_streaming_grpc_deadline_for_test(
         response_headers: &mut HashMap<String, String>,
         deadline_enabled: bool,

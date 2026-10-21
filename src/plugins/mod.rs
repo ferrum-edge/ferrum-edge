@@ -3942,6 +3942,13 @@ impl RequestContext {
         let _ = self.gateway_response_replacement.set(());
     }
 
+    /// Whether gateway policy replaced the response this request is about to
+    /// send. On a backend-path response this is what makes it gateway-authored:
+    /// an accepted backend response is never replaced.
+    pub(crate) fn response_replaced_by_gateway(&self) -> bool {
+        self.gateway_response_replacement.get().is_some()
+    }
+
     /// Phase of the matched route rule's total request deadline that produced
     /// this request's gateway-authored `504`, when one did.
     pub(crate) fn route_request_timeout_phase(&self) -> Option<&'static str> {
