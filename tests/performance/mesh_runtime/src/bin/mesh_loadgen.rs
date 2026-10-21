@@ -6,6 +6,7 @@
 //! 200 AND the echoed body bytes equal the request payload bytes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -18,6 +19,69 @@ use hyper_util::rt::TokioIo;
 use mesh_runtime_perf::{BenchMetrics, FixedRateSchedule, MeasurementWindow};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+
+// Only failures touch this process-wide budget. Diagnostic text contains
+// static classifications/numeric metadata, never Display of peer/IO errors.
+static ERROR_LINES: AtomicUsize = AtomicUsize::new(0);
+const MAX_ERROR_LINES: usize = 16;
+
+fn report_error(
+    phase: &'static str,
+    window: Option<MeasurementWindow>,
+    slot: Option<u64>,
+    error: &anyhow::Error,
+) {
+    if ERROR_LINES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < MAX_ERROR_LINES).then_some(count + 1)
+        })
+        .is_err()
+    {
+        return;
+    }
+    let elapsed = window
+        .map(|window| {
+            Instant::now()
+                .saturating_duration_since(window.start())
+                .as_micros()
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let slot = slot
+        .map(|slot| slot.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!("MESH_LOADGEN_ERROR phase={phase} elapsed_us={elapsed} slot={slot} {error}");
+}
+
+fn hyper_error(stage: &'static str, error: hyper::Error) -> anyhow::Error {
+    let mut io_kind = None;
+    let mut os_error = None;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io_kind = Some(io.kind());
+            os_error = io.raw_os_error();
+            break;
+        }
+        source = cause.source();
+    }
+    anyhow::anyhow!(
+        "stage={stage} cause=hyper closed={} canceled={} parse={} incomplete={} timeout={} io_kind={io_kind:?} os_error={os_error:?}",
+        error.is_closed(),
+        error.is_canceled(),
+        error.is_parse(),
+        error.is_incomplete_message(),
+        error.is_timeout(),
+    )
+}
+
+fn io_error(stage: &'static str, error: std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "stage={stage} cause=io io_kind={:?} os_error={:?}",
+        error.kind(),
+        error.raw_os_error()
+    )
+}
 
 #[derive(Parser)]
 struct Cli {
@@ -220,7 +284,8 @@ async fn worker(
     // after a failure so a refused connection cannot strand their peers.
     let mut sender = match open_conn(&target.host, target.port).await {
         Ok(s) => Some(s),
-        Err(_) => {
+        Err(error) => {
+            report_error("setup", None, None, &error);
             if warmup.is_zero() {
                 metrics.record_error();
             } else {
@@ -241,6 +306,12 @@ async fn worker(
     }
     barrier.wait().await;
     if window_rx.changed().await.is_err() {
+        report_error(
+            "setup",
+            None,
+            None,
+            &anyhow::anyhow!("stage=measurement_window cause=coordinator_closed"),
+        );
         metrics.record_error();
         return metrics;
     }
@@ -252,6 +323,12 @@ async fn worker(
             run_phase(&target, &mut sender, window, Phase::Measured, &mut metrics).await;
         }
     } else {
+        report_error(
+            "setup",
+            None,
+            None,
+            &anyhow::anyhow!("stage=measurement_window cause=missing_epoch"),
+        );
         metrics.record_error();
     }
     metrics
@@ -274,6 +351,13 @@ enum Phase {
 }
 
 impl Phase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Warmup => "warmup",
+            Self::Measured => "measured",
+        }
+    }
+
     fn record_error(self, metrics: &mut BenchMetrics) {
         match self {
             Self::Warmup => metrics.record_warmup_error(),
@@ -296,7 +380,8 @@ async fn run_phase(
             Some(s) if !s.is_closed() => s,
             _ => match open_conn(&target.host, target.port).await {
                 Ok(s) => s,
-                Err(_) => {
+                Err(error) => {
+                    report_error(phase.label(), Some(window), None, &error);
                     phase.record_error(metrics);
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
@@ -329,10 +414,13 @@ async fn run_phase(
                 }
                 *sender = Some(send);
             }
-            Err(_) => match phase {
-                Phase::Warmup => metrics.record_warmup_error(),
-                Phase::Measured => metrics.record_admitted_error(),
-            },
+            Err(error) => {
+                report_error(phase.label(), Some(window), None, &error);
+                match phase {
+                    Phase::Warmup => metrics.record_warmup_error(),
+                    Phase::Measured => metrics.record_admitted_error(),
+                }
+            }
         }
     }
 }
@@ -364,14 +452,21 @@ async fn run_scheduled_phase(
                 // Connection admission also ends at the shared deadline.
                 // The exchange deadline starts only after admission, and
                 // bounds any successful or failed postdeadline drain.
-                match tokio::time::timeout_at(
+                let connection = match tokio::time::timeout_at(
                     tokio::time::Instant::from_std(window.deadline()),
                     open_conn(&target.host, target.port),
                 )
                 .await
                 {
-                    Ok(Ok(s)) => s,
-                    _ => {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "stage=connection_admission cause=measurement_deadline"
+                    )),
+                };
+                match connection {
+                    Ok(s) => s,
+                    Err(error) => {
+                        report_error("measured", Some(window), Some(slot.index), &error);
                         metrics.record_missed_reservation(slot.index);
                         metrics.record_error();
                         // Refused connects may complete immediately; retain
@@ -401,7 +496,10 @@ async fn run_scheduled_phase(
                 );
                 *sender = Some(send);
             }
-            Err(_) => metrics.record_admitted_error(),
+            Err(error) => {
+                report_error("measured", Some(window), Some(slot.index), &error);
+                metrics.record_admitted_error();
+            }
         }
     }
 }
@@ -413,38 +511,71 @@ async fn complete_exchange(
     // Readiness, sending, and the entire response body share one deadline.
     // Failure drops the sender and its connection; a successful late echo
     // is drained and reported separately by the measurement phase.
-    tokio::time::timeout(target.exchange_timeout, async {
+    let mut stage = "request_build";
+    let mut response_status = None;
+    match tokio::time::timeout(target.exchange_timeout, async {
         let req = Request::builder()
             .method("POST")
             .uri(&target.path)
             .header("host", &target.host_header)
             .header("content-length", target.payload.len().to_string())
-            .body(Full::new(target.payload.clone()))?;
+            .body(Full::new(target.payload.clone()))
+            .map_err(|_| anyhow::anyhow!("stage=request_build cause=invalid_request"))?;
 
-        send.ready().await?;
-        let resp = send.send_request(req).await?;
+        stage = "sender_ready";
+        send.ready().await.map_err(|error| hyper_error("sender_ready", error))?;
+        stage = "response_head";
+        let resp = send.send_request(req).await.map_err(|error| hyper_error("response_head", error))?;
         let status = resp.status();
-        let bytes = resp.into_body().collect().await?.to_bytes();
+        response_status = Some(status.as_u16());
+        stage = "response_body";
+        let bytes = resp.into_body().collect().await.map_err(|error| {
+            let error = hyper_error("response_body", error);
+            anyhow::anyhow!("{error} status={} expected_body_bytes={} actual_body_bytes=unknown", status.as_u16(), target.payload.len())
+        })?.to_bytes();
         anyhow::ensure!(
-            status == StatusCode::OK && bytes == target.payload,
-            "response must be a status-200 byte-exact echo"
+            status == StatusCode::OK,
+            "stage=response_validation cause=unexpected_status status={} expected_status=200 expected_body_bytes={} actual_body_bytes={}",
+            status.as_u16(), target.payload.len(), bytes.len()
+        );
+        anyhow::ensure!(
+            bytes == target.payload,
+            "stage=response_validation cause=body_mismatch status={} expected_status=200 expected_body_bytes={} actual_body_bytes={}",
+            status.as_u16(), target.payload.len(), bytes.len()
         );
         Ok((send, bytes.len()))
     })
-    .await
-    .context("request/response exchange timed out")?
+    .await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "stage={stage} cause=exchange_timeout timeout_secs={} status={response_status:?} expected_body_bytes={} actual_body_bytes=unknown",
+            target.exchange_timeout.as_secs(), target.payload.len()
+        )),
+    }
 }
 
 async fn open_conn(host: &str, port: u16) -> Result<SendRequest<Full<Bytes>>> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let tcp = TcpStream::connect((host, port)).await?;
-        tcp.set_nodelay(true)?;
-        let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
+    let mut stage = "tcp_connect";
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        let tcp = TcpStream::connect((host, port))
+            .await
+            .map_err(|error| io_error("tcp_connect", error))?;
+        tcp.set_nodelay(true)
+            .map_err(|error| io_error("tcp_nodelay", error))?;
+        stage = "http1_handshake";
+        let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+            .await
+            .map_err(|error| hyper_error("http1_handshake", error))?;
         tokio::spawn(async move {
             let _ = conn.await;
         });
         Ok(send)
     })
     .await
-    .context("connection setup timed out")?
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "stage={stage} cause=connection_setup_timeout timeout_secs=5"
+        )),
+    }
 }

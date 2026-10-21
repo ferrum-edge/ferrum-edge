@@ -44,6 +44,13 @@ class ProductionContracts(unittest.TestCase):
                     self.assertEqual(abs(block.index("ferruma")-block.index("ferrumb")),1)
                     self.assertEqual(abs(block.index("ferrumtcpa")-block.index("ferrumtcpb")),1)
 
+    def test_fixed_diagnostic_is_bounded_and_does_not_replace_ranking(self):
+        cells=campaign.plan("smoke-fixed")
+        self.assertEqual(len(cells),8)
+        self.assertTrue(all(c["duration"]==30 and c["rate"]==2000 and c["payload"]==1024 and c["load"]=="fixed" for c in cells))
+        self.assertEqual([c["arm"] for c in cells[:4]],list(reversed([c["arm"] for c in cells[4:]])))
+        self.assertEqual(len(campaign.plan("ranking")),128)
+
     def test_bad_metadata_and_missed_fixed_slots_fail(self):
         cell=campaign.plan("smoke-l7")[-1]
         load=self.valid_load(cell)

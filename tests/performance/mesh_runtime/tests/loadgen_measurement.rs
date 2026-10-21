@@ -174,13 +174,74 @@ async fn echo_response(
         .expect("echo response"))
 }
 
-async fn report(child: Child) -> serde_json::Value {
+async fn report_with_stderr(child: Child) -> (serde_json::Value, String) {
     let output: Output = tokio::time::timeout(TEST_DEADLINE, child.wait_with_output())
         .await
         .expect("loadgen must finish within the test deadline")
         .expect("read loadgen output");
     assert!(output.status.success(), "loadgen failed: {output:?}");
-    serde_json::from_slice(&output.stdout).expect("loadgen JSON report")
+    let report = serde_json::from_slice(&output.stdout).expect("loadgen JSON report");
+    let stderr = String::from_utf8(output.stderr).expect("loadgen diagnostic UTF-8");
+    (report, stderr)
+}
+
+async fn report(child: Child) -> serde_json::Value {
+    report_with_stderr(child).await.0
+}
+
+fn assert_invalid_echo_diagnostics(stderr: &str, errors: u64, wrong_status: bool, scheduled: bool) {
+    let lines: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("MESH_LOADGEN_ERROR "))
+        .collect();
+    assert_eq!(
+        lines.len() as u64,
+        errors.min(16),
+        "one diagnostic per error up to the process cap: {stderr}"
+    );
+    let cause = if wrong_status {
+        "cause=unexpected_status"
+    } else {
+        "cause=body_mismatch"
+    };
+    let status = if wrong_status {
+        " status=502 "
+    } else {
+        " status=200 "
+    };
+    for (index, line) in lines.iter().enumerate() {
+        assert!(line.contains("phase=measured "), "{line}");
+        assert!(line.contains("stage=response_validation"), "{line}");
+        assert!(line.contains(cause), "{line}");
+        assert!(line.contains(status), "{line}");
+        assert!(line.contains("expected_status=200"), "{line}");
+        assert!(
+            line.contains("expected_body_bytes=16 actual_body_bytes=16"),
+            "{line}"
+        );
+        let elapsed = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("elapsed_us="))
+            .expect("window-relative elapsed time");
+        assert!(elapsed.parse::<u128>().is_ok(), "{line}");
+        if scheduled {
+            assert!(line.contains(&format!("slot={index} ")), "{line}");
+        } else {
+            assert!(line.contains("slot=none "), "{line}");
+        }
+    }
+    assert!(
+        !stderr.contains(&"x".repeat(16)),
+        "request payload must not be logged"
+    );
+    assert!(
+        !stderr.contains(&"y".repeat(16)),
+        "response payload must not be logged"
+    );
+    assert!(
+        !stderr.contains("svc.ferrum.svc.cluster.local"),
+        "Host contents must not be logged"
+    );
 }
 
 async fn wait_for_measurement_end(child: &mut Child) {
@@ -286,8 +347,15 @@ async fn warmup_and_measurement_reuse_each_workers_connection() {
 #[tokio::test]
 async fn wrong_status_or_equal_length_wrong_body_is_an_error() {
     for mode in [ResponseMode::WrongStatus, ResponseMode::WrongBody] {
+        let wrong_status = matches!(mode, ResponseMode::WrongStatus);
         let peer = EchoPeer::new(mode).await;
-        let report = report(peer.spawn_loadgen("0", "1")).await;
+        let (report, stderr) = report_with_stderr(peer.spawn_loadgen("0", "1")).await;
+        assert_invalid_echo_diagnostics(
+            &stderr,
+            report["total_errors"].as_u64().expect("errors"),
+            wrong_status,
+            false,
+        );
         assert_eq!(report["total_requests"], 0);
         assert_eq!(report["drained_requests"], 0);
         assert_eq!(report["cohort_requests"], 0);
@@ -356,8 +424,11 @@ async fn low_aggregate_rate_reuses_warmup_connections_with_more_workers_than_slo
 #[tokio::test]
 async fn fixed_rate_invalid_echo_is_an_admitted_error_without_latency_samples() {
     for mode in [ResponseMode::WrongStatus, ResponseMode::WrongBody] {
+        let wrong_status = matches!(mode, ResponseMode::WrongStatus);
         let peer = EchoPeer::new(mode).await;
-        let report = report(peer.spawn_loadgen_with_rate("0", "1", Some("2"))).await;
+        let (report, stderr) =
+            report_with_stderr(peer.spawn_loadgen_with_rate("0", "1", Some("2"))).await;
+        assert_invalid_echo_diagnostics(&stderr, 2, wrong_status, true);
         assert_eq!(report["offered_requests"], 2);
         assert_eq!(report["admitted_requests"], 2);
         assert_eq!(report["admitted_errors"], 2);

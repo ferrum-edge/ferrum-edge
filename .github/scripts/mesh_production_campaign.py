@@ -20,10 +20,15 @@ def physical(arm):
 
 
 def plan(phase):
-    if phase not in ("smoke-l7", "smoke", "ranking"):
+    if phase not in ("smoke-l7", "smoke", "smoke-fixed", "ranking"):
         raise ValueError("unknown phase")
     cells = []
-    if phase.startswith("smoke"):
+    if phase == "smoke-fixed":
+        arms = ["direct", "ferruma", "ferrumb", "envoy"]
+        for repetition in (1, 2):
+            for arm in arms if repetition == 1 else reversed(arms):
+                cells.append(dict(arm=arm, payload=1024, repetition=repetition, load="fixed", duration=30, rate=2000))
+    elif phase.startswith("smoke"):
         arms = ARMS[:5] if phase == "smoke-l7" else ARMS
         for arm in arms:
             cells.append(dict(arm=arm, payload=1024, repetition=1, load="saturated", duration=3, rate=0))

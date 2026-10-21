@@ -7,7 +7,7 @@ on:
         description: "Qualification or four balanced repeated production ranking blocks"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, ranking, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum]
+        options: [smoke-l7, smoke, smoke-fixed, ranking, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum]
 permissions:
   contents: read
 concurrency:

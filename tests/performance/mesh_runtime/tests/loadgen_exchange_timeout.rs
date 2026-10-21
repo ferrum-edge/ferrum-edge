@@ -68,6 +68,19 @@ async fn stalled_response_body_is_recorded_as_cell_error() {
     assert!(output.status.success(), "loadgen failed: {output:?}");
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("loadgen JSON report");
+    let stderr = String::from_utf8(output.stderr).expect("loadgen stderr");
+    assert!(
+        stderr.contains("MESH_LOADGEN_ERROR phase=measured "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("stage=response_body cause=exchange_timeout"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("status=Some(200) expected_body_bytes=16 actual_body_bytes=unknown"),
+        "{stderr}"
+    );
     assert_eq!(report["total_requests"], 0, "stalled body is not a result");
     assert!(
         report["total_errors"].as_u64().unwrap_or(0) >= 1,
