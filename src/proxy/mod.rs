@@ -5313,7 +5313,24 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
-    let mut metadata = ctx.metadata.clone();
+    project_log_metadata(ctx, ctx.metadata.clone())
+}
+
+/// Transfer metadata only after the owned request context has completed every
+/// mutable terminal hook. Subsequent logging reads the summary and the
+/// context's typed state; it must not read `ctx.metadata` again.
+///
+/// Other terminal paths still borrow a live context and use `clone_log_metadata`.
+/// Both ownership paths apply exactly the same authoritative projections.
+pub(crate) fn take_terminal_log_metadata(ctx: &mut RequestContext) -> HashMap<String, String> {
+    let metadata = std::mem::take(&mut ctx.metadata);
+    project_log_metadata(ctx, metadata)
+}
+
+fn project_log_metadata(
+    ctx: &RequestContext,
+    mut metadata: HashMap<String, String>,
+) -> HashMap<String, String> {
     // Detached uploads publish through the shared latch. Import its bounded
     // class even when no response relay copied it into the request context.
     if let Some(termination) = ctx.authorization_termination_latch().observed() {

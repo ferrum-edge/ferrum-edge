@@ -579,7 +579,10 @@ impl DeferredTransactionLogger {
             if summary.timestamp_received.is_empty() {
                 summary.timestamp_received = ctx.timestamp_received.to_rfc3339();
             }
-            summary.metadata = crate::proxy::clone_log_metadata(&ctx);
+            // All metadata writers have finished. The remaining log funnel
+            // consumes the summary plus typed context state, so transfer this
+            // owned map through the same projection used by borrowed contexts.
+            summary.metadata = crate::proxy::take_terminal_log_metadata(&mut ctx);
             log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
         };
         #[cfg(test)]
