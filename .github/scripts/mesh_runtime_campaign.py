@@ -19,6 +19,15 @@ ARMS = ("direct", "ferrum", "envoy", "consul", "consulhttp", "linkerd")
 SIZES = (1024, 10240, 71680, 512000, 1048576, 5242880)
 
 
+def workload_limits(duration):
+    """Explicit harness limits shared by every arm; no timeout A/B drift."""
+    return {"warmup_secs": 2, "probe_exchange_timeout_secs": 2,
+            "exchange_timeout_secs": 10, "readiness_timeout_secs": 90,
+            "cell_wall_timeout_secs": duration + 2 + 2 * 10 + 20,
+            "cell_kill_grace_secs": 5, "cell_cleanup_timeout_secs": 2,
+            "arm_wall_timeout_secs": duration + 420, "arm_kill_grace_secs": 10}
+
+
 def plan(arms, sizes, iterations, paired):
     sequence = []
     for repetition in range(1, iterations + 1):
@@ -48,6 +57,7 @@ def build(args):
         raise ValueError("baseline must be an exact lowercase 40-hex commit SHA")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     provenance = {"candidate_sha": revision, "baseline_sha": baseline or None,
+                  "workload_limits": workload_limits(int(os.environ.get("BENCH_DURATION", "30"))),
                   "profile": profile, "features": features, "runner": os.environ.get("RUNNER_OS"),
                   "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{os.environ.get('GITHUB_RUN_ID')}",
                   "candidate_image_id": subprocess.check_output(["docker", "image", "inspect", "ferrum-edge:bench", "--format", "{{.Id}}"], text=True).strip(),
@@ -82,7 +92,8 @@ def measure(args):
         raise ValueError("empty or invalid campaign")
     sequence = plan(arms, sizes, iterations, bool(provenance["baseline_sha"]))
     (results / "campaign.json").write_text(json.dumps({"cells": sequence, "duration": duration,
-        "concurrency": concurrency, "order": "balanced round blocks; paired AB/BA Ferrum images"}, indent=2) + "\n")
+        "concurrency": concurrency, "workload_limits": workload_limits(duration),
+        "order": "balanced round blocks; paired AB/BA Ferrum images"}, indent=2) + "\n")
     (results / "plan.txt").write_text("".join(f"{c['arm']} {c['payload']} {c['repetition']}\n" for c in sequence))
 
 

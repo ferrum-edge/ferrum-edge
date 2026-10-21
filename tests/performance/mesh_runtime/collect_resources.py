@@ -55,7 +55,9 @@ def host_snapshot(proc: Path = Path("/proc")) -> dict:
 def run(args: argparse.Namespace) -> int:
     containers = []
     for name in args.container:
-        inspected = json.loads(subprocess.check_output(["docker", "inspect", name]))[0]
+        inspected = json.loads(subprocess.check_output(["docker", "inspect", name], timeout=5))[0]
+        if not inspected["State"].get("Running"):
+            raise ValueError(f"proxy {name} exited before measurement")
         containers.append({"name": name, "pid": inspected["State"]["Pid"],
                            "image_id": inspected["Image"],
                            "cpu_limit_nanos": inspected["HostConfig"]["NanoCpus"],
@@ -88,15 +90,18 @@ def run(args: argparse.Namespace) -> int:
                 return
 
     sampler = None
+    print(f"[measure] starting {args.mesh}: warmup={args.warmup}s duration={args.duration}s", file=sys.stderr, flush=True)
     with args.output.open("w") as output:
-        child = subprocess.Popen(["docker", "run", "--rm", "--network", "host", args.image,
+        child = subprocess.Popen(["docker", "run", "--rm", "--network", "host", "--name", args.loadgen_name, args.image,
             "--target", args.target, "--host-header", args.host_header, "--mesh", args.mesh,
             "--duration", args.duration, "--concurrency", args.concurrency,
-            "--warmup", args.warmup, "--payload-size", args.payload_size, "--json"],
-            stdout=output, stderr=subprocess.PIPE, text=True)
+            "--warmup", args.warmup, "--payload-size", args.payload_size,
+            "--exchange-timeout-secs", str(args.exchange_timeout_secs), "--json"],
+            stdout=output, stderr=subprocess.PIPE, text=True, bufsize=1)
         assert child.stderr is not None
         for line in child.stderr:
             sys.stderr.write(line)
+            sys.stderr.flush()
             marker = line.strip()
             try:
                 if marker == START and begin is None:
@@ -109,6 +114,7 @@ def run(args: argparse.Namespace) -> int:
             except (OSError, ValueError, IndexError) as exc:
                 report["errors"].append(str(exc))
         status = child.wait()
+    print(f"[measure] {args.mesh} loadgen exited status={status}", file=sys.stderr, flush=True)
     stop.set()
     if sampler is not None:
         sampler.join(timeout=2)
@@ -144,9 +150,14 @@ def main() -> int:
     parser.add_argument("--allocation-url", action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resources", type=Path, required=True)
+    parser.add_argument("--loadgen-name", required=True)
+    parser.add_argument("--exchange-timeout-secs", type=int, default=10)
     for name in ("image", "target", "host-header", "mesh", "duration", "concurrency", "warmup", "payload-size"):
         parser.add_argument("--" + name, required=True)
-    return run(parser.parse_args())
+    args = parser.parse_args()
+    if args.exchange_timeout_secs <= 0:
+        parser.error("--exchange-timeout-secs must be positive")
+    return run(args)
 
 
 if __name__ == "__main__":
