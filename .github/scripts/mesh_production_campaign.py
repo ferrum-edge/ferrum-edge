@@ -56,6 +56,9 @@ def provenance():
         "l7_topology": "two sidecars; H1 frontend/backend, Ferrum and static Envoy H2 mTLS peers; Consul explicit HTTP xDS",
         "l4_topology": "same source namespace bridge/VIP capture, declared TCP; Ferrum per-connection mTLS H2 CONNECT, Consul native TCP mTLS",
         "fixed_load_rates": {"1024": 2000, "1048576": 200},
+        "fixed_boundary_loss_gate": {"max_missed": 2, "all_missed_due_in_final_nanoseconds": 1000000,
+            "requires_exact_missed_ordinal_and_count_accounting": True,
+            "note": "qualified timer-boundary loss, not proof of its cause; preserve every miss and successful-cohort latency"},
         "limits": ["one shared runner, backend/loadgen/proxies share CPU", "static Envoy is not full Istio and policy/telemetry work differs", "socket samples are not complete connection churn counters", "thread context switches are not logical task wakes", "saturated latency and fixed scheduled latency are separate populations"],
         "config_sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path("tests/performance/mesh_runtime/configs").rglob("*")) if p.is_file()}}
     (ROOT/"production-provenance.json").write_text(json.dumps(data, indent=2)+"\n")
@@ -74,8 +77,21 @@ def validate(cell, load, resource):
         errors.append("errors or no useful completions")
     if load.get("admitted_requests") != load.get("cohort_requests", 0)+load.get("admitted_errors", 0):
         errors.append("admitted cohort accounting mismatch")
-    if cell["rate"] and (load.get("missed_requests") != 0 or load.get("offered_requests") != cell["rate"]*cell["duration"]):
-        errors.append("fixed offered schedule missed or incorrect")
+    if cell["rate"]:
+        offered = cell["rate"]*cell["duration"]
+        missed = load.get("missed_requests")
+        first, last = load.get("first_missed_slot"), load.get("last_missed_slot")
+        if (load.get("offered_requests") != offered or type(missed) is not int
+                or load.get("missed_slot_count") != missed
+                or load.get("missed_reservations", -1)+load.get("unclaimed_requests", -1) != missed
+                or load.get("admitted_requests", -1)+missed != offered):
+            errors.append("fixed offered/missed count accounting incorrect")
+        elif missed == 0:
+            if first is not None or last is not None:
+                errors.append("zero misses with nonempty missed range")
+        elif not (0 < missed <= 2 and type(first) is int and type(last) is int and 0 <= first <= last < offered
+                  and first*1000000000 >= (cell["duration"]*1000000000-1000000)*cell["rate"]):
+            errors.append("fixed schedule lost a slot outside the bounded final-1ms qualification")
     if not resource.get("valid") or resource.get("errors"):
         errors.append("invalid resource interval")
     return errors
@@ -109,7 +125,7 @@ def summarize():
                     groups.append({"arm": arm, "payload": payload, "load": mode, "repetitions": len(subset), "all_valid": False, "metrics": None})
                     continue
                 metrics = {}
-                for key in ("rps", "cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us"):
+                for key in ("rps", "cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us", "missed_requests", "admission_delay_p99_us", "admission_delay_max_us"):
                     values = [r["report"][key] for r in subset]
                     metrics[key] = {"median": statistics.median(values), "min": min(values), "max": max(values), "all": values}
                 values = [r["cpu_us_per_completion"] for r in subset]
@@ -119,16 +135,16 @@ def summarize():
               "cells": rows, "valid": not errors and len(rows)==len(planned)}
     (ROOT/"production-summary.json").write_text(json.dumps(result, indent=2)+"\n")
     text = ["Production mesh campaign", "", f"Planned: {len(planned)}; parsed: {len(rows)}; invalid/missing: {len(errors)}.",
-        "All outcomes retained. L4 and L7 are separate product paths. Fixed scheduled latency includes admission delay.", "",
-        "| Arm | Bytes | Load | N | RPS median | successful cohort p50/p95/p99 us (fixed: scheduled; saturated: service) | CPU us/completion |", "|---|---:|---|---:|---:|---|---:|"]
+        "All outcomes retained. L4 and L7 are separate product paths. Fixed scheduled latency includes admission delay. Up to two missed arrivals are qualified only with ordinal proof that every missed due time was in the final 1 ms; all misses remain reported.", "",
+        "| Arm | Bytes | Load | N | RPS median | successful cohort p50/p95/p99 us (fixed: scheduled; saturated: service) | CPU us/completion | Missed arrivals (all repetitions) |", "|---|---:|---|---:|---:|---|---:|---|"]
     for group in groups:
         m=group["metrics"]
         if m is None:
-            text.append(f"| {group['arm']} | {group['payload']} | {group['load']} | {group['repetitions']} | INVALID | INVALID | INVALID |")
+            text.append(f"| {group['arm']} | {group['payload']} | {group['load']} | {group['repetitions']} | INVALID | INVALID | INVALID | retained in cell records |")
             continue
         tail_keys = ("cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us") if group["load"] == "fixed" else ("cohort_p50_us","cohort_p95_us","cohort_p99_us")
         tails="/".join(str(round(m[k]["median"],1)) for k in tail_keys)
-        text.append(f"| {group['arm']} | {group['payload']} | {group['load']} | {group['repetitions']} | {m['rps']['median']:.1f} | {tails} | {m['cpu_us_per_completion']['median']:.1f} |")
+        text.append(f"| {group['arm']} | {group['payload']} | {group['load']} | {group['repetitions']} | {m['rps']['median']:.1f} | {tails} | {m['cpu_us_per_completion']['median']:.1f} | {m['missed_requests']['all']} |")
     if errors:
         text += ["", "Invalid/missing cells:", json.dumps(errors, indent=2)]
     (ROOT/"production-summary.md").write_text("\n".join(text)+"\n")

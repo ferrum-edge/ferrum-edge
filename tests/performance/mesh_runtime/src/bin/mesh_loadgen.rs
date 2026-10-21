@@ -345,15 +345,16 @@ async fn run_scheduled_phase(
     metrics: &mut BenchMetrics,
 ) {
     while window.contains(Instant::now()) {
-        let Some(offset) = schedule.claim() else {
+        let Some(slot) = schedule.claim_slot() else {
             break;
         };
-        let due = window.start() + offset;
+        let due = window.start() + slot.offset;
         // One future reservation per worker spreads low aggregate rates
         // across the exact same global schedule regardless of concurrency.
         // No busy wait and no relative sleep that drifts with service time.
         tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await;
         if !window.contains(Instant::now()) {
+            metrics.record_missed_reservation(slot.index);
             break;
         }
 
@@ -371,6 +372,7 @@ async fn run_scheduled_phase(
                 {
                     Ok(Ok(s)) => s,
                     _ => {
+                        metrics.record_missed_reservation(slot.index);
                         metrics.record_error();
                         // Refused connects may complete immediately; retain
                         // the saturated path's bounded retry backoff.
@@ -383,6 +385,7 @@ async fn run_scheduled_phase(
 
         let admitted_at = Instant::now();
         if !window.contains(admitted_at) {
+            metrics.record_missed_reservation(slot.index);
             *sender = Some(send);
             break;
         }

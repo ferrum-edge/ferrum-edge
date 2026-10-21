@@ -27,12 +27,18 @@ class ProductionContracts(unittest.TestCase):
         cell=campaign.plan("smoke-l7")[-1]
         load=dict(mesh="ferrum",protocol="http1",payload_size=1024,duration_secs=3,rate=2000,concurrency=100,
                   total_errors=0,warmup_errors=0,total_requests=6000,admitted_requests=6000,cohort_requests=6000,
-                  admitted_errors=0,missed_requests=0,offered_requests=6000)
+                  admitted_errors=0,missed_requests=0,offered_requests=6000,missed_slot_count=0,missed_reservations=0,unclaimed_requests=0,first_missed_slot=None,last_missed_slot=None)
         resource=dict(valid=True,errors=[])
         self.assertEqual(campaign.validate(cell,load,resource),[])
         for key,value in (("missed_requests",1),("mesh","envoy"),("duration_secs",2),("offered_requests",5999),("warmup_errors",1)):
             self.assertTrue(campaign.validate(cell,{**load,key:value},resource))
         self.assertTrue(campaign.validate(cell,load,{"valid":False,"errors":[]}))
+        boundary={**load,"admitted_requests":5998,"cohort_requests":5998,"missed_requests":2,"missed_slot_count":2,
+                  "missed_reservations":1,"unclaimed_requests":1,"first_missed_slot":5998,"last_missed_slot":5999}
+        self.assertEqual(campaign.validate(cell,boundary,resource),[])
+        self.assertTrue(campaign.validate(cell,{**boundary,"first_missed_slot":5},resource))
+        self.assertTrue(campaign.validate(cell,{**boundary,"missed_slot_count":1},resource))
+        self.assertTrue(campaign.validate(cell,{**boundary,"unclaimed_requests":0},resource))
 
     def test_invalid_failure_stub_retains_complete_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:

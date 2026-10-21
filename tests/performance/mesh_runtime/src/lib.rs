@@ -54,6 +54,13 @@ pub struct FixedRateSchedule {
     next: AtomicU64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledSlot {
+    /// Zero-based ordinal in the aggregate offered schedule.
+    pub index: u64,
+    pub offset: Duration,
+}
+
 impl FixedRateSchedule {
     pub fn new(rate: u64, duration_secs: u64) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -81,6 +88,10 @@ impl FixedRateSchedule {
     /// Offset from the coordinator's epoch. Integer quotient/remainder
     /// arithmetic avoids accumulating per-request interval rounding drift.
     pub fn claim(&self) -> Option<Duration> {
+        self.claim_slot().map(|slot| slot.offset)
+    }
+
+    pub fn claim_slot(&self) -> Option<ScheduledSlot> {
         let index = self
             .next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
@@ -91,10 +102,13 @@ impl FixedRateSchedule {
                 }
             })
             .ok()?;
-        Some(Duration::new(
-            index / self.rate,
-            ((index % self.rate) * 1_000_000_000 / self.rate) as u32,
-        ))
+        Some(ScheduledSlot {
+            index,
+            offset: Duration::new(
+                index / self.rate,
+                ((index % self.rate) * 1_000_000_000 / self.rate) as u32,
+            ),
+        })
     }
 }
 
@@ -106,6 +120,10 @@ pub struct BenchMetrics {
     admission_delay_histogram: Histogram<u64>,
     rate: u64,
     offered_requests: u64,
+    missed_reservations: u64,
+    unclaimed_requests: u64,
+    first_missed_slot: Option<u64>,
+    last_missed_slot: Option<u64>,
     pub admitted_requests: u64,
     pub admitted_errors: u64,
     pub total_requests: u64,
@@ -138,6 +156,10 @@ impl BenchMetrics {
             histogram,
             rate: 0,
             offered_requests: 0,
+            missed_reservations: 0,
+            unclaimed_requests: 0,
+            first_missed_slot: None,
+            last_missed_slot: None,
             admitted_requests: 0,
             admitted_errors: 0,
             total_requests: 0,
@@ -166,6 +188,25 @@ impl BenchMetrics {
     pub fn configure_fixed_rate(&mut self, schedule: &FixedRateSchedule) {
         self.rate = schedule.rate();
         self.offered_requests = schedule.offered_requests();
+        // Called after every worker has returned, so no further claims or
+        // abandoned reservations can race this global unclaimed-tail snapshot.
+        let first_unclaimed = schedule.next.load(Ordering::Relaxed);
+        self.unclaimed_requests = self.offered_requests - first_unclaimed;
+        if self.unclaimed_requests > 0 {
+            self.include_missed_range(first_unclaimed, self.offered_requests - 1);
+        }
+    }
+
+    fn include_missed_range(&mut self, first: u64, last: u64) {
+        self.first_missed_slot = Some(self.first_missed_slot.map_or(first, |old| old.min(first)));
+        self.last_missed_slot = Some(self.last_missed_slot.map_or(last, |old| old.max(last)));
+    }
+
+    /// A worker claimed this slot but never admitted its exchange. Keep its
+    /// original ordinal even if other workers admitted later reservations.
+    pub fn record_missed_reservation(&mut self, index: u64) {
+        self.missed_reservations += 1;
+        self.include_missed_range(index, index);
     }
 
     pub fn record_admission(&mut self) {
@@ -250,6 +291,11 @@ impl BenchMetrics {
             .add(&other.admission_delay_histogram);
         self.admitted_requests += other.admitted_requests;
         self.admitted_errors += other.admitted_errors;
+        self.missed_reservations += other.missed_reservations;
+        self.unclaimed_requests += other.unclaimed_requests;
+        if let (Some(first), Some(last)) = (other.first_missed_slot, other.last_missed_slot) {
+            self.include_missed_range(first, last);
+        }
         self.total_requests += other.total_requests;
         self.total_errors += other.total_errors;
         self.total_bytes += other.total_bytes;
@@ -289,6 +335,11 @@ impl BenchMetrics {
             } else {
                 self.offered_requests.saturating_sub(self.admitted_requests)
             },
+            missed_slot_count: self.missed_reservations + self.unclaimed_requests,
+            missed_reservations: self.missed_reservations,
+            unclaimed_requests: self.unclaimed_requests,
+            first_missed_slot: self.first_missed_slot,
+            last_missed_slot: self.last_missed_slot,
             total_requests: self.total_requests,
             total_errors: self.total_errors,
             rps,
@@ -346,6 +397,15 @@ pub struct BenchReport {
     pub admitted_errors: u64,
     /// Scheduled slots never admitted, including reserved-but-unstarted slots.
     pub missed_requests: u64,
+    /// Independently counted abandoned reservations plus the unclaimed tail.
+    /// Must equal offered_requests - admitted_requests in fixed-rate mode.
+    pub missed_slot_count: u64,
+    pub missed_reservations: u64,
+    pub unclaimed_requests: u64,
+    /// Inclusive zero-based bounds covering every missed slot, including
+    /// noncontiguous abandoned reservations. None when no slots were missed.
+    pub first_missed_slot: Option<u64>,
+    pub last_missed_slot: Option<u64>,
     pub total_requests: u64,
     pub total_errors: u64,
     pub rps: f64,

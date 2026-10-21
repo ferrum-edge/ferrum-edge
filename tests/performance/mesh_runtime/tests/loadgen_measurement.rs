@@ -310,6 +310,11 @@ async fn fixed_rate_overload_counts_every_unstarted_slot_and_drains_admitted_ech
     assert_eq!(report["offered_requests"], 10);
     assert_eq!(report["admitted_requests"], 1);
     assert_eq!(report["missed_requests"], 9);
+    assert_eq!(report["missed_slot_count"], 9);
+    assert_eq!(report["missed_reservations"], 0);
+    assert_eq!(report["unclaimed_requests"], 9);
+    assert_eq!(report["first_missed_slot"], 1);
+    assert_eq!(report["last_missed_slot"], 9);
     assert_eq!(report["total_requests"], 0);
     assert_eq!(report["scheduled_requests"], 0);
     assert_eq!(report["drained_requests"], 1);
@@ -334,6 +339,11 @@ async fn low_aggregate_rate_reuses_warmup_connections_with_more_workers_than_slo
     assert_eq!(report["offered_requests"], 2);
     assert_eq!(report["admitted_requests"], 2);
     assert_eq!(report["missed_requests"], 0);
+    assert_eq!(report["missed_slot_count"], 0);
+    assert_eq!(report["missed_reservations"], 0);
+    assert_eq!(report["unclaimed_requests"], 0);
+    assert!(report["first_missed_slot"].is_null());
+    assert!(report["last_missed_slot"].is_null());
     assert_eq!(report["cohort_requests"], 2);
     assert_eq!(report["cohort_scheduled_requests"], 2);
     assert_eq!(report["admitted_errors"], 0);

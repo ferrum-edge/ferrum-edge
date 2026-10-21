@@ -84,7 +84,9 @@ fn late_admission_and_drain_preserve_scheduled_and_service_populations() {
     );
     // Reserving a slot without admitting it must not erase it from missed
     // accounting; the final fourth slot is never even claimed.
-    assert_eq!(schedule.claim(), Some(Duration::from_millis(500)));
+    let reservation = schedule.claim_slot().unwrap();
+    assert_eq!(reservation.offset, Duration::from_millis(500));
+    second.record_missed_reservation(reservation.index);
     second.record_warmup_success();
     combined.merge(&second);
     combined.configure_fixed_rate(&schedule);
@@ -94,6 +96,11 @@ fn late_admission_and_drain_preserve_scheduled_and_service_populations() {
     assert_eq!(report.offered_requests, 4);
     assert_eq!(report.admitted_requests, 2);
     assert_eq!(report.missed_requests, 2);
+    assert_eq!(report.missed_slot_count, 2);
+    assert_eq!(report.missed_reservations, 1);
+    assert_eq!(report.unclaimed_requests, 1);
+    assert_eq!(report.first_missed_slot, Some(2));
+    assert_eq!(report.last_missed_slot, Some(3));
     assert_eq!(report.total_requests, 1);
     assert_eq!(report.drained_requests, 1);
     assert_eq!(report.cohort_requests, 2);
@@ -115,15 +122,21 @@ fn failed_admissions_and_setup_errors_are_not_synthetic_latency_samples() {
     let epoch = Instant::now();
     let schedule = FixedRateSchedule::new(2, 1).unwrap();
     let mut metrics = BenchMetrics::new();
-    metrics.configure_fixed_rate(&schedule);
     metrics.record_warmup_error();
+    assert_eq!(schedule.claim_slot().unwrap().index, 0);
     metrics.record_scheduled_admission(epoch, epoch + Duration::from_millis(250));
     metrics.record_admitted_error();
+    metrics.configure_fixed_rate(&schedule);
     let report = metrics.json("test", "http://example/echo", 1, 1, 16);
     assert_eq!(report.offered_requests, 2);
     assert_eq!(report.admitted_requests, 1);
     assert_eq!(report.admitted_errors, 1);
     assert_eq!(report.missed_requests, 1);
+    assert_eq!(report.missed_slot_count, 1);
+    assert_eq!(report.missed_reservations, 0);
+    assert_eq!(report.unclaimed_requests, 1);
+    assert_eq!(report.first_missed_slot, Some(1));
+    assert_eq!(report.last_missed_slot, Some(1));
     assert_eq!(report.warmup_errors, 1);
     assert_eq!(report.total_errors, 2);
     assert_eq!(report.scheduled_requests, 0);
@@ -145,6 +158,9 @@ fn saturated_accounting_keeps_existing_service_latency_semantics() {
     assert_eq!(report.rate, 0);
     assert_eq!(report.offered_requests, 0);
     assert_eq!(report.missed_requests, 0);
+    assert_eq!(report.missed_slot_count, 0);
+    assert_eq!(report.first_missed_slot, None);
+    assert_eq!(report.last_missed_slot, None);
     assert_eq!(report.admitted_requests, 2);
     assert_eq!(report.total_requests, 1);
     assert_eq!(report.rps, 1.0);
@@ -154,4 +170,73 @@ fn saturated_accounting_keeps_existing_service_latency_semantics() {
     assert_eq!(report.scheduled_requests, 0);
     assert_eq!(report.cohort_scheduled_requests, 0);
     assert_eq!(report.admission_delay_max_us, 0);
+}
+
+#[test]
+fn final_millisecond_proof_includes_reserved_and_unclaimed_slots() {
+    let schedule = FixedRateSchedule::new(2000, 3).unwrap();
+    let mut metrics = BenchMetrics::new();
+    for expected in 0..5998 {
+        assert_eq!(schedule.claim_slot().unwrap().index, expected);
+        metrics.record_admission();
+    }
+    metrics.record_missed_reservation(schedule.claim_slot().unwrap().index);
+    metrics.configure_fixed_rate(&schedule);
+    let report = metrics.json("test", "http://example/echo", 100, 3, 16);
+    assert_eq!(report.offered_requests, 6000);
+    assert_eq!(report.admitted_requests, 5998);
+    assert_eq!(report.missed_requests, 2);
+    assert_eq!(report.missed_slot_count, report.missed_requests);
+    assert_eq!(report.missed_reservations, 1);
+    assert_eq!(report.unclaimed_requests, 1);
+    assert_eq!(report.first_missed_slot, Some(5998));
+    assert_eq!(report.last_missed_slot, Some(5999));
+    let first = u128::from(report.first_missed_slot.unwrap());
+    assert!(first * 1_000_000_000 >= (3_000_000_000 - 1_000_000) * 2000);
+}
+
+#[test]
+fn noncontiguous_early_reservation_cannot_pass_a_tail_only_miss_proof() {
+    let schedule = FixedRateSchedule::new(2000, 1).unwrap();
+    let mut workers = [BenchMetrics::new(), BenchMetrics::new()];
+    while let Some(slot) = schedule.claim_slot() {
+        match slot.index {
+            5 => workers[0].record_missed_reservation(slot.index),
+            1999 => workers[1].record_missed_reservation(slot.index),
+            _ => workers[0].record_admission(),
+        }
+    }
+    let mut combined = BenchMetrics::new();
+    for worker in &workers {
+        combined.merge(worker);
+    }
+    combined.configure_fixed_rate(&schedule);
+    let report = combined.json("test", "http://example/echo", 2, 1, 16);
+    assert_eq!(report.missed_requests, 2);
+    assert_eq!(report.missed_slot_count, 2);
+    assert_eq!(report.missed_reservations, 2);
+    assert_eq!(report.unclaimed_requests, 0);
+    assert_eq!(report.first_missed_slot, Some(5));
+    assert_eq!(report.last_missed_slot, Some(1999));
+    let first = u128::from(report.first_missed_slot.unwrap());
+    assert!(first * 1_000_000_000 < (1_000_000_000 - 1_000_000) * 2000);
+}
+
+#[test]
+fn a_200_rps_schedule_has_no_slot_in_the_final_millisecond() {
+    let schedule = FixedRateSchedule::new(200, 1).unwrap();
+    let mut metrics = BenchMetrics::new();
+    for _ in 0..199 {
+        schedule.claim_slot().unwrap();
+        metrics.record_admission();
+    }
+    let last = schedule.claim_slot().unwrap();
+    assert_eq!(last.offset, Duration::from_millis(995));
+    metrics.record_missed_reservation(last.index);
+    metrics.configure_fixed_rate(&schedule);
+    let report = metrics.json("test", "http://example/echo", 50, 1, 16);
+    assert_eq!(report.missed_slot_count, 1);
+    assert_eq!(report.first_missed_slot, Some(199));
+    let first = u128::from(report.first_missed_slot.unwrap());
+    assert!(first * 1_000_000_000 < (1_000_000_000 - 1_000_000) * 200);
 }
