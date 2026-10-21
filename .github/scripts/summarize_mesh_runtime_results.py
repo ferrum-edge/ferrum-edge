@@ -30,7 +30,7 @@ import statistics
 import sys
 from pathlib import Path
 
-MESH_ORDER = ("direct", "ferrum", "envoy", "consul", "linkerd")
+MESH_ORDER = ("direct", "ferrumbaseline", "ferrum", "envoy", "consul", "consulhttp", "linkerd")
 CELL_RE = re.compile(r"^(?P<mesh>[a-z]+)_http1_(?P<payload>[0-9]+)\.json$")
 MEM_RE = re.compile(r"^([0-9.]+)\s*([KMGT]?i?B)")
 
@@ -126,6 +126,20 @@ def collect(results_root: Path) -> dict:
         stats = parse_stats(f.with_name(f.name.replace(".json", ".stats.jsonl")))
         if stats is not None:
             record["resources"] = stats
+        resource_file = f.with_name(f.name.replace(".json", ".resources.json"))
+        if resource_file.exists():
+            try:
+                resources = json.loads(resource_file.read_text())
+                seconds = resources.get("elapsed_seconds", 0)
+                if not resources.get("valid") or not seconds or resources.get("host_cpu_steal_percent", 100) > 5:
+                    record["resource_error"] = "invalid /proc interval or CPU steal above 5%"
+                else:
+                    resources["proxy_cpu_percent_mean"] = 100 * resources["proxy_cpu_seconds"] / seconds
+                    resources["proxy_mem_bytes_peak_sum"] = resources["proxy_rss_bytes_peak"]
+                    resources["proxy_mem_bytes_mean"] = resources["proxy_rss_bytes_peak"]
+                    record["resources"] = resources
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                record["resource_error"] = str(exc)
         record["source_file"] = str(f)
         cells.setdefault((mesh, payload), []).append(record)
 
@@ -177,13 +191,23 @@ def collect(results_root: Path) -> dict:
                 )
 
     aggregated: dict[str, dict] = {}
+    campaign_file = results_root / "campaign.json"
+    if campaign_file.exists():
+        for cell in json.loads(campaign_file.read_text())["cells"]:
+            mesh, payload, repetition = cell["arm"], cell["payload"], cell["repetition"]
+            directory = results_root / mesh / f"run_{repetition}" / f"payload_{payload}"
+            expected = directory / f"{mesh}_http1_{payload}.json"
+            status = directory / f"{mesh}_arm_status.json"
+            unsupported = status.exists() and json.loads(status.read_text()).get("status") == "unsupported-standalone"
+            if not unsupported and (not expected.exists() or not expected.with_suffix(".resources.json").exists()):
+                warnings.append(f"missing expected cell or resource interval {expected}")
     for (mesh, payload), records in sorted(cells.items()):
         runs = []
         publishable = []
         for r in records:
             errors = r.get("total_errors")
             rps = float(r.get("rps") or 0)
-            ok = errors == 0 and rps > 0
+            ok = errors == 0 and rps > 0 and not r.get("resource_error")
             entry = {
                 "rps": rps,
                 "total_errors": errors,
@@ -198,6 +222,10 @@ def collect(results_root: Path) -> dict:
                 "p95_us": r.get("p95_us"),
                 "p99_us": r.get("p99_us"),
                 "resources": r.get("resources"),
+                "drained_requests": r.get("drained_requests"),
+                "warmup_requests": r.get("warmup_requests"),
+                "warmup_errors": r.get("warmup_errors"),
+                "resource_error": r.get("resource_error"),
             }
             runs.append(entry)
             if ok:
