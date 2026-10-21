@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **Relayed client upload aborts are no longer charged to mesh, HBONE, and
+  Unix-socket backends** (issue #6776). When a client abandoned its upload
+  while the sidecar mesh-mTLS, HBONE, or Unix-socket dispatcher was still
+  waiting for response headers, the gateway's own reset of the backend
+  exchange was classified `protocol_error` (`502`) and counted against the
+  target's circuit breaker and passive health. These dispatchers now check
+  for typed proof that the gateway's request body ended the exchange (an
+  HTTP/2 reset h2 records as user-initiated, or hyper's HTTP/1.1 user body
+  error). The upload's typed terminals then name the cause, as the
+  direct-HTTP/2 early-response refusal does (#6314). A client abort is a
+  health-neutral `client_disconnect` (`499`, gRPC `CANCELLED`) and is never
+  replayed. An authorization expiry gets the authorization terminal, and a
+  backend write watermark gets the `504` / `read_write_timeout` it already
+  had at the header wait. A reset, `CANCEL`, `NO_ERROR`, or close sent by the
+  backend is still a backend failure.
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and
   config-validation resolver used by `Consumer::validate_fields`, the

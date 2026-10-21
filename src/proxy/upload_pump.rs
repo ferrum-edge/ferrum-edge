@@ -309,6 +309,116 @@ pub(crate) const fn early_response_upload_refusal_error_class(
     }
 }
 
+/// What ended a sidecar mesh-mTLS, HBONE, or Unix-socket dispatch whose
+/// `send_request` failed before the backend response head (issue #6776).
+///
+/// Those dispatchers hand the client body to a pooled hyper client. When the
+/// gateway ends that body with an error, hyper ends the backend exchange
+/// itself: an HTTP/1.1 client fails it with the body's error, and an HTTP/2
+/// client resets the backend stream and fails the response wait with that
+/// locally initiated reset. Without provenance, every such failure read as a
+/// backend `ProtocolError`, so a client that abandoned its upload was charged
+/// to the selected target's circuit breaker and passive health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreHeaderSendTermination {
+    /// Not proven to be the gateway ending the upload, or the gateway ended it
+    /// for a cause the dispatcher cannot name. The transport's own
+    /// classification stands, so a backend reset, `CANCEL`, `NO_ERROR`, or
+    /// protocol failure is still a backend failure.
+    Transport,
+    /// The client's own upload failed (a reset, a dropped connection, a
+    /// malformed or truncated body) and the gateway relayed that failure.
+    ClientAbort,
+    /// The gateway-owned pump's backend write watermark ended the upload: the
+    /// backend stopped taking it.
+    BackendWriteTimeout,
+    /// The admitted stream's authorization lifetime ended the upload.
+    AuthorizationExpired,
+}
+
+/// Attribute a pre-response-head `send_request` failure on the sidecar
+/// mesh-mTLS, HBONE, and Unix-socket dispatchers (issue #6776), from the same
+/// typed upload terminals the direct-H2 early-response refusal reads (issue
+/// #6314, [`early_response_upload_refusal_error_class`]).
+///
+/// * `gateway_ended_upload`: the transport error is typed proof that the
+///   gateway's request body ended the exchange
+///   ([`hyper_send_error_ended_by_gateway_upload`]). Without it nothing below
+///   is consulted: whatever the upload was doing, the backend failed first.
+/// * `authorization_ended`: the admitted stream's authorization latch is
+///   recorded (by the pump, the adapter, or the caller's recheck).
+/// * `client_body_streamed`: the transport read a streaming client body, not
+///   the collected replayable one, so a client failure could reach it.
+/// * `upload_pumped` / `pump_outcome`: whether a gateway-owned pump fed the
+///   adapter, and that pump's joined terminal.
+///
+/// A pump's `SourceError` terminal is the only client proof on a pumped
+/// upload. Without a pump, the size-limit adapter reads the client body
+/// directly and arms neither a cancellation nor an authorization timer (both
+/// install a pump), so once the caller has ruled out its size refusal the only
+/// way that body can fail is the client's own stream failing.
+pub(crate) const fn pre_header_send_termination(
+    gateway_ended_upload: bool,
+    authorization_ended: bool,
+    client_body_streamed: bool,
+    upload_pumped: bool,
+    pump_outcome: Option<UploadPumpOutcome>,
+) -> PreHeaderSendTermination {
+    if !gateway_ended_upload {
+        return PreHeaderSendTermination::Transport;
+    }
+    if authorization_ended || matches!(pump_outcome, Some(UploadPumpOutcome::AuthorizationExpired))
+    {
+        return PreHeaderSendTermination::AuthorizationExpired;
+    }
+    if matches!(pump_outcome, Some(UploadPumpOutcome::WriteTimeout)) {
+        return PreHeaderSendTermination::BackendWriteTimeout;
+    }
+    let client_source_failed = if upload_pumped {
+        matches!(pump_outcome, Some(UploadPumpOutcome::SourceError))
+    } else {
+        true
+    };
+    if client_body_streamed && client_source_failed {
+        PreHeaderSendTermination::ClientAbort
+    } else {
+        PreHeaderSendTermination::Transport
+    }
+}
+
+/// Whether a hyper `send_request` failure is the gateway's own request body
+/// ending the exchange rather than the backend failing it (issue #6776).
+///
+/// Typed, and allocation-free:
+///
+/// * HTTP/1.1 (HBONE's inner client, the Unix-socket pool): hyper fails the
+///   exchange with a user body error that carries the body's error as its
+///   source, and only when polling the request body failed. No other user
+///   error on the client path carries a source. A body that ended short of its
+///   declared length is excluded; it is not a failure of the body stream.
+/// * HTTP/2 (sidecar mesh-mTLS, the Unix h2c transport): hyper resets the
+///   backend stream when the body fails, and h2 records that reset as
+///   user-initiated, so the response wait fails with a reset that is neither
+///   received from the backend (`is_remote`) nor raised by h2 because the
+///   backend broke the protocol (`is_library`). Whichever side reset the
+///   stream first owns it: a backend reset that arrived first stays remote.
+///
+/// A backend close, a reset or `GOAWAY` the backend sent, a hyper-cancelled
+/// dispatch, and an I/O failure are all `false`.
+pub(crate) fn hyper_send_error_ended_by_gateway_upload(err: &hyper::Error) -> bool {
+    if err.is_user() {
+        return !err.is_body_write_aborted() && std::error::Error::source(err).is_some();
+    }
+    let mut current = std::error::Error::source(err);
+    while let Some(node) = current {
+        if let Some(h2_err) = node.downcast_ref::<h2::Error>() {
+            return h2_err.is_reset() && !h2_err.is_remote() && !h2_err.is_library();
+        }
+        current = node.source();
+    }
+    false
+}
+
 /// Transport-side error for a non-clean pump terminal.
 ///
 /// Write-timeout uses a typed `io::ErrorKind::TimedOut` so the existing

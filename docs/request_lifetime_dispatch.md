@@ -130,10 +130,37 @@ apply the same end-of-stream read before dispatch (see [HTTP/3](http3.md)).
 The streaming body classifier, `classify_reqwest_error`, and the direct HTTP/1.1 pool's hyper error
 classifier never count this gateway-initiated reset as a backend failure (see
 [error classification](error_classification.md)). The sidecar mesh-mTLS, HBONE, and Unix-socket
-dispatchers do not inspect the cause of a `send_request` failure before response headers: apart
-from a canceled dispatch of a replayable body, it is `protocol_error`. If the gateway's reset
-surfaces there while the dispatch is still running, it is charged to that target's circuit breaker
-and passive health, as an explicit client `CANCEL` already is.
+dispatchers (issue #6776) first ask whether a `send_request` failure before response headers is
+the gateway's own request body ending the exchange. That proof is typed: hyper's HTTP/1.1 client
+(HBONE's inner client, the Unix-socket pool) fails the exchange with a user body error carrying the
+body's error, and its HTTP/2 client (sidecar mesh-mTLS, Unix h2c) fails the response wait with a
+stream reset h2 records as user-initiated. A reset or `GOAWAY` the backend sent, a backend close,
+and an I/O failure are not that proof. When it holds, the dispatcher names the cause from the
+upload's typed terminals, the same ones the direct-HTTP/2 early-response refusal reads (issue
+#6314):
+
+- The client's upload failed first: the gateway-owned pump's `SourceError` terminal, or, with no
+  pump, the size-limit adapter, which then reads only the client body. The request is a client
+  disconnect: `499` with `{"error":"Client disconnected"}` (Trailers-Only `CANCELLED` for gRPC),
+  error class `client_disconnect`. The circuit breaker, passive health, least-latency samples, and
+  adaptive concurrency are not charged, and `connection_error` stays `false`, so it is never
+  replayed as a connect failure. The client has usually gone, so the `499` is what the logs and
+  metrics record; it reaches the wire only if the client is still reading.
+- The admitted stream's authorization lifetime ended the upload: the same health-neutral
+  authorization terminal as the response-header wait.
+- The pump's backend write watermark ended it: the same backend-charged `504`
+  (`read_write_timeout`, gRPC `DEADLINE_EXCEEDED`) as the watermark arm of the header wait.
+
+Any other cause keeps the previous classification. A failure that is not that proof, including a
+backend `CANCEL`, `NO_ERROR`, or `REFUSED_STREAM` reset, is still `protocol_error` and still
+charged to the target, and a canceled dispatch of a replayable body is still the pre-wire
+`connection_pool_error`. A replayable body has no client source to fail, so a gateway reset there
+names only the authorization or write-watermark cause. A route deadline cancels the whole attempt
+instead and is attributed by the route-deadline wrapper (`504`, charged only when the backend held
+the attempt). Once response headers have arrived the backend status is kept; a later upload
+failure is handled by the response-body classifiers above. A client that disappears after its
+upload completed ends no backend upload, so it relays no reset through these dispatchers: its
+request handler is dropped, or it runs to completion.
 
 ## Request-future stack boundaries
 

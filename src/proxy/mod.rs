@@ -54106,6 +54106,128 @@ fn mesh_transport_hyper_error_response(
     }
 }
 
+/// Whether the admitted stream's authorization lifetime has ended the upload:
+/// its once-only latch is already recorded (by the pump or the size-limit
+/// adapter), or the deadline has now elapsed and is recorded here. The same
+/// recheck the direct-H2 upload gate makes before it commits a replacement
+/// response.
+fn upload_authorization_ended(auth: Option<&RequestAuthLifetimePlan>) -> bool {
+    auth.is_some_and(|(plan, family, latch)| {
+        if latch.observed().is_some() {
+            return true;
+        }
+        let Some(termination) = crate::proxy::auth_lifetime::expired_authorization(Some(*plan))
+        else {
+            return false;
+        };
+        latch.record_once(termination, *family);
+        true
+    })
+}
+
+/// Trailers-only `grpc-status: 1` (`CANCELLED`) for a gRPC-flavored client
+/// that abandoned its upload before the backend response head (issue #6776):
+/// the client's own cancellation, with the health-neutral `ClientDisconnect`
+/// class, never a backend `UNAVAILABLE`.
+fn mesh_grpc_client_cancelled_response(resolved_ip: Option<String>) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        grpc_proxy::grpc_status::CANCELLED.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        GRPC_CLIENT_DISCONNECT_MESSAGE.to_string(),
+    );
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ClientDisconnect),
+        request_on_wire: true,
+        buffered_trailers: None,
+    }
+}
+
+/// Response for a sidecar mesh-mTLS, HBONE, or Unix-socket dispatch whose
+/// `send_request` failed before the backend response head, attributed by the
+/// typed upload terminals (issue #6776,
+/// [`upload_pump::pre_header_send_termination`]).
+///
+/// * A client upload abort is the client's own outcome: `499` (the nginx
+///   convention for a client that went away before a response; it is logged
+///   and counted, and reaches the wire only if the client is still reading),
+///   or Trailers-Only `CANCELLED` for gRPC, with the health-neutral
+///   `ClientDisconnect` class. `connection_error` stays `false`, so it is
+///   never replayed as a connect failure.
+/// * A backend write watermark is the same backend-charged `504` /
+///   `ReadWriteTimeout` (gRPC `DEADLINE_EXCEEDED`) the watermark arm of the
+///   response-header wait returns.
+/// * An authorization expiry is the same health-neutral placeholder the
+///   response-header deadline arm returns; the pre-commitment terminal
+///   replaces it.
+/// * `Transport` is the conservative backend `ProtocolError`; callers keep
+///   their own transport response for it instead.
+pub(crate) fn pre_header_upload_termination_response(
+    proxy_id: &str,
+    transport: &'static str,
+    termination: upload_pump::PreHeaderSendTermination,
+    is_grpc_flavored: bool,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    match termination {
+        upload_pump::PreHeaderSendTermination::ClientAbort => {
+            debug!(
+                proxy_id = %proxy_id,
+                transport,
+                error_kind = retry::error_class_log_kind(retry::ErrorClass::ClientDisconnect),
+                "Client abandoned its request upload before backend response headers"
+            );
+            if is_grpc_flavored {
+                mesh_grpc_client_cancelled_response(resolved_ip)
+            } else {
+                retry::BackendResponse {
+                    status_code: 499,
+                    body: ResponseBody::buffered(Bytes::from_static(
+                        br#"{"error":"Client disconnected"}"#,
+                    )),
+                    headers: HashMap::new(),
+                    connection_error: false,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ClientDisconnect),
+                    request_on_wire: true,
+                    buffered_trailers: None,
+                }
+            }
+        }
+        upload_pump::PreHeaderSendTermination::BackendWriteTimeout => {
+            warn!(
+                proxy_id = %proxy_id,
+                transport,
+                write_bound = "upload_pump",
+                "Backend stopped reading the request body before response headers"
+            );
+            if is_grpc_flavored {
+                mesh_grpc_deadline_exceeded_response(resolved_ip)
+            } else {
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                )
+            }
+        }
+        upload_pump::PreHeaderSendTermination::AuthorizationExpired => {
+            authorization_expired_dispatch_placeholder(resolved_ip, true)
+        }
+        upload_pump::PreHeaderSendTermination::Transport => {
+            http_backend_dispatch_error_response(retry::ErrorClass::ProtocolError, resolved_ip)
+        }
+    }
+}
+
 fn hbone_hyper_error_response(
     proxy: &Proxy,
     err: hyper::Error,
@@ -57950,6 +58072,42 @@ async fn proxy_to_backend_hbone_after_ready(
                 // That makes it a pre-wire `ConnectionPoolError` on a fresh
                 // lease too (issue #5720).
                 let never_sent = try_err.take_message().is_some();
+                // The gateway's own request body failing is not the
+                // destination's failure (issue #6776): the typed upload
+                // terminals name the cause. A handed-back request was never
+                // polled, so it cannot carry that proof.
+                if !never_sent
+                    && crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                        try_err.error(),
+                    )
+                {
+                    let upload_pumped = upload_pump.is_some();
+                    let pump_outcome = match upload_pump.take() {
+                        Some(pump) => pump.cancel_and_join().await,
+                        None => None,
+                    };
+                    let termination = crate::proxy::upload_pump::pre_header_send_termination(
+                        true,
+                        upload_authorization_ended(send_auth_deadline.as_ref()),
+                        !request_body_replayable,
+                        upload_pumped,
+                        pump_outcome,
+                    );
+                    if termination != crate::proxy::upload_pump::PreHeaderSendTermination::Transport
+                    {
+                        return (
+                            pre_header_upload_termination_response(
+                                &proxy.id,
+                                "hbone",
+                                termination,
+                                false,
+                                resolved_ip,
+                            ),
+                            None,
+                            None,
+                        );
+                    }
+                }
                 return (
                     hbone_hyper_error_response(
                         proxy,
@@ -58983,6 +59141,42 @@ async fn proxy_to_backend_unix(
                 // a pre-wire `ConnectionPoolError` on a fresh lease too (issue
                 // #5720).
                 let never_sent = try_err.take_message().is_some();
+                // The gateway's own request body failing is not the
+                // destination's failure (issue #6776): the typed upload
+                // terminals name the cause. A handed-back request was never
+                // polled, so it cannot carry that proof.
+                if !never_sent
+                    && crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                        try_err.error(),
+                    )
+                {
+                    let upload_pumped = upload_pump.is_some();
+                    let pump_outcome = match upload_pump.take() {
+                        Some(pump) => pump.cancel_and_join().await,
+                        None => None,
+                    };
+                    let termination = crate::proxy::upload_pump::pre_header_send_termination(
+                        true,
+                        upload_authorization_ended(send_auth_deadline.as_ref()),
+                        !request_body_replayable,
+                        upload_pumped,
+                        pump_outcome,
+                    );
+                    if termination != crate::proxy::upload_pump::PreHeaderSendTermination::Transport
+                    {
+                        return (
+                            pre_header_upload_termination_response(
+                                &proxy.id,
+                                "unix",
+                                termination,
+                                false,
+                                resolved_ip,
+                            ),
+                            None,
+                            None,
+                        );
+                    }
+                }
                 return (
                     unix_hyper_error_response(
                         proxy,
@@ -60603,6 +60797,40 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     None,
                     None,
                 );
+            }
+            // A stream reset the gateway raised because its own request body
+            // failed is not the backend's failure (issue #6776): the typed
+            // upload terminals name the cause.
+            if crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(&err) {
+                let upload_pumped = upload_pump.is_some();
+                let pump_outcome = match upload_pump.take() {
+                    Some(pump) => pump.cancel_and_join().await,
+                    None => None,
+                };
+                let termination = crate::proxy::upload_pump::pre_header_send_termination(
+                    true,
+                    upload_authorization_ended(send_auth_deadline.as_ref()),
+                    !request_body_replayable,
+                    upload_pumped,
+                    pump_outcome,
+                );
+                if termination != crate::proxy::upload_pump::PreHeaderSendTermination::Transport {
+                    return (
+                        pre_header_upload_termination_response(
+                            &proxy.id,
+                            if unix_socket_path.is_some() {
+                                "unix_h2c"
+                            } else {
+                                "sidecar_mtls"
+                            },
+                            termination,
+                            is_grpc_flavored,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
             }
             let error_class = if request_body_replayable && err.is_canceled() {
                 retry::ErrorClass::ConnectionPoolError
