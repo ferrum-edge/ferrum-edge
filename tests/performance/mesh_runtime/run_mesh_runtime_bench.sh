@@ -96,6 +96,8 @@ LINKERD_IMAGE="${LINKERD_IMAGE:-ghcr.io/linkerd/proxy:edge-25.11.1}"
 TOOLS_IMAGE="${TOOLS_IMAGE:-mesh-bench-tools:local}"
 BENCH_CARGO_PROFILE="${BENCH_CARGO_PROFILE:-release}"
 case "$BENCH_CARGO_PROFILE" in release|ci-release) ;; *) echo "invalid build profile" >&2; exit 2 ;; esac
+BENCH_FERRUM_FEATURES="${BENCH_FERRUM_FEATURES:-cloud-secrets}"
+case "$BENCH_FERRUM_FEATURES" in cloud-secrets|cloud-secrets,bench-h1-profile) ;; *) echo "invalid build features" >&2; exit 2 ;; esac
 
 BACKEND_PORT=18080
 OUTBOUND_PORT=15101
@@ -197,7 +199,7 @@ build_tools_image() {
 
 build_ferrum_image() {
     echo "[build] building ferrum image $FERRUM_IMAGE (repo Dockerfile)"
-    docker build --build-arg "CARGO_PROFILE=$BENCH_CARGO_PROFILE" \
+    docker build --build-arg "CARGO_PROFILE=$BENCH_CARGO_PROFILE" --build-arg "FEATURES=$BENCH_FERRUM_FEATURES" \
         -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" \
         > "$OUTPUT_DIR/logs/ferrum-build.log" 2>&1 || {
         tail -30 "$OUTPUT_DIR/logs/ferrum-build.log" >&2; exit 1; }
@@ -307,6 +309,8 @@ start_ferrum() {
         -e FERRUM_POOL_WARMUP_ENABLED=false \
         -e FERRUM_PROXY_HTTP_PORT=0 \
         -e FERRUM_ADMIN_HTTP_PORT=15020 \
+        -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
+        -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
         "$FERRUM_IMAGE" >/dev/null
     # Client sidecar: outbound :15101 dials destination :15006, pins SVID.
@@ -330,6 +334,8 @@ start_ferrum() {
         -e FERRUM_POOL_WARMUP_ENABLED=false \
         -e FERRUM_PROXY_HTTP_PORT=0 \
         -e FERRUM_ADMIN_HTTP_PORT=15120 \
+        -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
+        -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
         "$FERRUM_IMAGE" >/dev/null
 }
@@ -492,6 +498,9 @@ run_cell() {
     local resource_args=()
     if [ "$MESH" != direct ]; then
         resource_args=(--container "$CLIENT_NAME" --container "$SERVER_NAME")
+    fi
+    if [ "$MESH" = ferrum ] && [ "$BENCH_FERRUM_FEATURES" = cloud-secrets,bench-h1-profile ]; then
+        resource_args+=(--allocation-url http://127.0.0.1:15120/metrics --allocation-url http://127.0.0.1:15020/metrics)
     fi
     local rc=0
     python3 "$SCRIPT_DIR/collect_resources.py" "${resource_args[@]}" \
