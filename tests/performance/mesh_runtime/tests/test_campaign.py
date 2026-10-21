@@ -68,7 +68,10 @@ class Contracts(unittest.TestCase):
     def test_missing_repetition_cannot_be_hidden_by_another_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "campaign.json").write_text(json.dumps({"cells": campaign.plan(["ferrum"], [1024], 3, True)}))
+            (root / "campaign.json").write_text(json.dumps({
+                "cells": campaign.plan(["ferrum"], [1024], 3, True),
+                "duration": 10, "concurrency": 100,
+            }))
             collected = summary.collect(root)
             self.assertEqual(len(collected["warnings"]), 6)
             self.assertNotEqual(summary.check_acceptance(collected), 0)
@@ -84,6 +87,114 @@ class Contracts(unittest.TestCase):
                     (directory / "ferrum_http1_1024.json").write_text(value)
                 collected = summary.collect(root)
                 self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+    def write_campaign(self, root, payloads=(1024,), concurrency=100):
+        cells = campaign.plan(["ferrum"], payloads, 2, False)
+        (root / "campaign.json").write_text(json.dumps({
+            "cells": cells, "duration": 10, "concurrency": concurrency,
+        }))
+        return cells
+
+    def write_campaign_cell(self, root, payload=1024, repetition=1, concurrency=100, **overrides):
+        directory = root / "ferrum" / f"run_{repetition}" / f"payload_{payload}"
+        directory.mkdir(parents=True, exist_ok=True)
+        file = directory / f"ferrum_http1_{payload}.json"
+        record = {
+            "mesh": "ferrum", "gateway": "ferrum", "protocol": "http1",
+            "payload_size": payload, "duration_secs": 10, "concurrency": concurrency,
+            "rps": 2, "total_errors": 0,
+        }
+        record.update(overrides)
+        file.write_text(json.dumps(record))
+        file.with_suffix(".resources.json").write_text(json.dumps({
+            "valid": True, "elapsed_seconds": 10, "host_cpu_steal_percent": 0,
+            "proxy_cpu_seconds": 1, "proxy_rss_bytes_peak": 1024,
+            "proxy_rss_bytes_mean": 512,
+        }))
+        return file
+
+    def test_campaign_rejects_wrong_metadata_even_with_a_valid_repetition(self):
+        for overrides in (
+            {"duration_secs": 9}, {"duration_secs": "10"},
+            {"duration_secs": None}, {"protocol": "http2"}, {"protocol": None},
+            {"concurrency": 99}, {"concurrency": "100"},
+            {"mesh": "envoy"}, {"gateway": "envoy"}, {"payload_size": 10240},
+        ):
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_campaign(root)
+                self.write_campaign_cell(root)
+                self.write_campaign_cell(root, repetition=2, **overrides)
+                collected = summary.collect(root)
+                self.assertEqual(collected["meshes"]["ferrum"]["1024"]["publishable_runs"], 1)
+                self.assertTrue(any("unpublishable cell" in warning for warning in collected["warnings"]))
+                self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+    def test_campaign_accepts_bulk_concurrency_at_both_thresholds_and_clamps_to_one(self):
+        expected = {1024: 101, 1048575: 101, 1048576: 50, 5242879: 50, 5242880: 25}
+        for concurrency, counts in ((101, expected), (1, {payload: 1 for payload in expected})):
+            with self.subTest(concurrency=concurrency), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for cell in self.write_campaign(root, tuple(counts), concurrency):
+                    self.write_campaign_cell(root, cell["payload"], cell["repetition"], counts[cell["payload"]])
+                collected = summary.collect(root)
+                self.assertEqual(collected["warnings"], [])
+                self.assertEqual(summary.check_acceptance(collected), 0)
+                self.assertTrue(all(cell["publishable_runs"] == 2 for cell in collected["meshes"]["ferrum"].values()))
+
+    def test_campaign_rejects_unscaled_bulk_concurrency_in_one_repetition(self):
+        for payload, effective in ((1048576, 50), (5242880, 25)):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_campaign(root, (payload,))
+                self.write_campaign_cell(root, payload, concurrency=effective)
+                self.write_campaign_cell(root, payload, repetition=2, concurrency=100)
+                collected = summary.collect(root)
+                self.assertEqual(collected["meshes"]["ferrum"][str(payload)]["publishable_runs"], 1)
+                self.assertTrue(any(f"expected {effective}" in warning for warning in collected["warnings"]))
+                self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+    def test_campaign_rejects_unplanned_repetition_even_with_matching_file_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_campaign(root)
+            for repetition in (1, 2, 3):
+                self.write_campaign_cell(root, repetition=repetition)
+            collected = summary.collect(root)
+            self.assertEqual(collected["meshes"]["ferrum"]["1024"]["publishable_runs"], 2)
+            self.assertTrue(any("not a planned campaign cell" in warning for warning in collected["warnings"]))
+            self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+    def test_standalone_legacy_summary_does_not_require_campaign_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ferrum_http1_1024.json").write_text(json.dumps({
+                "mesh": "ferrum", "gateway": "ferrum", "payload_size": 1024,
+                "rps": 2, "total_errors": 0,
+            }))
+            collected = summary.collect(root)
+            self.assertEqual(collected["warnings"], [])
+            self.assertEqual(summary.check_acceptance(collected), 0)
+            self.assertNotIn("Admitted-success cohort", summary.render_markdown(collected))
+
+    def test_markdown_distinguishes_in_window_and_cohort_latency_including_drains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_campaign(root)
+            for repetition in (1, 2):
+                self.write_campaign_cell(root, repetition=repetition,
+                    latency_avg_us=100, p50_us=80, p95_us=150, p99_us=200,
+                    cohort_requests=21, cohort_p50_us=80, cohort_p95_us=1_500_000,
+                    cohort_p99_us=2_000_000, cohort_latency_max_us=3_000_000)
+            collected = summary.collect(root)
+            self.assertEqual(collected["meshes"]["ferrum"]["1024"]["cohort_requests"], 21)
+            markdown = summary.render_markdown(collected)
+            in_window = markdown.split("## In-window successful-completion latency", 1)[1].split("## Admitted-success cohort", 1)[0]
+            self.assertIn("200µs", in_window)
+            self.assertNotIn("2.00s", in_window)
+            cohort = markdown.split("## Admitted-success cohort latency including drains", 1)[1]
+            self.assertIn("| Successful exchanges | P50 | P95 | P99 | Max |", cohort)
+            self.assertIn("| ferrum | 1KiB | 21 | 80µs | 1.50s | 2.00s | 3.00s |", cohort)
 
 
 if __name__ == "__main__":
