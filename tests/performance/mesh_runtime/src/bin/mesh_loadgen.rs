@@ -14,8 +14,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::SendRequest;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
-use mesh_runtime_perf::BenchMetrics;
+use mesh_runtime_perf::{BenchMetrics, MeasurementWindow};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 
 #[derive(Parser)]
 struct Cli {
@@ -28,9 +29,13 @@ struct Cli {
     /// Mesh arm name stamped into the JSON report.
     #[arg(long, default_value = "direct")]
     mesh: String,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     duration: u64,
-    #[arg(long, default_value_t = 100)]
+    /// Discarded traffic on each worker's retained connection before the
+    /// coordinator starts the shared measurement window.
+    #[arg(long, default_value_t = 0)]
+    warmup: u64,
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
     concurrency: u64,
     #[arg(long, default_value_t = 1024)]
     payload_size: usize,
@@ -59,33 +64,39 @@ async fn main() -> Result<()> {
 
     let payload = Bytes::from(vec![b'x'; args.payload_size]);
 
-    // Ready barrier: every worker establishes its first connection, then
-    // all workers start from a shared epoch so connection setup is never
-    // charged to the measured window and the deadline is common.
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(args.concurrency as usize));
+    // Workers retain their warmed connections while waiting. Only the
+    // coordinator chooses the epoch, after every worker has become ready.
+    // A watch channel distributes that exact window even to workers which
+    // are scheduled later; they never create their own relative deadlines.
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(args.concurrency as usize + 1));
+    let (window_tx, window_rx) = watch::channel(None);
     let duration = Duration::from_secs(args.duration);
-    let exchange_timeout = Duration::from_secs(args.exchange_timeout_secs);
+    let warmup = Duration::from_secs(args.warmup);
+    let target = ExchangeTarget {
+        host,
+        port,
+        path,
+        host_header: args.host_header.clone(),
+        payload,
+        exchange_timeout: Duration::from_secs(args.exchange_timeout_secs),
+    };
     let mut handles = Vec::with_capacity(args.concurrency as usize);
     for _ in 0..args.concurrency {
-        let host = host.clone();
-        let path = path.clone();
-        let host_header = args.host_header.clone();
-        let payload = payload.clone();
+        let target = target.clone();
         let barrier = barrier.clone();
+        let window_rx = window_rx.clone();
         handles.push(tokio::spawn(async move {
-            worker(
-                host,
-                port,
-                path,
-                host_header,
-                payload,
-                barrier,
-                duration,
-                exchange_timeout,
-            )
-            .await
+            worker(target, barrier, window_rx, warmup).await
         }));
     }
+    barrier.wait().await;
+    let epoch = Instant::now();
+    eprintln!("MESH_BENCH_MEASUREMENT_START");
+    window_tx.send_replace(Some(MeasurementWindow::new(epoch, duration)));
+    // Emit the end marker at the accounting deadline, independently of
+    // worker drains. Host CPU samplers can exclude both warmup and drain.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(epoch + duration)).await;
+    eprintln!("MESH_BENCH_MEASUREMENT_END");
 
     let mut combined = BenchMetrics::new();
     let mut worker_join_failed = false;
@@ -123,7 +134,7 @@ async fn main() -> Result<()> {
             args.payload_size,
         );
         println!(
-            "  {} target={} concurrency={}\n  Latency avg {}us p50 {}us p95 {}us p99 {}us max {}us\n  {} requests, {} errors\nRequests/sec: {:.2}",
+            "  {} target={} concurrency={}\n  Latency avg {}us p50 {}us p95 {}us p99 {}us max {}us\n  {} requests, {} errors, {} drained after window\n  {} warmup requests, {} warmup errors\nRequests/sec: {:.2}",
             r.mesh,
             r.target,
             r.concurrency,
@@ -134,6 +145,9 @@ async fn main() -> Result<()> {
             r.latency_max_us,
             r.total_requests,
             r.total_errors,
+            r.drained_requests,
+            r.warmup_requests,
+            r.warmup_errors,
             r.rps
         );
     }
@@ -141,94 +155,163 @@ async fn main() -> Result<()> {
 }
 
 async fn worker(
+    target: ExchangeTarget,
+    barrier: std::sync::Arc<tokio::sync::Barrier>,
+    mut window_rx: watch::Receiver<Option<MeasurementWindow>>,
+    warmup: Duration,
+) -> BenchMetrics {
+    let mut metrics = BenchMetrics::new();
+    // Setup and optional warmup are excluded from throughput and latency.
+    // Their errors still invalidate the cell; workers join readiness even
+    // after a failure so a refused connection cannot strand their peers.
+    let mut sender = match open_conn(&target.host, target.port).await {
+        Ok(s) => Some(s),
+        Err(_) => {
+            if warmup.is_zero() {
+                metrics.record_error();
+            } else {
+                metrics.record_warmup_error();
+            }
+            None
+        }
+    };
+    if !warmup.is_zero() {
+        run_phase(
+            &target,
+            &mut sender,
+            MeasurementWindow::new(Instant::now(), warmup),
+            Phase::Warmup,
+            &mut metrics,
+        )
+        .await;
+    }
+    barrier.wait().await;
+    if window_rx.changed().await.is_err() {
+        metrics.record_error();
+        return metrics;
+    }
+    let window = *window_rx.borrow_and_update();
+    if let Some(window) = window {
+        run_phase(&target, &mut sender, window, Phase::Measured, &mut metrics).await;
+    } else {
+        metrics.record_error();
+    }
+    metrics
+}
+
+#[derive(Clone)]
+struct ExchangeTarget {
     host: String,
     port: u16,
     path: String,
     host_header: String,
     payload: Bytes,
-    barrier: std::sync::Arc<tokio::sync::Barrier>,
-    duration: Duration,
     exchange_timeout: Duration,
-) -> BenchMetrics {
-    let mut metrics = BenchMetrics::new();
-    // Establish the first connection before the shared start epoch; a
-    // setup failure is recorded once and the worker still joins the
-    // barrier so peers are never blocked by one failed connect.
-    let mut sender: Option<SendRequest<Full<Bytes>>> = match open_conn(&host, port).await {
-        Ok(s) => Some(s),
-        Err(_) => {
-            metrics.record_error();
-            None
-        }
-    };
-    barrier.wait().await;
-    let deadline = Instant::now() + duration;
+}
 
-    while Instant::now() < deadline {
-        let mut send = match sender.take() {
-            Some(s) if s.is_ready() => s,
-            _ => match open_conn(&host, port).await {
+#[derive(Clone, Copy)]
+enum Phase {
+    Warmup,
+    Measured,
+}
+
+impl Phase {
+    fn record_error(self, metrics: &mut BenchMetrics) {
+        match self {
+            Self::Warmup => metrics.record_warmup_error(),
+            Self::Measured => metrics.record_error(),
+        }
+    }
+}
+
+async fn run_phase(
+    target: &ExchangeTarget,
+    sender: &mut Option<SendRequest<Full<Bytes>>>,
+    window: MeasurementWindow,
+    phase: Phase,
+    metrics: &mut BenchMetrics,
+) {
+    while window.contains(Instant::now()) {
+        let send = match sender.take() {
+            // A temporarily unready keep-alive connection can become ready
+            // in the bounded exchange. Reopening it would discard warmup.
+            Some(s) if !s.is_closed() => s,
+            _ => match open_conn(&target.host, target.port).await {
                 Ok(s) => s,
                 Err(_) => {
-                    metrics.record_error();
+                    phase.record_error(metrics);
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
                 }
             },
         };
 
-        let req = match Request::builder()
-            .method("POST")
-            .uri(&path)
-            .header("host", &host_header)
-            .header("content-length", payload.len().to_string())
-            .body(Full::new(payload.clone()))
-        {
-            Ok(r) => r,
-            Err(_) => {
-                metrics.record_error();
-                continue;
-            }
-        };
-
+        // A reconnect may have consumed the remaining window. Never admit
+        // another exchange after the common deadline just because it began
+        // opening its connection earlier.
         let start = Instant::now();
-        // One deadline for the whole exchange, send plus body read: a peer
-        // that returns headers and then stalls mid-body must not pin a
-        // worker past the measurement epoch (or until the harness step
-        // times out) without recording a cell error. Dropping the timed-out
-        // exchange also drops the connection, so the next iteration opens
-        // a fresh one.
-        let exchange = async move {
-            let resp = send.send_request(req).await?;
-            let status = resp.status();
-            let bytes = resp.into_body().collect().await?.to_bytes();
-            Ok::<(SendRequest<Full<Bytes>>, StatusCode, Bytes), anyhow::Error>((
-                send, status, bytes,
-            ))
-        };
-
-        match tokio::time::timeout(exchange_timeout, exchange).await {
-            Ok(Ok((send, status, bytes))) if status == StatusCode::OK && bytes == payload => {
-                let elapsed = start.elapsed().as_micros() as u64;
-                metrics.record(elapsed, bytes.len());
-                sender = Some(send);
+        if !window.contains(start) {
+            *sender = Some(send);
+            break;
+        }
+        match complete_exchange(send, target).await {
+            Ok((send, bytes)) => {
+                let completed_at = Instant::now();
+                match phase {
+                    Phase::Warmup => metrics.record_warmup_success(),
+                    Phase::Measured => metrics.record_completion(
+                        window,
+                        completed_at,
+                        completed_at.duration_since(start).as_micros() as u64,
+                        bytes,
+                    ),
+                }
+                *sender = Some(send);
             }
-            _ => {
-                metrics.record_error();
-            }
+            Err(_) => phase.record_error(metrics),
         }
     }
-    metrics
+}
+
+async fn complete_exchange(
+    mut send: SendRequest<Full<Bytes>>,
+    target: &ExchangeTarget,
+) -> Result<(SendRequest<Full<Bytes>>, usize)> {
+    // Readiness, sending, and the entire response body share one deadline.
+    // Failure drops the sender and its connection; a successful late echo
+    // is drained and reported separately by the measurement phase.
+    tokio::time::timeout(target.exchange_timeout, async {
+        let req = Request::builder()
+            .method("POST")
+            .uri(&target.path)
+            .header("host", &target.host_header)
+            .header("content-length", target.payload.len().to_string())
+            .body(Full::new(target.payload.clone()))?;
+
+        send.ready().await?;
+        let resp = send.send_request(req).await?;
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await?.to_bytes();
+        anyhow::ensure!(
+            status == StatusCode::OK && bytes == target.payload,
+            "response must be a status-200 byte-exact echo"
+        );
+        Ok((send, bytes.len()))
+    })
+    .await
+    .context("request/response exchange timed out")?
 }
 
 async fn open_conn(host: &str, port: u16) -> Result<SendRequest<Full<Bytes>>> {
-    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, port)))
-        .await
-        .context("connect timed out")??;
-    let _ = tcp.set_nodelay(true);
-    let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    Ok(send)
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let tcp = TcpStream::connect((host, port)).await?;
+        tcp.set_nodelay(true)?;
+        let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(send)
+    })
+    .await
+    .context("connection setup timed out")?
 }

@@ -12,6 +12,38 @@ overhead, mesh DNS), which contain no competitor comparison.
 - Harness: `tests/performance/mesh_runtime/` (see its README)
 - Summarizer: `.github/scripts/summarize_mesh_runtime_results.py`
 
+## Qualification update (2026-10-21)
+
+The historical `consul` arm has no HTTP service-defaults entry. It is an
+L4 TCP/mTLS control, not an equivalent HTTP mesh: its echo and intention
+probes do not establish L7 processing. `consulhttp` is the separate L7 arm,
+with explicit HTTP service-defaults for both services and a live listener
+filter check requiring an HTTP connection manager on each proxy. The L4
+arm requires TCP proxy filters and no HTTP connection manager. Artifacts
+include listener-only config dumps; SDS secrets are never collected.
+Earlier tables and protocol descriptions below predate this correction.
+
+The campaign now reverses arm and payload blocks every other repetition.
+An optional exact `baseline_sha` builds a second Ferrum image with the same
+Dockerfile, features and build profile, then runs adjacent same-payload
+baseline/candidate pairs in AB/BA order. Both use the dispatched harness.
+`provenance.json` records exact SHAs, image IDs, configuration hashes and
+build profile; `campaign.json` retains the full schedule and required cells.
+`ci-release` is a diagnostic profile and cannot establish shipping-profile
+performance. Use `release`, 30 seconds and at least three repetitions for
+production-profile comparisons.
+
+The load generator warms each measured frontend connection, publishes one
+common accounting window, and includes only byte-exact successful responses
+completed inside it in RPS and latency. Successful post-deadline drains and
+warmup are separate counters; warmup/exchange errors invalidate the cell.
+Host `/proc` CPU and steal deltas are bracketed by receipt of the loadgen's
+start/end stderr markers, excluding warmup/drains with pipe/scheduler jitter.
+RSS is sampled every 100 ms; raw counters and container image IDs are kept.
+Resource intervals missing markers, changing PIDs, or above 5% CPU steal fail
+acceptance. These are process RSS and CPU deltas, not the older docker-stats
+sample estimates. Closed-loop latency still has coordinated-omission limits.
+
 The workflow builds the harness tools image and the Ferrum bench image once,
 in a dedicated step before the arm loop (`run_mesh_runtime_bench.sh
 --build-only`), then runs every arm with `--skip-build`. Image builds

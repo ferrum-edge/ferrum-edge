@@ -64,6 +64,17 @@ on:
         required: false
         default: ""
         type: string
+      baseline_sha:
+        description: "Optional exact Ferrum baseline SHA; built identically and paired AB/BA"
+        required: false
+        default: ""
+        type: string
+      profile:
+        description: "Matched Ferrum image build profile (ci-release is diagnostic only)"
+        required: false
+        default: release
+        type: choice
+        options: [release, ci-release]
 
 permissions:
   contents: read
@@ -78,16 +89,19 @@ env:
   BENCH_ITERATIONS: ${{ inputs.iterations }}
   BENCH_SKIP_MESHES: ${{ inputs.skip_meshes }}
   BENCH_SKIP_PAYLOAD_SIZES: ${{ inputs.skip_payload_sizes }}
+  BENCH_BASELINE_SHA: ${{ inputs.baseline_sha }}
+  BENCH_CARGO_PROFILE: ${{ inputs.profile }}
 
 jobs:
   benchmark:
     name: Mesh runtime benchmark
     runs-on: ubuntu-26.04
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify summarizer contract (static)
@@ -115,30 +129,6 @@ jobs:
           echo "=== Docker ==="
           docker version --format '{{.Server.Version}}' || true
 
-      - name: Compute mesh + payload lists
-        id: plan
-        run: |
-          all_meshes="direct ferrum envoy consul linkerd"
-          meshes=""
-          for m in $all_meshes; do
-            case " $BENCH_SKIP_MESHES " in
-              *" $m "*) ;;
-              *) meshes="${meshes:+$meshes }$m" ;;
-            esac
-          done
-          all_sizes="1024 10240 71680 512000 1048576 5242880"
-          sizes=""
-          for sz in $all_sizes; do
-            case " $BENCH_SKIP_PAYLOAD_SIZES " in
-              *" $sz "*) ;;
-              *) sizes="${sizes:+$sizes }$sz" ;;
-            esac
-          done
-          echo "meshes=$meshes" >> "$GITHUB_OUTPUT"
-          echo "payload_sizes=$sizes" >> "$GITHUB_OUTPUT"
-          echo "Arms: $meshes"
-          echo "Payload sizes: $sizes"
-
       # No docker/buildx actions here by design: a new workflow may not
       # add Cross executable surfaces (Trusted Cross Build Policy). The
       # harness builds both images with literal `docker build` commands in
@@ -150,52 +140,16 @@ jobs:
       # under `--skip-build`. Every arm now runs with `--skip-build` and
       # fails fast if this step did not produce the image it needs.
       - name: Build benchmark images
-        if: steps.plan.outputs.meshes != ''
-        timeout-minutes: 45
+        timeout-minutes: 120
         env:
           FERRUM_IMAGE: ferrum-edge:bench
         run: |
-          bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh \
-            --build-only \
-            --output-dir results/images
+          python3 .github/scripts/mesh_runtime_campaign.py build
 
-      - name: Run benchmark (all arms, sequential, same runner)
-        timeout-minutes: 150
-        env:
-          MESHES: ${{ steps.plan.outputs.meshes }}
-          PAYLOAD_SIZES: ${{ steps.plan.outputs.payload_sizes }}
-          FERRUM_IMAGE: ferrum-edge:bench
+      - name: Run benchmark (balanced blocks, paired Ferrum images, same runner)
+        timeout-minutes: 110
         run: |
-          mkdir -p results
-          {
-            echo "sha=${GITHUB_SHA}"
-            echo "runner=ubuntu-26.04"
-            date -u +%Y-%m-%dT%H:%M:%SZ
-            nproc
-            uname -a
-            docker version --format '{{.Server.Version}}' || true
-            docker image inspect ferrum-edge:bench --format 'ferrum {{.Id}}' || true
-          } > results/host-facts.txt
-          for mesh in $MESHES; do
-            for run in $(seq 1 "$BENCH_ITERATIONS"); do
-              echo ""
-              echo "============================================"
-              echo "  ARM ${mesh} — RUN ${run}/${BENCH_ITERATIONS}"
-              echo "============================================"
-              run_dir="results/${mesh}/run_${run}"
-              mkdir -p "$run_dir"
-              # The tools and Ferrum images were built once in the step
-              # above; arms only consume them.
-              bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh \
-                "$mesh" \
-                --payload-sizes "$PAYLOAD_SIZES" \
-                --duration "$BENCH_DURATION" \
-                --concurrency "$BENCH_CONCURRENCY" \
-                --output-dir "$run_dir" \
-                --skip-build \
-                2>&1 | tee "$run_dir/run.log" || true
-            done
-          done
+          python3 .github/scripts/mesh_runtime_campaign.py measure
 
       - name: Force-cleanup any leaked containers
         if: always()
