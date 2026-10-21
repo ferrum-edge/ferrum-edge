@@ -2543,68 +2543,43 @@ Coverage Plan.
 
 `ci.yml` is a protected workflow. The ARM64 job stays digest-frozen; every other
 job the pull-request scan reads as Cross-sensitive is compared by its whole-job
-SHA-256. The CI optimization tranche rewrites some of those jobs. Rather than
-relaxing the scan, the trusted policy admits exact retired→adopted pairs
-(`CI_JOB_GENERATION_TRANSITIONS` in `.github/scripts/verify_cross_build_policy.py`):
+SHA-256. When a reviewed change has to rewrite one of those jobs, the trusted
+policy admits an exact retired→adopted pair instead of relaxing the scan
+(`CI_JOB_GENERATION_TRANSITIONS` in `.github/scripts/verify_cross_build_policy.py`).
 
-| Job | Retired SHA-256 (trusted base) | Adopted SHA-256 | Destination |
-|---|---|---|---|
-| `performance-regression` | `74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4` | `e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986` | PR #3911 / issue #3906 |
-| `ebpf-live` | `b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c` | `9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87` | PR #3915 / issue #3900 |
-| `netns-capture-live` | `db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598` | `b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32` | PR #3915 / issue #3900 |
-| `two-cluster-mesh-live` | `0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27` | `9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7` | PR #3915 / issue #3900 |
+The table is currently **empty**. Every pair it has held is retired:
 
-The three `#3915` pairs admit the per-suite planner-gate split (the union
-`run_ebpf_live` output becomes `run_ebpf_kernel_live` /
-`run_netns_capture_live` / `run_two_cluster_live`); the adopted digests are
-pinned against #3915's branch after merging latest `main`
-(`grok/issue-3900-ebpf-gates`, merged text `d95ea4796`). #3915's `ci-plan` /
-`test` changes are planner-body and aggregate-summary edits that today's scan
-does not read as Cross-sensitive, so those need no pair here. The
-`performance-regression` job has since moved out of `ci.yml` into
-`performance-regression.yml`, so its pair can no longer match and should be
-retired.
+- PR #3911's `performance-regression` pair (issue #3906): the job has moved out
+  of `ci.yml` into `performance-regression.yml`, so the pair can never match a
+  `ci.yml` revision again.
+- PR #3915's `ebpf-live` / `netns-capture-live` / `two-cluster-mesh-live` pairs
+  (issue #3900), which admitted the per-suite planner-gate split: #3915 landed
+  and later changes moved all three jobs on `main`, so neither end of any pair
+  is a state `main` is in.
+- The four issue #6573 pairs (`build-binaries`, `ebpf-live`,
+  `netns-capture-live`, `two-cluster-mesh-live`), which retired BoringCache from
+  the Cross-sensitive cached jobs: each pin-normalized destination is main's
+  live job text. The `BORINGCACHE_ENABLED` top-level `env` allowance went with
+  them, so any edit to the protected top-level `env` is refused again.
+- PR #3913's `ci-plan` / `test` pairs and PR #3916's `build-binaries` pair:
+  their destinations reached `main`.
+- PR #4355's `build-binaries` / `build-release-binaries` pairs (issue #4301):
+  both destinations landed on `main`, and the issue #4423 predecessor has since
+  moved both jobs again on `main` directly. Both producers are held to `main`'s
+  own text by the ordinary whole-job surface comparison, and absolutely by
+  `linux_gnu_producer_contract_errors` — see the standing contract below.
 
-The four issue #6573 pairs (`build-binaries`, `ebpf-live`,
-`netns-capture-live`, `two-cluster-mesh-live`), which retired BoringCache from
-the Cross-sensitive cached jobs, are retired: each pin-normalized destination
-is main's live job text. The `BORINGCACHE_ENABLED` top-level `env` allowance
-went with them, so any edit to the protected top-level `env` is refused again.
-
-PR #3916's `build-binaries` pair is retired: its destination is main's live
-value, so the tuple admitted a transition between two states `main` is not in
-and only widened what a pull request could claim.
-
-PR #4355's `build-binaries` / `build-release-binaries` pairs (issue #4301) are
-retired for the same reason, and more strongly: both destinations landed on
-`main`, and the issue #4423 predecessor has since moved both jobs again on
-`main` directly, so neither end of either pair is a state `main` is in.
-Keeping them would only widen what a pull request may claim. Both producers
-are held to `main`'s own text by the ordinary whole-job surface comparison,
-and absolutely by `linux_gnu_producer_contract_errors` — see the standing
-contract below.
-
-Each digest is the SHA-256 of `extract_job_block` text. Both ends are exact, the
-binding includes the job name, the move is one-way, and only that job's
-`job:<name>:*` surfaces are withheld for that one pair. The candidate supplies
-no digest. `fuzz-smoke` is not in this table; it uses
-`CI_FUZZ_SMOKE_JOB_GENERATIONS`.
-
-Jobs omitted because a single predecessor cannot name a unique merged text:
-
-- `test-pkcs11-softhsm` — #3889 already rewrote this job on `main`. #3913
-  rewrites it from a different retired text. #3913 must merge latest `main` and
-  needs a follow-up predecessor if the remaining PKCS path-gate still moves a
-  Cross-sensitive digest.
-- `ci-plan` / `test` for #3915 (issue #3900) — different destination hashes from
-  #3913. After #3913 is the trusted base, #3915 needs a follow-up predecessor.
-
-Lint (`#3909`) and optional live-suite `changes`
-jobs (`#3919`) are not admitted here. They are not folded into this
-predecessor; if hosted Cross disagrees after a latest-`main` merge, they need
-their own exact pair rather than a wildcard. Coverage planning (`#3917`) used
-the workflow-directory table below because `coverage.yml` is not a protected
-workflow; that pair has since been retired.
+A future entry follows the same rules. Each digest is the SHA-256 of
+`extract_job_block` text over pin-normalized job text, the form the comparison
+loads. Both ends are exact, the binding includes the job name, the move is
+one-way, and only that job's `job:<name>:*` surfaces are withheld for that one
+pair. The candidate supplies no digest. Overlapping destinations that do not
+share a retired text are never chained into one pair, because that would invent
+a merged text that does not exist; each needs its own predecessor once the first
+destination is the trusted base. `fuzz-smoke` is not in this table; it uses
+`CI_FUZZ_SMOKE_JOB_GENERATIONS`. RETIREMENT IS MANDATORY: once each destination
+is on `main`, delete that tuple, because a spent tuple only widens what a pull
+request may claim.
 
 ##### Published x86_64 GNU producer contract (standing)
 
@@ -2705,34 +2680,29 @@ surface anywhere else in the same file, or any other revision pair of the
 named job, is scanned as before. RETIREMENT IS MANDATORY: once each
 destination is on `main`, delete that tuple.
 
-##### Admitted `setup-rust-ci` generation transitions (temporary)
+##### Admitted local-action generation transitions (temporary)
 
-`.github/actions/setup-rust-ci/action.yml` carries a two-step chain decided by
-this trusted policy (`LOCAL_ACTION_GENERATION_TRANSITIONS`), starting from PR
-#3889's landed file (SHA-256
-`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`):
+Once Cross-sensitive, a local composite action is compared by whole-file
+digest. `LOCAL_ACTION_GENERATION_TRANSITIONS` admits exact, path-bound, one-way
+retired→adopted pairs for those files; the candidate supplies no digest,
+allowlist, or fallback, and a dest-to-dest rewrite, a one-byte drift, or any
+other path is scanned as an ordinary Cross surface change.
 
-- Step 1 — the cache-budget generation: rust-cache `save-if` gated to a
-  trusted `refs/heads/main` run so pull requests and merge groups restore
-  without saving (see the cache-budget policy in the Ambient section):
-  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`
-- Step 2 — PR #3911 / issue #3906 rebased onto step 1, preserving every
-  cache-safety change plus #3911's optional `workspaces` input/pass-through:
-  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`
+The table is currently **empty**, and the self-test pins it that way. Its
+retired entries were all for `.github/actions/setup-rust-ci/action.yml`:
 
-Each pair is exact, path-bound, one-way, and fail-closed. The candidate
-supplies no digest, allowlist, or fallback. A dest-to-dest rewrite, a one-byte
-drift, or any other path is scanned as an ordinary Cross surface change. The
-former direct #3889→#3911 destination
-(`57a99a179ddc2935af187f518a803bf167eb9e33593c37b7b29f7151ec994da2`) is
-superseded by this chain. The current `setup-rust-ci/action.yml` has since
-moved past both destinations, so the chain is spent and its tuples should be
-retired.
+- the two-step chain from PR #3889's landed file
+  (`fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda`) to the
+  cache-budget generation
+  (`b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`) and then
+  to PR #3911's rebased destination
+  (`219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`). The
+  file has since moved past both destinations on `main`.
+- issue #6573's BoringCache-retirement pair, whose pin-normalized destination
+  (`e52e897637ce12e001ba7b3abb83d9c6d1e1edce20fcd1f3b78adbd633194b99`) is
+  main's live file.
 
-Issue #6573's pair, from the BoringCache generation back to the
-GitHub-cache-only file, is retired: its pin-normalized destination
-(`e52e897637ce12e001ba7b3abb83d9c6d1e1edce20fcd1f3b78adbd633194b99`) is main's
-live `setup-rust-ci/action.yml`.
+RETIREMENT IS MANDATORY: once each destination is on `main`, delete that tuple.
 
 #### 8. Linux CI Image
 
