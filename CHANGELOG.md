@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **Gateway-authored status codes follow the failure cause** (issues #6770,
+  #6771, #6773, #6775). A backend connect timeout answers `504` instead of
+  `502` (still a pre-wire connection failure for retry, circuit breaker and
+  `X-Gateway-Error`), including WebSocket upgrades and native-HTTP/3 backends
+  reached from any frontend; a DestinationRule `maxConnections` refusal on
+  direct HTTP/2, native HTTP/3, HBONE and sidecar mTLS answers `503` like every
+  other transport; a native gRPC internal gateway error is `INTERNAL` (13) on
+  every frontend and on native-HTTP/3 backends instead of `UNAVAILABLE` (14);
+  proxy and admin response-builder fallbacks answer `500` instead of
+  defaulting to `200`; and
+  `FERRUM_VIA_PSEUDONYM` must be an RFC 9110 token (optionally `:<port>`).
 - **Relayed client upload aborts are no longer charged to mesh, HBONE, and
   Unix-socket backends** (issue #6776). When a client abandoned its upload
   while the sidecar mesh-mTLS, HBONE, or Unix-socket dispatcher was still

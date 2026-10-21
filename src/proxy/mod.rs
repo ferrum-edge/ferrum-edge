@@ -268,6 +268,7 @@ use self::backend_capabilities::{
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER,
+    GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
 };
 use self::grpc_proxy::{GrpcConnectionPool, GrpcProxyError, GrpcResponseKind};
 use self::hbone_pool::{HboneConnectionPool, HbonePoolError};
@@ -15697,6 +15698,39 @@ fn build_websocket_error_response(
     body: &str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
+    build_websocket_error_response_with_gateway_error(
+        status,
+        body,
+        initial_response_header_policy_plugins,
+        None,
+    )
+}
+
+/// [`build_websocket_error_response`] for a failed backend dial/handshake:
+/// after the header policies run, stamps the authoritative `X-Gateway-Error`
+/// for the classified failure (`connection_failure` when nothing reached the
+/// backend, otherwise `backend_timeout` / `backend_error` by status), exactly
+/// as the HTTP dispatch paths do.
+fn build_websocket_backend_failure_response(
+    status: StatusCode,
+    body: &str,
+    connection_error: bool,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) -> Response<ProxyBody> {
+    build_websocket_error_response_with_gateway_error(
+        status,
+        body,
+        initial_response_header_policy_plugins,
+        Some(connection_error),
+    )
+}
+
+fn build_websocket_error_response_with_gateway_error(
+    status: StatusCode,
+    body: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    backend_failure_connection_error: Option<bool>,
+) -> Response<ProxyBody> {
     let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     // Strips WebSocket negotiation / hop-by-hop fields *and* any policy-authored
@@ -15705,6 +15739,13 @@ fn build_websocket_error_response(
         initial_response_header_policy_plugins,
         &mut response_headers,
     );
+    if let Some(connection_error) = backend_failure_connection_error {
+        insert_x_gateway_error_for_backend_failure(
+            &mut response_headers,
+            connection_error,
+            status.as_u16(),
+        );
+    }
     // A failed handshake is an ordinary HTTP response (RFC 6455 §4.2.2): it keeps
     // the negotiated HTTP version and an authoritative `Content-Length` derived
     // from the error body. Only the transport-owned negotiation fields above are
@@ -15720,6 +15761,25 @@ fn build_websocket_error_response(
     )
     .body(ProxyBody::from_string(body))
     .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
+}
+
+/// Client-visible status + body for a failed WebSocket backend dial/handshake.
+/// The status follows the shared HTTP-family mapper so a connect or handshake
+/// timeout is 504 like every other transport (#6770); the generic 502 keeps
+/// its WebSocket wording.
+pub(crate) fn websocket_backend_failure_status_and_body(
+    class: retry::ErrorClass,
+) -> (StatusCode, &'static str) {
+    match http_backend_failure_status_and_body(class) {
+        (502, _) => (
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Backend WebSocket connection failed"}"#,
+        ),
+        (status, body) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        ),
+    }
 }
 
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
@@ -16443,6 +16503,13 @@ async fn handle_websocket_request_authenticated(
                     e.as_ref(),
                 );
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // Client-visible status for this failure, shared by the wire
+                // response, request/status metrics, the transaction log, the
+                // circuit breaker and backend admission so they cannot diverge:
+                // a connect or handshake timeout is 504 (#6770), everything
+                // else keeps the 502.
+                let (ws_failure_status, ws_failure_body) =
+                    websocket_backend_failure_status_and_body(ws_error_class);
                 // A gateway-side egress-policy rejection (denied literal-IP
                 // backend) never reached a backend: it must be non-retryable AND
                 // neutral to backend health — no circuit-breaker trip and no
@@ -16482,7 +16549,7 @@ async fn handle_websocket_request_authenticated(
                 if should_retry_ws {
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
-                            response_status: 502,
+                            response_status: ws_failure_status.as_u16(),
                             connection_error: ws_is_pre_wire,
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
@@ -16495,10 +16562,10 @@ async fn handle_websocket_request_authenticated(
                     let retry_config = match proxy.retry.as_ref() {
                         Some(rc) => rc,
                         None => {
-                            let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
-                            return Ok(build_websocket_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                ws_body,
+                            return Ok(build_websocket_backend_failure_response(
+                                ws_failure_status,
+                                ws_failure_body,
+                                ws_is_pre_wire && !ws_egress_denied,
                                 &initial_response_header_policy_plugins,
                             ));
                         }
@@ -16521,7 +16588,11 @@ async fn handle_websocket_request_authenticated(
                             current_cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
+                        cb.record_failure(
+                            ws_failure_status.as_u16(),
+                            ws_is_pre_wire,
+                            cb_probe.take_slot(),
+                        );
                         cb_failure_already_recorded = true;
                     }
 
@@ -16713,7 +16784,11 @@ async fn handle_websocket_request_authenticated(
                         // skipping the record entirely.
                         cb.record_neutral(cb_probe.take_slot());
                     } else {
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
+                        cb.record_failure(
+                            ws_failure_status.as_u16(),
+                            ws_is_pre_wire,
+                            cb_probe.take_slot(),
+                        );
                     }
                 }
                 if !backend_outcome_already_recorded
@@ -16721,14 +16796,14 @@ async fn handle_websocket_request_authenticated(
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: 502,
+                        response_status: ws_failure_status.as_u16(),
                         connection_error: ws_is_pre_wire,
                         error_class: Some(ws_error_class),
                         backend_elapsed: backend_admission_start.elapsed(),
                     });
                 }
                 state.request_count.fetch_add(1, Ordering::Relaxed);
-                record_status(&state, 502);
+                record_status(&state, ws_failure_status.as_u16());
 
                 // Log with error_class for WebSocket backend failures.
                 // Dispatch to the full plugin chain — the default `.log()` impl
@@ -16765,7 +16840,7 @@ async fn handle_websocket_request_authenticated(
                             backend_target: Some(
                                 strip_query_params(&current_backend_url).to_string(),
                             ),
-                            response_status_code: 502,
+                            response_status_code: ws_failure_status.as_u16(),
                             latency_total_ms: ws_total_ms,
                             latency_gateway_processing_ms: ws_total_ms,
                             latency_backend_ttfb_ms: -1.0,
@@ -16790,10 +16865,10 @@ async fn handle_websocket_request_authenticated(
                         .record_http_error(Some(&proxy.id), ws_error_class);
                 }
 
-                let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
-                return Ok(build_websocket_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    ws_body,
+                return Ok(build_websocket_backend_failure_response(
+                    ws_failure_status,
+                    ws_failure_body,
+                    ws_is_pre_wire && !ws_egress_denied,
                     &initial_response_header_policy_plugins,
                 ));
             }
@@ -41327,7 +41402,11 @@ async fn handle_proxy_request_inner(
                     GrpcProxyError::ResponseBufferCapacity(_) => {
                         response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS
                     }
-                    GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE,
+                    // A gateway-side construction failure (backend TLS config,
+                    // invalid backend URL/authority), not a transient backend
+                    // outage: INTERNAL, as on the HTTP/3 builders (#6773), so
+                    // callers do not retry it as UNAVAILABLE.
+                    GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::INTERNAL,
                     // Answered by its own arm above; listed for exhaustiveness.
                     GrpcProxyError::AuthorizationExpired { .. } => {
                         grpc_proxy::grpc_status::UNAUTHENTICATED
@@ -41337,6 +41416,7 @@ async fn handle_proxy_request_inner(
                 // internal backend details (hostnames, DNS errors, etc.).
                 let msg = match &e {
                     GrpcProxyError::ClientDeadlineExceeded(_) => GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
+                    GrpcProxyError::Internal(_) => GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
                     // Fixed, redaction-safe, and deliberately distinguishable
                     // from the backend's own "payload too large" refusal.
                     GrpcProxyError::ResponseBufferCapacity(_) => {
@@ -44318,8 +44398,15 @@ async fn handle_proxy_request_inner(
 
     // Advertise HTTP/3 availability via pre-computed Alt-Svc header, for the
     // frontend port this request actually arrived on.
-    if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
-        resp_builder = resp_builder.header("alt-svc", alt_svc.as_ref());
+    // Typed conversion (same cost as the builder's own `&str` conversion) so an
+    // unrepresentable value is skipped here instead of poisoning the builder:
+    // every input to this builder is a typed, already-valid header, which keeps
+    // the 500 fallback below unreachable and the summary already logged above
+    // truthful (#6775).
+    if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port)
+        && let Ok(value) = http::HeaderValue::from_str(alt_svc.as_ref())
+    {
+        resp_builder = resp_builder.header(http::header::ALT_SVC, value);
     }
 
     // During shutdown drain or overload pressure, tell HTTP/1.1 clients to
@@ -44364,9 +44451,13 @@ async fn handle_proxy_request_inner(
     // Via header on response path (RFC 9110 §7.6.3): describe the protocol
     // used by the upstream sender of this message, not the client-facing
     // inbound protocol.
+    // `FERRUM_VIA_PSEUDONYM` is validated at startup; the typed conversion
+    // keeps a hand-built configuration from poisoning the builder (#6775).
     let resp_via = via_header_for_backend_response_body(&state, &response_body);
-    if let Some(via) = resp_via {
-        resp_builder = resp_builder.header("via", via.as_str());
+    if let Some(via) = resp_via
+        && let Ok(value) = http::HeaderValue::from_str(via.as_str())
+    {
+        resp_builder = resp_builder.header(http::header::VIA, value);
     }
 
     // Seal the streaming trailer boundary captured before the
@@ -45186,16 +45277,26 @@ async fn handle_proxy_request_inner(
             Ok(resp)
         }
         Err(_) => {
+            // Defense in depth: every input to `resp_builder` is a typed,
+            // already-valid header, so this arm is not reachable today. Should a
+            // future input make it fail, the prepared response never reaches the
+            // wire, so a deferred (streaming) logger records the 500 the client
+            // actually receives rather than the status captured at header commit
+            // (#6775). A buffered summary was already delivered above with the
+            // prepared status, and `record_request` counted it.
             if let Some(logger) = logger {
-                logger.fire(crate::proxy::deferred_log::BodyOutcome::error(
-                    crate::retry::ErrorClass::RequestError,
-                    0,
-                    false,
-                ));
+                logger.fire_with_response_status(
+                    crate::proxy::deferred_log::BodyOutcome::error(
+                        crate::retry::ErrorClass::RequestError,
+                        0,
+                        false,
+                    ),
+                    StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                );
             }
-            Ok(Response::new(ProxyBody::from_string(
-                "Internal Server Error",
-            )))
+            Ok(internal_error_fallback_response(
+                r#"{"error":"Internal server error"}"#,
+            ))
         }
     }
 }
@@ -46707,7 +46808,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 return retry::BackendResponse {
                     status_code: 503,
                     body: ResponseBody::buffered(
-                        r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                        BACKEND_CONNECTION_LIMIT_ERROR_BODY.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
                     connection_error: false,
@@ -47821,24 +47922,44 @@ fn buffered_backend_response_from_eager_collect(
 /// Client-visible HTTP status + redacted JSON body for a classified
 /// HTTP-family backend dispatch failure (#3922).
 ///
-/// Post-wire `ReadWriteTimeout` (`backend_read_timeout_ms` /
-/// `backend_write_timeout_ms` expiry after the request reached the backend)
-/// is 504 with a timeout-specific body. Genuine connect/refused/unavailable
-/// failures stay 502 with the generic unavailable body. Path-specific
-/// overlays (DNS wording, H3 "request failed") may replace the 502 body;
-/// they must not override the 504 timeout pair.
+/// * `ReadWriteTimeout` (`backend_read_timeout_ms` / `backend_write_timeout_ms`
+///   expiry after the request reached the backend) and `ConnectionTimeout`
+///   (`backend_connect_timeout_ms` expiry while establishing the backend
+///   connection) are both 504 with the timeout body (#6770): the upstream did
+///   not answer in time (RFC 9110 §15.6.5). Only the status changes for a
+///   connect timeout — it stays a pre-wire `connection_error`, so
+///   `retry_on_connect_failure`, target rotation, circuit-breaker and
+///   `X-Gateway-Error: connection_failure` keep their connect-class meaning.
+/// * `BackendConnectionLimit` is 503 (#6771): the gateway refused locally at
+///   the destination's DestinationRule `maxConnections` ceiling before dialing,
+///   so no upstream response was invalid. It matches the reqwest, Unix-socket
+///   and raw-TCP over-cap answers and stays pre-wire and health-neutral.
+/// * Genuine connect-refused / DNS / TLS / pool / protocol failures stay 502
+///   with the generic unavailable body.
+///
+/// Path-specific overlays (DNS wording, H3 "request failed") may replace the
+/// 502 body; they must not override the 503/504 pairs.
 ///
 /// gRPC keeps its protocol-appropriate Trailers-Only / `DEADLINE_EXCEEDED`
 /// shape and does not use this mapper.
 pub(crate) fn http_backend_failure_status_and_body(
     class: retry::ErrorClass,
 ) -> (u16, &'static str) {
-    if class == retry::ErrorClass::ReadWriteTimeout {
-        (504, r#"{"error":"Backend timeout"}"#)
-    } else {
-        (502, r#"{"error":"Backend unavailable"}"#)
+    match class {
+        retry::ErrorClass::ReadWriteTimeout | retry::ErrorClass::ConnectionTimeout => {
+            (504, r#"{"error":"Backend timeout"}"#)
+        }
+        retry::ErrorClass::BackendConnectionLimit => (503, BACKEND_CONNECTION_LIMIT_ERROR_BODY),
+        _ => (502, r#"{"error":"Backend unavailable"}"#),
     }
 }
+
+/// Fixed client-visible body for a dispatch the gateway refused because the
+/// destination is at its DestinationRule `maxConnections` ceiling. Shared by
+/// the reqwest admission refusal and [`http_backend_failure_status_and_body`]
+/// so every HTTP-family transport answers the same 503 pair.
+pub(crate) const BACKEND_CONNECTION_LIMIT_ERROR_BODY: &str =
+    r#"{"error":"Backend connection limit exceeded"}"#;
 
 /// Fixed client-visible body for a reqwest connection-pool client that could
 /// not be built (backend TLS material unreadable or invalid, egress refusal,
@@ -50978,7 +51099,7 @@ async fn proxy_to_backend(
                     retry::BackendResponse {
                         status_code: 503,
                         body: ResponseBody::buffered(
-                            r#"{"error":"Backend connection limit exceeded"}"#.as_bytes().to_vec(),
+                            BACKEND_CONNECTION_LIMIT_ERROR_BODY.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
                         connection_error: false,
@@ -53758,6 +53879,26 @@ fn check_protocol_headers_with_wire_framing(
     None
 }
 
+/// Last-resort answer when `http::response::Builder` rejects an otherwise
+/// prepared response (an invalid header value reached it). `Response::new`
+/// defaults to `200 OK`, so a bare fallback would present an internal failure
+/// as success to the client, caches and status-keyed metrics (#6775). The
+/// body is a fixed literal: nothing from the failed response is propagated.
+pub(crate) fn internal_error_fallback_response(body: &'static str) -> Response<ProxyBody> {
+    let content_type = if body.starts_with('{') {
+        "application/json"
+    } else {
+        "text/plain"
+    };
+    let mut response = Response::new(ProxyBody::from_string(body));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers_mut().insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static(content_type),
+    );
+    response
+}
+
 fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
     // Response::builder with a valid status and static header name cannot fail
     Response::builder()
@@ -53765,9 +53906,7 @@ fn build_response(status: StatusCode, body: &str) -> Response<ProxyBody> {
         .header("Content-Type", "application/json")
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
-            Response::new(ProxyBody::from_string(
-                r#"{"error":"Internal server error"}"#,
-            ))
+            internal_error_fallback_response(r#"{"error":"Internal server error"}"#)
         })
 }
 
@@ -53782,9 +53921,7 @@ fn build_response_with_gateway_error(
         .header("X-Gateway-Error", error)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
-            Response::new(ProxyBody::from_string(
-                r#"{"error":"Internal server error"}"#,
-            ))
+            internal_error_fallback_response(r#"{"error":"Internal server error"}"#)
         })
 }
 
@@ -53799,9 +53936,7 @@ fn build_method_not_allowed_response_with_allow(body: &str, allow: &str) -> Resp
         .header("Allow", allow)
         .body(ProxyBody::from_string(body))
         .unwrap_or_else(|_| {
-            Response::new(ProxyBody::from_string(
-                r#"{"error":"Internal server error"}"#,
-            ))
+            internal_error_fallback_response(r#"{"error":"Internal server error"}"#)
         })
 }
 
@@ -53999,7 +54134,7 @@ fn build_plain_text_response(status: StatusCode, body: &str) -> Response<ProxyBo
         .header("Content-Type", "text/plain")
         .header("Cache-Control", "no-store")
         .body(ProxyBody::from_string(body))
-        .unwrap_or_else(|_| Response::new(ProxyBody::from_string("Internal server error")))
+        .unwrap_or_else(|_| internal_error_fallback_response("Internal server error"))
 }
 
 /// Client-visible dispatch failure for a mesh transport pool.
@@ -54031,14 +54166,19 @@ fn mesh_transport_pool_error_response(
     if error_class == retry::ErrorClass::PortExhaustion {
         state.overload.record_port_exhaustion();
     }
-    let error_body = if error_class == retry::ErrorClass::DnsLookupError {
-        transport.dns_failure_body().to_string()
-    } else {
-        transport.unavailable_body_for_error(err)
+    // A connect timeout (504) or a local `maxConnections` refusal (503) takes
+    // the shared HTTP-family status and body (#6770 / #6771); every other pool
+    // failure keeps the transport-specific 502 wording.
+    let (status_code, error_body) = match http_backend_failure_status_and_body(error_class) {
+        (502, _) if error_class == retry::ErrorClass::DnsLookupError => {
+            (502, transport.dns_failure_body().to_string())
+        }
+        (502, _) => (502, transport.unavailable_body_for_error(err)),
+        (status_code, body) => (status_code, body.to_string()),
     };
     transport.log_pool_error(&proxy.id, err);
     retry::BackendResponse {
-        status_code: 502,
+        status_code,
         body: ResponseBody::buffered(error_body.into_bytes()),
         headers: HashMap::new(),
         connection_error: !retry::request_reached_wire(error_class),
@@ -54853,17 +54993,29 @@ fn mesh_mtls_request_body_too_large_response(
     }
 }
 
+/// Trailers-Only gRPC terminal for a pre-response sidecar mesh-mTLS transport
+/// failure. A connect timeout (pool dial or sender-readiness connect budget)
+/// is a backend deadline, so it answers `DEADLINE_EXCEEDED` with the shared
+/// "Backend deadline exceeded" wording, exactly like the direct gRPC pool's
+/// `BackendTimeout` and native-HTTP/3 gRPC (#6770 review); every other
+/// failure is `UNAVAILABLE` with the caller's message. Class, pre-wire
+/// `connection_error` and connect-retry eligibility are unchanged.
 fn mesh_grpc_unavailable_response(
     resolved_ip: Option<String>,
     message: &str,
     error_class: retry::ErrorClass,
 ) -> retry::BackendResponse {
+    let (grpc_status, message) = if error_class == retry::ErrorClass::ConnectionTimeout {
+        (
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            "Backend deadline exceeded",
+        )
+    } else {
+        (grpc_proxy::grpc_status::UNAVAILABLE, message)
+    };
     let mut headers = HashMap::with_capacity(3);
     headers.insert("content-type".to_string(), "application/grpc".to_string());
-    headers.insert(
-        "grpc-status".to_string(),
-        grpc_proxy::grpc_status::UNAVAILABLE.to_string(),
-    );
+    headers.insert("grpc-status".to_string(), grpc_status.to_string());
     headers.insert("grpc-message".to_string(), message.to_string());
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
@@ -63057,20 +63209,12 @@ async fn proxy_to_backend_http3(
                                 "HTTP/3 backend streaming request failed"
                             );
                             (
-                                retry::BackendResponse {
-                                    status_code: 502,
-                                    body: ResponseBody::buffered(
-                                        r#"{"error":"HTTP/3 backend request failed"}"#
-                                            .as_bytes()
-                                            .to_vec(),
-                                    ),
-                                    headers: HashMap::new(),
-                                    connection_error: is_conn_error,
-                                    backend_resolved_ip: resolved_ip,
-                                    error_class: Some(error_class),
-                                    request_on_wire: e.request_on_wire(),
-                                    buffered_trailers: None,
-                                },
+                                h3_pool_failure_backend_response(
+                                    error_class,
+                                    is_conn_error,
+                                    e.request_on_wire(),
+                                    resolved_ip,
+                                ),
                                 None,
                             )
                         }
@@ -63420,18 +63564,12 @@ async fn proxy_to_backend_http3(
                     "HTTP/3 backend streaming request failed"
                 );
                 (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: is_conn_error,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(error_class),
-                        request_on_wire: e.request_on_wire(),
-                        buffered_trailers: None,
-                    },
+                    h3_pool_failure_backend_response(
+                        error_class,
+                        is_conn_error,
+                        e.request_on_wire(),
+                        resolved_ip,
+                    ),
                     retained_body,
                 )
             }
@@ -63589,18 +63727,12 @@ async fn proxy_to_backend_http3(
                     "HTTP/3 backend request failed"
                 );
                 (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: is_conn_error,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(error_class),
-                        request_on_wire: e.request_on_wire(),
-                        buffered_trailers: None,
-                    },
+                    h3_pool_failure_backend_response(
+                        error_class,
+                        is_conn_error,
+                        e.request_on_wire(),
+                        resolved_ip,
+                    ),
                     retained_body,
                 )
             }
@@ -63777,18 +63909,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 error = %e,
                 "HTTP/3 backend buffered response read failed"
             );
-            retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::buffered(
-                    r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(error_class),
-                request_on_wire: true,
-                buffered_trailers: None,
-            }
+            h3_pool_failure_backend_response(error_class, false, true, resolved_ip)
         }
         Err(crate::http3::client::H3BodyDrainError::Truncated { received, declared }) => {
             // The backend FIN'd before delivering its declared Content-Length —
@@ -64006,6 +64127,33 @@ pub(crate) fn declared_response_length_exceeds_limit(
 /// reached the backend's application layer (post-wire), so
 /// `retry_on_connect_failure` must not replay it; retries are governed by
 /// `retry_on_methods` / `retryable_status_codes`.
+/// Client-visible response for a failed H1/H2-frontend → native-HTTP/3
+/// backend dispatch. The status follows the shared HTTP-family mapper (504 for
+/// a timeout, 503 for a local `maxConnections` refusal, #6770 / #6771); the
+/// generic 502 keeps its HTTP/3-specific wording. `connection_error` and
+/// `request_on_wire` come from the pool's typed signals, never the status.
+pub(crate) fn h3_pool_failure_backend_response(
+    error_class: retry::ErrorClass,
+    connection_error: bool,
+    request_on_wire: bool,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let (status_code, body) = match http_backend_failure_status_and_body(error_class) {
+        (502, _) => (502, r#"{"error":"HTTP/3 backend request failed"}"#),
+        mapped => mapped,
+    };
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(body.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+        request_on_wire,
+        buffered_trailers: None,
+    }
+}
+
 fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
 }
@@ -64256,18 +64404,12 @@ async fn proxy_to_backend_http3_retry(
                     error = %e,
                     "HTTP/3 backend streaming retry request failed"
                 );
-                retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::buffered(
-                        r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: is_conn_error,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(error_class),
-                    request_on_wire: e.request_on_wire(),
-                    buffered_trailers: None,
-                }
+                h3_pool_failure_backend_response(
+                    error_class,
+                    is_conn_error,
+                    e.request_on_wire(),
+                    resolved_ip,
+                )
             }
         };
     }
@@ -64419,18 +64561,12 @@ async fn proxy_to_backend_http3_retry(
                 error = %e,
                 "HTTP/3 backend retry request failed"
             );
-            retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::buffered(
-                    r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: is_conn_error,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(error_class),
-                request_on_wire: e.request_on_wire(),
-                buffered_trailers: None,
-            }
+            h3_pool_failure_backend_response(
+                error_class,
+                is_conn_error,
+                e.request_on_wire(),
+                resolved_ip,
+            )
         }
     }
 }
