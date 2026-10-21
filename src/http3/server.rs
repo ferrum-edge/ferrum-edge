@@ -3251,6 +3251,27 @@ async fn handle_h3_request(
     {
         session.record_fenced();
         record_h3_flavor_aware_reject(&state, http_flavor, 401);
+        if grpc_web_response_content_type.is_none() && !matches!(http_flavor, HttpFlavor::Grpc) {
+            // An HTTP `401` names the credential that lost trust (RFC 9110
+            // §15.5.2, issue #6774); the gRPC flavors keep `UNAUTHENTICATED`.
+            let headers = HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "WWW-Authenticate".to_string(),
+                    crate::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE
+                        .to_string(),
+                ),
+            ]);
+            send_h3_finalized_reject_response(
+                &mut stream,
+                http::StatusCode::UNAUTHORIZED,
+                Bytes::from_static(br#"{"error":"Client certificate trust withdrawn"}"#),
+                &headers,
+                RejectBodyDisposition::for_request(req.method().as_str(), 401),
+            )
+            .await?;
+            return Ok(());
+        }
         send_h3_error_flavor_aware(
             &mut stream,
             http_flavor,
@@ -11207,6 +11228,15 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        // Every replacement and policy stage has run: a gateway-replaced `401`
+        // gets its challenge before committed observers and the wire (#6774).
+        crate::proxy::ensure_replaced_response_challenge(
+            &plugins,
+            &ctx,
+            response_status,
+            &mut response_headers,
+        );
+
         if capabilities.has(crate::plugin_cache::PluginCapabilities::HAS_RESPONSE_COMMITTED_HOOK) {
             let phase_start = std::time::Instant::now();
             if crate::proxy::run_deadline_bounded_response_committed_hooks(
@@ -12378,6 +12408,30 @@ fn h3_backend_failure_headers(connection_error: bool, status: u16) -> HashMap<St
         connection_error,
         status,
     );
+    if status == StatusCode::UNAUTHORIZED.as_u16() {
+        // The authorization-expiry arm of `h3_backend_failure_status_body`: a
+        // gateway `401` always carries a challenge (issue #6774). Callers
+        // holding the request context refine it to the committing mechanism's
+        // scheme through `h3_backend_failure_headers_for_request`.
+        headers.insert(
+            "WWW-Authenticate".to_string(),
+            crate::plugins::utils::auth_flow::GENERIC_AUTHENTICATION_CHALLENGE.to_string(),
+        );
+    }
+    headers
+}
+
+/// [`h3_backend_failure_headers`] whose authorization-expiry `401` names the
+/// committing mechanism's scheme (issue #6774).
+fn h3_backend_failure_headers_for_request(
+    ctx: &RequestContext,
+    connection_error: bool,
+    status: u16,
+) -> HashMap<String, String> {
+    let mut headers = h3_backend_failure_headers(connection_error, status);
+    if status == StatusCode::UNAUTHORIZED.as_u16() {
+        crate::proxy::insert_reauthentication_challenge(&mut headers, ctx);
+    }
     headers
 }
 
@@ -12737,7 +12791,11 @@ async fn proxy_to_backend_h3_refined_response(
                 return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
                     status: reject_status.as_u16(),
                     body: Bytes::from_static(reject_body.as_bytes()),
-                    headers: h3_backend_failure_headers(!request_on_wire, reject_status.as_u16()),
+                    headers: h3_backend_failure_headers_for_request(
+                        ctx,
+                        !request_on_wire,
+                        reject_status.as_u16(),
+                    ),
                     trailers: None,
                     error_class: Some(h3_error_class),
                     request_on_wire,
@@ -12871,7 +12929,7 @@ async fn proxy_to_backend_h3_refined_response(
             H3BufferedDispatchResult {
                 status: status.as_u16(),
                 body: Bytes::from_static(body.as_bytes()),
-                headers: h3_backend_failure_headers(false, status.as_u16()),
+                headers: h3_backend_failure_headers_for_request(ctx, false, status.as_u16()),
                 trailers: None,
                 error_class: Some(classify_h3_error(&error)),
                 request_on_wire: error.request_on_wire(),
@@ -18743,6 +18801,11 @@ async fn send_h3_backend_failure_response(
         connection_error,
         status.as_u16(),
     );
+    if status == StatusCode::UNAUTHORIZED {
+        // Authorization-expiry terminal: a gateway `401` always carries the
+        // committing mechanism's challenge (issue #6774).
+        crate::proxy::insert_reauthentication_challenge(&mut headers, ctx);
+    }
     let write = send_h3_finalized_reject_response(
         stream,
         status,

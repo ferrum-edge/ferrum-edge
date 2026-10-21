@@ -44,6 +44,27 @@ client-certificate trust, a sibling's authorization-lifetime close, shutdown
 teardown after the drain wait) as `444` with a `gateway_close_*` rejection
 phase.
 
+### Every gateway `401` carries an applicable `WWW-Authenticate` challenge (#6774)
+
+Authentication `401`s now always carry a challenge for the mechanism that
+applies (see "Authentication Challenges" in `docs/plugins.md`). `key_auth`
+advertises `ApiKey realm="ferrum-edge"`, `jwt_auth` and `jwks_auth` answer
+`Bearer` (with RFC 6750 `error` codes on rejected tokens) or `DPoP`,
+`hmac_auth` answers `hmac realm="ferrum-edge"`, `mtls_auth` answers
+`ClientCertificate realm="ferrum-edge"`, and `soap_ws_security` answers
+`WS-Security realm="ferrum-edge"`. A route that previously answered a
+`key_auth`-only missing credential with `WWW-Authenticate: ferrum-edge` now
+answers `ApiKey realm="ferrum-edge"`, and a chain of several mechanisms lists
+every applicable challenge instead of only the first. Any other plugin `401`
+without a valid challenge gets the route's challenges, or `ferrum-edge`, and a
+`security_headers`/`response_transformer` rule can no longer remove the field
+from a gateway `401` (it may still replace it). Authorization-expiry and
+client-trust-withdrawal `401`s and admin JWT `401`s now carry a challenge.
+Clients
+or tests that match the exact `WWW-Authenticate` value must be updated; status
+codes and response bodies are unchanged. Custom authentication plugins should
+implement `Plugin::authentication_challenge`.
+
 ### Gateway-authored status codes follow the failure cause (issues #6770, #6771, #6773, #6775)
 
 - A backend **connect timeout** now answers `504` instead of `502` on the

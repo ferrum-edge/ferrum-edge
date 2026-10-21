@@ -7103,6 +7103,15 @@ pub(crate) async fn run_plain_buffered_response_plugin_pipeline(
         }
     }
 
+    // Every replacement and policy stage has run: a gateway-replaced `401`
+    // gets its challenge before committed observers and the wire (#6774).
+    crate::proxy::ensure_replaced_response_challenge(
+        plugins,
+        ctx,
+        *response_status,
+        response_headers,
+    );
+
     if !response_committed_plugins.is_empty() {
         crate::proxy::run_deadline_bounded_response_committed_hooks(
             response_committed_plugins,
@@ -12560,7 +12569,9 @@ async fn write_plain_authorization_expired_terminal<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
-    let headers = HashMap::new();
+    // RFC 9110 §15.5.2 (issue #6774): the committing mechanism's scheme.
+    let mut headers = HashMap::with_capacity(1);
+    crate::proxy::insert_reauthentication_challenge(&mut headers, ctx);
     let write = write_plain_gateway_reject_with_recv_halt(
         stream,
         ctx,

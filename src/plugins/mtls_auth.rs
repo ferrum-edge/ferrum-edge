@@ -1098,6 +1098,10 @@ impl AuthMechanism for MtlsAuth {
         "mtls_auth"
     }
 
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         // Defense in depth for issue #3857. Every production path already fences
         // a retired transport strictly earlier — H1/H2 in

@@ -229,7 +229,7 @@ async fn websocket_upgrade_without_api_key_rejects_before_backend() {
     assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
@@ -257,7 +257,12 @@ async fn websocket_upgrade_with_invalid_api_key_preserves_plugin_reject() {
     let (status_code, body, headers) = result.expect("invalid key should reject");
     assert_eq!(status_code, 401);
     assert_eq!(&body[..], br#"{"error":"Invalid API key"}"#);
-    assert!(headers.is_empty());
+    // Issue #6774: the only header is the applicable `key_auth` challenge.
+    assert_eq!(headers.len(), 1, "{headers:?}");
+    assert_eq!(
+        headers.get("WWW-Authenticate").map(String::as_str),
+        Some(r#"ApiKey realm="ferrum-edge""#)
+    );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
     assert!(ctx.auth_method.is_none());

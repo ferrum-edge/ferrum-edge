@@ -1782,3 +1782,56 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+// --- `WWW-Authenticate` on every HTTP 401 (issue #6774) ---
+
+/// A client certificate travels in the TLS handshake, so `mtls_auth` advertises
+/// the informational `ClientCertificate` scheme on every HTTP 401.
+#[tokio::test]
+async fn test_mtls_auth_every_401_carries_the_client_certificate_challenge() {
+    use super::plugin_utils::{
+        assert_phase_unauthorized_with_challenge, assert_unauthorized_with_challenge,
+    };
+    use ferrum_edge::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE;
+
+    let consumer = create_mtls_consumer("c1", "alice", "client.example.com");
+    let index = ConsumerIndex::new(&[consumer]);
+    let plugin = MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap();
+
+    // Missing certificate: the plugin defers and the phase answers.
+    let auth_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(
+        MtlsAuth::new(&json!({"cert_field": "subject_cn"})).unwrap(),
+    )];
+    for mode in [
+        ferrum_edge::config::types::AuthMode::Single,
+        ferrum_edge::config::types::AuthMode::Multi,
+    ] {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/test".to_string(),
+        );
+        assert_phase_unauthorized_with_challenge(
+            ferrum_edge::proxy::run_authentication_phase(mode, &auth_plugins, &mut ctx, &index)
+                .await,
+            CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
+        );
+    }
+
+    // Malformed certificate bytes, and a well-formed certificate naming no
+    // consumer.
+    for cert_der in [
+        vec![0, 1, 2, 3],
+        create_test_cert("unknown-client.example.com", None, None),
+    ] {
+        let mut ctx = create_ctx_with_cert(cert_der);
+        assert_unauthorized_with_challenge(
+            plugin.authenticate(&mut ctx, &index).await,
+            CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
+        );
+    }
+
+    let mut valid = create_ctx_with_cert(create_test_cert("client.example.com", None, None));
+    assert_continue(plugin.authenticate(&mut valid, &index).await);
+    assert!(valid.identified_consumer.is_some());
+}

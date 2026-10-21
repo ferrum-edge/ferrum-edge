@@ -40,6 +40,7 @@ mod unit {
         mod ambient_cloud_credentials_tests;
         mod api_chargeback_sink_tests;
         mod api_chargeback_tests;
+        mod auth_challenge_tests;
         mod auth_flow_credential_deadline_tests;
         mod authenticated_identity_bounds_tests;
         mod basic_auth_tests;
