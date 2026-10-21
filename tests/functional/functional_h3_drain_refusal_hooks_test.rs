@@ -1923,3 +1923,168 @@ async fn h3_native_grpc_client_abort_after_headers_logs_cancelled() {
     assert_eq!(entry["client_disconnected"], true, "{entry}");
     assert_transaction_count(&harness, GRPC_PATH, 1).await;
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Cancellation after a clean upload FIN (issue #6772)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Wait until the native-H3 backend has a request to `path` with request DATA.
+async fn wait_for_h3_backend_request(
+    harness: &GatewayHarness,
+    backend: &ScriptedH3Backend,
+    path: &str,
+) {
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    loop {
+        if backend
+            .received_requests()
+            .await
+            .iter()
+            .any(|request| request.path.starts_with(path) && !request.body.is_empty())
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the H3 backend must receive the request before the client cancels it; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Native HTTP/3: the upload ends with a clean FIN, the backend withholds its
+/// head, and the client then sends STOP_SENDING. The dispatch observes the
+/// cancel itself: one `499` / `client_disconnect` record, never a backend
+/// timeout charged to the backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_native_clean_fin_then_stop_sending_is_a_client_abort() {
+    let (backend_port, h3_backend) = spawn_native_h3_backend(
+        "h3-native-fin-then-cancel",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::ReadRequestData,
+            H3Step::StallFor(Duration::from_secs(30)),
+        ],
+    )
+    .await;
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(base_proxy("https", backend_port), Vec::new()),
+        &[],
+    )
+    .await;
+    wait_for_h3_supported(&harness).await;
+
+    let mut upload = open_upload_stream(
+        &proxy_url(https_port, UPLOAD_PATH),
+        "application/octet-stream",
+    )
+    .await;
+    upload
+        .send_raw_data(Bytes::from_static(b"complete upload"))
+        .await
+        .expect("send upload");
+    upload.finish().await.expect("clean FIN");
+    wait_for_h3_backend_request(&harness, &h3_backend, UPLOAD_PATH).await;
+    upload.cancel_response_download();
+
+    assert_client_abort_entry(&wait_for_status(&harness, UPLOAD_PATH, 499).await);
+    assert_transaction_count(&harness, UPLOAD_PATH, 1).await;
+}
+
+/// Native HTTP/3 gRPC: the same clean-FIN-then-cancel shape on the header
+/// wait. The pump already finished, so only the response-direction watcher
+/// can see it: one `CANCELLED` record with `client_disconnected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn h3_native_grpc_clean_fin_then_stop_sending_is_cancelled() {
+    let (backend_port, h3_backend) = spawn_native_h3_backend(
+        "h3-native-grpc-fin-then-cancel",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::ReadRequestData,
+            H3Step::StallFor(Duration::from_secs(30)),
+        ],
+    )
+    .await;
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(base_proxy("https", backend_port), Vec::new()),
+        &[],
+    )
+    .await;
+    wait_for_h3_supported(&harness).await;
+
+    let mut rpc = open_grpc_rpc(&proxy_url(https_port, GRPC_PATH)).await;
+    rpc.send_message(b"complete")
+        .await
+        .expect("request message");
+    rpc.finish().await.expect("clean FIN");
+    wait_for_h3_backend_request(&harness, &h3_backend, GRPC_PATH).await;
+    rpc.cancel_response_download();
+
+    let entry = wait_for_transaction(&harness, GRPC_PATH, "a CANCELLED RPC", |entry| {
+        entry
+            .pointer("/metadata/grpc_status")
+            .and_then(Value::as_str)
+            == Some("1")
+    })
+    .await;
+    assert_eq!(entry["client_disconnected"], true, "{entry}");
+    assert_eq!(entry["error_class"], "client_disconnect", "{entry}");
+    assert_transaction_count(&harness, GRPC_PATH, 1).await;
+}
+
+/// The streaming HTTP/3-to-gRPC bridge: a complete upload, then STOP_SENDING
+/// while the backend withholds its head. The bridge sees the cancel itself:
+/// one `CANCELLED` record with `client_disconnected`, never a backend failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_streaming_grpc_bridge_clean_fin_then_stop_sending_is_cancelled() {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let backend_port = listener.local_addr().expect("backend addr").port();
+    let ca = TestCa::new("h3-fin-then-cancel-grpc-be").expect("ca");
+    let (cert, key) = ca.valid().expect("backend leaf");
+    let backend = ScriptedGrpcBackend::builder_tls(listener, &cert, &key)
+        .expect("backend tls")
+        .step(GrpcStep::AcceptStreamingRpc(MatchRpc::any()))
+        .step(GrpcStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn grpc backend");
+    let (harness, https_port) = spawn_h3_gateway(
+        gateway_yaml(base_proxy("https", backend_port), Vec::new()),
+        &[],
+    )
+    .await;
+    let streams_before = backend.received_stream_count();
+
+    let mut rpc = open_grpc_rpc(&proxy_url(https_port, GRPC_PATH)).await;
+    rpc.send_message(b"complete")
+        .await
+        .expect("request message");
+    rpc.finish().await.expect("clean FIN");
+    let deadline = Instant::now() + UPLOAD_OBSERVATION_WINDOW;
+    while backend.received_stream_count() == streams_before {
+        assert!(
+            Instant::now() < deadline,
+            "the gRPC backend must receive the RPC before the client cancels it; logs:\n{}",
+            harness.captured_combined().unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    rpc.cancel_response_download();
+
+    let entry = wait_for_transaction(&harness, GRPC_PATH, "a CANCELLED RPC", |entry| {
+        entry
+            .pointer("/metadata/grpc_status")
+            .and_then(Value::as_str)
+            == Some("1")
+    })
+    .await;
+    assert_eq!(entry["client_disconnected"], true, "{entry}");
+    assert_eq!(entry["error_class"], "client_disconnect", "{entry}");
+    assert_transaction_count(&harness, GRPC_PATH, 1).await;
+}

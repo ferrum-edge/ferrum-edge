@@ -545,7 +545,7 @@ struct PlainPeerGoneBeforeResponseHeadersCtx<'a> {
 /// #6772), from positive evidence only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlainPeerGone {
-    /// The client reset its upload, sent `STOP_SENDING`, or closed or lost its
+    /// The client reset its upload, sent `STOP_SENDING`, or closed its
     /// connection.
     ClientAbort(ProvenClientAbort),
     /// The upload reader failed on an HTTP/3 framing violation.
@@ -572,11 +572,13 @@ fn plain_reader_failure_code(error: &h3::error::StreamError) -> u8 {
 
 impl PlainPeerGone {
     /// The cause when the response-cancellation or connection-close watcher
-    /// ended the wait. With the connection still open, only a client
-    /// `STOP_SENDING` can have fired it; a closed connection is the client's
-    /// only when the client closed or lost it.
-    fn from_watcher(peer: Option<&crate::plugins::PeerConnectionSignal>) -> Self {
-        let stop_sending = peer.is_some_and(|signal| !signal.is_closed());
+    /// ended the wait. `stop_sending` is the watcher's own typed record of a
+    /// peer `STOP_SENDING`; otherwise a closed connection is the client's only
+    /// when the client closed it.
+    fn from_watcher(
+        stop_sending: bool,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
         match ProvenClientAbort::from_response_cancellation(stop_sending, peer) {
             Some(abort) => Self::ClientAbort(abort),
             None => Self::GatewayClosed,
@@ -585,14 +587,18 @@ impl PlainPeerGone {
 
     /// The cause for the streamed-upload arm: the reader's own classified read
     /// failure when it recorded one, the watchers' evidence otherwise.
-    fn from_reader(code: u8, peer: Option<&crate::plugins::PeerConnectionSignal>) -> Self {
+    fn from_reader(
+        code: u8,
+        stop_sending: bool,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
         match code {
             PLAIN_READER_CLIENT_ABORT => {
                 Self::ClientAbort(ProvenClientAbort::latched_upload_abort())
             }
             PLAIN_READER_MALFORMED => Self::Malformed,
             PLAIN_READER_GATEWAY_TERMINATED => Self::GatewayClosed,
-            _ => Self::from_watcher(peer),
+            _ => Self::from_watcher(stop_sending, peer),
         }
     }
 
@@ -719,7 +725,7 @@ where
 /// response head because its client stream ended (issue #6772).
 ///
 /// A proven client abort (STOP_SENDING on the response, a connection the client
-/// closed or lost, or a client reset seen by the upload reader) takes the shared
+/// closed, or a client reset seen by the upload reader) takes the shared
 /// pre-header client-abort terminal: `499` in the log and request metrics, the
 /// `ClientDisconnect` error class, `client_disconnected`, and nothing written to
 /// the departed client. A framing violation the reader saw is a `400`, and a
@@ -4383,6 +4389,9 @@ where
                     );
                     let plain_upload_deadline = plain_write_bound.deadline();
                     let plain_peer_signal = ctx.peer_connection.as_ref();
+                    // Set by the response-cancellation watcher when a peer
+                    // `STOP_SENDING` ended the wait (issue #6772).
+                    let plain_stop_sending = AtomicBool::new(false);
                     let mut plain_attempt_builder = plain_request_builder.body(plain_upload_body);
                     // Every way this attempt can end, classified before anything
                     // acts on it, so it is recorded at ONE point below (issue
@@ -4400,7 +4409,10 @@ where
                         // the eventual response.
                         let header_bound = loop {
                             let stream_cancelled =
-                                crate::http3::stream_util::peer_response_cancelled(stream);
+                                crate::http3::stream_util::peer_response_cancelled(
+                                    stream,
+                                    &plain_stop_sending,
+                                );
                             let attempt = crate::plugins::await_deadline_first(
                                 plain_header_deadline_at,
                                 await_h3_backend_or_peer(
@@ -4634,7 +4646,10 @@ where
                             crate::http3::stream_util::halt_request_body(stream);
                             // Only the watchers can end this wait; nothing is
                             // written, the response direction is reset.
-                            let cause = PlainPeerGone::from_watcher(ctx.peer_connection.as_ref());
+                            let cause = PlainPeerGone::from_watcher(
+                                plain_stop_sending.load(Ordering::Acquire),
+                                ctx.peer_connection.as_ref(),
+                            );
                             cause.reset_response(stream);
                             return Ok(plain_peer_gone_before_response_headers(
                                 PlainPeerGoneBeforeResponseHeadersCtx {
@@ -5285,7 +5300,13 @@ where
                 // Capture STOP_SENDING before the reader borrows the stream.
                 // The future is `'static` and does not hold `&mut` on either
                 // half, so the upload pump can keep polling recv_data.
-                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(stream);
+                // Set by the response-cancellation watcher when a peer
+                // `STOP_SENDING` ended the wait (issue #6772).
+                let response_stop_sending = AtomicBool::new(false);
+                let stream_cancelled = crate::http3::stream_util::peer_response_cancelled(
+                    stream,
+                    &response_stop_sending,
+                );
                 let reader_reset_flag = Arc::clone(&reader_peer_reset);
                 // Set by the reader beside `reader_reset_flag` with the
                 // classified cause of its failed read, so the terminal can tell
@@ -5841,6 +5862,7 @@ where
                         drop(attempt_end);
                         let cause = PlainPeerGone::from_reader(
                             reader_upload_failure.load(Ordering::Acquire),
+                            response_stop_sending.load(Ordering::Acquire),
                             ctx.peer_connection.as_ref(),
                         );
                         // Nothing is written either way: the response direction
@@ -7874,6 +7896,9 @@ where
     // authorization exit inside it records through the REQUEST's shared latch
     // rather than the bare counter.
     let auth_latch = ctx.authorization_termination_latch();
+    // Typed evidence that the gateway's own reset ended the backend body (issue
+    // #6772); read with the relayed upload fault below.
+    let body_error_local_reset = AtomicBool::new(false);
     let (
         mut bytes_streamed,
         body_completed,
@@ -7898,6 +7923,7 @@ where
             // and never recomputed from relay activity.
             auth_deadline: auth_deadline_plan,
             auth_latch: &auth_latch,
+            body_error_local_reset: &body_error_local_reset,
         },
     )
     .await;
@@ -8214,10 +8240,17 @@ where
     // That is the frontend's terminal, not a backend fault — so classify it as
     // ClientDisconnect (neutral for backend health / adaptive concurrency) rather
     // than the protocol/timeout class hyper reports (codex P2).
-    let relayed_upload_fault = frontend_upload.map_or(
-        GRPC_BRIDGE_UPLOAD_OK,
-        GrpcBridgeUploadSignals::relayed_fault,
-    );
+    // The relay latch counts only together with the typed local-reset
+    // evidence: a backend reset that beat hyper's own reset stays the
+    // backend's failure.
+    let relayed_upload_fault = if body_error_local_reset.load(Ordering::Relaxed) {
+        frontend_upload.map_or(
+            GRPC_BRIDGE_UPLOAD_OK,
+            GrpcBridgeUploadSignals::relayed_fault,
+        )
+    } else {
+        GRPC_BRIDGE_UPLOAD_OK
+    };
     let frontend_aborted = relayed_upload_fault != GRPC_BRIDGE_UPLOAD_OK;
     // Response headers are committed, so HTTP 200 stands; a PROVEN client abort
     // that ended the response body records `CANCELLED` and `client_disconnected`
@@ -10252,6 +10285,25 @@ fn grpc_bridge_upload_fault(error: &h3::error::StreamError, trailers: bool) -> u
     }
 }
 
+/// Whether a backend error chain ends in the gateway's OWN HTTP/2 stream reset
+/// (issue #6772): an `h2` reset that the backend did not send (`is_remote`) and
+/// that h2 did not raise for a backend protocol violation (`is_library`). That
+/// is the reset hyper issues when the channel body hands it the client's
+/// upload failure. Whichever side reset the stream first owns it: a backend
+/// reset that arrived first stays remote, so it, a connection failure, and an
+/// I/O failure all return `false` and stay backend failures. Typed only, and
+/// allocation-free.
+fn error_chain_is_local_h2_reset(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(node) = current {
+        if let Some(h2_err) = node.downcast_ref::<h2::Error>() {
+            return h2_err.is_reset() && !h2_err.is_remote() && !h2_err.is_library();
+        }
+        current = node.source();
+    }
+    false
+}
+
 /// The streaming bridge's frontend upload evidence, read together.
 #[derive(Clone, Copy)]
 struct GrpcBridgeUploadSignals<'a> {
@@ -10642,6 +10694,14 @@ pub(crate) async fn dispatch_grpc_streaming(
     let mut held_frontend_grpc_upload = None;
     // The single attempt's `otel_tracing` CLIENT span (issue #5867).
     let attempt_span = ctx.begin_backend_attempt_span(backend_url, &merge_proxy_headers);
+    // The client's response direction is watched until the response head
+    // (issue #6772): after a clean upload FIN the pump has nothing left to
+    // observe, so a `STOP_SENDING`, or a connection the client closed, while the
+    // backend withholds its head is seen here and recorded with its typed
+    // provenance, never left to surface as a backend timeout. A settled attempt
+    // (including every deadline inside it) keeps precedence.
+    let response_stopped = crate::http3::stream_util::peer_response_stopped(&send_half);
+    let mut response_cancel: Option<bool> = None;
     let mut result = {
         let attempt = grpc_proxy::proxy_grpc_request_streaming_channel(
             hyper_method,
@@ -10663,7 +10723,20 @@ pub(crate) async fn dispatch_grpc_streaming(
             grpc_auth.as_ref(),
         );
         tokio::pin!(attempt);
-        attempt_span.scope(attempt).await
+        let scoped = attempt_span.scope(attempt);
+        tokio::pin!(scoped);
+        tokio::pin!(response_stopped);
+        tokio::select! {
+            biased;
+            result = &mut scoped => result,
+            peer_stop_sending = &mut response_stopped => {
+                response_cancel = Some(peer_stop_sending);
+                Err(grpc_proxy::GrpcProxyError::backend_unavailable(
+                    grpc_proxy::GrpcBackendUnavailableKind::DispatchCanceled,
+                    "client response direction ended before the response head".to_string(),
+                ))
+            }
+        }
     };
     // A stall the matched rule's per-attempt budget (`backendRequest`) cut is
     // the backend's, exactly as on the H1/H2 gRPC path (#5646).
@@ -10790,7 +10863,23 @@ pub(crate) async fn dispatch_grpc_streaming(
                     | grpc_proxy::GrpcProxyError::BackendTimeout { .. }
                     | grpc_proxy::GrpcProxyError::AuthorizationExpired { .. }
             );
-            let upload_fault = if gateway_terminal {
+            // The relay latch alone does not prove the relay ended the exchange:
+            // a backend reset can win before hyper's own reset, which h2 then
+            // drops. So a relayed upload fault counts only when the returned
+            // error is the gateway's own local reset as well.
+            let upload_fault = if let Some(peer_stop_sending) = response_cancel {
+                // The response-direction watcher above ended the dispatch.
+                if ProvenClientAbort::from_response_cancellation(
+                    peer_stop_sending,
+                    ctx.peer_connection.as_ref(),
+                )
+                .is_some()
+                {
+                    GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+                } else {
+                    GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED
+                }
+            } else if gateway_terminal || !error_chain_is_local_h2_reset(&err) {
                 GRPC_BRIDGE_UPLOAD_OK
             } else {
                 upload_signals.relayed_fault()
@@ -10966,13 +11055,21 @@ pub(crate) async fn dispatch_grpc_streaming(
                     backend_start,
                     bytes_sent,
                     initial_response_header_policy_plugins,
-                )
-                .await;
+                );
                 // A frontend-selected terminal (`CANCELLED`, `INVALID_ARGUMENT`,
                 // or the gateway-closed `UNAVAILABLE`) is best effort: a stream
-                // that is already gone cannot take it, and the request must still
-                // reach the transaction log once rather than surface as a
-                // request-task error.
+                // that is already gone cannot take it, and a client that keeps
+                // its response direction open without QUIC credit must not hold
+                // it, so the write takes the shared terminal-write grace. Either
+                // way the request reaches the transaction log once rather than
+                // surface as a request-task error.
+                let write = if upload_terminal_selected {
+                    crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("frontend terminal write did not complete"))
+                } else {
+                    write.await
+                };
                 let write = match write {
                     Err(_) if upload_terminal_selected => {
                         crate::http3::stream_util::abort_response_stream(&mut send_half);
@@ -11807,6 +11904,11 @@ struct StreamHyperIncomingOpts<'a> {
     /// exit inside the relay records through it, so the idle arm, the
     /// blocked-write seam, and the terminal FIN cannot double count one stream.
     auth_latch: &'a crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
+    /// Set when the backend body failed with the gateway's OWN HTTP/2 reset
+    /// (see [`error_chain_is_local_h2_reset`]), the typed evidence that a
+    /// relayed client upload failure, not the backend, ended the body (issue
+    /// #6772).
+    body_error_local_reset: &'a AtomicBool,
 }
 
 /// Stream a hyper `Incoming` body into the H3 stream, separating trailer
@@ -11843,6 +11945,7 @@ where
         grpc_response_messages,
         auth_deadline,
         auth_latch,
+        body_error_local_reset,
     } = opts;
     let mut coalesce_buf = BytesMut::with_capacity(coalesce.max_bytes);
     let mut total_streamed: usize = 0;
@@ -12160,6 +12263,9 @@ where
                     }
                     Some(Err(e)) => {
                         body_error_class = Some(classify_hyper_error(&e));
+                        if error_chain_is_local_h2_reset(&e) {
+                            body_error_local_reset.store(true, Ordering::Relaxed);
+                        }
                         coalesce_buf.clear();
                         crate::http3::stream_util::abort_response_stream(stream);
                         break 'outer;

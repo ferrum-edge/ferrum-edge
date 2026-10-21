@@ -3249,11 +3249,11 @@ fn h3_plain_header_wait_races_per_stream_stop_sending_not_only_connection_close(
         .next()
         .expect("bounded dispatch_plain");
     assert!(
-        dispatch.contains("crate::http3::stream_util::peer_response_cancelled(stream)"),
+        dispatch.contains("crate::http3::stream_util::peer_response_cancelled("),
         "the prebuffered/no-body header wait must watch per-stream STOP_SENDING"
     );
     assert!(
-        dispatch.matches("peer_response_cancelled(stream)").count() >= 2,
+        dispatch.matches("peer_response_cancelled(").count() >= 2,
         "both prebuffered and streaming-upload header waits must watch per-stream STOP_SENDING"
     );
     assert!(
@@ -3353,20 +3353,34 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         .next()
         .expect("bounded peer_response_cancelled");
     assert!(
-        watch.contains("impl Future<Output = ()> + Send + 'static"),
-        "peer_response_cancelled must return a statically dispatched 'static future: {watch}"
+        watch.contains("impl Future<Output = ()> + Send + use<'a, S>"),
+        "peer_response_cancelled must return a statically dispatched future that never \
+         borrows the stream: {watch}"
     );
     assert!(
         !watch.contains("Box::pin") && !watch.contains("Pin<Box") && !watch.contains("dyn Future"),
         "peer_response_cancelled must not box a trait-object future: {watch}"
     );
     assert!(
-        watch.contains("Ok(Some(_)) | Err(_) => {}"),
-        "STOP_SENDING and connection loss must complete the cancel watch: {watch}"
+        watch.contains("let stopped = peer_response_stopped(stream);")
+            && watch.contains("stop_sending.store(true, std::sync::atomic::Ordering::Release);"),
+        "the cancel watch must record a typed STOP_SENDING (issue #6772): {watch}"
+    );
+    let stopped = util
+        .split("pub(crate) fn peer_response_stopped<")
+        .nth(1)
+        .expect("peer_response_stopped must exist")
+        .split("pub(crate) fn peer_response_cancelled<")
+        .next()
+        .expect("bounded peer_response_stopped");
+    assert!(stopped.contains("impl Future<Output = bool> + Send + 'static"));
+    assert!(
+        stopped.contains("Ok(Some(_)) => true,") && stopped.contains("Err(_) => false,"),
+        "STOP_SENDING and connection loss must complete the watch, typed apart: {stopped}"
     );
     assert!(
-        watch.contains("Ok(None) => std::future::pending::<()>().await"),
-        "a local finish acknowledgement must not be treated as cancellation: {watch}"
+        stopped.contains("Ok(None) => std::future::pending::<bool>().await"),
+        "a local finish acknowledgement must not be treated as cancellation: {stopped}"
     );
 }
 

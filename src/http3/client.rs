@@ -1101,7 +1101,7 @@ pub struct H3PoolError {
 /// is a backend fault, so all of them are neutral for backend health.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum H3ClientRequestFault {
-    /// The client reset its request stream, or closed or lost its connection.
+    /// The client reset its request stream, or closed its connection.
     Abort(ProvenClientAbort),
     /// A request DATA read failed on a framing violation (`400`).
     MalformedBody,

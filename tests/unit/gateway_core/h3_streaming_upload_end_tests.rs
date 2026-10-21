@@ -54,7 +54,7 @@ fn find_after(src: &str, from: usize, needle: &str) -> usize {
 }
 
 #[test]
-fn every_peer_reset_and_peer_lost_connection_is_a_client_abort() {
+fn every_peer_reset_and_peer_close_is_a_client_abort() {
     // Issue #6772: the read failure is classified positively. A peer reset or a
     // connection the peer closed or lost is the client's abort; a framing
     // violation is malformed; everything else is the gateway's own close.
@@ -69,14 +69,16 @@ fn every_peer_reset_and_peer_lost_connection_is_a_client_abort() {
         "a peer reset with any code, H3_NO_ERROR included, is a client abort"
     );
     assert!(
-        helper.contains("ConnectionErrorIncoming::ApplicationClose { .. }")
-            && helper
-                .contains("ConnectionError::Timeout { .. } => H3RequestReadFailure::ClientAbort,"),
-        "a close the peer sent or a timed-out connection is a client abort"
+        helper.contains("ConnectionErrorIncoming::ApplicationClose { .. } => {"),
+        "a close the peer sent is a client abort"
     );
     assert!(
-        helper.contains("ConnectionErrorIncoming::InternalError(_) => {"),
-        "a gateway-internal failure is classified on its own"
+        helper.contains(
+            "ConnectionError::Timeout { .. } => H3RequestReadFailure::GatewayTerminated,"
+        ) && helper.contains(
+            "ConnectionErrorIncoming::Timeout | ConnectionErrorIncoming::InternalError(_) => {"
+        ),
+        "an idle-timeout expiry is local and unproven, never a client abort"
     );
     assert!(
         helper.contains(
@@ -107,14 +109,13 @@ fn every_peer_reset_and_peer_lost_connection_is_a_client_abort() {
         !quic.contains("LocallyClosed"),
         "Quinn's LocallyClosed (the gateway's own close) is never a client abort"
     );
-    for peer in [
-        "ApplicationClosed(_)",
-        "ConnectionClosed(_)",
-        "Reset",
-        "TimedOut",
-    ] {
-        assert!(quic.contains(peer), "{peer} is the peer's close or loss");
+    for peer in ["ApplicationClosed(_)", "ConnectionClosed(_)", "Reset"] {
+        assert!(quic.contains(peer), "{peer} is the peer's close");
     }
+    assert!(
+        !quic.contains("TimedOut"),
+        "an idle-timeout expiry fires locally even for a reachable client"
+    );
 }
 
 #[test]

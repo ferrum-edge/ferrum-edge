@@ -3094,17 +3094,17 @@ impl crate::plugins::PeerConnectionWatch for QuicPeerConnectionWatch {
     }
 
     fn closed_by_peer(&self) -> bool {
-        // Only a close the client sent, a stateless reset, or an idle timeout
-        // is the client's. `LocallyClosed` is the gateway's own close (a
-        // shutdown or an h3 protocol-error close), and a transport error is
-        // one the gateway detected and closed on (issue #6772).
+        // Only a close the client sent or a stateless reset is the client's.
+        // `LocallyClosed` is the gateway's own close (a shutdown or an h3
+        // protocol-error close), a transport error is one the gateway
+        // detected and closed on, and an idle-timeout expiry fires locally
+        // even while the client is still reachable (issue #6772).
         matches!(
             self.connection.close_reason(),
             Some(
                 quinn::ConnectionError::ApplicationClosed(_)
                     | quinn::ConnectionError::ConnectionClosed(_)
                     | quinn::ConnectionError::Reset
-                    | quinn::ConnectionError::TimedOut
             )
         )
     }
@@ -14434,7 +14434,7 @@ async fn run_h3_grpc_upload_pump(
             H3GrpcUploadAwaitOutcome::Ready(result) => match result {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break 'pump H3UploadPumpExit::ClientEof,
-                // Only a reset or a connection the client closed or lost is its
+                // Only a reset or a connection the client closed is its
                 // abort; a framing violation is malformed input, and anything
                 // else is the gateway's own close (issue #6772).
                 Err(error) => {
@@ -15538,9 +15538,29 @@ async fn dispatch_grpc_native_h3(
     // The open future ends with the open.
     // The pool composes the cold-connect winner where its dial begins. An
     // outer lifetime race would hide an earlier connect timeout on a late wake.
+    //
+    // The client's response direction is watched while the backend stream
+    // opens (issue #6772): a `STOP_SENDING`, or a connection the client closed,
+    // ends the dispatch as its abort rather than leaving a slow acquisition to
+    // surface later as a backend fault. A settled open keeps precedence.
+    let open_response_stopped = crate::http3::stream_util::peer_response_stopped(&stream);
+    let open_peer_connection = ctx.peer_connection.clone();
     let open_result = {
         tokio::pin!(open_fut);
-        attempt_span.scope(open_fut).await
+        let scoped = attempt_span.scope(open_fut);
+        tokio::pin!(scoped);
+        tokio::pin!(open_response_stopped);
+        tokio::select! {
+            biased;
+            result = &mut scoped => result,
+            peer_stop_sending = &mut open_response_stopped => Err(
+                h3_response_cancelled_pool_error(
+                    peer_stop_sending,
+                    open_peer_connection.as_ref(),
+                    false,
+                ),
+            ),
+        }
     };
     let opened = match open_result {
         Err(error) => {
@@ -15652,7 +15672,7 @@ async fn dispatch_grpc_native_h3(
     // legitimately do that once it has read everything it needs. The client's
     // response direction is watched too (issue #6772): after a clean upload FIN
     // the pump has nothing left to observe, so a `STOP_SENDING` or a connection
-    // the client closed or lost while the backend withholds its head is seen
+    // the client closed while the backend withholds its head is seen
     // here, never as a backend timeout. The composed deadline keeps precedence.
     let response_stopped = crate::http3::stream_util::peer_response_stopped(&send_half);
     let peer_connection = ctx.peer_connection.clone();

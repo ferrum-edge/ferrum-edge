@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
-  `STOP_SENDING`, or loses its connection before response headers is now
+  `STOP_SENDING`, or closes its connection before response headers is now
   logged and counted as `499` with `client_disconnect` and
   `client_disconnected`, and native gRPC records `CANCELLED`. Before, the
   native HTTP/3 backend path wrote and counted a gateway `502`, native
@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gateway closed itself is its own `503` / `UNAVAILABLE`. An HTTP/3 framing
   violation is `400` / `INVALID_ARGUMENT`. Neither is a client disconnect.
   Backend health stays neutral, and a backend failure that coincides with a
-  client abort keeps its own classification. See the upgrade guide.
+  client abort keeps its own classification. An idle-timeout expiry is the
+  gateway's own close, never a client abort. See the upgrade guide.
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and
   config-validation resolver used by `Consumer::validate_fields`, the

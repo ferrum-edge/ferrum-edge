@@ -5816,7 +5816,7 @@ fn native_h3_grpc_dispatch_phases_compose_the_authorization_lifetime() {
     assert!(precommit.contains("let open_auth = crate::http3::client::H3Authorization::new("));
     assert_eq!(precommit.matches("open_auth,").count(), 2);
     assert!(precommit.contains("error.authorization_expiry()"));
-    assert!(precommit.contains("attempt_span.scope(open_fut).await"));
+    assert!(precommit.contains("let scoped = attempt_span.scope(open_fut);"));
     assert!(!precommit.contains("await_deadline_first(dispatch_deadline_at,"));
     assert_eq!(
         dispatch

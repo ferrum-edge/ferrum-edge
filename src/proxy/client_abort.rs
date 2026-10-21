@@ -112,7 +112,7 @@ pub struct ProvenClientAbort {
 impl ProvenClientAbort {
     /// A failed read of the client's HTTP/3 request stream that the client
     /// caused: a peer reset with any code (`H3_NO_ERROR` included), or a
-    /// connection the peer closed or lost. The classifier is the one every
+    /// connection the peer closed. The classifier is the one every
     /// buffered drain and streamed upload uses, so buffered and streamed uploads
     /// can never disagree about the same error. Malformed input and a stream or
     /// connection the gateway ended itself return `None`.
@@ -124,8 +124,8 @@ impl ProvenClientAbort {
     /// The client's response direction or connection ended while the gateway
     /// still owed it a response head. `peer_stop_sending` is true when the
     /// client sent `STOP_SENDING` on the response, which only the client can
-    /// do. Otherwise the connection ended, and only a close the peer sent, a
-    /// stateless reset, or an idle timeout is the client's
+    /// do. Otherwise the connection ended, and only a close the peer sent or a
+    /// stateless reset is the client's (an idle-timeout expiry is local)
     /// ([`crate::plugins::PeerConnectionSignal::closed_by_peer`]); the gateway's
     /// own close returns `None`.
     pub fn from_response_cancellation(

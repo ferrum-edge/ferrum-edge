@@ -539,16 +539,18 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum H3RequestReadFailure {
     /// The client ended the request: it reset the request stream (any code,
-    /// `H3_NO_ERROR` included), closed its connection, or its connection was
-    /// lost (idle timeout or stateless reset).
+    /// `H3_NO_ERROR` included), closed its connection, or reset it statelessly.
     ClientAbort,
     /// The request violated HTTP/3 framing or field rules: an undecodable or
     /// oversized trailer section, a known frame after it, or a frame error h3
     /// detected and answered with a protocol error code.
     Malformed,
     /// The gateway ended the stream or connection itself (its own graceful or
-    /// error close, a local QUIC failure, a stream it already stopped), or the
-    /// cause is not observable. Never proof of a client abort.
+    /// error close, a local QUIC failure, a stream it already stopped, or its
+    /// own idle-timeout expiry), or the cause is not observable. Never proof of
+    /// a client abort: an idle timeout fires locally even while the client is
+    /// still reachable, for example when a completed upload waits on a slow
+    /// backend without keepalives.
     GatewayTerminated,
 }
 
@@ -569,10 +571,10 @@ fn h3_code_is_peer_protocol_violation(code: Code) -> bool {
 }
 
 /// Classify a QUIC connection error h3 reported as `Undefined` (vendored
-/// h3-quinn folds several Quinn errors into it). Only a close the peer sent, a
-/// stateless reset, or an idle timeout is the client's; the gateway's own
-/// `LocallyClosed`, a transport error it detected, and resource exhaustion are
-/// not.
+/// h3-quinn folds several Quinn errors into it). Only a close the peer sent or
+/// a stateless reset is the client's; the gateway's own `LocallyClosed`, an
+/// idle-timeout expiry, a transport error it detected, and resource exhaustion
+/// are not.
 fn classify_undefined_connection_error(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> H3RequestReadFailure {
@@ -580,8 +582,7 @@ fn classify_undefined_connection_error(
         Some(
             quinn::ConnectionError::ApplicationClosed(_)
             | quinn::ConnectionError::ConnectionClosed(_)
-            | quinn::ConnectionError::Reset
-            | quinn::ConnectionError::TimedOut,
+            | quinn::ConnectionError::Reset,
         ) => H3RequestReadFailure::ClientAbort,
         _ => H3RequestReadFailure::GatewayTerminated,
     }
@@ -603,16 +604,19 @@ pub(crate) fn classify_h3_request_read_error(
         StreamError::RemoteTerminate { .. } => H3RequestReadFailure::ClientAbort,
         StreamError::ConnectionError { 0: connection, .. } => match connection {
             ConnectionError::Remote { 0: incoming, .. } => match incoming {
-                ConnectionErrorIncoming::ApplicationClose { .. }
-                | ConnectionErrorIncoming::Timeout => H3RequestReadFailure::ClientAbort,
-                ConnectionErrorIncoming::InternalError(_) => {
+                ConnectionErrorIncoming::ApplicationClose { .. } => {
+                    H3RequestReadFailure::ClientAbort
+                }
+                // An idle-timeout expiry is local and unproven (see
+                // `GatewayTerminated`), like an internal failure.
+                ConnectionErrorIncoming::Timeout | ConnectionErrorIncoming::InternalError(_) => {
                     H3RequestReadFailure::GatewayTerminated
                 }
                 ConnectionErrorIncoming::Undefined(error) => {
                     classify_undefined_connection_error(&**error)
                 }
             },
-            ConnectionError::Timeout { .. } => H3RequestReadFailure::ClientAbort,
+            ConnectionError::Timeout { .. } => H3RequestReadFailure::GatewayTerminated,
             ConnectionError::Local {
                 error: LocalError::Application { code, .. },
                 ..
@@ -638,8 +642,9 @@ pub(crate) fn h3_request_read_error_is_client_abort(error: &h3::error::StreamErr
 /// ended (closed or lost by either side). A clean local finish acknowledgement
 /// (`Ok(None)`) is not cancellation and never resolves.
 ///
-/// Like [`peer_response_cancelled`], the future is `'static` and does not
-/// borrow `stream`.
+/// Quinn's `SendStream::stopped` is `&self` and `'static`, so the future does
+/// not borrow `stream` and can race a backend wait while the receive half is
+/// still polled or the send half is later used to write a response.
 pub(crate) fn peer_response_stopped<S>(
     stream: &RequestStream<S, Bytes>,
 ) -> impl Future<Output = bool> + Send + 'static
@@ -658,22 +663,22 @@ where
 
 /// Watch peer cancellation of this H3 request's response (send) direction.
 ///
-/// Quinn's `SendStream::stopped` is `&self` and `'static`, so this future does
-/// not borrow `stream` and can race a backend header wait while the receive
-/// half is still polled or the send half is later used to write a response.
-/// Completes on peer `STOP_SENDING` or a connection-level failure. A clean
-/// local finish acknowledgement (`Ok(None)`) is not cancellation.
-pub(crate) fn peer_response_cancelled<S>(
+/// Completes on peer `STOP_SENDING` or a connection-level failure, as
+/// [`peer_response_stopped`] does, and records WHICH in `stop_sending` (issue
+/// #6772) so the typed result survives a later teardown: a gateway close during
+/// the backend teardown grace cannot then turn a proven `STOP_SENDING` into a
+/// gateway close. The future borrows only `stop_sending`, never `stream`.
+pub(crate) fn peer_response_cancelled<'a, S>(
     stream: &RequestStream<S, Bytes>,
-) -> impl Future<Output = ()> + Send + 'static
+    stop_sending: &'a std::sync::atomic::AtomicBool,
+) -> impl Future<Output = ()> + Send + use<'a, S>
 where
     S: SendStreamStopped,
 {
-    let stopped = stream.stopped();
+    let stopped = peer_response_stopped(stream);
     async move {
-        match stopped.await {
-            Ok(Some(_)) | Err(_) => {}
-            Ok(None) => std::future::pending::<()>().await,
+        if stopped.await {
+            stop_sending.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 }

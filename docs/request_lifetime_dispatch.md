@@ -103,8 +103,10 @@ records the same outcome as for a reset in the middle of the body.
 
 A client-origin abort before response headers are committed is recorded the same way on every
 HTTP-family path (issue #6772). The cases are a request-stream reset with any code (`H3_NO_ERROR`
-included), `STOP_SENDING` on the response, or a connection the client closed or lost (a close it
-sent, a stateless reset, or an idle timeout). The paths are H1/H2 buffered intake, the native
+included), `STOP_SENDING` on the response, or a connection the client closed (a close it sent, or a
+stateless reset). An idle-timeout expiry is not one: it fires locally even while the client is still
+reachable, for example while a completed upload waits on a slow backend, so it is the gateway-closed
+terminal. The paths are H1/H2 buffered intake, the native
 HTTP/3 backend, both HTTP/3 bridges, and native gRPC:
 
 | Signal | Recorded value |
@@ -123,14 +125,16 @@ plain HTTP paths reset the HTTP/3 response with `H3_REQUEST_CANCELLED`. Neither 
 Only a proven client action selects this terminal (`ProvenClientAbort` in
 `src/proxy/client_abort.rs`). A failed read of the upload is classified positively by one shared
 classifier (`stream_util::classify_h3_request_read_error`) on buffered and streamed paths alike. A
-peer reset, or a connection the peer closed or lost, is an abort. A frame error h3 closes with a
+peer reset, or a connection the peer closed, is an abort. A frame error h3 closes with a
 protocol error code, or an undecodable or oversized trailer section, is malformed input. Anything
 else, including the gateway's own graceful `H3_NO_ERROR` close and Quinn's `LocallyClosed`, is the
 gateway's own close. A response-direction or connection watcher proves an abort only through a
-`STOP_SENDING` or a close the peer caused (`PeerConnectionSignal::closed_by_peer`). On the HTTP/3
-to gRPC bridge, the frontend terminal applies only when the channel body actually handed the upload
-failure to the backend exchange. A backend failure that happened on its own keeps its status and its
-health charge.
+`STOP_SENDING` or a close the peer caused (`PeerConnectionSignal::closed_by_peer`). The watcher
+records its own typed result, so a later teardown cannot change it. On the HTTP/3 to gRPC bridge,
+the frontend terminal needs two pieces of evidence: the channel body handed the upload failure to
+hyper, and the returned error is the gateway's own HTTP/2 reset (neither received from the backend
+nor raised by h2 for a backend protocol violation). A backend reset that wins that race, a
+connection failure, and an I/O failure keep their status and their health charge.
 
 The `client_disconnect` class alone does not select the client-abort terminal, because that class
 also marks terminals the gateway chose while the client may still be connected. Each terminal keeps
@@ -146,10 +150,15 @@ its own status:
 | Backend failure | `502` (`504` for a backend timeout) | `UNAVAILABLE` (`DEADLINE_EXCEEDED`) |
 
 The client-abort, malformed, and gateway-closed terminals are all neutral for backend health, and
-each request is recorded once. The native HTTP/3 paths watch the client's response direction until
-the backend's response head arrives. A client that cancels after a clean upload FIN, while the
-backend withholds its head, is a client abort, not a backend timeout. A settled backend result or
-route deadline wins a simultaneous cancel.
+each request is recorded once. The streamed native HTTP/3 dispatch, the native HTTP/3 gRPC backend
+open and header wait, and the streaming HTTP/3 to gRPC bridge watch the client's response direction
+until the backend's response head arrives. On those paths, a client that cancels after a clean upload
+FIN while the backend withholds its head is a client abort, not a backend timeout. A settled backend
+result or a deadline wins a simultaneous cancel. The buffered native HTTP/3 retry loop does not watch
+yet. There, such a cancel stays unobserved until the backend answers or its own timeout fires, and it
+is never recorded as a client abort. A frontend-selected gRPC terminal write is bounded by the shared
+terminal-write grace, so a client that leaves its response direction open without flow-control
+credit cannot hold the request's accounting.
 
 After response headers are committed, the committed status stays. A later client abort only marks
 the transaction `client_disconnected` and incomplete. A gRPC status is committed with the trailers,

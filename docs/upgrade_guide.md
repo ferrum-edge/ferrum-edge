@@ -674,7 +674,7 @@ their separate admission rules.
 
 ### Client aborts record `499` / `CANCELLED` on every path (#6772)
 
-A client that resets its request stream, sends `STOP_SENDING`, or loses its
+A client that resets its request stream, sends `STOP_SENDING`, or closes its
 connection before response headers now gets one terminal on every
 HTTP-family path. It is logged and counted as `499` with
 `error_class: client_disconnect` and `client_disconnected: true`, and native
@@ -689,7 +689,8 @@ receive `CANCELLED` trailers. Backend health stays neutral.
 Alerts and dashboards keyed on `5xx`, on gRPC `UNAVAILABLE`, or on status `0`
 see fewer of these requests, and those keyed on `499` or `CANCELLED` see
 more. Only proven client actions count. A stream or connection the gateway
-closed itself (a shutdown, its own graceful or error close) is logged as the
+closed itself (a shutdown, its own graceful or error close, or its own
+idle-timeout expiry) is logged as the
 gateway's `503` / `UNAVAILABLE` and is not a client disconnect. This applies
 to the buffered HTTP/3 drains too, under the new rejection phase
 `gateway_closed_h3_upload`. An HTTP/3 framing violation (an undecodable

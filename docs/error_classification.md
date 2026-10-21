@@ -308,8 +308,9 @@ body-read timeout keeps its timeout classification.
 A proven client-origin abort before response headers are committed has one
 terminal on every HTTP-family path, buffered or streamed (issue #6772). A
 proven abort is a request-stream reset with any code, `STOP_SENDING` on the
-response, or a connection the client closed or lost (a close it sent, a
-stateless reset, or an idle timeout). The gateway's own close, including a
+response, or a connection the client closed (a close it sent, or a stateless
+reset). An idle-timeout expiry fires locally even while the client is still
+reachable, so it is the gateway-closed terminal, not a client abort. The gateway's own close, including a
 graceful `H3_NO_ERROR` close or Quinn's `LocallyClosed`, is never one. The
 terminal is defined once in
 [`src/proxy/client_abort.rs`](../src/proxy/client_abort.rs):

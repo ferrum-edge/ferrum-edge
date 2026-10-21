@@ -225,7 +225,9 @@ fn the_gateway_closed_terminal_is_neither_a_client_abort_nor_a_backend_fault() {
         "\n    }\n",
     ));
     assert!(
-        !quic.contains("ConnectionError::LocallyClosed") && quic.contains("ApplicationClosed(_)"),
+        !quic.contains("ConnectionError::LocallyClosed")
+            && !quic.contains("ConnectionError::TimedOut")
+            && quic.contains("ApplicationClosed(_)"),
         "the QUIC watcher counts only a close the client sent, a reset, or a timeout"
     );
 }
@@ -380,6 +382,20 @@ fn native_h3_watches_the_response_direction_until_the_head_arrives() {
         .find("peer_stop_sending=response_stopped=>Ok(Err(h3_response_cancelled_pool_error(")
         .expect("the native gRPC header wait watches the client too");
     assert!(head < cancel, "a ready backend head keeps precedence");
+    let open = compact(region(
+        SERVER,
+        "// ── Phase 1: open the backend request stream",
+        "let opened = match open_result {",
+    ));
+    assert!(open.contains(
+        "letopen_response_stopped=crate::http3::stream_util::peer_response_stopped(&stream);"
+    ));
+    assert!(
+        open.contains(
+            "biased;result=&mutscoped=>result,peer_stop_sending=&mutopen_response_stopped=>Err(h3_response_cancelled_pool_error("
+        ),
+        "backend acquisition watches the client too, with a settled open first"
+    );
 }
 
 #[test]
@@ -542,7 +558,11 @@ fn the_plain_bridge_never_records_status_zero_for_a_departed_client() {
         "the departed client is recorded as 499, never status 0"
     );
     let watcher = compact(region(CROSS_PROTOCOL, "fn from_watcher(", "\n    }\n"));
-    assert!(watcher.contains("letstop_sending=peer.is_some_and(|signal|!signal.is_closed());"));
+    assert!(
+        watcher.contains("ProvenClientAbort::from_response_cancellation(stop_sending,peer)")
+            && !watcher.contains("is_closed()"),
+        "the watcher's own typed STOP_SENDING decides, never the later connection state"
+    );
     assert!(watcher.contains("None=>Self::GatewayClosed,"));
 }
 
@@ -565,12 +585,14 @@ fn the_plain_bridge_reader_records_one_classified_cause() {
         "async fn dispatch_plain<S>(",
         "\n#[allow(clippy::too_many_arguments)]\nasync fn dispatch_grpc<S>(",
     ));
-    assert!(
-        dispatch.contains("letcause=PlainPeerGone::from_watcher(ctx.peer_connection.as_ref());")
-    );
     assert!(dispatch.contains(
-        "letcause=PlainPeerGone::from_reader(reader_upload_failure.load(Ordering::Acquire),ctx.peer_connection.as_ref(),);"
+        "letcause=PlainPeerGone::from_watcher(plain_stop_sending.load(Ordering::Acquire),ctx.peer_connection.as_ref(),);"
     ));
+    assert!(dispatch.contains(
+        "letcause=PlainPeerGone::from_reader(reader_upload_failure.load(Ordering::Acquire),response_stop_sending.load(Ordering::Acquire),ctx.peer_connection.as_ref(),);"
+    ));
+    assert!(dispatch.contains("peer_response_cancelled(stream,&plain_stop_sending,)"));
+    assert!(dispatch.contains("peer_response_cancelled(stream,&response_stop_sending,)"));
     assert_eq!(dispatch.matches("cause.reset_response(stream);").count(), 2);
 }
 
@@ -619,6 +641,30 @@ fn the_grpc_bridge_keys_its_terminal_on_the_relayed_upload_fault() {
     ));
     assert!(dispatch.contains("Some(Arc::clone(&frontend_failure_relayed)),"));
     assert!(dispatch.contains("upload_signals.relayed_fault()"));
+    // The latch counts only with the typed local-reset evidence; a backend
+    // reset that beat hyper's own reset stays the backend's failure.
+    assert!(dispatch.contains(
+        "}elseifgateway_terminal||!error_chain_is_local_h2_reset(&err){GRPC_BRIDGE_UPLOAD_OK}else{upload_signals.relayed_fault()};"
+    ));
+    let reset = compact(region(
+        CROSS_PROTOCOL,
+        "fn error_chain_is_local_h2_reset(",
+        "\n}\n",
+    ));
+    assert!(reset.contains("returnh2_err.is_reset()&&!h2_err.is_remote()&&!h2_err.is_library();"));
+    // A clean upload FIN followed by a cancel is observed before the head.
+    let race = dispatch
+        .find("letresponse_stopped=crate::http3::stream_util::peer_response_stopped(&send_half);")
+        .expect("response-direction watcher");
+    let select = dispatch
+        .find("biased;result=&mutscoped=>result,peer_stop_sending=&mutresponse_stopped=>{response_cancel=Some(peer_stop_sending);")
+        .expect("a settled attempt keeps precedence over the cancel");
+    assert!(race < select);
+    assert!(dispatch.contains("letupload_fault=ifletSome(peer_stop_sending)=response_cancel{"));
+    // The frontend-selected terminal write is bounded by the shared grace.
+    assert!(dispatch.contains(
+        "letwrite=ifupload_terminal_selected{crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await"
+    ));
     // Controls: deadline and authorization terminals keep their own status.
     assert!(dispatch.contains(
         "grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_)|grpc_proxy::GrpcProxyError::BackendTimeout{..}|grpc_proxy::GrpcProxyError::AuthorizationExpired{..}"
@@ -644,6 +690,10 @@ fn the_grpc_bridge_keys_its_terminal_on_the_relayed_upload_fault() {
         relay.contains("letclient_cancelled=relayed_upload_fault==GRPC_BRIDGE_UPLOAD_CLIENT_ABORT")
     );
     assert!(relay.contains("ifclient_cancelled{final_client_disconnected=true;}"));
+    assert!(
+        relay.contains("letrelayed_upload_fault=ifbody_error_local_reset.load(Ordering::Relaxed){")
+    );
+    assert!(relay.contains("body_error_local_reset:&body_error_local_reset,"));
     assert!(relay.contains("}elseifclient_cancelled{ProvenClientAbort::latched_upload_abort().pre_header_terminal().grpc_status}"));
     // The channel body sets the relay flag exactly when it hands the failure on.
     let body = compact(include_str!("../../../src/proxy/grpc_proxy.rs"));

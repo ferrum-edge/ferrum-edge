@@ -2011,7 +2011,8 @@ pub trait PeerConnectionWatch: Send + Sync {
     fn is_closed(&self) -> bool;
 
     /// Whether an already-closed transport was ended by the client (a close it
-    /// sent, a stateless reset, or an idle timeout) rather than by the gateway.
+    /// sent, or a stateless reset) rather than by the gateway. An idle-timeout
+    /// expiry is local and never counts.
     /// Only this proves a client abort (issue #6772); the default, for a
     /// transport that cannot tell, is `false`.
     fn closed_by_peer(&self) -> bool {
