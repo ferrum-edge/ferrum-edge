@@ -16,29 +16,31 @@
 //! context is still intact when hyper drops the handler. The scope's `Drop`
 //! then settles the request's terminal exactly once, according to how far the
 //! request's own terminal record had got
-//! ([`crate::plugins::TerminalRecordState`]):
+//! ([`crate::plugins::TerminalRecordState`]) and WHY the handler was dropped
+//! ([`TerminationCause`]):
 //!
-//! * **Not started, client cancellation** — `record_request(499)` (the nginx
-//!   client-closed-request status, logs and metrics only: nothing is written to
-//!   the departed client) and, with a plugin chain, one `TransactionSummary`
-//!   with `499`, `error_class: client_disconnect`, `client_disconnected:
-//!   true`, `response_delivery: observed`, rejection phase
-//!   [`CLIENT_ABORT_REJECTION_PHASE`], and gRPC `CANCELLED` for a gRPC
-//!   request, handed to the bounded terminal delivery the streaming terminal
-//!   uses (`Drop` cannot await a plugin). Without a chain, the runtime terminal
-//!   outcome the summary would have fed.
-//! * **Not started, gateway close** — the gateway itself is tearing the
-//!   connection down (withdrawn client-certificate trust, an
-//!   authorization-lifetime close, or shutdown drain), so the drop proves no
-//!   client cancellation. The request is settled as
-//!   [`GATEWAY_CLOSED_REQUEST_STATUS`] (`444`, nginx's "closed without a
-//!   response"; again logs and metrics only) with a `gateway_close_*`
-//!   rejection phase naming the cause and no client-disconnect claim.
+//! * **Not started** — one terminal record (status counter, and with a plugin
+//!   chain a `TransactionSummary` handed to the bounded terminal delivery the
+//!   streaming terminal uses, since `Drop` cannot await a plugin):
+//!   * `499` client abort only on positive evidence of a PEER-originated
+//!     cancellation: the HTTP/2 peer's `RST_STREAM` / `GOAWAY` or a lost
+//!     transport, as the vendored hyper reports it while it drops the stream
+//!     (Hyper patch 006), or an HTTP/1.1 dispatcher dropping an in-flight
+//!     request, which it does only on the client's EOF or I/O error.
+//!   * `400` when hyper's own HTTP/2 stack reset the stream for a protocol
+//!     violation in what the peer sent.
+//!   * `444` (nginx's "closed without response") when the gateway itself
+//!     ended the connection — withdrawn client-certificate trust, an
+//!     authorization-lifetime close a sibling stream triggered, or shutdown
+//!     teardown after the drain wait — or when no cause could be attributed.
+//!
+//!   All three are logs-and-metrics vocabulary: nothing is written to the
+//!   client. A request the handler had already counted is not counted again.
 //! * **In flight** — the request's own terminal summary was being logged.
-//!   `log_with_mirror` hands its remaining sinks, the runtime counters, and
-//!   the mirrors to detached delivery when it is dropped, so the summary still
-//!   arrives once; the scope settles only the status count the handler takes
-//!   right after that log, with the status the summary carries.
+//!   `log_with_mirror` hands the sinks that had not started, the runtime
+//!   counters, and the mirrors to detached delivery when it is dropped, so the
+//!   summary arrives at most once per sink; the scope settles only the status
+//!   count, if the handler had not taken it yet.
 //! * **Finished** — nothing is owed.
 //!
 //! Backend health is untouched: no backend outcome exists, the half-open probe
@@ -78,45 +80,94 @@ use crate::runtime_metrics::TerminalOutcome;
 /// `rejection_phase` on the client-abort transaction record.
 pub const CLIENT_ABORT_REJECTION_PHASE: &str = "client_disconnect_before_response";
 
+/// `rejection_phase` on the record of a request hyper's HTTP/2 stack reset for
+/// a protocol violation by the peer.
+pub const PROTOCOL_RESET_REJECTION_PHASE: &str = "protocol_error_before_response";
+
 /// Status recorded for an admitted request whose connection the gateway itself
-/// closed before any response head: nginx's `444` ("connection closed without
-/// response"). Logging and metrics vocabulary only; it is never sent.
+/// closed before any response head, or whose drop has no attributable cause:
+/// nginx's `444` ("connection closed without response"). Logging and metrics
+/// vocabulary only; it is never sent.
 pub const GATEWAY_CLOSED_REQUEST_STATUS: u16 = 444;
 
-/// Why the gateway, not the client, ended a request before its response head.
+/// Status recorded for a request the local HTTP/2 stack reset because the peer
+/// violated the protocol. Logging and metrics vocabulary only.
+pub const PROTOCOL_RESET_REQUEST_STATUS: u16 = 400;
+
+/// Why an admitted H1/H2 request handler was dropped before its response head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GatewayCloseCause {
+pub enum TerminationCause {
+    /// The peer cancelled: an HTTP/2 `RST_STREAM` / `GOAWAY` from the client,
+    /// a lost client transport, or an HTTP/1.1 client EOF.
+    PeerCancelled,
+    /// The local HTTP/2 stack reset the stream or connection because what the
+    /// peer sent violated the protocol.
+    LocalProtocolReset,
     /// The connection's client-certificate trust was withdrawn.
     ClientTrustWithdrawn,
-    /// An authenticated stream on the connection outlived its authorization
-    /// and the gateway closed the connection.
-    AuthorizationLifetime,
-    /// Shutdown drain had begun, so the gateway may be tearing the handler down
-    /// itself and a client cancellation cannot be proven.
-    Shutdown,
+    /// A sibling stream outlived its authorization and the gateway closed the
+    /// shared connection. This request's own authorization did not fail.
+    AuthorizationConnectionClose,
+    /// Shutdown stopped waiting for in-flight work and tore the handler down.
+    ShutdownTeardown,
+    /// No cause could be attributed.
+    Unattributed,
 }
 
-impl GatewayCloseCause {
-    /// The `rejection_phase` on the gateway-close transaction record.
+impl TerminationCause {
+    /// The `rejection_phase` on the transaction record.
     pub fn rejection_phase(self) -> &'static str {
         match self {
+            Self::PeerCancelled => CLIENT_ABORT_REJECTION_PHASE,
+            Self::LocalProtocolReset => PROTOCOL_RESET_REJECTION_PHASE,
             Self::ClientTrustWithdrawn => "gateway_close_client_trust_withdrawn",
-            Self::AuthorizationLifetime => "gateway_close_authorization_lifetime",
-            Self::Shutdown => "gateway_close_shutdown",
+            Self::AuthorizationConnectionClose => "gateway_close_authorization_lifetime",
+            Self::ShutdownTeardown => "gateway_close_shutdown",
+            Self::Unattributed => "connection_closed_before_response",
+        }
+    }
+
+    /// The status the transaction record and counters carry.
+    pub fn status(self) -> u16 {
+        match self {
+            Self::PeerCancelled => CLIENT_CLOSED_REQUEST_STATUS,
+            Self::LocalProtocolReset => PROTOCOL_RESET_REQUEST_STATUS,
+            Self::ClientTrustWithdrawn
+            | Self::AuthorizationConnectionClose
+            | Self::ShutdownTeardown
+            | Self::Unattributed => GATEWAY_CLOSED_REQUEST_STATUS,
+        }
+    }
+
+    fn error_class(self) -> Option<ErrorClass> {
+        match self {
+            Self::PeerCancelled => Some(ErrorClass::ClientDisconnect),
+            Self::LocalProtocolReset => Some(ErrorClass::ProtocolError),
+            _ => None,
         }
     }
 
     fn grpc_terminal(self) -> (u32, &'static str) {
         match self {
+            // The client's own cancellation, even when a backend outcome was
+            // already copied into the context: the client never received it.
+            Self::PeerCancelled => (
+                grpc_status::CANCELLED,
+                super::GRPC_CLIENT_DISCONNECT_MESSAGE,
+            ),
+            // gRPC maps an HTTP/2 PROTOCOL_ERROR stream reset to INTERNAL.
+            Self::LocalProtocolReset => (grpc_status::INTERNAL, "HTTP/2 protocol error"),
             Self::ClientTrustWithdrawn => (
                 grpc_status::UNAUTHENTICATED,
                 "Client certificate trust withdrawn",
             ),
-            Self::AuthorizationLifetime => (
-                grpc_status::UNAUTHENTICATED,
-                "Connection closed at authorization lifetime",
-            ),
-            Self::Shutdown => (grpc_status::UNAVAILABLE, "Gateway shutting down"),
+            // Collateral connection loss: this request's credentials did not
+            // fail, so it is UNAVAILABLE, never UNAUTHENTICATED.
+            Self::AuthorizationConnectionClose => {
+                (grpc_status::UNAVAILABLE, "Connection closed by the gateway")
+            }
+            Self::ShutdownTeardown => (grpc_status::UNAVAILABLE, "Gateway shutting down"),
+            Self::Unattributed => (grpc_status::UNAVAILABLE, "Connection closed"),
         }
     }
 }
@@ -140,6 +191,9 @@ pub struct ClientAbortScope {
 pub struct ClientAbortRecord {
     state: Option<Arc<ProxyState>>,
     start_time: Option<Instant>,
+    /// Whether the request arrived over HTTP/2, whose stream terminations
+    /// hyper attributes explicitly (Hyper patch 006).
+    http2: bool,
     plugins: Option<Arc<Vec<Arc<dyn Plugin>>>>,
     client_request_path: Option<String>,
 }
@@ -158,6 +212,7 @@ impl ClientAbortScope {
             record: ClientAbortRecord {
                 state: None,
                 start_time: None,
+                http2: false,
                 plugins: None,
                 client_request_path: None,
             },
@@ -171,15 +226,18 @@ impl ClientAbortScope {
     ///
     /// `start_time` is the instant the handler first saw the request, so the
     /// terminal record's `latency_total_ms` covers the same span as every
-    /// other terminal record.
+    /// other terminal record. `version` is the frontend wire version, which
+    /// decides how a drop is attributed.
     pub fn install(
         &mut self,
         state: &Arc<ProxyState>,
         start_time: Instant,
+        version: http::Version,
         ctx: RequestContext,
     ) -> (&mut RequestContext, &mut ClientAbortRecord) {
         self.record.state = Some(Arc::clone(state));
         self.record.start_time = Some(start_time);
+        self.record.http2 = version == http::Version::HTTP_2;
         (self.ctx.insert(ctx), &mut self.record)
     }
 
@@ -227,68 +285,63 @@ impl ClientAbortRecord {
         }
     }
 
-    fn settle(&mut self, ctx: RequestContext) {
+    fn settle(
+        &mut self,
+        ctx: RequestContext,
+        h2_termination: Option<hyper::ext::H2StreamTermination>,
+    ) {
         let Some(state) = self.state.take() else {
             return;
         };
+        let counted = ctx.terminal_status_counted();
         match ctx.terminal_record_state() {
             TerminalRecordState::Finished => {}
-            // The summary's remaining sinks and runtime counters continue in
+            // The summary's unstarted sinks and runtime counters continue in
             // detached delivery; the status count the handler takes after its
-            // log is what the drop skipped.
-            TerminalRecordState::InFlight { status } => super::record_request(&state, status),
-            TerminalRecordState::NotStarted => match gateway_close_cause(&ctx, &state) {
-                Some(cause) => self.record_gateway_close(&state, ctx, cause),
-                None => self.record_client_abort(&state, ctx),
-            },
+            // log is what the drop skipped, unless it was taken already.
+            TerminalRecordState::InFlight { status } => {
+                if !counted {
+                    super::record_request(&state, status);
+                }
+            }
+            TerminalRecordState::NotStarted => {
+                let cause = termination_cause(&ctx, &state, self.http2, h2_termination);
+                self.record_terminal(&state, ctx, cause, counted);
+            }
         }
     }
 
-    fn record_client_abort(&mut self, state: &ProxyState, ctx: RequestContext) {
-        super::record_request(state, CLIENT_CLOSED_REQUEST_STATUS);
+    fn record_terminal(
+        &mut self,
+        state: &ProxyState,
+        ctx: RequestContext,
+        cause: TerminationCause,
+        counted: bool,
+    ) {
+        if !counted {
+            super::record_request(state, cause.status());
+        }
         let Some(plugins) = self.plugins.take() else {
+            if counted {
+                return;
+            }
             crate::runtime_metrics::global_ref().record_terminal_outcome(TerminalOutcome {
                 proxy_id: ctx.matched_proxy.as_ref().map(|proxy| proxy.id.as_str()),
                 grpc: crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
-                error_class: Some(ErrorClass::ClientDisconnect),
+                error_class: cause.error_class(),
                 body_error_class: None,
-                client_disconnected: true,
+                client_disconnected: cause == TerminationCause::PeerCancelled,
             });
             return;
         };
         let mut summary = self.terminal_summary(
             &ctx,
-            CLIENT_CLOSED_REQUEST_STATUS,
-            CLIENT_ABORT_REJECTION_PHASE,
-            // A proven pre-header frontend cancellation is the client's
-            // CANCELLED, even when a backend outcome was already copied into
-            // the context: the client never received it.
-            (
-                grpc_status::CANCELLED,
-                super::GRPC_CLIENT_DISCONNECT_MESSAGE,
-            ),
-        );
-        summary.client_disconnected = true;
-        summary.error_class = Some(ErrorClass::ClientDisconnect);
-        deliver(plugins, summary, ctx);
-    }
-
-    fn record_gateway_close(
-        &mut self,
-        state: &ProxyState,
-        ctx: RequestContext,
-        cause: GatewayCloseCause,
-    ) {
-        super::record_request(state, GATEWAY_CLOSED_REQUEST_STATUS);
-        let Some(plugins) = self.plugins.take() else {
-            return;
-        };
-        let summary = self.terminal_summary(
-            &ctx,
-            GATEWAY_CLOSED_REQUEST_STATUS,
+            cause.status(),
             cause.rejection_phase(),
             cause.grpc_terminal(),
         );
+        summary.client_disconnected = cause == TerminationCause::PeerCancelled;
+        summary.error_class = cause.error_class();
         deliver(plugins, summary, ctx);
     }
 
@@ -374,29 +427,54 @@ fn deliver(
     });
 }
 
-/// Whether the gateway itself is ending this request's connection, which a
-/// dropped handler then cannot be told apart from. Each listed cause
-/// hard-closes the connection (after a bounded settle) or tears the runtime
-/// down, dropping every handler still pending on it.
-fn gateway_close_cause(ctx: &RequestContext, state: &ProxyState) -> Option<GatewayCloseCause> {
+/// Attribute a dropped handler (see [`TerminationCause`]).
+///
+/// Gateway-initiated connection closes come first: their teardown also loses
+/// the transport underneath the stream, which must not read as the peer's.
+/// Then the HTTP/2 termination hyper published while dropping the stream
+/// (Hyper patch 006), which separates the peer's reset from the local stack's.
+/// An HTTP/1.1 dispatcher drops an in-flight request only on the client's EOF
+/// or I/O error, every gateway-initiated HTTP/1.1 close being one of the
+/// causes checked first. Anything else is unattributed and never labelled a
+/// client cancellation.
+fn termination_cause(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    http2: bool,
+    h2_termination: Option<hyper::ext::H2StreamTermination>,
+) -> TerminationCause {
     if ctx
         .client_trust_session
         .as_ref()
         .is_some_and(crate::tls::ClientTrustSession::is_retired)
     {
-        return Some(GatewayCloseCause::ClientTrustWithdrawn);
+        return TerminationCause::ClientTrustWithdrawn;
     }
     if ctx
         .authorization_connection_closer
         .as_ref()
         .is_some_and(crate::proxy::auth_lifetime::AuthorizationConnectionCloser::close_requested)
     {
-        return Some(GatewayCloseCause::AuthorizationLifetime);
+        return TerminationCause::AuthorizationConnectionClose;
     }
-    if state.overload.draining.load(Ordering::Acquire) {
-        return Some(GatewayCloseCause::Shutdown);
+    if state.overload.drain_wait_ended.load(Ordering::Acquire) {
+        return TerminationCause::ShutdownTeardown;
     }
-    None
+    if http2 {
+        return match h2_termination {
+            Some(
+                hyper::ext::H2StreamTermination::PeerReset { .. }
+                | hyper::ext::H2StreamTermination::TransportLost,
+            ) => TerminationCause::PeerCancelled,
+            Some(hyper::ext::H2StreamTermination::LocalReset { .. }) => {
+                TerminationCause::LocalProtocolReset
+            }
+            // `H2StreamTermination` is non-exhaustive; an unknown cause, or
+            // none, is not evidence of the peer's cancellation.
+            Some(_) | None => TerminationCause::Unattributed,
+        };
+    }
+    TerminationCause::PeerCancelled
 }
 
 impl Drop for ClientAbortScope {
@@ -405,9 +483,12 @@ impl Drop for ClientAbortScope {
         if self.settled || std::thread::panicking() {
             return;
         }
+        // Take hyper's HTTP/2 termination cause even when nothing is owed, so
+        // it can never be read by an unrelated drop.
+        let h2_termination = hyper::ext::take_h2_stream_termination();
         let Some(ctx) = self.ctx.take() else {
             return;
         };
-        self.record.settle(ctx);
+        self.record.settle(ctx, h2_termination);
     }
 }

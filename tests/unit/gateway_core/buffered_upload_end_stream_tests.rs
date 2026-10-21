@@ -160,6 +160,7 @@ fn serve_h2_inline(io: DuplexStream, collector: Collector, state: Arc<ProxyState
             let _ = client_abort.install(
                 &state,
                 Instant::now(),
+                http::Version::HTTP_2,
                 RequestContext::new(
                     "127.0.0.1".to_string(),
                     "POST".to_string(),

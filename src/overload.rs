@@ -138,6 +138,11 @@ pub struct OverloadState {
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
     pub draining: AtomicBool,
+    /// Set once the serving mode stops waiting for in-flight work: the drain
+    /// wait ended, timed out, or was disabled. Anything still pending after
+    /// this is torn down by the gateway, so a dropped request handler is not
+    /// evidence that its client cancelled (issue #6768).
+    pub drain_wait_ended: AtomicBool,
     /// Cold one-shot broadcast for work that must stop as soon as drain starts.
     /// The atomic remains the authoritative state and fast path; cancellation
     /// supplies race-free event delivery to waiters already parked on drain.
@@ -235,6 +240,7 @@ impl OverloadState {
             reject_new_connections: CachePadded::new(AtomicBool::new(false)),
             reject_new_requests: CachePadded::new(AtomicBool::new(false)),
             draining: AtomicBool::new(false),
+            drain_wait_ended: AtomicBool::new(false),
             drain_started: CancellationToken::new(),
             active_connections: CachePadded::new(AtomicU64::new(0)),
             active_requests: CachePadded::new(AtomicU64::new(0)),
@@ -1789,6 +1795,15 @@ pub fn begin_drain(state: &Arc<OverloadState>) {
 /// process-global and one-shot, so cancelling it from the plain drain-flag
 /// helper — which ordinary tests call directly — would silently disarm every
 /// later fault delay in the same test binary.
+/// Record that the serving mode stopped waiting for in-flight work after
+/// [`begin_shutdown_drain`]: the drain wait completed, timed out, was cut short,
+/// or is disabled (`FERRUM_SHUTDOWN_DRAIN_SECONDS=0`). From here, a request
+/// handler that is dropped was torn down by the gateway's shutdown, not
+/// cancelled by its client (issue #6768).
+pub fn end_shutdown_drain_wait(state: &Arc<OverloadState>) {
+    state.drain_wait_ended.store(true, Ordering::Release);
+}
+
 pub fn begin_shutdown_drain(state: &Arc<OverloadState>) {
     begin_drain(state);
     crate::plugins::utils::fault_delay::cancel_fault_delays_for_shutdown();

@@ -17,6 +17,8 @@ use crate::common::date;
 use crate::common::io::Compat;
 use crate::common::time::Time;
 use crate::ext::Protocol;
+// FERRUM PATCH 006
+use crate::ext::{publish_h2_stream_termination, ClearH2StreamTermination, H2StreamTermination};
 use crate::headers;
 use crate::proto::h2::ping::Recorder;
 use crate::proto::Dispatched;
@@ -377,6 +379,9 @@ pin_project! {
         // FERRUM PATCH 005: bounds the response body pipe's coalescing wait.
         timer: Time,
         exec: E,
+        // FERRUM PATCH 006: declared after `state`, so it drops after the
+        // service future and clears a termination cause nobody took.
+        _termination: ClearH2StreamTermination,
     }
 }
 
@@ -422,6 +427,7 @@ where
             date_header,
             timer,
             exec,
+            _termination: ClearH2StreamTermination,
         }
     }
 }
@@ -461,13 +467,36 @@ where
                         Poll::Pending => {
                             // Response is not yet ready, so we want to check if the client has sent a
                             // RST_STREAM frame which would cancel the current request.
-                            if let Poll::Ready(reason) =
-                                me.reply.poll_reset(cx).map_err(crate::Error::new_h2)?
-                            {
-                                debug!("stream received RST_STREAM: {:?}", reason);
-                                return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
+                            //
+                            // FERRUM PATCH 006: before returning, publish who ended the
+                            // stream; the service future is dropped with this stream.
+                            match me.reply.poll_reset(cx) {
+                                Poll::Ready(Ok(reason)) => {
+                                    let code = u32::from(reason);
+                                    publish_h2_stream_termination(match me.reply.reset_is_local() {
+                                        Some(true) => H2StreamTermination::LocalReset { reason: code },
+                                        _ => H2StreamTermination::PeerReset { reason: code },
+                                    });
+                                    debug!("stream received RST_STREAM: {:?}", reason);
+                                    return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
+                                }
+                                Poll::Ready(Err(e)) => {
+                                    if e.is_io() {
+                                        publish_h2_stream_termination(
+                                            H2StreamTermination::TransportLost,
+                                        );
+                                    } else if let Some(reason) = e.reason() {
+                                        let code = u32::from(reason);
+                                        publish_h2_stream_termination(if e.is_remote() {
+                                            H2StreamTermination::PeerReset { reason: code }
+                                        } else {
+                                            H2StreamTermination::LocalReset { reason: code }
+                                        });
+                                    }
+                                    return Poll::Ready(Err(crate::Error::new_h2(e)));
+                                }
+                                Poll::Pending => return Poll::Pending,
                             }
-                            return Poll::Pending;
                         }
                         Poll::Ready(Err(e)) => {
                             let err = crate::Error::new_user_service(e);

@@ -36,13 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a handler dropped before it returned records exactly one `499` client
   abort (`error_class: client_disconnect`, `client_disconnected: true`, gRPC
   `CANCELLED`) through the plugin `log` chain and the request/status
-  counters, including during the WebSocket upgrade handshake. A pending
-  request whose connection the gateway itself closes (withdrawn trust,
-  authorization-lifetime close, shutdown drain) is recorded as a `444`
-  gateway close instead. `log_with_mirror` now finishes its remaining sinks,
-  runtime counters, and mirrors in detached delivery when cancelled mid-sink,
-  and the request's status is still counted once. Neutral to backend health;
-  a committed status is never rewritten.
+  counters, including during the WebSocket upgrade handshake. `499` needs
+  positive evidence of the client's cancellation: Hyper patch 006 and h2
+  patch 004 report whether an HTTP/2 reset came from the peer or from the
+  gateway's own stack (a protocol-violation reset is recorded as `400`), and
+  a request whose connection the gateway itself closed (withdrawn trust, a
+  sibling's authorization-lifetime close, shutdown teardown after the drain
+  wait) or with no attributable cause is a `444`. `log_with_mirror` now
+  finishes the sinks that had not started, runtime counters, and mirrors in
+  detached delivery when cancelled mid-sink, never re-invoking a started
+  sink, and a request is counted at most once. Neutral to backend health; a
+  committed status is never rewritten.
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and
   config-validation resolver used by `Consumer::validate_fields`, the

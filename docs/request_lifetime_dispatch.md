@@ -83,11 +83,15 @@ request's one terminal: a `499` client abort with the `client_disconnect` error 
 `CANCELLED`), through the plugin `log` chain when the route has plugins and the runtime terminal
 counters otherwise. It applies to every cancellation point before the response head: the upload,
 plugin phases, backend acquisition, the WebSocket upgrade handshake, and the wait for backend
-response headers. The scope settles in the same poll the handler returns in. A request whose own
-terminal log was being delivered keeps that record (the log funnel finishes its sinks in detached
-delivery) and has its status counted once. A drop caused by the gateway closing the connection
-itself (withdrawn trust, an authorization-lifetime close, shutdown drain) is recorded as a `444`
-gateway close, never as a client abort.
+response headers. The scope settles in the same poll the handler returns in. It calls the drop a
+`499` client abort only on positive evidence of the client's cancellation: the HTTP/2 peer's reset
+or a lost transport, which the vendored hyper reports while it drops the stream (Hyper patch 006),
+or an HTTP/1.1 client EOF. A reset the gateway's own HTTP/2 stack sent for a protocol violation is a
+`400`; a connection the gateway closed itself (withdrawn trust, a sibling's authorization-lifetime
+close, shutdown teardown after the drain wait) or an unattributed HTTP/2 drop is a `444`. A request
+whose own terminal log was being delivered keeps that record (the log funnel finishes the sinks
+that had not started in detached delivery, never re-invoking one that had) and has its status
+counted once.
 
 When the dispatcher cancels a pump whose client has already reset, the pump looks past the DATA
 still buffered ahead of that reset, so the backend gets the client's `CANCEL` rather than the

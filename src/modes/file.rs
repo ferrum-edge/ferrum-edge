@@ -348,6 +348,8 @@ impl ServeHandles {
             )
             .await;
         }
+        // Shutdown now tears down whatever is still pending (issue #6768).
+        crate::overload::end_shutdown_drain_wait(&self.proxy_state.overload);
         // Release backend transport pools that hold kernel objects (issue
         // #3731): after the bounded in-flight drain, no further request may be
         // served, so idle sidecar-ingress Unix carriers must not outlive it.

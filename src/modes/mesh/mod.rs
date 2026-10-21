@@ -21083,6 +21083,8 @@ async fn shutdown_and_join_mesh(
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
             .await;
     }
+    // Shutdown now tears down whatever is still pending (issue #6768).
+    crate::overload::end_shutdown_drain_wait(&proxy_state.overload);
     // Release backend transport pools that hold kernel objects (issue #3731).
     // On a sidecar this is the pool of admitted connections to the co-located
     // application's Unix ingress sockets; leaving one idle keeps the app's

@@ -302,20 +302,31 @@ upload, a plugin phase, backend acquisition, the WebSocket upgrade handshake,
 or the wait for backend response headers is pending — is settled once by its
 `ClientAbortScope` (`src/proxy/client_abort_scope.rs`, issue #6768):
 
-- **Client cancellation:** status `499` in logs and metrics only,
-  `error_class: client_disconnect`, `client_disconnected: true`,
-  `response_delivery: observed`, rejection phase
-  `client_disconnect_before_response`, and gRPC `CANCELLED` for a gRPC request
-  (overriding any backend status already read: the client never received it).
-- **Gateway close:** when the connection is being closed by the gateway itself
-  (withdrawn client-certificate trust, an authorization-lifetime close, or
-  shutdown drain), status `444` ("closed without response", logs and metrics
-  only), no client-disconnect claim and no `error_class`, rejection phase
+- **Client cancellation** (positive evidence only: an HTTP/2 peer
+  `RST_STREAM` / `GOAWAY` or lost transport, which the vendored hyper reports
+  while it drops the stream, or an HTTP/1.1 client EOF / I/O error): status
+  `499` in logs and metrics only, `error_class: client_disconnect`,
+  `client_disconnected: true`, `response_delivery: observed`, rejection phase
+  `client_disconnect_before_response`, and gRPC `CANCELLED` (overriding any
+  backend status already read: the client never received it).
+- **Local protocol reset** (the gateway's HTTP/2 stack reset the stream for a
+  protocol violation by the client): status `400`, `error_class:
+  protocol_error`, rejection phase `protocol_error_before_response`, gRPC
+  `INTERNAL`.
+- **Gateway close** (withdrawn client-certificate trust, a sibling stream's
+  authorization-lifetime close of the shared connection, or shutdown teardown
+  after the drain wait) and **unattributed HTTP/2 drops**: status `444`
+  ("closed without response", logs and metrics only), no client-disconnect
+  claim and no `error_class`, rejection phase
   `gateway_close_client_trust_withdrawn` / `gateway_close_authorization_lifetime`
-  / `gateway_close_shutdown`.
+  / `gateway_close_shutdown` / `connection_closed_before_response`. Only the
+  trust withdrawal reports gRPC `UNAUTHENTICATED`; the others are
+  `UNAVAILABLE`.
 - **Terminal log in flight:** the request's own summary stands. `log_with_mirror`
-  hands its remaining sinks, runtime counters, and mirrors to detached delivery
-  when it is dropped, and the scope counts the summary's status once.
+  hands the sinks that had not started, the runtime counters, and the mirrors to
+  detached delivery when it is dropped (a sink whose `log` started is never
+  invoked again), and the scope counts the summary's status once unless the
+  handler already had.
 
 No backend outcome exists, so circuit breakers, passive health, and retry
 budgets are untouched. The scope stays silent when the handler returned or

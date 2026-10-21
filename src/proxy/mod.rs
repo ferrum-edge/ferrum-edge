@@ -15825,6 +15825,7 @@ async fn handle_websocket_request_authenticated(
             Some(&original_request_path),
         )
         .await;
+        ctx.terminal_record.mark_counted();
         record_request(&state, status.as_u16());
         cb_probe.release_neutral();
         return Ok(build_websocket_error_response(
@@ -15911,6 +15912,7 @@ async fn handle_websocket_request_authenticated(
                     Some(&original_request_path),
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 503);
                 // Gateway-side reject after the CB check — release a claimed
                 // HALF_OPEN probe slot so the breaker doesn't wedge.
@@ -15951,6 +15953,7 @@ async fn handle_websocket_request_authenticated(
                 Some(&original_request_path),
             )
             .await;
+            ctx.terminal_record.mark_counted();
             record_request(&state, 503);
             cb_probe.release_neutral();
             return Ok(build_websocket_error_response(
@@ -16105,6 +16108,7 @@ async fn handle_websocket_request_authenticated(
                     Some(&original_request_path),
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 503);
                 // Gateway-side reject after the CB check — release a claimed
                 // HALF_OPEN probe slot so the breaker doesn't wedge.
@@ -16739,6 +16743,7 @@ async fn handle_websocket_request_authenticated(
                         backend_elapsed: backend_admission_start.elapsed(),
                     });
                 }
+                ctx.terminal_record.mark_counted();
                 state.request_count.fetch_add(1, Ordering::Relaxed);
                 record_status(&state, 502);
 
@@ -16900,6 +16905,7 @@ async fn handle_websocket_request_authenticated(
             Some(&original_request_path),
         )
         .await;
+        ctx.terminal_record.mark_counted();
         record_request(&state, status.as_u16());
         return Ok(build_websocket_error_response(
             status,
@@ -16934,6 +16940,7 @@ async fn handle_websocket_request_authenticated(
                     Some(&original_request_path),
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 502);
                 return Ok(build_websocket_error_response(
                     StatusCode::BAD_GATEWAY,
@@ -16962,8 +16969,6 @@ async fn handle_websocket_request_authenticated(
     // Backend verified — record status and log.
     // HTTP/2 Extended CONNECT returns 200 OK; HTTP/1.1 returns 101 Switching Protocols.
     let ws_status_code: u16 = if is_h2_websocket { 200 } else { 101 };
-    state.request_count.fetch_add(1, Ordering::Relaxed);
-    record_status(&state, ws_status_code);
 
     // Measure total latency using monotonic Instant (NTP-safe).
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -17025,6 +17030,12 @@ async fn handle_websocket_request_authenticated(
     };
 
     crate::plugins::log_with_mirror_before_buffered_response(&plugins, summary, &ctx).await;
+    // Counted after the awaited log and DNS lookup, like every other terminal:
+    // a client that leaves before then is the client-abort scope's to settle
+    // (issue #6768).
+    ctx.terminal_record.mark_counted();
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+    record_status(&state, ws_status_code);
 
     // Apply response policy before gateway-owned affinity and transport fields.
     // This matches ordinary HTTP/gRPC ordering: operator policy governs backend
@@ -33592,6 +33603,7 @@ async fn handle_proxy_request_inner(
     let (mut ctx, client_abort_record) = client_abort.install(
         &state,
         start_time,
+        inbound_version,
         RequestContext::new(socket_ip.clone(), method.clone(), path.clone()),
     );
     // Carry the operator's response-body ceiling so the buffered representation
@@ -33668,6 +33680,7 @@ async fn handle_proxy_request_inner(
     for (name, value) in req.headers() {
         let header_size = name.as_str().len() + value.len();
         if header_size > state.max_single_header_size_bytes {
+            ctx.terminal_record.mark_counted();
             record_request(&state, 431);
             // Escape header name to prevent JSON injection from client-controlled data.
             // Use serde_json to produce a correctly escaped JSON string value,
@@ -33687,6 +33700,7 @@ async fn handle_proxy_request_inner(
         total_header_size += header_size;
     }
     if total_header_size > state.max_header_size_bytes {
+        ctx.terminal_record.mark_counted();
         record_request(&state, 431);
         return Ok(build_response(
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
@@ -33694,6 +33708,7 @@ async fn handle_proxy_request_inner(
         ));
     }
     if state.max_header_count > 0 && req.headers().len() > state.max_header_count {
+        ctx.terminal_record.mark_counted();
         record_request(&state, 431);
         return Ok(build_response(
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
@@ -33750,6 +33765,7 @@ async fn handle_proxy_request_inner(
                 1 + query_string.len()
             };
         if url_len > state.max_url_length_bytes {
+            ctx.terminal_record.mark_counted();
             record_request(&state, 414);
             return Ok(build_response(
                 StatusCode::URI_TOO_LONG,
@@ -33765,6 +33781,7 @@ async fn handle_proxy_request_inner(
     if state.max_query_params > 0 && !query_string.is_empty() {
         let param_count = count_query_params(&query_string);
         if param_count > state.max_query_params {
+            ctx.terminal_record.mark_counted();
             record_request(&state, 400);
             return Ok(build_response(
                 StatusCode::BAD_REQUEST,
@@ -33789,6 +33806,7 @@ async fn handle_proxy_request_inner(
         ),
     ) {
         warn!("Rejected request: {}", error_body);
+        ctx.terminal_record.mark_counted();
         record_request(&state, 400);
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
@@ -33797,6 +33815,7 @@ async fn handle_proxy_request_inner(
         check_host_authority_consistency(req.headers(), req.uri(), req.version())
     {
         warn!("Rejected request: {}", error_body);
+        ctx.terminal_record.mark_counted();
         record_request(&state, 400);
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
@@ -33880,6 +33899,7 @@ async fn handle_proxy_request_inner(
                 reason = rejection.reason(),
                 "Rejected request: ambiguous percent-encoded request path"
             );
+            ctx.terminal_record.mark_counted();
             record_request(&state, 400);
             if let Some(content_type) = grpc_web_response_content_type {
                 return Ok(build_grpc_web_error_response(
@@ -33922,6 +33942,7 @@ async fn handle_proxy_request_inner(
     // response body, which can be exploited to steal credentials.
     if method == "TRACE" {
         warn!("Rejected TRACE request");
+        ctx.terminal_record.mark_counted();
         record_request(&state, 405);
         return Ok(build_method_not_allowed_response(
             r#"{"error":"TRACE method is not allowed"}"#,
@@ -33939,6 +33960,7 @@ async fn handle_proxy_request_inner(
     // filter non-WebSocket ones here before routing.
     if method == "CONNECT" && !is_h2_websocket_connect(&req) && !is_hbone_connect_any {
         warn!("Rejected non-WebSocket CONNECT request");
+        ctx.terminal_record.mark_counted();
         record_request(&state, 405);
         return Ok(build_method_not_allowed_response(
             r#"{"error":"CONNECT method is not allowed"}"#,
@@ -33975,6 +33997,7 @@ async fn handle_proxy_request_inner(
                     "Rejected 0-RTT request: method {} not in allowed early data methods",
                     wire_method
                 );
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 425);
                 if is_grpc {
                     return Ok(grpc_proxy::build_grpc_error_response(
@@ -34074,6 +34097,7 @@ async fn handle_proxy_request_inner(
                 limit = state.max_concurrent_requests_per_ip,
                 "Per-IP concurrent request limit exceeded"
             );
+            ctx.terminal_record.mark_counted();
             record_request(&state, 429);
             return Ok(build_response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -34105,6 +34129,7 @@ async fn handle_proxy_request_inner(
                 let normalized = normalize_authority_host(host);
                 if normalized.is_empty() {
                     warn!("Rejected request: malformed Host/authority value");
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 400);
                     return Ok(build_response(
                         StatusCode::BAD_REQUEST,
@@ -34116,6 +34141,7 @@ async fn handle_proxy_request_inner(
             }
             None => {
                 warn!("Rejected request: malformed Host/authority value");
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 400);
                 return Ok(build_response(
                     StatusCode::BAD_REQUEST,
@@ -34203,6 +34229,7 @@ async fn handle_proxy_request_inner(
                 client_ip = %ctx.client_ip,
                 "Direct Pod-IP HTTP mesh egress destination is declared but not routable; rejecting captured request"
             );
+            ctx.terminal_record.mark_counted();
             state.request_count.fetch_add(1, Ordering::Relaxed);
             let response = build_pre_plugin_reject_response(
                 StatusCode::BAD_GATEWAY,
@@ -34285,6 +34312,7 @@ async fn handle_proxy_request_inner(
                         client_ip = %ctx.client_ip,
                         "Mesh outbound port selection failed; rejecting captured request"
                     );
+                    ctx.terminal_record.mark_counted();
                     state.request_count.fetch_add(1, Ordering::Relaxed);
                     let body: &[u8] = match reason {
                         crate::router_cache::MeshOutboundPortSelectError::OrigDstUnavailable => {
@@ -34378,6 +34406,7 @@ async fn handle_proxy_request_inner(
                             "Rejected mesh inbound request: its port signal (or its absence) matches no mesh-routable port of the local service"
                         );
                     }
+                    ctx.terminal_record.mark_counted();
                     state.request_count.fetch_add(1, Ordering::Relaxed);
                     let body: &[u8] = match reason {
                         crate::router_cache::MeshInboundPortSelectError::PortSignalUnavailable => {
@@ -34616,6 +34645,7 @@ async fn handle_proxy_request_inner(
                             reject_status,
                             "Mesh REGISTRY_ONLY: rejecting outbound route miss for unadmitted destination"
                         );
+                        ctx.terminal_record.mark_counted();
                         state.request_count.fetch_add(1, Ordering::Relaxed);
                         let status =
                             StatusCode::from_u16(reject_status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -34641,6 +34671,7 @@ async fn handle_proxy_request_inner(
                         return Ok(response);
                     }
                     debug!(path = %path, client_ip = %ctx.client_ip, "No route matched for request path");
+                    ctx.terminal_record.mark_counted();
                     state.request_count.fetch_add(1, Ordering::Relaxed);
                     let response = build_pre_plugin_reject_response(
                         StatusCode::NOT_FOUND,
@@ -34695,6 +34726,7 @@ async fn handle_proxy_request_inner(
             reason = rejection.reason(),
             "Rejected request: path parameter not admitted for the routed proxy"
         );
+        ctx.terminal_record.mark_counted();
         record_request(&state, 400);
         if let Some(content_type) = grpc_web_response_content_type {
             return Ok(build_grpc_web_error_response(
@@ -34811,6 +34843,7 @@ async fn handle_proxy_request_inner(
     // `on_request_received` phase; it is never forwarded upstream.
     let cors_preflight_exempted = omitted_policy_exemption == Some(true);
     if omitted_policy_exemption == Some(false) {
+        ctx.terminal_record.mark_counted();
         state.request_count.fetch_add(1, Ordering::Relaxed);
         debug!(
             proxy_id = %proxy.id,
@@ -34849,6 +34882,7 @@ async fn handle_proxy_request_inner(
     if let Some(ref allowed) = proxy.allowed_methods
         && !request_method_is_allowed(allowed, &method)
     {
+        ctx.terminal_record.mark_counted();
         state.request_count.fetch_add(1, Ordering::Relaxed);
         let allow_header = allow_header_from_allowed_methods(allowed);
         let mut reject_headers = HashMap::new();
@@ -34900,6 +34934,7 @@ async fn handle_proxy_request_inner(
     // gRPC spec mandates POST method. Reject non-POST gRPC requests with a proper
     // gRPC trailers-only error rather than forwarding an invalid request to the backend.
     if is_grpc_request && method != "POST" {
+        ctx.terminal_record.mark_counted();
         state.request_count.fetch_add(1, Ordering::Relaxed);
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
         let mut reject = normalize_reject_response(
@@ -34987,6 +35022,7 @@ async fn handle_proxy_request_inner(
         .await;
         // Counted after the log, like every other terminal: a client abort
         // during that log is settled by the client-abort scope (issue #6768).
+        ctx.terminal_record.mark_counted();
         record_request(&state, wire_status);
         if let Some(response) = grpc_web_response {
             return Ok(response);
@@ -35058,6 +35094,7 @@ async fn handle_proxy_request_inner(
         if let reject @ (PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }) = prepared
         {
             let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 500);
                 return Ok(build_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -35091,6 +35128,7 @@ async fn handle_proxy_request_inner(
                 0,
             )
             .await;
+            ctx.terminal_record.mark_counted();
             record_request(&state, reject.http_status.as_u16());
             if let Some(response) = grpc_web_response {
                 return Ok(response);
@@ -35158,6 +35196,7 @@ async fn handle_proxy_request_inner(
                         plugin_execution_ns,
                     )
                     .await;
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, reject.http_status.as_u16());
                     if let Some(response) = grpc_web_response {
                         return Ok(response);
@@ -35195,6 +35234,7 @@ async fn handle_proxy_request_inner(
             plugin_execution_ns,
         )
         .await;
+        ctx.terminal_record.mark_counted();
         record_request(&state, StatusCode::FORBIDDEN.as_u16());
         return Ok(build_response_from_normalized_reject(reject));
     }
@@ -35306,6 +35346,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35327,6 +35368,7 @@ async fn handle_proxy_request_inner(
                             Some(&original_request_path),
                         )
                         .await;
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -35341,6 +35383,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35352,6 +35395,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35446,6 +35490,7 @@ async fn handle_proxy_request_inner(
                 plugin_execution_ns,
             )
             .await;
+            ctx.terminal_record.mark_counted();
             record_request(&state, reject.http_status.as_u16());
             if let Some(response) = grpc_web_response {
                 return Ok(response);
@@ -35521,6 +35566,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35542,6 +35588,7 @@ async fn handle_proxy_request_inner(
                             Some(&original_request_path),
                         )
                         .await;
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -35556,6 +35603,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35567,6 +35615,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35607,6 +35656,7 @@ async fn handle_proxy_request_inner(
                             .initial_response_header_policy_plugins()
                             .as_ref(),
                     );
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, response.status().as_u16());
                     return Ok(response);
                 }
@@ -35674,6 +35724,7 @@ async fn handle_proxy_request_inner(
                         plugin_execution_ns,
                     )
                     .await;
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, reject.http_status.as_u16());
                     if let Some(response) = grpc_web_response {
                         return Ok(response);
@@ -35783,6 +35834,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35804,6 +35856,7 @@ async fn handle_proxy_request_inner(
                             Some(&original_request_path),
                         )
                         .await;
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -35818,6 +35871,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35829,6 +35883,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -35869,6 +35924,7 @@ async fn handle_proxy_request_inner(
                             .initial_response_header_policy_plugins()
                             .as_ref(),
                     );
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, response.status().as_u16());
                     return Ok(response);
                 }
@@ -35956,6 +36012,7 @@ async fn handle_proxy_request_inner(
                     phase = reject_phase,
                     "pre-before_proxy body-phase rejection could not be normalized"
                 );
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 500);
                 return Ok(build_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -35991,6 +36048,7 @@ async fn handle_proxy_request_inner(
                 plugin_execution_ns,
             )
             .await;
+            ctx.terminal_record.mark_counted();
             record_request(&state, reject.http_status.as_u16());
             if let Some(response) = grpc_web_response {
                 return Ok(response);
@@ -36035,6 +36093,7 @@ async fn handle_proxy_request_inner(
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 500);
                     return Ok(build_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -36070,6 +36129,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns,
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, reject.http_status.as_u16());
                 if let Some(response) = grpc_web_response {
                     return Ok(response);
@@ -36099,6 +36159,7 @@ async fn handle_proxy_request_inner(
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
                     error!("before_proxy rejection could not be normalized");
                     ctx.headers = tmp_headers;
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 500);
                     return Ok(build_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -36135,6 +36196,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns,
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, reject.http_status.as_u16());
                 if let Some(response) = grpc_web_response {
                     return Ok(response);
@@ -36307,6 +36369,7 @@ async fn handle_proxy_request_inner(
                 plugin_execution_ns,
             )
             .await;
+            ctx.terminal_record.mark_counted();
             record_request(&state, reject.http_status.as_u16());
             if let Some(response) = grpc_web_response {
                 return Ok(response);
@@ -36578,6 +36641,7 @@ async fn handle_proxy_request_inner(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(plugin_reject) = plugin_result_into_reject_parts(reject) else {
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 500);
                     return Ok(build_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -36614,6 +36678,7 @@ async fn handle_proxy_request_inner(
                     Some(&original_request_path),
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, reject.http_status.as_u16());
                 if let Some(response) = grpc_web_response {
                     return Ok(response);
@@ -36959,6 +37024,7 @@ async fn handle_proxy_request_inner(
                     reject @ PluginResult::Reject { .. }
                     | reject @ PluginResult::RejectBinary { .. } => {
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            ctx.terminal_record.mark_counted();
                             record_request(&state, 500);
                             return Ok(build_response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -36995,6 +37061,7 @@ async fn handle_proxy_request_inner(
                             Some(&original_request_path),
                         )
                         .await;
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, normalized.http_status.as_u16());
                         if let Some(response) = grpc_web_response {
                             return Ok(response);
@@ -37056,6 +37123,7 @@ async fn handle_proxy_request_inner(
             PluginResult::Continue => {}
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 500);
                     return Ok(build_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -37092,6 +37160,7 @@ async fn handle_proxy_request_inner(
                     Some(&original_request_path),
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, normalized.http_status.as_u16());
                 if let Some(response) = grpc_web_response {
                     return Ok(response);
@@ -37167,6 +37236,7 @@ async fn handle_proxy_request_inner(
                     Some(&original_request_path),
                 )
                 .await;
+                ctx.terminal_record.mark_counted();
                 record_request(&state, reject.http_status.as_u16());
                 return Ok(build_response_from_normalized_reject(reject));
             }
@@ -37263,6 +37333,7 @@ async fn handle_proxy_request_inner(
                     Ok(body) => body,
                     Err(RequestBodyBufferError::TooLarge) => {
                         cb_probe.release_neutral();
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, 413);
                         return Ok(build_response(
                             StatusCode::PAYLOAD_TOO_LARGE,
@@ -37288,6 +37359,7 @@ async fn handle_proxy_request_inner(
                             Some(&original_request_path),
                         )
                         .await;
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, 499);
                         return Ok(build_response(
                             StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
@@ -37304,6 +37376,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -37317,6 +37390,7 @@ async fn handle_proxy_request_inner(
                                 .initial_response_header_policy_plugins()
                                 .as_ref(),
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, response.status().as_u16());
                         return Ok(response);
                     }
@@ -37423,6 +37497,7 @@ async fn handle_proxy_request_inner(
                     | reject @ PluginResult::RejectBinary { .. } => {
                         cb_probe.release_neutral();
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
+                            ctx.terminal_record.mark_counted();
                             record_request(&state, 500);
                             return Ok(build_response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -37459,6 +37534,7 @@ async fn handle_proxy_request_inner(
                             Some(&original_request_path),
                         )
                         .await;
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, normalized.http_status.as_u16());
                         if let Some(response) = grpc_web_response {
                             return Ok(response);
@@ -37518,6 +37594,7 @@ async fn handle_proxy_request_inner(
         // repeated refusals leak `half_open_in_flight` slots and wedge the
         // breaker (same reason the HBONE / mesh-mTLS refusals do it).
         cb_probe.release_neutral();
+        ctx.terminal_record.mark_counted();
         record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
@@ -37549,6 +37626,7 @@ async fn handle_proxy_request_inner(
                 // `src/http3/server.rs` and the other H1/H2 WebSocket gateway-side
                 // rejects (missing OnUpgrade, connection limits, backend admission).
                 cb_probe.release_neutral();
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 403);
                 return Ok(build_websocket_error_response(
                     StatusCode::FORBIDDEN,
@@ -37564,6 +37642,7 @@ async fn handle_proxy_request_inner(
                     false,
                     "websocket requests should never be pre-buffered for before_proxy"
                 );
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 500);
                 return Ok(build_websocket_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -37756,6 +37835,7 @@ async fn handle_proxy_request_inner(
                 // reject precedes any backend dispatch, so a leaked probe slot would
                 // wedge the breaker (mirrors the WebSocket gateway-side rejects).
                 cb_probe.release_neutral();
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                 if let Some(content_type) = grpc_web_response_content_type {
                     return Ok(build_grpc_web_error_response(
@@ -37823,6 +37903,7 @@ async fn handle_proxy_request_inner(
             // `release_neutral` takes the slot, so the guard's `Drop` cannot fire
             // a SECOND release that would free another in-flight probe's slot.
             cb_probe.release_neutral();
+            ctx.terminal_record.mark_counted();
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
             return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                 14,
@@ -37868,6 +37949,7 @@ async fn handle_proxy_request_inner(
                 // Gateway-side refusal before any dial: hand the admitted
                 // HALF_OPEN slot back neutrally.
                 cb_probe.release_neutral();
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                 if let Some(content_type) = grpc_web_response_content_type {
                     return Ok(build_grpc_web_error_response(
@@ -38036,6 +38118,7 @@ async fn handle_proxy_request_inner(
                             // `cb_probe` remains armed: returning drops it and
                             // releases the admitted HALF_OPEN slot exactly once,
                             // neutrally, before the response is written by hyper.
+                            ctx.terminal_record.mark_counted();
                             record_request(&state, StatusCode::OK.as_u16());
                             return Ok(build_request_body_timeout_response(
                                 true,
@@ -38093,6 +38176,7 @@ async fn handle_proxy_request_inner(
                         Err(grpc_proxy::GrpcRequestBodyCollectError::ResourceExhausted(
                             message,
                         )) => {
+                            ctx.terminal_record.mark_counted();
                             record_request(&state, StatusCode::OK.as_u16());
                             return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                                 grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -38128,6 +38212,7 @@ async fn handle_proxy_request_inner(
                     if effective_max_grpc_recv_size_bytes > 0
                         && buffered.body.len() > effective_max_grpc_recv_size_bytes
                     {
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, StatusCode::OK.as_u16());
                         return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                             grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -38263,6 +38348,7 @@ async fn handle_proxy_request_inner(
                 | reject @ PluginResult::RejectBinary { .. } => {
                     let Some(reject) = plugin_result_into_reject_parts(reject) else {
                         warn!("reject plugin result could not be converted to response parts");
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, StatusCode::INTERNAL_SERVER_ERROR.as_u16());
                         return Ok(build_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -38299,6 +38385,7 @@ async fn handle_proxy_request_inner(
                         Some(&original_request_path),
                     )
                     .await;
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, normalized.http_status.as_u16());
                     if let Some(response) = grpc_web_response {
                         return Ok(response);
@@ -38404,6 +38491,7 @@ async fn handle_proxy_request_inner(
                     ClientRequestBody::Streaming(request) => *request,
                     ClientRequestBody::Buffered(_) => {
                         debug_assert!(false, "buffered gRPC body entered streaming fast path");
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, 500);
                         return Ok(build_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -38423,6 +38511,7 @@ async fn handle_proxy_request_inner(
                     && let Some(declared) = canonical_header_content_length(request.headers())
                     && declared > effective_max_grpc_recv_size_bytes as u64
                 {
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -38714,6 +38803,7 @@ async fn handle_proxy_request_inner(
                     Err(grpc_proxy::GrpcRequestBodyCollectError::TimedOut) => {
                         // As in the split path, the armed RAII guard performs the
                         // sole neutral probe release on this early return.
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, StatusCode::OK.as_u16());
                         return Ok(build_request_body_timeout_response(
                             true,
@@ -39077,6 +39167,7 @@ async fn handle_proxy_request_inner(
                         target_host = %rotated_target.host,
                         "Direct gRPC retry rotated onto a mesh target; refusing an insecure or trailer-losing transport switch"
                     );
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                     if let Some(content_type) = grpc_web_response_content_type {
                         return Ok(build_grpc_web_error_response(
@@ -39127,6 +39218,7 @@ async fn handle_proxy_request_inner(
                         backend = %rotated_target.host,
                         "Backend egress policy denied literal-IP gRPC retry target; not dialing"
                     );
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                     return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         14,
@@ -39263,6 +39355,7 @@ async fn handle_proxy_request_inner(
                              closed with gRPC UNAVAILABLE instead of an unauthenticated \
                              direct dial"
                         );
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
                         if let Some(content_type) = grpc_web_response_content_type {
                             return Ok(build_grpc_web_error_response(
@@ -39744,6 +39837,7 @@ async fn handle_proxy_request_inner(
                             Some(&original_request_path),
                         )
                         .await;
+                        ctx.terminal_record.mark_counted();
                         record_request(&state, normalized.http_status.as_u16());
                         return Ok(build_response_from_normalized_reject(normalized));
                     }
@@ -40050,6 +40144,7 @@ async fn handle_proxy_request_inner(
                 if body_exceeded {
                     drop(backend_admission_permits.take());
                     drop(grpc_lb_connection_guard.take());
+                    ctx.terminal_record.mark_counted();
                     record_request(&state, 200);
                     return Ok(grpc_proxy::build_grpc_error_response_with_policy(
                         grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -40058,6 +40153,7 @@ async fn handle_proxy_request_inner(
                     ));
                 }
 
+                ctx.terminal_record.mark_counted();
                 record_request(&state, grpc_streaming.status);
 
                 // A client gRPC deadline is an absolute total-body bound. It
@@ -41210,6 +41306,7 @@ async fn handle_proxy_request_inner(
                     }
                 }
 
+                ctx.terminal_record.mark_counted();
                 record_request(&state, response_status);
 
                 // Build gRPC response with headers and trailers (splitting any
@@ -41485,6 +41582,7 @@ async fn handle_proxy_request_inner(
                     );
                 }
 
+                ctx.terminal_record.mark_counted();
                 record_request(&state, 200); // gRPC errors use HTTP 200
                 // A gRPC-Web request must receive a gRPC-Web-shaped response even
                 // for a gateway-generated backend error: the terminal status has
@@ -41714,6 +41812,7 @@ async fn handle_proxy_request_inner(
         // refusal (gRPC errors ride HTTP 200 + grpc-status) instead of a JSON
         // 502 the client cannot parse. Same fail-closed contract either way.
         if is_grpc_request {
+            ctx.terminal_record.mark_counted();
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
             let message =
                 format!("HBONE dispatch required for this backend target: {block_reason}");
@@ -41733,6 +41832,7 @@ async fn handle_proxy_request_inner(
                 initial_response_header_policy_plugins.as_ref(),
             ));
         }
+        ctx.terminal_record.mark_counted();
         record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
@@ -41774,6 +41874,7 @@ async fn handle_proxy_request_inner(
         // protocol-appropriate Trailers-Only refusal — never fall back to a
         // plaintext direct dial.
         if is_grpc_request {
+            ctx.terminal_record.mark_counted();
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
             let message = format!(
                 "sidecar mesh mTLS dispatch required for this backend target: {block_reason}"
@@ -41806,6 +41907,7 @@ async fn handle_proxy_request_inner(
                 initial_response_header_policy_plugins.as_ref(),
             ));
         }
+        ctx.terminal_record.mark_counted();
         record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
@@ -44208,6 +44310,7 @@ async fn handle_proxy_request_inner(
             None
         };
 
+    ctx.terminal_record.mark_counted();
     record_request(&state, response_status);
 
     // Buffered translated gRPC-Web carries terminal metadata in its body

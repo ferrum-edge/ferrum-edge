@@ -1,0 +1,158 @@
+diff --git a/src/ext/h2_stream_termination.rs b/src/ext/h2_stream_termination.rs
+new file mode 100644
+index 000000000..0a82ac12b
+--- /dev/null
++++ b/src/ext/h2_stream_termination.rs
+@@ -0,0 +1,58 @@
++//! FERRUM PATCH 006: why an HTTP/2 server stream ended before its response,
++//! observable while hyper drops the stream's service future.
++
++use std::cell::Cell;
++
++/// Who ended an HTTP/2 server stream before the service produced a response.
++///
++/// hyper drops a pending service future when the stream is reset. The future's
++/// own drop glue has no way to tell a peer's cancellation from a reset hyper's
++/// HTTP/2 stack sent itself. While hyper drops that future, the service can
++/// read the cause with [`take_h2_stream_termination`].
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[non_exhaustive]
++pub enum H2StreamTermination {
++    /// The peer reset the stream (`RST_STREAM`) or the connection (`GOAWAY`).
++    PeerReset {
++        /// The HTTP/2 error code the peer sent.
++        reason: u32,
++    },
++    /// The connection's transport failed or closed underneath the stream.
++    TransportLost,
++    /// This endpoint reset the stream or connection, typically because what
++    /// the peer sent violated the protocol.
++    LocalReset {
++        /// The HTTP/2 error code this endpoint sent.
++        reason: u32,
++    },
++}
++
++thread_local! {
++    static PENDING: Cell<Option<H2StreamTermination>> = const { Cell::new(None) };
++}
++
++/// Take the termination cause hyper published for the HTTP/2 server stream
++/// whose service future is being dropped on this thread.
++///
++/// Returns `Some` at most once, and only from code that runs during that drop
++/// (the service future's drop glue). Everywhere else it returns `None`.
++pub fn take_h2_stream_termination() -> Option<H2StreamTermination> {
++    PENDING.with(Cell::take)
++}
++
++/// Publish `termination` for the service future the caller drops next on this
++/// thread.
++pub(crate) fn publish_h2_stream_termination(termination: H2StreamTermination) {
++    PENDING.with(|pending| pending.set(Some(termination)));
++}
++
++/// Clears a published termination once the stream holding the service future
++/// has been dropped, so it can never be read by an unrelated drop.
++#[derive(Debug, Default)]
++pub(crate) struct ClearH2StreamTermination;
++
++impl Drop for ClearH2StreamTermination {
++    fn drop(&mut self) {
++        PENDING.with(|pending| pending.set(None));
++    }
++}
+diff --git a/src/ext/mod.rs b/src/ext/mod.rs
+index e17d98b20..8690f2502 100644
+--- a/src/ext/mod.rs
++++ b/src/ext/mod.rs
+@@ -59,6 +59,15 @@ mod h2_body_write_timeout;
+ #[cfg(feature = "http2")]
+ pub use h2_body_write_timeout::Http2BodyWriteTimeout;
+ 
++#[cfg(all(feature = "http2", feature = "server"))]
++mod h2_stream_termination;
++#[cfg(all(feature = "http2", feature = "server"))]
++pub use h2_stream_termination::{take_h2_stream_termination, H2StreamTermination};
++#[cfg(all(feature = "http2", feature = "server"))]
++pub(crate) use h2_stream_termination::{
++    publish_h2_stream_termination, ClearH2StreamTermination,
++};
++
+ #[cfg(all(feature = "http1", feature = "client"))]
+ mod informational;
+ #[cfg(all(feature = "http1", feature = "client"))]
+diff --git a/src/proto/h2/server.rs b/src/proto/h2/server.rs
+index 5c8ae7884..05aaa9747 100644
+--- a/src/proto/h2/server.rs
++++ b/src/proto/h2/server.rs
+@@ -17,6 +17,8 @@ use crate::common::date;
+ use crate::common::io::Compat;
+ use crate::common::time::Time;
+ use crate::ext::Protocol;
++// FERRUM PATCH 006
++use crate::ext::{publish_h2_stream_termination, ClearH2StreamTermination, H2StreamTermination};
+ use crate::headers;
+ use crate::proto::h2::ping::Recorder;
+ use crate::proto::Dispatched;
+@@ -377,6 +379,9 @@ pin_project! {
+         // FERRUM PATCH 005: bounds the response body pipe's coalescing wait.
+         timer: Time,
+         exec: E,
++        // FERRUM PATCH 006: declared after `state`, so it drops after the
++        // service future and clears a termination cause nobody took.
++        _termination: ClearH2StreamTermination,
+     }
+ }
+ 
+@@ -422,6 +427,7 @@ where
+             date_header,
+             timer,
+             exec,
++            _termination: ClearH2StreamTermination,
+         }
+     }
+ }
+@@ -461,13 +467,36 @@ where
+                         Poll::Pending => {
+                             // Response is not yet ready, so we want to check if the client has sent a
+                             // RST_STREAM frame which would cancel the current request.
+-                            if let Poll::Ready(reason) =
+-                                me.reply.poll_reset(cx).map_err(crate::Error::new_h2)?
+-                            {
+-                                debug!("stream received RST_STREAM: {:?}", reason);
+-                                return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
++                            //
++                            // FERRUM PATCH 006: before returning, publish who ended the
++                            // stream; the service future is dropped with this stream.
++                            match me.reply.poll_reset(cx) {
++                                Poll::Ready(Ok(reason)) => {
++                                    let code = u32::from(reason);
++                                    publish_h2_stream_termination(match me.reply.reset_is_local() {
++                                        Some(true) => H2StreamTermination::LocalReset { reason: code },
++                                        _ => H2StreamTermination::PeerReset { reason: code },
++                                    });
++                                    debug!("stream received RST_STREAM: {:?}", reason);
++                                    return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
++                                }
++                                Poll::Ready(Err(e)) => {
++                                    if e.is_io() {
++                                        publish_h2_stream_termination(
++                                            H2StreamTermination::TransportLost,
++                                        );
++                                    } else if let Some(reason) = e.reason() {
++                                        let code = u32::from(reason);
++                                        publish_h2_stream_termination(if e.is_remote() {
++                                            H2StreamTermination::PeerReset { reason: code }
++                                        } else {
++                                            H2StreamTermination::LocalReset { reason: code }
++                                        });
++                                    }
++                                    return Poll::Ready(Err(crate::Error::new_h2(e)));
++                                }
++                                Poll::Pending => return Poll::Pending,
+                             }
+-                            return Poll::Pending;
+                         }
+                         Poll::Ready(Err(e)) => {
+                             let err = crate::Error::new_user_service(e);

@@ -1085,6 +1085,8 @@ pub async fn run(
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
             .await;
     }
+    // Shutdown now tears down whatever is still pending (issue #6768).
+    crate::overload::end_shutdown_drain_wait(&proxy_state.overload);
     // Release backend transport pools that hold kernel objects (issue #3731).
     proxy_state.drain_transport_pools_for_shutdown().await;
 

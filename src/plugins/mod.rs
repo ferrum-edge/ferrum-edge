@@ -3557,13 +3557,14 @@ pub struct RequestContext {
     /// [`crate::proxy::client_abort_scope::ClientAbortScope`] reads it when hyper
     /// drops the handler future, so a request cancelled while its own terminal
     /// log is in flight never also gets a client-abort record.
-    terminal_record_started: TerminalRecordLatch,
+    pub(crate) terminal_record: TerminalRecordLatch,
 }
 
 /// Latch recording how far a request's terminal transaction record has got
 /// (see [`TerminalRecordState`]): the logged status and a "started" bit set when
-/// the shared log funnel takes the summary, plus a "finished" bit once every
-/// inline sink and the runtime counters are settled.
+/// the shared log funnel takes the summary, a "finished" bit once every inline
+/// sink and the runtime counters are settled, and a "counted" bit set when the
+/// handler counts the request in the gateway's request/status counters.
 ///
 /// Atomic only because the log funnel holds the context by shared reference;
 /// a request's handler, its funnel, and the client-abort scope all run on the
@@ -3575,6 +3576,20 @@ pub(crate) struct TerminalRecordLatch(std::sync::atomic::AtomicU32);
 
 const TERMINAL_RECORD_STARTED: u32 = 1 << 16;
 const TERMINAL_RECORD_FINISHED: u32 = 1 << 17;
+const TERMINAL_STATUS_COUNTED: u32 = 1 << 18;
+
+impl TerminalRecordLatch {
+    /// Note that the handler has counted this request in the gateway's
+    /// request/status counters, so a client abort never counts it again
+    /// (issue #6768). Called at every H1/H2 handler counting site.
+    #[inline]
+    pub(crate) fn mark_counted(&self) {
+        self.0.fetch_or(
+            TERMINAL_STATUS_COUNTED,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
 
 /// How far a request's own terminal transaction record has got when its
 /// handler stops (issue #6768).
@@ -3872,14 +3887,21 @@ impl RequestContext {
     /// record that already finished stays finished.
     #[inline]
     pub(crate) fn mark_terminal_record_started(&self, status: u16) {
-        let _ = self.terminal_record_started.0.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |state| {
-                (state & TERMINAL_RECORD_FINISHED == 0)
-                    .then_some(TERMINAL_RECORD_STARTED | u32::from(status))
-            },
-        );
+        let latch = &self.terminal_record.0;
+        let mut current = latch.load(std::sync::atomic::Ordering::Relaxed);
+        while current & TERMINAL_RECORD_FINISHED == 0 {
+            let next =
+                (current & TERMINAL_STATUS_COUNTED) | TERMINAL_RECORD_STARTED | u32::from(status);
+            match latch.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Note that this request's terminal record is settled: every inline sink
@@ -3887,7 +3909,7 @@ impl RequestContext {
     /// detached delivery.
     #[inline]
     pub(crate) fn mark_terminal_record_finished(&self) {
-        self.terminal_record_started.0.fetch_or(
+        self.terminal_record.0.fetch_or(
             TERMINAL_RECORD_STARTED | TERMINAL_RECORD_FINISHED,
             std::sync::atomic::Ordering::Relaxed,
         );
@@ -3896,7 +3918,7 @@ impl RequestContext {
     /// How far this context's own terminal record has got.
     pub fn terminal_record_state(&self) -> TerminalRecordState {
         let state = self
-            .terminal_record_started
+            .terminal_record
             .0
             .load(std::sync::atomic::Ordering::Relaxed);
         if state & TERMINAL_RECORD_FINISHED != 0 {
@@ -3916,6 +3938,16 @@ impl RequestContext {
     #[inline]
     pub fn terminal_record_started(&self) -> bool {
         self.terminal_record_state() != TerminalRecordState::NotStarted
+    }
+
+    /// Whether the H1/H2 handler already counted this request in the gateway's
+    /// request/status counters (issue #6768). Always `false` on a clone.
+    pub fn terminal_status_counted(&self) -> bool {
+        self.terminal_record
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & TERMINAL_STATUS_COUNTED
+            != 0
     }
 
     /// Record one completed backend attempt in the request's diagnostic
@@ -4291,7 +4323,7 @@ impl RequestContext {
             mesh_inbound_terminator_ip: None,
             hbone_connect_relay: false,
             finalized_request_egress_dispatched: false,
-            terminal_record_started: TerminalRecordLatch::default(),
+            terminal_record: TerminalRecordLatch::default(),
         }
     }
 
@@ -5916,7 +5948,7 @@ impl RequestContext {
             // consistent with the live request.
             finalized_request_egress_dispatched: self.finalized_request_egress_dispatched,
             // A compatibility clone never logs the request's terminal record.
-            terminal_record_started: TerminalRecordLatch::default(),
+            terminal_record: TerminalRecordLatch::default(),
         }
     }
 
@@ -8699,18 +8731,21 @@ pub const LATENCY_UNKNOWN_MS: f64 = -1.0;
 /// [`TransactionSummary::body_completed`]:
 ///
 /// * [`Self::NotObserved`] — the record was finalized before the frontend
-///   transport took the response (every buffered H1/H2 response, gateway
-///   rejections and Trailers-Only gRPC errors, buffered HTTP/3 responses). A
+///   transport took the response: every buffered H1/H2 response, H1/H2
+///   gateway rejections and Trailers-Only gRPC errors, a streamed H1/H2
+///   response whose builder failed before hyper saw it, and any record built
+///   before an HTTP/3 send (HTTP/3 records built after the send settled are
+///   [`Self::Observed`]). A
 ///   `false` `client_disconnected` then means only that no disconnect was seen
 ///   before the hand-off. It is not evidence that the response reached the
 ///   client, and a client that leaves while the transport writes the response
 ///   is not reflected.
 /// * [`Self::Observed`] — the record was finalized at the response's terminal
 ///   transport boundary: a streamed body ended, failed, or was dropped by the
-///   transport (`DeferredTransactionLogger`), an HTTP/3 send settled, or the
-///   transport ended the request before any response was produced (the H1/H2
-///   client-abort `499` or gateway-close `444`). A streamed record whose
-///   response builder failed before hyper saw it stays `NotObserved`.
+///   transport (`DeferredTransactionLogger`), an HTTP/3 send (buffered,
+///   streamed, or a rejection) settled, or the transport ended an H1/H2 request
+///   before any response was produced (the client-abort `499`, the
+///   protocol-reset `400`, or the gateway-close `444`).
 ///   `client_disconnected` and `body_completed` describe
 ///   that boundary. Even then the gateway only knows what the transport
 ///   accepted: bytes the transport accepted can still be lost before the client
@@ -9355,7 +9390,10 @@ async fn log_with_mirror_inner(
         armed: resume_on_cancel,
     };
     for (index, plugin) in plugins.iter().enumerate() {
-        delivery.next = index;
+        // This sink's invocation starts now. If it is cancelled mid-call it is
+        // NOT invoked again: it may already have persisted or enqueued the
+        // record, and a dropped record beats a duplicate audit entry.
+        delivery.next = index + 1;
         // Transaction logging is gateway cleanup after the client-visible
         // outcome is final. A client RPC deadline must bound request handling,
         // but it must not suppress the audit/transaction record for the
@@ -9416,9 +9454,10 @@ fn finish_terminal_delivery(
 ///
 /// Holds only borrows on the normal path, so it costs nothing until it fires.
 /// On drop while armed it clones the summary, context, and plugin list into a
-/// detached terminal-delivery task that resumes at the sink whose `log` was
-/// interrupted (its record never completed, so it is invoked again), then
-/// settles the runtime counters and mirrors exactly as the inline path does.
+/// detached terminal-delivery task that invokes only the sinks whose `log` had
+/// not started (at most once per sink: the interrupted sink is never invoked
+/// again), then settles the runtime counters and mirrors exactly as the inline
+/// path does.
 struct TerminalDeliveryGuard<'a> {
     plugins: &'a [Arc<dyn Plugin>],
     summary: &'a TransactionSummary,

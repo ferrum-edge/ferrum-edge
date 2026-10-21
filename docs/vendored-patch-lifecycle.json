@@ -934,6 +934,36 @@
       ]
     },
     {
+      "id": "hyper-006-h2-stream-termination-origin",
+      "label": "hyper reports why an HTTP/2 server stream ended while its service future is dropped",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/006-h2-stream-termination-origin/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "hyper drops a pending HTTP/2 service future on any stream reset, and the future's drop glue cannot tell a peer RST_STREAM/GOAWAY or lost transport from a reset hyper's own HTTP/2 stack sent for a protocol violation. Ferrum records one terminal per admitted request and may label it a client cancellation (499) only on positive evidence (#6768). H2Stream::poll2 publishes hyper::ext::H2StreamTermination in a thread-local slot just before it returns the reset, readable through take_h2_stream_termination() while the service future is dropped, and cleared by a field that drops after the future.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with h2 patch 004 when hyper exposes why a server stream ended to the service, or when Ferrum stops serving HTTP/2 through hyper. Without it every HTTP/2 drop is recorded as unattributed (444), never as a client cancellation.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/client_abort_accounting_tests.rs (h2_reset_while_waiting_for_response_headers_records_one_client_abort, h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort, unattributed_http2_drop_is_never_a_client_abort)"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",
@@ -993,6 +1023,36 @@
         "vendor/h2-0.4.20-ferrum-patched (share::ferrum_assigned_capacity_tests)",
         "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_h2_small_window_coalescing_tests::a_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer, a_response_chunk_within_the_assigned_window_is_not_split_at_the_send_buffer)",
         "tests/unit/gateway_core/frontend_h2_response_coalescing_tests.rs (vendored_h2_exposes_the_send_capacity_accessor_hyper_patch_005_reads)"
+      ]
+    },
+    {
+      "id": "h2-004-reset-origin",
+      "label": "h2 reports whether a stream's reset was local or the peer's",
+      "crate": "h2",
+      "vendored_version": "0.4.20",
+      "vendor_path": "vendor/h2-0.4.20-ferrum-patched",
+      "docs_path": "docs/upstream-h2-patches/004-reset-origin/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "SendResponse::poll_reset reports library-generated resets (a PROTOCOL_ERROR for a content-length overrun, for example) through the same call as a peer RST_STREAM, so a server cannot tell a cancelling client from one that broke the protocol. The read-only reset_is_local() accessor exposes the initiator h2 already records, for Hyper patch 006.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h2",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Retire with Hyper patch 006, or earlier when an h2 release exposes the reset initiator on SendResponse.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/unit/gateway_core/client_abort_accounting_tests.rs (h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort)"
       ]
     }
   ]

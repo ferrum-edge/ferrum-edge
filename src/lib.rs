@@ -113,6 +113,12 @@ pub mod _test_support {
         ctx.authorization_connection_closer = Some(closer);
     }
 
+    /// Mark a request context as already counted by its handler, as every
+    /// H1/H2 handler counting site does (issue #6768 client-abort scope tests).
+    pub fn mark_terminal_status_counted_for_test(ctx: &crate::plugins::RequestContext) {
+        ctx.terminal_record.mark_counted();
+    }
+
     /// Bind a caller-owned shutdown broadcaster exactly as the serving modes do.
     pub fn shutdown_overload_for_test(
         shutdown: &crate::overload::ShutdownSender,

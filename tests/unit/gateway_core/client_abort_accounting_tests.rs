@@ -38,7 +38,7 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::proxy::client_abort_scope::{
     CLIENT_ABORT_REJECTION_PHASE, ClientAbortScope, GATEWAY_CLOSED_REQUEST_STATUS,
-    GatewayCloseCause,
+    PROTOCOL_RESET_REJECTION_PHASE, PROTOCOL_RESET_REQUEST_STATUS, TerminationCause,
 };
 use ferrum_edge::proxy::grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS;
 use ferrum_edge::proxy::{ProxyState, start_proxy_listener_with_bound_listener};
@@ -514,7 +514,12 @@ async fn dropped_scope_logs_one_client_abort_record() {
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         ctx.headers
             .insert("user-agent".to_string(), "abort-test".to_string());
         record.observe_plugins(&plugins);
@@ -554,7 +559,12 @@ async fn dropped_grpc_scope_records_cancelled() {
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         ctx.metadata
             .insert("request_protocol".to_string(), "grpc".to_string());
         record.observe_plugins(&plugins);
@@ -580,7 +590,12 @@ async fn retained_client_path_is_logged_after_a_route_override() {
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         record.observe_plugins(&plugins);
         ctx.path = "/backend/rewritten".to_string();
         record.retain_client_request_path("/orders");
@@ -596,7 +611,12 @@ async fn retained_client_path_is_logged_after_a_route_override() {
 async fn dropped_scope_without_plugins_still_counts_the_abort() {
     let state = scope_state();
     let mut scope = ClientAbortScope::new();
-    let _ = scope.install(&state, Instant::now(), request_context());
+    let _ = scope.install(
+        &state,
+        Instant::now(),
+        http::Version::HTTP_11,
+        request_context(),
+    );
     drop(scope);
 
     assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 1);
@@ -609,7 +629,12 @@ async fn completed_scope_records_nothing() {
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (_ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (_ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         record.observe_plugins(&plugins);
     }
     scope.complete();
@@ -626,7 +651,12 @@ async fn handed_off_context_is_not_recorded_by_the_scope() {
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (_ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (_ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         record.observe_plugins(&plugins);
     }
     let ctx = scope.hand_off().expect("installed context");
@@ -646,7 +676,12 @@ async fn abort_after_the_terminal_log_finished_adds_no_second_record() {
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         record.observe_plugins(&plugins);
         let summary = TransactionSummary {
             response_status_code: 200,
@@ -721,9 +756,10 @@ impl Plugin for ParkingPlugin {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_while_a_sink_is_pending_still_delivers_and_counts_once() {
     // hyper drops the handler while the first logging sink is genuinely
-    // pending. The interrupted sink is invoked again, the later sink still
-    // receives the summary, and the status the handler would have counted
-    // after its log is counted exactly once, with no client-abort record.
+    // pending. The interrupted sink is never invoked again (it may already
+    // have persisted the record), the later sink still receives the summary
+    // once, and the status the handler would have counted after its log is
+    // counted exactly once, with no client-abort record.
     let state = scope_state();
     let calls = Arc::new(Mutex::new(Vec::new()));
     let started = Arc::new(tokio::sync::Notify::new());
@@ -745,7 +781,12 @@ async fn cancel_while_a_sink_is_pending_still_delivers_and_counts_once() {
     let handler = tokio::spawn(async move {
         let mut scope = ClientAbortScope::new();
         {
-            let (ctx, record) = scope.install(&handler_state, Instant::now(), request_context());
+            let (ctx, record) = scope.install(
+                &handler_state,
+                Instant::now(),
+                http::Version::HTTP_11,
+                request_context(),
+            );
             record.observe_plugins(&handler_plugins);
             let summary = TransactionSummary {
                 response_status_code: 201,
@@ -770,8 +811,8 @@ async fn cancel_while_a_sink_is_pending_still_delivers_and_counts_once() {
     assert_eq!(summaries[0].response_status_code, 201);
     assert_eq!(
         calls.lock().expect("parking calls").as_slice(),
-        [201, 201],
-        "the interrupted sink is invoked again"
+        [201],
+        "a sink whose invocation started is never invoked again"
     );
     assert_eq!(status_count(&state, 201), 1, "the handler's status, once");
     assert_eq!(state.request_count.load(Ordering::Relaxed), 1);
@@ -788,7 +829,12 @@ async fn cancelled_grpc_overrides_a_stale_backend_status() {
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         ctx.metadata
             .insert("request_protocol".to_string(), "grpc".to_string());
         ctx.metadata
@@ -807,15 +853,23 @@ async fn cancelled_grpc_overrides_a_stale_backend_status() {
 }
 
 #[tokio::test]
-async fn shutdown_drain_drop_is_a_gateway_close_not_a_client_abort() {
+async fn shutdown_teardown_drop_is_a_gateway_close_not_a_client_abort() {
+    // Once shutdown stops waiting for in-flight work, the gateway tears the
+    // remaining handlers down itself.
     let state = scope_state();
     let (plugins, captured) = capture();
     let mut scope = ClientAbortScope::new();
     {
-        let (_ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (_ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
         record.observe_plugins(&plugins);
     }
     state.overload.draining.store(true, Ordering::Release);
+    ferrum_edge::overload::end_shutdown_drain_wait(&state.overload);
     drop(scope);
 
     let summaries = captured_after(&captured, 1).await;
@@ -829,7 +883,7 @@ async fn shutdown_drain_drop_is_a_gateway_close_not_a_client_abort() {
     assert_eq!(summary.error_class, None);
     assert_eq!(
         summary.rejection_phase(),
-        Some(GatewayCloseCause::Shutdown.rejection_phase())
+        Some(TerminationCause::ShutdownTeardown.rejection_phase())
     );
     assert_eq!(status_count(&state, GATEWAY_CLOSED_REQUEST_STATUS), 1);
     assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
@@ -839,13 +893,21 @@ async fn shutdown_drain_drop_is_a_gateway_close_not_a_client_abort() {
 #[tokio::test]
 async fn authorization_close_drops_a_sibling_stream_as_a_gateway_close() {
     // One stream's authorization lifetime closed the connection; a sibling
-    // stream still waiting on its backend is dropped by that close.
+    // gRPC stream with valid credentials, still waiting on its backend, is
+    // dropped by that close. Its own authentication never failed.
     let state = scope_state();
     let (plugins, captured) = capture();
     let closer = ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser::new();
     let mut scope = ClientAbortScope::new();
     {
-        let (ctx, record) = scope.install(&state, Instant::now(), request_context());
+        let (ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_2,
+            request_context(),
+        );
+        ctx.metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
         ferrum_edge::_test_support::attach_authorization_connection_closer_for_test(
             ctx,
             closer.clone(),
@@ -863,8 +925,187 @@ async fn authorization_close_drops_a_sibling_stream_as_a_gateway_close() {
     );
     assert_eq!(
         summaries[0].rejection_phase(),
-        Some(GatewayCloseCause::AuthorizationLifetime.rejection_phase())
+        Some(TerminationCause::AuthorizationConnectionClose.rejection_phase())
+    );
+    assert_eq!(
+        summaries[0].grpc_status(),
+        Some(14),
+        "collateral connection loss is UNAVAILABLE, never UNAUTHENTICATED"
     );
     assert_eq!(status_count(&state, GATEWAY_CLOSED_REQUEST_STATUS), 1);
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
+}
+
+#[tokio::test]
+async fn http1_drop_during_graceful_drain_is_still_a_client_abort() {
+    // During the drain wait the gateway only waits for in-flight work; an
+    // HTTP/1.1 handler dropped then lost its client.
+    let state = scope_state();
+    let mut scope = ClientAbortScope::new();
+    let _ = scope.install(
+        &state,
+        Instant::now(),
+        http::Version::HTTP_11,
+        request_context(),
+    );
+    state.overload.draining.store(true, Ordering::Release);
+    drop(scope);
+
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 1);
+    assert_eq!(status_count(&state, GATEWAY_CLOSED_REQUEST_STATUS), 0);
+}
+
+#[tokio::test]
+async fn unattributed_http2_drop_is_never_a_client_abort() {
+    // An HTTP/2 handler dropped without a termination cause from hyper (none
+    // was published for it) carries no evidence of the peer's cancellation.
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let mut scope = ClientAbortScope::new();
+    {
+        let (_ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_2,
+            request_context(),
+        );
+        record.observe_plugins(&plugins);
+    }
+    drop(scope);
+
+    let summaries = captured_after(&captured, 1).await;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0].response_status_code,
+        GATEWAY_CLOSED_REQUEST_STATUS
+    );
+    assert!(!summaries[0].client_disconnected);
+    assert_eq!(
+        summaries[0].rejection_phase(),
+        Some(TerminationCause::Unattributed.rejection_phase())
+    );
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
+}
+
+#[tokio::test]
+async fn a_counted_request_is_not_counted_again() {
+    // A handler that counted its status before an await it was dropped in
+    // keeps that count; the scope logs the abort without counting twice.
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let mut scope = ClientAbortScope::new();
+    {
+        let (ctx, record) = scope.install(
+            &state,
+            Instant::now(),
+            http::Version::HTTP_11,
+            request_context(),
+        );
+        record.observe_plugins(&plugins);
+        ferrum_edge::_test_support::mark_terminal_status_counted_for_test(ctx);
+    }
+    drop(scope);
+
+    assert_eq!(captured_after(&captured, 1).await.len(), 1);
+    assert_eq!(state.request_count.load(Ordering::Relaxed), 0);
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
+}
+
+/// One HTTP/2 frame: 9-byte header, then `payload`.
+fn h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() as u32;
+    let mut frame = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+    frame.extend_from_slice(&stream_id.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort() {
+    // The client declares `content-length: 1` and sends five bytes. hyper's
+    // HTTP/2 stack resets the stream with PROTOCOL_ERROR itself while the
+    // handler is pending: a local protocol rejection, not the peer's
+    // cancellation.
+    use std::convert::Infallible;
+
+    use http_body_util::Empty;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let (called_tx, mut called_rx) = mpsc::unbounded_channel::<()>();
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let service_state = Arc::clone(&state);
+    let service_plugins = Arc::clone(&plugins);
+    let service = service_fn(move |_request: Request<Incoming>| {
+        let state = Arc::clone(&service_state);
+        let plugins = Arc::clone(&service_plugins);
+        let called = called_tx.clone();
+        async move {
+            let mut scope = ClientAbortScope::new();
+            {
+                let (_ctx, record) = scope.install(
+                    &state,
+                    Instant::now(),
+                    http::Version::HTTP_2,
+                    request_context(),
+                );
+                record.observe_plugins(&plugins);
+            }
+            let _ = called.send(());
+            std::future::pending::<()>().await;
+            scope.complete();
+            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        }
+    });
+    tokio::spawn(async move {
+        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(server_io), service)
+            .await;
+    });
+
+    let (mut client_read, mut client_write) = tokio::io::split(client_io);
+    // Drain whatever the server writes so it never blocks on the duplex.
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = client_read.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    let mut opening = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    opening.extend(h2_frame(0x4, 0, 0, &[]));
+    // HPACK: :method POST, :scheme http, :path /, :authority x (literal,
+    // indexed name 1), content-length: 1 (literal, indexed name 28).
+    let headers = [0x83, 0x86, 0x84, 0x01, 0x01, b'x', 0x0F, 0x0D, 0x01, b'1'];
+    opening.extend(h2_frame(0x1, 0x4, 1, &headers));
+    client_write
+        .write_all(&opening)
+        .await
+        .expect("preface and HEADERS");
+    tokio::time::timeout(WAIT, called_rx.recv())
+        .await
+        .expect("the handler runs")
+        .expect("handler signal");
+    client_write
+        .write_all(&h2_frame(0x0, 0, 1, b"hello"))
+        .await
+        .expect("DATA past content-length");
+
+    let summaries = captured_after(&captured, 1).await;
+    assert_eq!(summaries.len(), 1, "exactly one terminal record");
+    let summary = &summaries[0];
+    assert_eq!(summary.response_status_code, PROTOCOL_RESET_REQUEST_STATUS);
+    assert!(!summary.client_disconnected);
+    assert_eq!(summary.error_class, Some(ErrorClass::ProtocolError));
+    assert_eq!(
+        summary.rejection_phase(),
+        Some(PROTOCOL_RESET_REJECTION_PHASE)
+    );
+    assert_eq!(status_count(&state, PROTOCOL_RESET_REQUEST_STATUS), 1);
     assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
 }

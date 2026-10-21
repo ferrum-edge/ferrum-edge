@@ -1923,14 +1923,15 @@ transaction hook sequentially:
   `client_disconnect_before_response`) to the same detached terminal delivery
   the streamed body uses, so the `log` hooks still run exactly once (issue
   #6768). Only `log` / `log_with_mesh_key` run for it: there is no response, so
-  no response-phase or streaming terminal hook does. A connection the gateway
-  closes itself is recorded the same way as a `444` gateway close.
-- `log_with_mirror` is cancellation-safe: if the task awaiting it is dropped
-  while a sink's `log` is pending, the summary, context, and remaining plugin
-  list move to detached terminal delivery, which invokes the interrupted sink
-  again and the later sinks once, then records the runtime counters and
-  mirrors. A sink must therefore tolerate a repeated `log` for a summary whose
-  first call was cancelled before it returned.
+  no response-phase or streaming terminal hook does. A reset the gateway's own
+  HTTP/2 stack sent is recorded the same way as a `400`, and a connection the
+  gateway closed itself as a `444`.
+- `log_with_mirror` is cancellation-safe and at-most-once per sink: if the task
+  awaiting it is dropped while a sink's `log` is pending, the summary, context,
+  and the sinks that had not started move to detached terminal delivery, which
+  invokes each of them once and then records the runtime counters and mirrors.
+  The interrupted sink is never invoked again: it may already have persisted
+  or enqueued the record, and a dropped record is preferred over a duplicate.
 
 A buffered record is built before the response is handed to the transport and
 says so with `response_delivery: not_observed`; streamed, HTTP/3 post-send,
