@@ -38,6 +38,22 @@
 
 set -eo pipefail
 
+# Runtime Docker operations must not pin a readiness or cleanup step. Image
+# builds retain their explicit build-job budget; pulls have a separate cap.
+docker() {
+    local budget=10 remaining
+    case "$1" in
+        build) command docker "$@"; return ;;
+        pull) budget=120 ;;
+    esac
+    if [ "${READINESS_DEADLINE:-0}" -gt 0 ] && [ "$1" != logs ] && [ "$1" != rm ]; then
+        remaining=$((READINESS_DEADLINE - SECONDS))
+        [ "$remaining" -gt 0 ] || return 124
+        [ "$remaining" -ge "$budget" ] || budget="$remaining"
+    fi
+    timeout --signal=TERM --kill-after=2s "${budget}s" docker "$@"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
 
@@ -51,7 +67,7 @@ else
     [ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|linkerd> [options]" >&2; exit 2; }
     shift
     case "$MESH" in
-        direct|ferrum|envoy|consul|linkerd) ;;
+        direct|ferrum|envoy|consul|consulhttp|linkerd) ;;
         *) echo "unknown mesh arm: $MESH" >&2; exit 2 ;;
     esac
 fi
@@ -60,6 +76,9 @@ PAYLOAD_SIZES="1024 10240 71680 512000 1048576 5242880"
 DURATION=10
 CONCURRENCY=100
 WARMUP=2
+EXCHANGE_TIMEOUT_SECS=10
+READINESS_TIMEOUT_SECS=90
+READINESS_DEADLINE=0
 OUTPUT_DIR="/tmp/mesh-runtime-results"
 SKIP_BUILD=false
 
@@ -88,12 +107,18 @@ done
 for s in $PAYLOAD_SIZES; do
     [[ "$s" =~ ^[0-9]+$ ]] || { echo "non-numeric payload size: $s" >&2; exit 2; }
 done
+[ "$DURATION" -gt 0 ] && [ "$CONCURRENCY" -gt 0 ] || { echo "duration and concurrency must be positive" >&2; exit 2; }
+command -v timeout >/dev/null || { echo "GNU timeout is required for bounded benchmark operations" >&2; exit 2; }
 
 FERRUM_IMAGE="${FERRUM_IMAGE:-ferrum-edge:bench}"
 ENVOY_IMAGE="${ENVOY_IMAGE:-envoyproxy/envoy:v1.39.1}"
 CONSUL_IMAGE="${CONSUL_IMAGE:-hashicorp/consul:1.21.4}"
 LINKERD_IMAGE="${LINKERD_IMAGE:-ghcr.io/linkerd/proxy:edge-25.11.1}"
 TOOLS_IMAGE="${TOOLS_IMAGE:-mesh-bench-tools:local}"
+BENCH_CARGO_PROFILE="${BENCH_CARGO_PROFILE:-release}"
+case "$BENCH_CARGO_PROFILE" in release|ci-release) ;; *) echo "invalid build profile" >&2; exit 2 ;; esac
+BENCH_FERRUM_FEATURES="${BENCH_FERRUM_FEATURES:-cloud-secrets}"
+case "$BENCH_FERRUM_FEATURES" in cloud-secrets|cloud-secrets,bench-h1-profile) ;; *) echo "invalid build features" >&2; exit 2 ;; esac
 
 BACKEND_PORT=18080
 OUTBOUND_PORT=15101
@@ -103,6 +128,11 @@ BACKEND_NAME="meshbench-${MESH}-${RUN_ID}-backend"
 CLIENT_NAME="meshbench-${MESH}-${RUN_ID}-client"
 SERVER_NAME="meshbench-${MESH}-${RUN_ID}-server"
 AGENT_NAME="meshbench-${MESH}-${RUN_ID}-agent"
+PROBE_NAME="meshbench-${MESH}-${RUN_ID}-probe"
+LOADGEN_NAME="meshbench-${MESH}-${RUN_ID}-loadgen"
+# This grants access only through the explicitly mounted, disposable fixture
+# directories. Container users stay nonroot and private keys stay mode 0640.
+CERT_GID="$(id -g)"
 
 mkdir -p "$OUTPUT_DIR"
 # Docker -v sources must be absolute (a relative results/... source is a
@@ -125,17 +155,39 @@ write_arm_status() {
 }
 
 cleanup() {
-    docker rm -f "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" "$AGENT_NAME" >/dev/null 2>&1 || true
+    local rc=$?
+    if [ "$rc" -ne 0 ] && [ -n "$MESH" ]; then
+        if ! grep -q '"status":"failed"' "$ARM_STATUS_FILE" 2>/dev/null; then
+            write_arm_status failed "harness exited with status $rc"
+        fi
+        dump_logs
+    fi
+    timeout --signal=KILL 5s docker rm -f "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" "$AGENT_NAME" \
+        "$PROBE_NAME" "$LOADGEN_NAME" >/dev/null 2>&1 || true
     # Single-run private keys never outlive the run (certificates and
     # public bundles remain as provenance under runtime/).
     rm -f "$CERT_DIR"/*/svid.key "$CERT_DIR"/*/key.p8 \
         "$CERT_DIR/ca/root.key" "$CERT_DIR/rogue/root.key" 2>/dev/null || true
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+prepare_cert_access() {
+    # Change only this run's synthetic fixture, never host credential stores.
+    chgrp "$CERT_GID" "$CERT_DIR" "$CERT_DIR"/ca "$CERT_DIR"/svc "$CERT_DIR"/client "$CERT_DIR"/rogue \
+        "$CERT_DIR"/*/svid.key
+    chmod 750 "$CERT_DIR" "$CERT_DIR"/ca "$CERT_DIR"/svc "$CERT_DIR"/client "$CERT_DIR"/rogue
+    chmod 640 "$CERT_DIR"/*/svid.key
+    chmod 600 "$CERT_DIR/ca/root.key" "$CERT_DIR/rogue/root.key"
+    chmod 644 "$CERT_DIR"/*/*.crt "$CERT_DIR"/*/bundle.pem
+}
 
 # ── Certs: one EC P-256 CA, svc + client SVID-shaped leaves ────────────────
-generate_certs() {
-    if [ -f "$CERT_DIR/svc/svid.crt" ]; then
+generate_certs() (
+    umask 077
+    if [ -f "$CERT_DIR/svc/svid.crt" ] && [ -f "$CERT_DIR/svc/svid.key" ] && \
+            [ -f "$CERT_DIR/client/svid.key" ] && [ -f "$CERT_DIR/rogue/svid.key" ]; then
         echo "[certs] reusing $CERT_DIR"
         return
     fi
@@ -182,8 +234,8 @@ generate_certs() {
         -extfile "$CERT_DIR/rogue/svid.ext" -out "$CERT_DIR/rogue/svid.crt" 2>/dev/null
     cp "$CERT_DIR/rogue/root.crt" "$CERT_DIR/rogue/bundle.pem"
     rm -f "$CERT_DIR/rogue/svid.csr" "$CERT_DIR/rogue/svid.ext"
-    chmod 640 "$CERT_DIR/rogue/svid.key" "$CERT_DIR/rogue/root.key"
-}
+    chmod 640 "$CERT_DIR/rogue/svid.key"
+)
 
 # ── Builds / pulls ──────────────────────────────────────────────────────────
 build_tools_image() {
@@ -195,7 +247,8 @@ build_tools_image() {
 
 build_ferrum_image() {
     echo "[build] building ferrum image $FERRUM_IMAGE (repo Dockerfile)"
-    docker build -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" \
+    docker build --build-arg "CARGO_PROFILE=$BENCH_CARGO_PROFILE" --build-arg "FEATURES=$BENCH_FERRUM_FEATURES" \
+        -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" \
         > "$OUTPUT_DIR/logs/ferrum-build.log" 2>&1 || {
         tail -30 "$OUTPUT_DIR/logs/ferrum-build.log" >&2; exit 1; }
 }
@@ -227,7 +280,7 @@ prepare_images() {
             fi
             ;;
         envoy) docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true ;;
-        consul)
+        consul|consulhttp)
             docker pull "$CONSUL_IMAGE" > "$OUTPUT_DIR/logs/consul-pull.log" 2>&1 || true
             docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true
             ;;
@@ -246,28 +299,55 @@ start_backend() {
 # Linux hosts and local container VMs (no host curl into the VM netns).
 probe_loadgen() {
     local target="$1" out="$OUTPUT_DIR/logs/probe.json"
-    docker run --rm --network host "$TOOLS_IMAGE" \
+    local rc=0
+    readiness_command 10 docker run --rm --network host --name "$PROBE_NAME" "$TOOLS_IMAGE" \
         --target "$target" --host-header "$HOST_HEADER" --mesh probe \
-        --duration 1 --concurrency 1 --payload-size 64 --json > "$out" 2>/dev/null || return 1
+        --duration 1 --concurrency 1 --payload-size 64 --exchange-timeout-secs 2 --json \
+        > "$out" 2> "$OUTPUT_DIR/logs/probe.stderr.log" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        timeout --signal=KILL 2s docker rm -f "$PROBE_NAME" >/dev/null 2>&1 || true
+        return 1
+    fi
     grep -q '"total_errors": 0' "$out" && grep -qE '"total_requests": [1-9]' "$out"
 }
 
+readiness_command() {
+    local budget="$1" remaining
+    shift
+    if [ "$READINESS_DEADLINE" -gt 0 ]; then
+        remaining=$((READINESS_DEADLINE - SECONDS))
+        [ "$remaining" -gt 0 ] || return 124
+        [ "$remaining" -ge "$budget" ] || budget="$remaining"
+    fi
+    timeout --signal=TERM --kill-after=2s "${budget}s" "$@"
+}
+
 wait_ready() {
-    local target="$1" label="$2" tries="${3:-60}"
-    for _ in $(seq 1 "$tries"); do
+    local target="$1" label="$2" container running attempt=0
+    shift 2
+    while [ "$SECONDS" -lt "$READINESS_DEADLINE" ]; do
+        for container in "$@"; do
+            running=$(readiness_command 3 docker inspect --format '{{.State.Running}}' "$container") || return 1
+            if [ "$running" != true ]; then
+                echo "[ready] $label container $container exited before readiness" >&2
+                return 1
+            fi
+        done
+        attempt=$((attempt + 1))
+        echo "[ready] $label probe=$attempt remaining=$((READINESS_DEADLINE - SECONDS))s"
         if probe_loadgen "$target"; then
             echo "[ready] $label answering through $target"
             return 0
         fi
         sleep 0.5
     done
-    echo "[ready] $label did not become ready via $target" >&2
+    echo "[ready] $label exhausted the shared ${READINESS_TIMEOUT_SECS}s readiness budget via $target" >&2
     return 1
 }
 
 dump_logs() {
     for c in "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" "$AGENT_NAME"; do
-        docker logs "$c" > "$OUTPUT_DIR/logs/${c}.log" 2>&1 || true
+        timeout --signal=KILL 1s docker logs "$c" > "$OUTPUT_DIR/logs/${c}.log" 2>&1 || true
     done
 }
 
@@ -284,8 +364,9 @@ start_ferrum() {
     # an empty directory at the source path).
     mkdir -p "$RUNTIME_DIR/ferrum"
     cp "$SCRIPT_DIR/configs/ferrum/mesh.yaml" "$RUNTIME_DIR/ferrum/mesh.yaml"
+    chmod 644 "$RUNTIME_DIR/ferrum/mesh.yaml"
     # Server (destination) sidecar: inbound :15006 STRICT mTLS.
-    docker run -d --network host --name "$SERVER_NAME" \
+    docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/ferrum/svid:ro" \
         -e FERRUM_MODE=mesh \
@@ -304,10 +385,12 @@ start_ferrum() {
         -e FERRUM_POOL_WARMUP_ENABLED=false \
         -e FERRUM_PROXY_HTTP_PORT=0 \
         -e FERRUM_ADMIN_HTTP_PORT=15020 \
+        -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
+        -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
         "$FERRUM_IMAGE" >/dev/null
     # Client sidecar: outbound :15101 dials destination :15006, pins SVID.
-    docker run -d --network host --name "$CLIENT_NAME" \
+    docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/client:/etc/ferrum/svid:ro" \
         -e FERRUM_MODE=mesh \
@@ -327,6 +410,8 @@ start_ferrum() {
         -e FERRUM_POOL_WARMUP_ENABLED=false \
         -e FERRUM_PROXY_HTTP_PORT=0 \
         -e FERRUM_ADMIN_HTTP_PORT=15120 \
+        -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
+        -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
         "$FERRUM_IMAGE" >/dev/null
 }
@@ -337,13 +422,16 @@ start_envoy() {
         > "$RUNTIME_DIR/envoy/server.yaml"
     sed "s|CERT_DIR|/etc/mesh-certs|g" "$SCRIPT_DIR/configs/envoy/client.yaml.tmpl" \
         > "$RUNTIME_DIR/envoy/client.yaml"
+    chmod 644 "$RUNTIME_DIR/envoy/server.yaml" "$RUNTIME_DIR/envoy/client.yaml"
     # Distinct --base-id: two Envoy processes sharing one host netns
     # otherwise collide on the base-id domain socket and the second exits.
-    docker run -d --network host --name "$SERVER_NAME" \
+    # v1.39.1's root entrypoint uses su-exec, which rebuilds groups. Start
+    # nonroot so its direct-exec branch retains Docker's fixture group.
+    docker run -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/server.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/mesh-certs/svc:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 0 -l error >/dev/null
-    docker run -d --network host --name "$CLIENT_NAME" \
+    docker run -d --network host --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/client.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/client:/etc/mesh-certs/client:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 1 -l error >/dev/null
@@ -362,22 +450,36 @@ start_consul() {
     cp "$SCRIPT_DIR/configs/consul/intention-deny.json" "$RUNTIME_DIR/consul/intention-deny.json"
     docker run -d --network host --name "$AGENT_NAME" \
         "$CONSUL_IMAGE" agent -dev -client=127.0.0.1 -bind=127.0.0.1 >/dev/null
-    local attempt
-    for attempt in $(seq 1 60); do
-        docker exec "$AGENT_NAME" consul members >/dev/null 2>&1 && break
+    local ready=false running
+    while [ "$SECONDS" -lt "$READINESS_DEADLINE" ]; do
+        running=$(readiness_command 3 docker inspect --format '{{.State.Running}}' "$AGENT_NAME") || return 1
+        [ "$running" = true ] || { echo "[ready] Consul agent exited" >&2; return 1; }
+        if docker exec "$AGENT_NAME" consul members >/dev/null 2>&1; then
+            ready=true; break
+        fi
         sleep 0.5
     done
+    [ "$ready" = true ] || { echo "[ready] Consul agent exhausted readiness budget" >&2; return 1; }
     docker cp "$RUNTIME_DIR/consul/svc.json" "$AGENT_NAME:/tmp/svc.json"
     docker cp "$RUNTIME_DIR/consul/client.json" "$AGENT_NAME:/tmp/client.json"
     docker cp "$RUNTIME_DIR/consul/intention-deny.json" "$AGENT_NAME:/tmp/intention-deny.json"
     docker exec "$AGENT_NAME" consul services register /tmp/svc.json >/dev/null
     docker exec "$AGENT_NAME" consul services register /tmp/client.json >/dev/null
+    # Keep the historical Consul TCP/L4 arm. HTTP is a separate, explicit
+    # service-defaults arm; service registration alone defaults to TCP.
+    if [ "$MESH" = consulhttp ]; then
+        docker cp "$SCRIPT_DIR/configs/consul/svc-http.json" "$AGENT_NAME:/tmp/svc-http.json"
+        docker cp "$SCRIPT_DIR/configs/consul/client-http.json" "$AGENT_NAME:/tmp/client-http.json"
+        docker exec "$AGENT_NAME" consul config write /tmp/svc-http.json >/dev/null
+        docker exec "$AGENT_NAME" consul config write /tmp/client-http.json >/dev/null
+    fi
     docker exec "$AGENT_NAME" consul connect envoy -sidecar-for svc-1 -bootstrap \
         > "$RUNTIME_DIR/consul/svc-bootstrap.json"
     docker exec "$AGENT_NAME" consul connect envoy -sidecar-for client-1 -bootstrap \
         > "$RUNTIME_DIR/consul/client-bootstrap.json"
     python3 "$SCRIPT_DIR/prepare_consul_bootstrap.py" "$RUNTIME_DIR/consul/svc-bootstrap.json" 19002
     python3 "$SCRIPT_DIR/prepare_consul_bootstrap.py" "$RUNTIME_DIR/consul/client-bootstrap.json" 19001
+    chmod 644 "$RUNTIME_DIR/consul/svc-bootstrap.json" "$RUNTIME_DIR/consul/client-bootstrap.json"
     # Distinct --base-id: two Envoy processes sharing one host netns
     # otherwise collide on the base-id domain socket.
     docker run -d --network host --name "$SERVER_NAME" \
@@ -403,6 +505,7 @@ consul_intention_probe() {
     docker exec "$AGENT_NAME" consul config write /tmp/intention-deny.json >> "$evidence" 2>&1
     local attempt denied=false
     for attempt in $(seq 1 20); do
+        [ "$SECONDS" -lt "$READINESS_DEADLINE" ] || break
         if ! probe_loadgen "http://127.0.0.1:$OUTBOUND_PORT/echo"; then
             denied=true; break
         fi
@@ -414,7 +517,7 @@ consul_intention_probe() {
         return 1
     fi
     echo "[auth-probe] ok: deny intention broke echo; restoring" | tee -a "$evidence"
-    wait_ready "http://127.0.0.1:$OUTBOUND_PORT/echo" consul-pair-restored 60
+    wait_ready "http://127.0.0.1:$OUTBOUND_PORT/echo" consul-pair-restored "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"
 }
 
 start_linkerd() {
@@ -430,8 +533,12 @@ start_linkerd() {
     cp "$CERT_DIR/svc/svid.key" "$CERT_DIR/linkerd-svc/key.p8"
     cp "$CERT_DIR/client/svid.crt" "$CERT_DIR/linkerd-client/crt.pem"
     cp "$CERT_DIR/client/svid.key" "$CERT_DIR/linkerd-client/key.p8"
-    docker run -d --network host --name "$SERVER_NAME" \
-        -v "$CERT_DIR/linkerd-svc:/var/run/linkerd/identity/end-entity" \
+    chgrp "$CERT_GID" "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client" "$CERT_DIR"/linkerd-*/key.p8
+    chmod 750 "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client"
+    chmod 640 "$CERT_DIR"/linkerd-*/key.p8
+    chmod 644 "$CERT_DIR"/linkerd-*/crt.pem
+    docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
+        -v "$CERT_DIR/linkerd-svc:/var/run/linkerd/identity/end-entity:ro" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_INBOUND_LISTEN_ADDR=127.0.0.1:4143 \
         -e LINKERD2_PROXY_INBOUND_PORTS=18080 \
@@ -441,8 +548,8 @@ start_linkerd() {
         -e LINKERD2_PROXY_IDENTITY_TOKEN_FILE="" \
         -e LINKERD2_PROXY_IDENTITY_LOCAL_NAME=svc.ferrum.serviceaccount.identity.linkerd.cluster.local \
         "$LINKERD_IMAGE" >/dev/null 2>&1 || true
-    docker run -d --network host --name "$CLIENT_NAME" \
-        -v "$CERT_DIR/linkerd-client:/var/run/linkerd/identity/end-entity" \
+    docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
+        -v "$CERT_DIR/linkerd-client:/var/run/linkerd/identity/end-entity:ro" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_OUTBOUND_LISTEN_ADDR=127.0.0.1:4140 \
         -e LINKERD2_PROXY_DESTINATION_CONTEXT="ns:ferrum" \
@@ -476,43 +583,37 @@ run_cell() {
     eff_concurrency=$(effective_concurrency "$payload")
     echo "[bench] $MESH payload=${payload}B duration=${DURATION}s concurrency=$eff_concurrency"
 
-    if [ "$WARMUP" -gt 0 ]; then
-        docker run --rm --network host "$TOOLS_IMAGE" \
-            --target "$target" --host-header "$HOST_HEADER" --mesh warmup \
-            --duration "$WARMUP" --concurrency "$eff_concurrency" \
-            --payload-size "$payload" --json > /dev/null 2>&1 || true
-    fi
-
-    # Sample proxy container stats (CPU/memory) for the measured window.
-    : > "$stats"
-    local stats_pid=""
+    # Warm the same frontend connections that are measured. The host sampler
+    # brackets /proc CPU/steal at the loadgen's common measurement markers.
+    local resource_args=()
     if [ "$MESH" != direct ]; then
-        (
-            while :; do
-                docker stats --no-stream --format '{{json .}}' \
-                    "$CLIENT_NAME" "$SERVER_NAME" >> "$stats" 2>/dev/null || true
-                sleep 1
-            done
-        ) &
-        stats_pid=$!
+        resource_args=(--container "$CLIENT_NAME" --container "$SERVER_NAME")
     fi
-
+    if [ "$MESH" = ferrum ] && [ "$BENCH_FERRUM_FEATURES" = cloud-secrets,bench-h1-profile ]; then
+        resource_args+=(--allocation-url http://127.0.0.1:15120/metrics --allocation-url http://127.0.0.1:15020/metrics)
+    fi
     local rc=0
-    docker run --rm --network host "$TOOLS_IMAGE" \
+    local cell_budget=$((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))
+    echo "[bench] cell wall budget=${cell_budget}s exchange budget=${EXCHANGE_TIMEOUT_SECS}s"
+    timeout --signal=TERM --kill-after=5s "${cell_budget}s" \
+        python3 -u "$SCRIPT_DIR/collect_resources.py" "${resource_args[@]}" \
+        --output "$out" --resources "${out%.json}.resources.json" --image "$TOOLS_IMAGE" \
+        --loadgen-name "$LOADGEN_NAME" --exchange-timeout-secs "$EXCHANGE_TIMEOUT_SECS" \
         --target "$target" --host-header "$HOST_HEADER" --mesh "$MESH" \
         --duration "$DURATION" --concurrency "$eff_concurrency" \
-        --payload-size "$payload" --json > "$out" || rc=$?
+        --warmup "$WARMUP" --payload-size "$payload" || rc=$?
 
-    if [ -n "$stats_pid" ]; then
-        kill "$stats_pid" 2>/dev/null || true
-        wait "$stats_pid" 2>/dev/null || true
-    fi
-
+    timeout --signal=KILL 2s docker rm -f "$LOADGEN_NAME" >/dev/null 2>&1 || true
     if [ "$rc" -ne 0 ] || ! grep -q '"rps"' "$out"; then
         echo "[bench] cell failed (rc=$rc); recording zero-result JSON" >&2
+        [ ! -f "$out" ] || cp "$out" "${out%.json}.failed-output.json"
         printf '{"gateway":"%s","mesh":"%s","protocol":"http1","payload_size":%s,"rps":0,"total_errors":-1,"error":"loadgen failed"}\n' \
             "$MESH" "$MESH" "$payload" > "$out"
-        return 0
+        return 1
+    fi
+    if ! grep -q '"total_errors": 0' "$out" || ! grep -qE '"total_requests": [1-9]' "$out"; then
+        echo "[bench] cell has errors or no useful completions; preserving its report and stopping" >&2
+        return 1
     fi
     grep -o '"rps": [0-9.]*' "$out" | head -1 || true
 }
@@ -534,11 +635,14 @@ auth_probes() {
     echo "[auth-probe] ok: plaintext refused" | tee -a "$evidence"
 
     tls_probe() {
-        docker run --rm --network host \
+        local rc=0
+        readiness_command 25 docker run --rm --network host --name "$PROBE_NAME" --group-add "$CERT_GID" \
             -v "$CERT_DIR:/certs:ro" \
             --entrypoint /usr/local/bin/mesh_tls_probe \
             "$TOOLS_IMAGE" --addr "127.0.0.1:$inbound_port" \
-            --server-name "$HOST_HEADER" "$@" >> "$evidence" 2>&1
+            --server-name "$HOST_HEADER" "$@" >> "$evidence" 2>&1 || rc=$?
+        timeout --signal=KILL 2s docker rm -f "$PROBE_NAME" >/dev/null 2>&1 || true
+        return "$rc"
     }
     if tls_probe --ca /certs/client/bundle.pem \
             --cert /certs/client/svid.crt --key /certs/client/svid.key; then
@@ -550,12 +654,16 @@ auth_probes() {
     if tls_probe --ca /certs/client/bundle.pem; then
         echo "[auth-probe] FAIL: handshake without client certificate succeeded" | tee -a "$evidence" >&2
         return 1
+    else
+        [ "$?" -eq 1 ] || { echo "[auth-probe] infrastructure failure in no-client-cert probe" | tee -a "$evidence" >&2; return 1; }
     fi
     echo "[auth-probe] ok: no-client-cert refused" | tee -a "$evidence"
     if tls_probe --ca /certs/client/bundle.pem \
             --cert /certs/rogue/svid.crt --key /certs/rogue/svid.key; then
         echo "[auth-probe] FAIL: rogue-CA client certificate accepted" | tee -a "$evidence" >&2
         return 1
+    else
+        [ "$?" -eq 1 ] || { echo "[auth-probe] infrastructure failure in rogue-CA probe" | tee -a "$evidence" >&2; return 1; }
     fi
     echo "[auth-probe] ok: rogue-CA client certificate refused" | tee -a "$evidence"
     return 0
@@ -568,8 +676,9 @@ write_manifest() {
     for payload in $PAYLOAD_SIZES; do
         cells="${cells}${cells:+,}${payload}"
     done
-    printf '{"mesh":"%s","payload_sizes":[%s],"duration":%s,"concurrency":%s,"warmup":%s}\n' \
-        "$MESH" "$cells" "$DURATION" "$CONCURRENCY" "$WARMUP" \
+    printf '{"mesh":"%s","payload_sizes":[%s],"duration":%s,"concurrency":%s,"warmup":%s,"exchange_timeout_secs":%s,"readiness_timeout_secs":%s,"cell_wall_timeout_secs":%s,"cell_kill_grace_secs":5,"cell_cleanup_timeout_secs":2}\n' \
+        "$MESH" "$cells" "$DURATION" "$CONCURRENCY" "$WARMUP" "$EXCHANGE_TIMEOUT_SECS" "$READINESS_TIMEOUT_SECS" \
+        "$((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))" \
         > "$OUTPUT_DIR/${MESH}_manifest.json"
 }
 
@@ -588,7 +697,9 @@ echo "  Mesh Runtime Benchmark — arm: $MESH"
 echo "================================================="
 write_manifest
 generate_certs
+prepare_cert_access
 prepare_images
+READINESS_DEADLINE=$((SECONDS + READINESS_TIMEOUT_SECS))
 if probe_loadgen "http://127.0.0.1:$BACKEND_PORT/echo" 2>/dev/null; then
     echo "[backend] port $BACKEND_PORT already answers; refusing to displace its owner" >&2
     write_arm_status failed "backend port $BACKEND_PORT already in use"
@@ -596,7 +707,7 @@ if probe_loadgen "http://127.0.0.1:$BACKEND_PORT/echo" 2>/dev/null; then
 fi
 start_backend
 
-if ! wait_ready "http://127.0.0.1:$BACKEND_PORT/echo" backend; then
+if ! wait_ready "http://127.0.0.1:$BACKEND_PORT/echo" backend "$BACKEND_NAME"; then
     dump_logs
     write_arm_status failed "backend did not become ready"
     exit 1
@@ -608,7 +719,7 @@ case "$MESH" in
     ferrum)
         start_ferrum
         TARGET="http://127.0.0.1:$OUTBOUND_PORT/echo"
-        if ! wait_ready "$TARGET" ferrum-pair 120; then
+        if ! wait_ready "$TARGET" ferrum-pair "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"; then
             dump_logs; write_arm_status failed "ferrum pair did not become ready"; exit 1
         fi
         if ! auth_probes 15006; then
@@ -618,26 +729,35 @@ case "$MESH" in
     envoy)
         start_envoy
         TARGET="http://127.0.0.1:$OUTBOUND_PORT/echo"
-        if ! wait_ready "$TARGET" envoy-pair 120; then
+        if ! wait_ready "$TARGET" envoy-pair "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"; then
             dump_logs; write_arm_status failed "envoy pair did not become ready"; exit 1
         fi
         if ! auth_probes 15006; then
             dump_logs; write_arm_status failed "auth probe failed on envoy inbound"; exit 1
         fi
         ;;
-    consul)
+    consul|consulhttp)
         if ! docker image inspect "$CONSUL_IMAGE" >/dev/null 2>&1; then
             write_arm_status failed "consul image $CONSUL_IMAGE unavailable (pull failed)"
             exit 1
         fi
         start_consul
         TARGET="http://127.0.0.1:$OUTBOUND_PORT/echo"
-        if ! wait_ready "$TARGET" consul-pair 120; then
+        if ! wait_ready "$TARGET" consul-pair "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"; then
             dump_logs; write_arm_status failed "consul pair did not become ready"; exit 1
         fi
         if ! consul_intention_probe; then
             dump_logs; write_arm_status failed "auth probe failed on consul pair"; exit 1
         fi
+        # Listener resources only: never upload SDS secrets from config_dump.
+        readiness_command 6 curl --fail --silent --show-error --connect-timeout 2 --max-time 5 'http://127.0.0.1:19001/config_dump?resource=dynamic_listeners' \
+            > "$OUTPUT_DIR/logs/consul-client-listeners.json"
+        readiness_command 6 curl --fail --silent --show-error --connect-timeout 2 --max-time 5 'http://127.0.0.1:19002/config_dump?resource=dynamic_listeners' \
+            > "$OUTPUT_DIR/logs/consul-server-listeners.json"
+        python3 "$SCRIPT_DIR/verify_consul_protocol.py" "$MESH" \
+            "$OUTPUT_DIR/logs/consul-client-listeners.json" \
+            "$OUTPUT_DIR/logs/consul-server-listeners.json" \
+            > "$OUTPUT_DIR/logs/consul-protocol.json"
         ;;
     linkerd)
         if ! docker image inspect "$LINKERD_IMAGE" >/dev/null 2>&1; then
@@ -646,7 +766,7 @@ case "$MESH" in
         fi
         start_linkerd
         TARGET="http://127.0.0.1:4140/echo"
-        if ! wait_ready "$TARGET" linkerd-pair 60; then
+        if ! wait_ready "$TARGET" linkerd-pair "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"; then
             dump_logs
             if grep -q "no destination service configured" \
                     "$OUTPUT_DIR/logs/${CLIENT_NAME}.log" \
@@ -665,8 +785,13 @@ case "$MESH" in
 esac
 
 write_arm_status ready "echo probe passed"
+READINESS_DEADLINE=0
 for payload in $PAYLOAD_SIZES; do
-    run_cell "$payload" "$TARGET"
+    if ! run_cell "$payload" "$TARGET"; then
+        dump_logs
+        write_arm_status failed "loadgen or resource collection failed"
+        exit 1
+    fi
 done
 dump_logs
 echo "[done] arm $MESH complete; results in $OUTPUT_DIR"
