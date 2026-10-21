@@ -177,7 +177,7 @@ def qualify_symbols(actual, candidate, Elf):
 
 
 def record_argv(perf, pid, directory):
-    return [perf, "record", "-e", "cpu-clock:u", "-F", str(FREQUENCY), "--clockid", "mono",
+    return [perf, "--buildid-dir", str(directory.parent / "buildid-cache"), "record", "-e", "cpu-clock:u", "-F", str(FREQUENCY), "--clockid", "mono",
             "--mmap-pages=64", "--timestamp", "--sample-cpu", "--buildid-all", "--buildid-mmap",
             "--no-buildid-cache", "--no-bpf-event", "--strict-freq", "--synth=mmap", "--delay=-1",
             "--max-size=64M", f"--control=fifo:{directory}/perf.control,{directory}/perf.ack",
@@ -566,7 +566,7 @@ class PerfCapture:
     def command(self, role, name, arguments, *, raw_records=False):
         destination = role["directory"] / name
         errors = role["report"]["errors"]
-        argv = [self.perf, *arguments]
+        argv = [self.perf, "--buildid-dir", str(self.output / "buildid-cache"), *arguments]
         with (destination.with_suffix(destination.suffix + ".stderr")).open("wb") as stderr:
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=stderr, env=self.environment(),
                 start_new_session=True, preexec_fn=child_limits)

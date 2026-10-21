@@ -51,6 +51,7 @@ class ProductionPerf(unittest.TestCase):
 
     def test_command_is_leaf_only_fixed_clock_and_rate_with_raw_cap(self):
         args = M.record_argv("/usr/bin/perf", 101, Path("/tmp/owned"))
+        self.assertEqual(args[:4], ["/usr/bin/perf", "--buildid-dir", "/tmp/buildid-cache", "record"])
         self.assertEqual(args[args.index("-F") + 1], "49")
         self.assertEqual(args[args.index("-e") + 1], "cpu-clock:u")
         self.assertEqual(args[args.index("--clockid") + 1], "mono")
@@ -62,6 +63,21 @@ class ProductionPerf(unittest.TestCase):
         self.assertTrue(M.validate_attributes(ATTRS.replace("49,", "99,")))
         self.assertTrue(M.validate_attributes(ATTRS.replace("IP|TID|TIME|CPU", "IP|TID|TIME|STACK_USER")))
         self.assertTrue(M.validate_attributes(ATTRS.replace("clockid: 1", "clockid: 0")))
+
+    def test_decoder_selects_private_cache_before_subcommand(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = M.PerfCapture([{"name": "a", "pid": 101, "image_id": IMAGE},
+                                     {"name": "b", "pid": 102, "image_id": IMAGE}], root, [])
+            role = {"directory": root, "report": {"errors": []}}
+            read, write = os.pipe()
+            os.close(write)
+            process = Mock(stdout=os.fdopen(read, "rb"), returncode=0)
+            process.poll.return_value = 0
+            with patch.object(M.subprocess, "Popen", return_value=process) as launch:
+                capture.command(role, "attributes.txt", ["evlist", "-v", "-i", "/tmp/owned-perf.data"])
+            self.assertEqual(launch.call_args.args[0][:4], [capture.perf, "--buildid-dir", str(root / "buildid-cache"), "evlist"])
+            self.assertEqual(role["report"]["errors"], [])
 
     def test_identity_rejects_pid_reuse_executable_and_image_changes(self):
         identity = {"pid": 101, "starttime": 7, "exe": "/bin/proxy", "exe_sha256": "a" * 64,

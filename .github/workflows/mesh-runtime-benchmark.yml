@@ -7,7 +7,7 @@ on:
         description: "Qualification or four balanced repeated production ranking blocks"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, ranking, symbols, profile-envoy]
+        options: [smoke-l7, smoke, ranking, symbols, profile-envoy, ferrum-symbol-canary]
 permissions:
   contents: read
 concurrency:
@@ -18,7 +18,7 @@ env:
 jobs:
   benchmark:
     name: Production mesh qualification and ranking
-    if: inputs.phase != 'symbols' && inputs.phase != 'profile-envoy'
+    if: inputs.phase != 'symbols' && inputs.phase != 'profile-envoy' && inputs.phase != 'ferrum-symbol-canary'
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -132,3 +132,31 @@ jobs:
       - name: Require observer qualification
         if: always()
         run: python3 .github/scripts/mesh_production_profile_campaign.py accept
+  ferrum-symbol-canary:
+    name: Qualify unchanged-profile Ferrum symbol capture
+    if: inputs.phase == 'ferrum-symbol-canary'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Verify helper contracts
+        run: |
+          python3 .github/scripts/mesh_production_profile_linker_test.py
+          python3 .github/scripts/mesh_production_profile_ferrum_test.py
+      - name: Run tiny link-equivalence canary in pinned builder
+        timeout-minutes: 16
+        run: bash .github/scripts/mesh_production_profile_ferrum.sh canary "$RUNNER_TEMP/ferrum-symbol-canary"
+      - name: Retain all canary receipts and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ferrum-symbol-canary-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/ferrum-symbol-canary/report.json
+            ${{ runner.temp }}/ferrum-symbol-canary/*.stdout
+            ${{ runner.temp }}/ferrum-symbol-canary/*.stderr
+            ${{ runner.temp }}/ferrum-symbol-canary/canary/*.log
+            ${{ runner.temp }}/ferrum-symbol-canary/canary/capture/**/*.json
+          retention-days: 30
