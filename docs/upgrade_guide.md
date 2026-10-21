@@ -32,24 +32,28 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 - A backend **connect timeout** now answers `504` `{"error":"Backend timeout"}`
   instead of `502` `{"error":"Backend unavailable"}` on every HTTP-family
-  transport (reqwest, direct HTTP/2, native HTTP/3, the HTTP/3 bridge, HBONE,
-  sidecar mTLS). It is still a pre-wire connection failure:
+  transport (reqwest, direct HTTP/2, native HTTP/3 from any frontend, the
+  HTTP/3 bridge, HBONE, sidecar mTLS, Unix sockets and WebSocket upgrades). It
+  is still a pre-wire connection failure:
   `error_class=connection_timeout`, `X-Gateway-Error: connection_failure`,
   `retry_on_connect_failure` replay, target rotation, and circuit-breaker
   accounting are unchanged. A `retryable_status_codes` list containing `504`
-  does not make it status-retryable.
+  does not make it status-retryable. An established HTTP/3 (QUIC) backend
+  connection that times out while the gateway waits on it is also `504`
+  (post-wire, like a read timeout), so a route listing `504` in
+  `retryable_status_codes` retries it for `retryable_methods` only.
 - A DestinationRule `maxConnections` refusal on the pooled transports (direct
   HTTP/2, native HTTP/3, HBONE, sidecar mTLS) now answers `503`
-  `{"error":"Backend connection limit exceeded"}`, matching reqwest, the
-  Unix-socket pool, and raw TCP. `error_class=backend_connection_limit` stays
-  pre-wire and backend-health-neutral.
-- A native gRPC `GrpcProxyError::Internal` terminal (backend TLS config or
-  backend URL/authority could not be built) on HTTP/1.1 and HTTP/2 now carries
-  `grpc-status: 13` (`INTERNAL`) with `grpc-message: Internal gateway error`,
-  as HTTP/3 already did, instead of `14` (`UNAVAILABLE`).
-- A response the HTTP/1.1 / HTTP/2 response builder rejects now answers an
-  explicit `500` (it used to fall back to a `200` carrying an error body), and
-  the transaction log records `500`.
+  `{"error":"Backend connection limit exceeded"}`, the status reqwest, the
+  Unix-socket pool and raw TCP already used. `error_class=backend_connection_limit`
+  stays pre-wire and backend-health-neutral.
+- A native gRPC internal gateway failure (backend TLS config or backend
+  URL/authority could not be built) now carries `grpc-status: 13` (`INTERNAL`)
+  with `grpc-message: Internal gateway error` on HTTP/1.1, HTTP/2 and the
+  native-HTTP/3 backend dispatch, as the HTTP/3 bridges already did, instead of
+  `14` (`UNAVAILABLE`). It stays neutral for backend health.
+- A response the proxy or admin API response builder rejects now answers an
+  explicit `500` (it used to fall back to a `200` carrying an error body).
 - `FERRUM_VIA_PSEUDONYM` must be an RFC 9110 token, optionally followed by
   `:<port>`; startup rejects other values.
 

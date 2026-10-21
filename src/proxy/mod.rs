@@ -15723,6 +15723,25 @@ fn build_websocket_error_response(
     .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
 }
 
+/// Client-visible status + body for a failed WebSocket backend dial/handshake.
+/// The status follows the shared HTTP-family mapper so a connect or handshake
+/// timeout is 504 like every other transport (#6770); the generic 502 keeps
+/// its WebSocket wording.
+pub(crate) fn websocket_backend_failure_status_and_body(
+    class: retry::ErrorClass,
+) -> (StatusCode, &'static str) {
+    match http_backend_failure_status_and_body(class) {
+        (502, _) => (
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Backend WebSocket connection failed"}"#,
+        ),
+        (status, body) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+        ),
+    }
+}
+
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
     let mut response = Response::new(ProxyBody::from_string(
         r#"{"error":"Internal server error"}"#,
@@ -16444,6 +16463,13 @@ async fn handle_websocket_request_authenticated(
                     e.as_ref(),
                 );
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // Client-visible status for this failure, shared by the wire
+                // response, request/status metrics, the transaction log, the
+                // circuit breaker and backend admission so they cannot diverge:
+                // a connect or handshake timeout is 504 (#6770), everything
+                // else keeps the 502.
+                let (ws_failure_status, ws_failure_body) =
+                    websocket_backend_failure_status_and_body(ws_error_class);
                 // A gateway-side egress-policy rejection (denied literal-IP
                 // backend) never reached a backend: it must be non-retryable AND
                 // neutral to backend health — no circuit-breaker trip and no
@@ -16483,7 +16509,7 @@ async fn handle_websocket_request_authenticated(
                 if should_retry_ws {
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
-                            response_status: 502,
+                            response_status: ws_failure_status.as_u16(),
                             connection_error: ws_is_pre_wire,
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
@@ -16496,10 +16522,9 @@ async fn handle_websocket_request_authenticated(
                     let retry_config = match proxy.retry.as_ref() {
                         Some(rc) => rc,
                         None => {
-                            let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
                             return Ok(build_websocket_error_response(
-                                StatusCode::BAD_GATEWAY,
-                                ws_body,
+                                ws_failure_status,
+                                ws_failure_body,
                                 &initial_response_header_policy_plugins,
                             ));
                         }
@@ -16522,7 +16547,11 @@ async fn handle_websocket_request_authenticated(
                             current_cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
+                        cb.record_failure(
+                            ws_failure_status.as_u16(),
+                            ws_is_pre_wire,
+                            cb_probe.take_slot(),
+                        );
                         cb_failure_already_recorded = true;
                     }
 
@@ -16714,7 +16743,11 @@ async fn handle_websocket_request_authenticated(
                         // skipping the record entirely.
                         cb.record_neutral(cb_probe.take_slot());
                     } else {
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
+                        cb.record_failure(
+                            ws_failure_status.as_u16(),
+                            ws_is_pre_wire,
+                            cb_probe.take_slot(),
+                        );
                     }
                 }
                 if !backend_outcome_already_recorded
@@ -16722,14 +16755,14 @@ async fn handle_websocket_request_authenticated(
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: 502,
+                        response_status: ws_failure_status.as_u16(),
                         connection_error: ws_is_pre_wire,
                         error_class: Some(ws_error_class),
                         backend_elapsed: backend_admission_start.elapsed(),
                     });
                 }
                 state.request_count.fetch_add(1, Ordering::Relaxed);
-                record_status(&state, 502);
+                record_status(&state, ws_failure_status.as_u16());
 
                 // Log with error_class for WebSocket backend failures.
                 // Dispatch to the full plugin chain — the default `.log()` impl
@@ -16766,7 +16799,7 @@ async fn handle_websocket_request_authenticated(
                             backend_target: Some(
                                 strip_query_params(&current_backend_url).to_string(),
                             ),
-                            response_status_code: 502,
+                            response_status_code: ws_failure_status.as_u16(),
                             latency_total_ms: ws_total_ms,
                             latency_gateway_processing_ms: ws_total_ms,
                             latency_backend_ttfb_ms: -1.0,
@@ -16791,10 +16824,9 @@ async fn handle_websocket_request_authenticated(
                         .record_http_error(Some(&proxy.id), ws_error_class);
                 }
 
-                let ws_body = r#"{"error":"Backend WebSocket connection failed"}"#;
                 return Ok(build_websocket_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    ws_body,
+                    ws_failure_status,
+                    ws_failure_body,
                     &initial_response_header_policy_plugins,
                 ));
             }
@@ -44311,8 +44343,15 @@ async fn handle_proxy_request_inner(
 
     // Advertise HTTP/3 availability via pre-computed Alt-Svc header, for the
     // frontend port this request actually arrived on.
-    if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port) {
-        resp_builder = resp_builder.header("alt-svc", alt_svc.as_ref());
+    // Typed conversion (same cost as the builder's own `&str` conversion) so an
+    // unrepresentable value is skipped here instead of poisoning the builder:
+    // every input to this builder is a typed, already-valid header, which keeps
+    // the 500 fallback below unreachable and the summary already logged above
+    // truthful (#6775).
+    if let Some(alt_svc) = state.alt_svc_for_frontend_port(ctx.frontend_listen_port)
+        && let Ok(value) = http::HeaderValue::from_str(alt_svc.as_ref())
+    {
+        resp_builder = resp_builder.header(http::header::ALT_SVC, value);
     }
 
     // During shutdown drain or overload pressure, tell HTTP/1.1 clients to
@@ -44357,9 +44396,13 @@ async fn handle_proxy_request_inner(
     // Via header on response path (RFC 9110 §7.6.3): describe the protocol
     // used by the upstream sender of this message, not the client-facing
     // inbound protocol.
+    // `FERRUM_VIA_PSEUDONYM` is validated at startup; the typed conversion
+    // keeps a hand-built configuration from poisoning the builder (#6775).
     let resp_via = via_header_for_backend_response_body(&state, &response_body);
-    if let Some(via) = resp_via {
-        resp_builder = resp_builder.header("via", via.as_str());
+    if let Some(via) = resp_via
+        && let Ok(value) = http::HeaderValue::from_str(via.as_str())
+    {
+        resp_builder = resp_builder.header(http::header::VIA, value);
     }
 
     // Seal the streaming trailer boundary captured before the
@@ -45179,9 +45222,13 @@ async fn handle_proxy_request_inner(
             Ok(resp)
         }
         Err(_) => {
-            // The prepared response never reaches the wire, so log the 500 the
-            // client actually receives rather than the status captured at
-            // header commit (#6775).
+            // Defense in depth: every input to `resp_builder` is a typed,
+            // already-valid header, so this arm is not reachable today. Should a
+            // future input make it fail, the prepared response never reaches the
+            // wire, so a deferred (streaming) logger records the 500 the client
+            // actually receives rather than the status captured at header commit
+            // (#6775). A buffered summary was already delivered above with the
+            // prepared status, and `record_request` counted it.
             if let Some(logger) = logger {
                 logger.fire_with_response_status(
                     crate::proxy::deferred_log::BodyOutcome::error(
@@ -54064,14 +54111,19 @@ fn mesh_transport_pool_error_response(
     if error_class == retry::ErrorClass::PortExhaustion {
         state.overload.record_port_exhaustion();
     }
-    let error_body = if error_class == retry::ErrorClass::DnsLookupError {
-        transport.dns_failure_body().to_string()
-    } else {
-        transport.unavailable_body_for_error(err)
+    // A connect timeout (504) or a local `maxConnections` refusal (503) takes
+    // the shared HTTP-family status and body (#6770 / #6771); every other pool
+    // failure keeps the transport-specific 502 wording.
+    let (status_code, error_body) = match http_backend_failure_status_and_body(error_class) {
+        (502, _) if error_class == retry::ErrorClass::DnsLookupError => {
+            (502, transport.dns_failure_body().to_string())
+        }
+        (502, _) => (502, transport.unavailable_body_for_error(err)),
+        (status_code, body) => (status_code, body.to_string()),
     };
     transport.log_pool_error(&proxy.id, err);
     retry::BackendResponse {
-        status_code: 502,
+        status_code,
         body: ResponseBody::buffered(error_body.into_bytes()),
         headers: HashMap::new(),
         connection_error: !retry::request_reached_wire(error_class),
@@ -62696,20 +62748,12 @@ async fn proxy_to_backend_http3(
                                 "HTTP/3 backend streaming request failed"
                             );
                             (
-                                retry::BackendResponse {
-                                    status_code: 502,
-                                    body: ResponseBody::buffered(
-                                        r#"{"error":"HTTP/3 backend request failed"}"#
-                                            .as_bytes()
-                                            .to_vec(),
-                                    ),
-                                    headers: HashMap::new(),
-                                    connection_error: is_conn_error,
-                                    backend_resolved_ip: resolved_ip,
-                                    error_class: Some(error_class),
-                                    request_on_wire: e.request_on_wire(),
-                                    buffered_trailers: None,
-                                },
+                                h3_pool_failure_backend_response(
+                                    error_class,
+                                    is_conn_error,
+                                    e.request_on_wire(),
+                                    resolved_ip,
+                                ),
                                 None,
                             )
                         }
@@ -63059,18 +63103,12 @@ async fn proxy_to_backend_http3(
                     "HTTP/3 backend streaming request failed"
                 );
                 (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: is_conn_error,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(error_class),
-                        request_on_wire: e.request_on_wire(),
-                        buffered_trailers: None,
-                    },
+                    h3_pool_failure_backend_response(
+                        error_class,
+                        is_conn_error,
+                        e.request_on_wire(),
+                        resolved_ip,
+                    ),
                     retained_body,
                 )
             }
@@ -63228,18 +63266,12 @@ async fn proxy_to_backend_http3(
                     "HTTP/3 backend request failed"
                 );
                 (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::buffered(
-                            r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: is_conn_error,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(error_class),
-                        request_on_wire: e.request_on_wire(),
-                        buffered_trailers: None,
-                    },
+                    h3_pool_failure_backend_response(
+                        error_class,
+                        is_conn_error,
+                        e.request_on_wire(),
+                        resolved_ip,
+                    ),
                     retained_body,
                 )
             }
@@ -63416,18 +63448,7 @@ async fn drain_h3_streaming_response_to_buffered(
                 error = %e,
                 "HTTP/3 backend buffered response read failed"
             );
-            retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::buffered(
-                    r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: false,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(error_class),
-                request_on_wire: true,
-                buffered_trailers: None,
-            }
+            h3_pool_failure_backend_response(error_class, false, true, resolved_ip)
         }
         Err(crate::http3::client::H3BodyDrainError::Truncated { received, declared }) => {
             // The backend FIN'd before delivering its declared Content-Length —
@@ -63645,6 +63666,33 @@ pub(crate) fn declared_response_length_exceeds_limit(
 /// reached the backend's application layer (post-wire), so
 /// `retry_on_connect_failure` must not replay it; retries are governed by
 /// `retry_on_methods` / `retryable_status_codes`.
+/// Client-visible response for a failed H1/H2-frontend → native-HTTP/3
+/// backend dispatch. The status follows the shared HTTP-family mapper (504 for
+/// a timeout, 503 for a local `maxConnections` refusal, #6770 / #6771); the
+/// generic 502 keeps its HTTP/3-specific wording. `connection_error` and
+/// `request_on_wire` come from the pool's typed signals, never the status.
+pub(crate) fn h3_pool_failure_backend_response(
+    error_class: retry::ErrorClass,
+    connection_error: bool,
+    request_on_wire: bool,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let (status_code, body) = match http_backend_failure_status_and_body(error_class) {
+        (502, _) => (502, r#"{"error":"HTTP/3 backend request failed"}"#),
+        mapped => mapped,
+    };
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(body.as_bytes().to_vec()),
+        headers: HashMap::new(),
+        connection_error,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+        request_on_wire,
+        buffered_trailers: None,
+    }
+}
+
 fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     http_backend_dispatch_error_response(retry::ErrorClass::ReadWriteTimeout, resolved_ip)
 }
@@ -63895,18 +63943,12 @@ async fn proxy_to_backend_http3_retry(
                     error = %e,
                     "HTTP/3 backend streaming retry request failed"
                 );
-                retry::BackendResponse {
-                    status_code: 502,
-                    body: ResponseBody::buffered(
-                        r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                    ),
-                    headers: HashMap::new(),
-                    connection_error: is_conn_error,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: Some(error_class),
-                    request_on_wire: e.request_on_wire(),
-                    buffered_trailers: None,
-                }
+                h3_pool_failure_backend_response(
+                    error_class,
+                    is_conn_error,
+                    e.request_on_wire(),
+                    resolved_ip,
+                )
             }
         };
     }
@@ -64058,18 +64100,12 @@ async fn proxy_to_backend_http3_retry(
                 error = %e,
                 "HTTP/3 backend retry request failed"
             );
-            retry::BackendResponse {
-                status_code: 502,
-                body: ResponseBody::buffered(
-                    r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
-                ),
-                headers: HashMap::new(),
-                connection_error: is_conn_error,
-                backend_resolved_ip: resolved_ip,
-                error_class: Some(error_class),
-                request_on_wire: e.request_on_wire(),
-                buffered_trailers: None,
-            }
+            h3_pool_failure_backend_response(
+                error_class,
+                is_conn_error,
+                e.request_on_wire(),
+                resolved_ip,
+            )
         }
     }
 }

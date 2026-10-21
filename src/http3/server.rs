@@ -14501,11 +14501,17 @@ where
     let is_client_side_neutral_timeout = e.client_deadline_expired()
         || err_msg.contains("client grpc-timeout deadline exceeded before")
         || err_msg.contains("client request upload stalled");
+    // The gateway could not build the backend TLS client configuration: an
+    // internal gateway fault, not an unavailable backend (#6773). INTERNAL on
+    // the wire, as on the HTTP/1.1-HTTP/2 and cross-protocol builders, and
+    // neutral for backend health / capability (nothing was dialed).
+    let is_gateway_internal = e.is_gateway_internal();
 
     // gRPC error signalling mirrors the cross-protocol bridge's
     // dispatch-failure mapping: oversized upload -> RESOURCE_EXHAUSTED,
     // malformed client trailers -> INVALID_ARGUMENT, read timeout / client
-    // deadline -> DEADLINE_EXCEEDED, everything else -> UNAVAILABLE.
+    // deadline -> DEADLINE_EXCEEDED, gateway-internal (backend TLS config
+    // could not be built) -> INTERNAL, everything else -> UNAVAILABLE.
     let (grpc_status, grpc_message) = if is_oversize {
         (
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -14526,6 +14532,11 @@ where
             crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             "Backend deadline exceeded",
         )
+    } else if is_gateway_internal {
+        (
+            crate::proxy::grpc_proxy::grpc_status::INTERNAL,
+            crate::proxy::grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
+        )
     } else {
         (
             crate::proxy::grpc_proxy::grpc_status::UNAVAILABLE,
@@ -14539,6 +14550,7 @@ where
     // oversized upload is client-caused, not a backend-capability signal.
     if !is_client_request_body_disconnect
         && !is_oversize
+        && !is_gateway_internal
         && crate::proxy::is_h3_transport_error_class(h3_error_class)
     {
         state
@@ -14585,6 +14597,11 @@ where
         // to the 504 / `ReadWriteTimeout` arm and wrongly trip the breaker /
         // passive health for a healthy backend.
         (504, Some(crate::retry::ErrorClass::ClientDisconnect))
+    } else if is_gateway_internal {
+        // Gateway-side configuration fault before any dial: neutral for
+        // CB / passive health / adaptive concurrency and never replayed
+        // (`DispatchPolicyRejected` is health-neutral and non-retryable).
+        (500, Some(crate::retry::ErrorClass::DispatchPolicyRejected))
     } else {
         let status = if is_read_timeout { 504 } else { 502 };
         let (_, error_class) = h3_streaming_body_failure_outcome(

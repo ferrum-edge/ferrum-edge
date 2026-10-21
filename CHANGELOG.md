@@ -22,11 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Gateway-authored status codes follow the failure cause** (issues #6770,
   #6771, #6773, #6775). A backend connect timeout answers `504` instead of
   `502` (still a pre-wire connection failure for retry, circuit breaker and
-  `X-Gateway-Error`); a DestinationRule `maxConnections` refusal on direct
-  HTTP/2, native HTTP/3, HBONE and sidecar mTLS answers `503` like every other
-  transport; a native gRPC internal gateway error on HTTP/1.1 / HTTP/2 is
-  `INTERNAL` (13), as on HTTP/3, instead of `UNAVAILABLE` (14); response-builder
-  fallbacks answer and log `500` instead of defaulting to `200`; and
+  `X-Gateway-Error`), including WebSocket upgrades and native-HTTP/3 backends
+  reached from any frontend; a DestinationRule `maxConnections` refusal on
+  direct HTTP/2, native HTTP/3, HBONE and sidecar mTLS answers `503` like every
+  other transport; a native gRPC internal gateway error is `INTERNAL` (13) on
+  every frontend and on native-HTTP/3 backends instead of `UNAVAILABLE` (14);
+  proxy and admin response-builder fallbacks answer `500` instead of
+  defaulting to `200`; and
   `FERRUM_VIA_PSEUDONYM` must be an RFC 9110 token (optionally `:<port>`).
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and

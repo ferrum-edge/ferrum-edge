@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use ferrum_edge::_test_support::{
-    PROTOCOL_LEVEL_405_ALLOW_FOR_TEST, allow_header_from_allowed_methods_for_test,
+    PROTOCOL_LEVEL_405_ALLOW_FOR_TEST, admin_builder_failure_response_for_test,
+    allow_header_from_allowed_methods_for_test,
     apply_authoritative_backend_gateway_error_header_for_test,
     internal_error_fallback_response_for_test, request_method_is_allowed_for_test,
     x_gateway_error_for_backend_failure_for_test,
@@ -438,4 +439,26 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
             && !oversized_compact.contains("headers"),
         "the declared-oversize 502 must hand the typed signal to the terminal writer"
     );
+}
+
+#[test]
+fn admin_builder_fallback_is_500_not_default_200() {
+    let response = admin_builder_failure_response_for_test();
+    assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    for source in [
+        include_str!("../../../src/admin/mod.rs"),
+        include_str!("../../../src/admin/config_export.rs"),
+    ] {
+        assert!(
+            !source.contains("unwrap_or_else(|_| Response::new("),
+            "admin builder fallbacks must not default to 200"
+        );
+    }
 }

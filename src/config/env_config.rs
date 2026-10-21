@@ -7335,14 +7335,16 @@ impl EnvConfig {
                 .map_err(|e| format!("FERRUM_STREAM_GATEWAY_REF: {e}"))?;
         }
         // The pseudonym is written verbatim as the `received-by` element of
-        // every `Via` header the gateway emits (`1.1 <pseudonym>`). A value
-        // outside RFC 9110 §7.6.3 (`pseudonym [":" port]`, pseudonym a token)
-        // is not a valid header value at all, so the response builder would
-        // reject every response that carries it (#6775). Fail at startup.
+        // every `Via` header the gateway emits (`1.1 <pseudonym>`). Accept only
+        // RFC 9110 §7.6.3 `received-by` syntax (`pseudonym [":" port]`,
+        // pseudonym a token): anything else is malformed `Via` on the wire, and
+        // control characters are not representable as a header value at all,
+        // which made the response builder reject every response carrying it
+        // (#6775). Fail at startup instead.
         if !is_valid_via_received_by(&self.via_pseudonym) {
             return Err(
                 "FERRUM_VIA_PSEUDONYM must be an RFC 9110 token, optionally followed by \
-                 ':<port>' (letters, digits and !#$%&'*+-.^_`|~ only; no spaces)"
+                 ':<digits>' (letters, digits and !#$%&'*+-.^_`|~ only; no spaces)"
                     .into(),
             );
         }
@@ -9440,7 +9442,8 @@ impl EnvConfig {
 
 /// RFC 9110 §7.6.3 `received-by` as Ferrum emits it from
 /// `FERRUM_VIA_PSEUDONYM`: a non-empty `token`, optionally followed by
-/// `:<port>` (1-5 ASCII digits).
+/// `:<port>` where `port = *DIGIT` (RFC 3986 §3.2.3). An empty port after the
+/// colon is rejected as an evident typo.
 fn is_valid_via_received_by(value: &str) -> bool {
     fn is_tchar(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
@@ -9451,9 +9454,8 @@ fn is_valid_via_received_by(value: &str) -> bool {
     };
     !pseudonym.is_empty()
         && pseudonym.bytes().all(is_tchar)
-        && port.is_none_or(|port| {
-            (1..=5).contains(&port.len()) && port.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        && port
+            .is_none_or(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Resolve the effective authoritative client-IP header for cold paths that

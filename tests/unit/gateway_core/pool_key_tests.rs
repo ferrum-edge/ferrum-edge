@@ -2448,6 +2448,20 @@ async fn h3_backend_tls_cold_miss_with_missing_ca_fails_closed() {
             .starts_with("Failed to build HTTP/3 backend TLS config"),
         "{error}"
     );
+    // #6773: the failure is typed as a gateway-internal fault, so the native-H3
+    // gRPC dispatch answers INTERNAL instead of UNAVAILABLE and keeps backend
+    // health neutral.
+    assert!(
+        error
+            .chain()
+            .any(|cause| cause.is::<ferrum_edge::connection_pool::BackendTlsConfigUnavailable>()),
+        "the TLS build failure must carry the typed marker: {error}"
+    );
+    assert!(ferrum_edge::http3::client::H3PoolError::pre_wire(error).is_gateway_internal());
+    assert!(
+        !ferrum_edge::http3::client::H3PoolError::pre_wire(anyhow::anyhow!("connection refused"))
+            .is_gateway_internal()
+    );
     let cache = pool.backend_tls_config_cache();
     assert!(cache.is_empty());
     assert_eq!(cache.pending_builds(), 0);

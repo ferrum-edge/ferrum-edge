@@ -2438,6 +2438,30 @@ pub mod _test_support {
         crate::proxy::internal_error_fallback_response(body)
     }
 
+    pub fn h3_pool_failure_backend_response_for_test(
+        error_class: crate::retry::ErrorClass,
+        connection_error: bool,
+        request_on_wire: bool,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::h3_pool_failure_backend_response(
+            error_class,
+            connection_error,
+            request_on_wire,
+            None,
+        )
+    }
+
+    pub fn websocket_backend_failure_status_and_body_for_test(
+        class: crate::retry::ErrorClass,
+    ) -> (hyper::StatusCode, &'static str) {
+        crate::proxy::websocket_backend_failure_status_and_body(class)
+    }
+
+    pub fn admin_builder_failure_response_for_test()
+    -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        crate::admin::admin_builder_failure_response()
+    }
+
     pub fn x_gateway_error_for_backend_failure_for_test(
         connection_error: bool,
         status: u16,

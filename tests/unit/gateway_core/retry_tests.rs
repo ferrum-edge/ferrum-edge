@@ -2495,6 +2495,7 @@ fn test_direct_h2_send_request_error_response_maintains_wire_boundary() {
         ErrorClass::TlsError,
         ErrorClass::DnsLookupError,
         ErrorClass::RequestError,
+        ErrorClass::BackendConnectionLimit,
     ] {
         let resp = direct_h2_send_request_error_response_for_class_for_test(
             class,
@@ -2506,14 +2507,17 @@ fn test_direct_h2_send_request_error_response_maintains_wire_boundary() {
             !ferrum_edge::retry::request_reached_wire(class),
             "{class:?}: connection_error must equal !request_reached_wire"
         );
-        let expected_status = if class == ErrorClass::ReadWriteTimeout {
-            504
-        } else {
-            502
+        let expected_status = match class {
+            // #6770: connect and read/write timeouts are both "the upstream did
+            // not answer in time".
+            ErrorClass::ReadWriteTimeout | ErrorClass::ConnectionTimeout => 504,
+            // #6771: local maxConnections refusal before any dial.
+            ErrorClass::BackendConnectionLimit => 503,
+            _ => 502,
         };
         assert_eq!(
             resp.status_code, expected_status,
-            "{class:?}: HTTP-family dispatch must map read/write timeout to 504 and everything else to 502"
+            "{class:?}: HTTP-family dispatch must map timeouts to 504, a local connection-limit refusal to 503 and everything else to 502"
         );
     }
 }
@@ -2888,6 +2892,104 @@ fn test_http_backend_dispatch_maps_connection_limit_to_503_health_neutral() {
         2,
         "initial and retry reqwest maxConnections refusals must share the 503 body"
     );
+}
+
+#[test]
+fn test_h1_h2_frontend_to_native_h3_failures_follow_shared_mapper() {
+    // Review of #6770/#6771: the H1/H2-frontend → native-H3 arms hard-coded
+    // 502. They now take the shared status (and its body for 503/504) while
+    // keeping the pool's typed `connection_error` / `request_on_wire`.
+    use ferrum_edge::_test_support::h3_pool_failure_backend_response_for_test as h3;
+
+    let timeout = h3(ErrorClass::ConnectionTimeout, true, false);
+    assert_eq!(timeout.status_code, 504);
+    assert_eq!(timeout.body_bytes(), br#"{"error":"Backend timeout"}"#);
+    assert!(timeout.connection_error && !timeout.request_on_wire);
+
+    let capped = h3(ErrorClass::BackendConnectionLimit, true, false);
+    assert_eq!(capped.status_code, 503);
+    assert_eq!(
+        capped.body_bytes(),
+        br#"{"error":"Backend connection limit exceeded"}"#
+    );
+
+    let reset = h3(ErrorClass::ConnectionReset, false, true);
+    assert_eq!(reset.status_code, 502);
+    assert_eq!(
+        reset.body_bytes(),
+        br#"{"error":"HTTP/3 backend request failed"}"#
+    );
+    assert!(!reset.connection_error && reset.request_on_wire);
+
+    // A post-wire QUIC idle timeout reads 504 but stays post-wire, so only an
+    // explicit status-retry policy for an idempotent method replays it.
+    let idle = h3(ErrorClass::ConnectionTimeout, false, true);
+    assert_eq!(idle.status_code, 504);
+    assert!(!idle.connection_error);
+    let status_retry = RetryConfig {
+        max_retries: 1,
+        retry_on_connect_failure: true,
+        retryable_status_codes: vec![504],
+        retryable_methods: vec!["GET".to_string()],
+        ..RetryConfig::default()
+    };
+    assert!(should_retry(&status_retry, "GET", &idle, 0));
+    assert!(!should_retry(&status_retry, "POST", &idle, 0));
+
+    // The HTTP/3 wording now lives only in the shared helper.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert_eq!(
+        proxy
+            .matches(r##"r#"{"error":"HTTP/3 backend request failed"}"#"##)
+            .count(),
+        1,
+        "no H1/H2 → H3 arm may hard-code the 502 any more"
+    );
+}
+
+#[test]
+fn test_websocket_backend_failure_status_follows_shared_mapper() {
+    use ferrum_edge::_test_support::websocket_backend_failure_status_and_body_for_test as ws;
+    assert_eq!(
+        ws(ErrorClass::ConnectionTimeout),
+        (
+            hyper::StatusCode::GATEWAY_TIMEOUT,
+            r#"{"error":"Backend timeout"}"#
+        )
+    );
+    assert_eq!(
+        ws(ErrorClass::ConnectionRefused),
+        (
+            hyper::StatusCode::BAD_GATEWAY,
+            r#"{"error":"Backend WebSocket connection failed"}"#
+        )
+    );
+    // Both WebSocket frontends feed the one class-derived status into the
+    // wire response, metrics, the summary and the breaker.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(proxy.contains("websocket_backend_failure_status_and_body(ws_error_class)"));
+    assert!(!proxy.contains("cb.record_failure(502, ws_is_pre_wire"));
+    let h3_ws = include_str!("../../../src/http3/websocket.rs");
+    assert!(h3_ws.contains("websocket_backend_failure_status_and_body(ws_error_class)"));
+    assert!(!h3_ws.contains("cb.record_failure(502, ws_is_pre_wire"));
+}
+
+#[test]
+fn test_mesh_transport_pool_failures_follow_shared_mapper() {
+    // HBONE and sidecar-mTLS pool failures (connect timeout, maxConnections)
+    // go through the shared mapper; only the generic 502 keeps the transport
+    // wording.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let start = proxy
+        .find("fn mesh_transport_pool_error_response(")
+        .expect("mesh transport pool mapper present");
+    let end = start
+        + proxy[start..]
+            .find("\n}\n")
+            .expect("mesh transport pool mapper body ends");
+    let body = &proxy[start..end];
+    assert!(body.contains("http_backend_failure_status_and_body(error_class)"));
+    assert!(!body.contains("status_code: 502,"));
 }
 
 #[test]

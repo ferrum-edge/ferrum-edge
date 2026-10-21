@@ -3022,7 +3022,7 @@ fn metrics_unauthorized_response() -> Response<Full<Bytes>> {
         .header("X-Content-Type-Options", "nosniff")
         .header("Cache-Control", "no-store")
         .body(Full::new(Bytes::from(body)))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))))
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 /// Handle an admin API request. `client_ip` is the peer address of the admin
@@ -3874,9 +3874,7 @@ async fn handle_admin_request_inner(
             .header("X-Content-Type-Options", "nosniff")
             .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::from(metrics_output)))
-            .unwrap_or_else(|_| {
-                Response::new(Full::new(Bytes::from("# error rendering metrics\n")))
-            });
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
@@ -3967,7 +3965,7 @@ async fn handle_admin_request_inner(
                             .header("X-Content-Type-Options", "nosniff")
                             .header("Cache-Control", "no-store")
                             .body(Full::new(Bytes::from(json_output)))
-                            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+                            .unwrap_or_else(|_| admin_builder_failure_response());
                         return Ok(resp);
                     }
                     Err(err) => {
@@ -3993,9 +3991,7 @@ async fn handle_admin_request_inner(
                             .header("X-Content-Type-Options", "nosniff")
                             .header("Cache-Control", "no-store")
                             .body(Full::new(Bytes::from(prom_output)))
-                            .unwrap_or_else(|_| {
-                                Response::new(Full::new(Bytes::from("# error rendering charges\n")))
-                            });
+                            .unwrap_or_else(|_| admin_builder_failure_response());
                         return Ok(resp);
                     }
                     Err(err) => {
@@ -4019,7 +4015,7 @@ async fn handle_admin_request_inner(
             .header("X-Content-Type-Options", "nosniff")
             .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::from(status_output)))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
@@ -8669,7 +8665,7 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
             .header("Cache-Control", "no-store")
             .header("X-Frame-Options", "DENY")
             .body(Full::new(bytes.clone()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
@@ -8687,7 +8683,7 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
         .header("Cache-Control", "no-store")
         .header("X-Frame-Options", "DENY")
         .body(Full::new(body_bytes))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        .unwrap_or_else(|_| admin_builder_failure_response());
     Ok(resp)
 }
 
@@ -8732,7 +8728,7 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
             .header("Cache-Control", "no-store")
             .header("X-Frame-Options", "DENY")
             .body(Full::new(bytes.clone()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+            .unwrap_or_else(|_| admin_builder_failure_response());
         return Ok(resp);
     }
 
@@ -8749,7 +8745,7 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
         .header("Cache-Control", "no-store")
         .header("X-Frame-Options", "DENY")
         .body(Full::new(body_bytes))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
+        .unwrap_or_else(|_| admin_builder_failure_response());
     Ok(resp)
 }
 
@@ -10015,11 +10011,7 @@ fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Resp
         .header("Cache-Control", "no-store")
         .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_bytes)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 /// Load BackupExport config + raw API-spec documents and serialize them while
@@ -12506,11 +12498,7 @@ pub(in crate::admin) fn json_response(status: StatusCode, body: &Value) -> Respo
         .header("Cache-Control", "no-store")
         .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 pub(in crate::admin) fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
@@ -12520,7 +12508,32 @@ pub(in crate::admin) fn empty_response(status: StatusCode) -> Response<Full<Byte
         .header("Cache-Control", "no-store")
         .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::new()))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .unwrap_or_else(|_| admin_builder_failure_response())
+}
+
+/// Last-resort answer when an admin `http::response::Builder` rejects a
+/// prepared response. `Response::new` defaults to `200 OK`, so a bare fallback
+/// would report an internal failure as success to automation and probes
+/// (#6775); this one is an explicit `500` with a fixed body.
+pub(crate) fn admin_builder_failure_response() -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from_static(
+        b"{\"error\":\"Internal Server Error\"}",
+    )));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    let headers = response.headers_mut();
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        hyper::header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        hyper::header::X_CONTENT_TYPE_OPTIONS,
+        hyper::header::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 /// JSON response with X-Data-Source: cached header to indicate stale/cached data.
@@ -12534,11 +12547,7 @@ fn json_response_with_stale(status: StatusCode, body: &Value) -> Response<Full<B
         .header("Cache-Control", "no-store")
         .header("X-Frame-Options", "DENY")
         .body(Full::new(Bytes::from(body_str)))
-        .unwrap_or_else(|_| {
-            Response::new(Full::new(Bytes::from(
-                "{\"error\":\"Internal Server Error\"}",
-            )))
-        })
+        .unwrap_or_else(|_| admin_builder_failure_response())
 }
 
 /// Body of the `503` a by-id read answers when the database read failed and

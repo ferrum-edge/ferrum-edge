@@ -4555,7 +4555,7 @@ fn test_env_config_via_pseudonym_must_be_a_header_safe_token() {
     // #6775: the pseudonym is written verbatim into every response `Via`
     // header; a non-token value made the response builder reject every
     // buffered response.
-    for valid in ["ferrum-edge", "gw.example", "edge_1:8443"] {
+    for valid in ["ferrum-edge", "gw.example", "edge_1:8443", "gw:000080"] {
         with_env_vars(
             &[
                 ("FERRUM_MODE", "file"),
@@ -4573,7 +4573,7 @@ fn test_env_config_via_pseudonym_must_be_a_header_safe_token() {
         "gw\tx",
         "gw:",
         "gw:http",
-        "gw:123456",
+        "gw:80:81",
         "(gw)",
         "gw/1",
     ] {

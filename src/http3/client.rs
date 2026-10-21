@@ -1243,6 +1243,17 @@ impl H3PoolError {
         self.request_on_wire
     }
 
+    /// Whether the failure is a gateway-side internal fault — the backend TLS
+    /// client configuration could not be built
+    /// ([`crate::connection_pool::BackendTlsConfigUnavailable`]) — rather than
+    /// anything the backend did. Native gRPC maps it to `INTERNAL` and keeps
+    /// it neutral for backend health (#6773).
+    pub fn is_gateway_internal(&self) -> bool {
+        self.inner
+            .chain()
+            .any(|cause| cause.is::<crate::connection_pool::BackendTlsConfigUnavailable>())
+    }
+
     /// Returns `true` if this error originates from a graceful remote
     /// close (`H3_NO_ERROR` `ApplicationClose` or `GOAWAY`/`RemoteClosing`)
     /// at the response read boundary. Gateway dispatch sites use this
