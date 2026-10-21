@@ -1951,7 +1951,7 @@ async fn test_websocket_key_auth_rejects_missing_key() {
                     .headers()
                     .get("www-authenticate")
                     .and_then(|v| v.to_str().ok()),
-                Some("ferrum-edge")
+                Some(r#"ApiKey realm="ferrum-edge""#)
             );
         }
         other => panic!("expected HTTP 401 handshake rejection, got {other:?}"),
@@ -1998,7 +1998,7 @@ async fn test_h3_websocket_key_auth_reject_strips_transport_policy_fields() {
             .headers
             .get("www-authenticate")
             .and_then(|value| value.to_str().ok()),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
 
     let _ = gateway.kill();

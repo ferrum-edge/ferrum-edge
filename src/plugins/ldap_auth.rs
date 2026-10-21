@@ -101,7 +101,7 @@ pub const LDAP_AUTH_DEFAULT_MAX_CACHE_ENTRIES: usize = 10_000;
 pub const LDAP_AUTH_MAX_CACHE_ENTRIES_LIMIT: usize = 1_000_000;
 
 /// `WWW-Authenticate` challenge advertised for rejected/absent credentials.
-const LDAP_AUTH_BASIC_CHALLENGE: &str = r#"Basic realm="ferrum-edge", charset="UTF-8""#;
+const LDAP_AUTH_BASIC_CHALLENGE: &str = auth_flow::BASIC_AUTHENTICATION_CHALLENGE;
 
 const LDAP_AUTH_DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const LDAP_AUTH_MAX_CONNECT_TIMEOUT_SECONDS: u64 = 300;
@@ -2082,8 +2082,8 @@ impl AuthMechanism for LdapAuth {
     /// (RFC 9110 section 11.6.1) — clients that drive Basic authentication off
     /// the challenge never prompt for credentials otherwise. Same value as
     /// `basic_auth`.
-    fn authentication_challenge(&self) -> Option<&'static str> {
-        Some(LDAP_AUTH_BASIC_CHALLENGE)
+    fn authentication_challenge(&self) -> &'static str {
+        LDAP_AUTH_BASIC_CHALLENGE
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {

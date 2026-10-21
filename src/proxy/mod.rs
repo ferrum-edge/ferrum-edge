@@ -25566,6 +25566,7 @@ pub(crate) async fn apply_plugin_rejection_response(
 ) -> Bytes {
     let mut body =
         rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+    ensure_unauthorized_response_challenge(plugins, ctx, *response_status, response_headers);
     apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
@@ -26635,6 +26636,12 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
+    // A gateway-generated HTTP `401` always carries an applicable challenge
+    // (issue #6774). Native gRPC answers over a `200` with `grpc-status: 16`,
+    // so its framing is left exactly as authored.
+    if !is_grpc_request {
+        ensure_unauthorized_response_challenge(plugins, ctx, *status, headers);
+    }
     let original_method = ctx
         .metadata
         .remove(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
@@ -31985,21 +31992,118 @@ fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
 ) -> (u16, Bytes, HashMap<String, String>) {
+    let mut challenges = Vec::new();
+    push_applicable_authentication_challenges(&mut challenges, auth_plugins, ctx);
     let mut headers = HashMap::new();
-    // Challenge selection follows configured priority order: mechanisms that
-    // do not advertise a challenge are skipped, and the first available
-    // challenge wins.
-    let challenge = auth_plugins
-        .iter()
-        .filter(|plugin| plugin.authentication_applies(ctx))
-        .find_map(|plugin| plugin.authentication_challenge())
-        .unwrap_or("ferrum-edge");
-    headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
+    headers.insert(
+        "WWW-Authenticate".to_string(),
+        crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges),
+    );
     (
         401,
         Bytes::from_static(MISSING_AUTHENTICATION_BODY),
         headers,
     )
+}
+
+/// Append the challenge of every authentication mechanism that governs this
+/// request, in configured priority order, one per auth-scheme. Mechanisms
+/// that advertise no challenge, and trigger-skipped instances, contribute
+/// nothing (issue #6774).
+fn push_applicable_authentication_challenges(
+    challenges: &mut Vec<String>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) {
+    for plugin in plugins {
+        if plugin.authentication_applies(ctx)
+            && let Some(challenge) = plugin.authentication_challenge()
+        {
+            crate::plugins::utils::auth_flow::push_authentication_challenge(challenges, challenge);
+        }
+    }
+}
+
+/// Record the challenge a mechanism's `401` rejection carries, or that
+/// mechanism's advertised challenge when the rejection has no header-valid
+/// one, so a later rejection in a multi-auth chain cannot erase it.
+fn collect_auth_rejection_challenge(
+    challenges: &mut Vec<String>,
+    plugin: &dyn Plugin,
+    status_code: u16,
+    headers: &HashMap<String, String>,
+) {
+    if status_code != 401 {
+        return;
+    }
+    let collected = challenges.len();
+    if let Some(challenge) =
+        crate::plugins::utils::auth_flow::response_authentication_challenge(headers)
+    {
+        crate::plugins::utils::auth_flow::push_authentication_challenge(challenges, challenge);
+    }
+    if challenges.len() == collected
+        && let Some(challenge) = plugin.authentication_challenge()
+    {
+        crate::plugins::utils::auth_flow::push_authentication_challenge(challenges, challenge);
+    }
+}
+
+/// Give the authentication phase's final `401` every applicable challenge
+/// (RFC 9110 §15.5.2, issue #6774): the rejecting mechanisms' own challenges
+/// first, then each other applicable mechanism's advertised challenge, one
+/// per auth-scheme, falling back to the generic gateway challenge. Any other
+/// status is left untouched.
+fn apply_auth_rejection_challenges(
+    reject: &mut (u16, Bytes, HashMap<String, String>),
+    mut challenges: Vec<String>,
+    auth_plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) {
+    if reject.0 != 401 {
+        return;
+    }
+    push_applicable_authentication_challenges(&mut challenges, auth_plugins, ctx);
+    crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+        &mut reject.2,
+        crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges),
+    );
+}
+
+/// Guarantee a gateway-generated `401` plugin rejection carries a header-valid
+/// `WWW-Authenticate` challenge (RFC 9110 §15.5.2, issue #6774).
+///
+/// Authentication-phase rejections already carry theirs. This covers every
+/// other plugin `401` — `access_control` with no identified consumer, a custom
+/// plugin, a response-phase rejection — by advertising the challenges of the
+/// route's applicable authentication mechanisms, or the generic gateway
+/// challenge when there are none. A rejection that already carries a valid
+/// challenge is left exactly as authored; an invalid one (for example, one
+/// containing CR/LF) is replaced rather than sent. Runs before the reject-path
+/// response hooks, so an operator's explicit header policy still has the final
+/// say.
+pub(crate) fn ensure_unauthorized_response_challenge(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status: u16,
+    headers: &mut HashMap<String, String>,
+) {
+    if status != 401 {
+        return;
+    }
+    if crate::plugins::utils::auth_flow::response_authentication_challenge(headers).is_some_and(
+        |challenge| {
+            crate::plugins::utils::auth_flow::is_valid_authentication_challenge(challenge.trim())
+        },
+    ) {
+        return;
+    }
+    let mut challenges = Vec::new();
+    push_applicable_authentication_challenges(&mut challenges, plugins, ctx);
+    crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+        headers,
+        crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -32738,6 +32842,9 @@ pub async fn run_authentication_phase_with_envelope(
             // diagnostic reference detail (issue #5846).
             let mut last_reject_plugin: Option<&Arc<dyn Plugin>> = None;
             let mut server_reject_plugin: Option<&Arc<dyn Plugin>> = None;
+            // Every rejecting mechanism's challenge, in chain order, so the
+            // last rejection selected below cannot erase an earlier one's.
+            let mut rejection_challenges: Vec<String> = Vec::new();
             for auth_plugin in auth_plugins {
                 if !auth_plugin.authentication_applies(ctx) {
                     continue;
@@ -32768,6 +32875,12 @@ pub async fn run_authentication_phase_with_envelope(
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             let reject = (reject.status_code, reject.body, reject.headers);
+                            collect_auth_rejection_challenge(
+                                &mut rejection_challenges,
+                                auth_plugin.as_ref(),
+                                reject.0,
+                                &reject.2,
+                            );
                             if reject.0 >= 500 {
                                 if server_reject.is_none() {
                                     server_reject = Some(reject);
@@ -32807,6 +32920,12 @@ pub async fn run_authentication_phase_with_envelope(
                 let mut reject = server_reject
                     .or(last_reject)
                     .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
+                apply_auth_rejection_challenges(
+                    &mut reject,
+                    rejection_challenges,
+                    auth_plugins,
+                    ctx,
+                );
                 attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                 Some(adapt_auth_reject_for_openai_envelope(
                     uses_openai_auth_error_envelope,
@@ -32838,6 +32957,19 @@ pub async fn run_authentication_phase_with_envelope(
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             crate::diagnostic_ref::note_rejecting_plugin(ctx, auth_plugin.as_ref());
                             let mut reject = (reject.status_code, reject.body, reject.headers);
+                            let mut rejection_challenges = Vec::new();
+                            collect_auth_rejection_challenge(
+                                &mut rejection_challenges,
+                                auth_plugin.as_ref(),
+                                reject.0,
+                                &reject.2,
+                            );
+                            apply_auth_rejection_challenges(
+                                &mut reject,
+                                rejection_challenges,
+                                auth_plugins,
+                                ctx,
+                            );
                             attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                             return Some(adapt_auth_reject_for_openai_envelope(
                                 uses_openai_auth_error_envelope,

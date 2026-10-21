@@ -1651,7 +1651,7 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
     assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
@@ -1683,7 +1683,7 @@ async fn test_single_basic_auth_missing_credentials_uses_basic_challenge() {
 }
 
 #[tokio::test]
-async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
+async fn test_multi_auth_missing_credentials_advertises_every_applicable_challenge() {
     let jwt: Arc<dyn Plugin> = Arc::new(JwtAuth::new(&json!({})).unwrap());
     let basic: Arc<dyn Plugin> = Arc::new(basic_auth_plugin());
     let mut ctx = RequestContext::new(
@@ -1702,9 +1702,10 @@ async fn test_multi_auth_missing_credentials_uses_first_available_challenge() {
 
     let (status, _body, headers) = result.expect("all-missing auth chain must reject");
     assert_eq!(status, 401);
+    // Issue #6774: every applicable mechanism's challenge, in priority order.
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+        Some(r#"Bearer, Basic realm="ferrum-edge", charset="UTF-8""#)
     );
 }
 
@@ -1808,7 +1809,7 @@ async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
     assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
-        Some("ferrum-edge")
+        Some(r#"ApiKey realm="ferrum-edge""#)
     );
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());

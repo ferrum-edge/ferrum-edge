@@ -3402,6 +3402,10 @@ async fn external_identity_runner_commits_the_mechanism_realm() {
             "realm_probe"
         }
 
+        fn authentication_challenge(&self) -> &'static str {
+            "Bearer"
+        }
+
         fn extract(&self, _ctx: &ferrum_edge::plugins::RequestContext) -> ExtractedCredential {
             ExtractedCredential::BearerToken("probe".to_string())
         }

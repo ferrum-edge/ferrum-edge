@@ -28,6 +28,23 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Every gateway `401` carries an applicable `WWW-Authenticate` challenge (#6774)
+
+Authentication `401`s now always carry a challenge for the mechanism that
+applies (see "Authentication Challenges" in `docs/plugins.md`). `key_auth`
+advertises `ApiKey realm="ferrum-edge"`, `jwt_auth` and `jwks_auth` answer
+`Bearer` (with RFC 6750 `error` codes on rejected tokens) or `DPoP`,
+`hmac_auth` answers `hmac realm="ferrum-edge"`, `mtls_auth` answers
+`ClientCertificate realm="ferrum-edge"`, and `soap_ws_security` answers
+`WS-Security realm="ferrum-edge"`. A route that previously answered a
+`key_auth`-only missing credential with `WWW-Authenticate: ferrum-edge` now
+answers `ApiKey realm="ferrum-edge"`, and a chain of several mechanisms lists
+every applicable challenge instead of only the first. Any other plugin `401`
+without a valid challenge gets the route's challenges, or `ferrum-edge`. Clients
+or tests that match the exact `WWW-Authenticate` value must be updated; status
+codes and response bodies are unchanged. Custom authentication plugins should
+implement `Plugin::authentication_challenge`.
+
 ### Plugin-config writes require `expected_proxy_ids` (forge-ops #569, PR #6744)
 
 `PUT` and `DELETE /plugins/config/{id}` now require the

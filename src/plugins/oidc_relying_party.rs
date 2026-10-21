@@ -23,7 +23,7 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
-    NumericDateBound, VerifyOutcome, authentication_attempt_can_commit,
+    NumericDateBound, VerifyOutcome, auth_rejection, authentication_attempt_can_commit,
     commit_authentication_attempt, constant_time_eq, credential_deadline_from_unix_seconds,
     external_identity_realm_authority, nonblank_identity, numeric_date_seconds,
 };
@@ -67,6 +67,12 @@ const DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE: usize = 32;
 const DEFAULT_REFRESH_SKEW_SECS: u64 = 30;
 const DEFAULT_CHALLENGE_HTML_STATUS: u64 = 302;
 const DEFAULT_CHALLENGE_API_STATUS: u64 = 401;
+/// `WWW-Authenticate` challenge advertised for an absent session on an API
+/// request (issue #6774).
+const OIDC_SESSION_CHALLENGE: &str = r#"Bearer realm="oidc""#;
+/// Challenge on a `401` for a session that is expired, invalid, or names no
+/// usable principal (RFC 6750 §3.1 `invalid_token`).
+const OIDC_INVALID_SESSION_CHALLENGE: &str = r#"Bearer realm="oidc", error="invalid_token""#;
 const MAX_STATE_TTL_SECS: u64 = 3600;
 /// Upper bound on every configured session lifetime (`session.ttl_secs`,
 /// `session.idle_ttl_secs`) and on a provider-supplied `expires_in`, in
@@ -2230,7 +2236,7 @@ impl OidcRelyingParty {
             let mut headers = HashMap::new();
             headers.insert(
                 "www-authenticate".to_string(),
-                r#"Bearer realm="oidc", error="invalid_token""#.to_string(),
+                OIDC_INVALID_SESSION_CHALLENGE.to_string(),
             );
             if clear {
                 headers.insert("set-cookie".to_string(), self.clear_cookie());
@@ -2679,6 +2685,9 @@ impl super::Plugin for OidcRelyingParty {
     }
     fn is_auth_plugin(&self) -> bool {
         true
+    }
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        Some(OIDC_SESSION_CHALLENGE)
     }
     fn priority(&self) -> u16 {
         super::priority::OIDC_RELYING_PARTY
@@ -3341,7 +3350,9 @@ fn apply_verify_outcome(
         Err(VerifyOutcome::Invalid(body))
         | Err(VerifyOutcome::InvalidFormat(body))
         | Err(VerifyOutcome::ConsumerNotFound(body))
-        | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
+        | Err(VerifyOutcome::VerificationFailed(body)) => {
+            auth_rejection(401, body, OIDC_INVALID_SESSION_CHALLENGE)
+        }
         Err(VerifyOutcome::Internal(body)) => reject(500, body),
         Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
             PluginResult::Continue

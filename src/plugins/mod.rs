@@ -12255,10 +12255,19 @@ pub trait Plugin: Any + Send + Sync {
         self.is_auth_plugin()
     }
 
-    /// Returns the challenge advertised when the full authentication chain
-    /// completes without a credential or identity. The first configured auth
-    /// plugin that supplies a challenge wins; direct plugin rejections retain
-    /// their own response headers.
+    /// Returns the `WWW-Authenticate` challenge (RFC 9110 §11.6.1) this
+    /// authentication mechanism advertises.
+    ///
+    /// Every gateway-generated `401` carries at least one applicable challenge
+    /// (RFC 9110 §15.5.2, issue #6774). When the authentication phase ends in a
+    /// `401` — whether no credential was presented or a mechanism rejected one
+    /// — the response lists the rejecting mechanisms' own challenges first and
+    /// then the challenge of every other applicable auth plugin in configured
+    /// priority order, one per auth-scheme. Every built-in authentication
+    /// plugin returns `Some`; `None` (the default, and what non-auth plugins
+    /// keep) contributes nothing, and a `401` that would otherwise carry no
+    /// challenge gets the generic `ferrum-edge` challenge. Must be a fixed,
+    /// header-valid value.
     fn authentication_challenge(&self) -> Option<&'static str> {
         None
     }

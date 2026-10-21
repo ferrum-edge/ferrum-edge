@@ -16,9 +16,9 @@ use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::auth_flow::{
-    AuthMechanism, ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
-    credential_deadline_from_claims, external_identity_realm_authority, nonblank_identity,
-    refine_external_identity_realm_authority,
+    self, AuthMechanism, CredentialRejection, ExtractedCredential, VerifyOutcome,
+    commit_authentication_attempt, credential_deadline_from_claims,
+    external_identity_realm_authority, nonblank_identity, refine_external_identity_realm_authority,
 };
 use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
@@ -166,6 +166,11 @@ pub struct JwksAuth {
     /// bearer — and requires the `Authorization` header to be one of the
     /// provider's token locations (explicitly, with no prefix, or by default).
     dpop_authorization_scheme_providers: Vec<usize>,
+    /// `WWW-Authenticate` challenge advertised for an absent credential
+    /// (issue #6774), precomputed at construction. `DPoP` only when every
+    /// provider demands a proof; otherwise `Bearer`, which every provider
+    /// accepts (the RFC 9449 §7.1 migration shape).
+    advertised_challenge: &'static str,
     request_headers_to_redact: Vec<String>,
     emit_mesh_request_principal_metadata: bool,
     /// Istio `RequestAuthentication` semantics: a request carrying no token
@@ -1027,6 +1032,13 @@ impl JwksAuth {
             )),
         );
 
+        let advertised_challenge =
+            if !providers.is_empty() && providers.iter().all(|provider| provider.require_dpop) {
+                auth_flow::DPOP_AUTHENTICATION_CHALLENGE
+            } else {
+                auth_flow::BEARER_AUTHENTICATION_CHALLENGE
+            };
+
         Ok(Self {
             providers,
             global_scope_claim,
@@ -1039,6 +1051,7 @@ impl JwksAuth {
             strip_authorization_on_success,
             has_custom_query_token_locations,
             dpop_authorization_scheme_providers,
+            advertised_challenge,
             request_headers_to_redact,
             emit_mesh_request_principal_metadata,
             allow_missing_token,
@@ -1327,17 +1340,34 @@ impl JwksAuth {
         claims: &Value,
         provider: &JwksProvider,
         token: &str,
-    ) -> Result<Option<ReplayMarker>, (u16, String)> {
+    ) -> Result<Option<ReplayMarker>, (u16, String, &'static str)> {
+        // RFC 8705 §3: a certificate-bound token presented without the bound
+        // certificate is an `invalid_token`.
+        const MTLS: &str = auth_flow::BEARER_INVALID_TOKEN_CHALLENGE;
+        // RFC 9449 §7.1: an absent or rejected proof is an `invalid_dpop_proof`.
+        const DPOP: &str = auth_flow::DPOP_INVALID_PROOF_CHALLENGE;
         if provider.require_mtls_binding {
             let Some(cert_der) = ctx.tls_client_cert_der.as_ref() else {
-                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+                return Err((
+                    401,
+                    r#"{"error":"mTLS binding mismatch"}"#.to_string(),
+                    MTLS,
+                ));
             };
             let Some(expected_thumbprint) = extract_claim_string(claims, "cnf.x5t#S256") else {
-                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+                return Err((
+                    401,
+                    r#"{"error":"mTLS binding mismatch"}"#.to_string(),
+                    MTLS,
+                ));
             };
             let actual_thumbprint = sha256_base64url_no_pad(cert_der.as_slice());
             if !constant_time_eq(actual_thumbprint.as_bytes(), expected_thumbprint.as_bytes()) {
-                return Err((401, r#"{"error":"mTLS binding mismatch"}"#.to_string()));
+                return Err((
+                    401,
+                    r#"{"error":"mTLS binding mismatch"}"#.to_string(),
+                    MTLS,
+                ));
             }
         }
 
@@ -1350,10 +1380,10 @@ impl JwksAuth {
         // material, not a missing proof.
         let proof = match lookup_configured_header(ctx, "dpop", None) {
             ConfiguredHeaderLookup::Absent => {
-                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+                return Err((401, r#"{"error":"DPoP proof required"}"#.to_string(), DPOP));
             }
             ConfiguredHeaderLookup::PresentNonMaterialized => {
-                return Err((401, r#"{"error":"Invalid DPoP proof"}"#.to_string()));
+                return Err((401, r#"{"error":"Invalid DPoP proof"}"#.to_string(), DPOP));
             }
             ConfiguredHeaderLookup::Value(proof) => proof,
         };
@@ -1361,22 +1391,30 @@ impl JwksAuth {
         // construction rejects the configuration otherwise. Fail closed rather
         // than admit a proof that would not be made single-use.
         let Some(domain) = provider.dpop_replay_domain.as_ref() else {
-            return Err((401, r#"{"error":"DPoP proof required"}"#.to_string()));
+            return Err((401, r#"{"error":"DPoP proof required"}"#.to_string(), DPOP));
         };
         let Some(issuer) = extract_claim_string(claims, "iss") else {
-            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+            return Err((
+                401,
+                r#"{"error":"DPoP validation failed"}"#.to_string(),
+                DPOP,
+            ));
         };
         let Some(token_identity) = extract_claim_string(claims, "sub")
             .or_else(|| extract_claim_string(claims, "client_id"))
         else {
-            return Err((401, r#"{"error":"DPoP validation failed"}"#.to_string()));
+            return Err((
+                401,
+                r#"{"error":"DPoP validation failed"}"#.to_string(),
+                DPOP,
+            ));
         };
         let Some(host) = ctx
             .headers
             .get("host")
             .or_else(|| ctx.headers.get(":authority"))
         else {
-            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string(), DPOP));
         };
         let scheme = ctx
             .metadata
@@ -1384,7 +1422,7 @@ impl JwksAuth {
             .map(String::as_str)
             .unwrap_or("http");
         let Some(htu) = dpop::canonical_htu(scheme, host, &ctx.path) else {
-            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string()));
+            return Err((401, r#"{"error":"DPoP URL mismatch"}"#.to_string(), DPOP));
         };
         match dpop::verify(DpopVerifyInput {
             proof: &proof,
@@ -1397,7 +1435,11 @@ impl JwksAuth {
             domain,
         }) {
             Ok(marker) => Ok(Some(marker)),
-            Err(_) => Err((401, r#"{"error":"DPoP validation failed"}"#.to_string())),
+            Err(_) => Err((
+                401,
+                r#"{"error":"DPoP validation failed"}"#.to_string(),
+                DPOP,
+            )),
         }
     }
 
@@ -1523,7 +1565,9 @@ impl JwksAuth {
                 }
                 PluginResult::Continue
             }
-            JwksExtractedCredential::InvalidFormat(body) => reject(401, body),
+            JwksExtractedCredential::InvalidFormat(body) => {
+                reject(401, body, auth_flow::BEARER_INVALID_REQUEST_CHALLENGE)
+            }
             JwksExtractedCredential::BearerToken {
                 token,
                 provider_indices,
@@ -1534,7 +1578,13 @@ impl JwksAuth {
                     .await
                 {
                     Ok(result) => result,
-                    Err((status, body)) => return reject(status, body.to_string()),
+                    Err((status, body)) => {
+                        return reject(
+                            status,
+                            body.to_string(),
+                            auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
+                        );
+                    }
                 };
 
                 let provider = &self.providers[provider_idx];
@@ -1546,15 +1596,15 @@ impl JwksAuth {
                 let pending_dpop_marker =
                     match self.check_sender_constraints(ctx, &claims, provider, &token) {
                         Ok(marker) => marker,
-                        Err((status, body)) => return reject(status, body),
+                        Err((status, body, challenge)) => return reject(status, body, challenge),
                     };
                 if let Err((status, body)) = self.check_claims_authorization(&claims, provider) {
-                    return reject(status, body);
+                    return reject(status, body, auth_flow::BEARER_INVALID_TOKEN_CHALLENGE);
                 }
                 if let Some(marker) = pending_dpop_marker {
                     let admission = self.admit_dpop_marker(provider, marker).await;
                     if let Err((status, body)) = admission {
-                        return reject(status, body);
+                        return reject(status, body, auth_flow::DPOP_INVALID_PROOF_CHALLENGE);
                     }
                 }
 
@@ -1592,12 +1642,24 @@ impl JwksAuth {
                     true,
                 ) {
                     Ok(_) => PluginResult::Continue,
-                    Err(VerifyOutcome::InvalidFormat(body))
-                    | Err(VerifyOutcome::Invalid(body))
+                    Err(VerifyOutcome::InvalidFormat(body)) => reject(
+                        401,
+                        body,
+                        self.rejection_challenge(CredentialRejection::InvalidFormat),
+                    ),
+                    Err(VerifyOutcome::Invalid(body))
                     | Err(VerifyOutcome::ConsumerNotFound(body))
-                    | Err(VerifyOutcome::VerificationFailed(body)) => reject(401, body),
-                    Err(VerifyOutcome::Forbidden(body)) => reject(403, body),
-                    Err(VerifyOutcome::Internal(body)) => reject(500, body),
+                    | Err(VerifyOutcome::VerificationFailed(body)) => reject(
+                        401,
+                        body,
+                        self.rejection_challenge(CredentialRejection::InvalidCredential),
+                    ),
+                    Err(VerifyOutcome::Forbidden(body)) => {
+                        reject(403, body, self.advertised_challenge)
+                    }
+                    Err(VerifyOutcome::Internal(body)) => {
+                        reject(500, body, self.advertised_challenge)
+                    }
                     Err(VerifyOutcome::Success { .. }) | Err(VerifyOutcome::NotApplicable) => {
                         PluginResult::Continue
                     }
@@ -1710,6 +1772,17 @@ impl AuthMechanism for JwksAuth {
         "jwks_auth"
     }
 
+    fn authentication_challenge(&self) -> &'static str {
+        self.advertised_challenge
+    }
+
+    fn rejection_challenge(&self, rejection: CredentialRejection) -> &'static str {
+        match rejection {
+            CredentialRejection::InvalidFormat => auth_flow::BEARER_INVALID_REQUEST_CHALLENGE,
+            CredentialRejection::InvalidCredential => auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
+        }
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         match self.extract_jwks_credential(ctx) {
             JwksExtractedCredential::Missing => ExtractedCredential::Missing,
@@ -1816,6 +1889,10 @@ impl super::Plugin for JwksAuth {
 
     fn priority(&self) -> u16 {
         super::priority::JWKS_AUTH
+    }
+
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        Some(self.advertised_challenge)
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
@@ -2928,12 +3005,10 @@ fn optional_provider_usize(
         .map_err(|_| format!("jwks_auth: `provider[{provider_idx}].{field}` is too large"))
 }
 
-fn reject(status_code: u16, body: String) -> PluginResult {
-    PluginResult::Reject {
-        status_code,
-        body,
-        headers: std::collections::HashMap::new(),
-    }
+/// Every `jwks_auth` rejection goes through here, so a `401` always carries
+/// the challenge for the credential that failed (issue #6774).
+fn reject(status_code: u16, body: String, challenge: &'static str) -> PluginResult {
+    auth_flow::auth_rejection(status_code, body, challenge)
 }
 
 /// Fetch the OIDC discovery document and extract a validated `jwks_uri`.

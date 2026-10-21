@@ -19,6 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **Every gateway-generated `401` carries an applicable `WWW-Authenticate`
+  challenge** (issue #6774, RFC 9110 §15.5.2). `AuthMechanism` now requires a
+  challenge, so `key_auth` (`ApiKey`), `jwt_auth`/`jwks_auth` (`Bearer` with
+  RFC 6750 error codes, or `DPoP`), `hmac_auth` (`hmac`, including replay
+  rejects), `mtls_auth` (`ClientCertificate`), `soap_ws_security`
+  (`WS-Security`), and `oidc_relying_party` session rejects no longer answer
+  `401` without one. An authentication-phase `401` lists every rejecting and
+  applicable mechanism's challenge (one per scheme) instead of letting the
+  last rejection erase earlier ones, and any other plugin `401` lacking a
+  valid challenge gets the route's challenges or the generic `ferrum-edge`.
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and
   config-validation resolver used by `Consumer::validate_fields`, the

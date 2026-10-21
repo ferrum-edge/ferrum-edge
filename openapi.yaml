@@ -11690,8 +11690,12 @@ components:
         returned by a plugin is terminal.
         `multi` — auth plugins run sequentially until one succeeds. If none
         succeeds, a server rejection takes precedence over the last ordinary
-        rejection; an all-missing chain returns the first available challenge
-        in plugin priority order, skipping challenge-less mechanisms.
+        rejection.
+        In either mode a `401` from the authentication phase carries a
+        `WWW-Authenticate` field listing, one challenge per auth-scheme, each
+        rejecting mechanism's challenge in chain order and then every other
+        applicable auth plugin's advertised challenge in priority order,
+        falling back to the generic `ferrum-edge` challenge.
 
     PluginAssociation:
       type: object

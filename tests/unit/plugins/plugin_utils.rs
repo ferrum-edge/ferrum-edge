@@ -503,6 +503,60 @@ pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {
     }
 }
 
+/// The `WWW-Authenticate` field of a response header map, matched
+/// case-insensitively (issue #6774).
+#[allow(dead_code)]
+pub fn challenge_header(headers: &HashMap<String, String>) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Assert a `401` plugin rejection whose `WWW-Authenticate` field is exactly
+/// `expected_challenge` (RFC 9110 §15.5.2, issue #6774).
+#[allow(dead_code)]
+pub fn assert_unauthorized_with_challenge(result: PluginResult, expected_challenge: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            body,
+        } => {
+            assert_eq!(status_code, 401, "expected a 401 rejection, body={body}");
+            assert_eq!(
+                challenge_header(&headers),
+                Some(expected_challenge),
+                "a 401 must carry the applicable challenge, body={body}"
+            );
+        }
+        other => panic!("Expected a 401 Reject, got {other:?}"),
+    }
+}
+
+/// Assert an authentication-phase rejection is a `401` whose
+/// `WWW-Authenticate` field is exactly `expected_challenge` (issue #6774).
+#[allow(dead_code)]
+pub fn assert_phase_unauthorized_with_challenge(
+    rejection: Option<(u16, bytes::Bytes, HashMap<String, String>)>,
+    expected_challenge: &str,
+) {
+    let (status_code, body, headers) =
+        rejection.expect("the authentication phase must reject the request");
+    assert_eq!(
+        status_code,
+        401,
+        "expected a 401 rejection, body={}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        challenge_header(&headers),
+        Some(expected_challenge),
+        "a 401 must carry every applicable challenge, body={}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tracing capture (advisory GHSA-8594-2xhc-8g38 sink-URL redaction tests)
 // ---------------------------------------------------------------------------
