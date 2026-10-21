@@ -5101,9 +5101,9 @@ pub struct PluginPhaseData {
     /// `enforced_request_body_limit`; buffered collection aborts here instead of
     /// at the generally larger global allowance.
     pub enforced_response_body_limit: Option<u64>,
-    /// Audited request-hook sublists, retaining configured order and instances.
-    pub on_request_received_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    pub before_proxy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Present only when audited defaults were removed from a request phase.
+    /// Unfiltered chains reuse `ProtocolEntry::plugins` without another Arc.
+    request_hooks: Option<Arc<RequestHookPlans>>,
     /// gRPC deadline-policy plugins only, in configured priority order.
     pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
@@ -5186,6 +5186,12 @@ pub struct PluginPhaseData {
     /// members would produce a digest that matches while an undescribed
     /// transform silently changes.
     pub response_presentation_policy_digest: Option<[u8; 32]>,
+}
+
+/// Both filtered request phases share one allocation and one per-view Arc bump.
+struct RequestHookPlans {
+    on_request_received: Vec<Arc<dyn Plugin>>,
+    before_proxy: Vec<Arc<dyn Plugin>>,
 }
 
 /// The two request hooks audited for default-future elision. This inventory is
@@ -5442,9 +5448,16 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
                 Some(enforced_response_body_limit.map_or(limit, |current: u64| current.min(limit)));
         }
     }
+    let request_hooks = (on_request_received.len() != plugins.len()
+        || before_proxy.len() != plugins.len())
+    .then(|| {
+        Arc::new(RequestHookPlans {
+            on_request_received,
+            before_proxy,
+        })
+    });
     PluginPhaseData {
-        on_request_received_plugins: Arc::new(on_request_received),
-        before_proxy_plugins: Arc::new(before_proxy),
+        request_hooks,
         enforced_request_body_limit,
         enforced_response_body_limit,
         grpc_deadline_plugins: Arc::new(grpc_deadline),
@@ -6547,8 +6560,7 @@ impl PluginCacheInner {
             .then(|| Arc::clone(&entry.phase.backend_path_plugins));
         PluginCacheRequestView {
             plugins: Arc::clone(&entry.plugins),
-            on_request_received_plugins: Arc::clone(&entry.phase.on_request_received_plugins),
-            before_proxy_plugins: Arc::clone(&entry.phase.before_proxy_plugins),
+            request_hooks: entry.phase.request_hooks.clone(),
             grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
             auth_plugins: Arc::clone(&entry.phase.auth_plugins),
             authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
@@ -6586,8 +6598,7 @@ impl PluginCacheInner {
     fn empty_request_view(&self, proxy_key: &str) -> PluginCacheRequestView {
         PluginCacheRequestView {
             plugins: Arc::new(Vec::new()),
-            on_request_received_plugins: Arc::new(Vec::new()),
-            before_proxy_plugins: Arc::new(Vec::new()),
+            request_hooks: None,
             grpc_deadline_plugins: Arc::new(Vec::new()),
             auth_plugins: Arc::new(Vec::new()),
             authorize_plugins: Arc::new(Vec::new()),
@@ -6639,8 +6650,7 @@ impl PluginCacheInner {
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    on_request_received_plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    before_proxy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    request_hooks: Option<Arc<RequestHookPlans>>,
     grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -6705,13 +6715,19 @@ impl PluginCacheRequestView {
     /// Request-received hooks from this same cache generation. Only audited
     /// built-in trait defaults are omitted; triggered/custom instances remain.
     pub fn on_request_received_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.on_request_received_plugins.as_slice()
+        self.request_hooks
+            .as_deref()
+            .map_or(self.plugins.as_slice(), |plan| {
+                plan.on_request_received.as_slice()
+            })
     }
 
     /// Before-proxy hooks in configured order, including every routing
     /// finalizer and every triggered/custom instance.
     pub fn before_proxy_plugins(&self) -> &[Arc<dyn Plugin>] {
-        self.before_proxy_plugins.as_slice()
+        self.request_hooks
+            .as_deref()
+            .map_or(self.plugins.as_slice(), |plan| plan.before_proxy.as_slice())
     }
 
     /// Get the pre-filtered synchronous gRPC deadline-policy chain.

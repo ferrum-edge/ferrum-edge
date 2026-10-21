@@ -108,6 +108,48 @@ fn mesh_plans_omit_only_defaults_and_retain_phase_order_and_instances() {
     assert_eq!(grpc_web.before_proxy_plugins().len(), 3);
 }
 
+#[test]
+fn unfiltered_empty_and_custom_chains_reuse_the_original_plugin_slice() {
+    let cache = PluginCache::new(&config(Vec::new())).unwrap();
+    for custom in [false, true] {
+        if custom {
+            prepend_proxy_plugin_for_test(
+                &cache,
+                "ferrum",
+                "p1",
+                Arc::new(CustomProbe {
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            )
+            .unwrap();
+        }
+        let view = cache.request_view("ferrum", "p1", ProxyProtocol::Http);
+        let full = view.plugins();
+        assert_eq!(full.len(), usize::from(custom));
+        assert!(std::ptr::eq(
+            view.on_request_received_plugins(),
+            full.as_slice()
+        ));
+        assert!(std::ptr::eq(view.before_proxy_plugins(), full.as_slice()));
+    }
+    // Guard the hot-view ownership budget as well as the slice results: the
+    // optional plan owns plain Vecs, and an unfiltered view has no plan Arc.
+    let source = include_str!("../../../src/plugin_cache.rs");
+    let start = source.find("struct RequestHookPlans {").unwrap();
+    let end = source[start..].find("\n}\n").unwrap() + start;
+    assert_eq!(
+        source[start..end].matches("Vec<Arc<dyn Plugin>>").count(),
+        2
+    );
+    assert!(!source[start..end].contains("Arc<Vec"));
+    assert_eq!(
+        source
+            .matches("request_hooks: Option<Arc<RequestHookPlans>>")
+            .count(),
+        2
+    );
+}
+
 struct CustomProbe {
     calls: Arc<Mutex<Vec<&'static str>>>,
 }
