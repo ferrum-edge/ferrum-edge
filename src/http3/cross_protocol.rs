@@ -3752,7 +3752,7 @@ where
                     stream,
                     ctx,
                     StatusCode::BAD_REQUEST,
-                    r#"{"error":"Malformed request body"}"#,
+                    crate::proxy::client_abort::MALFORMED_UPLOAD_HTTP_BODY,
                     None,
                     backend_start,
                     0,
@@ -10903,7 +10903,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 (
                     grpc_proxy::grpc_status::INVALID_ARGUMENT,
                     if upload_fault == GRPC_BRIDGE_UPLOAD_MALFORMED_BODY {
-                        "Malformed request body"
+                        crate::proxy::client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE
                     } else {
                         "Malformed request trailers"
                     },

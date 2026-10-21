@@ -800,9 +800,9 @@ fn boxed_finalize_h3_upload_read_failure<'a>(
         } else if error.failure() == crate::http3::stream_util::H3RequestReadFailure::Malformed {
             (
                 StatusCode::BAD_REQUEST,
-                br#"{"error":"Malformed request body"}"#.as_slice(),
+                crate::proxy::client_abort::MALFORMED_UPLOAD_HTTP_BODY.as_bytes(),
                 crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
-                "Malformed request body",
+                crate::proxy::client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE,
                 "invalid_h3_upload",
             )
         } else {
@@ -12474,7 +12474,7 @@ fn h3_malformed_client_request_status_body(
         )),
         Some(crate::http3::client::H3ClientRequestFault::MalformedBody) => Some((
             StatusCode::BAD_REQUEST,
-            r#"{"error":"Malformed request body"}"#,
+            crate::proxy::client_abort::MALFORMED_UPLOAD_HTTP_BODY,
         )),
         Some(
             crate::http3::client::H3ClientRequestFault::Abort(_)
@@ -14070,7 +14070,7 @@ impl H3GrpcTerminatingUploadFault {
             ),
             Self::MalformedBody => (
                 crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
-                "Malformed request body",
+                crate::proxy::client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE,
             ),
             Self::ClientAbort => {
                 let terminal = ProvenClientAbort::latched_upload_abort().pre_header_terminal();
@@ -14727,7 +14727,7 @@ where
             Some("Malformed request trailers")
         }
         Some(crate::http3::client::H3ClientRequestFault::MalformedBody) => {
-            Some("Malformed request body")
+            Some(crate::proxy::client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE)
         }
         Some(
             crate::http3::client::H3ClientRequestFault::Abort(_)

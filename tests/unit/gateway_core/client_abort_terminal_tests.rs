@@ -18,14 +18,15 @@
 //! `functional_h3_drain_refusal_hooks_test.rs` (`h3_*_client_abort_*`).
 
 use ferrum_edge::_test_support::{
-    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
-    map_http_reject_status_to_grpc_status,
+    PreHeaderSendTerminationForTest, error_class_is_backend_failure_for_test,
+    error_class_is_health_neutral_for_test, map_http_reject_status_to_grpc_status,
+    pre_header_upload_termination_response_for_test,
 };
 use ferrum_edge::plugins::{PeerConnectionSignal, PeerConnectionWatch, TransactionSummary};
 use ferrum_edge::proxy::client_abort::{
     CLIENT_ABORT_GRPC_STATUS, CLIENT_ABORT_HTTP_BODY, CLIENT_ABORT_MESSAGE,
-    CLIENT_CLOSED_REQUEST_STATUS, GATEWAY_CLOSED_UPLOAD_TERMINAL, PRE_HEADER_CLIENT_ABORT_TERMINAL,
-    ProvenClientAbort,
+    CLIENT_CLOSED_REQUEST_STATUS, GATEWAY_CLOSED_UPLOAD_TERMINAL, MALFORMED_UPLOAD_GRPC_MESSAGE,
+    MALFORMED_UPLOAD_HTTP_BODY, PRE_HEADER_CLIENT_ABORT_TERMINAL, ProvenClientAbort,
 };
 use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::retry::ErrorClass;
@@ -255,6 +256,75 @@ fn the_499_is_defined_once_and_minted_only_from_client_evidence() {
             "{name} must not map the ClientDisconnect class to 499"
         );
     }
+}
+
+#[test]
+fn the_relayed_upload_dispatcher_terminal_shares_the_one_definition() {
+    // Issue #6776's mesh-mTLS, HBONE, and Unix-socket terminal records the same
+    // client-abort terminal, from the same constants, as every HTTP/3 path.
+    let http = pre_header_upload_termination_response_for_test(
+        PreHeaderSendTerminationForTest::ClientAbort,
+        false,
+        None,
+    );
+    assert_eq!(http.status_code, CLIENT_CLOSED_REQUEST_STATUS);
+    assert_eq!(http.error_class, Some(ErrorClass::ClientDisconnect));
+    let grpc = pre_header_upload_termination_response_for_test(
+        PreHeaderSendTerminationForTest::ClientAbort,
+        true,
+        None,
+    );
+    assert_eq!(
+        grpc.headers.get("grpc-status").map(String::as_str),
+        Some(CLIENT_ABORT_GRPC_STATUS.to_string().as_str())
+    );
+    assert_eq!(
+        grpc.headers.get("grpc-message").map(String::as_str),
+        Some(CLIENT_ABORT_MESSAGE)
+    );
+    // Malformed input is the same 400 / INVALID_ARGUMENT vocabulary everywhere.
+    let malformed = pre_header_upload_termination_response_for_test(
+        PreHeaderSendTerminationForTest::MalformedUpload,
+        true,
+        None,
+    );
+    assert_eq!(
+        malformed.headers.get("grpc-status").map(String::as_str),
+        Some(grpc_status::INVALID_ARGUMENT.to_string().as_str())
+    );
+    assert_eq!(
+        malformed.headers.get("grpc-message").map(String::as_str),
+        Some(MALFORMED_UPLOAD_GRPC_MESSAGE)
+    );
+    assert_eq!(
+        MALFORMED_UPLOAD_HTTP_BODY,
+        r#"{"error":"Malformed request body"}"#
+    );
+
+    // One definition: the dispatcher's constants and the gRPC mapping's
+    // `grpc_proxy::CLIENT_CLOSED_REQUEST_STATUS` path alias `client_abort`.
+    let proxy = compact(PROXY);
+    for alias in [
+        "constGRPC_CLIENT_DISCONNECT_MESSAGE:&str=client_abort::CLIENT_ABORT_MESSAGE;",
+        "constMALFORMED_REQUEST_BODY_JSON:&[u8]=client_abort::MALFORMED_UPLOAD_HTTP_BODY.as_bytes();",
+        "constMALFORMED_REQUEST_BODY_GRPC_MESSAGE:&str=client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE;",
+    ] {
+        assert!(proxy.contains(alias), "missing shared alias {alias}");
+    }
+    let terminal = compact(region(
+        PROXY,
+        "pub(crate) fn pre_header_upload_termination_response(",
+        "upload_pump::PreHeaderSendTermination::MalformedUpload =>",
+    ));
+    assert!(terminal.contains(
+        "client_abort::ProvenClientAbort::latched_upload_abort().pre_header_terminal();"
+    ));
+    assert!(terminal.contains("client_abort::CLIENT_ABORT_HTTP_BODY.as_bytes(),"));
+    assert!(!terminal.contains("Clientdisconnected"));
+    let grpc_source = compact(include_str!("../../../src/proxy/grpc_proxy.rs"));
+    assert!(grpc_source.contains(
+        "pub(crate)constCLIENT_CLOSED_REQUEST_STATUS:u16=crate::proxy::client_abort::CLIENT_CLOSED_REQUEST_STATUS;"
+    ));
 }
 
 // ── H1/H2 buffered intake ───────────────────────────────────────────────────

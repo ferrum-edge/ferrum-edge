@@ -31486,7 +31486,8 @@ fn boxed_finalize_authorization_expired_rejection<'a>(
 
 /// Fixed `grpc-message` for a client that reset or dropped its buffered gRPC
 /// upload. Compiled in: it echoes nothing from the client's transport error.
-const GRPC_CLIENT_DISCONNECT_MESSAGE: &str = "Client disconnected";
+/// The one definition lives in [`client_abort`] (issue #6772).
+const GRPC_CLIENT_DISCONNECT_MESSAGE: &str = client_abort::CLIENT_ABORT_MESSAGE;
 
 /// Transaction-log `rejection_phase` for a buffered native-gRPC / gRPC-Web
 /// upload the client reset or dropped before dispatch (issue #6022).
@@ -43873,6 +43874,14 @@ async fn handle_proxy_request_inner(
     {
         passthrough.record(&mut ctx.metadata);
     }
+    // A buffered native-gRPC terminal the generic dispatch authored (a mesh
+    // Trailers-Only refusal) carries its status in the response headers only.
+    record_buffered_native_grpc_header_status(
+        &mut ctx.metadata,
+        request_uses_grpc_content_type && !grpc_web_request,
+        matches!(&response_body, ResponseBody::Buffered(_)),
+        &response_headers,
+    );
     // Native H3 needs the backend's declared length to distinguish a complete
     // body followed by a graceful QUIC close from truncation. Use the
     // pre-`after_proxy` capture: a hook-authored Content-Length must not
@@ -44051,6 +44060,10 @@ async fn handle_proxy_request_inner(
                 },
                 ai_usage_export: ctx.ai_usage_export.clone(),
                 proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+                // A dispatcher's proof that the client abandoned its upload
+                // before the response head (issue #6776); a streaming terminal
+                // reports its own disconnect at body end.
+                client_disconnected: ctx.proven_client_upload_abort(),
                 ..TransactionSummary::default()
             };
 
@@ -44135,8 +44148,9 @@ async fn handle_proxy_request_inner(
             if buffered_terminal_outcome_only {
                 // Exactly what `record_transaction` would have read off the
                 // summary this arm no longer builds: a buffered terminal has
-                // already ended, so it carries no body error and no client
-                // disconnect, and its `error_class` is the one the summary
+                // already ended, so it carries no body error, a client
+                // disconnect only when a dispatcher proved the client abandoned
+                // its upload (issue #6776), and the `error_class` the summary
                 // would have carried after the gateway output-policy
                 // refinement.
                 crate::runtime_metrics::global_ref().record_terminal_outcome(
@@ -44145,7 +44159,7 @@ async fn handle_proxy_request_inner(
                         grpc: crate::runtime_metrics::terminal_metadata_is_grpc(&ctx.metadata),
                         error_class: ctx.response_policy_error_class(backend_error_class),
                         body_error_class: None,
-                        client_disconnected: false,
+                        client_disconnected: ctx.proven_client_upload_abort(),
                     },
                 );
             }
@@ -54112,6 +54126,247 @@ fn mesh_transport_hyper_error_response(
     }
 }
 
+/// An unpumped streaming upload's client-fault latch (issue #6776): `Some`
+/// exactly when [`install_streaming_upload_authorization`] will install no
+/// gateway-owned pump (no authorization lifetime and
+/// `backend_write_timeout_ms = 0`), so the size-limit adapter is the one
+/// reading the client body. The default path pays nothing.
+fn unpumped_client_fault_latch(
+    auth: Option<&RequestAuthLifetimePlan>,
+    write_timeout_ms: u64,
+) -> Option<Arc<upload_pump::ClientUploadFaultLatch>> {
+    (auth.is_none() && write_timeout_ms == 0)
+        .then(|| Arc::new(upload_pump::ClientUploadFaultLatch::default()))
+}
+
+/// Attribute a pre-response-head `send_request` failure the gateway's own
+/// request body caused on the sidecar mesh-mTLS, HBONE, and Unix-socket
+/// dispatchers (issue #6776), from the joined pump terminal and recorded
+/// client fault, and record a proven client abort on the request so its
+/// terminal summary reports the disconnect exactly once.
+fn attribute_gateway_ended_upload(
+    send_auth_deadline: Option<&RequestAuthLifetimePlan>,
+    request_body_replayable: bool,
+    upload_pumped: bool,
+    pump_outcome: Option<upload_pump::UploadPumpOutcome>,
+    pump_fault: Option<upload_pump::ClientUploadFault>,
+    client_fault_latch: Option<&upload_pump::ClientUploadFaultLatch>,
+    request_ctx: Option<&RequestContext>,
+) -> upload_pump::PreHeaderSendTermination {
+    let client_fault = pump_fault.or_else(|| client_fault_latch.and_then(|latch| latch.observed()));
+    let termination = upload_pump::pre_header_send_termination(
+        true,
+        upload_authorization_ended(send_auth_deadline),
+        !request_body_replayable,
+        upload_pumped,
+        pump_outcome,
+        client_fault,
+    );
+    if termination == upload_pump::PreHeaderSendTermination::ClientAbort
+        && let Some(ctx) = request_ctx
+    {
+        ctx.record_proven_client_upload_abort();
+    }
+    termination
+}
+
+/// Whether the admitted stream's authorization lifetime has ended the upload:
+/// its once-only latch is already recorded (by the pump or the size-limit
+/// adapter), or the deadline has now elapsed and is recorded here. The same
+/// recheck the direct-H2 upload gate makes before it commits a replacement
+/// response.
+fn upload_authorization_ended(auth: Option<&RequestAuthLifetimePlan>) -> bool {
+    auth.is_some_and(|(plan, family, latch)| {
+        if latch.observed().is_some() {
+            return true;
+        }
+        let Some(termination) = crate::proxy::auth_lifetime::expired_authorization(Some(*plan))
+        else {
+            return false;
+        };
+        latch.record_once(termination, *family);
+        true
+    })
+}
+
+/// Fixed client-visible body for a client upload the frontend codec rejected
+/// as malformed before the backend response head (issue #6776).
+/// Shared with the HTTP/3 paths through [`client_abort`] (issue #6772).
+const MALFORMED_REQUEST_BODY_JSON: &[u8] = client_abort::MALFORMED_UPLOAD_HTTP_BODY.as_bytes();
+/// Fixed `grpc-message` for the same refusal on a gRPC-flavored request.
+const MALFORMED_REQUEST_BODY_GRPC_MESSAGE: &str = client_abort::MALFORMED_UPLOAD_GRPC_MESSAGE;
+
+/// Trailers-only gRPC refusal for a gRPC-flavored client whose upload failed
+/// before the backend response head (issue #6776): `grpc-status: 1`
+/// (`CANCELLED`) for a client that went away, `grpc-status: 3`
+/// (`INVALID_ARGUMENT`) for a malformed upload. Either is the client's own
+/// outcome, with the health-neutral `ClientDisconnect` class, never a backend
+/// `UNAVAILABLE`.
+fn mesh_grpc_client_upload_failure_response(
+    resolved_ip: Option<String>,
+    grpc_status: u32,
+    grpc_message: &'static str,
+) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("grpc-status".to_string(), grpc_status.to_string());
+    headers.insert("grpc-message".to_string(), grpc_message.to_string());
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ClientDisconnect),
+        request_on_wire: true,
+        buffered_trailers: None,
+    }
+}
+
+/// HTTP refusal for a client whose upload failed before the backend response
+/// head (issue #6776), with the health-neutral `ClientDisconnect` class.
+fn client_upload_failure_response(
+    resolved_ip: Option<String>,
+    status_code: u16,
+    body: &'static [u8],
+) -> retry::BackendResponse {
+    retry::BackendResponse {
+        status_code,
+        body: ResponseBody::buffered(Bytes::from_static(body)),
+        headers: HashMap::new(),
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ClientDisconnect),
+        request_on_wire: true,
+        buffered_trailers: None,
+    }
+}
+
+/// Response for a sidecar mesh-mTLS, HBONE, or Unix-socket dispatch whose
+/// `send_request` failed before the backend response head, attributed by the
+/// typed upload terminals (issue #6776,
+/// [`upload_pump::pre_header_send_termination`]).
+///
+/// * A proven client abort (a reset the client sent, or a reset or broken
+///   connection) is a client-closed request: `499` (nginx's convention, the
+///   same `CLIENT_CLOSED_REQUEST_STATUS` the gRPC mapping reads), or
+///   Trailers-Only `CANCELLED` for gRPC. That transport cannot deliver a
+///   response, so this is what the logs and request metrics record; the
+///   caller also marks the request `client_disconnected`.
+/// * A malformed or incomplete upload without that proof (including an early
+///   EOF from a client that half-closed and is still reading) is a bad
+///   request: `400` `{"error":"Malformed request body"}`, or
+///   `INVALID_ARGUMENT` for gRPC. Never `499`.
+/// * Both carry the health-neutral `ClientDisconnect` class with
+///   `connection_error = false`, so neither trains backend health or is
+///   replayed as a connect failure.
+/// * A backend write watermark is the same backend-charged `504` /
+///   `ReadWriteTimeout` (gRPC `DEADLINE_EXCEEDED`) the watermark arm of the
+///   response-header wait returns.
+/// * An authorization expiry is the same health-neutral placeholder the
+///   response-header deadline arm returns; the pre-commitment terminal
+///   replaces it.
+/// * `Transport` is the conservative backend `ProtocolError`; callers keep
+///   their own transport response for it instead.
+pub(crate) fn pre_header_upload_termination_response(
+    proxy_id: &str,
+    transport: &'static str,
+    termination: upload_pump::PreHeaderSendTermination,
+    is_grpc_flavored: bool,
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    match termination {
+        upload_pump::PreHeaderSendTermination::ClientAbort => {
+            debug!(
+                proxy_id = %proxy_id,
+                transport,
+                error_kind = retry::error_class_log_kind(retry::ErrorClass::ClientDisconnect),
+                "Client abandoned its request upload before backend response headers"
+            );
+            // The shared pre-header client-abort terminal (issue #6772): the
+            // typed upload terminal is the evidence.
+            let terminal =
+                client_abort::ProvenClientAbort::latched_upload_abort().pre_header_terminal();
+            if is_grpc_flavored {
+                mesh_grpc_client_upload_failure_response(
+                    resolved_ip,
+                    terminal.grpc_status,
+                    terminal.grpc_message,
+                )
+            } else {
+                client_upload_failure_response(
+                    resolved_ip,
+                    terminal.http_status,
+                    client_abort::CLIENT_ABORT_HTTP_BODY.as_bytes(),
+                )
+            }
+        }
+        upload_pump::PreHeaderSendTermination::MalformedUpload => {
+            debug!(
+                proxy_id = %proxy_id,
+                transport,
+                "Client request upload was malformed or incomplete before backend response headers"
+            );
+            if is_grpc_flavored {
+                mesh_grpc_client_upload_failure_response(
+                    resolved_ip,
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    MALFORMED_REQUEST_BODY_GRPC_MESSAGE,
+                )
+            } else {
+                client_upload_failure_response(
+                    resolved_ip,
+                    StatusCode::BAD_REQUEST.as_u16(),
+                    MALFORMED_REQUEST_BODY_JSON,
+                )
+            }
+        }
+        upload_pump::PreHeaderSendTermination::BackendWriteTimeout => {
+            warn!(
+                proxy_id = %proxy_id,
+                transport,
+                write_bound = "upload_pump",
+                "Backend stopped reading the request body before response headers"
+            );
+            if is_grpc_flavored {
+                mesh_grpc_deadline_exceeded_response(resolved_ip)
+            } else {
+                http_backend_dispatch_error_response(
+                    retry::ErrorClass::ReadWriteTimeout,
+                    resolved_ip,
+                )
+            }
+        }
+        upload_pump::PreHeaderSendTermination::AuthorizationExpired => {
+            authorization_expired_dispatch_placeholder(resolved_ip, true)
+        }
+        upload_pump::PreHeaderSendTermination::Transport => {
+            http_backend_dispatch_error_response(retry::ErrorClass::ProtocolError, resolved_ip)
+        }
+    }
+}
+
+/// Record the gRPC status of a buffered native-gRPC terminal that a generic
+/// dispatch returned in its response headers (a gateway Trailers-Only answer
+/// from the mesh-mTLS or Unix h2c transport, issue #6776), so the transaction
+/// summary and request metrics carry it instead of synthesizing `UNKNOWN`.
+/// A status already recorded (a gateway terminal that stamped its own) wins.
+/// gRPC-Web is excluded by the caller: its terminal status rides a body
+/// trailer frame, recorded by the gRPC-Web rules.
+pub(crate) fn record_buffered_native_grpc_header_status(
+    metadata: &mut HashMap<String, String>,
+    native_grpc_request: bool,
+    response_is_buffered: bool,
+    response_headers: &HashMap<String, String>,
+) {
+    if !native_grpc_request || !response_is_buffered || metadata.contains_key("grpc_status") {
+        return;
+    }
+    if let Some(grpc_status) = grpc_proxy::grpc_status_from_maps(&EMPTY_HEADERS, response_headers) {
+        metadata.insert("grpc_status".to_string(), grpc_status.to_string());
+    }
+}
+
 fn hbone_hyper_error_response(
     proxy: &Proxy,
     err: hyper::Error,
@@ -57526,7 +57781,7 @@ async fn proxy_to_backend_hbone_after_ready(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body, mut upload_pump) = match client_request_body {
+    let (mut parts, body, mut upload_pump, client_fault_latch) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             // Read before `parts.version` is rewritten for the backend: an
@@ -57547,13 +57802,21 @@ async fn proxy_to_backend_hbone_after_ready(
             // wait so `backend_write_timeout_ms` is client-visible even when
             // the transport is parked outside a body poll; after headers, the
             // transport body and `UploadPumpSource` abort guard own teardown.
+            let upload_auth = request_upload_auth_deadline(
+                ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            );
+            // An unpumped adapter reads the client body itself, so it records
+            // why that body failed (issue #6776); a pump records it instead.
+            let client_fault_latch =
+                unpumped_client_fault_latch(upload_auth.as_ref(), proxy.backend_write_timeout_ms);
+            let body = match &client_fault_latch {
+                Some(latch) => body.with_client_fault_latch(Arc::clone(latch)),
+                None => body,
+            };
             let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
-                request_upload_auth_deadline(
-                    ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                )
-                .as_ref(),
+                upload_auth.as_ref(),
                 proxy.backend_write_timeout_ms,
             );
             let grpc_tap = ctx.and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
@@ -57561,7 +57824,12 @@ async fn proxy_to_backend_hbone_after_ready(
                 Some(tap) => body.with_grpc_message_tap(tap),
                 None => body,
             };
-            (parts, http_body_util::Either::Left(body), upload_pump)
+            (
+                parts,
+                http_body_util::Either::Left(body),
+                upload_pump,
+                client_fault_latch,
+            )
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -57584,7 +57852,12 @@ async fn proxy_to_backend_hbone_after_ready(
                 trailers,
                 proxy.backend_write_timeout_ms,
             );
-            (parts, http_body_util::Either::Right(body), upload_pump)
+            (
+                parts,
+                http_body_util::Either::Right(body),
+                upload_pump,
+                None,
+            )
         }
     };
     parts.uri = tunneled_uri;
@@ -57956,6 +58229,44 @@ async fn proxy_to_backend_hbone_after_ready(
                 // That makes it a pre-wire `ConnectionPoolError` on a fresh
                 // lease too (issue #5720).
                 let never_sent = try_err.take_message().is_some();
+                // The gateway's own request body failing is not the
+                // destination's failure (issue #6776): the typed upload
+                // terminals name the cause. A handed-back request was never
+                // polled, so it cannot carry that proof.
+                if !never_sent
+                    && crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                        try_err.error(),
+                    )
+                {
+                    let upload_pumped = upload_pump.is_some();
+                    let (pump_outcome, pump_fault) = match upload_pump.take() {
+                        Some(pump) => pump.cancel_and_join_with_client_fault().await,
+                        None => (None, None),
+                    };
+                    let termination = attribute_gateway_ended_upload(
+                        send_auth_deadline.as_ref(),
+                        request_body_replayable,
+                        upload_pumped,
+                        pump_outcome,
+                        pump_fault,
+                        client_fault_latch.as_deref(),
+                        ctx,
+                    );
+                    if termination != crate::proxy::upload_pump::PreHeaderSendTermination::Transport
+                    {
+                        return (
+                            pre_header_upload_termination_response(
+                                &proxy.id,
+                                "hbone",
+                                termination,
+                                false,
+                                resolved_ip,
+                            ),
+                            None,
+                            None,
+                        );
+                    }
+                }
                 return (
                     hbone_hyper_error_response(
                         proxy,
@@ -58605,7 +58916,7 @@ async fn proxy_to_backend_unix(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body, mut upload_pump) = match client_request_body {
+    let (mut parts, body, mut upload_pump, client_fault_latch) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             // Read before `parts.version` is rewritten for the backend: an
@@ -58626,13 +58937,21 @@ async fn proxy_to_backend_unix(
             // wait so `backend_write_timeout_ms` is client-visible even when
             // the transport is parked outside a body poll; after headers, the
             // transport body and `UploadPumpSource` abort guard own teardown.
+            let upload_auth = request_upload_auth_deadline(
+                ctx,
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            );
+            // An unpumped adapter reads the client body itself, so it records
+            // why that body failed (issue #6776); a pump records it instead.
+            let client_fault_latch =
+                unpumped_client_fault_latch(upload_auth.as_ref(), proxy.backend_write_timeout_ms);
+            let body = match &client_fault_latch {
+                Some(latch) => body.with_client_fault_latch(Arc::clone(latch)),
+                None => body,
+            };
             let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
-                request_upload_auth_deadline(
-                    ctx,
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                )
-                .as_ref(),
+                upload_auth.as_ref(),
                 proxy.backend_write_timeout_ms,
             );
             let grpc_tap = ctx.and_then(crate::plugins::grpc_web::request_stream_grpc_message_tap);
@@ -58640,7 +58959,12 @@ async fn proxy_to_backend_unix(
                 Some(tap) => body.with_grpc_message_tap(tap),
                 None => body,
             };
-            (parts, http_body_util::Either::Left(body), upload_pump)
+            (
+                parts,
+                http_body_util::Either::Left(body),
+                upload_pump,
+                client_fault_latch,
+            )
         }
         MeshClientRequestBody::Replayable {
             body,
@@ -58663,7 +58987,12 @@ async fn proxy_to_backend_unix(
                 trailers,
                 proxy.backend_write_timeout_ms,
             );
-            (parts, http_body_util::Either::Right(body), upload_pump)
+            (
+                parts,
+                http_body_util::Either::Right(body),
+                upload_pump,
+                None,
+            )
         }
     };
     parts.uri = origin_form_uri;
@@ -58989,6 +59318,44 @@ async fn proxy_to_backend_unix(
                 // a pre-wire `ConnectionPoolError` on a fresh lease too (issue
                 // #5720).
                 let never_sent = try_err.take_message().is_some();
+                // The gateway's own request body failing is not the
+                // destination's failure (issue #6776): the typed upload
+                // terminals name the cause. A handed-back request was never
+                // polled, so it cannot carry that proof.
+                if !never_sent
+                    && crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(
+                        try_err.error(),
+                    )
+                {
+                    let upload_pumped = upload_pump.is_some();
+                    let (pump_outcome, pump_fault) = match upload_pump.take() {
+                        Some(pump) => pump.cancel_and_join_with_client_fault().await,
+                        None => (None, None),
+                    };
+                    let termination = attribute_gateway_ended_upload(
+                        send_auth_deadline.as_ref(),
+                        request_body_replayable,
+                        upload_pumped,
+                        pump_outcome,
+                        pump_fault,
+                        client_fault_latch.as_deref(),
+                        ctx,
+                    );
+                    if termination != crate::proxy::upload_pump::PreHeaderSendTermination::Transport
+                    {
+                        return (
+                            pre_header_upload_termination_response(
+                                &proxy.id,
+                                "unix",
+                                termination,
+                                false,
+                                resolved_ip,
+                            ),
+                            None,
+                            None,
+                        );
+                    }
+                }
                 return (
                     unix_hyper_error_response(
                         proxy,
@@ -60235,7 +60602,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body, mut upload_pump) = match client_request_body {
+    let (mut parts, body, mut upload_pump, client_fault_latch) = match client_request_body {
         MeshClientRequestBody::Streaming(request) => {
             let (parts, body) = request.into_parts();
             // Read before `parts.version` is rewritten for the backend: an
@@ -60256,13 +60623,21 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
             // wait so `backend_write_timeout_ms` is client-visible even when
             // the transport is parked outside a body poll; after headers, the
             // transport body and `UploadPumpSource` abort guard own teardown.
+            let upload_auth = request_upload_auth_deadline(
+                Some(request_ctx),
+                state.env_config.authenticated_stream_max_lifetime_seconds,
+            );
+            // An unpumped adapter reads the client body itself, so it records
+            // why that body failed (issue #6776); a pump records it instead.
+            let client_fault_latch =
+                unpumped_client_fault_latch(upload_auth.as_ref(), proxy.backend_write_timeout_ms);
+            let body = match &client_fault_latch {
+                Some(latch) => body.with_client_fault_latch(Arc::clone(latch)),
+                None => body,
+            };
             let (body, upload_pump) = install_streaming_upload_authorization(
                 body,
-                request_upload_auth_deadline(
-                    Some(request_ctx),
-                    state.env_config.authenticated_stream_max_lifetime_seconds,
-                )
-                .as_ref(),
+                upload_auth.as_ref(),
                 proxy.backend_write_timeout_ms,
             );
             let grpc_tap = crate::plugins::grpc_web::request_stream_grpc_message_tap(request_ctx);
@@ -60274,6 +60649,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 parts,
                 mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body),
                 upload_pump,
+                client_fault_latch,
             )
         }
         MeshClientRequestBody::Replayable {
@@ -60301,6 +60677,7 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                 parts,
                 mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body),
                 upload_pump,
+                None,
             )
         }
     };
@@ -60609,6 +60986,42 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     None,
                     None,
                 );
+            }
+            // A stream reset the gateway raised because its own request body
+            // failed is not the backend's failure (issue #6776): the typed
+            // upload terminals name the cause.
+            if crate::proxy::upload_pump::hyper_send_error_ended_by_gateway_upload(&err) {
+                let upload_pumped = upload_pump.is_some();
+                let (pump_outcome, pump_fault) = match upload_pump.take() {
+                    Some(pump) => pump.cancel_and_join_with_client_fault().await,
+                    None => (None, None),
+                };
+                let termination = attribute_gateway_ended_upload(
+                    send_auth_deadline.as_ref(),
+                    request_body_replayable,
+                    upload_pumped,
+                    pump_outcome,
+                    pump_fault,
+                    client_fault_latch.as_deref(),
+                    Some(request_ctx),
+                );
+                if termination != crate::proxy::upload_pump::PreHeaderSendTermination::Transport {
+                    return (
+                        pre_header_upload_termination_response(
+                            &proxy.id,
+                            if unix_socket_path.is_some() {
+                                "unix_h2c"
+                            } else {
+                                "sidecar_mtls"
+                            },
+                            termination,
+                            is_grpc_flavored,
+                            resolved_ip,
+                        ),
+                        None,
+                        None,
+                    );
+                }
             }
             let error_class = if request_body_replayable && err.is_canceled() {
                 retry::ErrorClass::ConnectionPoolError

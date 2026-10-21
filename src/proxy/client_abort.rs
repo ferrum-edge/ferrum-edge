@@ -52,6 +52,14 @@ pub const CLIENT_ABORT_MESSAGE: &str = "Client disconnected";
 /// (hyper discards it when the client is gone).
 pub const CLIENT_ABORT_HTTP_BODY: &str = r#"{"error":"Client disconnected"}"#;
 
+/// Fixed JSON body for a client upload refused as malformed before the backend
+/// response head: `400`, never `499` (issues #6772, #6776).
+pub const MALFORMED_UPLOAD_HTTP_BODY: &str = r#"{"error":"Malformed request body"}"#;
+
+/// Fixed `grpc-message` for the same refusal on a gRPC-flavored request
+/// (`INVALID_ARGUMENT`).
+pub const MALFORMED_UPLOAD_GRPC_MESSAGE: &str = "Malformed request body";
+
 /// Terminal accounting for a proven client abort before response headers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientAbortTerminal {
@@ -137,10 +145,12 @@ impl ProvenClientAbort {
         proven.then_some(Self { _evidence: () })
     }
 
-    /// A client abort the shared H3 read-failure classifier already accepted,
-    /// carried across a task or a typed latch (an upload pump's fault, a
-    /// reader's failure code, a typed pool error). Mint it only behind such a
-    /// latch.
+    /// A client abort already proven by typed evidence and carried across a
+    /// task or a typed latch: an upload fault the shared H3 read-failure
+    /// classifier accepted (a pump's fault, a reader's failure code, a typed
+    /// pool error), or an H1/H2 relayed upload terminal attributed by
+    /// `upload_pump::pre_header_send_termination` (issue #6776). Mint it only
+    /// behind such a latch.
     pub const fn latched_upload_abort() -> Self {
         Self { _evidence: () }
     }

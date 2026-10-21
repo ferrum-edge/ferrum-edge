@@ -36,6 +36,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
+use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep};
 
 /// A minimal HTTP/1.1 server on a Unix-domain stream socket. Answers every
@@ -593,4 +594,620 @@ async fn assert_unix_grpc_buffer_capacity_refusal(grpc_web: bool) {
     driver.abort();
     acceptor.abort();
     gateway.shutdown().await;
+}
+
+// ── Issue #6776: relayed client upload aborts are not backend failures ────
+//
+// The Unix-socket pool (HTTP/1.1) and the Sidecar `ingress[]` h2c transport
+// (which runs the sidecar mesh-mTLS dispatcher) hand the client upload to a
+// pooled hyper client. When the client disappears mid-upload, the gateway
+// relays that failure into the backend exchange, and `send_request` fails
+// before any response head. That failure is the client's, so a hair-trigger
+// circuit breaker must stay closed. The controls prove the same breaker DOES
+// open when the backend itself fails the upload, so the negative assertion is
+// not vacuous.
+
+/// What the upload backend does once the first upload bytes arrive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UploadBackendMode {
+    /// Keep reading the upload; answer `200 complete` only if it completes.
+    HoldUntilComplete,
+    /// Fail the exchange itself: close the HTTP/1.1 connection, or reset the
+    /// h2c stream with `CANCEL`.
+    FailMidUpload,
+}
+
+/// Backend events, in order: `upload_head` once the first upload bytes
+/// arrived, `upload_aborted` once the gateway ended the upload.
+type BackendEvents = mpsc::UnboundedSender<&'static str>;
+
+const COMPLETE_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\ncomplete";
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+async fn handle_upload_h1(
+    mut stream: tokio::net::UnixStream,
+    mode: UploadBackendMode,
+    events: BackendEvents,
+) {
+    let mut seen = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    let head_end = loop {
+        if let Some(pos) = seen.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    };
+    if seen.starts_with(b"GET ") {
+        let _ = stream.write_all(COMPLETE_RESPONSE).await;
+        let _ = stream.flush().await;
+        return;
+    }
+    let _ = events.send("upload_head");
+    if mode == UploadBackendMode::FailMidUpload {
+        drop(stream);
+        return;
+    }
+    loop {
+        if contains_subslice(&seen[head_end..], b"0\r\n\r\n") {
+            let _ = stream.write_all(COMPLETE_RESPONSE).await;
+            let _ = stream.flush().await;
+            return;
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => {
+                let _ = events.send("upload_aborted");
+                return;
+            }
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+async fn handle_upload_h2c(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<bytes::Bytes>,
+    mode: UploadBackendMode,
+    events: BackendEvents,
+) {
+    let complete = |mut respond: h2::server::SendResponse<bytes::Bytes>| {
+        let response = http::Response::builder()
+            .status(200)
+            .body(())
+            .expect("complete response");
+        if let Ok(mut send) = respond.send_response(response, false) {
+            let _ = send.send_data(bytes::Bytes::from_static(b"complete"), true);
+        }
+    };
+    if *request.method() == http::Method::GET {
+        complete(respond);
+        return;
+    }
+    let mut body = request.into_body();
+    match body.data().await {
+        Some(Ok(chunk)) => {
+            let _ = body.flow_control().release_capacity(chunk.len());
+        }
+        _ => return,
+    }
+    let _ = events.send("upload_head");
+    if mode == UploadBackendMode::FailMidUpload {
+        respond.send_reset(h2::Reason::CANCEL);
+        return;
+    }
+    loop {
+        match body.data().await {
+            Some(Ok(chunk)) => {
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            Some(Err(_)) => {
+                let _ = events.send("upload_aborted");
+                return;
+            }
+            None => {
+                complete(respond);
+                return;
+            }
+        }
+    }
+}
+
+async fn serve_upload_backend(
+    listener: UnixListener,
+    h2c: bool,
+    mode: UploadBackendMode,
+    events: BackendEvents,
+) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let events = events.clone();
+        if h2c {
+            tokio::spawn(async move {
+                let Ok(mut connection) = h2::server::handshake(stream).await else {
+                    return;
+                };
+                while let Some(Ok((request, respond))) = connection.accept().await {
+                    tokio::spawn(handle_upload_h2c(request, respond, mode, events.clone()));
+                }
+            });
+        } else {
+            tokio::spawn(handle_upload_h1(stream, mode, events));
+        }
+    }
+}
+
+/// One HTTP route on a Unix-socket target with a hair-trigger circuit breaker:
+/// a single `502` / `504` (or connection error) opens it for the rest of the
+/// test, so every later request would be refused with `503`. An `http_logging`
+/// sink receives every terminal transaction summary, which is the barrier the
+/// tests wait on: the summary is emitted only after the dispatch outcome has
+/// been fed to the circuit breaker.
+fn circuit_breaker_unix_config(
+    socket_path: &str,
+    placeholder_port: u16,
+    h2c: bool,
+    sink_port: u16,
+) -> String {
+    let h1_only = if h2c {
+        ""
+    } else {
+        "\n    pool_enable_http2: false"
+    };
+    format!(
+        r#"version: "1"
+proxies:
+  - id: "unix-cb"
+    listen_path: "/unix-cb"
+    backend_scheme: http
+    backend_host: "127.0.0.1"
+    backend_port: {placeholder_port}
+    upstream_id: "unix-cb-upstream"
+    strip_listen_path: false
+    preserve_host_header: true{h1_only}
+    circuit_breaker:
+      failure_threshold: 1
+      timeout_seconds: 300
+      failure_status_codes: [400, 499, 502, 504]
+      trip_on_connection_errors: true
+    updated_at: "2026-10-21T00:00:00Z"
+upstreams:
+  - id: "unix-cb-upstream"
+    name: "unix-cb-upstream"
+    algorithm: round_robin
+    updated_at: "2026-10-21T00:00:00Z"
+    targets:
+      - host: "127.0.0.1"
+        port: {placeholder_port}
+        weight: 1
+        tags:
+          mesh.unix_socket: "{socket_path}"
+          mesh.unix_socket_h2c: "{h2c}"
+consumers: []
+plugin_configs:
+  - id: "unix-cb-http-log"
+    plugin_name: http_logging
+    scope: global
+    enabled: true
+    config:
+      endpoint_url: "http://127.0.0.1:{sink_port}/logs"
+      batch_size: 1
+      flush_interval_ms: 100
+"#
+    )
+}
+
+/// Request path of the upload under test, as the transaction summary logs it.
+const UPLOAD_PATH: &str = "/unix-cb/upload";
+
+/// Open a raw HTTP/1.1 chunked upload through the gateway and send its first
+/// chunk, leaving the body unfinished.
+async fn start_chunked_upload(proxy_port: u16) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .expect("connect to the gateway");
+    stream
+        .write_all(
+            b"POST /unix-cb/upload HTTP/1.1\r\nHost: unix-cb.test\r\n\
+              Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+        )
+        .await
+        .expect("send the request head and first chunk");
+    stream.flush().await.expect("flush the first chunk");
+    stream
+}
+
+/// Read the gateway's response head from a raw upload connection.
+async fn read_response_head(upload: &mut tokio::net::TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !contains_subslice(&head, b"\r\n\r\n") {
+            match upload.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await
+    .expect("the gateway answers the failed upload");
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+async fn expect_backend_event(
+    events: &mut mpsc::UnboundedReceiver<&'static str>,
+    expected: &'static str,
+) {
+    let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for backend event {expected}"))
+        .expect("backend event channel open");
+    assert_eq!(event, expected, "unexpected backend event order");
+}
+
+type LoggedSummaries = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// Minimal HTTP/1.1 sink recording the JSON transaction summaries the
+/// `http_logging` plugin posts (the in-process gateway's stdout is not
+/// captured).
+async fn start_http_logging_sink() -> (u16, LoggedSummaries) {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind http_logging sink");
+    let port = listener.local_addr().expect("sink addr").port();
+    let entries: LoggedSummaries = Arc::default();
+    let captured = Arc::clone(&entries);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let captured = Arc::clone(&captured);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body = loop {
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..pos]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= pos + 4 + length {
+                            break request[pos + 4..pos + 4 + length].to_vec();
+                        }
+                    }
+                    match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await
+                    {
+                        Ok(Ok(n)) if n > 0 => request.extend_from_slice(&buf[..n]),
+                        _ => return,
+                    }
+                };
+                if let Ok(posted) = serde_json::from_slice::<serde_json::Value>(&body)
+                    && let Ok(mut guard) = captured.lock()
+                {
+                    match posted {
+                        serde_json::Value::Array(batch) => guard.extend(batch),
+                        entry => guard.push(entry),
+                    }
+                }
+                let _ = stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    (port, entries)
+}
+
+struct UploadFixture {
+    _temp: TempDir,
+    _placeholder: tokio::net::TcpListener,
+    backend: tokio::task::JoinHandle<()>,
+    events: mpsc::UnboundedReceiver<&'static str>,
+    summaries: LoggedSummaries,
+    gateway: TrustedProjectedGateway,
+    client: reqwest::Client,
+}
+
+impl UploadFixture {
+    async fn start(h2c: bool, mode: UploadBackendMode) -> Self {
+        let temp = TempDir::new().expect("temp dir");
+        let root = containment_root(&temp);
+        let socket_path = root.join("upload.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind upload socket");
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let backend = tokio::spawn(serve_upload_backend(listener, h2c, mode, events_tx));
+        let (placeholder_port, placeholder) = reserve_placeholder_port().await;
+        let (sink_port, summaries) = start_http_logging_sink().await;
+        let config = circuit_breaker_unix_config(
+            socket_path.to_str().expect("utf-8 socket path"),
+            placeholder_port,
+            h2c,
+            sink_port,
+        );
+        let gateway = spawn_unix_gateway(config, &root).await;
+        gateway
+            .wait_for_proxy_port(Duration::from_secs(10))
+            .await
+            .expect("proxy port ready");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build client");
+        // A complete request is served before anything else happens.
+        wait_for_body(
+            &client,
+            &gateway.proxy_url("/unix-cb/ready"),
+            "unix upload backend first response",
+            |status, body| status == 200 && body == "complete",
+        )
+        .await;
+        Self {
+            _temp: temp,
+            _placeholder: placeholder,
+            backend,
+            events,
+            summaries,
+            gateway,
+            client,
+        }
+    }
+
+    async fn get_status(&self, path: &str) -> u16 {
+        self.client
+            .get(self.gateway.proxy_url(path))
+            .send()
+            .await
+            .expect("gateway answers")
+            .status()
+            .as_u16()
+    }
+
+    /// Wait for the upload's terminal transaction summary, the positive
+    /// barrier that its dispatch outcome has already reached the circuit
+    /// breaker, and return it after checking it is the only one.
+    async fn upload_summary(&self) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let uploads: Vec<serde_json::Value> = self
+                .summaries
+                .lock()
+                .map(|guard| {
+                    guard
+                        .iter()
+                        .filter(|entry| entry["request_path"] == UPLOAD_PATH)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !uploads.is_empty() {
+                // Give a duplicate a chance to show up before asserting one.
+                sleep(Duration::from_millis(300)).await;
+                let uploads: Vec<serde_json::Value> = self
+                    .summaries
+                    .lock()
+                    .map(|guard| {
+                        guard
+                            .iter()
+                            .filter(|entry| entry["request_path"] == UPLOAD_PATH)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(
+                    uploads.len(),
+                    1,
+                    "exactly one terminal summary for the upload: {uploads:?}"
+                );
+                return uploads[0].clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the upload's terminal transaction summary was never logged"
+            );
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn assert_breaker_closed(&self, context: &str) {
+        for attempt in 0..3 {
+            assert_eq!(
+                self.get_status("/unix-cb/after").await,
+                200,
+                "{context}: the backend's circuit breaker must stay closed (attempt {attempt})"
+            );
+        }
+    }
+
+    async fn shutdown(mut self) {
+        self.backend.abort();
+        self.gateway.shutdown().await;
+    }
+}
+
+async fn assert_client_upload_abort_is_not_charged(h2c: bool) {
+    let mut fixture = UploadFixture::start(h2c, UploadBackendMode::HoldUntilComplete).await;
+
+    let upload = start_chunked_upload(fixture.gateway.proxy_http_port).await;
+    expect_backend_event(&mut fixture.events, "upload_head").await;
+    // The client's connection is reset while the backend is still reading its
+    // upload and before any response head: typed proof it is gone, which the
+    // gateway relays into the backend.
+    upload.set_zero_linger().expect("set abortive close");
+    drop(upload);
+    expect_backend_event(&mut fixture.events, "upload_aborted").await;
+
+    let summary = fixture.upload_summary().await;
+    assert_eq!(
+        summary["response_status_code"], 499,
+        "h2c={h2c}: a proven client abort is a client-closed request: {summary}"
+    );
+    assert_eq!(summary["error_class"], "client_disconnect", "{summary}");
+    assert_eq!(
+        summary["client_disconnected"], true,
+        "h2c={h2c}: the proven abort reaches the disconnect accounting: {summary}"
+    );
+    fixture
+        .assert_breaker_closed(&format!("h2c={h2c}: a relayed client upload abort"))
+        .await;
+    fixture.shutdown().await;
+}
+
+async fn assert_half_closed_client_upload_is_a_400_not_charged(h2c: bool) {
+    let mut fixture = UploadFixture::start(h2c, UploadBackendMode::HoldUntilComplete).await;
+
+    let mut upload = start_chunked_upload(fixture.gateway.proxy_http_port).await;
+    expect_backend_event(&mut fixture.events, "upload_head").await;
+    // The client ends its write side mid-chunk but keeps reading: an
+    // incomplete request, not proof the client left, so the response must
+    // still be delivered and it is never a 499.
+    upload.shutdown().await.expect("half-close the write side");
+    let head = read_response_head(&mut upload).await;
+    assert!(
+        head.starts_with("HTTP/1.1 400"),
+        "h2c={h2c}: a half-closed client still reading gets a bad request, never 499: {head:?}"
+    );
+    expect_backend_event(&mut fixture.events, "upload_aborted").await;
+
+    let summary = fixture.upload_summary().await;
+    assert_eq!(summary["response_status_code"], 400, "{summary}");
+    assert_eq!(summary["error_class"], "client_disconnect", "{summary}");
+    assert!(
+        summary.get("client_disconnected").is_none(),
+        "h2c={h2c}: a half-closed upload is not a disconnect: {summary}"
+    );
+    fixture
+        .assert_breaker_closed(&format!("h2c={h2c}: a half-closed client upload"))
+        .await;
+    drop(upload);
+    fixture.shutdown().await;
+}
+
+async fn assert_malformed_client_upload_is_a_400_not_charged(h2c: bool) {
+    let mut fixture = UploadFixture::start(h2c, UploadBackendMode::HoldUntilComplete).await;
+
+    let mut upload = start_chunked_upload(fixture.gateway.proxy_http_port).await;
+    expect_backend_event(&mut fixture.events, "upload_head").await;
+    // The client stays connected and reading, but its next chunk-size line is
+    // not hex: the frontend codec rejects the upload as malformed.
+    upload
+        .write_all(b"zz\r\n")
+        .await
+        .expect("send a malformed chunk");
+    upload.flush().await.expect("flush the malformed chunk");
+    let head = read_response_head(&mut upload).await;
+    assert!(
+        head.starts_with("HTTP/1.1 400"),
+        "h2c={h2c}: a connected client with a malformed upload gets a bad request, \
+         never 499: {head:?}"
+    );
+    expect_backend_event(&mut fixture.events, "upload_aborted").await;
+
+    let summary = fixture.upload_summary().await;
+    assert_eq!(summary["response_status_code"], 400, "{summary}");
+    assert_eq!(summary["error_class"], "client_disconnect", "{summary}");
+    assert!(
+        summary.get("client_disconnected").is_none(),
+        "h2c={h2c}: a malformed upload is not a disconnect: {summary}"
+    );
+    fixture
+        .assert_breaker_closed(&format!("h2c={h2c}: a malformed client upload"))
+        .await;
+    drop(upload);
+    fixture.shutdown().await;
+}
+
+async fn assert_backend_upload_failure_is_charged(h2c: bool) {
+    let mut fixture = UploadFixture::start(h2c, UploadBackendMode::FailMidUpload).await;
+
+    let mut upload = start_chunked_upload(fixture.gateway.proxy_http_port).await;
+    expect_backend_event(&mut fixture.events, "upload_head").await;
+    // The client keeps its upload open; the backend ends the exchange.
+    let head = read_response_head(&mut upload).await;
+    assert!(
+        head.starts_with("HTTP/1.1 502"),
+        "h2c={h2c}: a backend that fails the upload is a backend failure: {head:?}"
+    );
+    let summary = fixture.upload_summary().await;
+    assert_eq!(summary["response_status_code"], 502, "{summary}");
+    assert!(summary.get("client_disconnected").is_none(), "{summary}");
+
+    // The summary is emitted after the breaker feedback, so it is open now.
+    assert_eq!(
+        fixture.get_status("/unix-cb/after").await,
+        503,
+        "h2c={h2c}: the backend's own upload failure must open the circuit breaker"
+    );
+    drop(upload);
+    fixture.shutdown().await;
+}
+
+#[test]
+#[ignore]
+fn unix_h1_client_upload_abort_is_not_charged_to_the_backend() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_client_upload_abort_is_not_charged(false)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h1_malformed_client_upload_is_a_400_not_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_malformed_client_upload_is_a_400_not_charged(false)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h1_backend_close_mid_upload_is_still_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_backend_upload_failure_is_charged(false)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h2c_client_upload_abort_is_not_charged_to_the_backend() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_client_upload_abort_is_not_charged(true)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h2c_malformed_client_upload_is_a_400_not_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_malformed_client_upload_is_a_400_not_charged(true)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h2c_backend_cancel_mid_upload_is_still_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_backend_upload_failure_is_charged(true)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h1_half_closed_client_upload_is_a_400_not_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_half_closed_client_upload_is_a_400_not_charged(false)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h2c_half_closed_client_upload_is_a_400_not_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_half_closed_client_upload_is_a_400_not_charged(true)
+    });
 }
