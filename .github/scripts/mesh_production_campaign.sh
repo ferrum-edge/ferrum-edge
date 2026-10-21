@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Isolated experimental production ranking. Runtime images are immutable.
 set -euo pipefail
-export FERRUM_IMAGE=ghcr.io/ferrum-edge/ferrum-edge@sha256:e95e7f8d0d19e5714cb4e93afb600ebe14a1703aab51e84ad5c2be822d82a4af
+export FERRUM_IMAGE=ferrumedge/ferrum-edge@sha256:e95e7f8d0d19e5714cb4e93afb600ebe14a1703aab51e84ad5c2be822d82a4af
 export ENVOY_IMAGE=envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4
 export CONSUL_IMAGE=hashicorp/consul@sha256:842ee8b5d0ea228b6c36230a442bcf13b7f92bbe35091676f4482eaa933a6ad7
 export TOOLS_IMAGE=mesh-bench-tools:production
@@ -10,6 +10,7 @@ export BENCH_WORKERS=4 BENCH_PRODUCTION_OBSERVE=true
 mode="${1:?prepare or measure}"
 if [ "$mode" = prepare ]; then
     mkdir -p results/images
+    python3 .github/scripts/mesh_production_campaign.py plan
     for image in "$FERRUM_IMAGE" "$ENVOY_IMAGE" "$CONSUL_IMAGE"; do
         timeout --signal=TERM --kill-after=10s 300s docker pull "$image"
     done
@@ -21,7 +22,7 @@ if [ "$mode" = prepare ]; then
     readelf -S "$RUNNER_TEMP/mesh-production-binary" > results/images/ferrum-elf-sections.txt
     rm "$RUNNER_TEMP/mesh-production-binary"
     docker rm meshbench-production-identity >/dev/null
-    timeout 20s docker run --rm "$FERRUM_IMAGE" --version > results/images/ferrum-version.txt
+    timeout 20s docker run --rm "$FERRUM_IMAGE" version --json > results/images/ferrum-version.txt
     timeout 20s docker run --rm "$ENVOY_IMAGE" --version > results/images/envoy-version.txt
     timeout 20s docker run --rm "$CONSUL_IMAGE" version > results/images/consul-version.txt
     docker build -f tests/performance/mesh_runtime/Dockerfile.production-tools -t "$TOOLS_IMAGE" tests/performance/mesh_runtime         > results/images/tools-build.log 2>&1 || { tail -80 results/images/tools-build.log; exit 1; }
