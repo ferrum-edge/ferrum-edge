@@ -3143,8 +3143,9 @@ fn h3_stamps_a_connection_close_watch_so_injected_delays_cannot_outlive_the_peer
         "the watch must observe QUIC connection close"
     );
     assert!(
-        watch_body.contains("self.connection.close_reason().is_some()"),
-        "the watch must offer a non-blocking already-closed check"
+        watch_body.contains("self.observe_close().is_some()")
+            && watch_body.contains("self.connection\n                .close_reason()"),
+        "the watch must offer a non-blocking already-closed check over the latched close"
     );
     // Ownership guard: the watch must never touch the request stream. Reading
     // or polling it from a detached watcher would race the proxy path for

@@ -147,7 +147,10 @@ impl ProvenClientAbort {
 
     /// The client's connection is already closed, and the client closed it: a
     /// close it sent or a stateless reset
-    /// ([`crate::plugins::PeerConnectionSignal::closed_by_peer`]). Terminal
+    /// ([`crate::plugins::PeerConnectionSignal::closed_by_peer`]). The QUIC
+    /// watch answers from its [`ConnectionCloseLatch`], so the verdict is the
+    /// close cause first observed, never one the gateway's later teardown
+    /// close wrote over it. Terminal
     /// decision points consult this before recording an unproven
     /// gateway-closed cause, because a request-stream read on a connection
     /// the client closed can fail as an unclassified closed stream rather
@@ -173,5 +176,63 @@ impl ProvenClientAbort {
     /// The terminal to record when the abort came before response headers.
     pub const fn pre_header_terminal(self) -> ClientAbortTerminal {
         PRE_HEADER_CLIENT_ABORT_TERMINAL
+    }
+}
+
+const CLOSE_UNOBSERVED: u8 = 0;
+const CLOSED_BY_PEER: u8 = 1;
+const CLOSED_BY_GATEWAY: u8 = 2;
+
+/// Write-once record of who closed a client connection (issue #6772).
+///
+/// A transport's current close reason is not stable: Quinn's
+/// `Connection::close` replaces an already-recorded peer close with
+/// `LocallyClosed`, and the HTTP/3 connection's destructor calls it when the
+/// accept loop ends. A request task that settles its terminal after that
+/// teardown would read the gateway's close and record `503` for a client that
+/// closed first. The latch keeps the FIRST observed cause: a peer close stays
+/// a peer close however the connection is torn down afterwards, and a close
+/// the gateway made first stays the gateway's. One atomic, no allocation.
+#[derive(Debug, Default)]
+pub struct ConnectionCloseLatch(std::sync::atomic::AtomicU8);
+
+impl ConnectionCloseLatch {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(CLOSE_UNOBSERVED))
+    }
+
+    /// Record the close cause observed now and return the latched one:
+    /// `None` while no close has been observed, `Some(true)` for a client
+    /// close, `Some(false)` for the gateway's own. `observed` is `None` while
+    /// the connection is still open, `Some(by_peer)` once it has closed. The
+    /// first observed close wins; later observations never change it.
+    pub fn observe(&self, observed: Option<bool>) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        let current = self.0.load(Ordering::Acquire);
+        if current != CLOSE_UNOBSERVED {
+            return Some(current == CLOSED_BY_PEER);
+        }
+        let verdict = match observed? {
+            true => CLOSED_BY_PEER,
+            false => CLOSED_BY_GATEWAY,
+        };
+        let latched = match self.0.compare_exchange(
+            CLOSE_UNOBSERVED,
+            verdict,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => verdict,
+            Err(existing) => existing,
+        };
+        Some(latched == CLOSED_BY_PEER)
+    }
+
+    /// The latched close cause, without observing a new one.
+    pub fn latched(&self) -> Option<bool> {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            CLOSE_UNOBSERVED => None,
+            verdict => Some(verdict == CLOSED_BY_PEER),
+        }
     }
 }

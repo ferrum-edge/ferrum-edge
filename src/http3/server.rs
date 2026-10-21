@@ -2742,10 +2742,8 @@ async fn handle_h3_connection(
     // accepted request stream. Watching connection close needs no access to
     // the request stream, so nothing here can race the proxy path for request
     // bytes or mask a stream-accounting failure.
-    let peer_connection =
-        crate::plugins::PeerConnectionSignal::new(std::sync::Arc::new(QuicPeerConnectionWatch {
-            connection: connection.clone(),
-        }));
+    let quic_peer_watch = std::sync::Arc::new(QuicPeerConnectionWatch::new(connection.clone()));
+    let peer_connection = crate::plugins::PeerConnectionSignal::new(quic_peer_watch.clone());
     // RFC 9220 / RFC 9298: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3
     // clients can bootstrap an Extended CONNECT profile (:method=CONNECT plus
     // :protocol=websocket or :protocol=connect-udp). Mirrors the H2 listener's
@@ -2797,6 +2795,9 @@ async fn handle_h3_connection(
         .max_buffered_frame_len(h3_max_buffered_frame_len)
         .build(h3_quinn::Connection::new(connection))
         .await?;
+    // Declared after `h3_conn` so it drops first: the client's close is latched
+    // before the h3 destructor's own close can overwrite it (issue #6772).
+    let _close_verdict = QuicCloseVerdictGuard(quic_peer_watch);
 
     // Pre-format socket IP string once per connection — shared across all streams
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
@@ -3095,37 +3096,87 @@ async fn handle_h3_connection(
 /// `STOP_SENDING` / reset while the gateway waits for backend headers is
 /// observed separately through [`h3::quic::SendStreamStopped`] on that
 /// request task, not through this connection watch.
+///
+/// Who closed the connection is latched the first time a close is observed
+/// (issue #6772): Quinn's `close()` overwrites a recorded peer close with
+/// `LocallyClosed`, and the HTTP/3 connection's destructor calls it when the
+/// accept loop ends, so re-reading the live close reason after teardown would
+/// blame the gateway for a client's close. `handle_h3_connection` observes the
+/// close once more just before `h3_conn` drops ([`QuicCloseVerdictGuard`]).
 struct QuicPeerConnectionWatch {
     connection: quinn::Connection,
+    close: crate::proxy::client_abort::ConnectionCloseLatch,
+}
+
+impl QuicPeerConnectionWatch {
+    fn new(connection: quinn::Connection) -> Self {
+        Self {
+            connection,
+            close: crate::proxy::client_abort::ConnectionCloseLatch::new(),
+        }
+    }
+
+    /// Latch the connection's current close cause if none is latched yet, and
+    /// return the latched one (`None` while open, `Some(true)` for a client
+    /// close).
+    fn observe_close(&self) -> Option<bool> {
+        if let Some(latched) = self.close.latched() {
+            return Some(latched);
+        }
+        self.close.observe(
+            self.connection
+                .close_reason()
+                .map(|reason| quinn_close_reason_is_peer(&reason)),
+        )
+    }
+}
+
+/// Whether a QUIC close reason is the client's: a close it sent or a stateless
+/// reset. `LocallyClosed` is the gateway's own close (a shutdown or an h3
+/// protocol-error close), a transport error is one the gateway detected and
+/// closed on, and an idle-timeout expiry fires locally even while the client
+/// is still reachable (issue #6772).
+pub(crate) fn quinn_close_reason_is_peer(reason: &quinn::ConnectionError) -> bool {
+    matches!(
+        reason,
+        quinn::ConnectionError::ApplicationClosed(_)
+            | quinn::ConnectionError::ConnectionClosed(_)
+            | quinn::ConnectionError::Reset
+    )
 }
 
 impl crate::plugins::PeerConnectionWatch for QuicPeerConnectionWatch {
     fn closed(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             // `Connection::closed()` is cancel-safe and resolves with the
-            // termination reason; the reason itself is irrelevant here.
-            let _ = self.connection.closed().await;
+            // termination reason, which is latched at once.
+            let reason = self.connection.closed().await;
+            self.close
+                .observe(Some(quinn_close_reason_is_peer(&reason)));
         })
     }
 
     fn is_closed(&self) -> bool {
-        self.connection.close_reason().is_some()
+        self.observe_close().is_some()
     }
 
     fn closed_by_peer(&self) -> bool {
-        // Only a close the client sent or a stateless reset is the client's.
-        // `LocallyClosed` is the gateway's own close (a shutdown or an h3
-        // protocol-error close), a transport error is one the gateway
-        // detected and closed on, and an idle-timeout expiry fires locally
-        // even while the client is still reachable (issue #6772).
-        matches!(
-            self.connection.close_reason(),
-            Some(
-                quinn::ConnectionError::ApplicationClosed(_)
-                    | quinn::ConnectionError::ConnectionClosed(_)
-                    | quinn::ConnectionError::Reset
-            )
-        )
+        self.observe_close() == Some(true)
+    }
+}
+
+/// Latches the QUIC connection's close cause when `handle_h3_connection`
+/// ends, before `h3_conn` drops: the h3 connection's destructor closes the
+/// transport, which would otherwise overwrite a client's close with the
+/// gateway's `LocallyClosed` (issue #6772). Declared after `h3_conn`, so it
+/// drops first on every exit, cancellation included. A connection still open
+/// at that point latches nothing, and the teardown close is then the
+/// gateway's.
+struct QuicCloseVerdictGuard(std::sync::Arc<QuicPeerConnectionWatch>);
+
+impl Drop for QuicCloseVerdictGuard {
+    fn drop(&mut self) {
+        let _ = self.0.observe_close();
     }
 }
 

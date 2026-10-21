@@ -9340,6 +9340,28 @@ pub mod _test_support {
         }
     }
 
+    /// Replay a sequence of QUIC close reasons through the HTTP/3 peer watch's
+    /// write-once close latch, classifying each with the watch's own
+    /// predicate, and return the latched verdict: `None` while every
+    /// observation saw an open connection, `Some(true)` when the first
+    /// observed close was the client's (issue #6772). Models a request task
+    /// settling its terminal after the h3 teardown's `LocallyClosed`
+    /// overwrote a client's close.
+    pub fn quic_close_latch_verdict_for_test(
+        observed: Vec<Option<quinn::ConnectionError>>,
+    ) -> Option<bool> {
+        let latch = crate::proxy::client_abort::ConnectionCloseLatch::new();
+        let mut verdict = None;
+        for reason in observed {
+            verdict = latch.observe(
+                reason
+                    .as_ref()
+                    .map(crate::http3::server::quinn_close_reason_is_peer),
+            );
+        }
+        verdict
+    }
+
     /// The positive classification of a failed HTTP/3 request-stream read
     /// (issue #6772).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

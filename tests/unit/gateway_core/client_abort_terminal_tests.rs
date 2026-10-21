@@ -22,12 +22,14 @@ use ferrum_edge::_test_support::{
     error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
     h3_connection_error_incoming_failure_for_test, h3_grpc_upload_fault_latched_with_peer_for_test,
     map_http_reject_status_to_grpc_status, pre_header_upload_termination_response_for_test,
+    quic_close_latch_verdict_for_test,
 };
 use ferrum_edge::plugins::{PeerConnectionSignal, PeerConnectionWatch, TransactionSummary};
 use ferrum_edge::proxy::client_abort::{
     CLIENT_ABORT_GRPC_STATUS, CLIENT_ABORT_HTTP_BODY, CLIENT_ABORT_MESSAGE,
-    CLIENT_CLOSED_REQUEST_STATUS, GATEWAY_CLOSED_UPLOAD_TERMINAL, MALFORMED_UPLOAD_GRPC_MESSAGE,
-    MALFORMED_UPLOAD_HTTP_BODY, PRE_HEADER_CLIENT_ABORT_TERMINAL, ProvenClientAbort,
+    CLIENT_CLOSED_REQUEST_STATUS, ConnectionCloseLatch, GATEWAY_CLOSED_UPLOAD_TERMINAL,
+    MALFORMED_UPLOAD_GRPC_MESSAGE, MALFORMED_UPLOAD_HTTP_BODY, PRE_HEADER_CLIENT_ABORT_TERMINAL,
+    ProvenClientAbort,
 };
 use ferrum_edge::proxy::grpc_proxy::grpc_status;
 use ferrum_edge::retry::ErrorClass;
@@ -329,6 +331,91 @@ fn a_gateway_terminated_read_on_a_connection_the_client_closed_is_its_abort() {
 }
 
 #[test]
+fn the_first_observed_connection_close_wins() {
+    let latch = ConnectionCloseLatch::new();
+    assert_eq!(latch.latched(), None);
+    // An open connection latches nothing.
+    assert_eq!(latch.observe(None), None);
+    assert_eq!(latch.latched(), None);
+    // The client's close is latched once observed...
+    assert_eq!(latch.observe(Some(true)), Some(true));
+    // ...and the gateway's later teardown close never overwrites it.
+    assert_eq!(latch.observe(Some(false)), Some(true));
+    assert_eq!(latch.observe(None), Some(true));
+    assert_eq!(latch.latched(), Some(true));
+
+    // A close the gateway made first stays the gateway's.
+    let gateway = ConnectionCloseLatch::new();
+    assert_eq!(gateway.observe(Some(false)), Some(false));
+    assert_eq!(gateway.observe(Some(true)), Some(false));
+    assert_eq!(gateway.latched(), Some(false));
+}
+
+fn application_close(code: u32) -> quinn::ConnectionError {
+    quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+        error_code: quinn::VarInt::from_u32(code),
+        reason: bytes::Bytes::new(),
+    })
+}
+
+#[test]
+fn a_client_close_survives_the_h3_teardown_close() {
+    // Client close -> accept loop ends (the guard observes the peer close) ->
+    // h3 connection drop calls `close()`, which Quinn records as
+    // `LocallyClosed` over the peer's reason -> a request task settles its
+    // terminal afterwards and must still see the client's close.
+    for code in [0x0, 0x100] {
+        assert_eq!(
+            quic_close_latch_verdict_for_test(vec![
+                None,
+                Some(application_close(code)),
+                Some(quinn::ConnectionError::LocallyClosed),
+            ]),
+            Some(true),
+            "a client close with code {code:#x} must outlive the teardown close"
+        );
+    }
+    assert_eq!(
+        quic_close_latch_verdict_for_test(vec![
+            Some(quinn::ConnectionError::Reset),
+            Some(quinn::ConnectionError::LocallyClosed),
+        ]),
+        Some(true)
+    );
+    // The gateway's own close, or its idle timeout, observed first stays the
+    // gateway's: 503, never 499.
+    for first in [
+        quinn::ConnectionError::LocallyClosed,
+        quinn::ConnectionError::TimedOut,
+    ] {
+        assert_eq!(
+            quic_close_latch_verdict_for_test(vec![Some(first), Some(application_close(0))]),
+            Some(false)
+        );
+    }
+    // Still open: nothing is proven.
+    assert_eq!(quic_close_latch_verdict_for_test(vec![None, None]), None);
+
+    // The watch answers from the latch, and the accept loop latches the close
+    // before `h3_conn` (whose destructor closes the transport) drops.
+    let server = compact(SERVER);
+    assert!(server.contains("fnclosed_by_peer(&self)->bool{self.observe_close()==Some(true)}"));
+    let h3_conn = server
+        .find("letmuth3_conn=h3::server::builder()")
+        .expect("h3 connection");
+    let guard = server
+        .find("let_close_verdict=QuicCloseVerdictGuard(quic_peer_watch);")
+        .expect("the close verdict guard");
+    assert!(
+        h3_conn < guard,
+        "the guard is declared after h3_conn so it drops first"
+    );
+    assert!(server.contains(
+        "implDropforQuicCloseVerdictGuard{fndrop(&mutself){let_=self.0.observe_close();}}"
+    ));
+}
+
+#[test]
 fn a_connection_watch_that_cannot_tell_is_never_proof() {
     struct Unknown;
     impl PeerConnectionWatch for Unknown {
@@ -353,8 +440,8 @@ fn the_gateway_closed_terminal_is_neither_a_client_abort_nor_a_backend_fault() {
     assert_ne!(terminal.grpc_status, CLIENT_ABORT_GRPC_STATUS);
     let quic = compact(region(
         SERVER,
-        "fn closed_by_peer(&self) -> bool {",
-        "\n    }\n",
+        "pub(crate) fn quinn_close_reason_is_peer(",
+        "\n}\n",
     ));
     assert!(
         !quic.contains("ConnectionError::LocallyClosed")
