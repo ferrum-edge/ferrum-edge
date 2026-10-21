@@ -1056,20 +1056,15 @@ Current admissions:
 - `fips-build.yml`: one transition for the issue #4018 memory mitigation on the
   `fips-test-build` job (`FIPS_BUILD_ADMITTED_GENERATION_TRANSITION`). The
   earlier #3889 admission was retired by #3943.
-- Cross-sensitive `ci.yml` jobs: `CI_JOB_GENERATION_TRANSITIONS`.
-- `setup-rust-ci/action.yml`: a two-step chain in
-  `LOCAL_ACTION_GENERATION_TRANSITIONS`, from
-  `fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda` to the
-  cache-budget generation
-  `b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924`, then to
-  the combined #3911 destination
-  `219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925`. The
-  issue #6573 BoringCache retirement pairs are retired: their destinations are
-  on `main`.
+- Cross-sensitive `ci.yml` jobs (`CI_JOB_GENERATION_TRANSITIONS`) and local
+  composite actions (`LOCAL_ACTION_GENERATION_TRANSITIONS`): both tables are
+  currently empty. Their pairs, including the `setup-rust-ci` #3889→#3911
+  chain and the issue #6573 BoringCache retirement pairs, are spent and
+  retired.
 
 Details and digests: `docs/ci_cd.md` → "Admitted `fips-build.yml` generation
 transition", "Admitted CI job SHA-256 generation transitions", and "Admitted
-`setup-rust-ci` generation transitions".
+local-action generation transitions".
 
 ### Refreshing kind / kubectl / Helm versions and checksums
 
