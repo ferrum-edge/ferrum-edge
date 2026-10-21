@@ -9,21 +9,35 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import re
+import sys
 
 RUNTIME_SHA = "4a7be250e45a367314e3dec872ecbd512220558e"
 ARMS = ["direct", "ferruma", "ferrumb", "envoy", "consulhttp", "ferrumtcpa", "ferrumtcpb", "consultcp"]
+IDLE_PHASE = "h1-idle-diagnostic"
+IDLE_CAPS = {"h1idle64a": 64, "h1idle64b": 64, "h1idle128": 128}
 ROOT = Path("results")
 
 
 def physical(arm):
+    if arm in IDLE_CAPS:
+        return "ferrum"
     return {"ferruma": "ferrum", "ferrumb": "ferrum", "ferrumtcpa": "ferrumtcp", "ferrumtcpb": "ferrumtcp"}.get(arm, arm)
 
 
 def plan(phase):
-    if phase not in ("smoke-l7", "smoke", "smoke-fixed", "ranking"):
+    if phase not in ("smoke-l7", "smoke", "smoke-fixed", "ranking", IDLE_PHASE):
         raise ValueError("unknown phase")
     cells = []
-    if phase == "smoke-fixed":
+    if phase == IDLE_PHASE:
+        for repetition in range(1, 5):
+            arms = list(IDLE_CAPS) if repetition % 2 else list(reversed(IDLE_CAPS))
+            sizes = (1024, 1048576) if repetition % 2 else (1048576, 1024)
+            for payload in sizes:
+                for arm in arms:
+                    cells.append(dict(arm=arm, payload=payload, repetition=repetition,
+                                      load="saturated", duration=30, rate=0))
+    elif phase == "smoke-fixed":
         arms = ["direct", "ferruma", "ferrumb", "envoy"]
         for repetition in (1, 2):
             for arm in arms if repetition == 1 else reversed(arms):
@@ -72,6 +86,13 @@ def provenance():
             "note": "bounded end-window admission loss, not proof of timer-only cause or zero overload; preserve every miss and successful-cohort latency"},
         "limits": ["one shared runner, backend/loadgen/proxies share CPU", "L4 bridge/capture differs from L7 host-network placement; cross-layer differences do not isolate HTTP overhead", "static Envoy is not full Istio and policy/telemetry work differs", "socket samples are not complete connection churn counters", "thread context switches are not logical task wakes", "saturated latency and fixed scheduled latency are separate populations"],
         "config_sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path("tests/performance/mesh_runtime/configs").rglob("*")) if p.is_file()}}
+    if data["phase"] == IDLE_PHASE:
+        data["configuration_diagnostic"] = {"kind": "destination H1 idle retention, not shipping-default ranking",
+            "source_max_idle_per_host": 64, "destination_caps_by_arm": IDLE_CAPS,
+            "unchanged_image_and_runtime": True, "runtime_default_changed": False,
+            "hypothesis": "idle overflow may cause backend H1 churn; separate from mesh H2 width",
+            "memory_tradeoff": "cap 128 can retain more idle sockets, descriptors and buffers; report RSS and CPU",
+            "measurement_cells": 24, "baseline_controls": ["h1idle64a", "h1idle64b"]}
     (ROOT/"production-provenance.json").write_text(json.dumps(data, indent=2)+"\n")
 
 
@@ -194,6 +215,66 @@ def read_json(path):
     return json.loads(path.read_text(), parse_constant=invalid_constant)
 
 
+def idle_receipt(directory, destination_cap, containers):
+    """Retain only the diagnostic variable and immutable process/image identity."""
+    if os.environ.get("BENCH_PHASE") != IDLE_PHASE or destination_cap not in (64, 128):
+        raise ValueError("H1 idle override is restricted to its explicit diagnostic phase")
+    if not isinstance(containers, list) or len(containers) != 2:
+        raise ValueError("expected source and destination inspect receipts")
+    roles = []
+    for role, cap, container in zip(("source", "destination"), (64, destination_cap), containers):
+        config = container["Config"]
+        environment = [value for value in config["Env"] if value.startswith("FERRUM_POOL_MAX_IDLE_PER_HOST=")]
+        if (environment != [f"FERRUM_POOL_MAX_IDLE_PER_HOST={cap}"]
+                or config.get("Labels", {}).get("org.opencontainers.image.revision") != RUNTIME_SHA
+                or not container["State"].get("Running") or container["State"]["Pid"] <= 1
+                or not container["Name"].endswith("-client" if role == "source" else "-server")):
+            raise ValueError("diagnostic environment or shipping identity mismatch")
+        roles.append({"role": role, "name": container["Name"].lstrip("/"), "pid": container["State"]["Pid"],
+            "image_id": container["Image"], "runtime_sha": RUNTIME_SHA, "environment": environment})
+    if roles[0]["image_id"] != roles[1]["image_id"]:
+        raise ValueError("diagnostic roles must use the same shipping image")
+    path = directory/"h1-idle-environment.json"
+    with path.open("x") as output:
+        json.dump({"phase": IDLE_PHASE, "roles": roles}, output, indent=2, allow_nan=False)
+        output.write("\n")
+
+
+def validate_idle_receipts(cell, resource, directory):
+    errors, evidence = [], {"phase": IDLE_PHASE, "source_cap": 64, "destination_cap": IDLE_CAPS[cell["arm"]]}
+    try:
+        provenance = read_json(ROOT/"production-provenance.json")
+        if provenance["phase"] != IDLE_PHASE or provenance["runtime_sha"] != RUNTIME_SHA:
+            raise ValueError("diagnostic provenance does not match its phase/runtime")
+        image_id = provenance["images"][0]["Id"]
+        receipt = read_json(directory/"h1-idle-environment.json")
+        if receipt["phase"] != IDLE_PHASE or len(receipt["roles"]) != 2 or len(resource["containers"]) != 2:
+            raise ValueError("missing diagnostic role identity")
+        evidence["roles"] = []
+        for index, (role, cap) in enumerate((("source", 64), ("destination", IDLE_CAPS[cell["arm"]]))):
+            actual, measured = receipt["roles"][index], resource["containers"][index]
+            if (actual["role"] != role or actual["runtime_sha"] != RUNTIME_SHA or actual["image_id"] != image_id
+                    or actual["environment"] != [f"FERRUM_POOL_MAX_IDLE_PER_HOST={cap}"]
+                    or any(actual[key] != measured[key] for key in ("name", "pid", "image_id"))):
+                raise ValueError("diagnostic role environment/PID/image differs from measurement")
+            metrics = {}
+            for phase in ("before", "after"):
+                snapshot = read_json(directory/f"{phase}-{index}-metrics.json")
+                values = re.findall(r"^ferrum_connection_pool_max_idle_per_host\s+(\S+)\s*$", snapshot["body"], re.MULTILINE)
+                if snapshot["returncode"] != 0 or snapshot.get("error") or len(values) != 1 or float(values[0]) != cap:
+                    raise ValueError("missing or mismatched diagnostic idle-cap metric")
+                metrics[phase] = float(values[0])
+            evidence["roles"].append({**actual, "idle_cap_metric": metrics})
+        if receipt["roles"][0]["image_id"] != receipt["roles"][1]["image_id"]:
+            raise ValueError("diagnostic roles use different images")
+        for key in ("proxy_rss_bytes_mean", "proxy_rss_bytes_peak"):
+            if not finite_number(resource.get(key), positive=True):
+                raise ValueError("missing diagnostic memory evidence")
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
+        errors.append(f"H1 idle diagnostic receipt: {error}")
+    return errors, evidence
+
+
 def observed_metrics(cell, load, resource):
     """All errors remain counted; successful drains do not increase goodput."""
     outcomes = load["cohort_requests"]+load["warmup_requests"]+load["total_errors"]
@@ -210,6 +291,9 @@ def observed_metrics(cell, load, resource):
         result[key] = load[key] if count else None
     for key in ("admission_delay_p99_us", "admission_delay_max_us"):
         result[key] = load[key] if cell["rate"] and load["admitted_requests"] else None
+    if cell["arm"] in IDLE_CAPS:
+        for key in ("proxy_cpu_seconds", "proxy_rss_bytes_mean", "proxy_rss_bytes_peak"):
+            result[key] = resource[key]
     return result
 
 
@@ -237,6 +321,10 @@ def read_cell(cell, runner_exit_code=None):
                             and (load["total_errors"] > 0 or load.get("total_requests") == 0))
         if type(runner_exit_code) is not int or not (runner_exit_code == 0 or runner_exit_code == 1 and ordinary_failure):
             read_errors.append("runner failure is not an ordinary error/no-completion load result")
+    idle_evidence = None
+    if cell["arm"] in IDLE_CAPS:
+        extra, idle_evidence = validate_idle_receipts(cell, resource, directory)
+        read_errors.extend(extra)
     measurement_errors = read_errors + validate_observation(cell, load, resource)
     capacity_errors = read_errors + validate(cell, load, resource)
     metrics = observed_metrics(cell, load, resource) if not measurement_errors else None
@@ -251,6 +339,8 @@ def read_cell(cell, runner_exit_code=None):
            "classification": classification, "end_to_end_errors_observed": has_errors,
            "observed_metrics": metrics, "cpu_us_per_completion": metrics["cpu_us_per_completion"] if metrics else None,
            "report_paths": {"load": str(load_path), "resources": str(resource_path)}}
+    if idle_evidence is not None:
+        row["configuration_diagnostic"] = idle_evidence
     # Preserve any full raw report that the cell runner backed up before
     # replacing its canonical file with a failure stub; it cannot qualify it.
     failed = load_path.with_name(load_path.stem + ".failed-output.json")
@@ -270,13 +360,41 @@ def metric_summary(values):
             "all": values, "defined_repetitions": sum(finite_number(value) for value in values)}
 
 
+def idle_comparisons(rows):
+    comparisons = []
+    keys = ("goodput_rps", "cpu_us_per_completion", "cohort_p50_us", "cohort_p95_us", "cohort_p99_us",
+            "proxy_rss_bytes_mean", "proxy_rss_bytes_peak")
+    for payload in (1024, 1048576):
+        paired = {key: [] for key in keys}
+        aa = {key: [] for key in keys}
+        blocks = []
+        for repetition in range(1, 5):
+            block = {row["arm"]: row for row in rows if row["arm"] in IDLE_CAPS
+                     and row["payload"] == payload and row["repetition"] == repetition}
+            measured = len(block) == 3 and all(row["measurement_valid"] for row in block.values())
+            blocks.append({"repetition": repetition, "measurement_valid": measured,
+                "capacity_qualified": len(block) == 3 and all(row["valid"] for row in block.values()),
+                "errors_by_arm": {arm: row["report"].get("total_errors") if isinstance(row["report"], dict) else None for arm, row in block.items()}})
+            for key in keys:
+                values = [block[arm]["observed_metrics"][key] if arm in block and block[arm]["measurement_valid"] else None for arm in IDLE_CAPS]
+                defined = all(finite_number(value) for value in values)
+                aa[key].append(values[1]/values[0] if all(finite_number(value) for value in values[:2]) and values[0] > 0 else None)
+                paired[key].append(values[2]/math.sqrt(values[0]*values[1])
+                                   if defined and values[0] > 0 and values[1] > 0 else None)
+        comparisons.append({"payload": payload, "blocks": blocks,
+            "aa_64b_over_64a": {key: metric_summary(values) for key, values in aa.items()},
+            "candidate128_over_geomean64ab": {key: metric_summary(values) for key, values in paired.items()},
+            "scope": "configuration diagnostic; errors retained; AA calibrates drift; RSS/FD retention is a cost; no default-change or shipping-ranking claim"})
+    return comparisons
+
+
 def summarize():
     planned = json.loads((ROOT/"production-plan.json").read_text())
     rows = [read_cell(cell) for cell in planned]
     errors = [{"cell": cell, "errors": row["capacity_errors"]} for cell, row in zip(planned, rows) if not row["valid"]]
     measurement_errors = [{"cell": cell, "errors": row["measurement_errors"]} for cell, row in zip(planned, rows) if not row["measurement_valid"]]
     groups = []
-    for arm in ARMS:
+    for arm in [*ARMS, *IDLE_CAPS]:
         for payload in (1024,1048576):
             for mode in ("saturated", "fixed"):
                 subset = [row for row in rows if row["arm"] == arm and row["payload"] == payload and row["load"] == mode]
@@ -314,6 +432,9 @@ def summarize():
                       if all(type(row["report"].get(key)) is int and row["report"][key] >= 0 for key in ("missed_requests", "offered_requests")) else None,
                   "measurement_valid": row["measurement_valid"], "zero_error_capacity_qualified": row["zero_error_capacity_qualified"]}
                   for row in rows if row["load"] == "fixed" and isinstance(row["report"], dict)]}
+    if any(row["arm"] in IDLE_CAPS for row in rows):
+        result["campaign_kind"] = "destination H1 idle configuration diagnostic, not shipping-default ranking"
+        result["configuration_comparisons"] = idle_comparisons(rows)
     (ROOT/"production-summary.json").write_text(json.dumps(result, indent=2, allow_nan=False)+"\n")
     text = ["Production mesh campaign", "", f"Planned: {len(planned)}; parsed: {result['parsed_cells']}; measurement-valid: {result['measurement_valid_cells']}; zero-error capacity-qualified: {result['zero_error_capacity_cells']}.",
         f"Strict zero-missed-arrival result: {result['strict_zero_miss_valid']}.",
@@ -333,6 +454,10 @@ def summarize():
         tails = "/".join(f"{m[key]['median']:g}" if m[key]["median"] is not None else "undefined" for key in tail_keys)
         cpu = m["cpu_us_per_completion"]["median"]
         text.append(f"| {group['arm']} | {group['payload']} | {group['load']} | {counts} | {'PASS' if group['all_valid'] else 'FAIL'} | {m['goodput_rps']['median']:.1f} | {tails} | {cpu if cpu is not None else 'undefined'} | {m['total_errors']['all']} | {m['admitted_error_rate']['all']} | {m['missed_requests']['all']} |")
+    if "configuration_comparisons" in result:
+        text += ["", result["campaign_kind"],
+            "Candidate cap 128 retains more idle sockets/FDs/buffers; source stays 64. All four paired ratios, AA drift and RSS are retained below.",
+            json.dumps(result["configuration_comparisons"], indent=2)]
     if errors:
         text += ["", "Capacity-unqualified or missing cells (raw observations retained):", json.dumps(errors, indent=2)]
     (ROOT/"production-summary.md").write_text("\n".join(text)+"\n")
@@ -360,8 +485,10 @@ def classify_planned(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["provenance", "plan", "summarize", "accept", "classify"])
-    parser.add_argument("--arm", choices=ARMS)
+    parser.add_argument("action", choices=["provenance", "plan", "summarize", "accept", "classify", "idle-receipt"])
+    parser.add_argument("--arm", choices=[*ARMS, *IDLE_CAPS])
+    parser.add_argument("--directory", type=Path)
+    parser.add_argument("--destination-cap", type=int, choices=(64, 128))
     parser.add_argument("--payload", type=int)
     parser.add_argument("--repetition", type=int)
     parser.add_argument("--load", choices=["fixed", "saturated"])
@@ -381,6 +508,8 @@ def main():
         return summarize()
     elif args.action == "classify":
         return classify_planned(args)
+    elif args.action == "idle-receipt":
+        idle_receipt(args.directory, args.destination_cap, json.load(sys.stdin))
     else:
         return 0 if json.loads((ROOT/"production-summary.json").read_text())["valid"] else 1
     return 0

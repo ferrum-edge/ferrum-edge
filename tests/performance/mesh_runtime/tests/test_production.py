@@ -3,6 +3,7 @@ from pathlib import Path
 import unittest
 import tempfile
 import json
+import copy
 from types import SimpleNamespace
 from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
@@ -19,7 +20,7 @@ class ProductionContracts(unittest.TestCase):
     def valid_load(self, cell):
         count=cell["rate"]*cell["duration"] if cell["rate"] else 6000
         return dict(mesh=campaign.physical(cell["arm"]),protocol="http1",payload_size=cell["payload"],
-            duration_secs=cell["duration"],rate=cell["rate"],concurrency=100,
+            duration_secs=cell["duration"],rate=cell["rate"],concurrency=50 if cell["payload"]>=1048576 else 100,
             total_errors=0,warmup_errors=0,warmup_requests=30,total_requests=count,drained_requests=0,
             admitted_requests=count,cohort_requests=count,admitted_errors=0,
             scheduled_requests=count if cell["rate"] else 0,cohort_scheduled_requests=count if cell["rate"] else 0,
@@ -329,8 +330,135 @@ class ProductionContracts(unittest.TestCase):
     def test_ranking_shell_gates_continuation_and_refuses_stale_observations(self):
         script=(ROOT/".github/scripts/mesh_production_campaign.sh").read_text()
         self.assertIn('pipeline_status=("${PIPESTATUS[@]}")',script)
-        self.assertIn('[ "${BENCH_PHASE:-smoke-l7}" = ranking ] && [ "${pipeline_status[0]}" -eq 1 ] && [ "${pipeline_status[1]}" -eq 0 ]',script)
+        self.assertIn('if $observation_campaign && [ "${pipeline_status[0]}" -eq 1 ] && [ "${pipeline_status[1]}" -eq 0 ]',script)
+        self.assertIn('ranking|h1-idle-diagnostic) observation_campaign=true',script)
         self.assertIn('refusing to reuse an existing planned observation',script)
         self.assertIn('--runner-exit-code 1',script)
+
+    def idle_containers(self, cap):
+        return [{"Name": "/fixture-"+name, "Image": "sha256:"+"a"*64,
+            "Config": {"Env": [f"FERRUM_POOL_MAX_IDLE_PER_HOST={value}"],
+                "Labels": {"org.opencontainers.image.revision": campaign.RUNTIME_SHA}},
+            "State": {"Running": True, "Pid": pid}}
+            for name,value,pid in (("client",64,101),("server",cap,102))]
+
+    def write_idle_cell(self, root, cell, load=None):
+        resource=self.valid_resource(cell)
+        containers=self.idle_containers(campaign.IDLE_CAPS[cell["arm"]])
+        resource.update(containers=[{"name":c["Name"].lstrip("/"),"pid":c["State"]["Pid"],"image_id":c["Image"]} for c in containers],
+            proxy_rss_bytes_mean=256000,proxy_rss_bytes_peak=512000)
+        self.write_cell(root,cell,load or self.valid_load(cell),resource)
+        directory=root/cell["arm"]/cell["load"]/f"run_{cell['repetition']}"/f"payload_{cell['payload']}"
+        with patch.dict(campaign.os.environ,{"BENCH_PHASE":campaign.IDLE_PHASE}):
+            campaign.idle_receipt(directory,campaign.IDLE_CAPS[cell["arm"]],containers)
+        for index,cap in enumerate((64,campaign.IDLE_CAPS[cell["arm"]])):
+            for phase in ("before","after"):
+                (directory/f"{phase}-{index}-metrics.json").write_text(json.dumps({"returncode":0,"error":None,
+                    "body":f"ferrum_connection_pool_max_idle_per_host {cap}\n"}))
+        return directory
+
+    def write_idle_provenance(self, root):
+        (root/"production-provenance.json").write_text(json.dumps({"phase":campaign.IDLE_PHASE,
+            "runtime_sha":campaign.RUNTIME_SHA,"images":[{"Id":"sha256:"+"a"*64}]}))
+
+    def test_h1_idle_plan_is_separate_bounded_and_balanced(self):
+        cells=campaign.plan(campaign.IDLE_PHASE)
+        self.assertEqual(len(cells),24)
+        self.assertEqual(len({tuple(cell.values()) for cell in cells}),24)
+        for payload in (1024,1048576):
+            blocks=[[cell["arm"] for cell in cells if cell["payload"]==payload and cell["repetition"]==rep] for rep in range(1,5)]
+            self.assertEqual(blocks[0],list(reversed(blocks[1])))
+            self.assertEqual(blocks[2],list(reversed(blocks[3])))
+        self.assertTrue(all(c["duration"]==30 and c["rate"]==0 and c["load"]=="saturated" for c in cells))
+        self.assertTrue(all(campaign.physical(c["arm"])=="ferrum" for c in cells))
+        self.assertEqual(len(campaign.plan("ranking")),128)
+        self.assertFalse(any(c["arm"] in campaign.IDLE_CAPS for c in campaign.plan("ranking")))
+
+    def test_h1_idle_inspect_receipt_rejects_scope_and_identity_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            with patch.dict(campaign.os.environ,{"BENCH_PHASE":"ranking"}):
+                with self.assertRaisesRegex(ValueError,"restricted"):
+                    campaign.idle_receipt(root,128,self.idle_containers(128))
+            with patch.dict(campaign.os.environ,{"BENCH_PHASE":campaign.IDLE_PHASE}):
+                for change in ("source_cap","destination_cap","runtime","image","duplicate_env"):
+                    containers=copy.deepcopy(self.idle_containers(128))
+                    if change=="source_cap": containers[0]["Config"]["Env"]=["FERRUM_POOL_MAX_IDLE_PER_HOST=128"]
+                    elif change=="destination_cap": containers[1]["Config"]["Env"]=["FERRUM_POOL_MAX_IDLE_PER_HOST=64"]
+                    elif change=="runtime": containers[0]["Config"]["Labels"]["org.opencontainers.image.revision"]="other"
+                    elif change=="image": containers[1]["Image"]="sha256:"+"b"*64
+                    else: containers[0]["Config"]["Env"]*=2
+                    with self.subTest(change=change),self.assertRaises(ValueError):
+                        campaign.idle_receipt(root,128,containers)
+                with self.assertRaisesRegex(ValueError,"restricted"):
+                    campaign.idle_receipt(root,256,self.idle_containers(256))
+                campaign.idle_receipt(root,128,self.idle_containers(128))
+                with self.assertRaises(FileExistsError):
+                    campaign.idle_receipt(root,128,self.idle_containers(128))
+
+    def test_h1_idle_observation_requires_matching_metric_pid_image_and_memory(self):
+        cell=campaign.plan(campaign.IDLE_PHASE)[2]
+        for change in (None,"metric","pid","image","memory","missing_receipt","wrong_phase"):
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp)
+                self.write_idle_provenance(root)
+                directory=self.write_idle_cell(root,cell)
+                if change=="metric":
+                    (directory/'after-1-metrics.json').write_text(json.dumps({"returncode":0,"body":"ferrum_connection_pool_max_idle_per_host 64\n"}))
+                elif change in ("pid","image","memory"):
+                    path=directory/'ferrum_http1_1024.resources.json'
+                    resource=json.loads(path.read_text())
+                    if change=="pid": resource["containers"][1]["pid"]=103
+                    elif change=="image": resource["containers"][1]["image_id"]="sha256:"+"b"*64
+                    else: resource["proxy_rss_bytes_mean"]=None
+                    path.write_text(json.dumps(resource))
+                elif change=="missing_receipt": (directory/'h1-idle-environment.json').unlink()
+                elif change=="wrong_phase":
+                    (root/'production-provenance.json').write_text(json.dumps({"phase":"ranking","runtime_sha":campaign.RUNTIME_SHA}))
+                with patch.object(campaign,"ROOT",root): row=campaign.read_cell(cell)
+                self.assertEqual(row["measurement_valid"],change is None,row)
+                self.assertEqual(row["report"]["total_requests"],6000)
+
+    def test_h1_idle_all_24_positions_errors_and_undefined_ratios_are_retained(self):
+        cells=campaign.plan(campaign.IDLE_PHASE)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            self.write_idle_provenance(root)
+            (root/'production-plan.json').write_text(json.dumps(cells))
+            for cell in cells:
+                load=self.valid_load(cell)
+                if cell["arm"]=="h1idle128" and cell["repetition"]==2 and cell["payload"]==1024:
+                    load=self.error_load(cell)
+                if cell["arm"]=="h1idle128" and cell["repetition"]==4 and cell["payload"]==1048576:
+                    load=self.error_load(cell,6000)
+                self.write_idle_cell(root,cell,load)
+            with patch.object(campaign,"ROOT",root): self.assertEqual(campaign.summarize(),1)
+            result=json.loads((root/'production-summary.json').read_text())
+            self.assertEqual((result["planned_cells"],result["parsed_cells"],result["measurement_valid_cells"]),(24,24,24))
+            self.assertEqual(result["zero_error_capacity_cells"],22)
+            self.assertEqual(len(result["groups"]),6)
+            self.assertIn("not shipping-default ranking",result["campaign_kind"])
+            small,large=result["configuration_comparisons"]
+            self.assertEqual(small["aa_64b_over_64a"]["goodput_rps"]["all"],[1,1,1,1])
+            self.assertEqual(small["candidate128_over_geomean64ab"]["goodput_rps"]["all"],[1,5999/6000,1,1])
+            self.assertEqual(large["candidate128_over_geomean64ab"]["goodput_rps"]["all"],[1,1,1,0])
+            cpu=large["candidate128_over_geomean64ab"]["cpu_us_per_completion"]
+            self.assertEqual(cpu["all"],[1,1,1,None])
+            self.assertIsNone(cpu["median"])
+            self.assertFalse(large["blocks"][-1]["capacity_qualified"])
+            self.assertEqual(large["blocks"][-1]["errors_by_arm"]["h1idle128"],6000)
+
+    def test_h1_idle_fixture_override_cannot_leak_into_ranking(self):
+        runner=(ROOT/'.github/scripts/mesh_production_campaign.sh').read_text()
+        fixture=(ROOT/'tests/performance/mesh_runtime/run_mesh_runtime_bench.sh').read_text()
+        workflow=(ROOT/'.github/workflows/mesh-runtime-benchmark.yml').read_text()
+        self.assertIn('H1 idle override is forbidden outside its diagnostic phase',runner)
+        self.assertIn('unset BENCH_H1_IDLE_DESTINATION_CAP',runner)
+        self.assertIn('source_idle_args=(-e FERRUM_POOL_MAX_IDLE_PER_HOST=64)',fixture)
+        self.assertIn('destination_idle_args=(-e "FERRUM_POOL_MAX_IDLE_PER_HOST=$BENCH_H1_IDLE_DESTINATION_CAP")',fixture)
+        self.assertIn('case "$BENCH_H1_IDLE_DESTINATION_CAP" in 64|128)',fixture)
+        self.assertIn('[ "${BENCH_PHASE:-}" != h1-idle-diagnostic ] || [ "$MESH" != ferrum ]',fixture)
+        self.assertIn('idle-receipt',fixture)
+        self.assertIn('ranking, h1-idle-diagnostic, symbols',workflow)
 
 if __name__=="__main__": unittest.main()

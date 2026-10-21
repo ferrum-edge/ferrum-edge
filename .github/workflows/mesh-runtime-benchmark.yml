@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       phase:
-        description: "Qualification or four balanced repeated production ranking blocks"
+        description: "Qualification, production ranking, or labeled H1 idle-cap configuration diagnostic"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, smoke-fixed, ranking, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum]
+        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum]
 permissions:
   contents: read
 concurrency:

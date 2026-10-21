@@ -362,6 +362,16 @@ dump_logs() {
 
 # ── Arm starters ────────────────────────────────────────────────────────────
 start_ferrum() {
+    local source_idle_args=() destination_idle_args=()
+    if [ -n "${BENCH_H1_IDLE_DESTINATION_CAP:-}" ]; then
+        if [ "${BENCH_PHASE:-}" != h1-idle-diagnostic ] || [ "$MESH" != ferrum ]; then
+            echo "[bench] idle-cap override requires the explicit Ferrum H1 diagnostic" >&2
+            return 2
+        fi
+        case "$BENCH_H1_IDLE_DESTINATION_CAP" in 64|128) ;; *) return 2 ;; esac
+        source_idle_args=(-e FERRUM_POOL_MAX_IDLE_PER_HOST=64)
+        destination_idle_args=(-e "FERRUM_POOL_MAX_IDLE_PER_HOST=$BENCH_H1_IDLE_DESTINATION_CAP")
+    fi
     # Log level is pinned to error on every proxy arm (Ferrum env below,
     # Envoy -l in start_envoy), mirroring GATEWAY_LOG_LEVEL=error in
     # run_gateway_protocol_bench.sh: at info, Ferrum emits a per-request
@@ -399,7 +409,7 @@ start_ferrum() {
         -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
         -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
-        "$FERRUM_IMAGE" >/dev/null
+        "${destination_idle_args[@]}" "$FERRUM_IMAGE" >/dev/null
     # Client sidecar: outbound :15101 dials destination :15006, pins SVID.
     docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
@@ -426,7 +436,12 @@ start_ferrum() {
         -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
         -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
-        "$FERRUM_IMAGE" >/dev/null
+        "${source_idle_args[@]}" "$FERRUM_IMAGE" >/dev/null
+    if [ -n "${BENCH_H1_IDLE_DESTINATION_CAP:-}" ]; then
+        timeout --signal=KILL 10s docker inspect "$CLIENT_NAME" "$SERVER_NAME" \
+            | python3 "$PROJECT_ROOT/.github/scripts/mesh_production_campaign.py" idle-receipt \
+                --directory "$OUTPUT_DIR" --destination-cap "$BENCH_H1_IDLE_DESTINATION_CAP"
+    fi
 }
 
 start_envoy() {

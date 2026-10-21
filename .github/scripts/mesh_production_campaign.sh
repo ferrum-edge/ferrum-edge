@@ -7,6 +7,14 @@ export CONSUL_IMAGE=hashicorp/consul@sha256:842ee8b5d0ea228b6c36230a442bcf13b7f9
 export TOOLS_IMAGE=mesh-bench-tools:production
 export BENCH_CARGO_PROFILE=release BENCH_FERRUM_FEATURES=cloud-secrets
 export BENCH_WORKERS=4 BENCH_PRODUCTION_OBSERVE=true
+# Only the explicit diagnostic phase may wire this existing runtime setting.
+if [ -n "${BENCH_H1_IDLE_DESTINATION_CAP:-}" ] && [ "${BENCH_PHASE:-smoke-l7}" != h1-idle-diagnostic ]; then
+    echo "[production] H1 idle override is forbidden outside its diagnostic phase" >&2
+    exit 2
+fi
+unset BENCH_H1_IDLE_DESTINATION_CAP
+observation_campaign=false
+case "${BENCH_PHASE:-smoke-l7}" in ranking|h1-idle-diagnostic) observation_campaign=true ;; esac
 mode="${1:?prepare or measure}"
 if [ "$mode" = prepare ]; then
     mkdir -p results/images
@@ -33,6 +41,15 @@ elif [ "$mode" = measure ]; then
     while read -r arm payload repetition load duration rate; do
         physical="$arm"
         case "$arm" in ferruma|ferrumb) physical=ferrum ;; ferrumtcpa|ferrumtcpb) physical=ferrumtcp ;; esac
+        unset BENCH_H1_IDLE_DESTINATION_CAP
+        if [ "${BENCH_PHASE:-smoke-l7}" = h1-idle-diagnostic ]; then
+            physical=ferrum
+            case "$arm" in
+                h1idle64a|h1idle64b) export BENCH_H1_IDLE_DESTINATION_CAP=64 ;;
+                h1idle128) export BENCH_H1_IDLE_DESTINATION_CAP=128 ;;
+                *) echo "[production] unexpected idle diagnostic arm" >&2; exit 2 ;;
+            esac
+        fi
         export BENCH_RATE="$rate"
         directory="results/$arm/$load/run_$repetition/payload_$payload"
         mkdir -p "$directory"
@@ -42,7 +59,7 @@ elif [ "$mode" = measure ]; then
         fi
         classification_args=(classify --arm "$arm" --payload "$payload" --repetition "$repetition"
             --load "$load" --duration "$duration" --rate "$rate")
-        if [ "${BENCH_PHASE:-smoke-l7}" = ranking ]; then classification_args+=(--measurement-only); fi
+        if $observation_campaign; then classification_args+=(--measurement-only); fi
         echo "[production] arm=$arm physical=$physical payload=$payload repetition=$repetition load=$load rate=$rate"
         if timeout --signal=TERM --kill-after=10s "$((duration+420))s"             bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh "$physical"             --payload-sizes "$payload" --duration "$duration" --concurrency 100 --warmup 3             --output-dir "$directory" --skip-build 2>&1 | tee "$directory/run.log"; then
             python3 .github/scripts/mesh_production_campaign.py "${classification_args[@]}" --runner-exit-code 0
@@ -51,7 +68,7 @@ elif [ "$mode" = measure ]; then
             # Only an ordinary cell rc=1 can be retained as an observation.
             # Timeouts/signals, failed log capture, auth/fixture failures and
             # incomplete/resource-invalid reports still stop this campaign.
-            if [ "${BENCH_PHASE:-smoke-l7}" = ranking ] && [ "${pipeline_status[0]}" -eq 1 ] && [ "${pipeline_status[1]}" -eq 0 ] \
+            if $observation_campaign && [ "${pipeline_status[0]}" -eq 1 ] && [ "${pipeline_status[1]}" -eq 0 ] \
                 && python3 .github/scripts/mesh_production_campaign.py "${classification_args[@]}" --runner-exit-code 1; then
                 echo "[production] retained error-inclusive observation; zero-error capacity SLO remains failed" >&2
                 continue
