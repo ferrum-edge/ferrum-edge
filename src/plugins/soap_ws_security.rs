@@ -4980,11 +4980,12 @@ impl SoapRejection {
             status_code = self.status_code,
             "soap_ws_security: request rejected"
         );
-        PluginResult::Reject {
-            status_code: self.status_code,
-            body: self.body,
-            headers: HashMap::new(),
-        }
+        // A `401` always carries the WS-Security challenge (issue #6774).
+        auth_flow::auth_rejection(
+            self.status_code,
+            self.body,
+            auth_flow::WS_SECURITY_AUTHENTICATION_CHALLENGE,
+        )
     }
 }
 
@@ -5380,11 +5381,11 @@ impl SoapWsSecurity {
                 body,
                 headers: HashMap::new(),
             },
-            Err(_) => PluginResult::Reject {
-                status_code: 401,
-                body: r#"{"error":"WS-Security: identity could not be established"}"#.to_string(),
-                headers: HashMap::new(),
-            },
+            Err(_) => auth_flow::auth_rejection(
+                401,
+                r#"{"error":"WS-Security: identity could not be established"}"#.to_string(),
+                auth_flow::WS_SECURITY_AUTHENTICATION_CHALLENGE,
+            ),
         }
     }
 }
@@ -5622,6 +5623,11 @@ impl Plugin for SoapWsSecurity {
 
     fn is_auth_plugin(&self) -> bool {
         self.establishes_identity()
+    }
+
+    fn authentication_challenge(&self) -> Option<&'static str> {
+        self.establishes_identity()
+            .then_some(auth_flow::WS_SECURITY_AUTHENTICATION_CHALLENGE)
     }
 
     /// Every constructed instance enforces: construction refuses a policy with

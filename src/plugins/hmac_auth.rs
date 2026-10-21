@@ -1566,6 +1566,10 @@ impl AuthMechanism for HmacAuth {
         "hmac_auth"
     }
 
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::HMAC_AUTHENTICATION_CHALLENGE
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         // RFC 6750-style `Authorization` parameters and digest headers are
         // visible-ASCII structured fields. A present but non-materialized line
@@ -1726,12 +1730,11 @@ impl AuthMechanism for HmacAuth {
     }
 }
 
+/// Every `hmac_auth` rejection, including the replay `401` and the prebuffered
+/// digest path that bypass the shared runner, goes through here so a `401`
+/// always carries the `hmac` challenge (RFC 9110 §15.5.2, issue #6774).
 fn hmac_reject(status_code: u16, body: String) -> super::PluginResult {
-    super::PluginResult::Reject {
-        status_code,
-        body,
-        headers: std::collections::HashMap::new(),
-    }
+    auth_flow::auth_rejection(status_code, body, auth_flow::HMAC_AUTHENTICATION_CHALLENGE)
 }
 
 /// The single funnel both `hmac_auth` authentication paths pass through.

@@ -9067,6 +9067,17 @@ components:
             $ref: "#/components/schemas/Error"
     Unauthorized:
       description: Missing or invalid JWT
+      headers:
+        WWW-Authenticate:
+          description: |
+            RFC 6750 bearer challenge (RFC 9110 §15.5.2): `Bearer` for a
+            missing token or unavailable admin authentication,
+            `Bearer error="invalid_request"` for a malformed `Authorization`
+            header, `Bearer error="invalid_token"` for a token that fails
+            verification. A request on a connection whose client-certificate
+            trust was withdrawn answers `ClientCertificate realm="ferrum-edge"`.
+          schema:
+            type: string
       content:
         application/json:
           schema:
@@ -11690,8 +11701,13 @@ components:
         returned by a plugin is terminal.
         `multi` — auth plugins run sequentially until one succeeds. If none
         succeeds, a server rejection takes precedence over the last ordinary
-        rejection; an all-missing chain returns the first available challenge
-        in plugin priority order, skipping challenge-less mechanisms.
+        rejection.
+        In either mode a `401` from the authentication phase carries a
+        `WWW-Authenticate` field listing every challenge each rejecting
+        mechanism carried in chain order and then every other applicable auth
+        plugin's advertised challenge in priority order, merging only
+        equivalent challenges (same scheme and parameters), falling back to the
+        generic `ferrum-edge` challenge.
 
     PluginAssociation:
       type: object

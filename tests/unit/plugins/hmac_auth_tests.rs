@@ -3457,3 +3457,97 @@ fn unknown_key_diagnostic_preserves_root_context_without_supplied_data() {
         );
     }
 }
+
+// ── `WWW-Authenticate: hmac` on every 401 (issue #6774) ─────────────
+
+#[tokio::test]
+async fn every_hmac_401_carries_the_hmac_challenge() {
+    use super::plugin_utils::{
+        assert_phase_unauthorized_with_challenge, assert_unauthorized_with_challenge,
+    };
+    use ferrum_edge::plugins::utils::auth_flow::HMAC_AUTHENTICATION_CHALLENGE;
+
+    let plugin = HmacAuth::new(&default_config()).unwrap();
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let method = "GET";
+    let path = "/test";
+
+    // Missing credentials: the plugin defers and the phase answers.
+    let auth_plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(HmacAuth::new(&default_config()).unwrap())];
+    for mode in [
+        ferrum_edge::config::types::AuthMode::Single,
+        ferrum_edge::config::types::AuthMode::Multi,
+    ] {
+        let mut ctx = make_ctx(method, path);
+        assert_phase_unauthorized_with_challenge(
+            ferrum_edge::proxy::run_authentication_phase(
+                mode,
+                &auth_plugins,
+                &mut ctx,
+                &consumer_index,
+            )
+            .await,
+            HMAC_AUTHENTICATION_CHALLENGE,
+        );
+    }
+
+    let date = current_date();
+    let valid_signature = sign_sha256(TEST_SECRET, method, path, &date);
+    let cases = [
+        // Malformed: another scheme, and unparseable `hmac` parameters.
+        "Bearer some-token".to_string(),
+        "hmac not-a-parameter-list".to_string(),
+        // Unknown consumer.
+        hmac_auth_header("nonexistent-user", Some("hmac-sha256"), &valid_signature),
+        // Invalid signature.
+        hmac_auth_header(
+            TEST_USERNAME,
+            Some("hmac-sha256"),
+            "dGhpcy1pcy1ub3QtYS12YWxpZC1zaWduYXR1cmU=",
+        ),
+        // Signature computed with the wrong secret.
+        hmac_auth_header(
+            TEST_USERNAME,
+            Some("hmac-sha256"),
+            &sign_sha256("wrong-secret", method, path, &date),
+        ),
+    ];
+    for authorization in cases {
+        let mut ctx = make_ctx(method, path);
+        ctx.headers
+            .insert("authorization".to_string(), authorization);
+        ctx.headers.insert("date".to_string(), date.clone());
+        ctx.identified_consumer = None;
+        assert_unauthorized_with_challenge(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            HMAC_AUTHENTICATION_CHALLENGE,
+        );
+    }
+
+    let mut valid = make_ctx(method, path);
+    valid.headers.insert(
+        "authorization".to_string(),
+        hmac_auth_header(TEST_USERNAME, Some("hmac-sha256"), &valid_signature),
+    );
+    valid.headers.insert("date".to_string(), date);
+    valid.identified_consumer = None;
+    assert_continue(plugin.authenticate(&mut valid, &consumer_index).await);
+    assert!(valid.identified_consumer.is_some());
+}
+
+#[tokio::test]
+async fn hmac_v2_replay_401_carries_the_hmac_challenge() {
+    let plugin = v2_plugin_named("v2-replay-challenge");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = V2Request::new(&test_nonce(6774));
+
+    let mut first = request.context();
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+
+    let mut replay = request.context();
+    super::plugin_utils::assert_unauthorized_with_challenge(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        ferrum_edge::plugins::utils::auth_flow::HMAC_AUTHENTICATION_CHALLENGE,
+    );
+}

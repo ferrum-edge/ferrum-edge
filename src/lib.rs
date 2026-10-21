@@ -9174,6 +9174,23 @@ pub mod _test_support {
         .0
     }
 
+    /// The final per-frontend repair point for a gateway-replaced `401`
+    /// (issue #6774), run where every frontend runs it: after the buffered
+    /// transform and policy stages, before committed observers and the wire.
+    pub fn ensure_replaced_response_challenge_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::ensure_replaced_response_challenge(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+        );
+    }
+
     pub fn strip_content_length_for_streaming_grpc_deadline_for_test(
         response_headers: &mut HashMap<String, String>,
         deadline_enabled: bool,
@@ -9948,6 +9965,15 @@ pub mod _test_support {
         value: bool,
     ) {
         ctx.serverless_terminate_response = value;
+    }
+
+    /// Note `plugin` as the plugin whose hook rejected the request, exactly as
+    /// the rejection funnel does (origin provenance included, issue #6774).
+    pub fn note_rejecting_plugin_for_test(
+        ctx: &crate::plugins::RequestContext,
+        plugin: &dyn crate::plugins::Plugin,
+    ) {
+        crate::diagnostic_ref::note_rejecting_plugin(ctx, plugin);
     }
 
     /// The production gate that decides whether a plugin short-circuit runs the

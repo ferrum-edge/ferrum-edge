@@ -1922,15 +1922,23 @@ pub fn gateway_rejections_enabled() -> bool {
 }
 
 /// Note the plugin whose hook rejected the request, and whether its
-/// short-circuit is an origin-authored representation. A no-op (one `Option`
-/// check) when references are off.
+/// short-circuit is an origin-authored representation. Beyond recording the
+/// origin provenance on the request, a no-op (one `Option` check) when
+/// references are off.
 pub(crate) fn note_rejecting_plugin(
     ctx: &crate::plugins::RequestContext,
     plugin: &dyn crate::plugins::Plugin,
 ) {
+    let origin_response = plugin.rejects_with_origin_response();
+    if origin_response {
+        // Independent of diagnostic references: gateway-only response repairs
+        // (the `WWW-Authenticate` guarantee, issue #6774) must also leave an
+        // origin-authored short-circuit as authored.
+        ctx.note_origin_rejection();
+    }
     if let Some(slot) = ctx.diagnostic_slot() {
         slot.note_rejecting_plugin(plugin.name());
-        if plugin.rejects_with_origin_response() {
+        if origin_response {
             slot.note_origin_response();
         }
     }

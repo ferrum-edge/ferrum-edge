@@ -270,14 +270,26 @@ fn reject_headers(result: &PluginResult) -> &HashMap<String, String> {
 const USERNAME_TOKEN_INVALID_CREDENTIALS_BODY: &str =
     r#"{"error":"WS-Security: invalid credentials"}"#;
 
+/// Every WS-Security `401` carries exactly one header: the uniform
+/// `WWW-Authenticate: WS-Security` challenge (RFC 9110 §15.5.2, issue #6774).
+/// It is identical for every failure class, so it distinguishes none of them.
+fn assert_only_ws_security_challenge(result: &PluginResult, context: &str) {
+    let headers = reject_headers(result);
+    assert_eq!(headers.len(), 1, "{context}: {headers:?}");
+    assert_eq!(
+        super::plugin_utils::challenge_header(headers),
+        Some(ferrum_edge::plugins::utils::auth_flow::WS_SECURITY_AUTHENTICATION_CHALLENGE),
+        "{context}: {headers:?}"
+    );
+}
+
 fn assert_username_token_invalid_credentials(result: &PluginResult, candidate_usernames: &[&str]) {
     assert!(is_reject(result));
     assert_eq!(reject_status(result), 401);
     assert_eq!(reject_body(result), USERNAME_TOKEN_INVALID_CREDENTIALS_BODY);
-    assert!(
-        reject_headers(result).is_empty(),
-        "invalid-credential rejects must not add distinguishing headers: {:?}",
-        reject_headers(result)
+    assert_only_ws_security_challenge(
+        result,
+        "invalid-credential rejects must not add distinguishing headers",
     );
     let body = reject_body(result);
     for candidate in candidate_usernames {
@@ -312,10 +324,9 @@ fn assert_username_token_structural(
 ) {
     assert!(is_reject(result));
     assert_eq!(reject_status(result), 401);
-    assert!(
-        reject_headers(result).is_empty(),
-        "structural rejects must not add distinguishing headers: {:?}",
-        reject_headers(result)
+    assert_only_ws_security_challenge(
+        result,
+        "structural rejects must not add distinguishing headers",
     );
     let body = reject_body(result);
     assert_ne!(

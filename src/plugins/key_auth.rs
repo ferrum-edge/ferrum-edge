@@ -185,6 +185,10 @@ impl AuthMechanism for KeyAuth {
         "key_auth"
     }
 
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::API_KEY_AUTHENTICATION_CHALLENGE
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         match self.extract_key_credential(ctx) {
             HeaderCredentialExtract::Present(key) => ExtractedCredential::ApiKey(key),
