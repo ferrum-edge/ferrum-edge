@@ -512,6 +512,7 @@ async fn terminal_metadata_projection_cancelled_log_keeps_owned_summary_and_mirr
         .await
         .expect("primary sink started");
     assert!(ctx.terminal_record_started());
+    drop(ctx);
     handler.abort();
     assert!(
         handler
