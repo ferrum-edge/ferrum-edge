@@ -28,8 +28,8 @@
       "after": "938647ce5937258e4b0d3d3658852edb416ef006c11a1892021963f19268e794"
     },
     "src/proto/streams/streams.rs": {
-      "before": "4018a22be3b807e87bab359775453a59e4f44c3329297f3ce7f961d3fd826e69",
-      "after": "aad77952aa934da7c8606ff1914cb99568a5abebf884ea9095b7de20b69a0f61"
+      "before": "e7a2525276d478a7725832a18ba06b899e73e9700ec5f13ef13195af9417e8a5",
+      "after": "8e1fbc15326d0e820d28753bf867c6ee098a6c01046fe95d324df3c45ea56659"
     }
   },
   "assets": {

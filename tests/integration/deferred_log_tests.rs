@@ -36,9 +36,9 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegistry};
 use ferrum_edge::plugins::{
-    Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
-    create_plugin, create_response_stream_inspector, log_with_mirror_before_buffered_response,
-    spawn_bounded_terminal_summary_log,
+    Plugin, RequestContext, ResponseDelivery, ResponseStreamAction, ResponseStreamInspector,
+    TransactionSummary, create_plugin, create_response_stream_inspector,
+    log_with_mirror_before_buffered_response, spawn_bounded_terminal_summary_log,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::body::ProxyBodyError;
@@ -199,6 +199,7 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
@@ -671,6 +672,11 @@ async fn client_disconnect_outcome_sets_flag() {
     assert_eq!(got.bytes_received, 512);
     assert!(!got.body_completed);
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
+    // Issue #6768 / #6769: the head was committed, so a later disconnect keeps
+    // the status the client saw (never a `499`, RFC 9112 §8) and the record
+    // says it observed the body's transport terminal.
+    assert_eq!(got.response_status_code, 200);
+    assert_eq!(got.response_delivery, ResponseDelivery::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -793,6 +799,11 @@ async fn drop_without_fire_is_safety_net() {
     assert_eq!(got.body_error_class, Some(ErrorClass::ClientDisconnect));
     assert!(!got.body_completed);
     assert_eq!(got.bytes_received, 0);
+    assert_eq!(
+        got.response_status_code, 200,
+        "a committed status is never rewritten to 499"
+    );
+    assert_eq!(got.response_delivery, ResponseDelivery::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread")]

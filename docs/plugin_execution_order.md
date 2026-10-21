@@ -1916,6 +1916,27 @@ transaction hook sequentially:
 - Native H3 drives the response body to completion inside its handler. It then
   synchronously awaits streaming terminal hooks and sequential log hooks before
   the handler finishes; it does not use the detached hyper-body logger.
+- An H1/H2 request whose client resets or disconnects while the handler is
+  still pending (before any response head) is dropped by hyper, so none of the
+  handler's own log paths runs. Its `ClientAbortScope` hands one `499`
+  client-abort summary (`client_disconnected: true`, rejection phase
+  `client_disconnect_before_response`) to the same detached terminal delivery
+  the streamed body uses, so the `log` hooks still run exactly once (issue
+  #6768). Only `log` / `log_with_mesh_key` run for it: there is no response, so
+  no response-phase or streaming terminal hook does. A reset the gateway's own
+  HTTP/2 stack sent is recorded the same way as a `400`, and a connection the
+  gateway closed itself as a `444`.
+- `log_with_mirror` is cancellation-safe and at-most-once per sink: if the task
+  awaiting it is dropped while a sink's `log` is pending, the summary, context,
+  and the sinks that had not started move to detached terminal delivery, which
+  invokes each of them once and then records the runtime counters and mirrors.
+  The interrupted sink is never invoked again: it may already have persisted
+  or enqueued the record, and a dropped record is preferred over a duplicate.
+
+A buffered record is built before the response is handed to the transport and
+says so with `response_delivery: not_observed`; streamed, HTTP/3 post-send,
+client-abort, and gateway-close records carry `response_delivery: observed`
+(issue #6769).
 
 Potentially slow sinks should use an explicitly bounded, plugin-owned handoff.
 Own the queue, worker, cancellation state, and retry budget in the plugin;

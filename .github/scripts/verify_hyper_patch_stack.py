@@ -29,6 +29,7 @@ SERIES = (
     "003-greedy-h1-read/hyper-greedy-h1-read.patch",
     "004-h2-body-write-timeout/hyper-h2-body-write-timeout.patch",
     "005-h2-small-window-coalescing/hyper-h2-small-window-coalescing.patch",
+    "006-h2-stream-termination-origin/hyper-h2-stream-termination-origin.patch",
 )
 ROOT_FILES = {"Cargo.toml", "LICENSE", "README.md"}
 
@@ -44,7 +45,7 @@ def source_hash(path: Path) -> str:
 
 def validate_series(lines: list[str], available: set[str]) -> None:
     if tuple(lines) != SERIES or available != set(SERIES):
-        raise ValueError("Hyper patches must be exactly the complete ordered 001-005 series")
+        raise ValueError("Hyper patches must be exactly the complete ordered 001-006 series")
 
 
 def validate_member(member: tarfile.TarInfo) -> None:

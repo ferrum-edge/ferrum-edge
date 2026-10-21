@@ -384,6 +384,7 @@ impl SchemaSerializable for TransactionSummary {
                     Ok(())
                 }
             }
+            "response_delivery" => map.serialize_entry(out_key, &self.response_delivery),
             "bytes_sent" => {
                 if self.bytes_sent != 0 {
                     map.serialize_entry(out_key, &self.bytes_sent)

@@ -368,6 +368,23 @@ impl State {
         }
     }
 
+    // FERRUM PATCH 004: whether the reset or GOAWAY that closed this stream
+    // was local (sent by this endpoint: the library or the user) rather than
+    // received from the peer. `None` while the stream is open, after a clean
+    // close, and when an I/O error closed it.
+    pub fn reset_is_local(&self) -> Option<bool> {
+        match self.inner {
+            Closed(Cause::Error(ref e) | Cause::ErrorAfterEndStream(ref e)) => match *e {
+                Error::Reset(_, _, initiator) | Error::GoAway(_, _, initiator) => {
+                    Some(initiator != Initiator::Remote)
+                }
+                Error::Io(..) => None,
+            },
+            Closed(Cause::ScheduledLibraryReset(..)) => Some(true),
+            _ => None,
+        }
+    }
+
     pub fn is_remote_reset(&self) -> bool {
         matches!(
             self.inner,

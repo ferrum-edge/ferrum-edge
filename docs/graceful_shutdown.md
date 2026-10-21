@@ -15,7 +15,7 @@ Serving modes (database, file, cp, dp, mesh) run these phases **sequentially**, 
    - New requests/streams on existing connections are rejected (503 / gRPC `UNAVAILABLE`); H1/H2 WebSocket sessions end when drain starts
    - The gateway waits only until the shared deadline for all in-flight connections to complete
 6. **Connection tracking** — every accepted connection creates a `ConnectionGuard` (RAII) that increments an atomic counter on accept and decrements on drop. The drain waiter monitors this counter
-7. **Drain timeout** — if connections remain after the drain period, they are force-closed and the gateway proceeds with shutdown
+7. **Drain timeout** — if connections remain after the drain period, they are force-closed and the gateway proceeds with shutdown. Each HTTP/1.1 and HTTP/2 connection still serving a request closes when the drain wait ends, including one already settling an authorization-lifetime or client-trust close (or immediately, with `FERRUM_SHUTDOWN_DRAIN_SECONDS=0`), and the mode waits at most 250ms for those requests to release, so each one's terminal transaction record (`444`, rejection phase `gateway_close_shutdown`) reaches observability delivery before it closes in step 11. That bounded wait is spent only when requests outlived the drain and fits in the finalizer slack below (issue #6768)
 8. **Transport pool drain** — sidecar-ingress Unix backend pools release held file descriptors under a bounded tail (5s driver drain + 1s reap; see `src/proxy/unix_backend_pool.rs`)
 9. **Background task cleanup** — DNS refresh, config polling, overload monitor, health checks, and other background tasks get 5 seconds to clean up
 10. **Audit flush** (database and cp modes) — accepted audit events drain for `clamp(FERRUM_SHUTDOWN_DRAIN_SECONDS, 5, 60)` seconds while the database handle is still alive
@@ -76,7 +76,7 @@ With `FERRUM_SHUTDOWN_DRAIN_SECONDS=30` and the binary defaults above:
 | Background tasks | 5s |
 | Audit flush (database/cp) | 30s (`clamp(30, 5, 60)`) |
 | Observability delivery | 2s |
-| Recommended finalizer slack | 5s |
+| Recommended finalizer slack (also covers the ≤250ms force-close settle in step 7) | 5s |
 | **Total** | **78s** |
 
 ## Deployment Recommendations

@@ -609,6 +609,9 @@ fn build_hbone_relay_summary(
             .load(std::sync::atomic::Ordering::Acquire),
         metadata: crate::proxy::clone_log_metadata(ctx),
         proxy_lifecycle_generation: ctx.proxy_lifecycle_generation,
+        // Built after the relay ended: `body_completed` / `client_disconnected`
+        // describe what the tunnel transport observed (issue #6769).
+        response_delivery: crate::plugins::ResponseDelivery::Observed,
         ..TransactionSummary::default()
     }
 }
@@ -3317,6 +3320,34 @@ mod tests {
             Some("hbone")
         );
         assert_eq!(summary.request_user_agent.as_deref(), Some("hbone-client"));
+        // Issue #6769: built after the relay ended, so the delivery boundary is
+        // observed for an interrupted relay and a completed one alike.
+        assert_eq!(
+            summary.response_delivery,
+            crate::plugins::ResponseDelivery::Observed
+        );
+        let completed = build_hbone_relay_summary(
+            &proxy,
+            &ctx,
+            "CONNECT",
+            "tcp://backend.example:15008".to_string(),
+            None,
+            Instant::now(),
+            Instant::now(),
+            3.5,
+            0,
+            1,
+            1,
+            true,
+            false,
+            None,
+        );
+        assert!(completed.body_completed);
+        assert!(!completed.client_disconnected);
+        assert_eq!(
+            completed.response_delivery,
+            crate::plugins::ResponseDelivery::Observed
+        );
     }
 
     // Issue #5765: the datagram relay reports WHY it ended. These drive the
