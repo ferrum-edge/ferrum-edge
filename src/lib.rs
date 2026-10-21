@@ -8820,6 +8820,14 @@ pub mod _test_support {
         crate::proxy::clone_log_metadata(ctx)
     }
 
+    /// Run the production owned projection used after deferred terminal hooks.
+    /// Leaves only the public metadata map empty; typed request state remains.
+    pub fn take_terminal_log_metadata_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> HashMap<String, String> {
+        crate::proxy::take_terminal_log_metadata(ctx)
+    }
+
     /// The stamped `Content-Length` a LATER buffered body transform will read
     /// for this response.
     ///
