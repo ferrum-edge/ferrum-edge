@@ -13621,44 +13621,27 @@ def fips_build_generation_transition(
 #
 # `fuzz-smoke` is not in this table: it already has its own whole-text
 # generation list (`CI_FUZZ_SMOKE_JOB_GENERATIONS`). Overlapping destinations
-# that do not share a retired text — #3913 vs #3915 `ci-plan`/`test`, #3889 vs
-# #3913 `test-pkcs11-softhsm` — are omitted because chaining them here would
-# invent a merged text that does not exist. Those need a follow-up predecessor
-# once the first destination is the trusted base.
+# that do not share a retired text are never chained here, because chaining
+# them would invent a merged text that does not exist; each needs its own
+# predecessor once the first destination is the trusted base.
 #
 # RETIREMENT: once each destination is on `main`, delete that tuple. See
 # `docs/ci_cd.md` → "Admitted CI job SHA-256 generation transitions".
 CI_JOB_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
+    # Empty: no CI job generation transition is currently admitted.
+    #
     # PR #3913's `ci-plan` / `test` pairs are retired: its destination is on
     # `main`, so the admission is permanently unreachable.
-    # `performance-regression` on the trusted base → PR #3911 (issue #3906) head
-    # 5d342d8549ed3190a161a90ea53dc28ab80be5c7.
-    (
-        "performance-regression",
-        "74673023dee4c0970a8b8d3c9a99089be2f28eddf57ddb7337febdf22bd5a7e4",
-        "e7d9a4c0ea26a14efd92844998a42219ca2fb1379072776a313de6dd9b720986",
-    ),
-    # The three per-suite live gates on the trusted base → PR #3915
-    # (issue #3900) after merging latest `main` (branch
-    # grok/issue-3900-ebpf-gates, merged text d95ea4796): the union
-    # `run_ebpf_live` planner gate splits into per-suite fail-closed outputs
-    # (`run_ebpf_kernel_live` / `run_netns_capture_live` /
-    # `run_two_cluster_live`), moving each consumer job's `if:` and comments.
-    (
-        "ebpf-live",
-        "b7596b48641c850f797c84710dd5646013414d6ba01c30f4d4b2805737c8c26c",
-        "9aa3332bff5c4538f797f31133be0ef7dfc9767a72e7212b39be33ed58dcca87",
-    ),
-    (
-        "netns-capture-live",
-        "db543d5c35bfbd4a7b987a52635b359ea6268669257cd313146324f5ca79f598",
-        "b71296ba5929c78cd786301cc8ed677905cca82cd605be46880021b88c243e32",
-    ),
-    (
-        "two-cluster-mesh-live",
-        "0586ab0b5b8b803f2ee3663b608c40caca06f9c92e58d4cb28c2080d68f23f27",
-        "9c3d5b4dfbc6a209e801a47bceabd31fe8aa7df033d49989ad8f88a3e4ed73e7",
-    ),
+    #
+    # PR #3911's `performance-regression` pair (issue #3906) is retired: the
+    # job has moved out of `ci.yml` into `performance-regression.yml`, so
+    # neither end can match a `ci.yml` revision again.
+    #
+    # PR #3915's `ebpf-live` / `netns-capture-live` / `two-cluster-mesh-live`
+    # per-suite live-gate pairs (issue #3900) are retired: #3915 landed and
+    # later changes moved all three jobs on `main`, so neither end of any pair
+    # is a state `main` is in.
+    #
     # Issue #6573's four BoringCache-retirement pairs (`build-binaries`,
     # `ebpf-live`, `netns-capture-live`, `two-cluster-mesh-live`) are retired:
     # each pin-normalized destination is main's live job text, so the admission
@@ -13712,31 +13695,20 @@ WORKFLOW_DIRECTORY_JOB_GENERATION_TRANSITIONS: tuple[
 )
 
 # Local composite actions are compared by whole-file digest once Cross-sensitive.
-# BoringCache's retirement pair (issue #6573) is spent: its pre-rollout
-# destination is main's live `setup-rust-ci/action.yml`.
-# `setup-rust-ci/action.yml` carries a two-step chain from PR #3889's landed
-# file: first the cache-budget generation (this change) that gates rust-cache
-# `save-if` to a trusted `refs/heads/main` run so pull requests and merge
-# groups restore without saving, then that generation may move to exactly one
-# combined destination: PR #3911 rebased onto it, preserving every cache-safety
-# change plus #3911's optional `workspaces` input/pass-through. Each step is
-# exact, path-bound, one-way, fail-closed. The candidate cannot supply a
-# digest. The former direct #3889→#3911 pair is superseded by this chain and
-# #3911 must rebase to the combined destination text. The Helm Chart
-# setup-kubernetes-tools generation lives in `verify_trusted_local_action.py`,
-# not here: that gate is byte-identity of the extracted checker, not a Cross
-# surface comparison.
+# A future entry admits one exact, path-bound, one-way retired→adopted pair;
+# the candidate cannot supply a digest. RETIREMENT: once each destination is on
+# `main`, delete that tuple. The Helm Chart setup-kubernetes-tools generation
+# lives in `verify_trusted_local_action.py`, not here: that gate is
+# byte-identity of the extracted checker, not a Cross surface comparison.
 LOCAL_ACTION_GENERATION_TRANSITIONS: tuple[tuple[str, str, str], ...] = (
-    (
-        "setup-rust-ci/action.yml",
-        "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
-        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
-    ),
-    (
-        "setup-rust-ci/action.yml",
-        "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
-        "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
-    ),
+    # Empty: no local-action generation transition is currently admitted.
+    #
+    # The `setup-rust-ci/action.yml` chain from PR #3889's landed file (to the
+    # cache-budget generation, then to PR #3911's rebased destination) is
+    # retired: the file has since moved past both destinations on `main`, so
+    # neither end of either step is a state `main` is in. Issue #6573's
+    # BoringCache-retirement pair is retired too: its pre-rollout destination
+    # is main's live file.
 )
 
 
@@ -21364,21 +21336,10 @@ pre_build = []
                 f"local-action generation {action_name!r} does not pin SHA-256 "
                 "digests"
             )
-    if LOCAL_ACTION_GENERATION_TRANSITIONS != (
-        (
-            "setup-rust-ci/action.yml",
-            "fc4e41818dffdea880c057c8dfa0881a629cd01c917b43f69a9f2e5e9bd90dda",
-            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
-        ),
-        (
-            "setup-rust-ci/action.yml",
-            "b6ca6315ff9f2a206c1011b6b0166de3a340370fd75bf3e9cffe41e872008924",
-            "219187bdb0366d929577e67f48947b8c1096998dd7e04eafdffdb53dc3faa925",
-        ),
-    ):
+    if LOCAL_ACTION_GENERATION_TRANSITIONS != ():
         failures.append(
-            "the setup-rust-ci generation table does not pin the cache-budget "
-            "generation chain and rebased #3911 destination"
+            "the local-action generation table admits a transition; every "
+            "setup-rust-ci pair is spent and retired"
         )
 
     remote_action_composite = (
