@@ -35057,10 +35057,13 @@ async fn handle_proxy_request_inner(
     // many additions; converted to f64 milliseconds once when building the summary.
     let mut plugin_execution_ns: u64 = 0;
 
-    // Execute on_request_received hooks (skip iteration when no plugins configured)
-    if !plugins.is_empty() {
+    // This sublist belongs to the same request snapshot as `plugins`. Only
+    // audited ready-Continue trait defaults are absent; retained hooks keep the
+    // existing deadline wrapper and rejection path.
+    let on_request_received_plugins = plugin_cache_view.on_request_received_plugins();
+    if !on_request_received_plugins.is_empty() {
         let phase_start = Instant::now();
-        for plugin in plugins.iter() {
+        for plugin in on_request_received_plugins {
             let deadline = ctx.grpc_deadline_at();
             match crate::plugins::await_request_plugin_deadline_with_provenance(
                 deadline,
@@ -35970,7 +35973,7 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut cloned = ctx.headers.clone();
         match run_before_proxy_hooks_for_backend_path_policy(
-            &plugins,
+            plugin_cache_view.before_proxy_plugins(),
             &mut ctx,
             &mut cloned,
             backend_path_is_policy_bound,
@@ -36033,7 +36036,7 @@ async fn handle_proxy_request_inner(
         let phase_start = Instant::now();
         let mut tmp_headers = std::mem::take(&mut ctx.headers);
         match run_before_proxy_hooks_for_backend_path_policy(
-            &plugins,
+            plugin_cache_view.before_proxy_plugins(),
             &mut ctx,
             &mut tmp_headers,
             backend_path_is_policy_bound,
@@ -36416,7 +36419,7 @@ async fn handle_proxy_request_inner(
         deferred_result = match owned_proxy_headers.as_mut() {
             Some(headers) => {
                 run_before_proxy_hooks_for_backend_path_policy(
-                    &plugins,
+                    plugin_cache_view.before_proxy_plugins(),
                     &mut ctx,
                     headers,
                     true,
@@ -36427,7 +36430,7 @@ async fn handle_proxy_request_inner(
             None => {
                 let mut headers = std::mem::take(&mut ctx.headers);
                 let result = run_before_proxy_hooks_for_backend_path_policy(
-                    &plugins,
+                    plugin_cache_view.before_proxy_plugins(),
                     &mut ctx,
                     &mut headers,
                     true,
@@ -36475,7 +36478,7 @@ async fn handle_proxy_request_inner(
             deferred_result = match owned_proxy_headers.as_mut() {
                 Some(headers) => {
                     run_before_proxy_hooks_for_backend_path_policy(
-                        &plugins,
+                        plugin_cache_view.before_proxy_plugins(),
                         &mut ctx,
                         headers,
                         true,
@@ -36486,7 +36489,7 @@ async fn handle_proxy_request_inner(
                 None => {
                     let mut headers = std::mem::take(&mut ctx.headers);
                     let result = run_before_proxy_hooks_for_backend_path_policy(
-                        &plugins,
+                        plugin_cache_view.before_proxy_plugins(),
                         &mut ctx,
                         &mut headers,
                         true,

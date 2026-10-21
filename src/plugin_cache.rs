@@ -5101,6 +5101,9 @@ pub struct PluginPhaseData {
     /// `enforced_request_body_limit`; buffered collection aborts here instead of
     /// at the generally larger global allowance.
     pub enforced_response_body_limit: Option<u64>,
+    /// Audited request-hook sublists, retaining configured order and instances.
+    pub on_request_received_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    pub before_proxy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// gRPC deadline-policy plugins only, in configured priority order.
     pub grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     /// Auth plugins only (pre-filtered from the protocol plugin list).
@@ -5185,9 +5188,82 @@ pub struct PluginPhaseData {
     pub response_presentation_policy_digest: Option<[u8; 32]>,
 }
 
+/// The two request hooks audited for default-future elision. This inventory is
+/// deliberately closed over concrete built-in types, never plugin names or
+/// third-party declarations. Unknown/custom plugins keep both hooks.
+#[derive(Clone, Copy)]
+struct RequestHookMask(u8);
+
+impl RequestHookMask {
+    const NONE: Self = Self(0);
+    const RECEIVED: Self = Self(1);
+    const BEFORE_PROXY: Self = Self(2);
+    const ALL: Self = Self(3);
+
+    fn contains(self, hook: Self) -> bool {
+        self.0 & hook.0 != 0
+    }
+}
+
+/// Cold-path audit: omitted hooks must be the trait's ready `Continue` default.
+/// `plugin_request_hook_plan_tests` pins this inventory to the implementations
+/// so adding an override cannot silently suppress new behavior.
+fn audited_request_hook_mask(plugin: &(dyn Plugin + 'static)) -> RequestHookMask {
+    let any: &dyn std::any::Any = plugin;
+    if let Some(wrapper) = any.downcast_ref::<PluginInstanceWrapper>() {
+        // Even a default inner hook establishes a trigger's memoized decision.
+        // Priority-only wrappers add no request behavior and can forward the audit.
+        return if wrapper.trigger.is_some() {
+            RequestHookMask::ALL
+        } else {
+            audited_request_hook_mask(wrapper.inner.as_ref())
+        };
+    }
+    let audited = [
+        (
+            std::any::TypeId::of::<crate::plugins::mesh::spiffe_identity::SpiffeIdentity>(),
+            RequestHookMask::RECEIVED,
+        ),
+        (
+            std::any::TypeId::of::<crate::plugins::mesh::authz::MeshAuthz>(),
+            RequestHookMask::NONE,
+        ),
+        (
+            std::any::TypeId::of::<crate::plugins::mesh::outbound_registry::OutboundRegistry>(),
+            RequestHookMask::RECEIVED,
+        ),
+        (
+            std::any::TypeId::of::<crate::plugins::mesh::bpf_metrics::MeshBpfMetrics>(),
+            RequestHookMask::NONE,
+        ),
+        (
+            std::any::TypeId::of::<crate::plugins::mesh_route_dispatch::MeshRouteDispatch>(),
+            RequestHookMask::BEFORE_PROXY,
+        ),
+        (
+            std::any::TypeId::of::<MeshRouteDispatchFinalizer>(),
+            RequestHookMask::BEFORE_PROXY,
+        ),
+        (
+            std::any::TypeId::of::<crate::plugins::prometheus_metrics::PrometheusMetrics>(),
+            RequestHookMask::RECEIVED,
+        ),
+        (
+            std::any::TypeId::of::<crate::plugins::stdout_logging::StdoutLogging>(),
+            RequestHookMask::NONE,
+        ),
+    ];
+    audited
+        .into_iter()
+        .find_map(|(kind, mask)| (any.type_id() == kind).then_some(mask))
+        .unwrap_or(RequestHookMask::ALL)
+}
+
 /// Build `PluginPhaseData` from a protocol-filtered plugin list.
 fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut caps = 0u32;
+    let mut on_request_received = Vec::new();
+    let mut before_proxy = Vec::new();
     let mut auth = Vec::new();
     let mut grpc_deadline = Vec::new();
     let mut authorize = Vec::new();
@@ -5212,6 +5288,13 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut enforced_request_body_limit: Option<u64> = None;
     let mut enforced_response_body_limit: Option<u64> = None;
     for p in plugins {
+        let request_hooks = audited_request_hook_mask(p.as_ref());
+        if request_hooks.contains(RequestHookMask::RECEIVED) {
+            on_request_received.push(Arc::clone(p));
+        }
+        if request_hooks.contains(RequestHookMask::BEFORE_PROXY) {
+            before_proxy.push(Arc::clone(p));
+        }
         match p.response_presentation_policy() {
             Some(ResponsePresentationPolicy::Static(digest)) => {
                 presentation_policy_contributions.push((p.name(), digest));
@@ -5360,6 +5443,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
         }
     }
     PluginPhaseData {
+        on_request_received_plugins: Arc::new(on_request_received),
+        before_proxy_plugins: Arc::new(before_proxy),
         enforced_request_body_limit,
         enforced_response_body_limit,
         grpc_deadline_plugins: Arc::new(grpc_deadline),
@@ -6462,6 +6547,8 @@ impl PluginCacheInner {
             .then(|| Arc::clone(&entry.phase.backend_path_plugins));
         PluginCacheRequestView {
             plugins: Arc::clone(&entry.plugins),
+            on_request_received_plugins: Arc::clone(&entry.phase.on_request_received_plugins),
+            before_proxy_plugins: Arc::clone(&entry.phase.before_proxy_plugins),
             grpc_deadline_plugins: Arc::clone(&entry.phase.grpc_deadline_plugins),
             auth_plugins: Arc::clone(&entry.phase.auth_plugins),
             authorize_plugins: Arc::clone(&entry.phase.authorize_plugins),
@@ -6499,6 +6586,8 @@ impl PluginCacheInner {
     fn empty_request_view(&self, proxy_key: &str) -> PluginCacheRequestView {
         PluginCacheRequestView {
             plugins: Arc::new(Vec::new()),
+            on_request_received_plugins: Arc::new(Vec::new()),
+            before_proxy_plugins: Arc::new(Vec::new()),
             grpc_deadline_plugins: Arc::new(Vec::new()),
             auth_plugins: Arc::new(Vec::new()),
             authorize_plugins: Arc::new(Vec::new()),
@@ -6550,6 +6639,8 @@ impl PluginCacheInner {
 #[derive(Clone)]
 pub struct PluginCacheRequestView {
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    on_request_received_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    before_proxy_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     grpc_deadline_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     auth_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     authorize_plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -6609,6 +6700,18 @@ impl PluginCacheRequestView {
     /// Get pre-resolved protocol-filtered plugins from this request view.
     pub fn plugins(&self) -> Arc<Vec<Arc<dyn Plugin>>> {
         Arc::clone(&self.plugins)
+    }
+
+    /// Request-received hooks from this same cache generation. Only audited
+    /// built-in trait defaults are omitted; triggered/custom instances remain.
+    pub fn on_request_received_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.on_request_received_plugins.as_slice()
+    }
+
+    /// Before-proxy hooks in configured order, including every routing
+    /// finalizer and every triggered/custom instance.
+    pub fn before_proxy_plugins(&self) -> &[Arc<dyn Plugin>] {
+        self.before_proxy_plugins.as_slice()
     }
 
     /// Get the pre-filtered synchronous gRPC deadline-policy chain.
