@@ -102,7 +102,7 @@ class Contracts(unittest.TestCase):
         record = {
             "mesh": "ferrum", "gateway": "ferrum", "protocol": "http1",
             "payload_size": payload, "duration_secs": 10, "concurrency": concurrency,
-            "rps": 2, "total_errors": 0,
+            "rps": 2, "total_errors": 0, "warmup_errors": 0,
         }
         record.update(overrides)
         file.write_text(json.dumps(record))
@@ -128,6 +128,21 @@ class Contracts(unittest.TestCase):
                 collected = summary.collect(root)
                 self.assertEqual(collected["meshes"]["ferrum"]["1024"]["publishable_runs"], 1)
                 self.assertTrue(any("unpublishable cell" in warning for warning in collected["warnings"]))
+                self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+    def test_campaign_rejects_warmup_errors_or_missing_evidence(self):
+        for warmup_errors in (1, -1, None, "0", False):
+            with self.subTest(warmup_errors=warmup_errors), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_campaign(root)
+                self.write_campaign_cell(root)
+                file = self.write_campaign_cell(root, repetition=2, warmup_errors=warmup_errors)
+                if warmup_errors is None:
+                    record = json.loads(file.read_text())
+                    del record["warmup_errors"]
+                    file.write_text(json.dumps(record))
+                collected = summary.collect(root)
+                self.assertEqual(collected["meshes"]["ferrum"]["1024"]["publishable_runs"], 1)
                 self.assertNotEqual(summary.check_acceptance(collected), 0)
 
     def test_campaign_accepts_bulk_concurrency_at_both_thresholds_and_clamps_to_one(self):
