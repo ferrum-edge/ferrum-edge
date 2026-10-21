@@ -11,6 +11,7 @@ import argparse
 import copy
 import ipaddress
 import importlib.util
+import http.client
 import json
 import math
 import re
@@ -18,6 +19,8 @@ import selectors
 import socket
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 SOURCE = "spiffe://cluster.local/ns/ferrum/sa/client"
@@ -323,6 +326,175 @@ def verify_ferrum(directory: Path) -> dict:
             "note": "All raw probes/snapshots retained. Transport/auth acceptance does not qualify workload telemetry or full feature parity; counters include fixture probes."}
 
 
+METRICS_BODY_LIMIT = 4 * 1024 * 1024
+SETTLING_SECONDS = 6.5
+SETTLING_ATTEMPTS = 15
+SETTLING_INTERVAL = 0.5
+RESTORE_COUNTER_ERROR = "mtls success counters must be monotonic with restored-minus-denied >= 1"
+METRICS_URL = "http://127.0.0.1:15120/metrics"
+
+
+class MetricsReadFailure(ValueError):
+    def __init__(self, reason, body=b""):
+        super().__init__(reason)
+        self.reason, self.body = reason, body[:METRICS_BODY_LIMIT]
+
+
+def fetch_source_metrics(timeout):
+    """Only the existing loopback admin endpoint; no proxy or redirect handling."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    deadline = time.monotonic() + timeout
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    body = bytearray()
+    try:
+        try:
+            response = opener.open(METRICS_URL, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            response = response.fp if isinstance(response, urllib.error.HTTPError) else response
+            status = response.status
+            expected_length = response.length
+            # This fixed HTTP URL uses HTTPResponse -> BufferedReader -> SocketIO.
+            # Reset its socket timeout before each bounded read so a trickled body
+            # cannot restart a full timeout indefinitely.
+            sock = response.fp.raw._sock
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MetricsReadFailure("metrics read deadline", bytes(body))
+                sock.settimeout(min(0.5, remaining))
+                chunk = response.read1(min(65536, METRICS_BODY_LIMIT + 1 - len(body)))
+                if not chunk:
+                    if expected_length is not None and len(body) != expected_length:
+                        raise MetricsReadFailure("truncated metrics response", bytes(body))
+                    if status != 200:
+                        raise MetricsReadFailure("non-200 metrics response: " + str(status), bytes(body))
+                    return bytes(body)
+                body.extend(chunk)
+                if len(body) > METRICS_BODY_LIMIT:
+                    raise MetricsReadFailure("metrics body exceeds 4 MiB", bytes(body))
+                if expected_length is not None and len(body) == expected_length:
+                    if status != 200:
+                        raise MetricsReadFailure("non-200 metrics response: " + str(status), bytes(body))
+                    return bytes(body)
+    except MetricsReadFailure:
+        raise
+    except (OSError, ValueError, AttributeError, http.client.HTTPException, urllib.error.URLError) as error:
+        # Exception displays can include remote data; retain only the class.
+        raise MetricsReadFailure("metrics read failed: " + type(error).__name__, bytes(body)) from None
+
+
+def strict_mtls_success(body):
+    values = []
+    for line in body.decode("utf-8").splitlines():
+        if not line.startswith("ferrum_mesh_tcp_egress_connections_total"):
+            continue
+        match = SAMPLE.fullmatch(line)
+        if not match or match[1] != "ferrum_mesh_tcp_egress_connections_total":
+            raise ValueError("malformed TCP egress counter")
+        raw_labels = match[2] or ""
+        fields = list(LABEL.finditer(raw_labels))
+        if not re.fullmatch(LABEL.pattern + "(?:," + LABEL.pattern + ")*", raw_labels):
+            raise ValueError("malformed TCP egress counter labels")
+        labels = {field[1]: json.loads('"' + field[2] + '"') for field in fields}
+        if len(labels) != len(fields) or not re.fullmatch(r"[0-9]+", match[3]):
+            raise ValueError("invalid TCP egress counter labels/value")
+        if labels.get("transport") == "mtls" and labels.get("result") == "success":
+            values.append(int(match[3]))
+    if len(values) != 1:
+        raise ValueError("expected exactly one successful mtls TCP egress counter")
+    return values[0]
+
+
+def settle_ferrum_counter(directory, *, fetch=fetch_source_metrics, clock=time.monotonic, wait=time.sleep):
+    """Wait for existing relay/cached exposition only; never retry application traffic."""
+    started = clock()
+    evidence = directory / "l4-counter-settling"
+    evidence.mkdir()  # Refuse to overwrite a previous attempt's evidence.
+    receipt = {"accepted": False, "errors": [], "attempts": [], "begin_monotonic": started,
+               "deadline_monotonic": started + SETTLING_SECONDS, "max_attempts": SETTLING_ATTEMPTS,
+               "interval_seconds": SETTLING_INTERVAL, "body_limit_bytes": METRICS_BODY_LIMIT,
+               "url": METRICS_URL, "environment_proxies": False,
+               "pinned_source_defaults": {"render_cache_ttl_seconds": 5, "invalidation_min_age_ms": 500},
+               "mechanism_sources": [
+                   "https://github.com/ferrum-edge/ferrum-edge/blob/4a7be250e45a367314e3dec872ecbd512220558e/src/proxy/mesh_tcp_egress.rs#L403-L430",
+                   "https://github.com/ferrum-edge/ferrum-edge/blob/4a7be250e45a367314e3dec872ecbd512220558e/src/plugins/prometheus_metrics.rs#L736-L740",
+                   "https://github.com/ferrum-edge/ferrum-edge/blob/4a7be250e45a367314e3dec872ecbd512220558e/src/plugins/prometheus_metrics.rs#L2003-L2017",
+                   "https://github.com/ferrum-edge/ferrum-edge/blob/4a7be250e45a367314e3dec872ecbd512220558e/src/plugins/prometheus_metrics.rs#L2719-L2735",
+                   "https://github.com/ferrum-edge/ferrum-edge/blob/4a7be250e45a367314e3dec872ecbd512220558e/src/plugins/prometheus_metrics.rs#L3054-L3070"],
+               "scope": "No new application traffic or forced cache invalidation; EOF/publication ordering and cached exposition are plausible mechanisms, not proven causes. Relay failures log WARN and fixture logs ERROR."}
+    try:
+        for role in ("source", "destination"):
+            with (directory / f"l4-restored/{role}.metrics").open("rb") as stream:
+                body = stream.read(METRICS_BODY_LIMIT + 1)
+            if len(body) > METRICS_BODY_LIMIT:
+                raise ValueError("initial metrics body exceeds 4 MiB")
+            (evidence / f"initial-{role}.metrics").write_bytes(body)
+        initial = verify_ferrum(directory)
+        receipt["initial_proof_errors"] = initial["errors"]
+        current = strict_mtls_success((evidence / "initial-source.metrics").read_bytes())
+        receipt["initial_counter"] = current
+        baseline = initial["mtls_success_counts"].get("denied")
+        receipt["denied_counter"] = baseline
+        if initial["accepted"]:
+            receipt.update(accepted=True, selected_snapshot="initial-source.metrics")
+        elif (initial["errors"] != [RESTORE_COUNTER_ERROR]
+              or initial["restored_minus_denied_mtls_successes"] != 0
+              or not 0 < initial["mtls_success_counts"].get("allowed", 0) <= baseline):
+            raise ValueError("unrelated or regressing initial transport/auth proof")
+        else:
+            for number in range(1, SETTLING_ATTEMPTS + 1):
+                remaining = receipt["deadline_monotonic"] - clock()
+                if remaining <= 0:
+                    break
+                attempt = {"attempt": number, "begin_monotonic": clock(),
+                           "timeout_seconds": min(0.5, remaining), "counter": None,
+                           "raw_path": f"poll-{number:02d}.metrics", "error": None}
+                receipt["attempts"].append(attempt)
+                body = b""
+                try:
+                    body = fetch(attempt["timeout_seconds"])
+                    if not isinstance(body, bytes) or len(body) > METRICS_BODY_LIMIT:
+                        raise MetricsReadFailure("invalid or oversized metrics body", body if isinstance(body, bytes) else b"")
+                    attempt["counter"] = strict_mtls_success(body)
+                except (OSError, ValueError) as error:
+                    body = getattr(error, "body", body)
+                    attempt["error"] = error.reason if isinstance(error, MetricsReadFailure) else type(error).__name__
+                finally:
+                    (evidence / attempt["raw_path"]).write_bytes(body[:METRICS_BODY_LIMIT])
+                    attempt["end_monotonic"] = clock()
+                if attempt["error"]:
+                    raise ValueError("metrics poll failed: " + attempt["error"])
+                if clock() > receipt["deadline_monotonic"]:
+                    raise ValueError("counter publication deadline exceeded")
+                if attempt["counter"] < current:
+                    raise ValueError("successful mtls TCP egress counter regressed")
+                current = attempt["counter"]
+                if current >= baseline + 1:
+                    # Initial and every polled response remain immutable above.
+                    (directory / "l4-restored/source.metrics").write_bytes(body)
+                    final = verify_ferrum(directory)
+                    if not final["accepted"]:
+                        raise ValueError("final transport/auth proof rejected")
+                    receipt.update(accepted=True, selected_snapshot=attempt["raw_path"], final_counter=current)
+                    break
+                remaining = receipt["deadline_monotonic"] - clock()
+                if remaining > 0 and number < SETTLING_ATTEMPTS:
+                    wait(min(SETTLING_INTERVAL, remaining))
+            if not receipt["accepted"]:
+                raise ValueError("counter publication deadline/attempt bound exhausted")
+    except (OSError, ValueError, TypeError) as error:
+        # Only local fixed validation messages or exception classes enter receipts.
+        receipt["errors"].append(str(error) if type(error) is ValueError else type(error).__name__)
+    receipt["end_monotonic"] = clock()
+    write_json(evidence / "receipt.json", receipt)
+    return receipt
+
+
 def public_config(value):
     # Only listener resources are requested, never SecretsConfigDump. Redact
     # inline TLS credentials as well, in case an xDS producer embeds them.
@@ -425,6 +597,8 @@ def main() -> int:
     binary.add_argument("--timeout", type=float, default=2)
     verify = sub.add_parser("verify-ferrum")
     verify.add_argument("directory", type=Path)
+    settling = sub.add_parser("settle-ferrum-counter")
+    settling.add_argument("directory", type=Path)
     sub.add_parser("public-config")
     consul = sub.add_parser("verify-consul")
     consul.add_argument("directory", type=Path)
@@ -434,6 +608,10 @@ def main() -> int:
         render(args.directory, args.endpoint, args.vip, args.backend_port, args.raw_port)
     elif args.command == "bootstrap":
         adapt_bootstrap(args.path, args.agent_address)
+    elif args.command == "settle-ferrum-counter":
+        result = settle_ferrum_counter(args.directory)
+        print(json.dumps(result, indent=2, allow_nan=False))
+        return 0 if result["accepted"] else 1
     elif args.command == "public-config":
         print(json.dumps(public_config(json.load(sys.stdin)), indent=2, allow_nan=False))
     elif args.command == "echo":

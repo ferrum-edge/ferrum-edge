@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 DIRECTORY = Path(__file__).resolve().parents[1]
 ROOT = DIRECTORY.parents[2]
@@ -145,6 +146,181 @@ class CapturedL4Fixture(unittest.TestCase):
                 self.assertFalse(result["accepted"])
                 self.assertFalse(result["transport_auth_qualified"])
                 self.assertFalse(result["workload_telemetry_qualified"])
+
+    def counter_body(self, count):
+        return f'ferrum_mesh_tcp_egress_connections_total{{transport="mtls",result="success"}} {count}\n'.encode()
+
+    def settling_evidence(self, directory):
+        self.ferrum_evidence(directory)
+        (directory / "l4-restored/source.metrics").write_bytes(self.counter_body(2))
+
+    class Clock:
+        def __init__(self):
+            self.now, self.waits = 100.0, []
+
+        def __call__(self):
+            return self.now
+
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            self.now += seconds
+
+    def test_counter_already_published_preserves_initial_snapshots_without_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.ferrum_evidence(directory)
+            clock = self.Clock()
+            def forbidden(_):
+                self.fail("already-published counter must not fetch")
+            result = fixture.settle_ferrum_counter(directory, fetch=forbidden, clock=clock, wait=clock.wait)
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["attempts"], [])
+            self.assertEqual(clock.waits, [])
+            saved = directory / "l4-counter-settling"
+            for role in ("source", "destination"):
+                self.assertEqual((saved / f"initial-{role}.metrics").read_bytes(),
+                                 (directory / f"l4-restored/{role}.metrics").read_bytes())
+            self.assertEqual(json.loads((saved / "receipt.json").read_text()), result)
+
+    def test_counter_cached_until_5_5_seconds_keeps_all_raw_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.settling_evidence(directory)
+            clock, calls = self.Clock(), []
+            def fetch(timeout):
+                calls.append((clock(), timeout))
+                return self.counter_body(3 if clock() >= 105.5 else 2)
+            result = fixture.settle_ferrum_counter(directory, fetch=fetch, clock=clock, wait=clock.wait)
+            self.assertTrue(result["accepted"], result)
+            self.assertEqual(result["end_monotonic"] - result["begin_monotonic"], 5.5)
+            self.assertEqual(len(result["attempts"]), 12)
+            self.assertEqual(result["pinned_source_defaults"]["render_cache_ttl_seconds"], 5)
+            self.assertTrue(all(0 < timeout <= 0.5 for _, timeout in calls))
+            self.assertTrue(all(seconds == 0.5 for seconds in clock.waits))
+            saved = directory / "l4-counter-settling"
+            self.assertEqual((saved / "initial-source.metrics").read_bytes(), self.counter_body(2))
+            for attempt in result["attempts"]:
+                self.assertEqual((saved / attempt["raw_path"]).read_bytes(), self.counter_body(attempt["counter"]))
+                self.assertLessEqual(attempt["begin_monotonic"], attempt["end_monotonic"])
+            self.assertEqual((directory / "l4-restored/source.metrics").read_bytes(), self.counter_body(3))
+            self.assertTrue(fixture.verify_ferrum(directory)["accepted"])
+            with self.assertRaises(FileExistsError):
+                fixture.settle_ferrum_counter(directory, fetch=fetch, clock=clock, wait=clock.wait)
+
+    def test_counter_never_progresses_fails_within_wall_and_attempt_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.settling_evidence(directory)
+            clock = self.Clock()
+            result = fixture.settle_ferrum_counter(directory, fetch=lambda _: self.counter_body(2), clock=clock, wait=clock.wait)
+            self.assertFalse(result["accepted"])
+            self.assertLessEqual(len(result["attempts"]), 15)
+            self.assertEqual(clock() - 100, 6.5)
+            self.assertIn("bound exhausted", result["errors"][0])
+            self.assertEqual((directory / "l4-restored/source.metrics").read_bytes(), self.counter_body(2))
+
+    def test_counter_regression_malformed_read_error_and_body_limit_fail_closed(self):
+        cases = (self.counter_body(1), self.counter_body("NaN"), self.counter_body(3) * 2,
+                 self.counter_body("3.5"), self.counter_body(2).replace(b'transport="mtls"', b'transport="hbone"'),
+                 self.counter_body(3) + b"x" * fixture.METRICS_BODY_LIMIT, OSError("DO NOT DISPLAY remote body"))
+        for body in cases:
+            with self.subTest(case=type(body).__name__), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.settling_evidence(directory)
+                clock, calls = self.Clock(), []
+                def fetch(timeout):
+                    calls.append(timeout)
+                    if isinstance(body, Exception):
+                        raise body
+                    return body
+                result = fixture.settle_ferrum_counter(directory, fetch=fetch, clock=clock, wait=clock.wait)
+                self.assertFalse(result["accepted"])
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(clock.waits, [])
+                self.assertNotIn("DO NOT DISPLAY", json.dumps(result))
+                raw = directory / "l4-counter-settling/poll-01.metrics"
+                self.assertLessEqual(raw.stat().st_size, 4 * 1024 * 1024)
+                self.assertEqual((directory / "l4-restored/source.metrics").read_bytes(), self.counter_body(2))
+
+    def test_counter_unrelated_auth_or_binary_fault_never_polls(self):
+        for filename in ("auth_probes.log", "l4-restored.jsonl"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                self.settling_evidence(directory)
+                (directory / filename).write_text("")
+                clock = self.Clock()
+                def forbidden(_):
+                    self.fail("unrelated proof fault must not fetch")
+                result = fixture.settle_ferrum_counter(directory, fetch=forbidden, clock=clock, wait=clock.wait)
+                self.assertFalse(result["accepted"])
+                self.assertEqual(result["attempts"], [])
+                self.assertEqual(clock.waits, [])
+
+    def test_counter_fetch_cannot_qualify_a_response_after_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.settling_evidence(directory)
+            clock = self.Clock()
+            def late(_):
+                clock.now += 6.6
+                return self.counter_body(3)
+            result = fixture.settle_ferrum_counter(directory, fetch=late, clock=clock, wait=clock.wait)
+            self.assertFalse(result["accepted"])
+            self.assertIn("deadline exceeded", result["errors"][0])
+            self.assertEqual((directory / "l4-counter-settling/poll-01.metrics").read_bytes(), self.counter_body(3))
+            self.assertEqual((directory / "l4-restored/source.metrics").read_bytes(), self.counter_body(2))
+
+    def test_fixed_loopback_fetch_disables_proxies_and_reads_completed_body_once(self):
+        response = mock.MagicMock()
+        body = self.counter_body(3)
+        response.status, response.length = 200, len(body)
+        response.read1.side_effect = [body]
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(fixture.urllib.request, "build_opener", return_value=opener) as build, mock.patch.object(fixture.time, "monotonic", return_value=100):
+            self.assertEqual(fixture.fetch_source_metrics(0.5), body)
+        self.assertEqual(build.call_args.args[0].proxies, {})
+        self.assertIsNone(build.call_args.args[1].redirect_request(None, None, None, None, None, None))
+        opener.open.assert_called_once_with("http://127.0.0.1:15120/metrics", timeout=0.5)
+        response.fp.raw._sock.settimeout.assert_called_once_with(0.5)
+        response.read1.assert_called_once()
+
+    def test_fixed_loopback_fetch_retains_partial_read_failure_without_exception_display(self):
+        response = mock.MagicMock()
+        response.status, response.length = 200, None
+        response.read1.side_effect = [b"partial metrics", TimeoutError("SECRET REMOTE DATA")]
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(fixture.urllib.request, "build_opener", return_value=opener), mock.patch.object(fixture.time, "monotonic", return_value=100):
+            with self.assertRaises(fixture.MetricsReadFailure) as error:
+                fixture.fetch_source_metrics(0.5)
+        self.assertEqual(error.exception.body, b"partial metrics")
+        self.assertNotIn("SECRET", str(error.exception))
+
+    def test_counter_attempt_cap_holds_even_if_injected_wait_does_not_advance_clock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            self.settling_evidence(directory)
+            clock = self.Clock()
+            result = fixture.settle_ferrum_counter(directory, fetch=lambda _: self.counter_body(2), clock=clock, wait=lambda _: None)
+            self.assertFalse(result["accepted"])
+            self.assertEqual(len(result["attempts"]), 15)
+
+    def test_settling_shell_only_polls_fixed_loopback_after_restored_snapshot(self):
+        body = re.search(r'(?ms)^mesh_l4_prove\(\) \{.*?^\}', shell).group()
+        probe = body.index('mesh_l4_wait_binary 0 restored')
+        snapshot = body.index('mesh_l4_snapshot restored', probe)
+        settling = body.index('mesh_l4_ns python3 "$SCRIPT_DIR/mesh_l4_fixture.py" settle-ferrum-counter', snapshot)
+        verify = body.index('verify-ferrum "$OUTPUT_DIR/logs"', settling)
+        self.assertLess(snapshot, settling)
+        self.assertLess(settling, verify)
+        self.assertNotIn('mesh_l4_probe', body[snapshot:settling])
+        source = (DIRECTORY / "mesh_l4_fixture.py").read_text()
+        helper = source[source.index('def settle_ferrum_counter('):source.index('def public_config(')]
+        self.assertNotIn('probe(', helper)
+        self.assertNotIn('socket.', helper)
+        self.assertIn('urllib.request.ProxyHandler({})', source)
+        self.assertEqual(fixture.METRICS_URL, "http://127.0.0.1:15120/metrics")
 
     def consul_evidence(self, directory):
         topology = directory / "topology.json"

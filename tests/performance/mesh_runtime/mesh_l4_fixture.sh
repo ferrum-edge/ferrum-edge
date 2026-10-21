@@ -227,6 +227,12 @@ mesh_l4_prove() {
     mesh_l4_wait_binary 0 restored || return 1
     mesh_l4_snapshot restored || return 1
     if [ "$MESH" = ferrumtcp ]; then
+        # No new binary/load requests: preserve the immediate snapshot and
+        # observe only source loopback metrics through the same owned netns.
+        # The helper has a 6.5s wall budget; mesh_l4_ns/readiness_command retain
+        # the existing 8s invocation and shared readiness deadline bounds.
+        mesh_l4_ns python3 "$SCRIPT_DIR/mesh_l4_fixture.py" settle-ferrum-counter "$OUTPUT_DIR/logs" \
+            > "$OUTPUT_DIR/logs/l4-counter-settling.json" || return 1
         python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-ferrum "$OUTPUT_DIR/logs" > "$OUTPUT_DIR/logs/l4-transport-proof.json" || return 1
     else
         python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-consul "$OUTPUT_DIR/logs/l4-restored" \
