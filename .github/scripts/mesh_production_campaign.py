@@ -59,7 +59,7 @@ def provenance():
         "fixed_load_rates": {"1024": 2000, "1048576": 200},
         "fixed_boundary_loss_gate": {"max_missed": 2, "all_missed_due_in_final_nanoseconds": 1000000,
             "requires_exact_missed_ordinal_and_count_accounting": True,
-            "note": "qualified timer-boundary loss, not proof of its cause; preserve every miss and successful-cohort latency"},
+            "note": "bounded end-window admission loss, not proof of timer-only cause or zero overload; preserve every miss and successful-cohort latency"},
         "limits": ["one shared runner, backend/loadgen/proxies share CPU", "static Envoy is not full Istio and policy/telemetry work differs", "socket samples are not complete connection churn counters", "thread context switches are not logical task wakes", "saturated latency and fixed scheduled latency are separate populations"],
         "config_sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path("tests/performance/mesh_runtime/configs").rglob("*")) if p.is_file()}}
     (ROOT/"production-provenance.json").write_text(json.dumps(data, indent=2)+"\n")
@@ -67,30 +67,57 @@ def provenance():
 
 def validate(cell, load, resource):
     errors = []
-    for key in ("cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us", "admission_delay_p99_us", "admission_delay_max_us", "missed_requests"):
+    count_keys = ("total_requests", "drained_requests", "cohort_requests", "admitted_requests",
+                  "admitted_errors", "total_errors", "warmup_requests", "warmup_errors",
+                  "scheduled_requests", "cohort_scheduled_requests", "offered_requests",
+                  "missed_requests", "missed_slot_count", "missed_reservations", "unclaimed_requests",
+                  "total_bytes", "drained_bytes")
+    invalid_counts = []
+    for key in count_keys:
+        if type(load.get(key)) is not int or load[key] < 0:
+            invalid_counts.append(key)
+            errors.append(f"missing or invalid nonnegative integer count {key}")
+    for key in ("cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us", "admission_delay_p99_us", "admission_delay_max_us"):
         if type(load.get(key)) is not int or load[key] < 0:
             errors.append(f"missing or invalid numeric evidence {key}")
-    if type(load.get("rps")) not in (int, float) or not math.isfinite(load["rps"]) or load["rps"] <= 0:
+    valid_rps = type(load.get("rps")) in (int, float) and math.isfinite(load["rps"]) and load["rps"] > 0
+    if not valid_rps:
         errors.append("missing or invalid throughput evidence")
     expected = {"mesh": physical(cell["arm"]), "protocol": "http1", "payload_size": cell["payload"],
                 "duration_secs": cell["duration"], "rate": cell["rate"], "concurrency": 50 if cell["payload"] >= 1048576 else 100}
     for key, value in expected.items():
         if load.get(key) != value:
             errors.append(f"metadata mismatch {key}: {load.get(key)!r} != {value!r}")
-    if load.get("warmup_errors") != 0:
+    if not resource.get("valid") or resource.get("errors"):
+        errors.append("invalid resource interval")
+    # Do not perform arithmetic on malformed counts or discard their raw
+    # report from the summary ledger through a TypeError.
+    if invalid_counts:
+        return errors
+    if load["warmup_errors"] != 0:
         errors.append("warmup errors or missing evidence")
-    if load.get("total_errors") != 0 or load.get("total_requests", 0) <= 0:
+    if load["total_errors"] != 0 or load["total_requests"] <= 0:
         errors.append("errors or no useful completions")
-    if load.get("admitted_requests") != load.get("cohort_requests", 0)+load.get("admitted_errors", 0):
+    if load["cohort_requests"] != load["total_requests"] + load["drained_requests"]:
+        errors.append("successful cohort must equal useful completions plus drains")
+    if load["admitted_requests"] != load["cohort_requests"] + load["admitted_errors"]:
         errors.append("admitted cohort accounting mismatch")
+    if load["total_errors"] < load["admitted_errors"] + load["warmup_errors"]:
+        errors.append("total errors do not cover admitted and warmup errors")
+    if load["total_bytes"] != load["total_requests"] * cell["payload"] or load["drained_bytes"] != load["drained_requests"] * cell["payload"]:
+        errors.append("successful echo byte accounting mismatch")
+    if valid_rps and not math.isclose(load["rps"], load["total_requests"] / cell["duration"], rel_tol=1e-12, abs_tol=1e-9):
+        errors.append("throughput does not match useful completions and duration")
     if cell["rate"]:
         offered = cell["rate"]*cell["duration"]
-        missed = load.get("missed_requests")
+        missed = load["missed_requests"]
         first, last = load.get("first_missed_slot"), load.get("last_missed_slot")
-        if (load.get("offered_requests") != offered or type(missed) is not int
-                or load.get("missed_slot_count") != missed
-                or load.get("missed_reservations", -1)+load.get("unclaimed_requests", -1) != missed
-                or load.get("admitted_requests", -1)+missed != offered):
+        if load["scheduled_requests"] != load["total_requests"] or load["cohort_scheduled_requests"] != load["cohort_requests"]:
+            errors.append("scheduled successful histograms do not conserve completions and drains")
+        if (load["offered_requests"] != offered
+                or load["missed_slot_count"] != missed
+                or load["missed_reservations"]+load["unclaimed_requests"] != missed
+                or load["admitted_requests"]+missed != offered):
             errors.append("fixed offered/missed count accounting incorrect")
         elif missed == 0:
             if first is not None or last is not None:
@@ -98,8 +125,10 @@ def validate(cell, load, resource):
         elif not (0 < missed <= 2 and type(first) is int and type(last) is int and 0 <= first <= last < offered
                   and first*1000000000 >= (cell["duration"]*1000000000-1000000)*cell["rate"]):
             errors.append("fixed schedule lost a slot outside the bounded final-1ms qualification")
-    if not resource.get("valid") or resource.get("errors"):
-        errors.append("invalid resource interval")
+    elif (any(load[key] != 0 for key in ("scheduled_requests", "cohort_scheduled_requests", "offered_requests",
+                                        "missed_requests", "missed_slot_count", "missed_reservations", "unclaimed_requests"))
+          or load.get("first_missed_slot") is not None or load.get("last_missed_slot") is not None):
+        errors.append("saturated mode must not contain scheduled requests or missed slots")
     return errors
 
 
@@ -113,10 +142,17 @@ def summarize():
             load = json.loads((directory/f"{name}.json").read_text())
             resource = json.loads((directory/f"{name}.resources.json").read_text())
             failures = validate(cell, load, resource)
+            completed, cpu = load.get("total_requests"), resource.get("proxy_cpu_seconds")
+            cpu_us_per_completion = None
+            if (type(completed) is int and completed > 0 and type(cpu) in (int, float)
+                    and math.isfinite(cpu) and cpu >= 0):
+                cpu_us_per_completion = cpu*1e6/completed
+            elif not failures:
+                failures.append("missing or invalid CPU per completion evidence")
             if failures:
                 errors.append({"cell": cell, "errors": failures})
-            rows.append({**cell, "valid": not failures, "report": load, "resources": resource,
-                         "cpu_us_per_completion": resource.get("proxy_cpu_seconds", 0)*1e6/max(1,load.get("total_requests",0))})
+            rows.append({**cell, "valid": not failures, "strict_zero_miss": not failures and load.get("missed_requests") == 0, "report": load, "resources": resource,
+                         "cpu_us_per_completion": cpu_us_per_completion})
         except (OSError, ValueError, TypeError, KeyError) as exc:
             errors.append({"cell": cell, "errors": [str(exc)]})
     groups = []
@@ -138,9 +174,15 @@ def summarize():
                 metrics["cpu_us_per_completion"] = {"median": statistics.median(values), "min": min(values), "max": max(values), "all": values}
                 groups.append({"arm": arm, "payload": payload, "load": mode, "repetitions": len(subset), "all_valid": all(r["valid"] for r in subset), "metrics": metrics})
     result = {"planned_cells": len(planned), "parsed_cells": len(rows), "errors": errors, "groups": groups,
-              "cells": rows, "valid": not errors and len(rows)==len(planned)}
+              "cells": rows, "valid": not errors and len(rows)==len(planned),
+              "strict_zero_miss_valid": not errors and len(rows)==len(planned) and all(r["strict_zero_miss"] for r in rows),
+              "fixed_admission_losses": [{"cell": {k: r[k] for k in ("arm", "payload", "load", "repetition")},
+                  "offered": r["report"]["offered_requests"], "missed": r["report"]["missed_requests"],
+                  "loss_fraction": r["report"]["missed_requests"]/max(1,r["report"]["offered_requests"])}
+                  for r in rows if r["load"] == "fixed" and r["valid"]]}
     (ROOT/"production-summary.json").write_text(json.dumps(result, indent=2)+"\n")
     text = ["Production mesh campaign", "", f"Planned: {len(planned)}; parsed: {len(rows)}; invalid/missing: {len(errors)}.",
+        f"Strict zero-missed-arrival result: {result['strict_zero_miss_valid']}.",
         "All outcomes retained. L4 and L7 are separate product paths. Fixed scheduled latency includes admission delay. Up to two missed arrivals are qualified only with ordinal proof that every missed due time was in the final 1 ms; all misses remain reported.", "",
         "| Arm | Bytes | Load | N | RPS median | successful cohort p50/p95/p99 us (fixed: scheduled; saturated: service) | CPU us/completion | Missed arrivals (all repetitions) |", "|---|---:|---|---:|---:|---|---:|---|"]
     for group in groups:

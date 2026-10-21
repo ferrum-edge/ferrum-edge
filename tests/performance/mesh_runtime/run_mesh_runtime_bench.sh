@@ -124,6 +124,8 @@ BACKEND_PORT=18080
 OUTBOUND_PORT=15101
 HOST_HEADER="svc.ferrum.svc.cluster.local"
 RUN_ID="$$-${RANDOM:-0}"
+BENCH_OWNER="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}"
+BENCH_OWNER_LABEL="ferrum.meshbench.owner=$BENCH_OWNER"
 BACKEND_NAME="meshbench-${MESH}-${RUN_ID}-backend"
 CLIENT_NAME="meshbench-${MESH}-${RUN_ID}-client"
 SERVER_NAME="meshbench-${MESH}-${RUN_ID}-server"
@@ -297,7 +299,7 @@ start_backend() {
     echo "[backend] starting mesh_backend on 127.0.0.1:$BACKEND_PORT"
     local bind_addr=127.0.0.1
     if [ "$MESH" = ferrumtcp ] || [ "$MESH" = consultcp ]; then bind_addr=0.0.0.0; fi
-    docker run -d --network host --name "$BACKEND_NAME" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$BACKEND_NAME" \
         --entrypoint /usr/local/bin/mesh_backend \
         "$TOOLS_IMAGE" --listen "$bind_addr:$BACKEND_PORT" >/dev/null
 }
@@ -307,7 +309,7 @@ start_backend() {
 probe_loadgen() {
     local target="$1" out="$OUTPUT_DIR/logs/probe.json"
     local rc=0
-    readiness_command 10 docker run --rm "${LOADGEN_NETWORK_ARGS[@]}" --name "$PROBE_NAME" "$TOOLS_IMAGE" \
+    readiness_command 10 docker run --label "$BENCH_OWNER_LABEL" --rm "${LOADGEN_NETWORK_ARGS[@]}" --name "$PROBE_NAME" "$TOOLS_IMAGE" \
         --target "$target" --host-header "$HOST_HEADER" --mesh probe \
         --duration 1 --concurrency 1 --payload-size 64 --exchange-timeout-secs 2 --json \
         > "$out" 2> "$OUTPUT_DIR/logs/probe.stderr.log" || rc=$?
@@ -373,7 +375,7 @@ start_ferrum() {
     cp "$SCRIPT_DIR/configs/ferrum/mesh.yaml" "$RUNTIME_DIR/ferrum/mesh.yaml"
     chmod 644 "$RUNTIME_DIR/ferrum/mesh.yaml"
     # Server (destination) sidecar: inbound :15006 STRICT mTLS.
-    docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/ferrum/svid:ro" \
         -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
@@ -399,7 +401,7 @@ start_ferrum() {
         -e FERRUM_LOG_LEVEL=error \
         "$FERRUM_IMAGE" >/dev/null
     # Client sidecar: outbound :15101 dials destination :15006, pins SVID.
-    docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/client:/etc/ferrum/svid:ro" \
         -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
@@ -438,11 +440,11 @@ start_envoy() {
     # otherwise collide on the base-id domain socket and the second exits.
     # v1.39.1's root entrypoint uses su-exec, which rebuilds groups. Start
     # nonroot so its direct-exec branch retains Docker's fixture group.
-    docker run -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/server.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/mesh-certs/svc:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 0 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
-    docker run -d --network host --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/client.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/client:/etc/mesh-certs/client:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 1 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
@@ -459,7 +461,7 @@ start_consul() {
     cp "$SCRIPT_DIR/configs/consul/svc.json" "$RUNTIME_DIR/consul/svc.json"
     cp "$SCRIPT_DIR/configs/consul/client.json" "$RUNTIME_DIR/consul/client.json"
     cp "$SCRIPT_DIR/configs/consul/intention-deny.json" "$RUNTIME_DIR/consul/intention-deny.json"
-    docker run -d --network host --name "$AGENT_NAME" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$AGENT_NAME" \
         "$CONSUL_IMAGE" agent -dev -client=127.0.0.1 -bind=127.0.0.1 >/dev/null
     local ready=false running
     while [ "$SECONDS" -lt "$READINESS_DEADLINE" ]; do
@@ -493,10 +495,10 @@ start_consul() {
     chmod 644 "$RUNTIME_DIR/consul/svc-bootstrap.json" "$RUNTIME_DIR/consul/client-bootstrap.json"
     # Distinct --base-id: two Envoy processes sharing one host netns
     # otherwise collide on the base-id domain socket.
-    docker run -d --network host --name "$SERVER_NAME" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" \
         -v "$RUNTIME_DIR/consul/svc-bootstrap.json:/bootstrap.json:ro" \
         "$ENVOY_IMAGE" -c /bootstrap.json --base-id 0 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
-    docker run -d --network host --name "$CLIENT_NAME" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$CLIENT_NAME" \
         -v "$RUNTIME_DIR/consul/client-bootstrap.json:/bootstrap.json:ro" \
         "$ENVOY_IMAGE" -c /bootstrap.json --base-id 1 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
 }
@@ -548,7 +550,7 @@ start_linkerd() {
     chmod 750 "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client"
     chmod 640 "$CERT_DIR"/linkerd-*/key.p8
     chmod 644 "$CERT_DIR"/linkerd-*/crt.pem
-    docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
         -v "$CERT_DIR/linkerd-svc:/var/run/linkerd/identity/end-entity:ro" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_INBOUND_LISTEN_ADDR=127.0.0.1:4143 \
@@ -559,7 +561,7 @@ start_linkerd() {
         -e LINKERD2_PROXY_IDENTITY_TOKEN_FILE="" \
         -e LINKERD2_PROXY_IDENTITY_LOCAL_NAME=svc.ferrum.serviceaccount.identity.linkerd.cluster.local \
         "$LINKERD_IMAGE" >/dev/null 2>&1 || true
-    docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
         -v "$CERT_DIR/linkerd-client:/var/run/linkerd/identity/end-entity:ro" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_OUTBOUND_LISTEN_ADDR=127.0.0.1:4140 \
@@ -610,11 +612,17 @@ run_cell() {
             resource_args+=(--aux-container "$AGENT_NAME")
         fi
     fi
-    resource_args+=(--rate "${BENCH_RATE:-0}" --loadgen-network "${LOADGEN_NETWORK:-host}" --loadgen-user "${LOADGEN_USER:-}")
+    if [ "${BENCH_PERF_LEAF:-false}" = true ]; then
+        [ "$MESH" = ferrum ] || [ "$MESH" = envoy ] || return 2
+        resource_args+=(--perf-leaf --symbol-elf "${BENCH_SYMBOL_ELF:?qualified symbol ELF required}"
+            --symbol-qualification-report "${BENCH_SYMBOL_REPORT:?qualification report required}")
+    fi
+    resource_args+=(--fixture-owner "$BENCH_OWNER" --rate "${BENCH_RATE:-0}" --loadgen-network "${LOADGEN_NETWORK:-host}" --loadgen-user "${LOADGEN_USER:-}")
     local runner_prefix=()
-    if [ "${BENCH_PRODUCTION_OBSERVE:-false}" = true ]; then runner_prefix=(sudo -n); fi
+    if [ "${BENCH_PRODUCTION_OBSERVE:-false}" = true ] || [ "${BENCH_PERF_LEAF:-false}" = true ]; then runner_prefix=(sudo -n); fi
     local rc=0
     local cell_budget=$((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))
+    if [ "${BENCH_PERF_LEAF:-false}" = true ]; then cell_budget=$((cell_budget + 150)); fi
     echo "[bench] cell wall budget=${cell_budget}s exchange budget=${EXCHANGE_TIMEOUT_SECS}s"
     timeout --signal=TERM --kill-after=5s "${cell_budget}s" \
         "${runner_prefix[@]}" python3 -u "$SCRIPT_DIR/collect_resources.py" "${resource_args[@]}" \
@@ -658,7 +666,7 @@ auth_probes() {
 
     tls_probe() {
         local rc=0
-        readiness_command 25 docker run --rm --network host --name "$PROBE_NAME" --group-add "$CERT_GID" \
+        readiness_command 25 docker run --label "$BENCH_OWNER_LABEL" --rm --network host --name "$PROBE_NAME" --group-add "$CERT_GID" \
             -v "$CERT_DIR:/certs:ro" \
             --entrypoint /usr/local/bin/mesh_tls_probe \
             "$TOOLS_IMAGE" --addr "127.0.0.1:$inbound_port" \

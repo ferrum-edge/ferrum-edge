@@ -7,7 +7,7 @@ on:
         description: "Qualification or four balanced repeated production ranking blocks"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, ranking, symbols]
+        options: [smoke-l7, smoke, ranking, symbols, profile-envoy]
 permissions:
   contents: read
 concurrency:
@@ -18,7 +18,7 @@ env:
 jobs:
   benchmark:
     name: Production mesh qualification and ranking
-    if: inputs.phase != 'symbols'
+    if: inputs.phase != 'symbols' && inputs.phase != 'profile-envoy'
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -46,7 +46,7 @@ jobs:
       - name: Cleanup fixture containers
         if: always()
         run: |
-          mapfile -t leaked < <(docker ps -aq --filter "name=meshbench-")
+          mapfile -t leaked < <(docker ps -aq --filter "label=ferrum.meshbench.owner=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
           if [ "${#leaked[@]}" -gt 0 ]; then docker rm -f "${leaked[@]}" 2>/dev/null || true; fi
       - name: Render complete evidence ledger
         if: always()
@@ -85,3 +85,50 @@ jobs:
             ${{ runner.temp }}/mesh-symbol-preflight/production/*manifest*.json
             ${{ runner.temp }}/mesh-symbol-preflight/debug/*manifest*.json
           retention-days: 30
+  profile-envoy:
+    name: Qualify shipping Envoy CPU leaf observer
+    if: inputs.phase == 'profile-envoy'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install bounded sampling and fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl sysstat binutils iproute2 iptables linux-perf linux-tools-generic linux-tools-common
+          mkdir -p results
+          lscpu > results/lscpu.txt
+          free -b > results/memory.txt
+      - name: Prepare production images and verified companion
+        timeout-minutes: 25
+        run: bash .github/scripts/mesh_production_profile_campaign.sh prepare
+      - name: Measure controls and leaf observer
+        timeout-minutes: 15
+        run: bash .github/scripts/mesh_production_profile_campaign.sh measure
+      - name: Cleanup this run's labeled fixture containers
+        if: always()
+        run: |
+          mapfile -t leaked < <(docker ps -aq --filter "label=ferrum.meshbench.owner=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+          if [ "${#leaked[@]}" -gt 0 ]; then docker rm -f "${leaked[@]}" 2>/dev/null || true; fi
+      - name: Render full observer qualification
+        if: always()
+        run: python3 .github/scripts/mesh_production_profile_campaign.py >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain raw samples and identity evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-profile-envoy-${{ github.sha }}
+          path: |
+            results
+            !results/**/runtime/**
+            !results/**/perf-leaf/elfs/**
+            !results/**/perf-leaf/buildid-cache/**
+            !results/**/perf-leaf/home/**
+            !results/**/perf-leaf/**/symfs/**
+          retention-days: 30
+      - name: Require observer qualification
+        if: always()
+        run: python3 .github/scripts/mesh_production_profile_campaign.py accept

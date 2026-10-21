@@ -8,6 +8,7 @@ scheduler delivery jitter. Warmup and post-deadline response drains are excluded
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib.util
 import json
 import os
@@ -85,6 +86,18 @@ def run(args: argparse.Namespace) -> int:
             "metric_scope": "before loadgen launch through completed drain (includes warmup)",
             "socket_interval_seconds": 1.0}
         observer.metrics(args.mesh, observed, args.resources.parent, "before")
+    perf_capture = None
+    if args.perf_leaf:
+        if args.mesh not in ("ferrum", "envoy") or len(containers) != 2:
+            raise ValueError("leaf profiling requires two Ferrum or Envoy sidecars")
+        from production_perf import PerfCapture
+        symbols = [{"path": path, "qualification_report": args.symbol_qualification_report}
+                   if args.symbol_qualification_report else path for path in args.symbol_elf]
+        perf_capture = PerfCapture(containers, args.resources.parent / "perf-leaf", symbols)
+        # On ordinary exceptions stop attached recorders; PDEATHSIG also bounds
+        # them if this collector is terminated by the outer cell deadline.
+        atexit.register(perf_capture.stop)
+        perf_capture.start()
     begin = None
     finish = None
     samples: list[int] = []
@@ -114,7 +127,7 @@ def run(args: argparse.Namespace) -> int:
         network_args = ["--network", args.loadgen_network]
         if args.loadgen_user:
             network_args += ["--user", args.loadgen_user]
-        child = subprocess.Popen(["docker", "run", "--rm", *network_args, "--name", args.loadgen_name, args.image,
+        child = subprocess.Popen(["docker", "run", "--rm", "--label", "ferrum.meshbench.owner=" + args.fixture_owner, *network_args, "--name", args.loadgen_name, args.image,
             "--target", args.target, "--host-header", args.host_header, "--mesh", args.mesh,
             "--duration", args.duration, "--concurrency", args.concurrency,
             "--warmup", args.warmup, "--payload-size", args.payload_size,
@@ -153,6 +166,8 @@ def run(args: argparse.Namespace) -> int:
             except (OSError, ValueError, IndexError) as exc:
                 report["errors"].append(str(exc))
         status = child.wait()
+    if perf_capture is not None:
+        perf_capture.stop()
     print(f"[measure] {args.mesh} loadgen exited status={status}", file=sys.stderr, flush=True)
     stop.set()
     if sampler is not None:
@@ -197,6 +212,13 @@ def run(args: argparse.Namespace) -> int:
         if abs(deviation) > max(0.25, float(args.duration)*0.02):
             report["errors"].append("CPU interval exceeds marker jitter budget")
         report["valid"] = not report["errors"]
+    if perf_capture is not None:
+        profile = perf_capture.decode(begin["monotonic"] if begin else None, finish["monotonic"] if finish else None)
+        report["perf_leaf"] = {"path": str(args.resources.parent / "perf-leaf/capture.json"), "valid": profile["valid"]}
+        if not profile["valid"]:
+            report["errors"].append("leaf profile failed identity, loss, or coverage qualification")
+            report["valid"] = False
+        atexit.unregister(perf_capture.stop)
     args.resources.write_text(json.dumps(report, indent=2) + "\n")
     return status if status else (0 if report["valid"] else 1)
 
@@ -205,12 +227,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--container", action="append", default=[])
     parser.add_argument("--production-observe", action="store_true")
+    parser.add_argument("--perf-leaf", action="store_true")
+    parser.add_argument("--symbol-elf", action="append", default=[])
+    parser.add_argument("--symbol-qualification-report")
     parser.add_argument("--aux-container", action="append", default=[])
     parser.add_argument("--client-name")
     parser.add_argument("--server-name")
     parser.add_argument("--rate", type=int, default=0)
     parser.add_argument("--loadgen-network", default="host")
     parser.add_argument("--loadgen-user", default="")
+    parser.add_argument("--fixture-owner", default="local-0")
     parser.add_argument("--allocation-url", action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resources", type=Path, required=True)

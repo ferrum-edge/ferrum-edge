@@ -115,6 +115,14 @@ class CapturedL4Fixture(unittest.TestCase):
         rules = re.search(r"<<'RULES'\n(.*?)\nRULES", shell, re.S).group(1)
         self.assertIn('--dports "$backend_port,$raw_port" -j REJECT', rules)
 
+    def test_unprivileged_probes_read_public_script_from_parent_stdin(self):
+        for name in ("mesh_l4_probe", "mesh_l4_prove"):
+            body = re.search(rf'(?ms)^{name}\(\) \{{.*?^\}}', shell).group()
+            dropped = body[body.index("setpriv"):]
+            self.assertIn('python3 - probe', dropped)
+            self.assertIn('< "$SCRIPT_DIR/mesh_l4_fixture.py"', dropped)
+        self.assertNotIn('chmod', shell)
+
     def test_nonroot_workers_private_mounts_and_owned_cleanup(self):
         for name in ("start_ferrum_l4", "start_consul_l4"):
             body = re.search(rf'(?ms)^{name}\(\) \{{.*?^\}}', shell).group()

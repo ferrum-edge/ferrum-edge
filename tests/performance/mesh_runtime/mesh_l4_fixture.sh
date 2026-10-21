@@ -25,9 +25,11 @@ mesh_l4_ns() {
     readiness_command 8 sudo -n nsenter --net="/proc/$pid/ns/net" -- "$@"
 }
 
+# The invoking runner opens this public script before setpriv changes UID.
+# Unprivileged fixture identities need no traversal access to the checkout.
 mesh_l4_probe() {
     mesh_l4_ns setpriv --reuid="$L4_APP_UID" --regid="$L4_APP_UID" --clear-groups -- \
-        python3 "$SCRIPT_DIR/mesh_l4_fixture.py" probe --host "$L4_VIP" --port "$L4_RAW_PORT" --timeout 2
+        python3 - probe --host "$L4_VIP" --port "$L4_RAW_PORT" --timeout 2 < "$SCRIPT_DIR/mesh_l4_fixture.py"
 }
 
 mesh_l4_wait_binary() {
@@ -71,7 +73,7 @@ mesh_l4_setup() {
     done
     # An idle tools container owns the namespace, like a pod sandbox. Neither
     # proxy lifecycle nor measured loadgen lifecycle can replace that namespace.
-    readiness_command 8 docker run -d --network "$L4_NETWORK_NAME" --name "$L4_NETNS_NAME" --label "ferrum.meshbench.l4=$L4_OWNER" \
+    readiness_command 8 docker run --label "$BENCH_OWNER_LABEL" -d --network "$L4_NETWORK_NAME" --name "$L4_NETNS_NAME" --label "ferrum.meshbench.l4=$L4_OWNER" \
         --entrypoint /usr/local/bin/mesh_backend "$TOOLS_IMAGE" --listen 127.0.0.1:18081 >/dev/null
     L4_NETNS_PID=$(readiness_command 3 docker inspect --format '{{.State.Pid}}' "$L4_NETNS_NAME")
     LOADGEN_NETWORK="container:$L4_NETNS_NAME"
@@ -109,7 +111,7 @@ RULES
 
 start_ferrum_l4() {
     mesh_l4_setup ferrumtcp
-    readiness_command 8 docker run -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
+    readiness_command 8 docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$L4_CONFIG_DIR:/etc/ferrum/bench:ro" -v "$CERT_DIR/svc:/etc/ferrum/svid:ro" \
         -e FERRUM_MODE=mesh -e FERRUM_NAMESPACE=ferrum -e FERRUM_MESH_TOPOLOGY=sidecar -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
         -e FERRUM_MESH_CONFIG_PROTOCOL=file -e FERRUM_MESH_FILE_CONFIG_PATH=/etc/ferrum/bench/destination.json \
@@ -121,7 +123,7 @@ start_ferrum_l4() {
         -e FERRUM_POOL_WARMUP_ENABLED=false -e FERRUM_PROXY_HTTP_PORT=0 \
         -e FERRUM_ADMIN_HTTP_PORT=15020 -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
         -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 -e FERRUM_LOG_LEVEL=error "$FERRUM_IMAGE" >/dev/null
-    readiness_command 8 docker run -d --network "$LOADGEN_NETWORK" --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
+    readiness_command 8 docker run --label "$BENCH_OWNER_LABEL" -d --network "$LOADGEN_NETWORK" --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$L4_CONFIG_DIR:/etc/ferrum/bench:ro" -v "$CERT_DIR/client:/etc/ferrum/svid:ro" \
         -e FERRUM_MODE=mesh -e FERRUM_NAMESPACE=ferrum -e FERRUM_MESH_TOPOLOGY=sidecar -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
         -e FERRUM_MESH_CONFIG_PROTOCOL=file -e FERRUM_MESH_FILE_CONFIG_PATH=/etc/ferrum/bench/source.json \
@@ -141,7 +143,7 @@ start_consul_l4() {
     mesh_l4_setup consultcp
     # Agent listens only on loopback plus this private bridge's host address.
     # No public bind. TLS data-plane identity remains Consul CA/xDS/SDS owned.
-    readiness_command 8 docker run -d --network host --name "$AGENT_NAME" "$CONSUL_IMAGE" \
+    readiness_command 8 docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$AGENT_NAME" "$CONSUL_IMAGE" \
         agent -dev -client="127.0.0.1 $L4_GATEWAY" -bind=127.0.0.1 >/dev/null
     while ! readiness_command 3 docker exec "$AGENT_NAME" consul members >/dev/null 2>&1; do
         [ "$SECONDS" -lt "$READINESS_DEADLINE" ] || return 1
@@ -160,9 +162,9 @@ start_consul_l4() {
     python3 "$SCRIPT_DIR/prepare_consul_bootstrap.py" "$L4_CONFIG_DIR/svc-bootstrap.json" 19002
     python3 "$SCRIPT_DIR/prepare_consul_bootstrap.py" "$L4_CONFIG_DIR/client-bootstrap.json" 19001
     python3 "$SCRIPT_DIR/mesh_l4_fixture.py" bootstrap "$L4_CONFIG_DIR/client-bootstrap.json" --agent-address "$L4_GATEWAY"
-    readiness_command 8 docker run -d --network host --name "$SERVER_NAME" --user 65532:65532 \
+    readiness_command 8 docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" --user 65532:65532 \
         -v "$L4_CONFIG_DIR/svc-bootstrap.json:/bootstrap.json:ro" "$ENVOY_IMAGE" -c /bootstrap.json --base-id 0 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
-    readiness_command 8 docker run -d --network "$LOADGEN_NETWORK" --name "$CLIENT_NAME" --user 65532:65532 \
+    readiness_command 8 docker run --label "$BENCH_OWNER_LABEL" -d --network "$LOADGEN_NETWORK" --name "$CLIENT_NAME" --user 65532:65532 \
         -v "$L4_CONFIG_DIR/client-bootstrap.json:/bootstrap.json:ro" "$ENVOY_IMAGE" -c /bootstrap.json --base-id 1 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
 }
 
@@ -198,7 +200,7 @@ mesh_l4_prove() {
         >> "$OUTPUT_DIR/logs/l4-raw-direct.jsonl"
     local rc=0
     mesh_l4_ns setpriv --reuid="$L4_PROXY_UID" --regid="$L4_PROXY_UID" --clear-groups -- \
-        python3 "$SCRIPT_DIR/mesh_l4_fixture.py" probe --host "$L4_GATEWAY" --port "$L4_RAW_PORT" \
+        python3 - probe --host "$L4_GATEWAY" --port "$L4_RAW_PORT" < "$SCRIPT_DIR/mesh_l4_fixture.py" \
         >> "$OUTPUT_DIR/logs/l4-bypass-blocked.jsonl" 2>&1 || rc=$?
     [ "$rc" -eq 1 ] || { echo '[l4] source proxy direct-backend block was not proved' >&2; return 1; }
     if [ "$MESH" = consultcp ]; then
