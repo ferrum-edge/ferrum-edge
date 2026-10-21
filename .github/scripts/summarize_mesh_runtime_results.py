@@ -136,7 +136,7 @@ def collect(results_root: Path) -> dict:
                 else:
                     resources["proxy_cpu_percent_mean"] = 100 * resources["proxy_cpu_seconds"] / seconds
                     resources["proxy_mem_bytes_peak_sum"] = resources["proxy_rss_bytes_peak"]
-                    resources["proxy_mem_bytes_mean"] = resources["proxy_rss_bytes_peak"]
+                    resources["proxy_mem_bytes_mean"] = resources["proxy_rss_bytes_mean"]
                     record["resources"] = resources
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 record["resource_error"] = str(exc)

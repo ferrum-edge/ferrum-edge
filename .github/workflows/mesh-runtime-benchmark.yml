@@ -75,6 +75,12 @@ on:
         default: release
         type: choice
         options: [release, ci-release]
+      features:
+        description: "Matched features (allocation instrumentation is diagnostic only)"
+        required: false
+        default: cloud-secrets
+        type: choice
+        options: [cloud-secrets, 'cloud-secrets,bench-h1-profile']
 
 permissions:
   contents: read
@@ -91,6 +97,7 @@ env:
   BENCH_SKIP_PAYLOAD_SIZES: ${{ inputs.skip_payload_sizes }}
   BENCH_BASELINE_SHA: ${{ inputs.baseline_sha }}
   BENCH_CARGO_PROFILE: ${{ inputs.profile }}
+  BENCH_FERRUM_FEATURES: ${{ inputs.features }}
 
 jobs:
   benchmark:
