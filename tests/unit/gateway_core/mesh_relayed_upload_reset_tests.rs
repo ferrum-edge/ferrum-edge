@@ -460,59 +460,119 @@ fn gateway_deadlines_keep_their_own_outcome() {
 
 // ── The typed client upload fault, from real frontend body errors ─────────
 
-/// Serve one HTTP/1.1 request on `server_io` and report the typed fault of the
-/// first error its body yields.
-async fn h1_frontend_body_fault(server_io: DuplexStream) -> Fault {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let service = service_fn(move |req: Request<Incoming>| {
-        let tx = tx.clone();
-        async move {
-            let mut body = req.into_body();
-            while let Some(frame) = body.frame().await {
-                if let Err(err) = frame {
-                    let _ = tx.send(client_upload_error_fault_for_test(&err));
-                    break;
+/// A served HTTP/1.1 frontend request: one signal per body DATA frame, and the
+/// typed fault of the first error its body yields.
+struct H1Frontend {
+    frames: mpsc::UnboundedReceiver<()>,
+    faults: mpsc::UnboundedReceiver<Fault>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl H1Frontend {
+    fn serve<I>(io: I) -> Self
+    where
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (frame_tx, frames) = mpsc::unbounded_channel();
+        let (fault_tx, faults) = mpsc::unbounded_channel();
+        let service = service_fn(move |req: Request<Incoming>| {
+            let frame_tx = frame_tx.clone();
+            let fault_tx = fault_tx.clone();
+            async move {
+                let mut body = req.into_body();
+                while let Some(frame) = body.frame().await {
+                    match frame {
+                        Ok(_) => {
+                            let _ = frame_tx.send(());
+                        }
+                        Err(err) => {
+                            let _ = fault_tx.send(client_upload_error_fault_for_test(&err));
+                            break;
+                        }
+                    }
                 }
+                Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
             }
-            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        });
+        let server = tokio::spawn(async move {
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(io), service)
+                .await;
+        });
+        Self {
+            frames,
+            faults,
+            server,
         }
-    });
-    let server = tokio::spawn(async move {
-        let _ = hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(server_io), service)
-            .await;
-    });
-    let fault = tokio::time::timeout(STEP, rx.recv())
+    }
+
+    async fn first_frame(&mut self) {
+        tokio::time::timeout(STEP, self.frames.recv())
+            .await
+            .expect("the first upload bytes arrive in time")
+            .expect("a body frame");
+    }
+
+    async fn fault(mut self) -> Fault {
+        let fault = tokio::time::timeout(STEP, self.faults.recv())
+            .await
+            .expect("the frontend body must fail in time")
+            .expect("a body fault");
+        self.server.abort();
+        fault
+    }
+}
+
+const TRUNCATED_CHUNKED_UPLOAD: &[u8] =
+    b"POST /upload HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel";
+
+#[tokio::test]
+async fn an_h1_client_that_half_closes_mid_upload_is_not_proven_gone() {
+    // A client may shut down its write side mid-upload and keep reading: the
+    // early EOF proves an incomplete request, not a departed client.
+    let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+    let frontend = H1Frontend::serve(server_io);
+    client
+        .write_all(TRUNCATED_CHUNKED_UPLOAD)
         .await
-        .expect("the frontend body must fail in time")
-        .expect("a body fault");
-    server.abort();
-    fault
+        .expect("write a truncated upload");
+    client.shutdown().await.expect("half-close the write side");
+    assert_eq!(frontend.fault().await, Fault::Malformed);
+    drop(client);
 }
 
 #[tokio::test]
-async fn an_h1_client_that_leaves_mid_upload_is_a_disconnect() {
-    let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+async fn an_h1_client_whose_connection_resets_mid_upload_is_a_disconnect() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind frontend");
+    let addr = listener.local_addr().expect("frontend addr");
+    let mut client = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect frontend");
+    let (server_io, _) = listener.accept().await.expect("accept frontend");
+    let mut frontend = H1Frontend::serve(server_io);
     client
-        .write_all(
-            b"POST /upload HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
-        )
+        .write_all(TRUNCATED_CHUNKED_UPLOAD)
         .await
         .expect("write a truncated upload");
-    client.shutdown().await.expect("the client goes away");
-    assert_eq!(h1_frontend_body_fault(server_io).await, Fault::Disconnected);
+    frontend.first_frame().await;
+    // An abortive close: the frontend read fails with a connection reset.
+    client.set_zero_linger().expect("set abortive close");
     drop(client);
+    assert_eq!(frontend.fault().await, Fault::Disconnected);
 }
 
 #[tokio::test]
 async fn an_h1_client_with_invalid_chunk_framing_is_malformed() {
     let (mut client, server_io) = tokio::io::duplex(64 * 1024);
     // Still connected and reading: only its framing is bad.
+    let frontend = H1Frontend::serve(server_io);
     client
         .write_all(b"POST /upload HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")
         .await
         .expect("write a malformed chunk");
-    assert_eq!(h1_frontend_body_fault(server_io).await, Fault::Malformed);
+    assert_eq!(frontend.fault().await, Fault::Malformed);
     drop(client);
 }
 
@@ -595,11 +655,12 @@ fn typed_io_and_h2_faults_classify_without_heuristics() {
         client_upload_error_fault_for_test(&wrapped),
         Fault::Malformed
     );
+    // Typed proof the connection is gone.
     for kind in [
-        std::io::ErrorKind::UnexpectedEof,
         std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::ConnectionAborted,
         std::io::ErrorKind::BrokenPipe,
-        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::NotConnected,
     ] {
         let gone = std::io::Error::new(kind, "client gone");
         assert_eq!(
@@ -608,12 +669,24 @@ fn typed_io_and_h2_faults_classify_without_heuristics() {
             "{kind:?}"
         );
     }
-    // A bare reason (the masked-EOF reset the gate raises) is the client's.
+    // An early EOF (a client may half-close and keep reading), a timeout, or
+    // an untyped error is not proof the client left.
+    for kind in [
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::Other,
+    ] {
+        let incomplete = std::io::Error::new(kind, "upload incomplete");
+        assert_eq!(
+            client_upload_error_fault_for_test(&incomplete),
+            Fault::Malformed,
+            "{kind:?}"
+        );
+    }
+    // A bare reason (the reset the END_STREAM gate raises for a stream that
+    // ended without one) was not sent by the client: not proof either.
     let reset = h2::Error::from(h2::Reason::CANCEL);
-    assert_eq!(
-        client_upload_error_fault_for_test(&reset),
-        Fault::Disconnected
-    );
+    assert_eq!(client_upload_error_fault_for_test(&reset), Fault::Malformed);
 }
 
 // ── Status, accounting, retry boundary, and breaker feedback ─────────────

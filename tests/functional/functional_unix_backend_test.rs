@@ -1036,8 +1036,10 @@ async fn assert_client_upload_abort_is_not_charged(h2c: bool) {
 
     let upload = start_chunked_upload(fixture.gateway.proxy_http_port).await;
     expect_backend_event(&mut fixture.events, "upload_head").await;
-    // The client disappears while the backend is still reading its upload and
-    // before any response head: the gateway relays that into the backend.
+    // The client's connection is reset while the backend is still reading its
+    // upload and before any response head: typed proof it is gone, which the
+    // gateway relays into the backend.
+    upload.set_zero_linger().expect("set abortive close");
     drop(upload);
     expect_backend_event(&mut fixture.events, "upload_aborted").await;
 
@@ -1054,6 +1056,36 @@ async fn assert_client_upload_abort_is_not_charged(h2c: bool) {
     fixture
         .assert_breaker_closed(&format!("h2c={h2c}: a relayed client upload abort"))
         .await;
+    fixture.shutdown().await;
+}
+
+async fn assert_half_closed_client_upload_is_a_400_not_charged(h2c: bool) {
+    let mut fixture = UploadFixture::start(h2c, UploadBackendMode::HoldUntilComplete).await;
+
+    let mut upload = start_chunked_upload(fixture.gateway.proxy_http_port).await;
+    expect_backend_event(&mut fixture.events, "upload_head").await;
+    // The client ends its write side mid-chunk but keeps reading: an
+    // incomplete request, not proof the client left, so the response must
+    // still be delivered and it is never a 499.
+    upload.shutdown().await.expect("half-close the write side");
+    let head = read_response_head(&mut upload).await;
+    assert!(
+        head.starts_with("HTTP/1.1 400"),
+        "h2c={h2c}: a half-closed client still reading gets a bad request, never 499: {head:?}"
+    );
+    expect_backend_event(&mut fixture.events, "upload_aborted").await;
+
+    let summary = fixture.upload_summary().await;
+    assert_eq!(summary["response_status_code"], 400, "{summary}");
+    assert_eq!(summary["error_class"], "client_disconnect", "{summary}");
+    assert!(
+        summary.get("client_disconnected").is_none(),
+        "h2c={h2c}: a half-closed upload is not a disconnect: {summary}"
+    );
+    fixture
+        .assert_breaker_closed(&format!("h2c={h2c}: a half-closed client upload"))
+        .await;
+    drop(upload);
     fixture.shutdown().await;
 }
 
@@ -1161,5 +1193,21 @@ fn unix_h2c_malformed_client_upload_is_a_400_not_charged() {
 fn unix_h2c_backend_cancel_mid_upload_is_still_charged() {
     crate::common::run_trusted_projected_gateway_test(|| {
         assert_backend_upload_failure_is_charged(true)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h1_half_closed_client_upload_is_a_400_not_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_half_closed_client_upload_is_a_400_not_charged(false)
+    });
+}
+
+#[test]
+#[ignore]
+fn unix_h2c_half_closed_client_upload_is_a_400_not_charged() {
+    crate::common::run_trusted_projected_gateway_test(|| {
+        assert_half_closed_client_upload_is_a_400_not_charged(true)
     });
 }

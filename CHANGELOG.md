@@ -28,10 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for typed proof that the gateway's request body ended the exchange (an
   HTTP/2 reset h2 records as user-initiated, or hyper's HTTP/1.1 user body
   error). The upload's typed terminals then name the cause, as the
-  direct-HTTP/2 early-response refusal does (#6314). A client that went
-  away is a health-neutral `client_disconnect` (`499`, gRPC `CANCELLED`)
-  with a `client_disconnected` summary. A malformed upload is a `400` (gRPC
-  `INVALID_ARGUMENT`), never a `499`. Neither is replayed, and a buffered
+  direct-HTTP/2 early-response refusal does (#6314). A client proven gone
+  (a reset it sent, or a reset or broken connection) is a health-neutral
+  `client_disconnect` (`499`, gRPC `CANCELLED`) with a `client_disconnected`
+  summary. A malformed or incomplete upload, including an early EOF from a
+  half-closed client, is a `400` (gRPC `INVALID_ARGUMENT`), never a `499`. Neither is replayed, and a buffered
   mesh gRPC refusal now records its `grpc_status` instead of `UNKNOWN`. An authorization expiry gets the authorization terminal, and a
   backend write watermark gets the `504` / `read_write_timeout` it already
   had at the header wait. A reset, `CANCEL`, `NO_ERROR`, or close sent by the

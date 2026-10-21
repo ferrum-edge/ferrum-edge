@@ -198,10 +198,13 @@ const PUMP_CONSUMER_DONE: u8 = 7;
 /// Still a source error for lifecycle accounting, but retain its wire meaning
 /// so the backend receives CANCEL rather than a clean or internal-error end.
 const PUMP_SOURCE_RESET: u8 = 8;
-/// A client body read the frontend codec rejected as malformed (issue #6776):
-/// still a source error for lifecycle accounting, but not proof that the
-/// client went away. See [`client_upload_error_fault`].
-const PUMP_SOURCE_MALFORMED: u8 = 9;
+/// [`PUMP_SOURCE_ERROR`] with typed proof that the client went away (issue
+/// #6776): a reset it sent or a failed connection, never a bare EOF. See
+/// [`client_upload_error_fault`]. Same lifecycle accounting and wire meaning.
+const PUMP_SOURCE_DISCONNECTED: u8 = 9;
+/// [`PUMP_SOURCE_RESET`] with the same typed proof that the client went away
+/// (issue #6776). The backend still receives CANCEL.
+const PUMP_SOURCE_RESET_DISCONNECTED: u8 = 10;
 
 /// Terminal state of one gateway-owned upload pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,9 +244,10 @@ const fn outcome_code(outcome: UploadPumpOutcome) -> u8 {
 const fn code_outcome(code: u8) -> Option<UploadPumpOutcome> {
     match code {
         PUMP_COMPLETED => Some(UploadPumpOutcome::Completed),
-        PUMP_SOURCE_ERROR | PUMP_SOURCE_RESET | PUMP_SOURCE_MALFORMED => {
-            Some(UploadPumpOutcome::SourceError)
-        }
+        PUMP_SOURCE_ERROR
+        | PUMP_SOURCE_RESET
+        | PUMP_SOURCE_DISCONNECTED
+        | PUMP_SOURCE_RESET_DISCONNECTED => Some(UploadPumpOutcome::SourceError),
         PUMP_CANCELLED => Some(UploadPumpOutcome::Cancelled),
         PUMP_AUTHORIZATION_EXPIRED => Some(UploadPumpOutcome::AuthorizationExpired),
         PUMP_CONSUMER_GONE => Some(UploadPumpOutcome::ConsumerGone),
@@ -322,44 +326,58 @@ pub(crate) const fn early_response_upload_refusal_error_class(
 /// detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClientUploadFault {
-    /// The client went away or cancelled: a reset or `GOAWAY` it sent, its
-    /// stream ending without `END_STREAM`, or its connection closing, timing
-    /// out, or failing mid-upload.
+    /// Typed proof the client went away: a stream reset or `GOAWAY` it sent
+    /// over HTTP/2, or a reset, aborted, or broken connection.
     Disconnected,
-    /// The frontend codec rejected the upload as malformed: an HTTP/1.1 body
-    /// framing it could not decode, or an HTTP/2 stream h2 reset because the
-    /// client broke the protocol. The client may still be connected and
-    /// reading, so this is a bad request, never a client-closed request.
+    /// The upload is malformed or incomplete, with no proof the client left:
+    /// framing the HTTP/1.1 decoder rejected, a body that ended early (a
+    /// client may half-close its write side and keep reading), an HTTP/2
+    /// stream that ended without `END_STREAM` and without a reset it sent, or
+    /// a stream h2 reset because the client broke the protocol. A response is
+    /// still deliverable, so this is a bad request, never a client-closed
+    /// request.
     Malformed,
 }
 
 /// The typed [`ClientUploadFault`] of a failed read of the client's upload.
 ///
-/// Malformed only on typed proof: an `io::Error` of kind `InvalidData` or
-/// `InvalidInput` (hyper's HTTP/1.1 body decoder rejecting chunk framing), or
-/// an h2 stream reset h2 itself raised (`is_library`) because the client
-/// violated the protocol. Anything else, including an early EOF, a reset or
-/// `GOAWAY` the client sent, and a connection error, is the client leaving.
+/// Disconnected only on typed proof the client is gone: an h2 error received
+/// from the client (`is_remote`: its `RST_STREAM` or `GOAWAY`), or an
+/// `io::Error` of kind `ConnectionReset`, `ConnectionAborted`, `BrokenPipe`,
+/// or `NotConnected` (including an h2 transport error carrying one). Anything
+/// else is [`ClientUploadFault::Malformed`]: an `UnexpectedEof` from a client
+/// that half-closed, a decoder rejection, a bare h2 reason, a library reset, a
+/// timeout, or an error with no typed node at all.
 /// Synchronous and allocation-free; the traversal is bounded like
 /// [`is_h2_source_cancel`] and inspects an `io::Error`'s payload first.
 pub(crate) fn client_upload_error_fault(
     error: &(dyn std::error::Error + 'static),
 ) -> ClientUploadFault {
+    const fn io_proves_departure(kind: std::io::ErrorKind) -> bool {
+        matches!(
+            kind,
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+        )
+    }
     let mut source = error;
     for _ in 0..16 {
         if let Some(io_err) = source.downcast_ref::<std::io::Error>()
-            && matches!(
-                io_err.kind(),
-                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
-            )
+            && io_proves_departure(io_err.kind())
         {
-            return ClientUploadFault::Malformed;
+            return ClientUploadFault::Disconnected;
         }
         if let Some(h2_err) = source.downcast_ref::<h2::Error>() {
-            return if h2_err.is_reset() && h2_err.is_library() {
-                ClientUploadFault::Malformed
-            } else {
+            let departed = h2_err.is_remote()
+                || h2_err
+                    .get_io()
+                    .is_some_and(|io_err| io_proves_departure(io_err.kind()));
+            return if departed {
                 ClientUploadFault::Disconnected
+            } else {
+                ClientUploadFault::Malformed
             };
         }
         let next = if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
@@ -371,10 +389,10 @@ pub(crate) fn client_upload_error_fault(
         };
         match next {
             Some(next) => source = next,
-            None => return ClientUploadFault::Disconnected,
+            None => return ClientUploadFault::Malformed,
         }
     }
-    ClientUploadFault::Disconnected
+    ClientUploadFault::Malformed
 }
 
 const CLIENT_FAULT_NONE: u8 = 0;
@@ -455,9 +473,10 @@ pub(crate) enum PreHeaderSendTermination {
     /// The client went away mid-upload ([`ClientUploadFault::Disconnected`])
     /// and the gateway relayed that failure: a client-closed request.
     ClientAbort,
-    /// The client's upload failed without proof that the client left: the
-    /// frontend codec rejected it as malformed, or no typed fault was
-    /// recorded. A bad request, never a client-closed request.
+    /// The client's upload failed without proof that the client left: it was
+    /// malformed or incomplete (an early EOF from a half-closed client, a
+    /// missing `END_STREAM`), or no typed fault was recorded. A response is
+    /// still deliverable: a bad request, never a client-closed request.
     MalformedUpload,
     /// The gateway-owned pump's backend write watermark ended the upload: the
     /// backend stopped taking it.
@@ -565,7 +584,7 @@ pub(crate) fn hyper_send_error_ended_by_gateway_upload(err: &hyper::Error) -> bo
 /// retains a typed CANCEL for hyper's backend writer. Other terminals keep
 /// the redacted literal.
 fn pump_terminal_error(terminal: u8) -> BoxError {
-    if terminal == PUMP_SOURCE_RESET {
+    if terminal == PUMP_SOURCE_RESET || terminal == PUMP_SOURCE_RESET_DISCONNECTED {
         return Box::new(h2::Error::from(h2::Reason::CANCEL));
     }
     let outcome = code_outcome(terminal).unwrap_or(UploadPumpOutcome::ConsumerGone);
@@ -1010,8 +1029,10 @@ impl UploadPumpJoin {
         self.cancel();
         let outcome = self.await_outcome().await;
         let fault = match self.terminal.load(Ordering::Acquire) {
-            PUMP_SOURCE_ERROR | PUMP_SOURCE_RESET => Some(ClientUploadFault::Disconnected),
-            PUMP_SOURCE_MALFORMED => Some(ClientUploadFault::Malformed),
+            PUMP_SOURCE_DISCONNECTED | PUMP_SOURCE_RESET_DISCONNECTED => {
+                Some(ClientUploadFault::Disconnected)
+            }
+            PUMP_SOURCE_ERROR | PUMP_SOURCE_RESET => Some(ClientUploadFault::Malformed),
             _ => None,
         };
         (outcome, fault)
@@ -1652,7 +1673,7 @@ where
     let write_idle = write_configured.then(|| tokio::time::sleep(write_idle_dur));
     tokio::pin!(write_idle);
     let mut source_reset = false;
-    let mut source_malformed = false;
+    let mut source_disconnected = false;
     let outcome = 'pump: loop {
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
@@ -1752,10 +1773,10 @@ where
             }
             Some(Err(error)) => {
                 let error: BoxError = error.into();
-                // Whether the client left or sent a malformed upload (issue
-                // #6776): a typed verdict, kept in the redacted terminal.
-                source_malformed =
-                    client_upload_error_fault(error.as_ref()) == ClientUploadFault::Malformed;
+                // Whether typed proof shows the client left (issue #6776): a
+                // verdict kept in the redacted terminal, never the error.
+                source_disconnected =
+                    client_upload_error_fault(error.as_ref()) == ClientUploadFault::Disconnected;
                 // Hyper 1.10 exposes CANCEL as an error instead of masking it
                 // as EOF. Preserve only that typed wire fact through the
                 // redacted terminal, just as the masked EOF arm above does.
@@ -1780,12 +1801,11 @@ where
     // Publish BEFORE the sender drops: the transport side reads this exactly
     // when `poll_recv` observes the closed channel, and the channel close is
     // the synchronisation edge for this release store.
-    let terminal_code = if source_reset {
-        PUMP_SOURCE_RESET
-    } else if source_malformed {
-        PUMP_SOURCE_MALFORMED
-    } else {
-        outcome_code(outcome)
+    let terminal_code = match (source_reset, source_disconnected) {
+        (true, true) => PUMP_SOURCE_RESET_DISCONNECTED,
+        (true, false) => PUMP_SOURCE_RESET,
+        (false, true) => PUMP_SOURCE_DISCONNECTED,
+        (false, false) => outcome_code(outcome),
     };
     terminal.store(terminal_code, Ordering::Release);
     drop(sender);

@@ -54239,12 +54239,14 @@ fn client_upload_failure_response(
 /// typed upload terminals (issue #6776,
 /// [`upload_pump::pre_header_send_termination`]).
 ///
-/// * A proven client abort is a client-closed request: `499` (nginx's
-///   convention, the same `CLIENT_CLOSED_REQUEST_STATUS` the gRPC mapping
-///   reads), or Trailers-Only `CANCELLED` for gRPC. The client has gone, so
-///   this is what the logs and request metrics record; the caller also marks
-///   the request `client_disconnected`.
-/// * A malformed upload, where the client may still be reading, is a bad
+/// * A proven client abort (a reset the client sent, or a reset or broken
+///   connection) is a client-closed request: `499` (nginx's convention, the
+///   same `CLIENT_CLOSED_REQUEST_STATUS` the gRPC mapping reads), or
+///   Trailers-Only `CANCELLED` for gRPC. That transport cannot deliver a
+///   response, so this is what the logs and request metrics record; the
+///   caller also marks the request `client_disconnected`.
+/// * A malformed or incomplete upload without that proof (including an early
+///   EOF from a client that half-closed and is still reading) is a bad
 ///   request: `400` `{"error":"Malformed request body"}`, or
 ///   `INVALID_ARGUMENT` for gRPC. Never `499`.
 /// * Both carry the health-neutral `ClientDisconnect` class with
@@ -54291,7 +54293,7 @@ pub(crate) fn pre_header_upload_termination_response(
             debug!(
                 proxy_id = %proxy_id,
                 transport,
-                "Client request upload was malformed before backend response headers"
+                "Client request upload was malformed or incomplete before backend response headers"
             );
             if is_grpc_flavored {
                 mesh_grpc_client_upload_failure_response(

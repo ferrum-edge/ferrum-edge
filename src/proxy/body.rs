@@ -3685,7 +3685,9 @@ impl http_body::Body for SizeLimitedIncoming {
             // reports end of stream once it ended cleanly.
             Poll::Ready(None) if this.require_end_stream && !this.inner.is_end_stream() => {
                 if let Some(latch) = this.client_fault.as_ref() {
-                    latch.record(crate::proxy::upload_pump::ClientUploadFault::Disconnected);
+                    // A missing END_STREAM without a reset the client sent is
+                    // not proof it left (issue #6776).
+                    latch.record(crate::proxy::upload_pump::ClientUploadFault::Malformed);
                 }
                 this.signal_completion(RequestBodyOutcome::Errored);
                 Poll::Ready(Some(Err(h2_upload_reset_error())))
