@@ -26,6 +26,11 @@ on:
       - .github/workflows/mesh-runtime-benchmark.yml
       - .github/workflows/mesh-runtime-harness-tests.yml
   workflow_dispatch:
+    inputs:
+      runtime_checks:
+        description: "Run bounded mesh hook-plan runtime regression checks"
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -38,7 +43,7 @@ jobs:
   harness-tests:
     name: Mesh runtime harness tests
     runs-on: ubuntu-26.04
-    timeout-minutes: 20
+    timeout-minutes: 90
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
@@ -68,3 +73,21 @@ jobs:
 
       - name: Crate formatting
         run: cargo fmt --manifest-path tests/performance/mesh_runtime/Cargo.toml -- --check
+
+      - name: Runtime test prerequisites
+        if: inputs.runtime_checks == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang cmake libssl-dev libcurl4-openssl-dev
+
+      - name: Mesh hook-plan and sibling regression tests
+        if: inputs.runtime_checks == true
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_request_hook_plan_tests
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_trigger_gate_tests
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_cache_tests
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests route_header_finalization_tests
+          cargo test --locked --profile pr-build --test unit_plugins_a_tests grpc_deadline_tests
+          cargo fmt --all -- --check
