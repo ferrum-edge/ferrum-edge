@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -85,18 +86,33 @@ with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) +
     def test_readiness_has_one_wall_budget_even_when_probe_hangs(self):
         self.check_readiness("hang", expected_run=True)
 
+    @unittest.skipUnless(shutil.which("timeout"), "GNU timeout required by the Linux harness")
+    def test_expired_readiness_budget_starts_no_probe(self):
+        self.check_readiness("expired", expected_run=False)
+
     def check_readiness(self, mode, expected_run):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "logs").mkdir()
-            executable(root / "docker", '''import json, os, sys, time
-with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) + "\\n")
-if sys.argv[1] == "inspect": print("false" if os.environ["MODE"] == "dead" else "true")
-elif sys.argv[1] == "run": time.sleep(20)
+            (root / "calls").touch()
+            # Keep inspection cheap: cold Python startup can consume a short
+            # integer-SECONDS deadline before the hanging probe even starts.
+            docker = root / "docker"
+            docker.write_text('''#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$CALLS"
+if [ "$1" = inspect ]; then
+    if [ "$MODE" = dead ]; then echo false; else echo true; fi
+elif [ "$1" = run ]; then
+    exec sleep 20
+fi
 ''')
+            docker.chmod(0o755)
             script = functions("readiness_command", "probe_loadgen", "wait_ready") + '''
-READINESS_DEADLINE=$((SECONDS + 1))
-READINESS_TIMEOUT_SECS=1
+# Two ticks leave at least one second for inspection despite SECONDS rounding.
+# The real probe must still obey this shared budget instead of its 10s request.
+READINESS_TIMEOUT_SECS=2
+READINESS_DEADLINE=$((SECONDS + READINESS_TIMEOUT_SECS))
+if [ "$MODE" = expired ]; then READINESS_DEADLINE=$SECONDS; fi
 PROBE_NAME=fixture-probe
 TOOLS_IMAGE=fixture-tools
 HOST_HEADER=fixture
@@ -108,14 +124,16 @@ wait_ready http://fixture/echo fixture fixture-container
                      "OUTPUT_DIR": str(root), "MODE": mode, "CALLS": str(root / "calls")})
             self.assertNotEqual(result.returncode, 0)
             self.assertLess(time.monotonic() - started, 4.5)
-            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            calls = [shlex.split(line) for line in (root / "calls").read_text().splitlines()]
             runs = [call for call in calls if call[0] == "run"]
             self.assertEqual(bool(runs), expected_run)
             if runs:
                 self.assertIn("--exchange-timeout-secs", runs[0])
                 self.assertEqual(runs[0][runs[0].index("--exchange-timeout-secs") + 1], "2")
-            else:
+            elif mode == "dead":
                 self.assertIn("exited before readiness", result.stderr)
+            else:
+                self.assertIn("exhausted the shared", result.stderr)
 
     def test_cell_watchdog_preserves_partial_output_and_returns_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
