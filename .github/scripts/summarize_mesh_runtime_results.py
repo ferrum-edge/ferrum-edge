@@ -260,8 +260,10 @@ def collect(results_root: Path) -> dict:
         publishable = []
         for r in records:
             errors = r.get("total_errors")
+            warmup_errors = r.get("warmup_errors", None if planned is not None else 0)
             rps = float(r.get("rps") or 0)
-            ok = errors == 0 and rps > 0 and not r.get("resource_error")
+            ok = (errors == 0 and type(warmup_errors) is int and warmup_errors == 0
+                  and rps > 0 and not r.get("resource_error"))
             entry = {
                 "rps": rps,
                 "total_errors": errors,
@@ -292,7 +294,7 @@ def collect(results_root: Path) -> dict:
             else:
                 warnings.append(
                     f"unpublishable cell mesh={mesh} payload={payload} "
-                    f"rps={rps} total_errors={errors} ({r.get('source_file')})"
+                    f"rps={rps} total_errors={errors} warmup_errors={warmup_errors} ({r.get('source_file')})"
                 )
         cell: dict = {"runs": runs, "publishable_runs": len(publishable)}
         if publishable:
