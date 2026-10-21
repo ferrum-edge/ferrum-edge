@@ -325,7 +325,7 @@ def check(output):
     report = dict(data_valid=not issues, issues=issues, comparisons=comparisons,
                   image_profile=plan.get("profile"), image_features=plan.get("features"),
                   performance_gate="not configured; no nonregression/equivalence claim",
-                  interpretation="Descriptive n=4 paired throughput intervals; latency ratios are per-pair quantiles. Calibrate a tolerance with A/A before gating performance.")
+                  interpretation="Descriptive n=4 paired throughput intervals; latency ratios are per-pair completion-window quantiles, excluding successful drain completions. These do not establish admitted-cohort tail improvements. Calibrate a tolerance with A/A before gating performance.")
     write_json(output / "report.json", report)
     lines = ["Gateway regression evidence", "", f"Data valid: {report['data_valid']}; matched image profile: {report['image_profile']} (ci-release is diagnostic only).", "", report["interpretation"], "",
              "| Protocol | Bytes | Reference → candidate | RPS ratio (geomean) | 95% paired interval | Pair RPS ratios |",
@@ -335,7 +335,7 @@ def check(output):
         ratio = f"{row['ratio']:.4f}" if row["data_valid"] else "invalid"
         pairs = ", ".join(f"{r['rps']:.4f}" for r in row["pair_ratios"] if "rps" in r)
         lines.append(f"| {row['protocol']} | {row['payload_size']} | {row['baseline']} → {row['candidate']} | {ratio} | {interval} | {pairs} |")
-    lines += ["", "All per-pair RPS, P50/P95/P99/max latency ratios are in report.json. Lower latency ratios are better.", ""]
+    lines += ["", "All per-pair RPS and completion-window P50/P95/P99/max latency ratios are in report.json. Successful drain completions are counted separately by the protocol runner but excluded from these quantiles. Use the mesh lane's admitted-cohort histogram for mesh tail claims.", ""]
     lines += [f"- {issue}" for issue in issues]
     (output / "report.md").write_text("\n".join(lines) + "\n")
     return report
