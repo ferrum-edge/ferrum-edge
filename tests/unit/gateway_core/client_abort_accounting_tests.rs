@@ -1187,3 +1187,13 @@ async fn h2_peer_reset_during_shutdown_teardown_is_still_a_client_abort() {
     assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 1);
     assert_eq!(status_count(&state, GATEWAY_CLOSED_REQUEST_STATUS), 0);
 }
+
+#[test]
+fn vendored_h2_exposes_the_reset_origin_hyper_patch_006_reads() {
+    // Hyper patch 006 falls back to "origin unknown" against stock h2. Bind the
+    // vendored h2 patch 004 accessor's exact signature so the gateway build
+    // fails, rather than silently attributing nothing, if it goes missing.
+    let accessor: fn(&h2::server::SendResponse<Bytes>) -> Option<bool> =
+        h2::server::SendResponse::<Bytes>::reset_is_local;
+    let _ = accessor;
+}

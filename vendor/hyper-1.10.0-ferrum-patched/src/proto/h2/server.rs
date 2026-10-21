@@ -409,6 +409,27 @@ struct ConnectParts {
     recv_stream: RecvStream,
 }
 
+/// FERRUM PATCH 006: whether the reset that closed a stream was local.
+///
+/// Ferrum's vendored h2 adds an inherent `SendResponse::reset_is_local`
+/// (h2 patch 004), and method resolution prefers an inherent method over this
+/// trait's. Against stock h2 this fallback reports `None`, so no termination
+/// cause is published for a reset and the service never reads it as the
+/// peer's. Ferrum's gateway tests bind the vendored method's exact signature,
+/// so dropping or changing it fails there rather than silently selecting this
+/// fallback.
+trait ResetIsLocal {
+    // Unused when the inherent method exists, which is the point.
+    #[allow(dead_code)]
+    fn reset_is_local(&self) -> Option<bool>;
+}
+
+impl<B: bytes::Buf> ResetIsLocal for SendResponse<B> {
+    fn reset_is_local(&self) -> Option<bool> {
+        None
+    }
+}
+
 impl<F, B, E> H2Stream<F, B, E>
 where
     B: Body,
@@ -473,10 +494,17 @@ where
                             match me.reply.poll_reset(cx) {
                                 Poll::Ready(Ok(reason)) => {
                                     let code = u32::from(reason);
-                                    publish_h2_stream_termination(match me.reply.reset_is_local() {
-                                        Some(true) => H2StreamTermination::LocalReset { reason: code },
-                                        _ => H2StreamTermination::PeerReset { reason: code },
-                                    });
+                                    // Without the vendored h2's origin (stock h2), publish
+                                    // nothing: an unattributed reset is never the peer's.
+                                    match me.reply.reset_is_local() {
+                                        Some(true) => publish_h2_stream_termination(
+                                            H2StreamTermination::LocalReset { reason: code },
+                                        ),
+                                        Some(false) => publish_h2_stream_termination(
+                                            H2StreamTermination::PeerReset { reason: code },
+                                        ),
+                                        None => {}
+                                    }
                                     debug!("stream received RST_STREAM: {:?}", reason);
                                     return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
                                 }

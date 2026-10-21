@@ -83,7 +83,7 @@ index e17d98b20..8690f2502 100644
  mod informational;
  #[cfg(all(feature = "http1", feature = "client"))]
 diff --git a/src/proto/h2/server.rs b/src/proto/h2/server.rs
-index 5c8ae7884..05aaa9747 100644
+index 5c8ae7884..d826975c7 100644
 --- a/src/proto/h2/server.rs
 +++ b/src/proto/h2/server.rs
 @@ -17,6 +17,8 @@ use crate::common::date;
@@ -105,7 +105,35 @@ index 5c8ae7884..05aaa9747 100644
      }
  }
  
-@@ -422,6 +427,7 @@ where
+@@ -404,6 +409,27 @@ struct ConnectParts {
+     recv_stream: RecvStream,
+ }
+ 
++/// FERRUM PATCH 006: whether the reset that closed a stream was local.
++///
++/// Ferrum's vendored h2 adds an inherent `SendResponse::reset_is_local`
++/// (h2 patch 004), and method resolution prefers an inherent method over this
++/// trait's. Against stock h2 this fallback reports `None`, so no termination
++/// cause is published for a reset and the service never reads it as the
++/// peer's. Ferrum's gateway tests bind the vendored method's exact signature,
++/// so dropping or changing it fails there rather than silently selecting this
++/// fallback.
++trait ResetIsLocal {
++    // Unused when the inherent method exists, which is the point.
++    #[allow(dead_code)]
++    fn reset_is_local(&self) -> Option<bool>;
++}
++
++impl<B: bytes::Buf> ResetIsLocal for SendResponse<B> {
++    fn reset_is_local(&self) -> Option<bool> {
++        None
++    }
++}
++
+ impl<F, B, E> H2Stream<F, B, E>
+ where
+     B: Body,
+@@ -422,6 +448,7 @@ where
              date_header,
              timer,
              exec,
@@ -113,7 +141,7 @@ index 5c8ae7884..05aaa9747 100644
          }
      }
  }
-@@ -461,13 +467,36 @@ where
+@@ -461,13 +488,43 @@ where
                          Poll::Pending => {
                              // Response is not yet ready, so we want to check if the client has sent a
                              // RST_STREAM frame which would cancel the current request.
@@ -128,10 +156,17 @@ index 5c8ae7884..05aaa9747 100644
 +                            match me.reply.poll_reset(cx) {
 +                                Poll::Ready(Ok(reason)) => {
 +                                    let code = u32::from(reason);
-+                                    publish_h2_stream_termination(match me.reply.reset_is_local() {
-+                                        Some(true) => H2StreamTermination::LocalReset { reason: code },
-+                                        _ => H2StreamTermination::PeerReset { reason: code },
-+                                    });
++                                    // Without the vendored h2's origin (stock h2), publish
++                                    // nothing: an unattributed reset is never the peer's.
++                                    match me.reply.reset_is_local() {
++                                        Some(true) => publish_h2_stream_termination(
++                                            H2StreamTermination::LocalReset { reason: code },
++                                        ),
++                                        Some(false) => publish_h2_stream_termination(
++                                            H2StreamTermination::PeerReset { reason: code },
++                                        ),
++                                        None => {}
++                                    }
 +                                    debug!("stream received RST_STREAM: {:?}", reason);
 +                                    return Poll::Ready(Err(crate::Error::new_h2(reason.into())));
 +                                }

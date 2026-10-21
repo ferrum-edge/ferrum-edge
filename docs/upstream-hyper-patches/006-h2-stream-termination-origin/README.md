@@ -40,9 +40,18 @@ applies after patches 001–005.
   pending cause.
 - `H2Stream::poll2` publishes the cause just before it returns the reset
   error that ends the stream: a reset whose `SendResponse::reset_is_local()`
-  (h2 patch 004) is `Some(true)` is `LocalReset`, any other reset is
+  (h2 patch 004) is `Some(true)` is `LocalReset`, `Some(false)` is
   `PeerReset`; an I/O error is `TransportLost`; an error carrying a reason is
   classified by `h2::Error::is_remote()`.
+- Like patch 005's `CapacityAndAssigned`, a private `ResetIsLocal` fallback
+  trait keeps the crate building against stock h2 (the standalone
+  `Vendored Patch Regressions` lane tests it that way as well as on the
+  vendored h2). Method resolution prefers the vendored h2's inherent
+  `reset_is_local`; the stock-h2 fallback reports `None`, and then no cause is
+  published for a reset, so the service never reads it as the peer's.
+  Ferrum's `tests/unit/gateway_core/client_abort_accounting_tests.rs::vendored_h2_exposes_the_reset_origin_hyper_patch_006_reads`
+  binds the vendored method's exact signature, so dropping or changing it
+  fails the gateway's test build instead of silently selecting the fallback.
 - `H2Stream` gains a last field, `ClearH2StreamTermination`, which drops after
   the service future and clears the slot. Tokio drops a completed task's
   future synchronously in the poll that completed it, so the cause is visible
