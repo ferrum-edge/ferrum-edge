@@ -4,8 +4,10 @@
 use std::collections::HashMap;
 
 use ferrum_edge::_test_support::{
-    PROTOCOL_LEVEL_405_ALLOW_FOR_TEST, allow_header_from_allowed_methods_for_test,
-    apply_authoritative_backend_gateway_error_header_for_test, request_method_is_allowed_for_test,
+    PROTOCOL_LEVEL_405_ALLOW_FOR_TEST, admin_builder_failure_response_for_test,
+    allow_header_from_allowed_methods_for_test,
+    apply_authoritative_backend_gateway_error_header_for_test,
+    internal_error_fallback_response_for_test, request_method_is_allowed_for_test,
     x_gateway_error_for_backend_failure_for_test,
 };
 
@@ -41,6 +43,51 @@ fn x_gateway_error_maps_connect_timeout_and_backend_5xx() {
         x_gateway_error_for_backend_failure_for_test(false, 404),
         None
     );
+    // #6770 / #6771: a connect timeout (504) and a pre-dial maxConnections
+    // refusal (503) are still pre-wire connection failures for the header.
+    assert_eq!(
+        x_gateway_error_for_backend_failure_for_test(true, 504),
+        Some("connection_failure")
+    );
+    assert_eq!(
+        x_gateway_error_for_backend_failure_for_test(true, 503),
+        Some("connection_failure")
+    );
+}
+
+#[test]
+fn response_builder_fallback_is_500_not_default_200() {
+    // #6775: `Response::new` defaults to 200 OK, so every builder-failure
+    // fallback must set 500 explicitly and keep a fixed, safe body.
+    for (body, content_type) in [
+        (r#"{"error":"Internal server error"}"#, "application/json"),
+        ("Internal server error", "text/plain"),
+    ] {
+        let response = internal_error_fallback_response_for_test(body);
+        assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(content_type)
+        );
+    }
+}
+
+#[test]
+fn no_proxy_response_fallback_defaults_to_200() {
+    // Guard the pattern itself: a bare `Response::new(ProxyBody::from_string(..))`
+    // in the proxy core must set its status before it can be returned.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    for (index, _) in proxy.match_indices("Response::new(ProxyBody::from_string(") {
+        let window = &proxy[index..proxy.len().min(index + 400)];
+        assert!(
+            window.contains(".status_mut()"),
+            "Response::new fallback without an explicit status near: {}",
+            &proxy[index..proxy.len().min(index + 120)]
+        );
+    }
 }
 
 #[test]
@@ -392,4 +439,27 @@ fn h3_gateway_error_terminal_writes_the_token_after_after_proxy_hooks() {
             && !oversized_compact.contains("headers"),
         "the declared-oversize 502 must hand the typed signal to the terminal writer"
     );
+}
+
+#[test]
+fn admin_builder_fallback_is_500_not_default_200() {
+    let response = admin_builder_failure_response_for_test();
+    assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    for source in [
+        include_str!("../../../src/admin/mod.rs"),
+        include_str!("../../../src/admin/config_export.rs"),
+        include_str!("../../../src/admin/api_specs/handlers.rs"),
+    ] {
+        assert!(
+            !source.contains("unwrap_or_else(|_| Response::new("),
+            "admin builder fallbacks must not default to 200"
+        );
+    }
 }

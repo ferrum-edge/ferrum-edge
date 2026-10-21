@@ -387,6 +387,23 @@ pub struct ConnectionPool {
     pool: Arc<GenericPool<ReqwestPoolManager>>,
 }
 
+/// Typed marker for an HTTP/3 backend TLS client configuration the gateway
+/// could not build (unreadable or invalid CA / client material, or a refused
+/// backend TLS policy). It is a gateway-side internal fault, not evidence that
+/// the backend is unavailable, so callers recognize it structurally (through
+/// the `anyhow` chain) instead of matching the message. Native gRPC answers it
+/// with `INTERNAL` rather than `UNAVAILABLE` (#6773).
+#[derive(Debug)]
+pub struct BackendTlsConfigUnavailable(String);
+
+impl std::fmt::Display for BackendTlsConfigUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BackendTlsConfigUnavailable {}
+
 impl ConnectionPool {
     /// Create a new connection pool manager with global configuration.
     #[allow(dead_code)] // Used by focused tests and by callers that do not share SVID rotation state.
@@ -663,8 +680,11 @@ impl ConnectionPool {
         &self,
         proxy: &Proxy,
     ) -> Result<Arc<rustls::ClientConfig>, anyhow::Error> {
-        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls)
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))?;
+        crate::tls::backend::refuse_backend_tls_if_refused(&proxy.resolved_tls).map_err(|e| {
+            anyhow::Error::new(BackendTlsConfigUnavailable(format!(
+                "Failed to build HTTP/3 backend TLS config: {e}"
+            )))
+        })?;
         let manager = self.pool.manager();
         manager
             .backend_h3_tls_configs
@@ -677,7 +697,11 @@ impl ConnectionPool {
                 }
             })
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 backend TLS config: {}", e))
+            .map_err(|e| {
+                anyhow::Error::new(BackendTlsConfigUnavailable(format!(
+                    "Failed to build HTTP/3 backend TLS config: {e}"
+                )))
+            })
     }
 
     /// TLS configuration for `wss://` backend upgrades.

@@ -2452,6 +2452,43 @@ pub mod _test_support {
         crate::proxy::http_backend_failure_status_and_body(class)
     }
 
+    pub fn internal_error_fallback_response_for_test(
+        body: &'static str,
+    ) -> hyper::Response<crate::proxy::ProxyBody> {
+        crate::proxy::internal_error_fallback_response(body)
+    }
+
+    pub fn h3_pool_failure_backend_response_for_test(
+        error_class: crate::retry::ErrorClass,
+        connection_error: bool,
+        request_on_wire: bool,
+    ) -> crate::retry::BackendResponse {
+        crate::proxy::h3_pool_failure_backend_response(
+            error_class,
+            connection_error,
+            request_on_wire,
+            None,
+        )
+    }
+
+    pub fn websocket_backend_failure_status_and_body_for_test(
+        class: crate::retry::ErrorClass,
+    ) -> (hyper::StatusCode, &'static str) {
+        crate::proxy::websocket_backend_failure_status_and_body(class)
+    }
+
+    pub fn grpc_bridge_failure_health_for_test(
+        err: &crate::proxy::grpc_proxy::GrpcProxyError,
+        error_class: crate::retry::ErrorClass,
+    ) -> (u16, crate::retry::ErrorClass) {
+        crate::http3::cross_protocol::grpc_bridge_failure_health(err, error_class)
+    }
+
+    pub fn admin_builder_failure_response_for_test()
+    -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        crate::admin::admin_builder_failure_response()
+    }
+
     pub fn x_gateway_error_for_backend_failure_for_test(
         connection_error: bool,
         status: u16,

@@ -738,9 +738,24 @@ async fn connect_backend(
             if class == retry::ErrorClass::PortExhaustion {
                 state.overload.record_port_exhaustion();
             }
+            // A kernel `ETIMEDOUT` (connect budget longer than the OS TCP
+            // timeout) is the same cause as the gateway's own connect timer
+            // below, so it gets the same 504 (#6770).
+            let (status, body): (StatusCode, &'static [u8]) =
+                if class == retry::ErrorClass::ConnectionTimeout {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        &br#"{"error":"Backend HBONE connection timed out"}"#[..],
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        &br#"{"error":"Backend HBONE connection failed"}"#[..],
+                    )
+                };
             return Err(HboneConnectFailure::Backend(HboneConnectError {
-                status: StatusCode::BAD_GATEWAY,
-                body: br#"{"error":"Backend HBONE connection failed"}"#,
+                status,
+                body,
                 phase: "hbone_connect",
                 class,
                 message: err.to_string(),

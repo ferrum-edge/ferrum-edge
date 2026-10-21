@@ -492,6 +492,33 @@ async fn success_outcome_populates_body_fields() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn fire_with_response_status_logs_the_status_actually_sent() {
+    // #6775: when the H1/H2 response builder rejects a prepared response, the
+    // client receives the gateway's 500 fallback instead, so the single
+    // terminal record must carry 500 rather than the status captured at
+    // header commit — and still fire exactly once.
+    let (plugin, captured) = CapturingPlugin::new();
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![Arc::new(plugin)]);
+    let summary = make_summary_with_status(200);
+    let logger = DeferredTransactionLogger::new(summary, plugins, make_ctx());
+
+    logger.fire_with_response_status(BodyOutcome::error(ErrorClass::RequestError, 0, false), 500);
+    logger.fire(BodyOutcome::success(10));
+    drop(logger);
+
+    let captures = wait_for_captures(&captured, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let captures_after = captured.lock().unwrap().len();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures_after, 1, "later fire/Drop must not log again");
+    let got = &captures[0];
+    assert_eq!(got.response_status_code, 500);
+    assert_eq!(got.body_error_class, Some(ErrorClass::RequestError));
+    assert!(!got.body_completed);
+    assert!(!got.client_disconnected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fire_invokes_response_stream_termination_before_log() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let status = Arc::new(Mutex::new(None));

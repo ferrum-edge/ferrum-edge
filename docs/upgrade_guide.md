@@ -44,6 +44,50 @@ client-certificate trust, a sibling's authorization-lifetime close, shutdown
 teardown after the drain wait) as `444` with a `gateway_close_*` rejection
 phase.
 
+### Gateway-authored status codes follow the failure cause (issues #6770, #6771, #6773, #6775)
+
+- A backend **connect timeout** now answers `504` instead of `502` on the
+  reqwest, direct HTTP/2, native HTTP/3 (from any frontend), HTTP/3 bridge,
+  HBONE / sidecar-mTLS pool and WebSocket transports, with the shared
+  `{"error":"Backend timeout"}` body (the inbound HBONE relay keeps its own
+  timeout wording). Unix sockets and the sidecar readiness
+  budget already answered `504`. Native gRPC answers `DEADLINE_EXCEEDED` (`4`)
+  for a connect timeout on every path, including sidecar mTLS and native
+  HTTP/3, which used to answer `UNAVAILABLE` (`14`). It is still a pre-wire
+  connection failure:
+  `error_class=connection_timeout`, `X-Gateway-Error: connection_failure`,
+  `retry_on_connect_failure` replay, target rotation, and circuit-breaker
+  accounting are unchanged. A `retryable_status_codes` list containing `504`
+  does not make it status-retryable. An established HTTP/3 (QUIC) backend
+  connection that times out while the gateway waits on it is also `504`
+  (post-wire, like a read timeout), so a route listing `504` in
+  `retryable_status_codes` retries it for `retryable_methods` only.
+- A DestinationRule `maxConnections` refusal on the pooled transports (direct
+  HTTP/2, native HTTP/3, HBONE, sidecar mTLS) now answers `503`
+  `{"error":"Backend connection limit exceeded"}`, the status reqwest, the
+  Unix-socket pool and raw TCP already used. `error_class=backend_connection_limit`
+  stays pre-wire and backend-health-neutral.
+- A native gRPC internal gateway failure (backend TLS config or backend
+  URL/authority could not be built) now carries `grpc-status: 13` (`INTERNAL`)
+  with `grpc-message: Internal gateway error` on HTTP/1.1, HTTP/2 and the
+  native-HTTP/3 backend dispatch, as the HTTP/3 bridges already did, instead of
+  `14` (`UNAVAILABLE`). It stays neutral for backend health on every path,
+  including the HTTP/3 → gRPC bridges, which used to charge it as a `502`.
+- A native-HTTP/3 gRPC backend connect timeout answers `DEADLINE_EXCEEDED`
+  (`4`) like HTTP/1.1 / HTTP/2, instead of `UNAVAILABLE` (`14`).
+- A failed WebSocket backend dial or handshake now carries `X-Gateway-Error`
+  (`connection_failure`, `backend_timeout` or `backend_error`).
+- A response the proxy or admin API response builder rejects now answers an
+  explicit `500` (it used to fall back to a `200` carrying an error body).
+- `FERRUM_VIA_PSEUDONYM` must be an RFC 9110 token, optionally followed by
+  `:<port>`; startup rejects other values.
+
+**Operator action:** dashboards or alerts that count connect timeouts by
+`502`, or `maxConnections` saturation by `502`, should select by `error_class`
+(`connection_timeout`, `backend_connection_limit`) or the new status. gRPC
+clients that retried `UNAVAILABLE` will no longer retry a deterministic
+gateway configuration fault.
+
 ### Plugin-config writes require `expected_proxy_ids` (forge-ops #569, PR #6744)
 
 `PUT` and `DELETE /plugins/config/{id}` now require the

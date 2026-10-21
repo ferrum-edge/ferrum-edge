@@ -1232,7 +1232,8 @@ async fn late_sidecar_readiness_wake_preserves_connect_before_client_winner() {
     );
     assert_eq!(
         sidecar_readiness_connect_terminal_for_test(),
-        (200, Some("14".into()), false)
+        // A sidecar connect timeout is a backend deadline (#6770 review).
+        (200, Some("4".into()), false)
     );
     assert_eq!(plan.2.observed(), None, "later authorization did not win");
 }

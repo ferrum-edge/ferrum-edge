@@ -2365,7 +2365,7 @@ fn spec_content_response(
             .header("Cache-Control", "no-store")
             .header("Vary", "Accept")
             .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
     }
 
     // Decompress with an output cap.  A corrupted or bomb-ratio row from the
@@ -3783,7 +3783,7 @@ pub async fn handle_delete_api_spec(
             .status(StatusCode::NO_CONTENT)
             .header("Cache-Control", "no-store")
             .body(Full::new(Bytes::new()))
-            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+            .unwrap_or_else(|_| crate::admin::admin_builder_failure_response());
         Ok(state
             .complete_live_config_mutation_after_commit_boxed(
                 namespace,

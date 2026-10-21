@@ -476,10 +476,26 @@ impl DeferredTransactionLogger {
         {
             return;
         }
-        self.fire_once(outcome);
+        self.fire_once(outcome, None);
     }
 
-    fn fire_once(&self, outcome: BodyOutcome) {
+    /// [`Self::fire`] for a terminal whose client-visible status is no longer
+    /// the one captured at header commit: the response the summary describes
+    /// was never sent and the gateway answered with `response_status` instead
+    /// (the response-builder failure fallback, #6775). Same single-fire
+    /// semantics.
+    pub fn fire_with_response_status(&self, outcome: BodyOutcome, response_status: u16) {
+        if self
+            .fired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.fire_once(outcome, Some(response_status));
+    }
+
+    fn fire_once(&self, outcome: BodyOutcome, response_status_override: Option<u16>) {
         let state = match self.state.lock() {
             Ok(mut guard) => guard.take(),
             // A poisoned mutex means another thread panicked while holding
@@ -503,6 +519,9 @@ impl DeferredTransactionLogger {
             request_bytes_latch,
             request_protocol_is_grpc,
         } = state;
+        if let Some(status) = response_status_override {
+            summary.response_status_code = status;
+        }
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
         summary.client_disconnected = outcome.client_disconnected;
@@ -628,7 +647,7 @@ impl Drop for DeferredTransactionLogger {
         // — callers that care about partial-byte accuracy should call
         // `fire` explicitly with the observed count.
         if !self.fired.swap(true, Ordering::AcqRel) {
-            self.fire_once(BodyOutcome::client_disconnect(0));
+            self.fire_once(BodyOutcome::client_disconnect(0), None);
         }
     }
 }
