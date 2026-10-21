@@ -732,6 +732,7 @@ class GuardObservationTests(unittest.TestCase):
                 / "h2-coalesce-data-frame-writes.patch",
                 repo / "docs/upstream-h2-patches/003-assigned-send-capacity"
                 / "h2-assigned-send-capacity.patch",
+                repo / "docs/upstream-h2-patches/004-reset-origin" / "h2-reset-origin.patch",
             )
             for patch in reversed(patches):
                 subprocess.run(["patch", "--batch", "--fuzz=0", "-R", "-p1"],

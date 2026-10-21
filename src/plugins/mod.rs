@@ -8743,7 +8743,8 @@ pub const LATENCY_UNKNOWN_MS: f64 = -1.0;
 /// * [`Self::Observed`] — the record was finalized at the response's terminal
 ///   transport boundary: a streamed body ended, failed, or was dropped by the
 ///   transport (`DeferredTransactionLogger`), an HTTP/3 send (buffered,
-///   streamed, or a rejection) settled, or the transport ended an H1/H2 request
+///   streamed, or a rejection) settled, an HBONE relay ended, or the transport
+///   ended an H1/H2 request
 ///   before any response was produced (the client-abort `499`, the
 ///   protocol-reset `400`, or the gateway-close `444`).
 ///   `client_disconnected` and `body_completed` describe

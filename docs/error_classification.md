@@ -322,6 +322,11 @@ or the wait for backend response headers is pending — is settled once by its
   / `gateway_close_shutdown` / `connection_closed_before_response`. Only the
   trust withdrawal reports gRPC `UNAUTHENTICATED`; the others are
   `UNAVAILABLE`.
+Explicit HTTP/2 stream evidence (the peer's reset, or the local stack's) is
+decided first; the gateway-close causes classify only an otherwise ambiguous
+loss (a lost HTTP/2 transport, an HTTP/1.1 drop, an HTTP/2 drop with no
+published cause).
+
 - **Terminal log in flight:** the request's own summary stands. `log_with_mirror`
   hands the sinks that had not started, the runtime counters, and the mirrors to
   detached delivery when it is dropped (a sink whose `log` started is never

@@ -429,20 +429,33 @@ fn deliver(
 
 /// Attribute a dropped handler (see [`TerminationCause`]).
 ///
-/// Gateway-initiated connection closes come first: their teardown also loses
-/// the transport underneath the stream, which must not read as the peer's.
-/// Then the HTTP/2 termination hyper published while dropping the stream
-/// (Hyper patch 006), which separates the peer's reset from the local stack's.
-/// An HTTP/1.1 dispatcher drops an in-flight request only on the client's EOF
-/// or I/O error, every gateway-initiated HTTP/1.1 close being one of the
-/// causes checked first. Anything else is unattributed and never labelled a
-/// client cancellation.
+/// Explicit stream-level evidence wins: the HTTP/2 peer's own `RST_STREAM` or
+/// `GOAWAY` is a client cancellation even while the gateway is closing the
+/// connection (a sibling's authorization close, shutdown), and a reset the
+/// local HTTP/2 stack sent is a protocol rejection. Only an otherwise
+/// ambiguous loss — a lost HTTP/2 transport, an HTTP/2 drop with no published
+/// cause, or an HTTP/1.1 dispatcher dropping an in-flight request — is
+/// attributed to a gateway-initiated close when one is in progress:
+/// withdrawn client-certificate trust, an authorization-lifetime close, or
+/// shutdown teardown after the drain wait. Without one, a lost transport and
+/// an HTTP/1.1 drop (which hyper's dispatcher performs only on the client's
+/// EOF or I/O error) are the client's cancellation; an HTTP/2 drop with no
+/// cause is unattributed and never labelled a client cancellation.
 fn termination_cause(
     ctx: &RequestContext,
     state: &ProxyState,
     http2: bool,
     h2_termination: Option<hyper::ext::H2StreamTermination>,
 ) -> TerminationCause {
+    match h2_termination {
+        Some(hyper::ext::H2StreamTermination::PeerReset { .. }) if http2 => {
+            return TerminationCause::PeerCancelled;
+        }
+        Some(hyper::ext::H2StreamTermination::LocalReset { .. }) if http2 => {
+            return TerminationCause::LocalProtocolReset;
+        }
+        _ => {}
+    }
     if ctx
         .client_trust_session
         .as_ref()
@@ -460,21 +473,15 @@ fn termination_cause(
     if state.overload.drain_wait_ended.load(Ordering::Acquire) {
         return TerminationCause::ShutdownTeardown;
     }
-    if http2 {
-        return match h2_termination {
-            Some(
-                hyper::ext::H2StreamTermination::PeerReset { .. }
-                | hyper::ext::H2StreamTermination::TransportLost,
-            ) => TerminationCause::PeerCancelled,
-            Some(hyper::ext::H2StreamTermination::LocalReset { .. }) => {
-                TerminationCause::LocalProtocolReset
-            }
-            // `H2StreamTermination` is non-exhaustive; an unknown cause, or
-            // none, is not evidence of the peer's cancellation.
-            Some(_) | None => TerminationCause::Unattributed,
-        };
+    if !http2 {
+        return TerminationCause::PeerCancelled;
     }
-    TerminationCause::PeerCancelled
+    match h2_termination {
+        Some(hyper::ext::H2StreamTermination::TransportLost) => TerminationCause::PeerCancelled,
+        // `H2StreamTermination` is non-exhaustive; an unknown cause, or none,
+        // is not evidence of the peer's cancellation.
+        _ => TerminationCause::Unattributed,
+    }
 }
 
 impl Drop for ClientAbortScope {

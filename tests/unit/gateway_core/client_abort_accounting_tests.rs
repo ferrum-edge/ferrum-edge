@@ -869,7 +869,7 @@ async fn shutdown_teardown_drop_is_a_gateway_close_not_a_client_abort() {
         record.observe_plugins(&plugins);
     }
     state.overload.draining.store(true, Ordering::Release);
-    ferrum_edge::overload::end_shutdown_drain_wait(&state.overload);
+    ferrum_edge::overload::end_shutdown_drain_wait(&state.overload).await;
     drop(scope);
 
     let summaries = captured_after(&captured, 1).await;
@@ -1020,12 +1020,14 @@ fn h2_frame(kind: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort() {
-    // The client declares `content-length: 1` and sends five bytes. hyper's
-    // HTTP/2 stack resets the stream with PROTOCOL_ERROR itself while the
-    // handler is pending: a local protocol rejection, not the peer's
-    // cancellation.
+/// Serve one raw HTTP/2 connection whose handler installs a production
+/// `ClientAbortScope` and then stays pending, open stream 1 (a POST declaring
+/// `content-length: 1`), and wait until the handler runs. Returns the client's
+/// write half for the frames that end the stream.
+async fn open_pending_h2_stream(
+    state: &Arc<ProxyState>,
+    plugins: &PluginChain,
+) -> tokio::io::WriteHalf<tokio::io::DuplexStream> {
     use std::convert::Infallible;
 
     use http_body_util::Empty;
@@ -1034,12 +1036,10 @@ async fn h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort() {
     use hyper::{Request, Response};
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
-    let state = scope_state();
-    let (plugins, captured) = capture();
     let (called_tx, mut called_rx) = mpsc::unbounded_channel::<()>();
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let service_state = Arc::clone(&state);
-    let service_plugins = Arc::clone(&plugins);
+    let service_state = Arc::clone(state);
+    let service_plugins = Arc::clone(plugins);
     let service = service_fn(move |_request: Request<Incoming>| {
         let state = Arc::clone(&service_state);
         let plugins = Arc::clone(&service_plugins);
@@ -1092,6 +1092,18 @@ async fn h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort() {
         .expect("the handler runs")
         .expect("handler signal");
     client_write
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort() {
+    // The client declares `content-length: 1` and sends five bytes. hyper's
+    // HTTP/2 stack resets the stream with PROTOCOL_ERROR itself while the
+    // handler is pending: a local protocol rejection, not the peer's
+    // cancellation.
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let mut client_write = open_pending_h2_stream(&state, &plugins).await;
+    client_write
         .write_all(&h2_frame(0x0, 0, 1, b"hello"))
         .await
         .expect("DATA past content-length");
@@ -1108,4 +1120,31 @@ async fn h2_local_protocol_reset_is_a_protocol_error_not_a_client_abort() {
     );
     assert_eq!(status_count(&state, PROTOCOL_RESET_REQUEST_STATUS), 1);
     assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_peer_reset_during_shutdown_teardown_is_still_a_client_abort() {
+    // Explicit stream evidence beats connection-close state: the client's own
+    // RST_STREAM(CANCEL) after shutdown stopped waiting is its cancellation,
+    // not the gateway's teardown.
+    let state = scope_state();
+    let (plugins, captured) = capture();
+    let mut client_write = open_pending_h2_stream(&state, &plugins).await;
+    state.overload.draining.store(true, Ordering::Release);
+    // Nothing is in flight on this state's counters, so this returns at once.
+    ferrum_edge::overload::end_shutdown_drain_wait(&state.overload).await;
+    client_write
+        .write_all(&h2_frame(0x3, 0, 1, &0x8u32.to_be_bytes()))
+        .await
+        .expect("RST_STREAM(CANCEL)");
+
+    let summaries = captured_after(&captured, 1).await;
+    assert_eq!(summaries.len(), 1, "exactly one terminal record");
+    assert_eq!(
+        summaries[0].response_status_code,
+        CLIENT_CLOSED_REQUEST_STATUS
+    );
+    assert!(summaries[0].client_disconnected);
+    assert_eq!(status_count(&state, CLIENT_CLOSED_REQUEST_STATUS), 1);
+    assert_eq!(status_count(&state, GATEWAY_CLOSED_REQUEST_STATUS), 0);
 }

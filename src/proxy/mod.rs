@@ -15401,7 +15401,13 @@ async fn handle_connection(
             // to poll the connection lets streams finish before the connection
             // future resolves.
             conn.as_mut().graceful_shutdown();
-            conn.as_mut().await
+            tokio::select! {
+                result = conn.as_mut() => result,
+                // Shutdown stopped waiting for in-flight work: close this
+                // connection now, while observability delivery is still open,
+                // so each request it drops settles its terminal (issue #6768).
+                () = post_conn_state.overload.wait_for_drain_wait_end() => Ok(()),
+            }
         }
         () = crate::proxy::auth_lifetime::authorization_close_requested(
             &mut authorization_close_rx,
@@ -24463,7 +24469,13 @@ async fn handle_tls_connection(
             // Send GOAWAY (H2) / signal end-of-keepalive (H1) and wait for
             // in-flight requests to complete on this connection.
             conn.as_mut().graceful_shutdown();
-            conn.as_mut().await
+            tokio::select! {
+                result = conn.as_mut() => result,
+                // Shutdown stopped waiting for in-flight work: close this
+                // connection now, while observability delivery is still open,
+                // so each request it drops settles its terminal (issue #6768).
+                () = post_conn_state.overload.wait_for_drain_wait_end() => Ok(()),
+            }
         }
         () = crate::proxy::auth_lifetime::authorization_close_requested(
             &mut authorization_close_rx,
