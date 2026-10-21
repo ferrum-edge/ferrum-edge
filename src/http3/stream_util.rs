@@ -647,7 +647,7 @@ pub(crate) fn h3_request_read_error_is_client_abort(error: &h3::error::StreamErr
 /// still polled or the send half is later used to write a response.
 pub(crate) fn peer_response_stopped<S>(
     stream: &RequestStream<S, Bytes>,
-) -> impl Future<Output = bool> + Send + 'static
+) -> impl Future<Output = bool> + Send + 'static + use<S>
 where
     S: SendStreamStopped,
 {
