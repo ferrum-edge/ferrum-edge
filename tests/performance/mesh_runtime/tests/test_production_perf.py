@@ -16,6 +16,7 @@ M = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(M)
 IMAGE = "sha256:" + "a" * 64
 ATTRS = "cpu-clock:u: type: 1 (software), config: 0 (PERF_COUNT_SW_CPU_CLOCK), { sample_period, sample_freq }: 49, sample_type: IP|TID|TIME|CPU, freq: 1, inherit: 1, exclude_kernel: 1, use_clockid: 1, clockid: 1\n"
+DUMMY = "dummy:u: type: 1 (PERF_TYPE_SOFTWARE), config: 0x9 (PERF_COUNT_SW_DUMMY), { sample_period, sample_freq }: 49, sample_type: IP|TID|TIME|ID|CPU|PERIOD, freq: 1, inherit: 1, exclude_kernel: 1, mmap: 1, comm: 1, task: 1, sample_id_all: 1, mmap2: 1, comm_exec: 1, use_clockid: 1, clockid: 1\n"
 
 
 def line(pid=101, when=15, symbol="ferrum::request", dso="/usr/local/bin/ferrum-edge"):
@@ -64,6 +65,31 @@ class ProductionPerf(unittest.TestCase):
         self.assertTrue(M.validate_attributes(ATTRS.replace("IP|TID|TIME|CPU", "IP|TID|TIME|STACK_USER")))
         self.assertTrue(M.validate_attributes(ATTRS.replace("clockid: 1", "clockid: 0")))
 
+    def test_delayed_recording_dummy_must_be_software_metadata(self):
+        self.assertEqual(M.validate_attributes(ATTRS + DUMMY), [])
+        for dummy in (DUMMY.replace("type: 1", "type: 0"), DUMMY.replace("config: 0x9", "config: 0"),
+                      DUMMY.replace("mmap: 1", "mmap: 0"), DUMMY.replace("comm: 1", "comm: 0"),
+                      DUMMY.replace("task: 1", "task: 0"), DUMMY.replace("clockid: 1", "clockid: 0"),
+                      DUMMY.replace("IP|TID|TIME|ID|CPU|PERIOD", "IP|TID|TIME|STACK_USER"),
+                      DUMMY.replace("dummy:u:", "cycles:u:"), DUMMY + DUMMY):
+            with self.subTest(dummy=dummy):
+                self.assertTrue(M.validate_attributes(ATTRS + dummy))
+        self.assertTrue(M.validate_attributes(DUMMY))
+        self.assertTrue(M.validate_attributes(ATTRS + ATTRS))
+
+    def test_dummy_and_unexpected_event_samples_are_explicit_unknowns(self):
+        text = "\n".join([line(), line().replace("cpu-clock:u:", "dummy:u:"),
+                          line(when=9).replace("cpu-clock:u:", "dummy:u:"),
+                          line().replace("cpu-clock:u:", "cycles:u:")])
+        result = M.parse_leaves(text, 101, 10, 20, {"/usr/local/bin/ferrum-edge": {}})
+        self.assertEqual(result["all_capture_sample_count"], 4)
+        self.assertEqual(result["measurement_sample_count"], 3)
+        self.assertEqual(result["unexpected_event_samples"], 3)
+        self.assertEqual(result["dummy_event_samples"], 2)
+        self.assertEqual(result["known_leaves"], 1)
+        self.assertEqual(result["unknown_leaves"], 2)
+        self.assertEqual(result["known_leaf_fraction"], 1 / 3)
+
     def test_decoder_selects_private_cache_before_subcommand(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -96,7 +122,7 @@ class ProductionPerf(unittest.TestCase):
         self.assertEqual(capture.environment()["PERF_BUILDID_DIR"], "/tmp/not-created/buildid-cache")
         self.assertEqual(capture.environment()["DEBUGINFOD_URLS"], "")
 
-    def fixture(self, output, *, known=80, lost=0, throttle=0, foreign=False, count_delta=0):
+    def fixture(self, output, *, known=80, lost=0, throttle=0, foreign=False, count_delta=0, dummy_sample=False):
         containers = [{"name": "source", "pid": 101, "image_id": IMAGE}, {"name": "destination", "pid": 102, "image_id": IMAGE}]
         capture = M.PerfCapture(containers, output, [])
         capture.output.mkdir()
@@ -116,12 +142,14 @@ class ProductionPerf(unittest.TestCase):
             rows += [line(container["pid"], symbol="[unknown]") for _ in range(100 - known)]
             if foreign:
                 rows.append(line(999, when=9))
+            if dummy_sample:
+                rows.append(line(container["pid"], when=9).replace("cpu-clock:u:", "dummy:u:"))
             leafs[container["role"]] = "\n".join(rows) + "\n"
         def command(role, name, argv, raw_records=False):
-            text = {"attributes.txt": ATTRS, "buildids.txt": "1234 /usr/local/bin/ferrum-edge\n",
+            text = {"attributes.txt": ATTRS + DUMMY, "buildids.txt": "1234 /usr/local/bin/ferrum-edge\n",
                     "leaf-events-all.txt": leafs[role["container"]["role"]]}.get(name, "PERF_RECORD_SAMPLE\n")
             (role["directory"] / name).write_text(text)
-            return {"PERF_RECORD_SAMPLE": 100 + int(foreign) + count_delta, "PERF_RECORD_LOST": lost,
+            return {"PERF_RECORD_SAMPLE": 100 + int(foreign) + int(dummy_sample) + count_delta, "PERF_RECORD_LOST": lost,
                     "PERF_RECORD_THROTTLE": throttle}
         capture.command = command
         return capture
@@ -140,13 +168,19 @@ class ProductionPerf(unittest.TestCase):
             self.assertTrue((capture.output / "capture.json").is_file())
 
     def test_low_coverage_loss_throttle_foreign_and_decoder_mismatch_are_invalid(self):
-        for options in ({"known": 79}, {"lost": 1}, {"throttle": 1}, {"foreign": True}, {"count_delta": 1}):
+        for options in ({"known": 79}, {"lost": 1}, {"throttle": 1}, {"foreign": True}, {"count_delta": 1}, {"dummy_sample": True}):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as tmp:
                 capture = self.fixture(Path(tmp) / "capture", **options)
                 result = capture.decode(10, 20)
                 self.assertFalse(result["valid"])
                 self.assertTrue(all(role["errors"] for role in result["roles"]))
                 self.assertTrue((capture.output / "capture.json").is_file())
+                if options.get("dummy_sample"):
+                    for role in result["roles"]:
+                        self.assertIn("metadata dummy event produced samples", role["errors"])
+                        self.assertEqual(role["all_capture_sample_count"], 101)
+                        self.assertEqual(role["record_types"]["PERF_RECORD_SAMPLE"], 101)
+                        self.assertEqual(role["known_leaf_fraction"], .8)
 
     def test_nonfinite_bracket_preserves_invalid_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,6 +199,42 @@ class ProductionPerf(unittest.TestCase):
             capture.reap(role)
             kill.assert_called_once_with(7001, signal.SIGINT)
         self.assertEqual(role["report"]["errors"], [])
+
+    def test_requested_sigint_flush_exit_is_valid_but_early_exit_is_not(self):
+        for code, running, signal_sent, valid in ((-signal.SIGINT, True, False, True),
+                                                  (-signal.SIGINT, False, True, True),
+                                                  (-signal.SIGINT, False, False, False),
+                                                  (0, False, False, False),
+                                                  (-signal.SIGKILL, True, False, False),
+                                                  (1, True, False, False)):
+            with self.subTest(code=code, running=running, signal_sent=signal_sent):
+                capture = M.PerfCapture([{"name": "a", "pid": 101, "image_id": IMAGE},
+                                         {"name": "b", "pid": 102, "image_id": IMAGE}], "/tmp/not-created", [])
+                process = Mock(pid=7001, returncode=code)
+                process.poll.return_value = None if running else code
+                # A timestamp alone is deliberately insufficient.
+                report = {"errors": [], "stop_requested_at_monotonic": 1}
+                if signal_sent:
+                    report["stop_signal_sent"] = int(signal.SIGINT)
+                with patch.object(M.os, "killpg") as kill:
+                    capture.reap({"process": process, "report": report})
+                self.assertEqual(not report["errors"], valid, report)
+                self.assertEqual(report["record_returncode"], code)
+                self.assertEqual(report["record_stopped_on_request"], valid)
+                self.assertEqual(kill.call_count, int(running))
+
+    def test_failed_stop_signal_does_not_authorize_sigint_exit(self):
+        capture = M.PerfCapture([{"name": "a", "pid": 101, "image_id": IMAGE},
+                                 {"name": "b", "pid": 102, "image_id": IMAGE}], "/tmp/not-created", [])
+        process = Mock(pid=7001, returncode=-signal.SIGINT)
+        process.poll.side_effect = [None, None, -signal.SIGINT]
+        role = {"process": process, "report": {"errors": []}}
+        with patch.object(M.os, "killpg", side_effect=ProcessLookupError):
+            capture.reap(role)
+        self.assertNotIn("stop_signal_sent", role["report"])
+        self.assertFalse(role["report"]["record_stopped_on_request"])
+        self.assertIn("forced recorder cleanup", role["report"]["errors"])
+        self.assertIn(f"perf record exit {-signal.SIGINT}", role["report"]["errors"])
 
     def test_wall_limit_stops_both_owned_recorders(self):
         capture = M.PerfCapture([{"name": "a", "pid": 101, "image_id": IMAGE},
@@ -203,8 +273,11 @@ class ProductionPerf(unittest.TestCase):
                                      {"name": "b", "pid": 102, "image_id": IMAGE}], root / "capture", [])
             capture.output.mkdir()
             (capture.output / "elfs").mkdir()
+            (capture.output / "buildid-cache").mkdir()
+            directory = capture.output / "source"
+            directory.mkdir()
             capture.retained_bytes = M.DSO_BYTES - 32
-            role = {"container": capture.containers[0], "mappings": {}, "report": {}}
+            role = {"container": capture.containers[0], "directory": directory, "mappings": {}, "report": {}}
             @contextlib.contextmanager
             def mapped(*args):
                 fd = os.open(original, os.O_RDONLY)
@@ -217,6 +290,72 @@ class ProductionPerf(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "1 GiB"):
                     capture.retain(role)
             self.assertEqual(list((capture.output / "elfs").iterdir()), [])
+
+    def test_symfs_resolves_qualified_elf_via_perf_selected_debug_cache(self):
+        helper = HERE.parents[2] / ".github/scripts/mesh_production_profile_symbols_test.py"
+        spec = importlib.util.spec_from_file_location("synthetic_cache_elf_fixture", helper)
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            actual, companion = root / "actual", root / "companion"
+            generator.elf(actual)
+            generator.elf(companion, symbols=True)
+            capture = M.PerfCapture([{"name": "a", "pid": 101, "image_id": IMAGE},
+                                     {"name": "b", "pid": 102, "image_id": IMAGE}], root / "capture", [companion])
+            capture.Elf = M.elf_reader()
+            capture.output.mkdir()
+            (capture.output / "elfs").mkdir()
+            (capture.output / "buildid-cache").mkdir(mode=0o700)
+            @contextlib.contextmanager
+            def mapped(*args):
+                fd = os.open(actual, os.O_RDONLY)
+                try:
+                    yield fd
+                finally:
+                    os.close(fd)
+            for container in capture.containers:
+                directory = capture.output / container["role"]
+                directory.mkdir()
+                role = {"container": container, "directory": directory, "mappings": {},
+                        "report": {"identity_before": {"process": {"exe_sha256": M.sha256(actual)}}}}
+                with patch.object(Path, "read_text", return_value="1000-2000 r-xp 0 00:01 7 /bin/proxy\n"), \
+                     patch.object(M, "mapped_fd", mapped):
+                    capture.retain(role)
+                binding = role["report"]["symbol_binding"]
+                debug = directory / "symfs/.debug"
+                # symbol__config_symfs replaces the global cache with this
+                # path; __dso__build_id_filename accepts its ELF symlink via stat.
+                selected = debug / ".build-id" / binding["build_id"][:2] / binding["build_id"][2:]
+                self.assertTrue(debug.is_symlink())
+                self.assertEqual(debug.resolve(), (capture.output / "buildid-cache").resolve())
+                self.assertTrue(selected.is_file())
+                self.assertEqual(selected.resolve(), companion.resolve())
+                self.assertEqual(M.sha256(selected), binding["sha256"])
+                self.assertFalse(binding["exact_elf_sha_match"])
+                capture.prepare_symbol_lookup(role)  # repeated retention is safe
+                debug.unlink()
+                debug.symlink_to(root)
+                with self.assertRaisesRegex(ValueError, "cache link changed"):
+                    capture.prepare_symbol_lookup(role)
+
+    def test_symbol_cache_rejects_missing_or_replaced_private_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            capture = M.PerfCapture([{"name": "a", "pid": 101, "image_id": IMAGE},
+                                     {"name": "b", "pid": 102, "image_id": IMAGE}], root, [])
+            role = {"directory": root, "report": {}}
+            with self.assertRaisesRegex(ValueError, "private build-ID cache"):
+                capture.prepare_symbol_lookup(role)
+            cache = root / "buildid-cache"
+            cache.symlink_to(root)
+            with self.assertRaisesRegex(ValueError, "private build-ID cache"):
+                capture.prepare_symbol_lookup(role)
+            cache.unlink()
+            cache.mkdir()
+            (root / "symfs/.debug").write_text("unexpected file")
+            with self.assertRaisesRegex(ValueError, "cache entry"):
+                capture.prepare_symbol_lookup(role)
 
     def test_public_artifacts_do_not_follow_external_elf_links(self):
         with tempfile.TemporaryDirectory() as tmp:

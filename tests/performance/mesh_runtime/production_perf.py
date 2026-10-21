@@ -34,7 +34,8 @@ FREQUENCY = 49
 KNOWN_FRACTION = 0.80
 HERE = Path(__file__).resolve().parent
 IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
-HEADER = re.compile(r"^\s*(.*?)\s+(\d+)/(\d+)\s+(\d+\.\d+):\s+(cpu-clock(?::[ukhS]+)?):\s*(.*?)\s*$")
+HEADER = re.compile(r"^\s*(.*?)\s+(\d+)/(\d+)\s+(\d+\.\d+):\s+(\S+):\s*(.*?)\s*$")
+CPU_EVENT = re.compile(r"cpu-clock(?::[ukhS]+)?\Z")
 LEAF = re.compile(r"^(?:0x)?([0-9a-fA-F]+)\s+(.+?)\s+\((.*?)\)\s*$")
 RECORD = re.compile(r"\b(PERF_RECORD_[A-Z0-9_]+)\b")
 
@@ -187,9 +188,23 @@ def record_argv(perf, pid, directory):
 def validate_attributes(text):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     errors = []
-    if len(lines) != 1 or not lines[0].startswith("cpu-clock:u:"):
-        return ["expected exactly one cpu-clock:u event"]
-    line = lines[0]
+    primary = [line for line in lines if line.startswith("cpu-clock:u:")]
+    dummy = [line for line in lines if line.startswith("dummy:u:")]
+    if len(primary) != 1 or len(dummy) > 1 or len(primary) + len(dummy) != len(lines):
+        return ["expected one cpu-clock:u event and at most one metadata dummy:u event"]
+    # --delay=-1 adds a software dummy tracking event for MMAP/COMM/TASK
+    # metadata. Its name alone cannot authorize another sampling event.
+    for line in dummy:
+        for key, expected in {"type": 1, "config": 9, "mmap": 1, "comm": 1, "task": 1,
+                              "exclude_kernel": 1, "use_clockid": 1, "clockid": 1}.items():
+            match = re.search(rf"(?:^|[, ]){key}\s*:\s*(0x[0-9a-fA-F]+|[0-9]+)\b", line)
+            if not match or int(match[1], 16 if match[1].startswith("0x") else 10) != expected:
+                errors.append(f"unexpected/missing metadata dummy attribute {key}")
+        sample = re.search(r"sample_type\s*:\s*([A-Z_|]+)", line)
+        bits = set(sample[1].split("|")) if sample else set()
+        if bits & {"CALLCHAIN", "STACK_USER", "REGS_USER"}:
+            errors.append("metadata dummy requests callchain/stack/register samples")
+    line = primary[0]
     required = {"type": 1, "config": 0, "freq": 1, "inherit": 1, "exclude_kernel": 1,
                 "use_clockid": 1, "clockid": 1}
     for key, expected in required.items():
@@ -217,14 +232,18 @@ def parse_leaves(text, pid, begin, end, retained_paths):
     for path in retained_paths:
         aliases.setdefault(Path(path).name, set()).add(path)
     counts, events, raw_lines = Counter(), [], []
-    foreign = malformed = all_samples = outside = 0
+    foreign = malformed = all_samples = outside = unexpected = dummy = 0
     for line in text.splitlines():
         header = HEADER.match(line)
         if not header:
-            if re.search(r"\d+\.\d+:\s+cpu-clock", line):
+            if re.search(r"\d+\.\d+:\s+(?:cpu-clock|dummy)", line):
                 malformed += 1
             continue
         all_samples += 1
+        event = header[5]
+        expected_event = CPU_EVENT.fullmatch(event) is not None
+        unexpected += not expected_event
+        dummy += event == "dummy:u"
         owner, tid, when = int(header[2]), int(header[3]), float(header[4])
         foreign += owner != pid
         if not begin <= when <= end:
@@ -235,19 +254,20 @@ def parse_leaves(text, pid, begin, end, retained_paths):
         if leaf:
             ip, original, displayed = leaf.groups()
             candidates = {displayed} if displayed in retained_paths else aliases.get(Path(displayed).name, set())
-            if len(candidates) == 1 and owner == pid and int(ip, 16) != 0 and original not in ("[unknown]", "[unknown]!", "0x0") and not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", original):
+            if expected_event and len(candidates) == 1 and owner == pid and int(ip, 16) != 0 and original not in ("[unknown]", "[unknown]!", "0x0") and not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", original):
                 dso = next(iter(candidates))
                 symbol = re.sub(r"\+0x[0-9a-fA-F]+$", "", original)
         else:
             malformed += 1
         counts[(dso, symbol)] += 1
-        events.append({"pid": owner, "tid": tid, "monotonic": when, "ip": ip,
+        events.append({"pid": owner, "tid": tid, "monotonic": when, "event": event, "ip": ip,
                        "dso": dso, "symbol": symbol, "known": symbol != "UNKNOWN"})
         raw_lines.append(line)
     total = len(events)
     unknown = sum(value for (dso, symbol), value in counts.items() if symbol == "UNKNOWN")
     return {"all_capture_sample_count": all_samples, "measurement_sample_count": total,
             "outside_window_samples": outside, "foreign_pid_samples": foreign,
+            "unexpected_event_samples": unexpected, "dummy_event_samples": dummy,
             "malformed_samples": malformed, "unknown_leaves": unknown, "known_leaves": total - unknown,
             "known_leaf_fraction": (total - unknown) / total if total else 0.0,
             "functions": [{"dso": dso, "symbol": symbol, "samples": count,
@@ -351,11 +371,32 @@ class PerfCapture:
             raise ValueError("sidecar and collector time namespaces differ")
         return dict(current, process=identity)
 
+    def prepare_symbol_lookup(self, role):
+        symfs = role["directory"] / "symfs"
+        symfs.mkdir(mode=0o700, exist_ok=True)
+        cache = self.output / "buildid-cache"
+        if cache.is_symlink() or not cache.is_dir():
+            raise ValueError("missing/unsafe private build-ID cache")
+        debug = symfs / ".debug"
+        if debug.is_symlink():
+            if os.readlink(debug) != str(cache):
+                raise ValueError("symfs build-ID cache link changed")
+        elif debug.exists():
+            raise ValueError("unexpected symfs build-ID cache entry")
+        else:
+            debug.symlink_to(cache, target_is_directory=True)
+        # perf 7.0.14 symbol.c:2490-2509 symbol__config_symfs replaces --buildid-dir with
+        # <symfs>/.debug. Build-ID candidates are opened outside the target
+        # mount namespace, unlike ordinary symfs paths for a live container.
+        role["report"]["symbol_lookup"] = {"symfs": str(symfs), "symfs_debug": str(debug),
+                                           "private_buildid_cache": str(cache)}
+
     def retain(self, role):
         pid = role["container"]["pid"]
         text = Path(f"/proc/{pid}/maps").read_text()
         maps, virtual = executable_maps(text)
         role["report"]["virtual_executable_mappings"] = virtual
+        self.prepare_symbol_lookup(role)
         deadline = time.monotonic() + 60
         for mapping in maps:
             if mapping["path"] in role["mappings"]:
@@ -503,22 +544,29 @@ class PerfCapture:
                     for peer in self.roles:
                         process = peer["process"]
                         if process is not None and process.poll() is None:
-                            peer["report"]["stop_requested_at_monotonic"] = time.monotonic()
-                            os.killpg(process.pid, signal.SIGINT)
+                            self.request_stop(peer)
                     for peer in self.roles:
                         self.reap(peer)
                     return
+
+    def request_stop(self, role):
+        if role["report"].get("stop_signal_sent") == int(signal.SIGINT):
+            return
+        role["report"]["stop_requested_at_monotonic"] = time.monotonic()
+        os.killpg(role["process"].pid, signal.SIGINT)
+        # Set only after killpg succeeds; a timestamp alone is not evidence
+        # that the collector requested the signal observed at process exit.
+        role["report"]["stop_signal_sent"] = int(signal.SIGINT)
 
     def reap(self, role):
         process = role["process"]
         if process is None:
             return
-        if process.poll() is not None and "stop_requested_at_monotonic" not in role["report"]:
+        if process.poll() is not None and role["report"].get("stop_signal_sent") != int(signal.SIGINT):
             role["report"]["errors"].append("recorder exited before requested stop")
         if process.poll() is None:
             try:
-                role["report"]["stop_requested_at_monotonic"] = time.monotonic()
-                os.killpg(process.pid, signal.SIGINT)
+                self.request_stop(role)
                 process.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 role["report"]["errors"].append("forced recorder cleanup")
@@ -526,7 +574,12 @@ class PerfCapture:
                     os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=3)
         role["report"]["record_returncode"] = process.returncode
-        if process.returncode != 0:
+        requested = role["report"].get("stop_signal_sent") == int(signal.SIGINT)
+        # perf's record__sig_exit re-raises the received signal after flushing.
+        # Accept -SIGINT only when this collector actually sent the stop.
+        normal = process.returncode == 0 or (requested and process.returncode == -signal.SIGINT)
+        role["report"]["record_stopped_on_request"] = requested and normal
+        if not normal:
             role["report"]["errors"].append(f"perf record exit {process.returncode}")
 
     def stop(self):
@@ -661,6 +714,10 @@ class PerfCapture:
                     errors.append("raw and decoded leaf sample counts disagree")
                 if decoded["foreign_pid_samples"] or decoded["malformed_samples"]:
                     errors.append("foreign PID or malformed leaf samples")
+                if decoded["dummy_event_samples"]:
+                    errors.append("metadata dummy event produced samples")
+                if decoded["unexpected_event_samples"]:
+                    errors.append("unexpected sampling event")
                 if not decoded["measurement_sample_count"] or decoded["known_leaf_fraction"] < KNOWN_FRACTION:
                     errors.append("fewer than 80% known measurement leaves")
                 events = decoded.pop("events")
