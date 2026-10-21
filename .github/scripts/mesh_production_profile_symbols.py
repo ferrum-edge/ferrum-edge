@@ -25,7 +25,11 @@ import urllib.request
 
 REPOSITORY = "envoyproxy/envoy"
 PRODUCTION = "sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
-DEBUG_TAG = "v1.39.1-debug"
+# Resolved from Docker Hub metadata on 2026-10-21; the published tag has a prefix.
+# Runtime fetches use the AMD64 manifest digest, never the mutable tag.
+DEBUG_TAG = "debug-v1.39.1"
+DEBUG = "sha256:e92b495e77ea757aefaa946773b999e1ad92f9f15215e139232e39d7697388ce"
+IMAGE_REFERENCES = (("production", PRODUCTION), ("debug", DEBUG))
 GIB = 1024 ** 3
 LIMITS = dict(transfer_bytes=4 * GIB, layer_bytes=3 * GIB,
               unpacked_bytes=12 * GIB, retained_bytes=6 * GIB,
@@ -108,7 +112,7 @@ class Registry:
         return data
 
     def manifest(self, reference):
-        require(digest_ok(reference) or reference == DEBUG_TAG, "unapproved image reference")
+        require(digest_ok(reference), "image reference must be a pinned digest")
         data = self.small(f"https://registry-1.docker.io/v2/{REPOSITORY}/manifests/{reference}")
         digest = "sha256:" + hashlib.sha256(data).hexdigest()
         if digest_ok(reference):
@@ -366,7 +370,7 @@ def main():
             and platform.machine() == "x86_64", "remote GitHub Actions Linux x64 only")
     args.output.mkdir(parents=False, exist_ok=False)
     report = dict(schema=1, status="failed", limits=LIMITS, production_reference=PRODUCTION,
-                  debug_tag=DEBUG_TAG, ferrum_symbols="not provided by Main Latest Image run 39611137595")
+                  debug_tag=DEBUG_TAG, debug_reference=DEBUG, ferrum_symbols="not provided by Main Latest Image run 39611137595")
     registry = None
 
     def interrupted(_signum, _frame):
@@ -377,7 +381,7 @@ def main():
         require(shutil.disk_usage(args.output).free >= LIMITS["minimum_free_bytes"], "insufficient preflight disk budget")
         registry = Registry()
         images = {}
-        for role, reference in (("production", PRODUCTION), ("debug", DEBUG_TAG)):
+        for role, reference in IMAGE_REFERENCES:
             directory = args.output / role
             directory.mkdir()
             images[role] = registry.resolve(reference, directory)

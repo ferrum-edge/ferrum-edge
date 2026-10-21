@@ -7,17 +7,18 @@ on:
         description: "Qualification or four balanced repeated production ranking blocks"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, ranking]
+        options: [smoke-l7, smoke, ranking, symbols]
 permissions:
   contents: read
 concurrency:
-  group: mesh-runtime-benchmark-${{ github.ref }}
+  group: mesh-runtime-benchmark-${{ github.ref }}-${{ inputs.phase }}
   cancel-in-progress: false
 env:
   BENCH_PHASE: ${{ inputs.phase }}
 jobs:
   benchmark:
     name: Production mesh qualification and ranking
+    if: inputs.phase != 'symbols'
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -64,7 +65,7 @@ jobs:
         run: python3 .github/scripts/mesh_production_campaign.py accept
   symbol-preflight:
     name: Qualify Envoy production symbol companion
-    if: inputs.phase == 'smoke'
+    if: inputs.phase == 'smoke' || inputs.phase == 'symbols'
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:

@@ -378,6 +378,7 @@ start_ferrum() {
         -v "$CERT_DIR/svc:/etc/ferrum/svid:ro" \
         -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
         -e FERRUM_MODE=mesh \
+        -e FERRUM_MESH_PRODUCTION_MODE=true \
         -e FERRUM_NAMESPACE=ferrum \
         -e FERRUM_MESH_TOPOLOGY=sidecar \
         -e FERRUM_MESH_CONFIG_PROTOCOL=file \
@@ -403,6 +404,7 @@ start_ferrum() {
         -v "$CERT_DIR/client:/etc/ferrum/svid:ro" \
         -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
         -e FERRUM_MODE=mesh \
+        -e FERRUM_MESH_PRODUCTION_MODE=true \
         -e FERRUM_NAMESPACE=ferrum \
         -e FERRUM_MESH_TOPOLOGY=sidecar \
         -e FERRUM_MESH_CONFIG_PROTOCOL=file \

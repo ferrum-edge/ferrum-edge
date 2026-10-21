@@ -188,6 +188,17 @@ class Extraction(unittest.TestCase):
 
 
 class RegistryContracts(unittest.TestCase):
+    def test_actual_published_debug_manifest_is_pinned_before_any_transfer(self):
+        self.assertEqual(M.REPOSITORY, "envoyproxy/envoy")
+        self.assertEqual(M.DEBUG_TAG, "debug-v1.39.1")
+        self.assertEqual(M.DEBUG, "sha256:e92b495e77ea757aefaa946773b999e1ad92f9f15215e139232e39d7697388ce")
+        self.assertEqual(M.IMAGE_REFERENCES, (("production", M.PRODUCTION), ("debug", M.DEBUG)))
+        registry = M.Registry.__new__(M.Registry)
+        registry.small = lambda url: self.fail("mutable tag reached registry")
+        for reference in (M.DEBUG_TAG, "v1.39.1-debug", "v1.39.1"):
+            with self.subTest(reference=reference), self.assertRaisesRegex(ValueError, "pinned digest"):
+                registry.manifest(reference)
+
     def test_resolved_manifest_is_pinned_and_exact_original_bytes_retained(self):
         config = b'{"architecture": "amd64", "os": "linux"}'
         config_digest = "sha256:" + hashlib.sha256(config).hexdigest()
@@ -197,7 +208,7 @@ class RegistryContracts(unittest.TestCase):
         registry = M.Registry.__new__(M.Registry)
         registry.small = lambda url: config if "/blobs/" in url else body
         with tempfile.TemporaryDirectory() as temp:
-            result = registry.resolve(M.DEBUG_TAG, Path(temp))
+            result = registry.resolve("sha256:" + hashlib.sha256(body).hexdigest(), Path(temp))
             self.assertEqual(result["platform_digest"], "sha256:" + hashlib.sha256(body).hexdigest())
             self.assertEqual((Path(temp) / "manifest-platform.json").read_bytes(), body)
             self.assertEqual((Path(temp) / "manifest-root.json").read_bytes(), body)
