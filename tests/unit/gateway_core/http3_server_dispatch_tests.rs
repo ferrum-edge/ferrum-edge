@@ -3353,16 +3353,17 @@ fn h3_quinn_vendored_send_stream_stopped_is_shared_and_static() {
         .next()
         .expect("bounded peer_response_cancelled");
     assert!(
-        watch.contains("impl Future<Output = ()> + Send + use<'a, S>"),
-        "peer_response_cancelled must return a statically dispatched future that never \
-         borrows the stream: {watch}"
+        watch.contains("impl Future<Output = ()> + Send + 'a")
+            && watch.contains("F: Future<Output = bool> + Send + 'static,"),
+        "peer_response_cancelled must take the already-built 'static stopped future and \
+         return a statically dispatched future that never borrows the stream: {watch}"
     );
     assert!(
         !watch.contains("Box::pin") && !watch.contains("Pin<Box") && !watch.contains("dyn Future"),
         "peer_response_cancelled must not box a trait-object future: {watch}"
     );
     assert!(
-        watch.contains("let stopped = peer_response_stopped(stream);")
+        watch.contains("if stopped.await {")
             && watch.contains("stop_sending.store(true, std::sync::atomic::Ordering::Release);"),
         "the cancel watch must record a typed STOP_SENDING (issue #6772): {watch}"
     );
