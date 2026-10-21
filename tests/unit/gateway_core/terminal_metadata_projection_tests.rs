@@ -7,19 +7,23 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use ferrum_edge::_test_support::{
     clone_log_metadata_for_test, request_upload_auth_deadline_for_test,
     set_diagnostic_slot_for_test, set_request_credential_deadline_for_test,
     set_request_http_flavor_for_test, set_waf_metadata_for_test,
     take_terminal_log_metadata_for_test,
 };
-use ferrum_edge::config::types::HttpFlavor;
+use ferrum_edge::PluginCache;
+use ferrum_edge::config::types::{GatewayConfig, HttpFlavor, PluginScope};
 use ferrum_edge::diagnostic_ref::DiagnosticSlot;
 use ferrum_edge::identity::SpiffeId;
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
+use ferrum_edge::plugins::api_chargeback::{ProtocolFamily, global_registry};
 use ferrum_edge::plugins::correlation_id::CorrelationId;
 use ferrum_edge::plugins::mesh::workload_metrics::WorkloadMetrics;
 use ferrum_edge::plugins::trigger::{PluginTriggerGate, TriggerPhase};
@@ -32,7 +36,9 @@ use serde_json::json;
 
 use super::response_coalescing_allocation_tests::measure;
 use crate::unit::env_lock::EnvGuard;
-use crate::unit::plugins::plugin_utils::create_test_proxy;
+use crate::unit::plugins::plugin_utils::{
+    create_test_proxy, make_plugin_config_with_json, make_proxy,
+};
 
 const RETAINED_KEY: &str = "mesh.source.principal";
 
@@ -257,6 +263,10 @@ impl Plugin for TerminalProbe {
         100
     }
 
+    fn defers_response_stream_termination_until_after_peers(&self) -> bool {
+        self.label == "second"
+    }
+
     async fn on_response_stream_terminated(
         &self,
         ctx: &mut RequestContext,
@@ -300,7 +310,9 @@ async fn terminal_metadata_projection_deferred_hooks_keep_order_and_move_final_s
     ferrum_edge::observability_delivery::begin_serving_cycle();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(
-        ["first", "second"]
+        // Place the deferred hook first so a single chain-order pass would
+        // fail its assertion that the ordinary peer already finalized metadata.
+        ["second", "first"]
             .into_iter()
             .map(|label| {
                 Arc::new(TerminalProbe {
@@ -322,7 +334,8 @@ async fn terminal_metadata_projection_deferred_hooks_keep_order_and_move_final_s
     logger.fire(BodyOutcome::success(77));
     logger.fire(BodyOutcome::success(88));
     drop(logger);
-    for label in ["first", "second"] {
+    // Deferral applies only to termination hooks. Log hooks keep chain order.
+    for label in ["second", "first"] {
         let (observed_label, summary, observed_pointer, _) = receive(&mut rx).await;
         assert_eq!(observed_label, label);
         assert_eq!(
@@ -418,5 +431,117 @@ async fn terminal_metadata_projection_preserves_terminal_typed_state_and_mirrors
             primary.metadata[RETAINED_KEY]
         );
         assert_eq!(mirror_decision, Some(false));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_metadata_projection_real_wrapper_suppresses_only_the_skipped_log() {
+    let _env = EnvGuard::new(&[]);
+    ferrum_edge::observability_delivery::begin_serving_cycle();
+    let proxy_id = "terminal-projection-trigger-wrapper";
+    let mut bill = make_plugin_config_with_json(
+        "projection-bill",
+        "api_chargeback",
+        json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]}),
+        PluginScope::Proxy,
+        Some(proxy_id),
+    );
+    bill.trigger = Some(
+        serde_json::from_value(json!({
+            "when": {"match": {"path": {"prefix": ["/selected"]}}}
+        }))
+        .expect("trigger schema"),
+    );
+    // Keep the published wrapper before the completion probe in every phase.
+    bill.priority_override = Some(99);
+    let config = GatewayConfig {
+        version: "1".into(),
+        proxies: vec![make_proxy(proxy_id, "/", vec!["projection-bill"])],
+        plugin_configs: vec![bill],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&config).expect("real trigger-wrapped chargeback fixture");
+    let published = cache.get_plugins("ferrum", proxy_id);
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].name(), "api_chargeback");
+
+    for (consumer, initial_path, final_path, expected_calls) in [
+        ("terminal-projection-skipped", "/free", "/selected/later", 0),
+        (
+            "terminal-projection-admitted",
+            "/selected/first",
+            "/free/later",
+            1,
+        ),
+    ] {
+        let calls = || -> u64 {
+            global_registry()
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.consumer.as_ref() == consumer
+                        && entry.proxy_id.as_ref() == proxy_id
+                        && entry.protocol_family == ProtocolFamily::Http
+                })
+                .map(|entry| entry.call_count.load(Ordering::Relaxed))
+                .sum()
+        };
+        assert_eq!(calls(), 0, "the fixture owns a fresh billing identity");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut plugins = published.as_ref().clone();
+        plugins.push(Arc::new(TerminalProbe {
+            label: "first",
+            gate: None,
+            tx,
+        }));
+        assert!(
+            plugins
+                .windows(2)
+                .all(|pair| pair[0].priority() <= pair[1].priority())
+        );
+        let mut ctx = RequestContext::new("10.0.0.2".into(), "GET".into(), initial_path.into());
+        ctx.metadata.insert(
+            RETAINED_KEY.into(),
+            "spiffe://cluster.local/ns/ferrum/sa/client".into(),
+        );
+        for plugin in &plugins {
+            assert!(matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ));
+        }
+        let mut headers = HashMap::new();
+        for plugin in &plugins {
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+        }
+        // Terminal dispatch must use the wrapper's memoized decision, even
+        // when later request mutations would reverse the original predicate.
+        ctx.path = final_path.into();
+        let summary = TransactionSummary {
+            namespace: "ferrum".into(),
+            consumer_username: Some(consumer.into()),
+            http_method: "GET".into(),
+            request_path: final_path.into(),
+            proxy_id: Some(proxy_id.into()),
+            response_status_code: 200,
+            ..TransactionSummary::default()
+        };
+        let logger = DeferredTransactionLogger::new(summary, Arc::new(plugins), ctx);
+        logger.fire(BodyOutcome::success(77));
+        let (label, observed, _, _) = receive(&mut rx).await;
+        assert_eq!(
+            label, "first",
+            "the trailing observer confirms dispatch completed"
+        );
+        assert_eq!(observed.metadata["stream.first"], "finalized");
+        assert_eq!(
+            calls(),
+            expected_calls,
+            "the real wrapper must govern the inner log hook"
+        );
     }
 }
