@@ -48,10 +48,34 @@ class HarnessBounds(unittest.TestCase):
             for name in ("start_ferrum", "start_envoy", "start_linkerd", "auth_probes"):
                 body = functions(name)
                 self.assertIn('--group-add "$CERT_GID"', body)
-                self.assertNotIn("--user", body)
+                if name != "start_envoy":
+                    self.assertNotIn("--user", body)
                 for mount in re.findall(r'-v "([^"]+)"', body):
                     if "$CERT_DIR" in mount:
                         self.assertTrue(mount.endswith(":ro"), mount)
+
+    def test_both_static_envoy_containers_start_nonroot_with_fixture_group_retained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable(root / "docker", '''import json, os, sys
+with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) + "\\n")
+''')
+            subprocess.run(["bash", "-ec", functions("start_envoy") + '\nstart_envoy'],
+                check=True, timeout=5, env={**os.environ,
+                    "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                    "CALLS": str(root / "calls"), "RUNTIME_DIR": str(root / "runtime"),
+                    "SCRIPT_DIR": str(HARNESS.parent), "CERT_DIR": str(root / "certs"),
+                    "CERT_GID": str(os.getgid()), "SERVER_NAME": "fixture-server",
+                    "CLIENT_NAME": "fixture-client", "ENVOY_IMAGE": "envoyproxy/envoy:v1.39.1"})
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            self.assertEqual(len(calls), 2)
+            for call, name in zip(calls, ("fixture-server", "fixture-client")):
+                self.assertEqual(call[call.index("--name") + 1], name)
+                self.assertEqual(call[call.index("--user") + 1], "65532:65532")
+                self.assertEqual(call[call.index("--group-add") + 1], str(os.getgid()))
+                self.assertIn("envoyproxy/envoy:v1.39.1", call)
+                mounts = [call[index + 1] for index, value in enumerate(call) if value == "-v"]
+                self.assertTrue(all(mount.endswith(":ro") for mount in mounts))
 
     @unittest.skipUnless(shutil.which("timeout"), "GNU timeout required by the Linux harness")
     def test_readiness_detects_dead_container_before_probing(self):

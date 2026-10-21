@@ -425,11 +425,13 @@ start_envoy() {
     chmod 644 "$RUNTIME_DIR/envoy/server.yaml" "$RUNTIME_DIR/envoy/client.yaml"
     # Distinct --base-id: two Envoy processes sharing one host netns
     # otherwise collide on the base-id domain socket and the second exits.
-    docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
+    # v1.39.1's root entrypoint uses su-exec, which rebuilds groups. Start
+    # nonroot so its direct-exec branch retains Docker's fixture group.
+    docker run -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/server.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/mesh-certs/svc:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 0 -l error >/dev/null
-    docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
+    docker run -d --network host --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/client.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/client:/etc/mesh-certs/client:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 1 -l error >/dev/null
