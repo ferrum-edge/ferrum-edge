@@ -672,6 +672,10 @@ where
 /// only `stop_sending`, never `stream`: h3's `stopped()` is a trait-returned
 /// future that names the stream borrow, which no precise-capture bound here
 /// could exclude.
+// Not an `async fn`: the explicit `+ 'a` outlives bound is what lets the
+// caller keep using the stream mutably while this future is alive (alias
+// liveness follows the declared bound rather than every captured lifetime).
+#[allow(clippy::manual_async_fn)]
 pub(crate) fn peer_response_cancelled<'a, F>(
     stopped: F,
     stop_sending: &'a std::sync::atomic::AtomicBool,
