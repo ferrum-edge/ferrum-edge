@@ -158,7 +158,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -198,6 +198,10 @@ const PUMP_CONSUMER_DONE: u8 = 7;
 /// Still a source error for lifecycle accounting, but retain its wire meaning
 /// so the backend receives CANCEL rather than a clean or internal-error end.
 const PUMP_SOURCE_RESET: u8 = 8;
+/// A client body read the frontend codec rejected as malformed (issue #6776):
+/// still a source error for lifecycle accounting, but not proof that the
+/// client went away. See [`client_upload_error_fault`].
+const PUMP_SOURCE_MALFORMED: u8 = 9;
 
 /// Terminal state of one gateway-owned upload pump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +241,9 @@ const fn outcome_code(outcome: UploadPumpOutcome) -> u8 {
 const fn code_outcome(code: u8) -> Option<UploadPumpOutcome> {
     match code {
         PUMP_COMPLETED => Some(UploadPumpOutcome::Completed),
-        PUMP_SOURCE_ERROR | PUMP_SOURCE_RESET => Some(UploadPumpOutcome::SourceError),
+        PUMP_SOURCE_ERROR | PUMP_SOURCE_RESET | PUMP_SOURCE_MALFORMED => {
+            Some(UploadPumpOutcome::SourceError)
+        }
         PUMP_CANCELLED => Some(UploadPumpOutcome::Cancelled),
         PUMP_AUTHORIZATION_EXPIRED => Some(UploadPumpOutcome::AuthorizationExpired),
         PUMP_CONSUMER_GONE => Some(UploadPumpOutcome::ConsumerGone),
@@ -309,6 +315,126 @@ pub(crate) const fn early_response_upload_refusal_error_class(
     }
 }
 
+/// Why the client's own upload failed (issue #6776), from the typed error the
+/// frontend body yielded. Recorded where that error is read (the gateway-owned
+/// pump, or an unpumped size-limit adapter's [`ClientUploadFaultLatch`]) and
+/// never retained beyond this verdict: the error may carry client-controlled
+/// detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientUploadFault {
+    /// The client went away or cancelled: a reset or `GOAWAY` it sent, its
+    /// stream ending without `END_STREAM`, or its connection closing, timing
+    /// out, or failing mid-upload.
+    Disconnected,
+    /// The frontend codec rejected the upload as malformed: an HTTP/1.1 body
+    /// framing it could not decode, or an HTTP/2 stream h2 reset because the
+    /// client broke the protocol. The client may still be connected and
+    /// reading, so this is a bad request, never a client-closed request.
+    Malformed,
+}
+
+/// The typed [`ClientUploadFault`] of a failed read of the client's upload.
+///
+/// Malformed only on typed proof: an `io::Error` of kind `InvalidData` or
+/// `InvalidInput` (hyper's HTTP/1.1 body decoder rejecting chunk framing), or
+/// an h2 stream reset h2 itself raised (`is_library`) because the client
+/// violated the protocol. Anything else, including an early EOF, a reset or
+/// `GOAWAY` the client sent, and a connection error, is the client leaving.
+/// Synchronous and allocation-free; the traversal is bounded like
+/// [`is_h2_source_cancel`] and inspects an `io::Error`'s payload first.
+pub(crate) fn client_upload_error_fault(
+    error: &(dyn std::error::Error + 'static),
+) -> ClientUploadFault {
+    let mut source = error;
+    for _ in 0..16 {
+        if let Some(io_err) = source.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_err.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput
+            )
+        {
+            return ClientUploadFault::Malformed;
+        }
+        if let Some(h2_err) = source.downcast_ref::<h2::Error>() {
+            return if h2_err.is_reset() && h2_err.is_library() {
+                ClientUploadFault::Malformed
+            } else {
+                ClientUploadFault::Disconnected
+            };
+        }
+        let next = if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+            io_err
+                .get_ref()
+                .map(|inner| inner as &dyn std::error::Error)
+        } else {
+            source.source()
+        };
+        match next {
+            Some(next) => source = next,
+            None => return ClientUploadFault::Disconnected,
+        }
+    }
+    ClientUploadFault::Disconnected
+}
+
+const CLIENT_FAULT_NONE: u8 = 0;
+const CLIENT_FAULT_DISCONNECTED: u8 = 1;
+const CLIENT_FAULT_MALFORMED: u8 = 2;
+
+/// Where an UNPUMPED size-limit adapter records the [`ClientUploadFault`] of
+/// the client body it reads directly (issue #6776). A pumped upload records it
+/// in the pump's own terminal instead, so this exists only on the path an
+/// operator chose with `backend_write_timeout_ms = 0` and no authorization
+/// lifetime. First record wins.
+#[derive(Debug, Default)]
+pub(crate) struct ClientUploadFaultLatch(AtomicU8);
+
+impl ClientUploadFaultLatch {
+    pub(crate) fn record(&self, fault: ClientUploadFault) {
+        let code = match fault {
+            ClientUploadFault::Disconnected => CLIENT_FAULT_DISCONNECTED,
+            ClientUploadFault::Malformed => CLIENT_FAULT_MALFORMED,
+        };
+        let _ =
+            self.0
+                .compare_exchange(CLIENT_FAULT_NONE, code, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    pub(crate) fn observed(&self) -> Option<ClientUploadFault> {
+        match self.0.load(Ordering::Acquire) {
+            CLIENT_FAULT_DISCONNECTED => Some(ClientUploadFault::Disconnected),
+            CLIENT_FAULT_MALFORMED => Some(ClientUploadFault::Malformed),
+            _ => None,
+        }
+    }
+}
+
+/// Request-scoped record that a dispatcher proved the client abandoned its
+/// upload before the backend response head (issue #6776). The handler reads it
+/// into the terminal transaction summary's `client_disconnected` flag (and so
+/// the runtime client-disconnect counter) exactly once. It is deliberately not
+/// derived from `ErrorClass::ClientDisconnect`, which also marks authorization
+/// and client-deadline terminals while the client may still be connected.
+/// Clones copy the current value.
+#[derive(Debug, Default)]
+pub(crate) struct ProvenClientUploadAbort(AtomicBool);
+
+impl Clone for ProvenClientUploadAbort {
+    fn clone(&self) -> Self {
+        Self(AtomicBool::new(self.0.load(Ordering::Acquire)))
+    }
+}
+
+impl ProvenClientUploadAbort {
+    pub(crate) fn record(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn observed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// What ended a sidecar mesh-mTLS, HBONE, or Unix-socket dispatch whose
 /// `send_request` failed before the backend response head (issue #6776).
 ///
@@ -326,9 +452,13 @@ pub(crate) enum PreHeaderSendTermination {
     /// classification stands, so a backend reset, `CANCEL`, `NO_ERROR`, or
     /// protocol failure is still a backend failure.
     Transport,
-    /// The client's own upload failed (a reset, a dropped connection, a
-    /// malformed or truncated body) and the gateway relayed that failure.
+    /// The client went away mid-upload ([`ClientUploadFault::Disconnected`])
+    /// and the gateway relayed that failure: a client-closed request.
     ClientAbort,
+    /// The client's upload failed without proof that the client left: the
+    /// frontend codec rejected it as malformed, or no typed fault was
+    /// recorded. A bad request, never a client-closed request.
+    MalformedUpload,
     /// The gateway-owned pump's backend write watermark ended the upload: the
     /// backend stopped taking it.
     BackendWriteTimeout,
@@ -351,18 +481,23 @@ pub(crate) enum PreHeaderSendTermination {
 ///   the collected replayable one, so a client failure could reach it.
 /// * `upload_pumped` / `pump_outcome`: whether a gateway-owned pump fed the
 ///   adapter, and that pump's joined terminal.
+/// * `client_fault`: the typed [`ClientUploadFault`] recorded where the
+///   client body was read (the pump's terminal, or the unpumped adapter's
+///   latch).
 ///
 /// A pump's `SourceError` terminal is the only client proof on a pumped
 /// upload. Without a pump, the size-limit adapter reads the client body
 /// directly and arms neither a cancellation nor an authorization timer (both
 /// install a pump), so once the caller has ruled out its size refusal the only
-/// way that body can fail is the client's own stream failing.
+/// way that body can fail is the client's own stream failing. Only a recorded
+/// [`ClientUploadFault::Disconnected`] makes that a client-closed request.
 pub(crate) const fn pre_header_send_termination(
     gateway_ended_upload: bool,
     authorization_ended: bool,
     client_body_streamed: bool,
     upload_pumped: bool,
     pump_outcome: Option<UploadPumpOutcome>,
+    client_fault: Option<ClientUploadFault>,
 ) -> PreHeaderSendTermination {
     if !gateway_ended_upload {
         return PreHeaderSendTermination::Transport;
@@ -379,10 +514,13 @@ pub(crate) const fn pre_header_send_termination(
     } else {
         true
     };
-    if client_body_streamed && client_source_failed {
+    if !client_body_streamed || !client_source_failed {
+        return PreHeaderSendTermination::Transport;
+    }
+    if matches!(client_fault, Some(ClientUploadFault::Disconnected)) {
         PreHeaderSendTermination::ClientAbort
     } else {
-        PreHeaderSendTermination::Transport
+        PreHeaderSendTermination::MalformedUpload
     }
 }
 
@@ -859,6 +997,24 @@ impl UploadPumpJoin {
     pub(crate) async fn cancel_and_join(mut self) -> Option<UploadPumpOutcome> {
         self.cancel();
         self.await_outcome().await
+    }
+
+    /// [`cancel_and_join`](Self::cancel_and_join), also reporting the typed
+    /// [`ClientUploadFault`] the pump recorded when its terminal is the
+    /// client's own source failure (issue #6776). The pump publishes that
+    /// terminal before it releases the bridge, and only a still-running
+    /// terminal is ever overwritten, so the joined value is final.
+    pub(crate) async fn cancel_and_join_with_client_fault(
+        mut self,
+    ) -> (Option<UploadPumpOutcome>, Option<ClientUploadFault>) {
+        self.cancel();
+        let outcome = self.await_outcome().await;
+        let fault = match self.terminal.load(Ordering::Acquire) {
+            PUMP_SOURCE_ERROR | PUMP_SOURCE_RESET => Some(ClientUploadFault::Disconnected),
+            PUMP_SOURCE_MALFORMED => Some(ClientUploadFault::Malformed),
+            _ => None,
+        };
+        (outcome, fault)
     }
 
     /// Resolve when — and only when — the pump ends on the backend write
@@ -1496,6 +1652,7 @@ where
     let write_idle = write_configured.then(|| tokio::time::sleep(write_idle_dur));
     tokio::pin!(write_idle);
     let mut source_reset = false;
+    let mut source_malformed = false;
     let outcome = 'pump: loop {
         // Reserve capacity BEFORE reading the client, so a transport that
         // stops draining stops the read rather than filling a buffer.
@@ -1594,11 +1751,16 @@ where
                 permit.send(BridgedFrame { frame, last });
             }
             Some(Err(error)) => {
+                let error: BoxError = error.into();
+                // Whether the client left or sent a malformed upload (issue
+                // #6776): a typed verdict, kept in the redacted terminal.
+                source_malformed =
+                    client_upload_error_fault(error.as_ref()) == ClientUploadFault::Malformed;
                 // Hyper 1.10 exposes CANCEL as an error instead of masking it
                 // as EOF. Preserve only that typed wire fact through the
                 // redacted terminal, just as the masked EOF arm above does.
                 if require_end_stream {
-                    source_reset = is_h2_source_cancel(error.into());
+                    source_reset = is_h2_source_cancel(error);
                 }
                 break UploadPumpOutcome::SourceError;
             }
@@ -1620,6 +1782,8 @@ where
     // the synchronisation edge for this release store.
     let terminal_code = if source_reset {
         PUMP_SOURCE_RESET
+    } else if source_malformed {
+        PUMP_SOURCE_MALFORMED
     } else {
         outcome_code(outcome)
     };

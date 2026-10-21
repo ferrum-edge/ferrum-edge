@@ -140,12 +140,24 @@ upload's typed terminals, the same ones the direct-HTTP/2 early-response refusal
 #6314):
 
 - The client's upload failed first: the gateway-owned pump's `SourceError` terminal, or, with no
-  pump, the size-limit adapter, which then reads only the client body. The request is a client
-  disconnect: `499` with `{"error":"Client disconnected"}` (Trailers-Only `CANCELLED` for gRPC),
-  error class `client_disconnect`. The circuit breaker, passive health, least-latency samples, and
-  adaptive concurrency are not charged, and `connection_error` stays `false`, so it is never
-  replayed as a connect failure. The client has usually gone, so the `499` is what the logs and
-  metrics record; it reaches the wire only if the client is still reading.
+  pump, the size-limit adapter, which then reads only the client body. Where that body is read,
+  the typed error is reduced to a fault and nothing else is kept. A reset or `GOAWAY` the client
+  sent, a stream that ended without `END_STREAM`, or a lost connection means the client went away.
+  A body hyper's HTTP/1.1 decoder rejected (`InvalidData` / `InvalidInput`), or an HTTP/2 stream h2
+  reset because the client broke the protocol, is malformed.
+  - The client went away: a client-closed request, `499` with `{"error":"Client disconnected"}`
+    (Trailers-Only `CANCELLED` for gRPC). The terminal transaction summary is marked
+    `client_disconnected`, which also feeds the client-disconnect counter, exactly once. That
+    mark comes from the dispatcher's proof, never from the `client_disconnect` class alone. The
+    client is gone, so the `499` is what the logs and request metrics record.
+  - The upload was malformed, or no fault was recorded: the client may still be connected and
+    reading, so it is a bad request, `400` with `{"error":"Malformed request body"}`
+    (`INVALID_ARGUMENT` for gRPC), never a `499`, and not marked `client_disconnected`.
+  - Both carry the health-neutral `client_disconnect` error class: the circuit breaker, passive
+    health, least-latency samples, and adaptive concurrency are not charged, and
+    `connection_error` stays `false`, so neither is replayed as a connect failure.
+  - A gRPC refusal's status is recorded for the transaction summary and request metrics from its
+    Trailers-Only headers (`grpc_status` `1` or `3`), not synthesized as `UNKNOWN`.
 - The admitted stream's authorization lifetime ended the upload: the same health-neutral
   authorization terminal as the response-header wait.
 - The pump's backend write watermark ended it: the same backend-charged `504`

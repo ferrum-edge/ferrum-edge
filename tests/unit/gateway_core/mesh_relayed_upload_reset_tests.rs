@@ -20,12 +20,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    PreHeaderSendTerminationForTest as Termination, UploadPumpOutcomeForTest as Pump,
-    apply_circuit_breaker_outcome_for_test, hyper_send_error_ended_by_gateway_upload_for_test,
+    ClientUploadFaultForTest as Fault, PreHeaderSendTerminationForTest as Termination,
+    UploadPumpOutcomeForTest as Pump, apply_circuit_breaker_outcome_for_test,
+    client_upload_error_fault_for_test, hyper_send_error_ended_by_gateway_upload_for_test,
     pre_header_send_termination_for_test, pre_header_upload_termination_response_for_test,
+    record_buffered_native_grpc_header_status_for_test,
 };
 use ferrum_edge::circuit_breaker::CircuitBreaker;
 use ferrum_edge::config::types::CircuitBreakerConfig;
+use ferrum_edge::plugins::TransactionSummary;
 use ferrum_edge::retry::{BackendResponse, ErrorClass, request_reached_wire};
 use http_body::Frame;
 use http_body_util::{BodyExt, Empty, StreamBody};
@@ -33,7 +36,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::io::{AsyncReadExt, DuplexStream};
+use std::collections::HashMap;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -319,7 +323,7 @@ async fn h2_backend_resets_stay_backend_failures() {
         );
         // And the dispatcher keeps the transport classification for it.
         assert_eq!(
-            pre_header_send_termination_for_test(false, false, true, false, None),
+            pre_header_send_termination_for_test(false, false, true, false, None, None),
             Termination::Transport
         );
         drop(tx);
@@ -345,19 +349,41 @@ async fn h2_early_backend_response_keeps_the_backend_status() {
 // ── The typed upload terminals that name the cause ───────────────────────
 
 #[test]
-fn a_proven_client_upload_failure_is_a_client_abort() {
-    let client_failures = [
-        // No pump: the adapter reads only the client body.
+fn a_proven_client_disconnect_is_a_client_abort() {
+    let client_disconnects = [
+        // No pump: the adapter's latch recorded the client leaving.
         (false, None),
-        // A pump's own client-source terminal.
+        // A pump's own client-source terminal, recorded as a disconnect.
         (true, Some(Pump::SourceError)),
     ];
-    for (pumped, pump) in client_failures {
+    for (pumped, pump) in client_disconnects {
         assert_eq!(
-            pre_header_send_termination_for_test(true, false, true, pumped, pump),
+            pre_header_send_termination_for_test(
+                true,
+                false,
+                true,
+                pumped,
+                pump,
+                Some(Fault::Disconnected)
+            ),
             Termination::ClientAbort,
             "pumped {pumped}, pump {pump:?}"
         );
+    }
+}
+
+#[test]
+fn a_client_upload_failure_without_disconnect_proof_is_a_malformed_upload() {
+    // A malformed upload, or a client failure with no recorded fault, is never
+    // a client-closed request: the client may still be reading.
+    for (pumped, pump) in [(false, None), (true, Some(Pump::SourceError))] {
+        for fault in [Some(Fault::Malformed), None] {
+            assert_eq!(
+                pre_header_send_termination_for_test(true, false, true, pumped, pump, fault),
+                Termination::MalformedUpload,
+                "pumped {pumped}, pump {pump:?}, fault {fault:?}"
+            );
+        }
     }
 }
 
@@ -380,11 +406,14 @@ fn indeterminate_or_backend_first_terminals_keep_the_transport_class() {
         (true, false, false, true, Some(Pump::Cancelled)),
     ];
     for (gateway, auth, streamed, pumped, pump) in cases {
-        assert_eq!(
-            pre_header_send_termination_for_test(gateway, auth, streamed, pumped, pump),
-            Termination::Transport,
-            "gateway {gateway}, auth {auth}, streamed {streamed}, pumped {pumped}, pump {pump:?}"
-        );
+        for fault in [None, Some(Fault::Disconnected), Some(Fault::Malformed)] {
+            assert_eq!(
+                pre_header_send_termination_for_test(gateway, auth, streamed, pumped, pump, fault),
+                Termination::Transport,
+                "gateway {gateway}, auth {auth}, streamed {streamed}, pumped {pumped}, \
+                 pump {pump:?}, fault {fault:?}"
+            );
+        }
     }
 }
 
@@ -399,7 +428,14 @@ fn gateway_deadlines_keep_their_own_outcome() {
         (true, false, true, Some(Pump::WriteTimeout)),
     ] {
         assert_eq!(
-            pre_header_send_termination_for_test(true, auth, streamed, pumped, pump),
+            pre_header_send_termination_for_test(
+                true,
+                auth,
+                streamed,
+                pumped,
+                pump,
+                Some(Fault::Disconnected)
+            ),
             Termination::AuthorizationExpired,
             "auth {auth}, streamed {streamed}, pumped {pumped}, pump {pump:?}"
         );
@@ -413,12 +449,171 @@ fn gateway_deadlines_keep_their_own_outcome() {
                 false,
                 streamed,
                 true,
-                Some(Pump::WriteTimeout)
+                Some(Pump::WriteTimeout),
+                None
             ),
             Termination::BackendWriteTimeout,
             "streamed {streamed}"
         );
     }
+}
+
+// ── The typed client upload fault, from real frontend body errors ─────────
+
+/// Serve one HTTP/1.1 request on `server_io` and report the typed fault of the
+/// first error its body yields.
+async fn h1_frontend_body_fault(server_io: DuplexStream) -> Fault {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let service = service_fn(move |req: Request<Incoming>| {
+        let tx = tx.clone();
+        async move {
+            let mut body = req.into_body();
+            while let Some(frame) = body.frame().await {
+                if let Err(err) = frame {
+                    let _ = tx.send(client_upload_error_fault_for_test(&err));
+                    break;
+                }
+            }
+            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        }
+    });
+    let server = tokio::spawn(async move {
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(server_io), service)
+            .await;
+    });
+    let fault = tokio::time::timeout(STEP, rx.recv())
+        .await
+        .expect("the frontend body must fail in time")
+        .expect("a body fault");
+    server.abort();
+    fault
+}
+
+#[tokio::test]
+async fn an_h1_client_that_leaves_mid_upload_is_a_disconnect() {
+    let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+    client
+        .write_all(
+            b"POST /upload HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel",
+        )
+        .await
+        .expect("write a truncated upload");
+    client.shutdown().await.expect("the client goes away");
+    assert_eq!(h1_frontend_body_fault(server_io).await, Fault::Disconnected);
+    drop(client);
+}
+
+#[tokio::test]
+async fn an_h1_client_with_invalid_chunk_framing_is_malformed() {
+    let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+    // Still connected and reading: only its framing is bad.
+    client
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")
+        .await
+        .expect("write a malformed chunk");
+    assert_eq!(h1_frontend_body_fault(server_io).await, Fault::Malformed);
+    drop(client);
+}
+
+#[tokio::test]
+async fn an_h2_client_reset_mid_upload_is_a_disconnect() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (fault_tx, mut fault_rx) = mpsc::unbounded_channel();
+    let (first_tx, mut first_rx) = mpsc::unbounded_channel::<()>();
+    let service = service_fn(move |req: Request<Incoming>| {
+        let fault_tx = fault_tx.clone();
+        let first_tx = first_tx.clone();
+        async move {
+            let mut body = req.into_body();
+            while let Some(frame) = body.frame().await {
+                match frame {
+                    Ok(_) => {
+                        let _ = first_tx.send(());
+                    }
+                    Err(err) => {
+                        let _ = fault_tx.send(client_upload_error_fault_for_test(&err));
+                        break;
+                    }
+                }
+            }
+            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        }
+    });
+    let server = tokio::spawn(async move {
+        let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(server_io), service)
+            .await;
+    });
+    let (client, connection) = h2::client::handshake(client_io)
+        .await
+        .expect("h2 client handshake");
+    let driver = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut client = client.ready().await.expect("h2 client ready");
+    let request = Request::builder()
+        .method("POST")
+        .uri("http://frontend.test/upload")
+        .body(())
+        .expect("request");
+    let (_response, mut upload) = client.send_request(request, false).expect("open stream");
+    upload
+        .send_data(Bytes::from_static(b"hello"), false)
+        .expect("first upload frame");
+    tokio::time::timeout(STEP, first_rx.recv())
+        .await
+        .expect("the first frame arrives in time");
+    upload.send_reset(h2::Reason::CANCEL);
+    let fault = tokio::time::timeout(STEP, fault_rx.recv())
+        .await
+        .expect("the reset reaches the body in time")
+        .expect("a body fault");
+    assert_eq!(fault, Fault::Disconnected);
+    driver.abort();
+    server.abort();
+}
+
+#[test]
+fn typed_io_and_h2_faults_classify_without_heuristics() {
+    let malformed = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size");
+    assert_eq!(
+        client_upload_error_fault_for_test(&malformed),
+        Fault::Malformed
+    );
+    let malformed = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad chunk ext");
+    assert_eq!(
+        client_upload_error_fault_for_test(&malformed),
+        Fault::Malformed
+    );
+    // The payload of a wrapping io::Error is inspected too.
+    let wrapped = std::io::Error::other(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "bad trailer",
+    ));
+    assert_eq!(
+        client_upload_error_fault_for_test(&wrapped),
+        Fault::Malformed
+    );
+    for kind in [
+        std::io::ErrorKind::UnexpectedEof,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::TimedOut,
+    ] {
+        let gone = std::io::Error::new(kind, "client gone");
+        assert_eq!(
+            client_upload_error_fault_for_test(&gone),
+            Fault::Disconnected,
+            "{kind:?}"
+        );
+    }
+    // A bare reason (the masked-EOF reset the gate raises) is the client's.
+    let reset = h2::Error::from(h2::Reason::CANCEL);
+    assert_eq!(
+        client_upload_error_fault_for_test(&reset),
+        Fault::Disconnected
+    );
 }
 
 // ── Status, accounting, retry boundary, and breaker feedback ─────────────
@@ -541,6 +736,7 @@ async fn end_to_end_relayed_client_abort_is_neutral_and_backend_reset_is_charged
             true,
             false,
             None,
+            Some(Fault::Disconnected),
         );
         assert_eq!(termination, Termination::ClientAbort, "{err:?}");
         let response = pre_header_upload_termination_response_for_test(termination, false, None);
@@ -564,6 +760,79 @@ async fn end_to_end_relayed_client_abort_is_neutral_and_backend_reset_is_charged
         true,
         false,
         None,
+        Some(Fault::Disconnected),
     );
     assert_eq!(termination, Termination::Transport);
+}
+
+#[test]
+fn a_malformed_upload_is_a_health_neutral_400_never_499() {
+    let response =
+        pre_header_upload_termination_response_for_test(Termination::MalformedUpload, false, None);
+    assert_eq!(
+        response.status_code, 400,
+        "a client that may still be reading gets a bad request, never 499"
+    );
+    assert_eq!(response.error_class, Some(ErrorClass::ClientDisconnect));
+    assert!(!response.connection_error);
+    assert_retry_boundary(&response);
+    assert!(!charged_to_backend(&response));
+
+    let grpc =
+        pre_header_upload_termination_response_for_test(Termination::MalformedUpload, true, None);
+    assert_eq!(grpc.status_code, 200, "gRPC errors ride HTTP 200");
+    assert_eq!(
+        grpc.headers.get("grpc-status").map(String::as_str),
+        Some("3"),
+        "INVALID_ARGUMENT"
+    );
+    assert!(!charged_to_backend(&grpc));
+}
+
+fn grpc_summary(metadata: HashMap<String, String>) -> TransactionSummary {
+    TransactionSummary {
+        response_status_code: 200,
+        metadata,
+        ..TransactionSummary::default()
+    }
+}
+
+#[test]
+fn a_buffered_mesh_grpc_cancel_reaches_the_transaction_summary_as_cancelled() {
+    let response =
+        pre_header_upload_termination_response_for_test(Termination::ClientAbort, true, None);
+    let mut metadata = HashMap::from([("request_protocol".to_string(), "grpc".to_string())]);
+    record_buffered_native_grpc_header_status_for_test(
+        &mut metadata,
+        true,
+        true,
+        &response.headers,
+    );
+    let summary = grpc_summary(metadata);
+    assert_eq!(summary.grpc_status(), Some(1), "CANCELLED, never UNKNOWN");
+    let logged = serde_json::to_value(&summary).expect("serialize summary");
+    assert_eq!(logged["grpc_status"], 1);
+}
+
+#[test]
+fn the_buffered_grpc_status_refresh_keeps_existing_and_grpc_web_rules() {
+    let headers = HashMap::from([("grpc-status".to_string(), "14".to_string())]);
+    // A status a gateway terminal already stamped wins.
+    let mut stamped = HashMap::from([("grpc_status".to_string(), "4".to_string())]);
+    record_buffered_native_grpc_header_status_for_test(&mut stamped, true, true, &headers);
+    assert_eq!(stamped.get("grpc_status").map(String::as_str), Some("4"));
+    // gRPC-Web (not native) and streaming responses keep their own rules.
+    for (native, buffered) in [(false, true), (true, false)] {
+        let mut metadata = HashMap::new();
+        record_buffered_native_grpc_header_status_for_test(
+            &mut metadata,
+            native,
+            buffered,
+            &headers,
+        );
+        assert!(
+            !metadata.contains_key("grpc_status"),
+            "native {native}, buffered {buffered}"
+        );
+    }
 }

@@ -2883,6 +2883,9 @@ pub struct SizeLimitedIncoming {
     /// A frontend HTTP/2 upload's EOF must be backed by the client's own
     /// END_STREAM. See [`SizeLimitedIncoming::with_h2_end_stream_required`].
     require_end_stream: bool,
+    /// Where an UNPUMPED adapter records why the client body it reads failed
+    /// (issue #6776). See [`SizeLimitedIncoming::with_client_fault_latch`].
+    client_fault: Option<Arc<crate::proxy::upload_pump::ClientUploadFaultLatch>>,
 }
 
 /// The error a frontend HTTP/2 upload yields when its EOF is not backed by the
@@ -3035,6 +3038,7 @@ impl SizeLimitedIncoming {
             grpc_scanner: None,
             auth_deadline: None,
             require_end_stream: false,
+            client_fault: None,
         }
     }
 
@@ -3065,6 +3069,7 @@ impl SizeLimitedIncoming {
             grpc_scanner: None,
             auth_deadline: None,
             require_end_stream: false,
+            client_fault: None,
         }
     }
 
@@ -3144,6 +3149,20 @@ impl SizeLimitedIncoming {
     #[must_use]
     pub(crate) fn with_h2_end_stream_required(mut self, required: bool) -> Self {
         self.require_end_stream = required;
+        self
+    }
+
+    /// Record why the client body this adapter reads directly failed, as a
+    /// typed [`crate::proxy::upload_pump::ClientUploadFault`] (issue #6776).
+    /// Only for an adapter that no gateway-owned pump will feed: a pump
+    /// records the same verdict in its own terminal. The error itself is
+    /// never retained.
+    #[must_use]
+    pub(crate) fn with_client_fault_latch(
+        mut self,
+        latch: Arc<crate::proxy::upload_pump::ClientUploadFaultLatch>,
+    ) -> Self {
+        self.client_fault = Some(latch);
         self
     }
 
@@ -3653,6 +3672,11 @@ impl http_body::Body for SizeLimitedIncoming {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
+                if let Some(latch) = this.client_fault.as_ref() {
+                    latch.record(crate::proxy::upload_pump::client_upload_error_fault(
+                        e.as_ref(),
+                    ));
+                }
                 this.signal_completion(RequestBodyOutcome::Errored);
                 Poll::Ready(Some(Err(e)))
             }
@@ -3660,6 +3684,9 @@ impl http_body::Body for SizeLimitedIncoming {
             // already ran this check against the original client body, and
             // reports end of stream once it ended cleanly.
             Poll::Ready(None) if this.require_end_stream && !this.inner.is_end_stream() => {
+                if let Some(latch) = this.client_fault.as_ref() {
+                    latch.record(crate::proxy::upload_pump::ClientUploadFault::Disconnected);
+                }
                 this.signal_completion(RequestBodyOutcome::Errored);
                 Poll::Ready(Some(Err(h2_upload_reset_error())))
             }

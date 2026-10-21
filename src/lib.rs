@@ -14987,8 +14987,59 @@ pub mod _test_support {
     pub enum PreHeaderSendTerminationForTest {
         Transport,
         ClientAbort,
+        MalformedUpload,
         BackendWriteTimeout,
         AuthorizationExpired,
+    }
+
+    /// Public mirror of the crate-private typed client upload fault (issue
+    /// #6776).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ClientUploadFaultForTest {
+        Disconnected,
+        Malformed,
+    }
+
+    fn client_upload_fault_from_test(
+        fault: ClientUploadFaultForTest,
+    ) -> crate::proxy::upload_pump::ClientUploadFault {
+        use crate::proxy::upload_pump::ClientUploadFault;
+        match fault {
+            ClientUploadFaultForTest::Disconnected => ClientUploadFault::Disconnected,
+            ClientUploadFaultForTest::Malformed => ClientUploadFault::Malformed,
+        }
+    }
+
+    /// The typed fault the upload pump and the unpumped size-limit adapter
+    /// record for a failed read of the client's upload.
+    pub fn client_upload_error_fault_for_test(
+        error: &(dyn std::error::Error + 'static),
+    ) -> ClientUploadFaultForTest {
+        match crate::proxy::upload_pump::client_upload_error_fault(error) {
+            crate::proxy::upload_pump::ClientUploadFault::Disconnected => {
+                ClientUploadFaultForTest::Disconnected
+            }
+            crate::proxy::upload_pump::ClientUploadFault::Malformed => {
+                ClientUploadFaultForTest::Malformed
+            }
+        }
+    }
+
+    /// Record a buffered native-gRPC terminal's header status into transaction
+    /// metadata, exactly as the generic dispatch handler does before it builds
+    /// the terminal summary (issue #6776).
+    pub fn record_buffered_native_grpc_header_status_for_test(
+        metadata: &mut std::collections::HashMap<String, String>,
+        native_grpc_request: bool,
+        response_is_buffered: bool,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) {
+        crate::proxy::record_buffered_native_grpc_header_status(
+            metadata,
+            native_grpc_request,
+            response_is_buffered,
+            response_headers,
+        )
     }
 
     fn pre_header_send_termination_from_test(
@@ -14998,6 +15049,9 @@ pub mod _test_support {
         match termination {
             PreHeaderSendTerminationForTest::Transport => PreHeaderSendTermination::Transport,
             PreHeaderSendTerminationForTest::ClientAbort => PreHeaderSendTermination::ClientAbort,
+            PreHeaderSendTerminationForTest::MalformedUpload => {
+                PreHeaderSendTermination::MalformedUpload
+            }
             PreHeaderSendTerminationForTest::BackendWriteTimeout => {
                 PreHeaderSendTermination::BackendWriteTimeout
             }
@@ -15012,13 +15066,14 @@ pub mod _test_support {
     /// transport error proves the gateway's body ended the exchange, whether
     /// the authorization lifetime ended it, whether the transport read a
     /// streaming client body, whether a gateway-owned pump fed it, and the
-    /// joined pump terminal.
+    /// joined pump terminal, and the recorded typed client upload fault.
     pub fn pre_header_send_termination_for_test(
         gateway_ended_upload: bool,
         authorization_ended: bool,
         client_body_streamed: bool,
         upload_pumped: bool,
         pump_outcome: Option<UploadPumpOutcomeForTest>,
+        client_fault: Option<ClientUploadFaultForTest>,
     ) -> PreHeaderSendTerminationForTest {
         use crate::proxy::upload_pump::PreHeaderSendTermination;
         match crate::proxy::upload_pump::pre_header_send_termination(
@@ -15027,9 +15082,13 @@ pub mod _test_support {
             client_body_streamed,
             upload_pumped,
             pump_outcome.map(upload_pump_outcome_from_test),
+            client_fault.map(client_upload_fault_from_test),
         ) {
             PreHeaderSendTermination::Transport => PreHeaderSendTerminationForTest::Transport,
             PreHeaderSendTermination::ClientAbort => PreHeaderSendTerminationForTest::ClientAbort,
+            PreHeaderSendTermination::MalformedUpload => {
+                PreHeaderSendTerminationForTest::MalformedUpload
+            }
             PreHeaderSendTermination::BackendWriteTimeout => {
                 PreHeaderSendTerminationForTest::BackendWriteTimeout
             }
