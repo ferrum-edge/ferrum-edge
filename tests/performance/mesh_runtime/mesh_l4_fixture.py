@@ -337,24 +337,51 @@ def public_config(value):
     return value
 
 
-def verify_consul(directory: Path) -> dict:
+def verify_consul(directory: Path, topology_path: Path) -> dict:
     # Reuse the active measured-listener checker. A TCP filter elsewhere in
     # the dump, or a warming listener, never proves the measured transport.
     module_spec = importlib.util.spec_from_file_location("verify_consul_protocol", Path(__file__).with_name("verify_consul_protocol.py"))
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)
-    verify, active_listeners = module.verify, module.active_listeners
+    verify = module.verify
     docs = [json.loads((directory / f"{role}-config.json").read_text())
             for role in ("source", "destination")]
-    result = verify("consul", docs)
-    errors = [] if result["accepted"] else ["active measured filters are not TCP"]
-    inbound = [listener for listener in active_listeners(docs[1])
-               if listener.get("address", {}).get("socket_address", {}).get("port_value") == 21000]
-    chains = [chain for listener in inbound for chain in listener.get("filter_chains", [])]
-    if not chains or any(chain.get("transport_socket", {}).get("name") != "envoy.transport_sockets.tls"
-                         or chain.get("transport_socket", {}).get("typed_config", {}).get("require_client_certificate") is not True
-                         for chain in chains):
-        errors.append("destination TCP listener does not require client TLS certificate")
+    # The source's upstream is the fixture's fixed loopback bind. B's bind is
+    # the exact bridge endpoint declared before startup, not any observed IP.
+    topology = json.loads(topology_path.read_text())
+    endpoint = str(ipaddress.IPv4Address(topology["endpoint"]))
+    addresses = (("127.0.0.1",), (endpoint,))
+    result = verify("consul", docs, measured_addresses=addresses)
+    errors = [] if result["accepted"] else ["active measured filters are not TCP at the declared listener addresses"]
+    chains = module.measured_listener_chains(docs[1], 21000, addresses[1])
+
+    def mutual_tls(chain):
+        transport = chain.get("transport_socket", {})
+        if not isinstance(transport, dict):
+            return False
+        context = transport.get("typed_config", {})
+        if not isinstance(context, dict):
+            return False
+        common = context.get("common_tls_context", {})
+        if not isinstance(common, dict):
+            return False
+        validation = common.get("validation_context", {})
+        if not isinstance(validation, dict):
+            return False
+        ca = validation.get("trusted_ca", {})
+        if not isinstance(ca, dict):
+            return False
+        trust = validation.get("trust_chain_verification", "VERIFY_TRUST_CHAIN")
+        ca_sources = [ca.get(key) for key in ("filename", "inline_string", "inline_bytes")]
+        return (transport.get("name") in ("tls", "envoy.transport_sockets.tls")
+                and context.get("@type") == "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext"
+                and context.get("require_client_certificate") is True
+                and sum(isinstance(value, str) and bool(value.strip()) for value in ca_sources) == 1
+                and (trust == "VERIFY_TRUST_CHAIN" or type(trust) is int and trust == 0)
+                and "custom_validator_config" not in validation)
+
+    if not chains or not all(mutual_tls(chain) for chain in chains):
+        errors.append("destination measured TCP listener requires exact DownstreamTlsContext, trusted CA and client certificate verification on every chain")
     for role, service in (("source", "client"), ("destination", "svc")):
         stats = (directory / f"{role}.metrics").read_text()
         if not any(re.search(r"\.ssl\.handshake: [1-9][0-9]*$", line) for line in stats.splitlines()):
@@ -401,6 +428,7 @@ def main() -> int:
     sub.add_parser("public-config")
     consul = sub.add_parser("verify-consul")
     consul.add_argument("directory", type=Path)
+    consul.add_argument("--topology", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "render":
         render(args.directory, args.endpoint, args.vip, args.backend_port, args.raw_port)
@@ -420,7 +448,7 @@ def main() -> int:
             print(json.dumps({"ok": False, "error": str(error), "kind": type(error).__name__}), flush=True)
             return 1
     else:
-        result = verify_consul(args.directory) if args.command == "verify-consul" else verify_ferrum(args.directory)
+        result = verify_consul(args.directory, args.topology) if args.command == "verify-consul" else verify_ferrum(args.directory)
         print(json.dumps(result, indent=2, allow_nan=False))
         return 0 if result["accepted"] else 1
     return 0

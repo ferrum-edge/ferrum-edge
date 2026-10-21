@@ -146,22 +146,105 @@ class CapturedL4Fixture(unittest.TestCase):
                 self.assertFalse(result["transport_auth_qualified"])
                 self.assertFalse(result["workload_telemetry_qualified"])
 
-    def test_consul_requires_active_tcp_mutual_tls_and_issued_identity(self):
+    def consul_evidence(self, directory):
+        topology = directory / "topology.json"
+        topology.write_text(json.dumps({"endpoint": "172.18.0.1"}))
+        # Minimal sanitized shape from smoke39654641860: source has plaintext
+        # loopback upstream; B binds the declared bridge with alias "tls".
+        for role, host, port, service in (("source", "127.0.0.1", 15101, "client"),
+                                          ("destination", "172.18.0.1", 21000, "svc")):
+            chain = {"filters": [{"name": "envoy.filters.network.tcp_proxy"}]}
+            if role == "destination":
+                chain["filters"].insert(0, {"name": "envoy.filters.network.rbac"})
+                chain["transport_socket"] = {"name": "tls", "typed_config": {
+                    "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+                    "common_tls_context": {"validation_context": {"trusted_ca": {"inline_string": "public CA certificate"}}},
+                    "require_client_certificate": True}}
+            listener = {"address": {"socket_address": {"address": host, "port_value": port}}, "filter_chains": [chain]}
+            (directory / f"{role}-config.json").write_text(json.dumps({"configs": [{
+                "@type": "type.googleapis.com/envoy.admin.v3.ListenersConfigDump.DynamicListener",
+                "active_state": {"listener": listener}}]}))
+            (directory / f"{role}.metrics").write_text('cluster.svc.ssl.handshake: 2\n')
+            (directory / f"{role}-certs.json").write_text(json.dumps({"uri": f"spiffe://trust.consul/ns/default/dc/dc1/svc/{service}"}))
+        return topology
+
+    def test_consul_real_sanitized_shape_accepts_both_tls_names_at_declared_addresses(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
-            for role, port, service in (("source", 15101, "client"), ("destination", 21000, "svc")):
-                listener = {"address": {"socket_address": {"address": "0.0.0.0", "port_value": port}},
-                            "filter_chains": [{"filters": [{"name": "envoy.filters.network.tcp_proxy"}],
-                                "transport_socket": {"name": "envoy.transport_sockets.tls", "typed_config": {"require_client_certificate": True}}}]}
-                (directory / f"{role}-config.json").write_text(json.dumps({"configs": [{"dynamic_listeners": [{"active_state": {"listener": listener}}]}]}))
-                (directory / f"{role}.metrics").write_text('cluster.svc.ssl.handshake: 2\n')
-                (directory / f"{role}-certs.json").write_text(json.dumps({"uri": f"spiffe://trust.consul/ns/default/dc/dc1/svc/{service}"}))
-            self.assertTrue(fixture.verify_consul(directory)["accepted"])
+            topology = self.consul_evidence(directory)
+            result = fixture.verify_consul(directory, topology)
+            self.assertTrue(result["accepted"], result)
+            self.assertEqual(result["measured_addresses"], [["127.0.0.1"], ["172.18.0.1"]])
             path = directory / "destination-config.json"
-            path.write_text(path.read_text().replace('"require_client_certificate": true', '"require_client_certificate": false'))
-            self.assertFalse(fixture.verify_consul(directory)["accepted"])
+            path.write_text(path.read_text().replace('"name": "tls"', '"name": "envoy.transport_sockets.tls"'))
+            self.assertTrue(fixture.verify_consul(directory, topology)["accepted"])
             (directory / "source.metrics").write_text('cluster.svc.ssl.handshake: 0\n')
-            self.assertFalse(fixture.verify_consul(directory)["accepted"])
+            self.assertFalse(fixture.verify_consul(directory, topology)["accepted"])
+            self.assertIn('--topology "$OUTPUT_DIR/logs/l4-fixture-configs/topology.json"', shell)
+
+    def test_consul_rejects_wrong_address_warming_duplicate_or_unprotected_chain(self):
+        for mutation in ("address", "source-address", "warming", "duplicate", "cleartext-chain", "cleartext-default"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                topology = self.consul_evidence(directory)
+                path = directory / ("source-config.json" if mutation == "source-address" else "destination-config.json")
+                doc = json.loads(path.read_text())
+                state = doc["configs"][0]
+                listener = state["active_state"]["listener"]
+                if mutation in ("address", "source-address"):
+                    listener["address"]["socket_address"]["address"] = "0.0.0.0"
+                elif mutation == "warming":
+                    state["warming_state"] = state.pop("active_state")
+                elif mutation == "duplicate":
+                    doc["configs"].append(copy.deepcopy(state))
+                else:
+                    cleartext = {"filters": [{"name": "envoy.filters.network.tcp_proxy"}]}
+                    if mutation == "cleartext-chain":
+                        listener["filter_chains"].append(cleartext)
+                    else:
+                        listener["default_filter_chain"] = cleartext
+                path.write_text(json.dumps(doc))
+                self.assertFalse(fixture.verify_consul(directory, topology)["accepted"])
+
+    def test_consul_tls_alias_requires_exact_context_trusted_ca_and_client_certificate(self):
+        for mutation in ("name", "type", "client-certificate", "ca", "empty-ca", "untrusted", "custom-validator"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                topology = self.consul_evidence(directory)
+                path = directory / "destination-config.json"
+                doc = json.loads(path.read_text())
+                transport = doc["configs"][0]["active_state"]["listener"]["filter_chains"][0]["transport_socket"]
+                context = transport["typed_config"]
+                validation = context["common_tls_context"]["validation_context"]
+                if mutation == "name":
+                    transport["name"] = "raw_buffer"
+                elif mutation == "type":
+                    context["@type"] = "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy"
+                elif mutation == "client-certificate":
+                    context["require_client_certificate"] = False
+                elif mutation == "ca":
+                    del validation["trusted_ca"]
+                elif mutation == "empty-ca":
+                    validation["trusted_ca"] = {"inline_string": " "}
+                elif mutation == "untrusted":
+                    validation["trust_chain_verification"] = "ACCEPT_UNTRUSTED"
+                else:
+                    validation["custom_validator_config"] = {"name": "unknown"}
+                path.write_text(json.dumps(doc))
+                self.assertFalse(fixture.verify_consul(directory, topology)["accepted"])
+
+    def test_consul_measured_transport_is_snapshotted_after_http_restore(self):
+        body = re.search(r'(?ms)^mesh_l4_prove\(\) \{.*?^\}', shell).group()
+        restore = body.index('consul services register /tmp/consul-svc.json')
+        ready = body.index('wait_ready "$TARGET_URL" consul-captured-http-restored', restore)
+        snapshot = body.index('mesh_l4_snapshot measured', ready)
+        verify = body.index('verify-consul "$OUTPUT_DIR/logs/l4-measured"', snapshot)
+        self.assertLess(restore, ready)
+        self.assertLess(ready, snapshot)
+        self.assertLess(snapshot, verify)
+        self.assertIn('l4-measured-http-readiness.json', body[ready:snapshot])
+        self.assertIn('l4-measured-transport-proof.json" || return 1', body[verify:])
+        self.assertNotIn('READINESS_DEADLINE=', body)
 
     def test_capture_matches_production_order_and_uid_is_separate(self):
         production = (ROOT / "src/capture/mod.rs").read_text()

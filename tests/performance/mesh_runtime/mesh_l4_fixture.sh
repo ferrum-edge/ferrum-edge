@@ -230,8 +230,18 @@ mesh_l4_prove() {
         python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-ferrum "$OUTPUT_DIR/logs" > "$OUTPUT_DIR/logs/l4-transport-proof.json" || return 1
     else
         python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-consul "$OUTPUT_DIR/logs/l4-restored" \
+            --topology "$OUTPUT_DIR/logs/l4-fixture-configs/topology.json" \
             > "$OUTPUT_DIR/logs/l4-transport-proof.json" || return 1
         readiness_command 3 docker exec "$AGENT_NAME" consul services register /tmp/consul-svc.json >/dev/null
+        # The binary proof temporarily changes B's local application port.
+        # Requalify the actual measured HTTP backend after xDS converges, using
+        # the SAME readiness deadline; retain its active TCP/mTLS config too.
+        wait_ready "$TARGET_URL" consul-captured-http-restored "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" || return 1
+        cp "$OUTPUT_DIR/logs/probe.json" "$OUTPUT_DIR/logs/l4-measured-http-readiness.json"
+        mesh_l4_snapshot measured || return 1
+        python3 "$SCRIPT_DIR/mesh_l4_fixture.py" verify-consul "$OUTPUT_DIR/logs/l4-measured" \
+            --topology "$OUTPUT_DIR/logs/l4-fixture-configs/topology.json" \
+            > "$OUTPUT_DIR/logs/l4-measured-transport-proof.json" || return 1
     fi
     # The caller now requires byte-exact H1 readiness again before measuring.
     # Probe-only Python echo stays idle; cleanup owns its exact child PID.
