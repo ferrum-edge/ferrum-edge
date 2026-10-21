@@ -28,9 +28,15 @@ on:
       - .github/workflows/mesh-runtime-benchmark.yml
       - .github/workflows/mesh-runtime-harness-tests.yml
   workflow_dispatch:
+    inputs:
+      fixture_smoke:
+        description: "Smoke synthetic mTLS fixtures using the retained pinned-main CI binary (no performance claim)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
@@ -70,3 +76,49 @@ jobs:
 
       - name: Crate formatting
         run: cargo fmt --manifest-path tests/performance/mesh_runtime/Cargo.toml -- --check
+
+      # The overall source CI failed; this retained build is only a disposable
+      # fixture probe, never evidence of release readiness or performance.
+      - name: Download pinned-main fixture binary
+        if: inputs.fixture_smoke == true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ferrum-edge-debug-Linux-X64
+          run-id: 39560802458
+          github-token: ${{ github.token }}
+          path: fixture-bin
+
+      - name: Package nonroot fixture image without compiling the runtime
+        if: inputs.fixture_smoke == true
+        uses: ./.github/actions/package-ferrum-runtime-image
+        with:
+          binary-path: fixture-bin/ferrum-edge
+          image: ferrum-edge:bench
+
+      - name: Build only the small load generator and retain fixture identity
+        if: inputs.fixture_smoke == true
+        timeout-minutes: 6
+        run: |
+          mkdir -p fixture-results
+          printf '%s\n' 'source_sha=236ec83e5684fe57284894ca96750ce8a37bdc94' 'source_run=39560802458' 'source_artifact=12327942352' 'purpose=fixture_smoke_only' > fixture-results/source.txt
+          sha256sum fixture-bin/ferrum-edge > fixture-results/source-binary.sha256
+          docker image inspect ferrum-edge:bench --format '{{.Id}} {{.Config.User}}' > fixture-results/image.txt
+          docker run --rm ferrum-edge:bench version --json > fixture-results/version.json
+          docker build -f tests/performance/mesh_runtime/Dockerfile.tools -t mesh-bench-tools:local tests/performance/mesh_runtime
+
+      - name: Prove Ferrum and Envoy synthetic identities and one tiny load cell
+        if: inputs.fixture_smoke == true
+        timeout-minutes: 6
+        run: |
+          bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh ferrum --skip-build --duration 1 --concurrency 1 --payload-sizes 1024 --output-dir fixture-results/ferrum
+          bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh envoy --skip-build --duration 1 --concurrency 1 --payload-sizes 1024 --output-dir fixture-results/envoy
+
+      - name: Retain fixture proof without synthetic private keys
+        if: always() && inputs.fixture_smoke == true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-fixture-smoke-${{ github.sha }}
+          path: |
+            fixture-results/
+            !fixture-results/**/runtime/**
+          retention-days: 14
