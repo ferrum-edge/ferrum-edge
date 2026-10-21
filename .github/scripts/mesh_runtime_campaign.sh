@@ -18,14 +18,20 @@ if [ "$mode" = build ]; then
     rm "$RUNNER_TEMP/mesh-candidate-binary"
     docker rm meshbench-candidate-hash >/dev/null
     if [ -n "$baseline" ]; then
-        baseline_source="${RUNNER_TEMP:?}/mesh-baseline-source"
-        git worktree add --detach "$baseline_source" "$baseline"
-        trap 'git worktree remove "$baseline_source"' EXIT
-        docker build --build-arg "CARGO_PROFILE=$profile" --build-arg "FEATURES=$features" \
-            -t ferrum-edge:baseline -f "$baseline_source/Dockerfile" "$baseline_source" \
-            > results/images/baseline-build.log 2>&1
-        git worktree remove "$baseline_source"
-        trap - EXIT
+        if [ "$baseline" = "$(git rev-parse HEAD)" ]; then
+            # Exact-image A/A control: a same-source rebuild can differ in
+            # bytes and must not spend a second compile to answer this check.
+            docker tag ferrum-edge:bench ferrum-edge:baseline
+        else
+            baseline_source="${RUNNER_TEMP:?}/mesh-baseline-source"
+            git worktree add --detach "$baseline_source" "$baseline"
+            trap 'git worktree remove "$baseline_source"' EXIT
+            docker build --build-arg "CARGO_PROFILE=$profile" --build-arg "FEATURES=$features" \
+                -t ferrum-edge:baseline -f "$baseline_source/Dockerfile" "$baseline_source" \
+                > results/images/baseline-build.log 2>&1
+            git worktree remove "$baseline_source"
+            trap - EXIT
+        fi
         docker create --name meshbench-baseline-hash ferrum-edge:baseline >/dev/null
         docker cp meshbench-baseline-hash:/app/ferrum-edge "$RUNNER_TEMP/mesh-baseline-binary"
         sha256sum "$RUNNER_TEMP/mesh-baseline-binary" > results/images/baseline-binary.sha256
@@ -46,9 +52,11 @@ elif [ "$mode" = measure ]; then
         directory="results/$arm/run_$repetition/payload_$payload"
         mkdir -p "$directory"
         echo "arm=$arm payload=$payload repetition=$repetition"
-        if bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh "$measured_arm" \
+        arm_budget=$((BENCH_DURATION + 420))
+        if timeout --signal=TERM --kill-after=10s "${arm_budget}s" \
+            bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh "$measured_arm" \
             --payload-sizes "$payload" --duration "$BENCH_DURATION" --concurrency "$BENCH_CONCURRENCY" \
-            --output-dir "$directory" --skip-build > "$directory/run.log" 2>&1; then
+            --output-dir "$directory" --skip-build 2>&1 | tee "$directory/run.log"; then
             :
         else
             failed=1
@@ -56,6 +64,10 @@ elif [ "$mode" = measure ]; then
         fi
         if [ "$arm" = ferrumbaseline ]; then
             python3 .github/scripts/mesh_runtime_campaign.py relabel --results "$directory"
+        fi
+        if [ "$failed" -ne 0 ]; then
+            echo "[campaign] stopping after failed arm; remaining planned cells stay missing" >&2
+            break
         fi
     done < results/plan.txt
     exit "$failed"
