@@ -8,12 +8,39 @@
 
 use hdrhistogram::Histogram;
 use serde::Serialize;
+use std::time::{Duration, Instant};
+
+/// The coordinator publishes one window to every worker after connection
+/// setup and warmup. Both request admission and useful completion accounting
+/// use this exact interval; worker scheduling never extends it.
+#[derive(Clone, Copy)]
+pub struct MeasurementWindow {
+    start: Instant,
+    deadline: Instant,
+}
+
+impl MeasurementWindow {
+    pub fn new(start: Instant, duration: Duration) -> Self {
+        Self {
+            start,
+            deadline: start + duration,
+        }
+    }
+
+    pub fn contains(self, instant: Instant) -> bool {
+        self.start <= instant && instant < self.deadline
+    }
+}
 
 pub struct BenchMetrics {
     histogram: Histogram<u64>,
     pub total_requests: u64,
     pub total_errors: u64,
     pub total_bytes: u64,
+    pub drained_requests: u64,
+    pub drained_bytes: u64,
+    pub warmup_requests: u64,
+    pub warmup_errors: u64,
 }
 
 impl Default for BenchMetrics {
@@ -30,6 +57,10 @@ impl BenchMetrics {
             total_requests: 0,
             total_errors: 0,
             total_bytes: 0,
+            drained_requests: 0,
+            drained_bytes: 0,
+            warmup_requests: 0,
+            warmup_errors: 0,
         }
     }
 
@@ -43,11 +74,43 @@ impl BenchMetrics {
         self.total_errors += 1;
     }
 
+    /// Only complete, validated echoes inside the shared window contribute
+    /// to useful throughput, bytes, or latency. An admitted exchange may
+    /// finish later while draining, but must not inflate any of those values.
+    pub fn record_completion(
+        &mut self,
+        window: MeasurementWindow,
+        completed_at: Instant,
+        latency_us: u64,
+        bytes: usize,
+    ) {
+        if window.contains(completed_at) {
+            self.record(latency_us, bytes);
+        } else {
+            self.drained_requests += 1;
+            self.drained_bytes += bytes as u64;
+        }
+    }
+
+    pub fn record_warmup_success(&mut self) {
+        self.warmup_requests += 1;
+    }
+
+    pub fn record_warmup_error(&mut self) {
+        self.warmup_errors += 1;
+        // Failed setup/warmup must still invalidate the cell's zero-error gate.
+        self.record_error();
+    }
+
     pub fn merge(&mut self, other: &BenchMetrics) {
         let _ = self.histogram.add(&other.histogram);
         self.total_requests += other.total_requests;
         self.total_errors += other.total_errors;
         self.total_bytes += other.total_bytes;
+        self.drained_requests += other.drained_requests;
+        self.drained_bytes += other.drained_bytes;
+        self.warmup_requests += other.warmup_requests;
+        self.warmup_errors += other.warmup_errors;
     }
 
     pub fn json(
@@ -80,6 +143,10 @@ impl BenchMetrics {
             p99_us: self.histogram.value_at_quantile(0.99),
             latency_max_us: self.histogram.max(),
             total_bytes: self.total_bytes,
+            drained_requests: self.drained_requests,
+            drained_bytes: self.drained_bytes,
+            warmup_requests: self.warmup_requests,
+            warmup_errors: self.warmup_errors,
         }
     }
 }
@@ -102,4 +169,8 @@ pub struct BenchReport {
     pub p99_us: u64,
     pub latency_max_us: u64,
     pub total_bytes: u64,
+    pub drained_requests: u64,
+    pub drained_bytes: u64,
+    pub warmup_requests: u64,
+    pub warmup_errors: u64,
 }

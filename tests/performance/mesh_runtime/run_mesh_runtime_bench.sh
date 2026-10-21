@@ -51,7 +51,7 @@ else
     [ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|linkerd> [options]" >&2; exit 2; }
     shift
     case "$MESH" in
-        direct|ferrum|envoy|consul|linkerd) ;;
+        direct|ferrum|envoy|consul|consulhttp|linkerd) ;;
         *) echo "unknown mesh arm: $MESH" >&2; exit 2 ;;
     esac
 fi
@@ -94,6 +94,8 @@ ENVOY_IMAGE="${ENVOY_IMAGE:-envoyproxy/envoy:v1.39.1}"
 CONSUL_IMAGE="${CONSUL_IMAGE:-hashicorp/consul:1.21.4}"
 LINKERD_IMAGE="${LINKERD_IMAGE:-ghcr.io/linkerd/proxy:edge-25.11.1}"
 TOOLS_IMAGE="${TOOLS_IMAGE:-mesh-bench-tools:local}"
+BENCH_CARGO_PROFILE="${BENCH_CARGO_PROFILE:-release}"
+case "$BENCH_CARGO_PROFILE" in release|ci-release) ;; *) echo "invalid build profile" >&2; exit 2 ;; esac
 
 BACKEND_PORT=18080
 OUTBOUND_PORT=15101
@@ -195,7 +197,8 @@ build_tools_image() {
 
 build_ferrum_image() {
     echo "[build] building ferrum image $FERRUM_IMAGE (repo Dockerfile)"
-    docker build -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" \
+    docker build --build-arg "CARGO_PROFILE=$BENCH_CARGO_PROFILE" \
+        -t "$FERRUM_IMAGE" -f "$PROJECT_ROOT/Dockerfile" "$PROJECT_ROOT" \
         > "$OUTPUT_DIR/logs/ferrum-build.log" 2>&1 || {
         tail -30 "$OUTPUT_DIR/logs/ferrum-build.log" >&2; exit 1; }
 }
@@ -227,7 +230,7 @@ prepare_images() {
             fi
             ;;
         envoy) docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true ;;
-        consul)
+        consul|consulhttp)
             docker pull "$CONSUL_IMAGE" > "$OUTPUT_DIR/logs/consul-pull.log" 2>&1 || true
             docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true
             ;;
@@ -372,6 +375,14 @@ start_consul() {
     docker cp "$RUNTIME_DIR/consul/intention-deny.json" "$AGENT_NAME:/tmp/intention-deny.json"
     docker exec "$AGENT_NAME" consul services register /tmp/svc.json >/dev/null
     docker exec "$AGENT_NAME" consul services register /tmp/client.json >/dev/null
+    # Keep the historical Consul TCP/L4 arm. HTTP is a separate, explicit
+    # service-defaults arm; service registration alone defaults to TCP.
+    if [ "$MESH" = consulhttp ]; then
+        docker cp "$SCRIPT_DIR/configs/consul/svc-http.json" "$AGENT_NAME:/tmp/svc-http.json"
+        docker cp "$SCRIPT_DIR/configs/consul/client-http.json" "$AGENT_NAME:/tmp/client-http.json"
+        docker exec "$AGENT_NAME" consul config write /tmp/svc-http.json >/dev/null
+        docker exec "$AGENT_NAME" consul config write /tmp/client-http.json >/dev/null
+    fi
     docker exec "$AGENT_NAME" consul connect envoy -sidecar-for svc-1 -bootstrap \
         > "$RUNTIME_DIR/consul/svc-bootstrap.json"
     docker exec "$AGENT_NAME" consul connect envoy -sidecar-for client-1 -bootstrap \
@@ -476,37 +487,18 @@ run_cell() {
     eff_concurrency=$(effective_concurrency "$payload")
     echo "[bench] $MESH payload=${payload}B duration=${DURATION}s concurrency=$eff_concurrency"
 
-    if [ "$WARMUP" -gt 0 ]; then
-        docker run --rm --network host "$TOOLS_IMAGE" \
-            --target "$target" --host-header "$HOST_HEADER" --mesh warmup \
-            --duration "$WARMUP" --concurrency "$eff_concurrency" \
-            --payload-size "$payload" --json > /dev/null 2>&1 || true
-    fi
-
-    # Sample proxy container stats (CPU/memory) for the measured window.
-    : > "$stats"
-    local stats_pid=""
+    # Warm the same frontend connections that are measured. The host sampler
+    # brackets /proc CPU/steal at the loadgen's common measurement markers.
+    local resource_args=()
     if [ "$MESH" != direct ]; then
-        (
-            while :; do
-                docker stats --no-stream --format '{{json .}}' \
-                    "$CLIENT_NAME" "$SERVER_NAME" >> "$stats" 2>/dev/null || true
-                sleep 1
-            done
-        ) &
-        stats_pid=$!
+        resource_args=(--container "$CLIENT_NAME" --container "$SERVER_NAME")
     fi
-
     local rc=0
-    docker run --rm --network host "$TOOLS_IMAGE" \
+    python3 "$SCRIPT_DIR/collect_resources.py" "${resource_args[@]}" \
+        --output "$out" --resources "${out%.json}.resources.json" --image "$TOOLS_IMAGE" \
         --target "$target" --host-header "$HOST_HEADER" --mesh "$MESH" \
         --duration "$DURATION" --concurrency "$eff_concurrency" \
-        --payload-size "$payload" --json > "$out" || rc=$?
-
-    if [ -n "$stats_pid" ]; then
-        kill "$stats_pid" 2>/dev/null || true
-        wait "$stats_pid" 2>/dev/null || true
-    fi
+        --warmup "$WARMUP" --payload-size "$payload" || rc=$?
 
     if [ "$rc" -ne 0 ] || ! grep -q '"rps"' "$out"; then
         echo "[bench] cell failed (rc=$rc); recording zero-result JSON" >&2
@@ -625,7 +617,7 @@ case "$MESH" in
             dump_logs; write_arm_status failed "auth probe failed on envoy inbound"; exit 1
         fi
         ;;
-    consul)
+    consul|consulhttp)
         if ! docker image inspect "$CONSUL_IMAGE" >/dev/null 2>&1; then
             write_arm_status failed "consul image $CONSUL_IMAGE unavailable (pull failed)"
             exit 1
@@ -638,6 +630,15 @@ case "$MESH" in
         if ! consul_intention_probe; then
             dump_logs; write_arm_status failed "auth probe failed on consul pair"; exit 1
         fi
+        # Listener resources only: never upload SDS secrets from config_dump.
+        curl --fail --silent --show-error 'http://127.0.0.1:19001/config_dump?resource=dynamic_listeners' \
+            > "$OUTPUT_DIR/logs/consul-client-listeners.json"
+        curl --fail --silent --show-error 'http://127.0.0.1:19002/config_dump?resource=dynamic_listeners' \
+            > "$OUTPUT_DIR/logs/consul-server-listeners.json"
+        python3 "$SCRIPT_DIR/verify_consul_protocol.py" "$MESH" \
+            "$OUTPUT_DIR/logs/consul-client-listeners.json" \
+            "$OUTPUT_DIR/logs/consul-server-listeners.json" \
+            > "$OUTPUT_DIR/logs/consul-protocol.json"
         ;;
     linkerd)
         if ! docker image inspect "$LINKERD_IMAGE" >/dev/null 2>&1; then
