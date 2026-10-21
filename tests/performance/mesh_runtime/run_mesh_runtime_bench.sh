@@ -67,7 +67,7 @@ else
     [ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|linkerd> [options]" >&2; exit 2; }
     shift
     case "$MESH" in
-        direct|ferrum|envoy|consul|consulhttp|linkerd) ;;
+        direct|ferrum|ferrumtcp|envoy|consul|consulhttp|consultcp|linkerd) ;;
         *) echo "unknown mesh arm: $MESH" >&2; exit 2 ;;
     esac
 fi
@@ -133,6 +133,10 @@ LOADGEN_NAME="meshbench-${MESH}-${RUN_ID}-loadgen"
 # This grants access only through the explicitly mounted, disposable fixture
 # directories. Container users stay nonroot and private keys stay mode 0640.
 CERT_GID="$(id -g)"
+LOADGEN_NETWORK_ARGS=(--network host)
+if [ "$MESH" = ferrumtcp ] || [ "$MESH" = consultcp ]; then
+    source "$SCRIPT_DIR/mesh_l4_fixture.sh"
+fi
 
 mkdir -p "$OUTPUT_DIR"
 # Docker -v sources must be absolute (a relative results/... source is a
@@ -164,6 +168,7 @@ cleanup() {
     fi
     timeout --signal=KILL 5s docker rm -f "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME" "$AGENT_NAME" \
         "$PROBE_NAME" "$LOADGEN_NAME" >/dev/null 2>&1 || true
+    if declare -F mesh_l4_cleanup >/dev/null; then mesh_l4_cleanup; fi
     # Single-run private keys never outlive the run (certificates and
     # public bundles remain as provenance under runtime/).
     rm -f "$CERT_DIR"/*/svid.key "$CERT_DIR"/*/key.p8 \
@@ -271,7 +276,7 @@ prepare_images() {
         build_tools_image
     fi
     case "$MESH" in
-        ferrum)
+        ferrum|ferrumtcp)
             if ! docker image inspect "$FERRUM_IMAGE" >/dev/null 2>&1; then
                 if $SKIP_BUILD; then
                     echo "[build] ferrum image $FERRUM_IMAGE missing and --skip-build set" >&2; exit 1
@@ -280,7 +285,7 @@ prepare_images() {
             fi
             ;;
         envoy) docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true ;;
-        consul|consulhttp)
+        consul|consulhttp|consultcp)
             docker pull "$CONSUL_IMAGE" > "$OUTPUT_DIR/logs/consul-pull.log" 2>&1 || true
             docker pull "$ENVOY_IMAGE" > "$OUTPUT_DIR/logs/envoy-pull.log" 2>&1 || true
             ;;
@@ -290,9 +295,11 @@ prepare_images() {
 
 start_backend() {
     echo "[backend] starting mesh_backend on 127.0.0.1:$BACKEND_PORT"
+    local bind_addr=127.0.0.1
+    if [ "$MESH" = ferrumtcp ] || [ "$MESH" = consultcp ]; then bind_addr=0.0.0.0; fi
     docker run -d --network host --name "$BACKEND_NAME" \
         --entrypoint /usr/local/bin/mesh_backend \
-        "$TOOLS_IMAGE" --listen "127.0.0.1:$BACKEND_PORT" >/dev/null
+        "$TOOLS_IMAGE" --listen "$bind_addr:$BACKEND_PORT" >/dev/null
 }
 
 # One short loadgen run used as the readiness probe: portable across
@@ -300,7 +307,7 @@ start_backend() {
 probe_loadgen() {
     local target="$1" out="$OUTPUT_DIR/logs/probe.json"
     local rc=0
-    readiness_command 10 docker run --rm --network host --name "$PROBE_NAME" "$TOOLS_IMAGE" \
+    readiness_command 10 docker run --rm "${LOADGEN_NETWORK_ARGS[@]}" --name "$PROBE_NAME" "$TOOLS_IMAGE" \
         --target "$target" --host-header "$HOST_HEADER" --mesh probe \
         --duration 1 --concurrency 1 --payload-size 64 --exchange-timeout-secs 2 --json \
         > "$out" 2> "$OUTPUT_DIR/logs/probe.stderr.log" || rc=$?
@@ -597,7 +604,7 @@ run_cell() {
     if [ "${BENCH_PRODUCTION_OBSERVE:-false}" = true ]; then
         resource_args+=(--production-observe --aux-container "$BACKEND_NAME"
             --client-name "$CLIENT_NAME" --server-name "$SERVER_NAME")
-        if [ "$MESH" = consul ] || [ "$MESH" = consulhttp ]; then
+        if [ "$MESH" = consul ] || [ "$MESH" = consulhttp ] || [ "$MESH" = consultcp ]; then
             resource_args+=(--aux-container "$AGENT_NAME")
         fi
     fi
@@ -638,6 +645,7 @@ run_cell() {
 # authenticated mesh transport the arm claims.
 auth_probes() {
     local inbound_port="$1"
+    local -a LOADGEN_NETWORK_ARGS=(--network host)
     local evidence="$OUTPUT_DIR/logs/auth_probes.log"
     : > "$evidence"
     if probe_loadgen "http://127.0.0.1:$inbound_port/echo"; then
@@ -736,6 +744,22 @@ case "$MESH" in
         fi
         if ! auth_probes 15006; then
             dump_logs; write_arm_status failed "auth probe failed on ferrum inbound"; exit 1
+        fi
+        ;;
+    ferrumtcp|consultcp)
+        if [ "$MESH" = ferrumtcp ]; then start_ferrum_l4; else start_consul_l4; fi
+        TARGET="$TARGET_URL"
+        if ! wait_ready "$TARGET" captured-tcp-pair "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"; then
+            dump_logs; write_arm_status failed "captured TCP pair did not become ready"; exit 1
+        fi
+        if [ "$MESH" = ferrumtcp ] && ! auth_probes 15006; then
+            dump_logs; write_arm_status failed "captured TCP mTLS authentication probe failed"; exit 1
+        fi
+        if ! mesh_l4_prove; then
+            dump_logs; write_arm_status failed "opaque TCP transport or destination authorization proof failed"; exit 1
+        fi
+        if ! wait_ready "$TARGET" captured-tcp-after-proofs "$CLIENT_NAME" "$SERVER_NAME" "$BACKEND_NAME"; then
+            dump_logs; write_arm_status failed "captured TCP pair did not restore measured application"; exit 1
         fi
         ;;
     envoy)

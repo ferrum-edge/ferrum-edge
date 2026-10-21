@@ -25,7 +25,8 @@ def inspect_container(name):
             "cpu_period": obj["HostConfig"]["CpuPeriod"],
             "cpuset": obj["HostConfig"]["CpusetCpus"],
             "memory_limit_bytes": obj["HostConfig"]["Memory"],
-            "network_mode": obj["HostConfig"]["NetworkMode"]}
+            "network_mode": obj["HostConfig"]["NetworkMode"],
+            "worker_environment": [e for e in obj["Config"].get("Env",[]) if e.startswith("FERRUM_WORKER_THREADS=")]}
 
 
 def endpoint(value):
@@ -97,7 +98,7 @@ def metrics(mesh, containers, destination, phase):
                      ("clusters", "/clusters?format=json")]
         for label, path in paths:
             command = ["nsenter", "-t", str(container["pid"]), "-n", "curl", "--fail", "--silent",
-                       "--show-error", "--max-time", "3", f"http://127.0.0.1:{port}{path}"]
+                       "--show-error", "--max-time", "3", "--max-filesize", "4194304", f"http://127.0.0.1:{port}{path}"]
             done = subprocess.run(command, capture_output=True, timeout=5)
             output = {"command_path": path, "phase": phase, "returncode": done.returncode,
                       "body": done.stdout.decode(errors="replace"), "error": done.stderr.decode(errors="replace")}

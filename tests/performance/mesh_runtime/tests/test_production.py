@@ -1,6 +1,9 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import tempfile
+import json
+from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[4]
 spec = importlib.util.spec_from_file_location("campaign", ROOT/".github/scripts/mesh_production_campaign.py")
 campaign = importlib.util.module_from_spec(spec)
@@ -30,5 +33,22 @@ class ProductionContracts(unittest.TestCase):
         for key,value in (("missed_requests",1),("mesh","envoy"),("duration_secs",2),("offered_requests",5999),("warmup_errors",1)):
             self.assertTrue(campaign.validate(cell,{**load,key:value},resource))
         self.assertTrue(campaign.validate(cell,load,{"valid":False,"errors":[]}))
+
+    def test_invalid_failure_stub_retains_complete_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            cell=campaign.plan("smoke-l7")[1]
+            (root/"production-plan.json").write_text(json.dumps([cell]))
+            path=root/"ferruma/saturated/run_1/payload_1024"
+            path.mkdir(parents=True)
+            (path/"ferrum_http1_1024.json").write_text(json.dumps(dict(mesh="ferrum",rps=0,total_errors=-1,error="loadgen failed")))
+            (path/"ferrum_http1_1024.resources.json").write_text(json.dumps(dict(valid=False,errors=["PID missing"])))
+            with patch.object(campaign,"ROOT",root):
+                self.assertEqual(campaign.summarize(),1)
+            result=json.loads((root/"production-summary.json").read_text())
+            self.assertEqual(result["parsed_cells"],1)
+            self.assertFalse(result["valid"])
+            self.assertIsNone(result["groups"][0]["metrics"])
+            self.assertIn("INVALID",(root/"production-summary.md").read_text())
 
 if __name__=="__main__": unittest.main()

@@ -62,3 +62,25 @@ jobs:
       - name: Require valid complete campaign
         if: always()
         run: python3 .github/scripts/mesh_production_campaign.py accept
+  symbol-preflight:
+    name: Qualify Envoy production symbol companion
+    if: inputs.phase == 'smoke'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+      - name: Match bounded symbol package to pinned production code
+        run: bash .github/scripts/mesh_production_profile_symbols.sh "$RUNNER_TEMP/mesh-symbol-preflight"
+      - name: Retain symbol identity report without multi-gigabyte binaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-symbol-preflight-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mesh-symbol-preflight/report.json
+            ${{ runner.temp }}/mesh-symbol-preflight/resolved-images.json
+            ${{ runner.temp }}/mesh-symbol-preflight/production/*manifest*.json
+            ${{ runner.temp }}/mesh-symbol-preflight/debug/*manifest*.json
+          retention-days: 30

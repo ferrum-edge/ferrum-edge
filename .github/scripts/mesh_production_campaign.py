@@ -104,6 +104,10 @@ def summarize():
                 subset = [r for r in rows if r["arm"]==arm and r["payload"]==payload and r["load"]==mode]
                 if not subset:
                     continue
+                keys = ("rps", "cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us")
+                if not all(r["valid"] and all(k in r["report"] for k in keys) for r in subset):
+                    groups.append({"arm": arm, "payload": payload, "load": mode, "repetitions": len(subset), "all_valid": False, "metrics": None})
+                    continue
                 metrics = {}
                 for key in ("rps", "cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us"):
                     values = [r["report"][key] for r in subset]
@@ -116,10 +120,14 @@ def summarize():
     (ROOT/"production-summary.json").write_text(json.dumps(result, indent=2)+"\n")
     text = ["Production mesh campaign", "", f"Planned: {len(planned)}; parsed: {len(rows)}; invalid/missing: {len(errors)}.",
         "All outcomes retained. L4 and L7 are separate product paths. Fixed scheduled latency includes admission delay.", "",
-        "| Arm | Bytes | Load | N | RPS median | cohort p50/p95/p99 us | CPU us/completion |", "|---|---:|---|---:|---:|---|---:|"]
+        "| Arm | Bytes | Load | N | RPS median | successful cohort p50/p95/p99 us (fixed: scheduled; saturated: service) | CPU us/completion |", "|---|---:|---|---:|---:|---|---:|"]
     for group in groups:
         m=group["metrics"]
-        tails="/".join(str(round(m[k]["median"],1)) for k in ("cohort_p50_us","cohort_p95_us","cohort_p99_us"))
+        if m is None:
+            text.append(f"| {group['arm']} | {group['payload']} | {group['load']} | {group['repetitions']} | INVALID | INVALID | INVALID |")
+            continue
+        tail_keys = ("cohort_scheduled_p50_us", "cohort_scheduled_p95_us", "cohort_scheduled_p99_us") if group["load"] == "fixed" else ("cohort_p50_us","cohort_p95_us","cohort_p99_us")
+        tails="/".join(str(round(m[k]["median"],1)) for k in tail_keys)
         text.append(f"| {group['arm']} | {group['payload']} | {group['load']} | {group['repetitions']} | {m['rps']['median']:.1f} | {tails} | {m['cpu_us_per_completion']['median']:.1f} |")
     if errors:
         text += ["", "Invalid/missing cells:", json.dumps(errors, indent=2)]
