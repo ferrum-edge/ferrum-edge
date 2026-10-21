@@ -30,11 +30,15 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ### Gateway-authored status codes follow the failure cause (issues #6770, #6771, #6773, #6775)
 
-- A backend **connect timeout** now answers `504` `{"error":"Backend timeout"}`
-  instead of `502` `{"error":"Backend unavailable"}` on every HTTP-family
-  transport (reqwest, direct HTTP/2, native HTTP/3 from any frontend, the
-  HTTP/3 bridge, HBONE, sidecar mTLS, Unix sockets and WebSocket upgrades). It
-  is still a pre-wire connection failure:
+- A backend **connect timeout** now answers `504` instead of `502` on the
+  reqwest, direct HTTP/2, native HTTP/3 (from any frontend), HTTP/3 bridge,
+  HBONE / sidecar-mTLS pool and WebSocket transports, with the shared
+  `{"error":"Backend timeout"}` body (the inbound HBONE relay keeps its own
+  timeout wording). Unix sockets and the sidecar readiness
+  budget already answered `504`. Native gRPC answers `DEADLINE_EXCEEDED` (`4`)
+  for a connect timeout on every path, including sidecar mTLS and native
+  HTTP/3, which used to answer `UNAVAILABLE` (`14`). It is still a pre-wire
+  connection failure:
   `error_class=connection_timeout`, `X-Gateway-Error: connection_failure`,
   `retry_on_connect_failure` replay, target rotation, and circuit-breaker
   accounting are unchanged. A `retryable_status_codes` list containing `504`

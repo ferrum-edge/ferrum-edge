@@ -54744,17 +54744,29 @@ fn mesh_mtls_request_body_too_large_response(
     }
 }
 
+/// Trailers-Only gRPC terminal for a pre-response sidecar mesh-mTLS transport
+/// failure. A connect timeout (pool dial or sender-readiness connect budget)
+/// is a backend deadline, so it answers `DEADLINE_EXCEEDED` with the shared
+/// "Backend deadline exceeded" wording, exactly like the direct gRPC pool's
+/// `BackendTimeout` and native-HTTP/3 gRPC (#6770 review); every other
+/// failure is `UNAVAILABLE` with the caller's message. Class, pre-wire
+/// `connection_error` and connect-retry eligibility are unchanged.
 fn mesh_grpc_unavailable_response(
     resolved_ip: Option<String>,
     message: &str,
     error_class: retry::ErrorClass,
 ) -> retry::BackendResponse {
+    let (grpc_status, message) = if error_class == retry::ErrorClass::ConnectionTimeout {
+        (
+            grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
+            "Backend deadline exceeded",
+        )
+    } else {
+        (grpc_proxy::grpc_status::UNAVAILABLE, message)
+    };
     let mut headers = HashMap::with_capacity(3);
     headers.insert("content-type".to_string(), "application/grpc".to_string());
-    headers.insert(
-        "grpc-status".to_string(),
-        grpc_proxy::grpc_status::UNAVAILABLE.to_string(),
-    );
+    headers.insert("grpc-status".to_string(), grpc_status.to_string());
     headers.insert("grpc-message".to_string(), message.to_string());
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status

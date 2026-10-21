@@ -8434,6 +8434,7 @@ async fn handle_h3_request(
                         is_client_request_body_disconnect,
                         e.is_read_timeout(),
                         h3_error_class,
+                        e.request_on_wire(),
                     );
                 // Do NOT propagate a send error: the outcome record below
                 // releases the CB probe slot and the admission outcome, so a `?`
@@ -12382,6 +12383,7 @@ fn h3_streaming_body_failure_outcome(
     is_client_request_body_disconnect: bool,
     is_read_timeout: bool,
     h3_error_class: crate::retry::ErrorClass,
+    request_on_wire: bool,
 ) -> (bool, Option<crate::retry::ErrorClass>) {
     if is_client_request_body_disconnect {
         (false, Some(crate::retry::ErrorClass::ClientDisconnect))
@@ -12393,7 +12395,16 @@ fn h3_streaming_body_failure_outcome(
         // a transport-level connection failure.
         (false, Some(h3_error_class))
     } else {
-        (true, Some(h3_error_class))
+        // The pool's typed wire marker is authoritative for H3
+        // `connection_error` (never the class): a post-wire failure — an
+        // established QUIC connection timing out or resetting after the
+        // request was committed — is not a connect failure, so it reads
+        // `backend_timeout` / `backend_error` rather than `connection_failure`
+        // and feeds the breaker through its status (#6770 review).
+        (
+            h3_connection_error(request_on_wire, Some(h3_error_class)),
+            Some(h3_error_class),
+        )
     }
 }
 
@@ -14615,6 +14626,7 @@ where
             is_client_request_body_disconnect,
             is_read_timeout,
             h3_error_class,
+            e.request_on_wire(),
         );
         (status, error_class)
     };
@@ -21271,8 +21283,12 @@ mod h3_streaming_outcome_tests {
 
     #[test]
     fn request_body_upload_client_disconnect_maps_to_neutral_outcome() {
-        let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(true, false, ErrorClass::ConnectionClosed);
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            true,
+            false,
+            ErrorClass::ConnectionClosed,
+            true,
+        );
 
         assert!(
             !connection_error,
@@ -21284,15 +21300,31 @@ mod h3_streaming_outcome_tests {
 
     #[test]
     fn request_body_upload_backend_failure_keeps_original_class() {
-        let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(false, false, ErrorClass::ProtocolError);
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            false,
+            false,
+            ErrorClass::ProtocolError,
+            false,
+        );
 
         assert!(
             connection_error,
-            "non-client H3 streaming-body failures still represent backend \
-             connection failures"
+            "pre-wire non-client H3 streaming-body failures still represent \
+             backend connection failures"
         );
         assert_eq!(error_class, Some(ErrorClass::ProtocolError));
+
+        // Post-wire (the pool's typed marker), e.g. an established QUIC
+        // connection timing out after the request was committed: not a
+        // connect failure, whatever the class says.
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            false,
+            false,
+            ErrorClass::ConnectionTimeout,
+            true,
+        );
+        assert!(!connection_error);
+        assert_eq!(error_class, Some(ErrorClass::ConnectionTimeout));
     }
 
     #[test]
@@ -21301,8 +21333,12 @@ mod h3_streaming_outcome_tests {
         // the backend, which then stalled. It must be recorded as a 504
         // status fault (connection_error=false), matching the direct-H2 /
         // HBONE read-timeout arms — not as a transport connection failure.
-        let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(false, true, ErrorClass::ReadWriteTimeout);
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            false,
+            true,
+            ErrorClass::ReadWriteTimeout,
+            true,
+        );
 
         assert!(
             !connection_error,
