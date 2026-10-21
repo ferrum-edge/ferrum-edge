@@ -25,6 +25,7 @@ const TEST_DEADLINE: Duration = Duration::from_secs(10);
 enum ResponseMode {
     Echo,
     Held(Arc<Semaphore>),
+    FastThenHeld(Arc<Semaphore>),
     WrongBody,
     WrongStatus,
 }
@@ -65,26 +66,7 @@ impl EchoPeer {
                             let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                                 let requests = requests.clone();
                                 let mode = mode.clone();
-                                async move {
-                                    let body = request.into_body().collect().await.expect("request body").to_bytes();
-                                    requests.fetch_add(1, Ordering::SeqCst);
-                                    if let ResponseMode::Held(gate) = &mode {
-                                        gate.acquire().await.expect("response gate").forget();
-                                    } else {
-                                        tokio::time::sleep(Duration::from_millis(10)).await;
-                                    }
-                                    let status = if matches!(mode, ResponseMode::WrongStatus) {
-                                        StatusCode::BAD_GATEWAY
-                                    } else {
-                                        StatusCode::OK
-                                    };
-                                    let body = if matches!(mode, ResponseMode::WrongBody) {
-                                        Bytes::from(vec![b'y'; body.len()])
-                                    } else {
-                                        body
-                                    };
-                                    Ok::<_, Infallible>(Response::builder().status(status).body(Full::new(body)).expect("echo response"))
-                                }
+                                echo_response(request, requests, mode)
                             });
                             let _ = hyper::server::conn::http1::Builder::new()
                                 .serve_connection(TokioIo::new(stream), service)
@@ -130,6 +112,43 @@ impl EchoPeer {
     }
 }
 
+async fn echo_response(
+    request: hyper::Request<hyper::body::Incoming>,
+    requests: Arc<AtomicU64>,
+    mode: ResponseMode,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let body = request
+        .into_body()
+        .collect()
+        .await
+        .expect("request body")
+        .to_bytes();
+    let request_index = requests.fetch_add(1, Ordering::SeqCst);
+    match &mode {
+        ResponseMode::Held(gate) => {
+            gate.acquire().await.expect("response gate").forget();
+        }
+        ResponseMode::FastThenHeld(gate) if request_index > 0 => {
+            gate.acquire().await.expect("response gate").forget();
+        }
+        _ => tokio::time::sleep(Duration::from_millis(10)).await,
+    }
+    let status = if matches!(mode, ResponseMode::WrongStatus) {
+        StatusCode::BAD_GATEWAY
+    } else {
+        StatusCode::OK
+    };
+    let body = if matches!(mode, ResponseMode::WrongBody) {
+        Bytes::from(vec![b'y'; body.len()])
+    } else {
+        body
+    };
+    Ok(Response::builder()
+        .status(status)
+        .body(Full::new(body))
+        .expect("echo response"))
+}
+
 async fn report(child: Child) -> serde_json::Value {
     let output: Output = tokio::time::timeout(TEST_DEADLINE, child.wait_with_output())
         .await
@@ -139,11 +158,7 @@ async fn report(child: Child) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("loadgen JSON report")
 }
 
-#[tokio::test]
-async fn late_echo_is_drained_after_end_marker_and_excluded_from_useful_rps() {
-    let gate = Arc::new(Semaphore::new(0));
-    let peer = EchoPeer::new(ResponseMode::Held(gate.clone())).await;
-    let mut child = peer.spawn_loadgen("0", "1");
+async fn wait_for_measurement_end(child: &mut Child) {
     let mut stderr = BufReader::new(child.stderr.take().expect("loadgen stderr")).lines();
     for expected in ["MESH_BENCH_MEASUREMENT_START", "MESH_BENCH_MEASUREMENT_END"] {
         let marker = tokio::time::timeout(TEST_DEADLINE, stderr.next_line())
@@ -153,6 +168,14 @@ async fn late_echo_is_drained_after_end_marker_and_excluded_from_useful_rps() {
             .expect("phase marker line");
         assert_eq!(marker, expected);
     }
+}
+
+#[tokio::test]
+async fn late_echo_is_drained_after_end_marker_and_excluded_from_useful_rps() {
+    let gate = Arc::new(Semaphore::new(0));
+    let peer = EchoPeer::new(ResponseMode::Held(gate.clone())).await;
+    let mut child = peer.spawn_loadgen("0", "1");
+    wait_for_measurement_end(&mut child).await;
     assert!(child.try_wait().expect("check loadgen process").is_none());
     assert_eq!(peer.requests.load(Ordering::SeqCst), 1);
     gate.add_permits(1);
@@ -164,12 +187,42 @@ async fn late_echo_is_drained_after_end_marker_and_excluded_from_useful_rps() {
     assert_eq!(report["latency_avg_us"], 0);
     assert_eq!(report["drained_requests"], 1);
     assert_eq!(report["drained_bytes"], 16);
+    assert_eq!(report["cohort_requests"], 1);
+    assert!(report["cohort_p99_us"].as_u64().expect("cohort p99") > 0);
     assert_eq!(report["total_errors"], 0);
     assert_eq!(
         peer.requests.load(Ordering::SeqCst),
         1,
         "no postdeadline request"
     );
+}
+
+#[tokio::test]
+async fn mixed_fast_and_held_echo_keeps_the_late_latency_in_the_successful_cohort() {
+    let gate = Arc::new(Semaphore::new(0));
+    let peer = EchoPeer::new(ResponseMode::FastThenHeld(gate.clone())).await;
+    let mut child = peer.spawn_loadgen("0", "1");
+    wait_for_measurement_end(&mut child).await;
+    assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
+    gate.add_permits(1);
+
+    let report = report(child).await;
+    assert_eq!(report["total_requests"], 1);
+    assert_eq!(report["total_bytes"], 16);
+    assert_eq!(
+        report["rps"], 1.0,
+        "late success must not inflate useful RPS"
+    );
+    assert_eq!(report["drained_requests"], 1);
+    assert_eq!(report["cohort_requests"], 2);
+    assert_eq!(report["total_errors"], 0);
+    assert!(
+        report["cohort_p99_us"].as_u64().expect("cohort p99")
+            > report["p99_us"].as_u64().expect("in-window p99"),
+        "the held exchange must remain visible in cohort tail latency: {report}"
+    );
+    assert_eq!(report["cohort_p99_us"], report["cohort_latency_max_us"]);
+    assert_eq!(peer.requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -183,6 +236,7 @@ async fn warmup_and_measurement_reuse_each_workers_connection() {
     assert!(useful >= 2, "each connection must serve measured traffic");
     assert_eq!(report["warmup_errors"], 0);
     assert_eq!(report["total_errors"], 0);
+    assert_eq!(report["cohort_requests"], useful + drained);
     assert_eq!(
         peer.connections.load(Ordering::SeqCst),
         2,
@@ -206,6 +260,7 @@ async fn wrong_status_or_equal_length_wrong_body_is_an_error() {
         let report = report(peer.spawn_loadgen("0", "1")).await;
         assert_eq!(report["total_requests"], 0);
         assert_eq!(report["drained_requests"], 0);
+        assert_eq!(report["cohort_requests"], 0);
         assert!(report["total_errors"].as_u64().expect("errors") > 0);
     }
 }

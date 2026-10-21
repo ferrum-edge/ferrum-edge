@@ -125,8 +125,8 @@ scope, below. Neither is silently represented by the `envoy` arm.
    (direct → ferrum → envoy → linkerd), so overhead uses a same-runner
    `direct` denominator. Sequential same-host execution still carries
    drift/steal variance across the campaign; publishable comparisons
-   should use the 30s × 3-iteration profile. (Balanced-order repetition
-   blocks are a follow-up; order is fixed, not rotated.)
+should use the 30s × 4-iteration profile for equal AB/BA order counts.
+   New campaigns reverse arm/payload blocks; historical campaigns used fixed order.
 7. **CPU/memory are container-level samples** (`docker stats`, 1s
    cadence, cgroup usage — not process RSS) summed across the proxy
    pair, with independent per-container peaks. They include idle/runtime
