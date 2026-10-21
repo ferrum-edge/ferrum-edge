@@ -39,6 +39,7 @@ pub mod backend_capabilities;
 pub mod backend_dispatch;
 pub mod backend_send_queue;
 pub mod body;
+pub mod client_abort;
 pub mod client_ip;
 pub mod datagram_client_address;
 pub mod deferred_log;
@@ -33015,6 +33016,8 @@ pub mod request_stack_test_support {
     /// Frontend boundary, concrete frontend, concrete routing handler, and
     /// concrete backend attempt sizes, including their awaited child state.
     pub fn future_sizes() -> [usize; 4] {
+        let mut client_abort_scope = client_abort::ClientAbortScope::new();
+        let client_abort = &mut client_abort_scope;
         [
             request_size(|req, state| {
                 construct_frontend_proxy_request(
@@ -33040,7 +33043,7 @@ pub mod request_stack_test_support {
                     RequestConnectionMetadata::default(),
                 )
             }),
-            request_size(|req, state| {
+            request_size(move |req, state| {
                 handle_proxy_request_inner(
                     req,
                     state,
@@ -33050,6 +33053,7 @@ pub mod request_stack_test_support {
                     None,
                     None,
                     RequestConnectionMetadata::default(),
+                    client_abort,
                 )
             }),
             dispatch_size(|req, state, proxy, ctx, started, handoff| {
@@ -33456,6 +33460,12 @@ async fn admit_proxy_request_on_frontend_port(
 /// admission and Hyper. The caller retains the request guard and transfers it
 /// to the response body. Large dispatch children remain boxed separately;
 /// bounded direct HTTP children stay inline under the backend state budget.
+///
+/// The request's [`client_abort::ClientAbortScope`] lives in the same
+/// allocation, beside the handler that borrows its context (issue #6768). The
+/// scope settles in the same poll the handler returns in, so only a handler
+/// hyper drops before it returned (an HTTP/2 `RST_STREAM`, or an HTTP/1.1
+/// connection close while the handler was pending) records the client abort.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn boxed_handle_proxy_request_inner(
@@ -33468,21 +33478,38 @@ fn boxed_handle_proxy_request_inner(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> impl std::future::Future<Output = Result<Response<ProxyBody>, hyper::Error>> + Send {
-    Box::pin(handle_proxy_request_inner(
-        req,
-        state,
-        remote_addr,
-        is_tls,
-        tls_client_cert_der,
-        tls_client_cert_chain_der,
-        mtls_auth_connection_cache,
-        connection_metadata,
-    ))
+    Box::pin(async move {
+        let mut client_abort = client_abort::ClientAbortScope::new();
+        let response = handle_proxy_request_inner(
+            req,
+            state,
+            remote_addr,
+            is_tls,
+            tls_client_cert_der,
+            tls_client_cert_chain_der,
+            mtls_auth_connection_cache,
+            connection_metadata,
+            &mut client_abort,
+        )
+        .await;
+        client_abort.complete();
+        response
+    })
 }
 
 /// Inner implementation of [`handle_proxy_request`] — separated so the outer
 /// function can attach the [`RequestGuard`] to the response body.
-#[allow(clippy::too_many_arguments)]
+///
+/// The request context is owned by `client_abort` and borrowed here as `ctx`
+/// (issue #6768). The existing `&ctx` / `&mut ctx` call sites keep their
+/// spelling and deref-coerce through that borrow, hence the borrow-style
+/// allowances.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_borrow,
+    clippy::borrow_deref_ref,
+    clippy::explicit_auto_deref
+)]
 async fn handle_proxy_request_inner(
     mut req: Request<Incoming>,
     state: Arc<ProxyState>,
@@ -33492,6 +33519,7 @@ async fn handle_proxy_request_inner(
     tls_client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>>,
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
+    client_abort: &mut client_abort::ClientAbortScope,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let start_time = Instant::now();
     let http1_framing_result = connection_metadata.http1_framing_result;
@@ -33544,7 +33572,17 @@ async fn handle_proxy_request_inner(
     // Build request context — pass cloned socket_ip to ctx (client_ip may be
     // overwritten by trusted-proxy resolution below). method and path keep
     // separate ownership for use in backend URL building and logging.
-    let mut ctx = RequestContext::new(socket_ip.clone(), method.clone(), path.clone());
+    //
+    // The client-abort scope owns the context and this handler borrows it, so
+    // a handler hyper drops on a client reset still leaves the context for the
+    // scope's one client-abort terminal record (issue #6768). Nothing above
+    // this point awaits, so every admitted request that can be cancelled has
+    // installed its context.
+    let (mut ctx, client_abort_record) = client_abort.install(
+        &state,
+        start_time,
+        RequestContext::new(socket_ip.clone(), method.clone(), path.clone()),
+    );
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
@@ -34987,6 +35025,8 @@ async fn handle_proxy_request_inner(
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup, no per-request filtering)
     let plugins = plugin_cache_view.plugins();
+    // From here a client abort is logged through this chain (issue #6768).
+    client_abort_record.observe_plugins(&plugins);
     ctx.set_request_headers_to_redact(plugin_cache_view.request_headers_to_redact());
     // Bind this request to the same cache generation's static response-side
     // presentation policy that the plugin list above will execute, so a plugin
@@ -36340,6 +36380,10 @@ async fn handle_proxy_request_inner(
     // path while their public `ctx.path` view is temporarily restored to the
     // client path. No allocation when no rewrite is set.
     let mut path = rebase_route_override_path(&mut ctx, path, &mut strip_len);
+    if ctx.route_override_path.is_some() {
+        // `ctx.path` is now the backend path; a client abort logs the client's.
+        client_abort_record.retain_client_request_path(&original_request_path);
+    }
 
     // Resolve upstream target and hash key from the request epoch.
     // `ctx.orig_dst` (the captured SO_ORIGINAL_DST on mesh capture listeners)
@@ -36604,6 +36648,7 @@ async fn handle_proxy_request_inner(
             .is_some_and(|rewrite| strip_len != 0 || rewrite != path || rewrite != ctx.path);
         if path_rebase_pending {
             path = rebase_route_override_path(&mut ctx, path, &mut strip_len);
+            client_abort_record.retain_client_request_path(&original_request_path);
         }
         if destination_rebound {
             // Replace the whole selection rather than only the target:
@@ -37525,6 +37570,20 @@ async fn handle_proxy_request_inner(
             ctx.request_is_secure,
             state.add_forwarded_header,
         );
+        // The upgrade handler owns the context, and with it the request's
+        // terminal record, from here (issue #6768).
+        let Some(ctx) = client_abort.hand_off() else {
+            debug_assert!(
+                false,
+                "the client-abort scope owns the handler's context until hand-off"
+            );
+            record_request(&state, 500);
+            return Ok(build_websocket_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"WebSocket request context invariant violated"}"#,
+                &initial_response_header_policy_plugins,
+            ));
+        };
         return handle_websocket_request_authenticated(
             request,
             state,
@@ -37955,7 +38014,7 @@ async fn handle_proxy_request_inner(
         // bounded collect; the fully-streamed arm hands it to the gateway-owned
         // upload pump, which keeps bidirectional streaming intact.
         let grpc_buffered_upload_auth_deadline = request_upload_auth_deadline(
-            Some(&ctx),
+            Some(&*ctx),
             state.env_config.authenticated_stream_max_lifetime_seconds,
         );
         let (mut grpc_result, grpc_body_bytes) = if grpc_needs_request_body_hooks {
@@ -45118,28 +45177,35 @@ async fn handle_proxy_request_inner(
     // is behind us and nothing above mutated it after the summary was
     // captured, so the logger takes the context by MOVE rather than forcing a
     // whole `RequestContext` clone on every streamed request (issue #5537).
+    //
+    // The context leaves the client-abort scope here (issue #6768): from this
+    // point the streaming terminal logger owns the request's terminal record.
     let deferred_logger = match pending_stream_terminal {
-        Some(pending) => {
-            // The clone this replaces never carried the bounded response-buffer
-            // permit, the mirror admission leases, or the hmac prebuffer stage.
-            // Release them here so the move does not extend a bounded admission
-            // to body-termination time.
-            ctx.release_leases_before_terminal_handoff();
-            let PendingStreamTerminal {
-                summary,
-                request_protocol_is_grpc,
-            } = *pending;
-            Some(
-                crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
+        Some(pending) => match client_abort.hand_off() {
+            Some(mut ctx) => {
+                // The clone this replaces never carried the bounded
+                // response-buffer permit, the mirror admission leases, or the
+                // hmac prebuffer stage. Release them here so the move does not
+                // extend a bounded admission to body-termination time.
+                ctx.release_leases_before_terminal_handoff();
+                let PendingStreamTerminal {
                     summary,
-                    Arc::clone(&plugins),
-                    ctx,
-                    start_time,
                     request_protocol_is_grpc,
+                } = *pending;
+                Some(
+                    crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
+                        summary,
+                        Arc::clone(&plugins),
+                        ctx,
+                        start_time,
+                        request_protocol_is_grpc,
+                    )
+                    .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
                 )
-                .with_passthrough_request_bytes_latch(passthrough_request_bytes_latch.clone()),
-            )
-        }
+            }
+            // Unreachable: the scope owns the context until this hand-off.
+            None => None,
+        },
         None => deferred_logger,
     };
 
@@ -47556,6 +47622,9 @@ fn spawn_buffered_summary_after_passthrough_bytes(
     ctx: &crate::plugins::RequestContext,
     latch: Arc<body::DirectH2BytesLatch>,
 ) {
+    // The detached task logs a clone; this summary is the request's terminal
+    // record, so latch the authoritative context now (issue #6768).
+    ctx.mark_terminal_record_started();
     let plugins = plugins.to_vec();
     let observed = Arc::clone(&ctx.bytes_sent_observed);
     let ctx = ctx.clone();

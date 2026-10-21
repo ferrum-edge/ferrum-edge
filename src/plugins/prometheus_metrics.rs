@@ -144,9 +144,16 @@ pub struct WsTrafficKey {
 /// Only downstream aborts are counted: a backend-side close mid-body maps to a
 /// transport `ErrorClass` with `client_disconnected == false` (see
 /// [`crate::retry::classify_body_error`]), so backend resets never inflate this
-/// series. Buffered responses log before the body reaches the wire and so
-/// always report `false` — a disconnect while hyper writes an already
-/// materialized body is not observable at that log site.
+/// series. Buffered responses log before the body reaches the wire, so their
+/// summary carries `response_delivery: not_observed` and `false` here means
+/// "no disconnect seen before the hand-off", not "delivered": a disconnect
+/// while hyper writes an already materialized body is not observable at that
+/// log site.
+///
+/// An H1/H2 client that resets or closes before any response head is counted
+/// once through the client-abort `499` summary
+/// ([`crate::proxy::client_abort`]), which carries `client_disconnected ==
+/// true`.
 ///
 /// WebSocket sessions are not counted here; their terminal classification has a
 /// dedicated bounded family, `ferrum_websocket_sessions_total`, keyed by

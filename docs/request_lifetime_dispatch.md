@@ -75,6 +75,17 @@ reset only while that future is pending, so a collect that read the last DATA an
 the same poll used to finish with the truncated body. It now fails as a client disconnect, and
 nothing is dispatched: a `499` on the HTTP paths, and gRPC `CANCELLED` on the native gRPC collect.
 
+When hyper drops the service future instead — the reset arrives while the handler is pending, or an
+HTTP/1.1 client closes its connection — no handler code runs at all. The request's
+`ClientAbortScope` (`src/proxy/client_abort.rs`, issue #6768) owns the request context for the
+handler's lifetime, so the drop still records the request's one terminal: a `499` client abort with
+the `client_disconnect` error class (gRPC: `CANCELLED`), through the plugin `log` chain when the route
+has plugins and the runtime terminal counters otherwise. It applies to every cancellation point before
+the response head: the upload, plugin phases, backend acquisition, and the wait for backend response
+headers. The scope settles in the same poll the handler returns in and yields to a terminal log that
+already started, so a request never gets two records, and a drop caused by the gateway closing the
+connection itself is not recorded as a client abort.
+
 When the dispatcher cancels a pump whose client has already reset, the pump looks past the DATA
 still buffered ahead of that reset, so the backend gets the client's `CANCEL` rather than the
 `INTERNAL_ERROR` of the gateway's own cancellation. Flow control limits that DATA to one frontend

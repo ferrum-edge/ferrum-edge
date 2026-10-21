@@ -490,6 +490,9 @@ impl DeferredTransactionLogger {
         summary.body_completed = outcome.body_completed;
         summary.body_error_class = outcome.body_error_class;
         summary.client_disconnected = outcome.client_disconnected;
+        // This record is finalized at the body's transport terminal, so the
+        // fields above describe what the transport consumed (issue #6769).
+        summary.response_delivery = crate::plugins::ResponseDelivery::Observed;
         // Streaming responses only learn their final byte count when the
         // body wrapper finishes or is dropped. Buffered responses populate
         // `bytes_received` synchronously and never reach the deferred logger.

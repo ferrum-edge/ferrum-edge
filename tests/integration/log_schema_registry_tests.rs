@@ -59,6 +59,7 @@ fn fully_populated_http() -> TransactionSummary {
         error_class: Some(ErrorClass::ConnectionTimeout),
         body_error_class: Some(ErrorClass::ConnectionReset),
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 100,
         bytes_received: 200,
         // Nonzero on purpose: both counters are skipped by the native

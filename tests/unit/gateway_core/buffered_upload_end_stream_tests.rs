@@ -18,10 +18,15 @@
 //! The H1/H2 retry/body-plugin collect inside `proxy_to_backend` has no test
 //! seam of its own; `proxy_tests::test_buffered_h2_request_collectors_require_h2_end_stream`
 //! pins that it uses the same gate.
+//!
+//! When hyper drops the service future on the reset instead, the request is
+//! not left without a terminal record (issue #6768): the inline server runs the
+//! collect inside the production `ClientAbortScope`, as the H1/H2 frontend
+//! does, and that drop must record exactly one `499` client abort.
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::Empty;
@@ -37,6 +42,11 @@ use ferrum_edge::_test_support::{
     GrpcBufferedCollectOutcomeForTest as GrpcOutcome, buffer_early_request_body_for_test,
     collect_grpc_request_body_for_test,
 };
+use ferrum_edge::plugins::RequestContext;
+use ferrum_edge::proxy::ProxyState;
+use ferrum_edge::proxy::client_abort::{CLIENT_CLOSED_REQUEST_STATUS, ClientAbortScope};
+
+use super::client_abort_accounting_tests::{scope_state, status_count};
 
 const PARTIAL: &[u8] = b"partial";
 const H1_CHUNKED_UPLOAD: &[u8] = b"POST /upload HTTP/1.1\r\nhost: edge.example\r\n\
@@ -137,13 +147,26 @@ fn serve_h2_detached(io: DuplexStream, collector: Collector) -> Report {
 }
 
 /// Serve one HTTP/2 connection and run `collector` INSIDE the service future,
-/// as the dispatchers do.
-fn serve_h2_inline(io: DuplexStream, collector: Collector) -> Report {
+/// as the dispatchers do: under the request's `ClientAbortScope`, which settles
+/// when the handler returns and records a client abort if hyper drops it.
+fn serve_h2_inline(io: DuplexStream, collector: Collector, state: Arc<ProxyState>) -> Report {
     let (slot, report) = report_slot();
     let service = service_fn(move |request: Request<Incoming>| {
         let reporter = take_reporter(&slot);
+        let state = Arc::clone(&state);
         async move {
+            let mut client_abort = ClientAbortScope::new();
+            let _ = client_abort.install(
+                &state,
+                Instant::now(),
+                RequestContext::new(
+                    "127.0.0.1".to_string(),
+                    "POST".to_string(),
+                    "/upload".to_string(),
+                ),
+            );
             let verdict = run_collector(collector, request).await;
+            client_abort.complete();
             if let Some(tx) = reporter {
                 let _ = tx.send(verdict);
             }
@@ -268,20 +291,48 @@ async fn h2_end_stream_still_completes_a_buffered_body() {
     }
 }
 
+/// Client aborts the scope recorded, once the count settles.
+async fn settled_client_aborts(state: &ProxyState, expected: u64) -> u64 {
+    let deadline = std::time::Instant::now() + WAIT;
+    while status_count(state, CLIENT_CLOSED_REQUEST_STATUS) < expected
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    status_count(state, CLIENT_CLOSED_REQUEST_STATUS)
+}
+
 #[tokio::test]
 async fn masked_h2_reset_read_in_the_collecting_poll_is_not_collected() {
     // The race N1 describes: the last DATA and the reset arrive together, and
     // the collect inside the service future reads both in one poll. hyper may
     // instead drop the service before it reports; either way the body is never
-    // accepted as complete.
+    // accepted as complete, and the request still ends with exactly one
+    // terminal (issue #6768).
     for collector in COLLECTORS {
+        let state = scope_state();
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let report = serve_h2_inline(server_io, collector);
+        let report = serve_h2_inline(server_io, collector, Arc::clone(&state));
         let _upload = h2_upload(client_io, ClientEnd::NoErrorReset).await;
         match tokio::time::timeout(WAIT, report).await {
-            Ok(Ok(verdict)) => assert_eq!(verdict, Verdict::Refused, "{collector:?}"),
-            // hyper dropped the service future on the reset: nothing collected.
-            Ok(Err(_)) => {}
+            Ok(Ok(verdict)) => {
+                assert_eq!(verdict, Verdict::Refused, "{collector:?}");
+                // The handler returned with its own client-disconnect verdict,
+                // which the dispatcher records; the scope settled silently.
+                assert_eq!(
+                    settled_client_aborts(&state, 0).await,
+                    0,
+                    "{collector:?}: a handler that returned is never also a client abort"
+                );
+            }
+            // hyper dropped the service future on the reset: nothing was
+            // collected, and the scope recorded the request's one terminal.
+            Ok(Err(_)) => assert_eq!(
+                settled_client_aborts(&state, 1).await,
+                1,
+                "{collector:?}: a dropped handler records exactly one client abort"
+            ),
             Err(_) => panic!("{collector:?}: the reader neither refused nor was dropped in time"),
         }
     }

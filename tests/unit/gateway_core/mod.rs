@@ -24,6 +24,7 @@ mod charged_content_coding_chain_tests;
 mod chart_image_tag_helm_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
+mod client_abort_accounting_tests;
 mod client_identity_tests;
 mod client_ip_tests;
 #[cfg(unix)]

@@ -261,6 +261,7 @@ fn http_summary(request_id: &str, consumer: &str) -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: true,
+        response_delivery: Default::default(),
         bytes_sent: 32,
         bytes_received: 64,
         grpc_request_messages: 0,

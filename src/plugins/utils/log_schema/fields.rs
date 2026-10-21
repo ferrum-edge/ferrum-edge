@@ -293,6 +293,10 @@ pub const HTTP_FIELDS: &[FieldMeta] = &[
         is_timestamp: false,
     },
     FieldMeta {
+        name: "response_delivery",
+        is_timestamp: false,
+    },
+    FieldMeta {
         name: "bytes_sent",
         is_timestamp: false,
     },

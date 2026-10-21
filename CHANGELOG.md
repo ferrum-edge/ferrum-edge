@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **HTTP transaction records state their delivery-observation boundary**
+  (issue #6769). Every `TransactionSummary` now carries `response_delivery`:
+  `not_observed` when the record was finalized before the frontend transport
+  took the response (buffered H1/H2 responses, rejections, Trailers-Only gRPC
+  errors), `observed` when it was finalized at the response's transport
+  terminal (streamed bodies, settled HTTP/3 sends, the H1/H2 client-abort
+  `499`). A `false` `client_disconnected` on a `not_observed` record no longer
+  reads as proof of delivery, and the documentation no longer claims
+  `body_completed` is set for buffered responses.
 - **BREAKING — plugin-config writes require an association precondition**
   (issue #569 in ferrum-edge-git-forge-ops). `PUT`/`DELETE /plugins/config/{id}` now require
   the `expected_proxy_ids` query parameter listing every proxy the caller
@@ -19,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **An H1/H2 client that cancels before the response head leaves one
+  terminal record** (issue #6768). hyper drops the pending handler on an
+  HTTP/2 `RST_STREAM` or an HTTP/1.1 connection close, which used to skip
+  every terminal log and metric while still releasing the admission count.
+  The request context now lives in a `ClientAbortScope` beside the handler,
+  and a handler dropped before it returned records exactly one `499` client
+  abort (`error_class: client_disconnect`, `client_disconnected: true`, gRPC
+  `CANCELLED`) through the plugin `log` chain and the request/status
+  counters. It is neutral to backend health, never rewrites a committed
+  status, and yields to a terminal log already in flight and to connections
+  the gateway closes itself.
 - **`FERRUM_MAX_CREDENTIALS_PER_TYPE` parse failures now fail closed**
   (issue #6754; follow-up to #6651 item 3). The library and
   config-validation resolver used by `Consumer::validate_fields`, the

@@ -1916,6 +1916,18 @@ transaction hook sequentially:
 - Native H3 drives the response body to completion inside its handler. It then
   synchronously awaits streaming terminal hooks and sequential log hooks before
   the handler finishes; it does not use the detached hyper-body logger.
+- An H1/H2 request whose client resets or disconnects while the handler is
+  still pending (before any response head) is dropped by hyper, so none of the
+  handler's own log paths runs. Its `ClientAbortScope` hands one `499`
+  client-abort summary (`client_disconnected: true`, rejection phase
+  `client_disconnect_before_response`) to the same detached terminal delivery
+  the streamed body uses, so the `log` hooks still run exactly once (issue
+  #6768). Only `log` / `log_with_mesh_key` run for it: there is no response, so
+  no response-phase or streaming terminal hook does.
+
+A buffered record is built before the response is handed to the transport and
+says so with `response_delivery: not_observed`; streamed and client-abort
+records carry `response_delivery: observed` (issue #6769).
 
 Potentially slow sinks should use an explicitly bounded, plugin-owned handoff.
 Own the queue, worker, cancellation state, and retry budget in the plugin;

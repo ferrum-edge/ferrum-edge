@@ -3551,6 +3551,30 @@ pub struct RequestContext {
     /// preparation); this flag keeps an irreversible external side effect
     /// exactly-once across all of them.
     pub finalized_request_egress_dispatched: bool,
+    /// Set once this request's terminal transaction record has started: the
+    /// shared log funnel ([`log_with_mirror`]) or a detached delivery of it
+    /// took the request's terminal summary (issue #6768). The H1/H2 frontend's
+    /// [`crate::proxy::client_abort::ClientAbortScope`] reads it when hyper
+    /// drops the handler future, so a request cancelled while its own terminal
+    /// log is in flight never also gets a client-abort record.
+    terminal_record_started: TerminalRecordLatch,
+}
+
+/// One-way latch recording that a request's terminal transaction record has
+/// started (see `RequestContext::terminal_record_started`).
+///
+/// Atomic only because the log funnel holds the context by shared reference;
+/// a request's handler, its funnel, and the client-abort scope all run on the
+/// request's own task. A clone starts UNSET: a cloned context is never the
+/// authoritative request, so whatever it logs cannot stand in for the
+/// request's own terminal record.
+#[derive(Debug, Default)]
+pub(crate) struct TerminalRecordLatch(std::sync::atomic::AtomicBool);
+
+impl Clone for TerminalRecordLatch {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// Request-scoped working state owned by individual plugin families.
@@ -3818,6 +3842,27 @@ impl RequestContext {
 
     pub(crate) fn backend_dispatch_state(&self) -> BackendDispatchState {
         self.backend_dispatch_state
+    }
+
+    /// Note that this request's terminal transaction record has started
+    /// (issue #6768). Called by the shared terminal log funnel before it can
+    /// first suspend, so the H1/H2 client-abort scope never records a second
+    /// terminal for a request whose own record is already in flight.
+    #[inline]
+    pub(crate) fn mark_terminal_record_started(&self) {
+        self.terminal_record_started
+            .0
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this context's terminal transaction record has started: the
+    /// shared terminal log funnel has taken it (issue #6768). Always `false` on
+    /// a clone.
+    #[inline]
+    pub fn terminal_record_started(&self) -> bool {
+        self.terminal_record_started
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Record one completed backend attempt in the request's diagnostic
@@ -4193,6 +4238,7 @@ impl RequestContext {
             mesh_inbound_terminator_ip: None,
             hbone_connect_relay: false,
             finalized_request_egress_dispatched: false,
+            terminal_record_started: TerminalRecordLatch::default(),
         }
     }
 
@@ -5816,6 +5862,8 @@ impl RequestContext {
             // Carrying the flag keeps a hook that reads it on this clone
             // consistent with the live request.
             finalized_request_egress_dispatched: self.finalized_request_egress_dispatched,
+            // A compatibility clone never logs the request's terminal record.
+            terminal_record_started: TerminalRecordLatch::default(),
         }
     }
 
@@ -8589,6 +8637,47 @@ pub enum DisconnectCause {
 /// "zero".
 pub const LATENCY_UNKNOWN_MS: f64 = -1.0;
 
+/// What a [`TransactionSummary`] observed of its response's delivery to the
+/// client (issue #6769). Serialized as `response_delivery` on every HTTP-family
+/// transaction record.
+///
+/// The value names the boundary at which the record was finalized, which is
+/// what bounds the meaning of [`TransactionSummary::client_disconnected`] and
+/// [`TransactionSummary::body_completed`]:
+///
+/// * [`Self::NotObserved`] — the record was finalized before the frontend
+///   transport took the response (every buffered H1/H2 response, gateway
+///   rejections and Trailers-Only gRPC errors, buffered HTTP/3 responses). A
+///   `false` `client_disconnected` then means only that no disconnect was seen
+///   before the hand-off. It is not evidence that the response reached the
+///   client, and a client that leaves while the transport writes the response
+///   is not reflected.
+/// * [`Self::Observed`] — the record was finalized at the response's terminal
+///   transport boundary: a streamed body ended, failed, or was dropped by the
+///   transport (`DeferredTransactionLogger`), a relay or session ended, or the
+///   transport cancelled the request before any response was produced (the H1/H2
+///   client-abort `499`). `client_disconnected` and `body_completed` describe
+///   that boundary. Even then the gateway only knows what the transport
+///   accepted: bytes the transport accepted can still be lost before the client
+///   reads them, so `Observed` is not proof of end-to-end receipt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseDelivery {
+    #[default]
+    NotObserved,
+    Observed,
+}
+
+impl ResponseDelivery {
+    /// The serialized spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::Observed => "observed",
+        }
+    }
+}
+
 /// Transaction summary for logging plugins.
 ///
 /// Implements [`Default`] so call sites that build partial summaries
@@ -8687,16 +8776,21 @@ pub struct TransactionSummary {
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
     ///
-    /// Semantics by response type:
-    /// * **Streaming responses**: accurate — set by the deferred-logging path
-    ///   when the response body wrapper (`ProxyBody`) observes a disconnect
-    ///   error frame, or when the wrapper is dropped before reaching
-    ///   end-of-stream (see `deferred_log::DeferredTransactionLogger`).
-    /// * **Buffered responses**: best-effort. Hyper only signals client
-    ///   send failures at the connection-error handler, which fires after
-    ///   the handler function has already constructed and emitted the
-    ///   summary. Consumers should treat `false` on a buffered response
-    ///   as "not known to have disconnected," not as a positive assertion.
+    /// Read it together with [`Self::response_delivery`]:
+    /// * **Streaming responses** (`response_delivery: observed`): set by the
+    ///   deferred-logging path when the response body wrapper (`ProxyBody`)
+    ///   observes a disconnect error frame, or when the wrapper is dropped
+    ///   before reaching end-of-stream (see
+    ///   `deferred_log::DeferredTransactionLogger`).
+    /// * **Client abort before any response** (`response_delivery: observed`):
+    ///   `true`, with the `499` status and `client_disconnect` error class, when
+    ///   an H1/H2 client reset the stream or closed the connection while the
+    ///   handler was still pending (`proxy::client_abort`).
+    /// * **Buffered responses and rejections** (`response_delivery:
+    ///   not_observed`): the summary is emitted before the transport takes the
+    ///   response, so a disconnect while the transport writes it is not
+    ///   observable here. `false` means "no disconnect seen before the
+    ///   hand-off", never "delivered".
     pub client_disconnected: bool,
     /// Human-friendly classification of the error when the gateway itself
     /// failed to communicate with the backend. `None` for successful requests
@@ -8714,6 +8808,9 @@ pub struct TransactionSummary {
     /// False when streaming was interrupted (client disconnect, backend RST,
     /// body size limit exceeded) or when no streaming occurred.
     pub body_completed: bool,
+    /// Which delivery boundary this record observed; see [`ResponseDelivery`].
+    /// Always serialized as `response_delivery`.
+    pub response_delivery: ResponseDelivery,
     /// Bytes of the request body relayed from the client to the backend
     /// (gateway-perspective: bytes it sent onward on the client's behalf).
     /// Same JSON key as `StreamTransactionSummary.bytes_sent`.
@@ -8860,6 +8957,7 @@ impl Serialize for TransactionSummary {
         if self.body_completed {
             map.serialize_entry("body_completed", &true)?;
         }
+        map.serialize_entry("response_delivery", &self.response_delivery)?;
         if self.bytes_sent != 0 {
             map.serialize_entry("bytes_sent", &self.bytes_sent)?;
         }
@@ -9021,6 +9119,7 @@ impl TransactionSummary {
         mirror.error_class = None;
         mirror.body_error_class = None;
         mirror.body_completed = false;
+        mirror.response_delivery = ResponseDelivery::NotObserved;
         // The cloned metadata describes the primary response. Clear every
         // response-only key that participates in terminal classification or
         // mirror serialization before applying the mirror task's own outcome.
@@ -9084,6 +9183,11 @@ pub async fn log_with_mirror(
     summary: &TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // The request's terminal record is now in flight. Latch it before the
+    // first suspension point so a client abort that drops the handler while a
+    // logging plugin awaits cannot add a second, client-abort record for the
+    // same request (issue #6768).
+    ctx.mark_terminal_record_started();
     // Copy the memoized per-instance execution-trigger decisions from the
     // authoritative request context onto the terminal summary, so `log` /
     // `log_with_mesh_key` decide exactly as the instance's request and response
@@ -9255,6 +9359,9 @@ pub fn spawn_bounded_terminal_summary_log(
     summary: TransactionSummary,
     ctx: &RequestContext,
 ) {
+    // The detached task logs a clone, so latch the authoritative context here:
+    // this summary is the request's terminal record (issue #6768).
+    ctx.mark_terminal_record_started();
     // Gateway diagnostic reference (issue #5767): record the detail on the
     // request task, before admission, so a delivery refused by
     // `FERRUM_LOG_DELIVERY_MAX_TASKS` cannot leave the client's reference

@@ -28,6 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### HTTP transaction logs: `response_delivery` and client-abort `499` records (#6768, #6769)
+
+Every HTTP-family transaction record now includes `response_delivery`
+(`not_observed` or `observed`). Log pipelines with a closed column set must
+accept the new key, or drop it with a `schema` `omit`. An HTTP/1.1 or HTTP/2
+request whose client resets or disconnects before any response head now
+produces a transaction record and a `499` status sample (rejection phase
+`client_disconnect_before_response`) where it previously produced none;
+dashboards that treat every `4xx` as a client error will start counting these
+cancellations.
+
 ### Plugin-config writes require `expected_proxy_ids` (forge-ops #569, PR #6744)
 
 `PUT` and `DELETE /plugins/config/{id}` now require the

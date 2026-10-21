@@ -36,6 +36,7 @@ fn make_full_summary() -> TransactionSummary {
         error_class: None,
         body_error_class: None,
         body_completed: false,
+        response_delivery: Default::default(),
         bytes_sent: 0,
         bytes_received: 0,
         grpc_request_messages: 0,
@@ -114,6 +115,50 @@ fn test_summary_exposes_normalized_terminal_grpc_status() {
     assert_eq!(
         value["grpc_status"], 2,
         "missing terminal status is UNKNOWN"
+    );
+}
+
+#[test]
+fn test_summary_always_states_its_delivery_observation() {
+    // Issue #6769: a buffered record is finalized before the transport takes
+    // the response, so it says so explicitly instead of implying delivery.
+    let summary = make_full_summary();
+    let parsed: serde_json::Value =
+        serde_json::to_value(&summary).expect("serialize buffered summary");
+    assert_eq!(parsed["response_delivery"], "not_observed");
+    assert!(parsed.get("client_disconnected").is_none());
+
+    let mut observed = make_full_summary();
+    observed.response_delivery = ferrum_edge::plugins::ResponseDelivery::Observed;
+    let parsed: serde_json::Value =
+        serde_json::to_value(&observed).expect("serialize observed summary");
+    assert_eq!(parsed["response_delivery"], "observed");
+    assert_eq!(
+        ferrum_edge::plugins::ResponseDelivery::Observed.as_str(),
+        "observed"
+    );
+    assert_eq!(
+        ferrum_edge::plugins::ResponseDelivery::NotObserved.as_str(),
+        "not_observed"
+    );
+}
+
+#[test]
+fn test_mirror_entry_does_not_inherit_delivery_observation() {
+    let mut summary = make_full_summary();
+    summary.response_delivery = ferrum_edge::plugins::ResponseDelivery::Observed;
+    let mirror = summary.as_mirror_entry(ferrum_edge::plugins::MirrorResponseMeta {
+        mirror_plugin_id: None,
+        mirror_target_url: "http://shadow.example/v1/users".to_string(),
+        mirror_response_status_code: Some(200),
+        mirror_response_size_bytes: None,
+        mirror_response_advertised_size_bytes: None,
+        mirror_latency_ms: 1.0,
+        mirror_error: None,
+    });
+    assert_eq!(
+        mirror.response_delivery,
+        ferrum_edge::plugins::ResponseDelivery::NotObserved
     );
 }
 
