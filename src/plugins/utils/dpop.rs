@@ -93,6 +93,20 @@ struct DpopClaims {
 /// validated a proof without making it single-use, which is why the only
 /// production caller feeds it straight into
 /// [`crate::plugins::utils::replay_authority::ReplayAuthority::admit`].
+/// [`verify`] failure: the access token carries no `cnf.jkt` key binding.
+const TOKEN_BINDING_MISSING: &str = "DPoP token binding missing";
+/// [`verify`] failure: the access token is bound to a different key than the
+/// proof's `jwk`.
+const TOKEN_BINDING_MISMATCH: &str = "DPoP binding mismatch";
+
+/// Whether a [`verify`] failure faults the access token's key binding rather
+/// than the proof itself. RFC 9449 §7.1 answers the former with
+/// `error="invalid_token"` and every other proof failure with
+/// `error="invalid_dpop_proof"`.
+pub fn is_token_binding_failure(reason: &str) -> bool {
+    reason == TOKEN_BINDING_MISSING || reason == TOKEN_BINDING_MISMATCH
+}
+
 #[must_use = "a validated DPoP proof is only single-use once its marker is claimed"]
 pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> {
     let header = decode_header(input.proof).map_err(|_| "Invalid DPoP proof")?;
@@ -104,10 +118,10 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
     }
     let jwk = header.jwk.as_ref().ok_or("DPoP proof missing jwk")?;
     let jkt = jwk_thumbprint_sha256(jwk).map_err(|_| "Invalid DPoP jwk")?;
-    let token_jkt = extract_claim_string(input.access_token_claims, "cnf.jkt")
-        .ok_or("DPoP token binding missing")?;
+    let token_jkt =
+        extract_claim_string(input.access_token_claims, "cnf.jkt").ok_or(TOKEN_BINDING_MISSING)?;
     if !constant_time_eq(jkt.as_bytes(), token_jkt.as_bytes()) {
-        return Err("DPoP binding mismatch");
+        return Err(TOKEN_BINDING_MISMATCH);
     }
 
     let key = DecodingKey::from_jwk(jwk).map_err(|_| "Invalid DPoP jwk")?;

@@ -308,6 +308,16 @@ impl Plugin for ExamplePlugin {
     //     self.is_auth_plugin()
     // }
     //
+    // fn authentication_challenge(&self) -> Option<&'static str> {
+    //     // An auth plugin should name the `WWW-Authenticate` challenge
+    //     // (RFC 9110 §11.6.1) for its scheme, for example
+    //     // `Some(r#"Bearer realm="example""#)`. Every gateway `401` lists the
+    //     // challenges of the route's applicable auth plugins; a fixed,
+    //     // header-valid literal only. Without one, a `401` this plugin causes
+    //     // falls back to the other mechanisms' challenges or `ferrum-edge`.
+    //     None
+    // }
+    //
     // fn requires_response_body_buffering(&self) -> bool {
     //     // Return `true` if your plugin needs to inspect or transform the
     //     // response body. This disables streaming for proxies using this plugin.

@@ -1520,9 +1520,12 @@ async fn serve_admin_io<I>(
                 && session.is_retired()
             {
                 session.record_fenced();
-                let response = json_response(
-                    StatusCode::UNAUTHORIZED,
-                    &json!({ "error": "Client certificate trust withdrawn" }),
+                let response = with_admin_challenge(
+                    json_response(
+                        StatusCode::UNAUTHORIZED,
+                        &json!({ "error": "Client certificate trust withdrawn" }),
+                    ),
+                    crate::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
                 );
                 let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
                 return Ok::<_, hyper::Error>(guarded);
@@ -3006,6 +3009,21 @@ fn diagnostic_ref_not_found_response() -> Response<Full<Bytes>> {
     )
 }
 
+/// Attach the admin API's `WWW-Authenticate` challenge to a `401` (RFC 9110
+/// §15.5.2, issue #6774). The admin API accepts RFC 6750 bearer JWTs; the
+/// client-certificate trust fence names the certificate instead. `challenge`
+/// is always a compiled-in, header-valid literal.
+fn with_admin_challenge(
+    mut response: Response<Full<Bytes>>,
+    challenge: &'static str,
+) -> Response<Full<Bytes>> {
+    response.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(challenge),
+    );
+    response
+}
+
 /// `401` response for `/metrics` when the caller is not authorized to scrape.
 /// Advertises the supported credential scheme so well-behaved scrapers can
 /// retry with a token.
@@ -3888,28 +3906,37 @@ async fn handle_admin_request_inner(
                 (actor, diagnostics_read)
             }
             Err(message) => {
-                return Ok(json_response(
-                    StatusCode::UNAUTHORIZED,
-                    &json!({"error": message}),
+                return Ok(with_admin_challenge(
+                    json_response(StatusCode::UNAUTHORIZED, &json!({"error": message})),
+                    crate::plugins::utils::auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
                 ));
             }
         },
         Err(JwtError::NotConfigured) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Admin authentication is unavailable"}),
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Admin authentication is unavailable"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_AUTHENTICATION_CHALLENGE,
             ));
         }
         Err(JwtError::MissingHeader) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Missing Authorization header"}),
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Missing Authorization header"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_AUTHENTICATION_CHALLENGE,
             ));
         }
         Err(JwtError::InvalidHeaderFormat) => {
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Invalid Authorization header format"}),
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Invalid Authorization header format"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_INVALID_REQUEST_CHALLENGE,
             ));
         }
         Err(JwtError::VerificationFailed(msg)) => {
@@ -3918,9 +3945,12 @@ async fn handle_admin_request_inner(
             // audience) would give unauthenticated callers a validation-policy
             // oracle. The reason never contains the token itself.
             debug!(reason = %msg, "Admin API token verification failed");
-            return Ok(json_response(
-                StatusCode::UNAUTHORIZED,
-                &json!({"error": "Token verification failed"}),
+            return Ok(with_admin_challenge(
+                json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &json!({"error": "Token verification failed"}),
+                ),
+                crate::plugins::utils::auth_flow::BEARER_INVALID_TOKEN_CHALLENGE,
             ));
         }
     };

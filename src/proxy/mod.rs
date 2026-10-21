@@ -15698,10 +15698,29 @@ fn build_websocket_error_response(
     body: &str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
-    build_websocket_error_response_with_gateway_error(
+    build_websocket_error_response_with_headers(
         status,
         body,
         initial_response_header_policy_plugins,
+        None,
+        None,
+    )
+}
+
+/// [`build_websocket_error_response`] for a gateway `401`: `challenge` is set
+/// after the initial response header policy, so the failed handshake always
+/// carries its `WWW-Authenticate` field (RFC 9110 §15.5.2, issue #6774).
+fn build_websocket_error_response_with_challenge(
+    status: StatusCode,
+    body: &str,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    challenge: Option<&'static str>,
+) -> Response<ProxyBody> {
+    build_websocket_error_response_with_headers(
+        status,
+        body,
+        initial_response_header_policy_plugins,
+        challenge,
         None,
     )
 }
@@ -15717,18 +15736,20 @@ fn build_websocket_backend_failure_response(
     connection_error: bool,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
-    build_websocket_error_response_with_gateway_error(
+    build_websocket_error_response_with_headers(
         status,
         body,
         initial_response_header_policy_plugins,
+        None,
         Some(connection_error),
     )
 }
 
-fn build_websocket_error_response_with_gateway_error(
+fn build_websocket_error_response_with_headers(
     status: StatusCode,
     body: &str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    challenge: Option<&'static str>,
     backend_failure_connection_error: Option<bool>,
 ) -> Response<ProxyBody> {
     let mut response_headers =
@@ -15739,6 +15760,12 @@ fn build_websocket_error_response_with_gateway_error(
         initial_response_header_policy_plugins,
         &mut response_headers,
     );
+    if let Some(challenge) = challenge {
+        crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+            &mut response_headers,
+            challenge.to_string(),
+        );
+    }
     if let Some(connection_error) = backend_failure_connection_error {
         insert_x_gateway_error_for_backend_failure(
             &mut response_headers,
@@ -15875,10 +15902,12 @@ async fn handle_websocket_request_authenticated(
         .await;
         record_request(&state, status.as_u16());
         cb_probe.release_neutral();
-        return Ok(build_websocket_error_response(
+        return Ok(build_websocket_error_response_with_challenge(
             status,
             body,
             &initial_response_header_policy_plugins,
+            (status == StatusCode::UNAUTHORIZED)
+                .then(|| crate::plugins::utils::auth_flow::reauthentication_challenge(&ctx)),
         ));
     }
 
@@ -16964,10 +16993,12 @@ async fn handle_websocket_request_authenticated(
         )
         .await;
         record_request(&state, status.as_u16());
-        return Ok(build_websocket_error_response(
+        return Ok(build_websocket_error_response_with_challenge(
             status,
             body,
             &initial_response_header_policy_plugins,
+            (status == StatusCode::UNAUTHORIZED)
+                .then(|| crate::plugins::utils::auth_flow::reauthentication_challenge(&ctx)),
         ));
     }
 
@@ -24832,6 +24863,9 @@ fn replace_rejection_with_authorization_terminal(
     response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     let family = request_upload_auth_family(ctx);
     ctx.record_authorization_termination_once(termination, family);
     ctx.retain_deadline_response_gateway_headers(response_headers);
@@ -24875,6 +24909,9 @@ fn replace_rejection_with_gateway_deadline(
     response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     *status_code = StatusCode::OK.as_u16();
     if let Some(body) = response_body {
         // Drop any retained shared capacity; do not clear-in-place.
@@ -25423,6 +25460,10 @@ async fn run_after_proxy_hooks_on_rejection(
                 if plugin.may_replace_rejection_response()
                     && let Some(body) = response_body.as_deref_mut()
                 {
+                    // An opted-in reject hook replaced the response, whatever
+                    // its status: it is gateway-authored from here on (issue
+                    // #6774).
+                    ctx.note_gateway_response_replacement();
                     let replaced_status = *status_code;
                     *status_code = reject.status_code;
                     *body = reject.body;
@@ -25619,10 +25660,14 @@ pub(crate) async fn apply_after_proxy_hooks_to_gateway_error_terminal(
 /// that one-shot state would already be gone and could not be re-applied to the
 /// rejection response, silently dropping the rotated cookie / route overrides.
 fn rebuild_plugin_rejection_response_headers(
+    ctx: &RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
 ) -> Bytes {
+    // The replacement is gateway-authored even when the response it replaces
+    // was an origin short-circuit (issue #6774).
+    ctx.note_gateway_response_replacement();
     *response_status = reject.status_code;
     response_headers.clear();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -25640,7 +25685,11 @@ pub(crate) async fn apply_plugin_rejection_response(
     reject: RejectedResponseParts,
 ) -> Bytes {
     let mut body =
-        rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+        rebuild_plugin_rejection_response_headers(ctx, response_status, response_headers, reject);
+    // Seed, then re-assert over the final map, the `WWW-Authenticate`
+    // guarantee for a gateway `401` (issue #6774); see
+    // `apply_reject_after_proxy_and_synthetic_body_hooks`.
+    ensure_unauthorized_response_challenge(plugins, ctx, *response_status, response_headers);
     apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
@@ -25649,6 +25698,7 @@ pub(crate) async fn apply_plugin_rejection_response(
         response_headers,
     )
     .await;
+    ensure_unauthorized_response_challenge(plugins, ctx, *response_status, response_headers);
     body
 }
 
@@ -25786,6 +25836,7 @@ fn enforce_synthetic_response_body_limit(
         "Synthetic response rejected: buffered body exceeds route limit"
     );
     *body = rebuild_plugin_rejection_response_headers(
+        ctx,
         status,
         headers,
         RejectedResponseParts {
@@ -26367,8 +26418,12 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     if let Some(reject) = response_body_reject {
         // Rebuild headers/body only; the after_proxy reject hooks run once in
         // the caller so one-shot response state survives this replacement.
-        *response_body =
-            rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
+        *response_body = rebuild_plugin_rejection_response_headers(
+            ctx,
+            response_status,
+            response_headers,
+            reject,
+        );
         terminal_body_response_selected = true;
     }
 
@@ -26539,6 +26594,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 "Mandatory replay response redaction transform failed; rejecting response"
             );
             *response_body = rebuild_plugin_rejection_response_headers(
+                ctx,
                 response_status,
                 response_headers,
                 RejectedResponseParts {
@@ -26620,6 +26676,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             // Rebuild headers/body only; the after_proxy reject hooks run once in
             // the caller so one-shot response state survives this replacement.
             *response_body = rebuild_plugin_rejection_response_headers(
+                ctx,
                 response_status,
                 response_headers,
                 reject,
@@ -26710,6 +26767,13 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
+    // A gateway-generated HTTP `401` always carries an applicable challenge
+    // (issue #6774), seeded here so the reject-path hooks observe it and
+    // re-asserted after them below. Native gRPC answers over a `200` with
+    // `grpc-status: 16`, so its framing is left exactly as authored.
+    if !is_grpc_request {
+        ensure_unauthorized_response_challenge(plugins, ctx, *status, headers);
+    }
     let original_method = ctx
         .metadata
         .remove(SYNTHETIC_RESPONSE_METHOD_OVERRIDE_METADATA_KEY)
@@ -26826,6 +26890,18 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     // flows through this finalizer.
     enforce_final_client_visible_response_header_policy(plugins, ctx, status, headers, body, false)
         .await;
+
+    // Re-assert the `WWW-Authenticate` guarantee over the FINAL status and
+    // header map (issue #6774): a reject-path hook or header policy
+    // (`security_headers` `remove`, a `response_transformer` rule) may have
+    // dropped or malformed the challenge, and a body-policy replacement may
+    // have produced a new gateway `401`. The guarantee wins over an operator
+    // removal — RFC 9110 §15.5.2 makes the challenge mandatory — but a valid
+    // operator replacement is kept as authored. Runs before the committed
+    // observers and wire preparation so both see the emitted response.
+    if !is_grpc_request {
+        ensure_unauthorized_response_challenge(plugins, ctx, *status, headers);
+    }
 
     // A failed WebSocket handshake is still an ordinary HTTP response, but its
     // transport-owned fields must come only from a successful H1 Upgrade or
@@ -27266,6 +27342,11 @@ pub(crate) async fn run_after_proxy_hooks(
                     true,
                 )
                 .await;
+                // The rejection replaced the backend response: a gateway `401`
+                // carries its challenge after the final policy pass, before
+                // observers and emission (issue #6774).
+                ctx.note_gateway_response_replacement();
+                ensure_after_proxy_rejection_challenge(plugins, ctx, status_code, &mut headers);
                 return Some(AfterProxyReject {
                     status_code,
                     body,
@@ -27325,6 +27406,8 @@ pub(crate) async fn run_after_proxy_hooks(
     )
     .await
     {
+        ctx.note_gateway_response_replacement();
+        ensure_after_proxy_rejection_challenge(plugins, ctx, rejection_status, response_headers);
         return Some(AfterProxyReject {
             status_code: rejection_status,
             body: rejection_body,
@@ -27332,6 +27415,45 @@ pub(crate) async fn run_after_proxy_hooks(
         });
     }
     None
+}
+
+/// The single final repair point for a backend-path response on every
+/// frontend — the H1/H2 response builder, the native H3 buffered send, and the
+/// H3 cross-protocol bridge — after every replacement and policy stage and
+/// before the committed observers and the wire (issue #6774).
+///
+/// Only a response gateway policy replaced is gateway-authored here: an
+/// accepted backend `401` and an unreplaced origin short-circuit are forwarded
+/// as authored. Any current or future replacement funnel that records its
+/// provenance (`RequestContext::note_gateway_response_replacement`) therefore
+/// cannot emit a challenge-free `401`. Native gRPC keeps its trailers-only
+/// `UNAUTHENTICATED` framing.
+pub(crate) fn ensure_replaced_response_challenge(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status: u16,
+    headers: &mut HashMap<String, String>,
+) {
+    if status == StatusCode::UNAUTHORIZED.as_u16()
+        && ctx.response_replaced_by_gateway()
+        && !is_native_grpc_request(ctx)
+    {
+        ensure_unauthorized_response_challenge(plugins, ctx, status, headers);
+    }
+}
+
+/// [`ensure_unauthorized_response_challenge`] for a rejection that replaced a
+/// backend response in `after_proxy` or the final header policy. Native gRPC
+/// keeps its trailers-only `UNAUTHENTICATED` framing untouched.
+fn ensure_after_proxy_rejection_challenge(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status: u16,
+    headers: &mut HashMap<String, String>,
+) {
+    if !is_native_grpc_request(ctx) {
+        ensure_unauthorized_response_challenge(plugins, ctx, status, headers);
+    }
 }
 
 pub(crate) struct NormalizedRejectResponse {
@@ -28625,6 +28747,9 @@ pub(crate) fn replace_buffered_response_with_authorization_terminal(
     response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> u16 {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     let family = request_upload_auth_family(ctx);
     ctx.record_authorization_termination_once(termination, family);
     ctx.retain_deadline_response_gateway_headers(response_headers);
@@ -28688,6 +28813,9 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     ctx.mark_gateway_deadline_response_selected();
     ctx.retain_deadline_response_gateway_headers(response_headers);
     if let Some(content_type) = grpc_web_response_content_type {
@@ -28785,6 +28913,9 @@ fn replace_buffered_response_with_capacity_refusal_with_policy_source(
     response_body: &mut Bytes,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     use crate::proxy::response_buffer_budget as budget;
 
     let policy_refusal = ctx.response_transform_size_refusal_selected();
@@ -29049,6 +29180,9 @@ async fn replace_buffered_response_with_representation_error(
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     warn_sampled!(
         reason = rejection.reason(),
         "Buffered response rejected: configured response body policy could not be enforced"
@@ -29128,6 +29262,7 @@ async fn replace_buffered_response_with_representation_error(
         // headers, which is what makes this rejection indistinguishable from an
         // ordinary body reject to a CORS/correlation/security-header plugin.
         *response_body = rebuild_plugin_rejection_response_headers(
+            ctx,
             response_status,
             response_headers,
             RejectedResponseParts {
@@ -29410,6 +29545,7 @@ async fn run_final_client_visible_response_body_policy(
         // the final replacement.
         InitialResponseHeaderPolicySource::ProtocolPlugins(_) => {
             *response_body = rebuild_plugin_rejection_response_headers(
+                ctx,
                 response_status,
                 response_headers,
                 reject,
@@ -29469,6 +29605,9 @@ async fn replace_buffered_response_with_policy_rejection(
     response_body: &mut Bytes,
     reject: RejectedResponseParts,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     // Keep only line-aware gateway output from the accepted backend lifecycle;
     // an identically named backend Set-Cookie/CORS/security field is not enough
     // to cross onto this gateway-authored replacement.
@@ -29557,6 +29696,9 @@ fn install_fixed_buffered_final_policy_terminal(
     response_headers: &mut HashMap<String, String>,
     response_body: &mut Bytes,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     let owned_grpc_web_response_content_type =
         crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
     if let Some(content_type) = owned_grpc_web_response_content_type.as_deref() {
@@ -29674,6 +29816,9 @@ fn install_final_header_policy_rejection(
     preserve_decorators: bool,
     preserve_from_gateway_provenance: bool,
 ) {
+    // Gateway policy replaced the response: from here on it is gateway-authored,
+    // whatever short-circuit it replaced (issue #6774).
+    ctx.note_gateway_response_replacement();
     if preserve_decorators {
         if preserve_from_gateway_provenance {
             // Ordinary backend responses have a pristine baseline plus
@@ -32060,21 +32205,174 @@ fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
     ctx: &RequestContext,
 ) -> (u16, Bytes, HashMap<String, String>) {
+    let mut challenges = Vec::new();
+    push_applicable_authentication_challenges(&mut challenges, auth_plugins, ctx, &[]);
     let mut headers = HashMap::new();
-    // Challenge selection follows configured priority order: mechanisms that
-    // do not advertise a challenge are skipped, and the first available
-    // challenge wins.
-    let challenge = auth_plugins
-        .iter()
-        .filter(|plugin| plugin.authentication_applies(ctx))
-        .find_map(|plugin| plugin.authentication_challenge())
-        .unwrap_or("ferrum-edge");
-    headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
+    headers.insert(
+        "WWW-Authenticate".to_string(),
+        crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges),
+    );
     (
         401,
         Bytes::from_static(MISSING_AUTHENTICATION_BODY),
         headers,
     )
+}
+
+/// Append the challenge of every authentication mechanism that governs this
+/// request, in configured priority order, skipping equivalent duplicates and
+/// the mechanisms in `rejected` (their rejection-specific challenge already
+/// stands in for the bare advertisement). Mechanisms that advertise no
+/// challenge, and trigger-skipped instances, contribute nothing (issue #6774).
+fn push_applicable_authentication_challenges(
+    challenges: &mut Vec<String>,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    rejected: &[&Arc<dyn Plugin>],
+) {
+    for plugin in plugins {
+        if rejected
+            .iter()
+            .any(|rejecting| std::ptr::eq::<Arc<dyn Plugin>>(*rejecting, plugin))
+        {
+            continue;
+        }
+        if plugin.authentication_applies(ctx)
+            && let Some(challenge) = plugin.authentication_challenge()
+        {
+            crate::plugins::utils::auth_flow::push_authentication_challenge(challenges, challenge);
+        }
+    }
+}
+
+/// Challenges collected from the authentication phase's `401` rejections, in
+/// chain order, and the mechanisms that produced them.
+#[derive(Default)]
+struct AuthRejectionChallenges<'a> {
+    challenges: Vec<String>,
+    rejected: Vec<&'a Arc<dyn Plugin>>,
+}
+
+impl<'a> AuthRejectionChallenges<'a> {
+    /// Record every challenge a mechanism's `401` rejection carries (all field
+    /// spellings, every challenge in each list), or that mechanism's
+    /// advertised challenge when the rejection carries no well-formed one, so
+    /// a later rejection in a multi-auth chain cannot erase it.
+    fn collect(
+        &mut self,
+        plugin: &'a Arc<dyn Plugin>,
+        status_code: u16,
+        headers: &HashMap<String, String>,
+    ) {
+        if status_code != 401 {
+            return;
+        }
+        self.rejected.push(plugin);
+        let mut carried_valid_challenge = false;
+        for value in crate::plugins::utils::auth_flow::response_authentication_challenges(headers) {
+            carried_valid_challenge |=
+                crate::plugins::utils::auth_flow::push_authentication_challenge(
+                    &mut self.challenges,
+                    value,
+                );
+        }
+        if !carried_valid_challenge && let Some(challenge) = plugin.authentication_challenge() {
+            crate::plugins::utils::auth_flow::push_authentication_challenge(
+                &mut self.challenges,
+                challenge,
+            );
+        }
+    }
+
+    /// Give the authentication phase's final `401` every applicable challenge
+    /// (RFC 9110 §15.5.2, issue #6774): the rejecting mechanisms' own
+    /// challenges first, then every other applicable mechanism's advertised
+    /// challenge, skipping only equivalent duplicates, falling back to the
+    /// generic gateway challenge. Any other status is left untouched.
+    fn apply(
+        self,
+        reject: &mut (u16, Bytes, HashMap<String, String>),
+        auth_plugins: &[Arc<dyn Plugin>],
+        ctx: &RequestContext,
+    ) {
+        if reject.0 != 401 {
+            return;
+        }
+        let Self {
+            mut challenges,
+            rejected,
+        } = self;
+        push_applicable_authentication_challenges(&mut challenges, auth_plugins, ctx, &rejected);
+        crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+            &mut reject.2,
+            crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges),
+        );
+    }
+}
+
+/// Guarantee a gateway-generated `401` plugin rejection carries a well-formed
+/// `WWW-Authenticate` challenge (RFC 9110 §15.5.2, issue #6774).
+///
+/// Authentication-phase rejections already carry theirs. This covers every
+/// other plugin `401` — `access_control` with no identified consumer, a custom
+/// plugin, a response-phase rejection, and a response a reject-path header
+/// hook stripped the challenge from — by advertising the challenges of the
+/// route's applicable authentication mechanisms, or the generic gateway
+/// challenge when there are none.
+///
+/// * A single field that already holds a well-formed challenge list is left
+///   exactly as authored.
+/// * Several spellings, or a list mixing well-formed and malformed challenges,
+///   are folded into one field holding every well-formed challenge exactly as
+///   it will be emitted; malformed values (CR/LF, an unterminated quoted
+///   string, a parameter without a value) are dropped rather than sent.
+/// * An origin-authored response — a cached, deduplicated, federated, or
+///   serverless-function `401` carried by a plugin short-circuit — is never
+///   touched: the gateway did not author it.
+pub(crate) fn ensure_unauthorized_response_challenge(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status: u16,
+    headers: &mut HashMap<String, String>,
+) {
+    if status != 401 || ctx.response_is_origin_authored() {
+        return;
+    }
+    let mut challenges = {
+        let present = crate::plugins::utils::auth_flow::response_authentication_challenges(headers);
+        if let [value] = present.as_slice()
+            && *value == value.trim()
+            && crate::plugins::utils::auth_flow::is_valid_authentication_challenge(value)
+        {
+            return;
+        }
+        let mut challenges = Vec::new();
+        for value in present {
+            crate::plugins::utils::auth_flow::push_authentication_challenge(&mut challenges, value);
+        }
+        challenges
+    };
+    if challenges.is_empty() {
+        push_applicable_authentication_challenges(&mut challenges, plugins, ctx, &[]);
+    }
+    crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+        headers,
+        crate::plugins::utils::auth_flow::render_authentication_challenges(&challenges),
+    );
+}
+
+/// The `WWW-Authenticate` field for a gateway-authored `401` that ends an
+/// authenticated request (credential expiry, authorization lifetime, or
+/// client-certificate trust withdrawal): the committing mechanism's scheme
+/// ([`crate::plugins::utils::auth_flow::reauthentication_challenge`]).
+pub(crate) fn insert_reauthentication_challenge(
+    headers: &mut HashMap<String, String>,
+    ctx: &RequestContext,
+) {
+    crate::plugins::utils::auth_flow::set_response_authentication_challenge(
+        headers,
+        crate::plugins::utils::auth_flow::reauthentication_challenge(ctx).to_string(),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -32813,6 +33111,9 @@ pub async fn run_authentication_phase_with_envelope(
             // diagnostic reference detail (issue #5846).
             let mut last_reject_plugin: Option<&Arc<dyn Plugin>> = None;
             let mut server_reject_plugin: Option<&Arc<dyn Plugin>> = None;
+            // Every rejecting mechanism's challenge, in chain order, so the
+            // last rejection selected below cannot erase an earlier one's.
+            let mut rejection_challenges = AuthRejectionChallenges::default();
             for auth_plugin in auth_plugins {
                 if !auth_plugin.authentication_applies(ctx) {
                     continue;
@@ -32843,6 +33144,7 @@ pub async fn run_authentication_phase_with_envelope(
                     | reject @ PluginResult::RejectBinary { .. } => {
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             let reject = (reject.status_code, reject.body, reject.headers);
+                            rejection_challenges.collect(auth_plugin, reject.0, &reject.2);
                             if reject.0 >= 500 {
                                 if server_reject.is_none() {
                                     server_reject = Some(reject);
@@ -32882,6 +33184,7 @@ pub async fn run_authentication_phase_with_envelope(
                 let mut reject = server_reject
                     .or(last_reject)
                     .unwrap_or_else(|| missing_authentication_reject(auth_plugins, ctx));
+                rejection_challenges.apply(&mut reject, auth_plugins, ctx);
                 attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                 Some(adapt_auth_reject_for_openai_envelope(
                     uses_openai_auth_error_envelope,
@@ -32913,6 +33216,9 @@ pub async fn run_authentication_phase_with_envelope(
                         if let Some(reject) = plugin_result_into_reject_parts(reject) {
                             crate::diagnostic_ref::note_rejecting_plugin(ctx, auth_plugin.as_ref());
                             let mut reject = (reject.status_code, reject.body, reject.headers);
+                            let mut rejection_challenges = AuthRejectionChallenges::default();
+                            rejection_challenges.collect(auth_plugin, reject.0, &reject.2);
+                            rejection_challenges.apply(&mut reject, auth_plugins, ctx);
                             attach_auth_rejection_set_cookie(ctx, &mut reject.2);
                             return Some(adapt_auth_reject_for_openai_envelope(
                                 uses_openai_auth_error_envelope,
@@ -33444,10 +33750,7 @@ async fn admit_proxy_request_on_frontend_port(
                 "Client certificate trust withdrawn",
             ));
         }
-        return Ok(build_response(
-            StatusCode::UNAUTHORIZED,
-            r#"{"error":"Client certificate trust withdrawn"}"#,
-        ));
+        return Ok(build_client_trust_withdrawn_response());
     }
 
     // ACME HTTP-01 is answered ahead of overload admission on purpose: losing a
@@ -43773,6 +44076,10 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // Every replacement and policy stage has run: a gateway-replaced `401`
+    // gets its challenge before committed observers and the wire (#6774).
+    ensure_replaced_response_challenge(&plugins, &ctx, response_status, &mut response_headers);
+
     // Inject the sticky-session cookie before committed exporters observe the
     // final header view. This remains after every rejection/body replacement so
     // the cookie lands on the same response that will be sent downstream.
@@ -53879,6 +54186,23 @@ fn check_protocol_headers_with_wire_framing(
     None
 }
 
+/// `401` for a request on a connection whose client-certificate trust was
+/// withdrawn (issue #3857). The certificate is the credential that lost
+/// trust, so the response advertises the `ClientCertificate` challenge
+/// (RFC 9110 §15.5.2, issue #6774). Every value is a compiled-in literal.
+fn build_client_trust_withdrawn_response() -> Response<ProxyBody> {
+    let body = r#"{"error":"Client certificate trust withdrawn"}"#;
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("Content-Type", "application/json")
+        .header(
+            hyper::header::WWW_AUTHENTICATE,
+            crate::plugins::utils::auth_flow::CLIENT_CERTIFICATE_AUTHENTICATION_CHALLENGE,
+        )
+        .body(ProxyBody::from_string(body))
+        .unwrap_or_else(|_| build_response(StatusCode::UNAUTHORIZED, body))
+}
+
 /// Last-resort answer when `http::response::Builder` rejects an otherwise
 /// prepared response (an invalid header value reached it). `Response::new`
 /// defaults to `200 OK`, so a bare fallback would present an internal failure
@@ -56550,8 +56874,15 @@ pub(crate) fn authorization_expired_dispatch_placeholder(
     resolved_ip: Option<String>,
     request_on_wire: bool,
 ) -> retry::BackendResponse {
-    let mut headers = HashMap::with_capacity(1);
+    let mut headers = HashMap::with_capacity(2);
     headers.insert("content-type".to_string(), "application/json".to_string());
+    // Replaced by the pre-commitment terminal before anything is emitted, but
+    // a gateway `401` never leaves without a challenge (issue #6774); the
+    // placeholder has no request context, so it carries the generic one.
+    headers.insert(
+        "WWW-Authenticate".to_string(),
+        crate::plugins::utils::auth_flow::GENERIC_AUTHENTICATION_CHALLENGE.to_string(),
+    );
     retry::BackendResponse {
         status_code: StatusCode::UNAUTHORIZED.as_u16(),
         body: ResponseBody::buffered(r#"{"error":"Unauthorized"}"#.as_bytes().to_vec()),
@@ -56717,8 +57048,11 @@ pub(crate) fn authorization_expired_pre_commitment_response(
             ResponseBody::buffered(translated.body),
         );
     }
-    let mut headers = HashMap::with_capacity(1);
+    let mut headers = HashMap::with_capacity(2);
     headers.insert("content-type".to_string(), "application/json".to_string());
+    // RFC 9110 §15.5.2 (issue #6774): the committing mechanism's scheme, a
+    // fixed literal that names nothing about the credential or the expiry.
+    insert_reauthentication_challenge(&mut headers, request_ctx);
     (
         StatusCode::UNAUTHORIZED.as_u16(),
         headers,
@@ -56781,6 +57115,9 @@ pub(crate) fn apply_precommit_authorization_terminal(
     response_body: &mut ResponseBody,
 ) -> Option<crate::proxy::auth_lifetime::StreamAuthTermination> {
     let termination = request_authorization_termination(ctx, max_lifetime_seconds)?;
+    // The authorization terminal replaces whatever response was selected
+    // (issue #6774).
+    ctx.note_gateway_response_replacement();
     let (terminal_status, terminal_headers, terminal_body) =
         authorization_expired_pre_commitment_response(
             ctx,

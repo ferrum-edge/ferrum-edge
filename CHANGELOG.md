@@ -19,6 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **Every gateway-generated `401` carries an applicable `WWW-Authenticate`
+  challenge** (issue #6774, RFC 9110 §15.5.2). `AuthMechanism` now requires a
+  challenge, so `key_auth` (`ApiKey`), `jwt_auth`/`jwks_auth` (`Bearer` with
+  RFC 6750 error codes, or `DPoP`), `hmac_auth` (`hmac`, including replay
+  rejects), `mtls_auth` (`ClientCertificate`), `soap_ws_security`
+  (`WS-Security`), and `oidc_relying_party` session rejects no longer answer
+  `401` without one. An authentication-phase `401` lists every rejecting and
+  applicable mechanism's challenge (merging only equivalent challenges)
+  instead of letting the last rejection erase earlier ones; any other
+  plugin `401` lacking a well-formed challenge — including a response-phase
+  refusal and one a header policy stripped — gets the route's challenges or
+  the generic `ferrum-edge`, while origin-authored `401`s (cache/dedup
+  replays, serverless, federated providers) pass through untouched unless
+  gateway policy replaced them. Authorization-expiry terminals (H1, H2,
+  H3, CONNECT-UDP, WebSocket), client-certificate trust withdrawal (proxy and
+  admin), and admin JWT failures now carry challenges too, and `jwks_auth`
+  answers DPoP token failures with `DPoP error="invalid_token"`.
+
 - **Gateway-authored status codes follow the failure cause** (issues #6770,
   #6771, #6773, #6775). A backend connect timeout answers `504` instead of
   `502` (still a pre-wire connection failure for retry, circuit breaker and

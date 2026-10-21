@@ -223,8 +223,8 @@ impl AuthMechanism for BasicAuth {
         "basic_auth"
     }
 
-    fn authentication_challenge(&self) -> Option<&'static str> {
-        Some(r#"Basic realm="ferrum-edge", charset="UTF-8""#)
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::BASIC_AUTHENTICATION_CHALLENGE
     }
 
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {

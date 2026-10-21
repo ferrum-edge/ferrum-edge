@@ -202,6 +202,21 @@ impl AuthMechanism for JwtAuth {
         "jwt_auth"
     }
 
+    fn authentication_challenge(&self) -> &'static str {
+        auth_flow::BEARER_AUTHENTICATION_CHALLENGE
+    }
+
+    fn rejection_challenge(&self, rejection: auth_flow::CredentialRejection) -> &'static str {
+        match rejection {
+            auth_flow::CredentialRejection::InvalidFormat => {
+                auth_flow::BEARER_INVALID_REQUEST_CHALLENGE
+            }
+            auth_flow::CredentialRejection::InvalidCredential => {
+                auth_flow::BEARER_INVALID_TOKEN_CHALLENGE
+            }
+        }
+    }
+
     fn extract(&self, ctx: &RequestContext) -> ExtractedCredential {
         self.extract_credential(ctx)
     }
