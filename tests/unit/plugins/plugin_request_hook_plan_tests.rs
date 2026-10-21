@@ -17,7 +17,11 @@ use std::sync::{Arc, Mutex};
 use super::plugin_utils::{make_plugin_config_with_json, make_proxy};
 
 fn config(rows: Vec<PluginConfig>) -> GatewayConfig {
-    let ids = rows.iter().map(|row| row.id.as_str()).collect();
+    let ids = rows
+        .iter()
+        .filter(|row| row.scope == PluginScope::Proxy)
+        .map(|row| row.id.as_str())
+        .collect();
     GatewayConfig {
         version: "1".to_string(),
         proxies: vec![make_proxy("p1", "/", ids)],
@@ -48,7 +52,13 @@ fn mesh_config() -> GatewayConfig {
         builtin("authz", "mesh_authz", json!({})),
         builtin("metrics", "workload_metrics", json!({})),
         builtin("log", "stdout_logging", json!({})),
-        builtin("prom", "prometheus_metrics", json!({})),
+        make_plugin_config_with_json(
+            "prom",
+            "prometheus_metrics",
+            json!({}),
+            PluginScope::Global,
+            None,
+        ),
         builtin(
             "route",
             "mesh_route_dispatch",

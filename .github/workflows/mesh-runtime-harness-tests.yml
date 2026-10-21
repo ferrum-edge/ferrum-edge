@@ -87,9 +87,12 @@ jobs:
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_request_hook_plan_tests
-          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_trigger_gate_tests
-          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_cache_tests
-          cargo test --locked --profile pr-build --test unit_plugins_b_tests route_header_finalization_tests
-          cargo test --locked --profile pr-build --test unit_plugins_a_tests grpc_deadline_tests
-          cargo fmt --all -- --check
+          status=0
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_request_hook_plan_tests || status=1
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_trigger_gate_tests || status=1
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests plugin_cache_tests || status=1
+          cargo test --locked --profile pr-build --test unit_plugins_b_tests route_header_finalization_tests || status=1
+          cargo test --locked --profile pr-build --test unit_plugins_a_tests grpc_deadline_tests || status=1
+          cargo clippy --locked --profile pr-build --lib -- -D warnings || status=1
+          cargo fmt --all -- --check || status=1
+          exit "$status"
