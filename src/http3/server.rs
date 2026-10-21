@@ -399,6 +399,25 @@ impl H3UploadReadError {
         }
     }
 
+    /// [`Self::proven_client_abort`], settled against the client's connection:
+    /// a read the gateway could not attribute, on a connection the client
+    /// closed, is its abort. Such a read can fail as an unclassified closed
+    /// stream rather than as the connection error (issue #6772); malformed
+    /// input stays malformed.
+    pub(crate) fn proven_client_abort_with_peer(
+        &self,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Option<ProvenClientAbort> {
+        self.proven_client_abort().or_else(|| {
+            if self.failure() == crate::http3::stream_util::H3RequestReadFailure::GatewayTerminated
+            {
+                ProvenClientAbort::from_peer_connection(peer)
+            } else {
+                None
+            }
+        })
+    }
+
     /// The positive classification of this read failure: a client abort,
     /// malformed input, or a stream the gateway ended itself.
     pub(crate) fn failure(&self) -> crate::http3::stream_util::H3RequestReadFailure {
@@ -785,7 +804,7 @@ fn boxed_finalize_h3_upload_read_failure<'a>(
     disconnect_phase: &'static str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        let client_abort = error.proven_client_abort();
+        let client_abort = error.proven_client_abort_with_peer(ctx.peer_connection.as_ref());
         let disconnected = client_abort.is_some();
         let (status, body, grpc_status, message, phase) = if let Some(abort) = client_abort {
             // The shared pre-header client-abort terminal (issue #6772).
@@ -8364,7 +8383,11 @@ async fn handle_h3_request(
             }
         };
         let streaming_resp = match dispatched {
-            Ok(Ok(result)) => result,
+            // A gateway-terminated upload read on a connection the client
+            // closed is its abort (issue #6772).
+            Ok(Ok(result)) => {
+                result.map_err(|e| e.with_peer_closed_upload(ctx.peer_connection.as_ref()))
+            }
             Ok(Err(expiry)) => Err(crate::http3::route_deadline::expiry_pool_error(
                 &mut ctx, expiry,
             )),
@@ -14144,6 +14167,9 @@ pub(crate) struct H3GrpcUploadState {
     /// Wakes the response relay the instant a fault is latched, so a bidi RPC
     /// whose upload dies does not wait out the backend read timeout.
     fault_signal: tokio::sync::Notify,
+    /// The client's connection, consulted when a gateway-terminated read fault
+    /// is published (issue #6772).
+    peer_connection: Option<crate::plugins::PeerConnectionSignal>,
 }
 
 impl H3GrpcUploadState {
@@ -14154,7 +14180,18 @@ impl H3GrpcUploadState {
             fault: std::sync::atomic::AtomicU8::new(H3GrpcUploadFault::NONE),
             blocked_on_backend: std::sync::atomic::AtomicBool::new(false),
             fault_signal: tokio::sync::Notify::new(),
+            peer_connection: None,
         }
+    }
+
+    /// Settle published gateway-terminated read faults against the client's
+    /// connection: see [`Self::publish_fault`].
+    pub(crate) fn with_peer_connection(
+        mut self,
+        peer_connection: Option<crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        self.peer_connection = peer_connection;
+        self
     }
 
     fn add_bytes(&self, len: u64) {
@@ -14188,7 +14225,20 @@ impl H3GrpcUploadState {
     /// Latch the FIRST fault and wake the relay. Later faults are dropped: the
     /// first one explains the RPC outcome, and a follow-on failure is usually
     /// its consequence.
+    ///
+    /// A gateway-terminated read on a connection the client closed is latched
+    /// as the client's abort (issue #6772): such a read can fail as an
+    /// unclassified closed stream rather than as the connection error, so the
+    /// connection's own close reason is the proof. A connection the gateway
+    /// closed, or whose idle timeout expired, stays gateway-terminated.
     pub(crate) fn publish_fault(&self, fault: H3GrpcUploadFault) {
+        let fault = if fault == H3GrpcUploadFault::GatewayTerminated
+            && ProvenClientAbort::from_peer_connection(self.peer_connection.as_ref()).is_some()
+        {
+            H3GrpcUploadFault::ClientAbort
+        } else {
+            fault
+        };
         if self
             .fault
             .compare_exchange(
@@ -15391,7 +15441,8 @@ async fn dispatch_grpc_native_h3(
     // so an expiry after the open is never charged to a pre-wire connect failure
     // on a byte-count test, and a healthy backend is not downgraded by a slow
     // upload.
-    let upload = Arc::new(H3GrpcUploadState::new());
+    let upload =
+        Arc::new(H3GrpcUploadState::new().with_peer_connection(ctx.peer_connection.clone()));
     // gRPC request-message accounting for the `GRPC_REQUEST_MESSAGES` telemetry
     // family. The upload pump owns the only copy of the backend-visible request
     // DATA on this path, so the length-prefixed message scan rides with it; the
@@ -15618,6 +15669,7 @@ async fn dispatch_grpc_native_h3(
             // (`send_h3_grpc_error_with_recv_halt`), so the client sees the gRPC
             // error before its request direction is halted rather than a bare
             // RESET_STREAM(0x0) racing it.
+            let error = error.with_peer_closed_upload(ctx.peer_connection.as_ref());
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut stream, error).await;
             crate::http3::stream_util::halt_request_body(&mut stream);
@@ -15764,6 +15816,7 @@ async fn dispatch_grpc_native_h3(
             // Response first, then retire the pump (which finalizes the forwarded
             // byte count and closes/resets the backend request direction), then
             // record.
+            let error = error.with_peer_closed_upload(ctx.peer_connection.as_ref());
             let failure =
                 send_failed_h3_grpc_dispatch_error(&dispatch_env, &mut send_half, error).await;
             pump_guard.retire().await;

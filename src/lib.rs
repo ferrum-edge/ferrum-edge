@@ -9267,6 +9267,70 @@ pub mod _test_support {
         }
     }
 
+    /// The fault a native-H3 gRPC upload state latches when `kind` is published
+    /// while the client's connection is `peer` (issue #6772): a
+    /// gateway-terminated read on a connection the client closed latches as
+    /// the client's abort.
+    pub fn h3_grpc_upload_fault_latched_with_peer_for_test(
+        kind: H3GrpcUploadFaultKind,
+        peer: Option<crate::plugins::PeerConnectionSignal>,
+    ) -> H3GrpcUploadFaultKind {
+        let state = crate::http3::server::H3GrpcUploadState::new().with_peer_connection(peer);
+        state.publish_fault(h3_grpc_upload_fault_for_test(kind));
+        match state.fault() {
+            Some(crate::http3::server::H3GrpcUploadFault::ClientAbort) => {
+                H3GrpcUploadFaultKind::ClientAbort
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedTrailers) => {
+                H3GrpcUploadFaultKind::MalformedTrailers
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::MalformedBody) => {
+                H3GrpcUploadFaultKind::MalformedBody
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::GatewayTerminated) => {
+                H3GrpcUploadFaultKind::GatewayTerminated
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::Oversize) => {
+                H3GrpcUploadFaultKind::Oversize
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::BackendUploadHalted) => {
+                H3GrpcUploadFaultKind::BackendUploadHalted
+            }
+            Some(crate::http3::server::H3GrpcUploadFault::AuthorizationExpired(_)) => {
+                H3GrpcUploadFaultKind::AuthorizationExpired
+            }
+            None => unreachable!("a published fault must latch"),
+        }
+    }
+
+    /// The positive classification of a failed HTTP/3 request-stream read
+    /// (issue #6772).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum H3RequestReadFailureKind {
+        ClientAbort,
+        Malformed,
+        GatewayTerminated,
+    }
+
+    /// Classify the QUIC connection error h3 surfaced for a request-stream
+    /// read, exactly as `classify_h3_request_read_error` does for a remote
+    /// connection error.
+    pub fn h3_connection_error_incoming_failure_for_test(
+        incoming: &h3::quic::ConnectionErrorIncoming,
+    ) -> H3RequestReadFailureKind {
+        match crate::http3::stream_util::classify_connection_error_incoming(incoming) {
+            crate::http3::stream_util::H3RequestReadFailure::ClientAbort => {
+                H3RequestReadFailureKind::ClientAbort
+            }
+            crate::http3::stream_util::H3RequestReadFailure::Malformed => {
+                H3RequestReadFailureKind::Malformed
+            }
+            crate::http3::stream_util::H3RequestReadFailure::GatewayTerminated => {
+                H3RequestReadFailureKind::GatewayTerminated
+            }
+        }
+    }
+
     /// Shape of the native-H3 gRPC request upload at the instant the
     /// response-header wait expires (issue #3283).
     ///

@@ -145,6 +145,21 @@ impl ProvenClientAbort {
         proven.then_some(Self { _evidence: () })
     }
 
+    /// The client's connection is already closed, and the client closed it: a
+    /// close it sent or a stateless reset
+    /// ([`crate::plugins::PeerConnectionSignal::closed_by_peer`]). Terminal
+    /// decision points consult this before recording an unproven
+    /// gateway-closed cause, because a request-stream read on a connection
+    /// the client closed can fail as an unclassified closed stream rather
+    /// than as the connection error itself. The gateway's own close, an
+    /// idle-timeout expiry, and an open connection return `None`.
+    pub fn from_peer_connection(
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Option<Self> {
+        peer.is_some_and(|signal| signal.is_closed() && signal.closed_by_peer())
+            .then_some(Self { _evidence: () })
+    }
+
     /// A client abort already proven by typed evidence and carried across a
     /// task or a typed latch: an upload fault the shared H3 read-failure
     /// classifier accepted (a pump's fault, a reader's failure code, a typed

@@ -1320,6 +1320,24 @@ impl H3PoolError {
         self.client_request_fault
     }
 
+    /// Settle a gateway-terminated upload read against the client's
+    /// connection (issue #6772): when the client closed that connection, the
+    /// fault is its abort. A read on a connection the client closed can fail
+    /// as an unclassified closed stream rather than as the connection error,
+    /// so the connection's own close reason is the proof. Every other error,
+    /// and a connection the gateway closed or that timed out, is unchanged.
+    pub(crate) fn with_peer_closed_upload(
+        mut self,
+        peer: Option<&crate::plugins::PeerConnectionSignal>,
+    ) -> Self {
+        if self.client_request_fault == Some(H3ClientRequestFault::GatewayTerminated)
+            && let Some(abort) = ProvenClientAbort::from_peer_connection(peer)
+        {
+            self.client_request_fault = Some(H3ClientRequestFault::Abort(abort));
+        }
+        self
+    }
+
     /// The proven client abort that ended this request, when one did. Only
     /// this, never the error class or text, selects the `499` / `CANCELLED`
     /// client-abort terminal.

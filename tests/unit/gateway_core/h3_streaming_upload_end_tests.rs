@@ -68,14 +68,28 @@ fn every_peer_reset_and_peer_close_is_a_client_abort() {
             .contains("StreamError::RemoteTerminate { .. } => H3RequestReadFailure::ClientAbort,"),
         "a peer reset with any code, H3_NO_ERROR included, is a client abort"
     );
+    // A remote connection error is sorted by the incoming-error classifier.
     assert!(
-        helper.contains("ConnectionErrorIncoming::ApplicationClose { .. } => {"),
-        "a close the peer sent is a client abort"
+        helper.contains(
+            "ConnectionError::Remote { 0: incoming, .. } => {\n                classify_connection_error_incoming(incoming)\n            }"
+        ),
+        "a remote connection error is sorted by its incoming cause"
+    );
+    let incoming = region(
+        STREAM_UTIL,
+        "pub(crate) fn classify_connection_error_incoming(",
+        "\n}\n",
+    );
+    assert!(
+        incoming.contains(
+            "ConnectionErrorIncoming::ApplicationClose { .. } => H3RequestReadFailure::ClientAbort,"
+        ),
+        "a close the peer sent, with any code, is a client abort"
     );
     assert!(
         helper.contains(
             "ConnectionError::Timeout { .. } => H3RequestReadFailure::GatewayTerminated,"
-        ) && helper.contains(
+        ) && incoming.contains(
             "ConnectionErrorIncoming::Timeout | ConnectionErrorIncoming::InternalError(_) => {"
         ),
         "an idle-timeout expiry is local and unproven, never a client abort"

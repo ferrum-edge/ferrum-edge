@@ -695,8 +695,26 @@ async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body() {
 /// first stream is cancelled at its budget, and the retry opens a new stream
 /// on the pooled connection, which answers.
 #[ignore]
-#[tokio::test]
-async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2() {
+#[test]
+fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2() {
+    // The in-process gateway serves this H3 -> HTTP/2 buffered retry on the
+    // test's own runtime. `#[tokio::test]` takes Rust's 2 MiB spawned-thread
+    // stack, a quarter of the 8 MiB every production worker gets
+    // (`thread_stack_size` in `src/main.rs`), and this cross-protocol retry
+    // future overflowed it at `opt-level = 0`. Match production, as
+    // `functional_h3_plain_dispatches_over_same_cluster_ambient_hbone` does.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_stack_size(8 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("build 8 MiB-stack runtime matching src/main.rs")
+        .block_on(
+            functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2_inner(),
+        );
+}
+
+async fn functional_h3_route_attempt_budget_retries_a_stalled_buffered_body_from_h2_inner() {
     let ca = TestCa::new("h3-buffered-body-retry").expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
     let listener = TcpListener::bind_test("127.0.0.1:0")

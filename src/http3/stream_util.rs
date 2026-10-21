@@ -548,9 +548,12 @@ pub(crate) enum H3RequestReadFailure {
     /// The gateway ended the stream or connection itself (its own graceful or
     /// error close, a local QUIC failure, a stream it already stopped, or its
     /// own idle-timeout expiry), or the cause is not observable. Never proof of
-    /// a client abort: an idle timeout fires locally even while the client is
-    /// still reachable, for example when a completed upload waits on a slow
-    /// backend without keepalives.
+    /// a client abort by itself: an idle timeout fires locally even while the
+    /// client is still reachable, for example when a completed upload waits on
+    /// a slow backend without keepalives. A read can also fail as an
+    /// unclassified closed stream after the connection is gone, so terminal
+    /// decision points consult the connection's own close reason
+    /// (`ProvenClientAbort::from_peer_connection`) before recording this.
     GatewayTerminated,
 }
 
@@ -588,6 +591,28 @@ fn classify_undefined_connection_error(
     }
 }
 
+/// Classify the QUIC connection error h3 surfaced for a request-stream read.
+///
+/// A peer `CONNECTION_CLOSE` arrives as `ApplicationClose` with the code the
+/// client chose (`0x0`, `H3_NO_ERROR` `0x100`, or any other): the client closed
+/// its connection, a client abort. An idle-timeout expiry and an internal
+/// failure are the gateway's own; Quinn's other errors are sorted by
+/// [`classify_undefined_connection_error`].
+pub(crate) fn classify_connection_error_incoming(
+    incoming: &h3::quic::ConnectionErrorIncoming,
+) -> H3RequestReadFailure {
+    use h3::quic::ConnectionErrorIncoming;
+    match incoming {
+        ConnectionErrorIncoming::ApplicationClose { .. } => H3RequestReadFailure::ClientAbort,
+        // An idle-timeout expiry is local and unproven (see
+        // `GatewayTerminated`), like an internal failure.
+        ConnectionErrorIncoming::Timeout | ConnectionErrorIncoming::InternalError(_) => {
+            H3RequestReadFailure::GatewayTerminated
+        }
+        ConnectionErrorIncoming::Undefined(error) => classify_undefined_connection_error(&**error),
+    }
+}
+
 /// Classify a failed read of the client's request stream.
 ///
 /// The ONE predicate every buffered drain and streamed upload uses, so the same
@@ -599,23 +624,12 @@ pub(crate) fn classify_h3_request_read_error(
     error: &h3::error::StreamError,
 ) -> H3RequestReadFailure {
     use h3::error::{ConnectionError, LocalError, StreamError};
-    use h3::quic::ConnectionErrorIncoming;
     match error {
         StreamError::RemoteTerminate { .. } => H3RequestReadFailure::ClientAbort,
         StreamError::ConnectionError { 0: connection, .. } => match connection {
-            ConnectionError::Remote { 0: incoming, .. } => match incoming {
-                ConnectionErrorIncoming::ApplicationClose { .. } => {
-                    H3RequestReadFailure::ClientAbort
-                }
-                // An idle-timeout expiry is local and unproven (see
-                // `GatewayTerminated`), like an internal failure.
-                ConnectionErrorIncoming::Timeout | ConnectionErrorIncoming::InternalError(_) => {
-                    H3RequestReadFailure::GatewayTerminated
-                }
-                ConnectionErrorIncoming::Undefined(error) => {
-                    classify_undefined_connection_error(&**error)
-                }
-            },
+            ConnectionError::Remote { 0: incoming, .. } => {
+                classify_connection_error_incoming(incoming)
+            }
             ConnectionError::Timeout { .. } => H3RequestReadFailure::GatewayTerminated,
             ConnectionError::Local {
                 error: LocalError::Application { code, .. },

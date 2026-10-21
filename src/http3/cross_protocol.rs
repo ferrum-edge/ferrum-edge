@@ -597,7 +597,15 @@ impl PlainPeerGone {
                 Self::ClientAbort(ProvenClientAbort::latched_upload_abort())
             }
             PLAIN_READER_MALFORMED => Self::Malformed,
-            PLAIN_READER_GATEWAY_TERMINATED => Self::GatewayClosed,
+            // A read on a connection the client closed can fail as an
+            // unclassified closed stream rather than as the connection error;
+            // the connection's own close reason still proves the abort.
+            PLAIN_READER_GATEWAY_TERMINATED => {
+                match ProvenClientAbort::from_peer_connection(peer) {
+                    Some(abort) => Self::ClientAbort(abort),
+                    None => Self::GatewayClosed,
+                }
+            }
             _ => Self::from_watcher(stop_sending, peer),
         }
     }
@@ -3727,7 +3735,9 @@ where
             }
             Err(super::server::H3RequestBodyReadError::Read(error)) => {
                 cb_probe.release_neutral();
-                if let Some(abort) = error.proven_client_abort() {
+                if let Some(abort) =
+                    error.proven_client_abort_with_peer(ctx.peer_connection.as_ref())
+                {
                     return Box::pin(write_bridge_upload_client_disconnect(
                         stream,
                         abort,
@@ -8244,9 +8254,12 @@ where
     // evidence: a backend reset that beat hyper's own reset stays the
     // backend's failure.
     let relayed_upload_fault = if body_error_local_reset.load(Ordering::Relaxed) {
-        frontend_upload.map_or(
-            GRPC_BRIDGE_UPLOAD_OK,
-            GrpcBridgeUploadSignals::relayed_fault,
+        grpc_bridge_upload_fault_with_peer(
+            frontend_upload.map_or(
+                GRPC_BRIDGE_UPLOAD_OK,
+                GrpcBridgeUploadSignals::relayed_fault,
+            ),
+            ctx.peer_connection.as_ref(),
         )
     } else {
         GRPC_BRIDGE_UPLOAD_OK
@@ -8570,7 +8583,7 @@ where
                     "cross-protocol H3→gRPC: request body read failed"
                 );
                 cb_probe.release_neutral();
-                if let Some(abort) = e.proven_client_abort() {
+                if let Some(abort) = e.proven_client_abort_with_peer(ctx.peer_connection.as_ref()) {
                     return Box::pin(write_bridge_upload_client_disconnect(
                         stream,
                         abort,
@@ -10285,6 +10298,23 @@ fn grpc_bridge_upload_fault(error: &h3::error::StreamError, trailers: bool) -> u
     }
 }
 
+/// Settle a published bridge upload fault against the client's connection: a
+/// gateway-terminated read on a connection the client closed is its abort,
+/// because such a read can fail as an unclassified closed stream rather than
+/// as the connection error (issue #6772). Every other code is unchanged.
+fn grpc_bridge_upload_fault_with_peer(
+    fault: u8,
+    peer: Option<&crate::plugins::PeerConnectionSignal>,
+) -> u8 {
+    if fault == GRPC_BRIDGE_UPLOAD_GATEWAY_TERMINATED
+        && ProvenClientAbort::from_peer_connection(peer).is_some()
+    {
+        GRPC_BRIDGE_UPLOAD_CLIENT_ABORT
+    } else {
+        fault
+    }
+}
+
 /// Whether a backend error chain ends in the gateway's OWN HTTP/2 stream reset
 /// (issue #6772): an `h2` reset that the backend did not send (`is_remote`) and
 /// that h2 did not raise for a backend protocol violation (`is_library`). That
@@ -10884,6 +10914,8 @@ pub(crate) async fn dispatch_grpc_streaming(
             } else {
                 upload_signals.relayed_fault()
             };
+            let upload_fault =
+                grpc_bridge_upload_fault_with_peer(upload_fault, ctx.peer_connection.as_ref());
             let malformed_upload = matches!(
                 upload_fault,
                 GRPC_BRIDGE_UPLOAD_MALFORMED_TRAILERS | GRPC_BRIDGE_UPLOAD_MALFORMED_BODY

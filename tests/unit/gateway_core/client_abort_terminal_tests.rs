@@ -13,14 +13,15 @@
 //! the gateway-closed `503` / `UNAVAILABLE` terminal, also neutral for backend
 //! health.
 //!
-//! h3's error variants cannot be built outside the crate, so the per-path
+//! h3's stream error variants cannot be built outside the crate, so the per-path
 //! keying is guarded structurally here. On-the-wire proof lives in
 //! `functional_h3_drain_refusal_hooks_test.rs` (`h3_*_client_abort_*`).
 
 use ferrum_edge::_test_support::{
-    PreHeaderSendTerminationForTest, error_class_is_backend_failure_for_test,
-    error_class_is_health_neutral_for_test, map_http_reject_status_to_grpc_status,
-    pre_header_upload_termination_response_for_test,
+    H3GrpcUploadFaultKind, H3RequestReadFailureKind, PreHeaderSendTerminationForTest,
+    error_class_is_backend_failure_for_test, error_class_is_health_neutral_for_test,
+    h3_connection_error_incoming_failure_for_test, h3_grpc_upload_fault_latched_with_peer_for_test,
+    map_http_reject_status_to_grpc_status, pre_header_upload_termination_response_for_test,
 };
 use ferrum_edge::plugins::{PeerConnectionSignal, PeerConnectionWatch, TransactionSummary};
 use ferrum_edge::proxy::client_abort::{
@@ -195,6 +196,136 @@ fn only_the_client_can_prove_a_response_cancellation() {
         ProvenClientAbort::from_response_cancellation(false, Some(&peer(false, false))).is_none()
     );
     assert!(ProvenClientAbort::from_response_cancellation(false, None).is_none());
+}
+
+#[test]
+fn a_remote_application_close_is_a_client_abort_whatever_its_code() {
+    use h3::quic::ConnectionErrorIncoming;
+    // A peer CONNECTION_CLOSE carries the code the client chose: `0x0` (what
+    // a client that simply drops its connection sends) and `H3_NO_ERROR`
+    // (`0x100`) are both the client closing its connection.
+    for error_code in [0x0_u64, 0x100] {
+        assert_eq!(
+            h3_connection_error_incoming_failure_for_test(
+                &ConnectionErrorIncoming::ApplicationClose { error_code }
+            ),
+            H3RequestReadFailureKind::ClientAbort,
+            "remote ApplicationClose {error_code:#x} is the client's close"
+        );
+    }
+    // A stateless reset only the peer can send.
+    assert_eq!(
+        h3_connection_error_incoming_failure_for_test(&ConnectionErrorIncoming::Undefined(
+            std::sync::Arc::new(quinn::ConnectionError::Reset)
+        )),
+        H3RequestReadFailureKind::ClientAbort
+    );
+}
+
+#[test]
+fn a_local_close_or_idle_timeout_stays_gateway_terminated() {
+    use h3::quic::ConnectionErrorIncoming;
+    for incoming in [
+        // The gateway's own idle-timeout expiry, as h3-quinn reports it.
+        ConnectionErrorIncoming::Timeout,
+        ConnectionErrorIncoming::InternalError("internal".to_string()),
+        // The gateway closed the connection itself.
+        ConnectionErrorIncoming::Undefined(std::sync::Arc::new(
+            quinn::ConnectionError::LocallyClosed,
+        )),
+        ConnectionErrorIncoming::Undefined(std::sync::Arc::new(quinn::ConnectionError::TimedOut)),
+        // A cause the classifier cannot observe is never proof.
+        ConnectionErrorIncoming::Undefined(std::sync::Arc::new(std::io::Error::other(
+            "unobservable",
+        ))),
+    ] {
+        assert_eq!(
+            h3_connection_error_incoming_failure_for_test(&incoming),
+            H3RequestReadFailureKind::GatewayTerminated,
+            "{incoming:?} must not become a client abort"
+        );
+    }
+}
+
+#[test]
+fn a_gateway_terminated_read_on_a_connection_the_client_closed_is_its_abort() {
+    // A read on a connection the client closed can fail as an unclassified
+    // closed stream; the connection's own close reason is the proof.
+    assert!(ProvenClientAbort::from_peer_connection(Some(&peer(true, true))).is_some());
+    // The gateway's own close or idle timeout, an open connection, and no
+    // connection at all prove nothing.
+    assert!(ProvenClientAbort::from_peer_connection(Some(&peer(true, false))).is_none());
+    assert!(ProvenClientAbort::from_peer_connection(Some(&peer(false, false))).is_none());
+    assert!(ProvenClientAbort::from_peer_connection(None).is_none());
+
+    // The native-H3 gRPC upload state settles a published gateway-terminated
+    // read the same way, and leaves every other fault alone.
+    assert_eq!(
+        h3_grpc_upload_fault_latched_with_peer_for_test(
+            H3GrpcUploadFaultKind::GatewayTerminated,
+            Some(peer(true, true)),
+        ),
+        H3GrpcUploadFaultKind::ClientAbort
+    );
+    assert_eq!(
+        h3_grpc_upload_fault_latched_with_peer_for_test(
+            H3GrpcUploadFaultKind::GatewayTerminated,
+            Some(peer(true, false)),
+        ),
+        H3GrpcUploadFaultKind::GatewayTerminated
+    );
+    assert_eq!(
+        h3_grpc_upload_fault_latched_with_peer_for_test(
+            H3GrpcUploadFaultKind::GatewayTerminated,
+            None,
+        ),
+        H3GrpcUploadFaultKind::GatewayTerminated
+    );
+    assert_eq!(
+        h3_grpc_upload_fault_latched_with_peer_for_test(
+            H3GrpcUploadFaultKind::MalformedBody,
+            Some(peer(true, true)),
+        ),
+        H3GrpcUploadFaultKind::MalformedBody
+    );
+
+    // Every terminal decision point consults the connection before recording
+    // the gateway-closed terminal.
+    assert!(compact(CROSS_PROTOCOL).contains(
+        "PLAIN_READER_GATEWAY_TERMINATED=>{matchProvenClientAbort::from_peer_connection(peer){Some(abort)=>Self::ClientAbort(abort),None=>Self::GatewayClosed,}}"
+    ));
+    assert_eq!(
+        compact(CROSS_PROTOCOL)
+            .matches("proven_client_abort_with_peer(ctx.peer_connection.as_ref())")
+            .count(),
+        2,
+        "both buffered bridge drains settle against the connection"
+    );
+    assert_eq!(
+        compact(CROSS_PROTOCOL)
+            .matches("grpc_bridge_upload_fault_with_peer(")
+            .count(),
+        3,
+        "the gRPC bridge settles its pre- and post-header upload faults"
+    );
+    let server = compact(SERVER);
+    assert!(server.contains(
+        "letclient_abort=error.proven_client_abort_with_peer(ctx.peer_connection.as_ref());"
+    ));
+    assert!(server.contains(
+        "Ok(Ok(result))=>{result.map_err(|e|e.with_peer_closed_upload(ctx.peer_connection.as_ref()))}"
+    ));
+    assert_eq!(
+        server
+            .matches("leterror=error.with_peer_closed_upload(ctx.peer_connection.as_ref());")
+            .count(),
+        2,
+        "both native gRPC dispatch-failure writers settle against the connection"
+    );
+    assert!(
+        server
+            .contains("H3GrpcUploadState::new().with_peer_connection(ctx.peer_connection.clone())")
+    );
 }
 
 #[test]

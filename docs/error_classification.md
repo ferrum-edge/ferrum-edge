@@ -311,7 +311,12 @@ proven abort is a request-stream reset with any code, `STOP_SENDING` on the
 response, or a connection the client closed (a close it sent, or a stateless
 reset). An idle-timeout expiry fires locally even while the client is still
 reachable, so it is the gateway-closed terminal, not a client abort. The gateway's own close, including a
-graceful `H3_NO_ERROR` close or Quinn's `LocallyClosed`, is never one. The
+graceful `H3_NO_ERROR` close or Quinn's `LocallyClosed`, is never one. A
+client close is proven by the connection's own close reason too: Quinn can
+report a read on a connection the client closed as a bare closed stream, so a
+read failure the gateway cannot attribute is settled against that close reason
+before the gateway-closed terminal is recorded. A close the client sent, with
+any application code (`0x0` or `H3_NO_ERROR` included), is an abort. The
 terminal is defined once in
 [`src/proxy/client_abort.rs`](../src/proxy/client_abort.rs):
 
