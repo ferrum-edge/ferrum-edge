@@ -3967,3 +3967,84 @@ async fn grpc_channel_late_poll_preserves_an_earlier_client_deadline() {
     assert!(cancelled.load(Ordering::Acquire));
     assert_eq!(latch.observed(), None);
 }
+
+#[test]
+fn internal_gateway_error_is_grpc_internal_on_every_native_grpc_builder() {
+    // #6773: `GrpcProxyError::Internal` is a gateway-side construction failure
+    // (backend TLS config, invalid backend URL/authority), not a transient
+    // backend outage. Every native-gRPC terminal builder must answer INTERNAL
+    // (13) with the shared fixed message; UNAVAILABLE (14) would invite
+    // clients to retry a deterministic gateway fault.
+    use ferrum_edge::proxy::grpc_proxy::grpc_status;
+    assert_eq!(grpc_status::INTERNAL, 13);
+    assert_eq!(grpc_status::UNAVAILABLE, 14);
+
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy.contains("GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::INTERNAL,"),
+        "HTTP/1.1-HTTP/2 native-gRPC builder must map Internal to INTERNAL"
+    );
+    assert!(
+        !proxy.contains("GrpcProxyError::Internal(_) => grpc_proxy::grpc_status::UNAVAILABLE"),
+        "HTTP/1.1-HTTP/2 native-gRPC builder must not map Internal to UNAVAILABLE"
+    );
+    assert!(
+        proxy.contains("GrpcProxyError::Internal(_) => GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,"),
+        "HTTP/1.1-HTTP/2 builder must use the shared INTERNAL message"
+    );
+    let h3 = include_str!("../../../src/http3/cross_protocol.rs");
+    assert_eq!(
+        h3.matches("grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE")
+            .count(),
+        2,
+        "both HTTP/3 native-gRPC builders must use the shared INTERNAL message"
+    );
+}
+
+#[test]
+fn h3_grpc_bridge_internal_failure_is_backend_health_neutral() {
+    // #6773 review: a gateway-side construction failure on the H3→gRPC bridge
+    // must not trip the breaker / passive health / adaptive concurrency, as on
+    // HTTP/1.1-HTTP/2 (neutral) and native HTTP/3.
+    use ferrum_edge::_test_support::{
+        error_class_is_health_neutral_for_test, grpc_bridge_failure_health_for_test,
+    };
+    use ferrum_edge::retry::ErrorClass;
+
+    let internal = grpc_proxy::GrpcProxyError::Internal("bad backend CA".to_string());
+    let (status, class) = grpc_bridge_failure_health_for_test(&internal, ErrorClass::RequestError);
+    assert_eq!(status, 500);
+    assert_eq!(class, ErrorClass::DispatchPolicyRejected);
+    assert!(error_class_is_health_neutral_for_test(class));
+
+    let unavailable = grpc_proxy::GrpcProxyError::backend_unavailable(
+        grpc_proxy::GrpcBackendUnavailableKind::Connect,
+        "refused".to_string(),
+    );
+    assert_eq!(
+        grpc_bridge_failure_health_for_test(&unavailable, ErrorClass::ConnectionRefused),
+        (502, ErrorClass::ConnectionRefused),
+        "a real backend failure keeps training backend health"
+    );
+
+    let bridge = include_str!("../../../src/http3/cross_protocol.rs");
+    assert_eq!(
+        bridge
+            .matches("grpc_bridge_failure_health(&err, error_class)")
+            .count(),
+        2,
+        "buffered and streaming H3→gRPC bridge arms must both settle health through the helper"
+    );
+}
+
+#[test]
+fn native_h3_grpc_connect_timeout_is_deadline_exceeded() {
+    // A native-H3 backend connect timeout (or post-wire QUIC idle timeout) is
+    // a backend deadline: DEADLINE_EXCEEDED like the HTTP/1.1-HTTP/2
+    // `BackendTimeout` mapping, not UNAVAILABLE.
+    let server = include_str!("../../../src/http3/server.rs");
+    assert!(server.contains(
+        "is_read_timeout || h3_error_class == crate::retry::ErrorClass::ConnectionTimeout"
+    ));
+    assert!(server.contains("} else if is_backend_timeout {"));
+}

@@ -8530,6 +8530,7 @@ async fn handle_h3_request(
                         is_client_request_body_disconnect,
                         e.is_read_timeout(),
                         h3_error_class,
+                        e.request_on_wire(),
                     );
                 // Do NOT propagate a send error: the outcome record below
                 // releases the CB probe slot and the admission outcome, so a `?`
@@ -12428,10 +12429,11 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
 /// Select the client-facing status + JSON body for a native-H3 backend
 /// dispatch failure. Classification is the shared HTTP-family mapper
 /// (`crate::proxy::http_backend_failure_status_and_body`): a
-/// `backend_read_timeout_ms` deadline expiry (`ReadWriteTimeout`) maps to
-/// 504 `{"error":"Backend timeout"}`, matching the reqwest / direct-H2 /
-/// HBONE / sidecar-mTLS arms, while every other failure keeps the generic
-/// 502 `{"error":"Backend unavailable"}`.
+/// `backend_read_timeout_ms` deadline expiry (`ReadWriteTimeout`) or a connect
+/// timeout (`ConnectionTimeout`) maps to 504 `{"error":"Backend timeout"}`, a
+/// DestinationRule `maxConnections` refusal (`BackendConnectionLimit`) to 503,
+/// matching the reqwest / direct-H2 / HBONE / sidecar-mTLS arms, while every
+/// other failure keeps the generic 502 `{"error":"Backend unavailable"}`.
 ///
 /// The body is deliberately `&'static str`: the `send_h3_response`
 /// consumers want a string, and the buffered-dispatch consumers can reach
@@ -12458,11 +12460,9 @@ fn h3_backend_failure_status_body(
     }
     let (status_code, body) =
         crate::proxy::http_backend_failure_status_and_body(classify_h3_error(e));
-    let status = if status_code == 504 {
-        StatusCode::GATEWAY_TIMEOUT
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
+    // The shared mapper only yields 502 / 503 / 504, all valid status codes;
+    // 502 is the fail-safe should that ever change.
+    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
     (status, body)
 }
 
@@ -12542,6 +12542,7 @@ fn h3_streaming_body_failure_outcome(
     is_client_request_body_disconnect: bool,
     is_read_timeout: bool,
     h3_error_class: crate::retry::ErrorClass,
+    request_on_wire: bool,
 ) -> (bool, Option<crate::retry::ErrorClass>) {
     if is_client_request_body_disconnect {
         (false, Some(crate::retry::ErrorClass::ClientDisconnect))
@@ -12553,7 +12554,16 @@ fn h3_streaming_body_failure_outcome(
         // a transport-level connection failure.
         (false, Some(h3_error_class))
     } else {
-        (true, Some(h3_error_class))
+        // The pool's typed wire marker is authoritative for H3
+        // `connection_error` (never the class): a post-wire failure — an
+        // established QUIC connection timing out or resetting after the
+        // request was committed — is not a connect failure, so it reads
+        // `backend_timeout` / `backend_error` rather than `connection_failure`
+        // and feeds the breaker through its status (#6770 review).
+        (
+            h3_connection_error(request_on_wire, Some(h3_error_class)),
+            Some(h3_error_class),
+        )
     }
 }
 
@@ -14795,12 +14805,25 @@ where
     let is_client_side_neutral_timeout = e.client_deadline_expired()
         || err_msg.contains("client grpc-timeout deadline exceeded before")
         || err_msg.contains("client request upload stalled");
+    // The gateway could not build the backend TLS client configuration: an
+    // internal gateway fault, not an unavailable backend (#6773). INTERNAL on
+    // the wire, as on the HTTP/1.1-HTTP/2 and cross-protocol builders, and
+    // neutral for backend health / capability (nothing was dialed).
+    let is_gateway_internal = e.is_gateway_internal();
+    // A backend connect timeout (pre-wire) or an established QUIC connection
+    // timing out while waiting on the backend is a backend deadline, exactly
+    // like `backend_read_timeout_ms`: DEADLINE_EXCEEDED on the wire and a 504
+    // health status, matching the HTTP/1.1-HTTP/2 `BackendTimeout` mapping
+    // and the HTTP-family 504 (#6770).
+    let is_backend_timeout =
+        is_read_timeout || h3_error_class == crate::retry::ErrorClass::ConnectionTimeout;
 
     // gRPC error signalling mirrors the cross-protocol bridge's
     // dispatch-failure mapping: oversized upload -> RESOURCE_EXHAUSTED,
     // malformed client body or trailers -> INVALID_ARGUMENT, a client abort ->
-    // CANCELLED, read timeout / client deadline -> DEADLINE_EXCEEDED,
-    // everything else -> UNAVAILABLE.
+    // CANCELLED, a gateway-closed upload -> UNAVAILABLE, read timeout / client
+    // deadline -> DEADLINE_EXCEEDED, gateway-internal (backend TLS config could
+    // not be built) -> INTERNAL, everything else -> UNAVAILABLE.
     let (grpc_status, grpc_message) = if is_oversize {
         (
             crate::proxy::grpc_proxy::grpc_status::RESOURCE_EXHAUSTED,
@@ -14821,10 +14844,15 @@ where
             crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
         )
-    } else if is_read_timeout {
+    } else if is_backend_timeout {
         (
             crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
             "Backend deadline exceeded",
+        )
+    } else if is_gateway_internal {
+        (
+            crate::proxy::grpc_proxy::grpc_status::INTERNAL,
+            crate::proxy::grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
         )
     } else {
         (
@@ -14839,6 +14867,7 @@ where
     // oversized upload is client-caused, not a backend-capability signal.
     if !is_client_request_body_disconnect
         && !is_oversize
+        && !is_gateway_internal
         && crate::proxy::is_h3_transport_error_class(h3_error_class)
     {
         state
@@ -14895,12 +14924,18 @@ where
         // to the 504 / `ReadWriteTimeout` arm and wrongly trip the breaker /
         // passive health for a healthy backend.
         (504, Some(crate::retry::ErrorClass::ClientDisconnect))
+    } else if is_gateway_internal {
+        // Gateway-side configuration fault before any dial: neutral for
+        // CB / passive health / adaptive concurrency and never replayed
+        // (`DispatchPolicyRejected` is health-neutral and non-retryable).
+        (500, Some(crate::retry::ErrorClass::DispatchPolicyRejected))
     } else {
-        let status = if is_read_timeout { 504 } else { 502 };
+        let status = if is_backend_timeout { 504 } else { 502 };
         let (_, error_class) = h3_streaming_body_failure_outcome(
             is_client_request_body_disconnect,
             is_read_timeout,
             h3_error_class,
+            e.request_on_wire(),
         );
         (status, error_class)
     };
@@ -21620,8 +21655,12 @@ mod h3_streaming_outcome_tests {
 
     #[test]
     fn request_body_upload_client_disconnect_maps_to_neutral_outcome() {
-        let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(true, false, ErrorClass::ConnectionClosed);
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            true,
+            false,
+            ErrorClass::ConnectionClosed,
+            true,
+        );
 
         assert!(
             !connection_error,
@@ -21633,15 +21672,31 @@ mod h3_streaming_outcome_tests {
 
     #[test]
     fn request_body_upload_backend_failure_keeps_original_class() {
-        let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(false, false, ErrorClass::ProtocolError);
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            false,
+            false,
+            ErrorClass::ProtocolError,
+            false,
+        );
 
         assert!(
             connection_error,
-            "non-client H3 streaming-body failures still represent backend \
-             connection failures"
+            "pre-wire non-client H3 streaming-body failures still represent \
+             backend connection failures"
         );
         assert_eq!(error_class, Some(ErrorClass::ProtocolError));
+
+        // Post-wire (the pool's typed marker), e.g. an established QUIC
+        // connection timing out after the request was committed: not a
+        // connect failure, whatever the class says.
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            false,
+            false,
+            ErrorClass::ConnectionTimeout,
+            true,
+        );
+        assert!(!connection_error);
+        assert_eq!(error_class, Some(ErrorClass::ConnectionTimeout));
     }
 
     #[test]
@@ -21650,8 +21705,12 @@ mod h3_streaming_outcome_tests {
         // the backend, which then stalled. It must be recorded as a 504
         // status fault (connection_error=false), matching the direct-H2 /
         // HBONE read-timeout arms — not as a transport connection failure.
-        let (connection_error, error_class) =
-            super::h3_streaming_body_failure_outcome(false, true, ErrorClass::ReadWriteTimeout);
+        let (connection_error, error_class) = super::h3_streaming_body_failure_outcome(
+            false,
+            true,
+            ErrorClass::ReadWriteTimeout,
+            true,
+        );
 
         assert!(
             !connection_error,

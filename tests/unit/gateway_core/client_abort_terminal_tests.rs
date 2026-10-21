@@ -674,7 +674,7 @@ fn native_h3_grpc_pre_header_abort_is_cancelled_and_disconnected() {
         .find("(504,Some(crate::retry::ErrorClass::ClientDisconnect))")
         .expect("a client-side deadline keeps its neutral 504");
     let backend_health = health
-        .find("letstatus=ifis_read_timeout{504}else{502};")
+        .find("letstatus=ifis_backend_timeout{504}else{502};")
         .expect("a backend failure keeps 502 / 504");
     assert!(abort_health < deadline_health && deadline_health < backend_health);
 

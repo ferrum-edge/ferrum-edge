@@ -10138,9 +10138,10 @@ where
                     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
                     crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                 ),
-                grpc_proxy::GrpcProxyError::Internal(_) => {
-                    (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
-                }
+                grpc_proxy::GrpcProxyError::Internal(_) => (
+                    grpc_proxy::grpc_status::INTERNAL,
+                    grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
+                ),
                 grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                     (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                 }
@@ -10160,6 +10161,7 @@ where
             let connection_error =
                 !matches!(&err, grpc_proxy::GrpcProxyError::ClientDeadlineExceeded(_))
                     && !crate::retry::request_reached_wire(error_class);
+            let (health_status, health_class) = grpc_bridge_failure_health(&err, error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -10175,18 +10177,18 @@ where
                 upstream_balancer,
                 current_target.as_deref(),
                 current_cb_target_key.as_deref(),
-                502,
+                health_status,
                 connection_error,
-                Some(error_class),
+                Some(health_class),
                 cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
             );
             record_cross_protocol_backend_admission_outcome(
                 &mut backend_admission_permits,
-                502,
+                health_status,
                 connection_error,
-                Some(error_class),
+                Some(health_class),
                 backend_admission_start.elapsed(),
             );
             let mut outcome = write_grpc_error_for_request(
@@ -10205,6 +10207,26 @@ where
             outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
             Ok(outcome)
         }
+    }
+}
+
+/// Backend-health `(status, class)` for an H3→gRPC bridge dispatch failure.
+///
+/// `GrpcProxyError::Internal` is a gateway-side construction failure before
+/// any dial (backend TLS config, backend URL/authority could not be built), so
+/// it must not trip the breaker, ding passive health or shrink adaptive
+/// concurrency: it is recorded as a health-neutral, non-retryable
+/// `DispatchPolicyRejected` `500`, as the HTTP/1.1-HTTP/2 path (which settles
+/// it neutrally) and the native-HTTP/3 dispatch do (#6773). The transaction
+/// log keeps the granular class. Every other failure keeps `502` + its class.
+pub(crate) fn grpc_bridge_failure_health(
+    err: &grpc_proxy::GrpcProxyError,
+    error_class: ErrorClass,
+) -> (u16, ErrorClass) {
+    if matches!(err, grpc_proxy::GrpcProxyError::Internal(_)) {
+        (500, ErrorClass::DispatchPolicyRejected)
+    } else {
+        (502, error_class)
     }
 }
 
@@ -10970,9 +10992,10 @@ pub(crate) async fn dispatch_grpc_streaming(
                         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
                         crate::proxy::response_buffer_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
                     ),
-                    grpc_proxy::GrpcProxyError::Internal(_) => {
-                        (grpc_proxy::grpc_status::INTERNAL, "Internal gateway error")
-                    }
+                    grpc_proxy::GrpcProxyError::Internal(_) => (
+                        grpc_proxy::grpc_status::INTERNAL,
+                        grpc_proxy::GRPC_INTERNAL_GATEWAY_ERROR_MESSAGE,
+                    ),
                     grpc_proxy::GrpcProxyError::BackendUnavailable { .. } => {
                         (grpc_proxy::grpc_status::UNAVAILABLE, "Service unavailable")
                     }
@@ -11016,6 +11039,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 && !malformed_upload
                 && !frontend_aborted
                 && !crate::retry::request_reached_wire(error_class);
+            let (health_status, health_class) = grpc_bridge_failure_health(&err, error_class);
             warn!(
                 proxy_id = %proxy.id,
                 error = %err,
@@ -11026,14 +11050,18 @@ pub(crate) async fn dispatch_grpc_streaming(
             );
             // A frontend terminal is recorded under its own status, never an
             // upstream `502`; its `ClientDisconnect` class keeps it neutral.
-            let health_status = if let Some(terminal) = client_abort {
-                terminal.http_status
+            // Every other failure keeps the shared bridge health mapping.
+            let (health_status, health_class) = if let Some(terminal) = client_abort {
+                (terminal.http_status, error_class)
             } else if gateway_closed {
-                crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL.http_status
+                (
+                    crate::proxy::client_abort::GATEWAY_CLOSED_UPLOAD_TERMINAL.http_status,
+                    error_class,
+                )
             } else if malformed_upload {
-                StatusCode::BAD_REQUEST.as_u16()
+                (StatusCode::BAD_REQUEST.as_u16(), error_class)
             } else {
-                502
+                (health_status, health_class)
             };
             record_backend_outcome_no_conn_end(
                 state,
@@ -11044,7 +11072,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 current_cb_target_key.as_deref(),
                 health_status,
                 connection_error,
-                Some(error_class),
+                Some(health_class),
                 cb_probe.take_slot(),
                 false,
                 backend_start.elapsed(),
@@ -11053,7 +11081,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 &mut backend_admission_permits,
                 health_status,
                 connection_error,
-                Some(error_class),
+                Some(health_class),
                 backend_admission_start.elapsed(),
             );
             if upload_terminal_selected {

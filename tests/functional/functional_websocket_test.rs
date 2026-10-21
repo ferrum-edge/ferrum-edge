@@ -2598,7 +2598,7 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     echo_handle.abort();
 }
 
-/// A failed backend dial opens the breaker, then the next Extended CONNECT is
+/// A timed-out backend dial opens the breaker, then the next Extended CONNECT is
 /// rejected in `handle_h3_request` before the dedicated WebSocket handler. The
 /// final flavor-aware writer must still remove every transport-owned header
 /// injected by response policy after the circuit-breaker reject hooks run.
@@ -2625,7 +2625,17 @@ async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() 
         .websocket(&url, WebSocketOptions::default())
         .await
         .expect("initial failed backend handshake response");
-    assert_eq!(first_rejected.status, StatusCode::BAD_GATEWAY);
+    // The listener never accepts, so the dial outlives
+    // `backend_connect_timeout_ms`: a connect timeout is 504 (#6770), still a
+    // pre-wire connection failure that trips the breaker below.
+    assert_eq!(first_rejected.status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        first_rejected
+            .headers
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("connection_failure")
+    );
 
     let second_client = Http3Client::insecure().expect("second H3 client");
     let mut circuit_rejected = second_client

@@ -346,6 +346,33 @@ pub(crate) async fn send_h3_error_body<S>(
     .await;
 }
 
+/// [`send_h3_error_body`] for a failed backend dial/handshake: after the
+/// header policies run, stamps the authoritative `X-Gateway-Error` for the
+/// classified failure, as the HTTP/1.1-HTTP/2 WebSocket path does.
+async fn send_h3_backend_failure_body<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &'static str,
+    connection_error: bool,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+) where
+    S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
+{
+    let mut headers = HashMap::new();
+    ensure_h3_reject_content_type(&mut headers);
+    crate::plugins::apply_initial_response_header_policies(
+        initial_response_header_policy_plugins,
+        &mut headers,
+    );
+    crate::proxy::insert_x_gateway_error_for_backend_failure(
+        &mut headers,
+        connection_error,
+        status.as_u16(),
+    );
+    write_h3_finalized_reject_body(stream, status, Bytes::from_static(body.as_bytes()), headers)
+        .await;
+}
+
 pub(crate) async fn send_h3_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
@@ -862,6 +889,7 @@ pub(crate) async fn handle_h3_websocket(
                 crate::proxy::websocket_dns_resolution_host(&proxy, current_target.as_deref()),
                 retry::ErrorClass::DispatchPolicyRejected,
                 &original_request_path,
+                502,
             )
             .await;
             let reason_headers =
@@ -1121,6 +1149,11 @@ pub(crate) async fn handle_h3_websocket(
                 let ws_error_class = retry::classify_boxed_setup_error(e.as_ref());
                 let is_ws_dns_error = ws_error_class == retry::ErrorClass::DnsLookupError;
                 let ws_is_pre_wire = !retry::request_reached_wire(ws_error_class);
+                // One status for the wire response, metrics, the transaction
+                // log, the circuit breaker and backend admission: a connect or
+                // handshake timeout is 504 (#6770), everything else 502.
+                let (ws_failure_status, ws_failure_body) =
+                    crate::proxy::websocket_backend_failure_status_and_body(ws_error_class);
                 // A gateway-side egress-policy denial (denied literal/rebound H3
                 // WebSocket backend) never reached a backend: non-retryable AND
                 // neutral to backend health (no CB trip, no backend-admission
@@ -1157,7 +1190,7 @@ pub(crate) async fn handle_h3_websocket(
                         crate::proxy::route_retry_ceiling(&proxy).unwrap_or(0);
                     if let Some(permits) = backend_admission_permits.take() {
                         permits.record_backend_outcome(BackendAdmissionOutcome {
-                            response_status: 502,
+                            response_status: ws_failure_status.as_u16(),
                             connection_error: ws_is_pre_wire,
                             error_class: Some(ws_error_class),
                             backend_elapsed: backend_admission_start.elapsed(),
@@ -1171,7 +1204,11 @@ pub(crate) async fn handle_h3_websocket(
                             current_cb_target_key.as_deref(),
                             cb_config,
                         );
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
+                        cb.record_failure(
+                            ws_failure_status.as_u16(),
+                            ws_is_pre_wire,
+                            cb_probe.take_slot(),
+                        );
                         cb_failure_already_recorded = true;
                     }
 
@@ -1318,7 +1355,7 @@ pub(crate) async fn handle_h3_websocket(
                     && let Some(permits) = backend_admission_permits.take()
                 {
                     permits.record_backend_outcome(BackendAdmissionOutcome {
-                        response_status: 502,
+                        response_status: ws_failure_status.as_u16(),
                         connection_error: ws_is_pre_wire,
                         error_class: Some(ws_error_class),
                         backend_elapsed: backend_admission_start.elapsed(),
@@ -1338,11 +1375,15 @@ pub(crate) async fn handle_h3_websocket(
                         // recover, rather than leaking it by skipping the record.
                         cb.record_neutral(cb_probe.take_slot());
                     } else {
-                        cb.record_failure(502, ws_is_pre_wire, cb_probe.take_slot());
+                        cb.record_failure(
+                            ws_failure_status.as_u16(),
+                            ws_is_pre_wire,
+                            cb_probe.take_slot(),
+                        );
                     }
                 }
 
-                crate::proxy::record_request(&state, 502);
+                crate::proxy::record_request(&state, ws_failure_status.as_u16());
 
                 // Emit the TransactionSummary for the failed upgrade so
                 // log plugins see the rejection.
@@ -1362,6 +1403,7 @@ pub(crate) async fn handle_h3_websocket(
                         ),
                         ws_error_class,
                         &original_request_path,
+                        ws_failure_status.as_u16(),
                     )
                     .await;
                 }
@@ -1369,12 +1411,13 @@ pub(crate) async fn handle_h3_websocket(
                 let ws_body = if is_ws_dns_error {
                     r#"{"error":"DNS resolution for backend failed"}"#
                 } else {
-                    r#"{"error":"Backend WebSocket connection failed"}"#
+                    ws_failure_body
                 };
-                send_h3_error_body(
+                send_h3_backend_failure_body(
                     &mut stream,
-                    StatusCode::BAD_GATEWAY,
+                    ws_failure_status,
                     ws_body,
+                    ws_is_pre_wire && !ws_egress_denied,
                     &initial_response_header_policy_plugins,
                 )
                 .await;
@@ -1969,6 +2012,8 @@ async fn emit_failed_upgrade_summary(
     // applied. Logged as `request_path` so access logs record what the client
     // sent, not the backend-rewritten path in `ctx.path`.
     original_request_path: &str,
+    // The status the client actually receives for this failed upgrade.
+    response_status: u16,
 ) {
     if plugins.is_empty() {
         return;
@@ -2010,7 +2055,7 @@ async fn emit_failed_upgrade_summary(
         proxy_name: proxy.name.clone(),
         backend_target: Some(crate::proxy::strip_query_params(backend_url).to_string()),
         backend_resolved_ip: resolved_ip,
-        response_status_code: 502,
+        response_status_code: response_status,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
         latency_backend_ttfb_ms: -1.0,

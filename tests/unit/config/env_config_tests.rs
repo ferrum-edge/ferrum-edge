@@ -4551,6 +4551,56 @@ fn test_env_config_via_pseudonym_custom() {
 }
 
 #[test]
+fn test_env_config_via_pseudonym_must_be_a_header_safe_token() {
+    // #6775: the pseudonym is written verbatim into every response `Via`
+    // header; a non-token value made the response builder reject every
+    // buffered response.
+    for valid in [
+        "ferrum-edge",
+        "gw.example",
+        "edge_1:8443",
+        "gw:000080",
+        "gw:",
+    ] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_VIA_PSEUDONYM", valid),
+            ],
+            || {
+                let config = EnvConfig::from_env().unwrap();
+                assert_eq!(config.via_pseudonym, valid);
+            },
+        );
+    }
+    for invalid in [
+        "my gateway",
+        "gw\tx",
+        ":8080",
+        "gw:http",
+        "gw:80:81",
+        "(gw)",
+        "gw/1",
+    ] {
+        with_env_vars(
+            &[
+                ("FERRUM_MODE", "file"),
+                ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+                ("FERRUM_VIA_PSEUDONYM", invalid),
+            ],
+            || {
+                let err = EnvConfig::from_env().unwrap_err();
+                assert!(
+                    err.contains("FERRUM_VIA_PSEUDONYM"),
+                    "unexpected error for {invalid:?}: {err}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
 fn test_env_config_add_forwarded_header_enabled() {
     with_env_vars(
         &[
