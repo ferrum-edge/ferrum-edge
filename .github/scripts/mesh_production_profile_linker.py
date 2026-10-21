@@ -3,6 +3,9 @@
 
 Installed as /opt/mesh-link-capture/cc with adjacent config.json in a disposable
 builder only. It never changes compiler options or overwrites the original ELF.
+The companion alone receives the original build ID via an explicit linker option.
+That assigned ID is not evidence of natural build-ID reproducibility; the caller
+must independently compare executable bytes/layout and allocated sections.
 Secondary failures are receipts, not a changed return status for the first link.
 """
 import hashlib
@@ -14,6 +17,7 @@ import resource
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -34,6 +38,48 @@ def sha256_file(path):
         for block in iter(lambda: source.read(1024**2), b''):
             h.update(block)
     return h.hexdigest()
+
+
+def elf_build_id(path):
+    """Read one bounded GNU build-ID note; no compiler/tool or whole-ELF copy."""
+    path = Path(path)
+    require(path.is_file() and not path.is_symlink() and
+            64 <= path.stat().st_size <= LIMITS['elf_bytes'], 'missing/oversize build-ID ELF')
+    size = path.stat().st_size
+    with path.open('rb') as source:
+        def read(offset, count):
+            require(0 <= offset <= size and 0 <= count <= size - offset, 'build-ID ELF range')
+            source.seek(offset)
+            data = source.read(count)
+            require(len(data) == count, 'truncated build-ID ELF')
+            return data
+
+        header = read(0, 64)
+        require(header[:7] == b'\x7fELF\x02\x01\x01', 'build-ID ELF must be ELF64 little-endian')
+        values = struct.unpack_from('<HHIQQQIHHHHHH', header, 16)
+        require(values[0] in (2, 3) and values[1:3] == (62, 1), 'build-ID ELF must be AMD64 executable')
+        shoff, shentsize, shnum, shstrndx = values[5], values[10], values[11], values[12]
+        require(shentsize == 64 and 0 < shstrndx < shnum <= 8192, 'build-ID section table bound')
+        table = read(shoff, shnum * 64)
+        sections = list(struct.iter_unpack('<IIQQQQIIQQ', table))
+        strings = sections[shstrndx]
+        require(strings[1] == 3 and 0 < strings[5] <= 1024**2, 'build-ID section-name bound')
+        names = read(strings[4], strings[5])
+        notes = []
+        for section in sections:
+            require(section[0] < len(names), 'build-ID section-name range')
+            end = names.find(b'\0', section[0])
+            require(end >= 0, 'unterminated build-ID section name')
+            if names[section[0]:end] == b'.note.gnu.build-id':
+                require(section[1] == 7 and 16 <= section[5] <= 4096, 'GNU build-ID note bound/type')
+                notes.append(read(section[4], section[5]))
+        require(len(notes) == 1, 'expected one GNU build-ID section')
+        note = notes[0]
+        namesz, descsz, kind = struct.unpack_from('<III', note)
+        require(namesz == 4 and kind == 3 and note[12:16] == b'GNU\0'
+                and 1 <= descsz <= 64 and len(note) in (16 + descsz, 16 + ((descsz + 3) & ~3)),
+                'expected one bounded GNU build-ID note')
+        return note[16:16 + descsz].hex()
 
 
 def expand_response_files(args, cwd):
@@ -76,17 +122,18 @@ def output_path(args, cwd):
     return (cwd / rows[0]).absolute() if rows else None
 
 
-def symbol_arguments(args, twin):
+def symbol_arguments(args, twin, build_id, *, delta=None):
+    require(re.fullmatch(r"(?:[0-9a-f]{2}){1,64}", build_id) is not None, "invalid assigned build ID")
     result, removed, outputs, i = [], 0, 0, 0
     while i < len(args):
+        original_start, secondary_start = i, len(result)
         arg = args[i]
         if arg == '-o':
             require(i + 1 < len(args), 'missing output argument')
             result.extend(('-o', str(twin)))
             outputs += 1
-            i += 2
-            continue
-        if arg.startswith('-o') and len(arg) > 2:
+            i += 1
+        elif arg.startswith('-o') and len(arg) > 2:
             result.append('-o' + str(twin))
             outputs += 1
         elif arg in ('-s', '--strip-all'):
@@ -103,11 +150,22 @@ def symbol_arguments(args, twin):
         else:
             result.append(arg)
         i += 1
+        before, after = args[original_start:i], result[secondary_start:]
+        if delta is not None and before != after:
+            delta.append(dict(operation='replace' if after else 'delete', original_start=original_start,
+                              original_end=i, secondary_start=secondary_start, secondary_end=len(result),
+                              original=before, secondary=after))
     require(outputs == 1 and removed == 1, 'expected one output and one strip-all option')
     require(not any(a in ('--strip-debug', '-S') or
                     (a.startswith('-Wl,') and any(x in ('--strip-all', '--strip-debug', '-s', '-S')
                                                for x in a[4:].split(','))) for a in result),
             'unsupported remaining strip option')
+    # Last linker option overrides its default hash of the complete symbol ELF.
+    result.append('-Wl,--build-id=0x' + build_id)
+    if delta is not None:
+        delta.append(dict(operation='insert', original_start=len(args), original_end=len(args),
+                          secondary_start=len(result) - 1, secondary_end=len(result),
+                          original=[], secondary=[result[-1]]))
     return result
 
 
@@ -146,7 +204,14 @@ def capture(args, config, cwd, env):
         receipt['original_sha256_before'] = before
         shutil.copyfile(original, slot / 'stripped')
         twin = slot / 'symbols'
-        rewritten = symbol_arguments(expanded, twin)
+        build_id = elf_build_id(original)
+        delta = []
+        rewritten = symbol_arguments(expanded, twin, build_id, delta=delta)
+        receipt.update(original_auto_build_id=build_id, assigned_companion_build_id=build_id,
+                       symbol_companion_normalization=True, natural_build_id_reproducibility_claim=False,
+                       unassigned_companion_build_id=None,
+                       build_id_policy='explicit ID on secondary link only; code/layout equivalence independently required',
+                       secondary_expanded_argv=rewritten, secondary_argv_delta=delta)
         response = slot / 'symbols.rsp'
         response.write_text(gcc_response(rewritten))
         receipt['secondary_argv'] = ['cc', '@' + str(response)]
@@ -190,6 +255,8 @@ def capture(args, config, cwd, env):
         receipt['original_sha256_after'] = sha256_file(original)
         require(receipt['original_sha256_after'] == before, 'original ELF changed during secondary link')
         receipt['symbol_sha256'] = sha256_file(twin)
+        receipt['observed_companion_build_id'] = elf_build_id(twin)
+        require(receipt['observed_companion_build_id'] == build_id, 'assigned companion build ID not retained')
         receipt['captured'] = True
     except BaseException as error:
         receipt['failure'] = dict(type=type(error).__name__, reason=str(error)[:1000])

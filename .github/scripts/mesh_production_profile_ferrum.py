@@ -2,7 +2,9 @@
 """Remote-only unchanged-profile linker canary and Ferrum symbol qualification.
 
 Shipping ranking remains on SHIPPING_IMAGE. A symbol twin is eligible only after
-shipping, fresh stripped and twin code/layout/build IDs match. No image is pushed.
+shipping, fresh stripped and twin code/layout/build IDs match. Only the companion
+build ID is assigned, explicitly; natural companion-ID reproducibility is not
+claimed. Code/layout equivalence is checked independently. No image is pushed.
 """
 import argparse
 import difflib
@@ -21,6 +23,7 @@ import time
 import tomllib
 
 from mesh_production_profile_symbols import Elf, require, sha256_file
+from mesh_production_profile_linker import elf_build_id
 
 SOURCE = "4a7be250e45a367314e3dec872ecbd512220558e"
 SHIPPING_IMAGE = "ferrumedge/ferrum-edge@sha256:e95e7f8d0d19e5714cb4e93afb600ebe14a1703aab51e84ad5c2be822d82a4af"
@@ -256,6 +259,7 @@ def qualify_chain(shipping, fresh, twin, minimum_functions=10000):
     return dict(qualified=qualified, shipping_to_fresh=first, fresh_to_symbols=second,
                 build_ids=ids, matching_build_ids=bool(ids[0]) and len(set(ids)) == 1,
                 symbols_may_be_applied_to_shipping=qualified,
+                symbol_companion_normalization=True, natural_build_id_reproducibility_claim=False,
                 sampled_coverage_verified=False, source_line_attribution_verified=False,
                 requirement="capture actual shipping mapped ELF hash/build ID; independently gate decoded sample coverage")
 
@@ -297,6 +301,13 @@ def read_capture(directory, source_hash):
             and receipt.get("source_sha256") == source_hash, "symbol twin was not captured successfully")
     require(receipt.get("original_sha256_before") == receipt.get("original_sha256_after") == sha256_file(slot / "stripped")
             and receipt.get("symbol_sha256") == sha256_file(slot / "symbols"), "link capture artifact hash mismatch")
+    original_id = elf_build_id(slot / "stripped")
+    require(receipt.get("symbol_companion_normalization") is True
+            and receipt.get("natural_build_id_reproducibility_claim") is False
+            and receipt.get("unassigned_companion_build_id") is None
+            and receipt.get("original_auto_build_id") == receipt.get("assigned_companion_build_id")
+            == receipt.get("observed_companion_build_id") == original_id == elf_build_id(slot / "symbols"),
+            "explicit companion build-ID assignment not verified")
     return receipt
 
 
