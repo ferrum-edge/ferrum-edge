@@ -18,10 +18,15 @@ The historical `consul` arm has no HTTP service-defaults entry. It is an
 L4 TCP/mTLS control, not an equivalent HTTP mesh: its echo and intention
 probes do not establish L7 processing. `consulhttp` is the separate L7 arm,
 with explicit HTTP service-defaults for both services and a live listener
-filter check requiring an HTTP connection manager on each proxy. The L4
-arm requires TCP proxy filters and no HTTP connection manager. Artifacts
+filter check requiring an HTTP connection manager on the active client
+15101 and server 21000 listener chains. Warming, draining, and unrelated
+listeners cannot satisfy it. The L4 arm requires TCP proxy filters and no
+HTTP connection manager on those same chains. Artifacts
 include listener-only config dumps; SDS secrets are never collected.
-Earlier tables and protocol descriptions below predate this correction.
+These distinct paths were verified from retained listener dumps in
+[qualification run 39566902232](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39566902232).
+That campaign failed fixture qualification and is not a performance ranking:
+Ferrum and static Envoy could not read host-owned synthetic private keys.
 
 The campaign now reverses arm and payload blocks every other repetition.
 An optional exact `baseline_sha` builds a second Ferrum image with the same
@@ -30,13 +35,16 @@ baseline/candidate pairs in AB/BA order. Both use the dispatched harness.
 `provenance.json` records exact SHAs, image IDs, configuration hashes and
 build profile; `campaign.json` retains the full schedule and required cells.
 `ci-release` is a diagnostic profile and cannot establish shipping-profile
-performance. Use `release`, 30 seconds and at least three repetitions for
-production-profile comparisons.
+performance. Use `release`, 30 seconds and four repetitions for equal AB/BA
+order counts. Calculate candidate effects from every paired ratio; the
+cross-product summary's independent medians are only descriptive.
 
 The load generator warms each measured frontend connection, publishes one
 common accounting window, and includes only byte-exact successful responses
-completed inside it in RPS and latency. Successful post-deadline drains and
-warmup are separate counters; warmup/exchange errors invalidate the cell.
+completed inside it in RPS and the in-window latency histogram. A separate
+admitted-cohort histogram includes successful post-deadline drains, so slow
+admitted requests do not disappear from tail reporting. Drain and warmup
+counters are retained; warmup/exchange errors invalidate the cell.
 Host `/proc` CPU and steal deltas are bracketed by receipt of the loadgen's
 start/end stderr markers, excluding warmup/drains with pipe/scheduler jitter.
 RSS is sampled every 100 ms; raw counters and container image IDs are kept.
@@ -58,20 +66,21 @@ per-request mesh cost dominates):
 
 - throughput (median RPS across iterations, derived MB/s),
 - latency (avg / p50 / p95 / p99 from the median-RPS run),
-- proxy-pair CPU% and RSS (mean/peak, `docker stats` during the
-  measured window),
+- proxy-pair process CPU time and sampled RSS (mean/peak),
 - overhead vs the same-runner's `direct` arm.
 
 Workload: closed-loop HTTP/1.1 POST echo, one keep-alive connection per
 worker (default 100 workers × 10s per cell; a common bulk schedule
 reduces workers to 50 at 1MB and 25 at 5MB in every arm, mirroring the
-gateway harness). Every mesh arm's wire shape is declared identically:
-**H1 → HTTP/2-over-mTLS → H1** (Ferrum's sidecar transport is pooled H2;
-the Envoy pair is explicitly configured for H2 east-west to match).
+gateway harness). Ferrum and static Envoy use **H1 → H2-over-mTLS → H1**.
+The explicit Consul HTTP arm uses H1 over mTLS between proxies; the legacy
+Consul arm forwards application bytes over an L4 mTLS tunnel. These protocol
+and policy-layer differences remain part of the comparison, even after
+verifying that the HTTP arm really installs L7 filters.
 Latency is therefore closed-loop full-response latency under offered
 load (coordinated-omission caveats apply), and MB/s means successful
 response-payload bytes/s. A response counts only when status is 200 and
-the echoed length equals the payload length. These are payload sizes,
+the echoed bytes exactly match the payload. These are payload sizes,
 not file-transfer timings (no disk is involved).
 
 Access logging is off in every arm (Ferrum Telemetry
@@ -88,7 +97,8 @@ produces a successful echo.
 | `direct` | loadgen → echo backend | — |
 | `ferrum` | the real Ferrum mesh runtime: two `FERRUM_MODE=mesh` Sidecar processes, localized file config (`FERRUM_MESH_CONFIG_PROTOCOL=file`), file SVIDs, STRICT PeerAuthentication, SPIFFE-ID pinning, full proxy/plugin chain | not a stripped proxy fixture |
 | `envoy` | two hand-configured `envoyproxy/envoy:v1.39.1` proxies as a static HTTP/2-over-mTLS sidecar pair (client-cert required, SAN pinning both directions, session resumption off) | **not full Istio** — no istiod-generated config, telemetry filters, Wasm, or capture iptables. An Envoy proxy control, labeled “Envoy” in every output |
-| `consul` | a real Consul control plane (`hashicorp/consul:1.21.4` dev agent) generating two Envoy sidecars via `consul connect envoy` + xDS, Consul Connect CA mTLS, `protocol: http` service (generated east-west is HTTP/1.1-over-mTLS). Bootstrap adapted only for admin ports and the loopback agent xDS channel (`prepare_consul_bootstrap.py`) | a single dev agent on loopback, not a Consul cluster; intentions default-allow except during the deny probe; agent excluded from pair CPU/memory like other control planes |
+| `consul` | Consul 1.21.4 dev agent generating two Envoy 1.39.1 sidecars, Connect CA mTLS, default TCP service; active listeners prove L4 TCP proxying | separate L4 control, not an HTTP-policy comparison; a single dev agent, default-allow intentions outside the deny probe |
+| `consulhttp` | same Consul/Envoy versions and topology with explicit HTTP service defaults; active measured listeners prove L7 HTTP connection managers | H1 peer transport differs from Ferrum/static Envoy H2; control-plane agent resource use is excluded from proxy-pair accounting |
 | `linkerd` | standalone probe of `ghcr.io/linkerd/proxy` | cannot run without the Linkerd Destination/Identity control plane (`Invalid configuration: no destination service configured` with static identity); the arm records `unsupported-standalone` with logs instead of numbers |
 
 Cilium service mesh also uses Envoy as the L7 data plane. Consul
@@ -121,20 +131,17 @@ scope, below. Neither is silently represented by the `envoy` arm.
 5. **Closed-loop client.** RPS at high concurrency is
    concurrency/latency; compare arms at the same concurrency, and prefer
    latency + overhead-vs-direct over raw RPS across different runners.
-6. **All CI arms run sequentially on one runner** in fixed order
-   (direct → ferrum → envoy → linkerd), so overhead uses a same-runner
-   `direct` denominator. Sequential same-host execution still carries
-   drift/steal variance across the campaign; publishable comparisons
-should use the 30s × 4-iteration profile for equal AB/BA order counts.
-   New campaigns reverse arm/payload blocks; historical campaigns used fixed order.
-7. **CPU/memory are container-level samples** (`docker stats`, 1s
-   cadence, cgroup usage — not process RSS) summed across the proxy
-   pair, with independent per-container peaks. They include idle/runtime
-   overhead and sample quantisation; use them for arm-to-arm shape, not
-   as precise per-request accounting. (The gateway harness's `/proc`
-   sampler in `tests/performance/multi_protocol/process_usage.py` is
-   the upgrade path; it needs host-visible PIDs, which a local
-   container VM does not expose.)
+6. **All CI arms run sequentially on one runner**, reversing arm/payload
+   blocks every other round and keeping Ferrum baseline/candidate adjacent.
+   Same-host execution still carries drift and shared-resource variance.
+   Use four rounds for equal AB/BA counts and an identical-image A/A control.
+   Historical fixed-order results cannot substitute for these controls.
+7. **CPU/RSS come from host `/proc`** for the two proxy processes. CPU ticks
+   bracket receipt of measurement markers; RSS is sampled every 100 ms.
+   Marker delivery and scheduler delay can include boundary work, so retain
+   interval deviation, idle/background activity and raw counters. Historical
+   `docker stats` records are separately labeled cgroup usage. The sampler
+   requires Linux host-visible PIDs; a local container VM is not equivalent.
 8. **One service, static identity, warmed persistent connections.**
    No capture (iptables/eBPF), original-destination recovery, pod
    networking, rotation, policy churn, or connection-churn behavior is
