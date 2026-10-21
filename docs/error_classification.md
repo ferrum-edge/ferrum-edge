@@ -293,7 +293,51 @@ Two summary types in [`src/plugins/mod.rs`](../src/plugins/mod.rs) carry classif
 |---|---|---|
 | `error_class: Option<ErrorClass>` | per-protocol classifier or upload rejection finalizer | gateway-side failure reaching the backend, or `ClientDisconnect` when the client resets or abandons a buffered upload before dispatch |
 | `body_error_class: Option<ErrorClass>` | `classify_body_error` or H3 bridge upload outcome | error during streaming-response-body delivery, or `ClientDisconnect` for an aborted buffered H3 bridge upload |
-| `client_disconnected: bool` | response-body classifier or upload rejection finalizer | client gave up during response delivery or before dispatch while an early, terminal, or buffered gRPC/H3 request body was being collected |
+| `client_disconnected: bool` | response-body classifier, upload rejection finalizer, or the H1/H2 client-abort scope | client gave up during response delivery, before dispatch while an early, terminal, or buffered gRPC/H3 request body was being collected, or before any response head while the H1/H2 handler was still pending |
+| `response_delivery` | the record's finalization point | `observed` when the record was finalized at the response's transport terminal (deferred streaming terminal, settled HTTP/3 send, H1/H2 client abort or gateway close); `not_observed` when it was finalized before the transport took the response (buffered H1/H2 responses, rejections, a streamed response whose builder failed). On `not_observed` an absent `client_disconnected` is not evidence of delivery |
+
+An admitted HTTP/1.1 or HTTP/2 request whose handler hyper drops before it
+returned — an HTTP/2 `RST_STREAM`, or an HTTP/1.1 connection close, while the
+upload, a plugin phase, backend acquisition, the WebSocket upgrade handshake,
+or the wait for backend response headers is pending — is settled once by its
+`ClientAbortScope` (`src/proxy/client_abort_scope.rs`, issue #6768):
+
+- **Client cancellation** (positive evidence only: an HTTP/2 peer
+  `RST_STREAM` / `GOAWAY` or lost transport, which the vendored hyper reports
+  while it drops the stream, or an HTTP/1.1 client EOF / I/O error): status
+  `499` in logs and metrics only, `error_class: client_disconnect`,
+  `client_disconnected: true`, `response_delivery: observed`, rejection phase
+  `client_disconnect_before_response`, and gRPC `CANCELLED` (overriding any
+  backend status already read: the client never received it).
+- **Local protocol reset** (the gateway's HTTP/2 stack reset the stream for a
+  protocol violation by the client): status `400`, `error_class:
+  protocol_error`, rejection phase `protocol_error_before_response`, gRPC
+  `INTERNAL`.
+- **Gateway close** (withdrawn client-certificate trust, a sibling stream's
+  authorization-lifetime close of the shared connection, or shutdown teardown
+  after the drain wait) and **unattributed HTTP/2 drops**: status `444`
+  ("closed without response", logs and metrics only), no client-disconnect
+  claim and no `error_class`, rejection phase
+  `gateway_close_client_trust_withdrawn` / `gateway_close_authorization_lifetime`
+  / `gateway_close_shutdown` / `connection_closed_before_response`. Only the
+  trust withdrawal reports gRPC `UNAUTHENTICATED`; the others are
+  `UNAVAILABLE`.
+Explicit evidence is decided first: the HTTP/2 peer's reset or the local
+stack's, then a mesh / HBONE / Unix-socket dispatcher's proof that the client
+abandoned its upload (issue #6776), which is a client cancellation; the gateway-close causes classify only an otherwise ambiguous
+loss (a lost HTTP/2 transport, an HTTP/1.1 drop, an HTTP/2 drop with no
+published cause).
+
+- **Terminal log in flight:** the request's own summary stands. `log_with_mirror`
+  hands the sinks that had not started, the runtime counters, and the mirrors to
+  detached delivery when it is dropped (a sink whose `log` started is never
+  invoked again), and the scope counts the summary's status once unless the
+  handler already had.
+
+No backend outcome exists, so circuit breakers, passive health, and retry
+budgets are untouched. The scope stays silent when the handler returned or
+handed its context to the streaming terminal. A status the transport already
+committed is never rewritten to `499` (RFC 9112 §8).
 
 Upload cancellations use dedicated `client_disconnect_*` rejection phases,
 including `client_disconnect_buffered_grpc_upload`,

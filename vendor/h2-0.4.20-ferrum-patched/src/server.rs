@@ -1325,6 +1325,18 @@ impl<B: Buf> SendResponse<B> {
         self.inner.poll_reset(cx, proto::PollReset::AwaitingHeaders)
     }
 
+    /// FERRUM PATCH 004: who closed this stream with a reset.
+    ///
+    /// After [`poll_reset`](Self::poll_reset) reports a reason, returns
+    /// `Some(false)` when the peer sent the `RST_STREAM` or `GOAWAY`, and
+    /// `Some(true)` when this endpoint did: h2 itself, for instance on a
+    /// protocol error in what the peer sent, or the user. Returns `None` while
+    /// the stream is open, after a clean close, and when an I/O error closed
+    /// the stream.
+    pub fn reset_is_local(&self) -> Option<bool> {
+        self.inner.reset_is_local()
+    }
+
     /// Returns the stream ID of the response stream.
     ///
     /// # Panics

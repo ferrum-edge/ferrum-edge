@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **HTTP transaction records state their delivery-observation boundary**
+  (issue #6769). Every `TransactionSummary` now carries `response_delivery`:
+  `not_observed` when the record was finalized before the frontend transport
+  took the response (buffered H1/H2 responses, rejections, Trailers-Only gRPC
+  errors), `observed` when it was finalized at the response's transport
+  terminal (streamed bodies, settled HTTP/3 sends, the H1/H2 client-abort
+  `499`). A `false` `client_disconnected` on a `not_observed` record no longer
+  reads as proof of delivery, and the documentation no longer claims
+  `body_completed` is set for buffered responses.
 - **BREAKING — plugin-config writes require an association precondition**
   (issue #569 in ferrum-edge-git-forge-ops). `PUT`/`DELETE /plugins/config/{id}` now require
   the `expected_proxy_ids` query parameter listing every proxy the caller
@@ -19,6 +28,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   must send the parameter on every plugin-config update and delete.
 
 ### Fixed
+- **An H1/H2 client that cancels before the response head leaves one
+  terminal record** (issue #6768). hyper drops the pending handler on an
+  HTTP/2 `RST_STREAM` or an HTTP/1.1 connection close, which used to skip
+  every terminal log and metric while still releasing the admission count.
+  The request context now lives in a `ClientAbortScope` beside the handler,
+  and a handler dropped before it returned records exactly one `499` client
+  abort (`error_class: client_disconnect`, `client_disconnected: true`, gRPC
+  `CANCELLED`) through the plugin `log` chain and the request/status
+  counters, including during the WebSocket upgrade handshake. `499` needs
+  positive evidence of the client's cancellation: Hyper patch 006 and h2
+  patch 004 report whether an HTTP/2 reset came from the peer or from the
+  gateway's own stack (a protocol-violation reset is recorded as `400`), and
+  a request whose connection the gateway itself closed (withdrawn trust, a
+  sibling's authorization-lifetime close, shutdown teardown after the drain
+  wait) or with no attributable cause is a `444`. `log_with_mirror` now
+  finishes the sinks that had not started, runtime counters, and mirrors in
+  detached delivery when cancelled mid-sink, never re-invoking a started
+  sink, and a request is counted at most once. Neutral to backend health; a
+  committed status is never rewritten.
 - **Every gateway-generated `401` carries an applicable `WWW-Authenticate`
   challenge** (issue #6774, RFC 9110 §15.5.2). `AuthMechanism` now requires a
   challenge, so `key_auth` (`ApiKey`), `jwt_auth`/`jwks_auth` (`Bearer` with

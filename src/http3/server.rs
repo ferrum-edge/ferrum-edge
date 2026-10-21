@@ -8166,6 +8166,8 @@ async fn handle_h3_request(
             client_disconnected: outcome.client_disconnected,
             body_error_class: outcome.body_error_class,
             body_completed: outcome.body_completed,
+            // Built after the H3 send settled: the send outcome is known.
+            response_delivery: crate::plugins::ResponseDelivery::Observed,
             bytes_sent: outcome.bytes_sent,
             bytes_received: outcome.bytes_streamed,
             grpc_request_messages: ctx
@@ -8539,6 +8541,8 @@ async fn handle_h3_request(
                     error_class: Some(h3_error_class),
                     body_completed: reject_sent,
                     client_disconnected: !reject_sent,
+                    // Built after the H3 reject send settled.
+                    response_delivery: crate::plugins::ResponseDelivery::Observed,
                     bytes_received: if reject_sent {
                         reject_body.len() as u64
                     } else {
@@ -8758,6 +8762,8 @@ async fn handle_h3_request(
                 error_class: None,
                 body_error_class: None,
                 body_completed: reject_sent,
+                // Built after the H3 send settled: the send outcome is known.
+                response_delivery: crate::plugins::ResponseDelivery::Observed,
                 bytes_sent: 0,
                 bytes_received: if reject_sent {
                     reject.body.len() as u64
@@ -9592,6 +9598,8 @@ async fn handle_h3_request(
             error_class: None,
             body_error_class,
             body_completed,
+            // Built after the H3 send settled: the send outcome is known.
+            response_delivery: crate::plugins::ResponseDelivery::Observed,
             bytes_sent: request_body_bytes_seen.load(std::sync::atomic::Ordering::Acquire),
             // Response bytes delivered to the client — tracked by the
             // streaming loop above as `bytes_streamed`.
@@ -10224,6 +10232,8 @@ async fn handle_h3_request(
             error_class: h3_error_class,
             body_error_class: h3_stream_result.body_error_class,
             body_completed: h3_stream_result.body_completed,
+            // Built after the H3 send settled: the send outcome is known.
+            response_delivery: crate::plugins::ResponseDelivery::Observed,
             bytes_sent: request_body_bytes,
             // `bytes_streamed` from the H3 streaming helper is the final
             // count of body bytes pushed to the client's h3 stream. Mirror
@@ -11565,6 +11575,8 @@ async fn handle_h3_request(
             client_disconnected,
             body_error_class,
             body_completed,
+            // Built after the downstream HEADERS/DATA/trailers/FIN writes.
+            response_delivery: crate::plugins::ResponseDelivery::Observed,
             bytes_sent: raw_request_body_bytes,
             bytes_received,
             metadata: crate::proxy::clone_log_metadata(&ctx),
@@ -17422,6 +17434,8 @@ async fn log_h3_grpc_transaction(
         client_disconnected,
         body_error_class,
         body_completed,
+        // Built after the H3 send settled: the send outcome is known.
+        response_delivery: crate::plugins::ResponseDelivery::Observed,
         bytes_sent,
         bytes_received,
         grpc_request_messages: ctx

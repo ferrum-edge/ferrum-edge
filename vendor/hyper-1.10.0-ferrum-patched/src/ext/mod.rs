@@ -59,6 +59,15 @@ mod h2_body_write_timeout;
 #[cfg(feature = "http2")]
 pub use h2_body_write_timeout::Http2BodyWriteTimeout;
 
+#[cfg(all(feature = "http2", feature = "server"))]
+mod h2_stream_termination;
+#[cfg(all(feature = "http2", feature = "server"))]
+pub use h2_stream_termination::{take_h2_stream_termination, H2StreamTermination};
+#[cfg(all(feature = "http2", feature = "server"))]
+pub(crate) use h2_stream_termination::{
+    publish_h2_stream_termination, ClearH2StreamTermination,
+};
+
 #[cfg(all(feature = "http1", feature = "client"))]
 mod informational;
 #[cfg(all(feature = "http1", feature = "client"))]

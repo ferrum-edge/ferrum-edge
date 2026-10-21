@@ -26,6 +26,13 @@ Like native serialization, each is emitted only when nonzero — zero means the
 transaction was not gRPC — so attaching a schema never removes message-count
 observability, and both names are valid in `omit`, `rename`, and `order`.
 
+HTTP-family records always carry `response_delivery` (`not_observed` or
+`observed`), which says whether the record was finalized before the frontend
+transport took the response or at the response's transport terminal. It
+bounds what `client_disconnected` and `body_completed` can claim (see the
+Transaction Summary Reference in `docs/plugins.md`), and is a native string
+field like any other: valid in `omit`, `rename`, and `order`.
+
 ## Quick Start
 
 ```yaml

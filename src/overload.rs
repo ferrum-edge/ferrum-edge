@@ -138,6 +138,14 @@ pub struct OverloadState {
     // ── Graceful shutdown drain ────────────────────────────────────────
     /// Set to true when SIGTERM/SIGINT is received to begin the drain phase.
     pub draining: AtomicBool,
+    /// Set once the serving mode stops waiting for in-flight work: the drain
+    /// wait ended, timed out, or was disabled. Anything still pending after
+    /// this is torn down by the gateway, so a dropped request handler is not
+    /// evidence that its client cancelled (issue #6768).
+    pub drain_wait_ended: AtomicBool,
+    /// Event form of [`Self::drain_wait_ended`] for the H1/H2 connection tasks
+    /// that are still serving in-flight requests when the wait ends.
+    drain_wait_ended_token: CancellationToken,
     /// Cold one-shot broadcast for work that must stop as soon as drain starts.
     /// The atomic remains the authoritative state and fast path; cancellation
     /// supplies race-free event delivery to waiters already parked on drain.
@@ -235,6 +243,8 @@ impl OverloadState {
             reject_new_connections: CachePadded::new(AtomicBool::new(false)),
             reject_new_requests: CachePadded::new(AtomicBool::new(false)),
             draining: AtomicBool::new(false),
+            drain_wait_ended: AtomicBool::new(false),
+            drain_wait_ended_token: CancellationToken::new(),
             drain_started: CancellationToken::new(),
             active_connections: CachePadded::new(AtomicU64::new(0)),
             active_requests: CachePadded::new(AtomicU64::new(0)),
@@ -348,6 +358,14 @@ impl OverloadState {
     /// immediately.
     pub(crate) async fn wait_for_drain_start(&self) {
         self.drain_started.cancelled().await;
+    }
+
+    /// Resolves once shutdown stops waiting for in-flight work
+    /// ([`end_shutdown_drain_wait`]). An H1/H2 connection still serving a
+    /// request then closes, so its handlers settle their terminal records
+    /// while observability delivery is still open (issue #6768).
+    pub(crate) async fn wait_for_drain_wait_end(&self) {
+        self.drain_wait_ended_token.cancelled().await;
     }
 
     /// Record an ephemeral port exhaustion event (EADDRNOTAVAIL).
@@ -1789,6 +1807,46 @@ pub fn begin_drain(state: &Arc<OverloadState>) {
 /// process-global and one-shot, so cancelling it from the plain drain-flag
 /// helper — which ordinary tests call directly — would silently disarm every
 /// later fault delay in the same test binary.
+/// Upper bound on how long [`end_shutdown_drain_wait`] waits for the H1/H2
+/// connections it closes to release their requests.
+const DRAIN_WAIT_END_SETTLE: Duration = Duration::from_millis(250);
+
+/// Record that the serving mode stopped waiting for in-flight work after
+/// [`begin_shutdown_drain`]: the drain wait completed, timed out, was cut short,
+/// or is disabled (`FERRUM_SHUTDOWN_DRAIN_SECONDS=0`). From here, a request
+/// handler that is dropped was torn down by the gateway's shutdown, not
+/// cancelled by its client (issue #6768).
+///
+/// The H1/H2 connections still serving a request close their transport now,
+/// and this waits — at most [`DRAIN_WAIT_END_SETTLE`] — until those requests
+/// are released, so each one's terminal record reaches observability delivery
+/// before the serving mode closes it. With nothing in flight it returns at
+/// once, so the `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget and the cleanup phase
+/// that follows are unchanged.
+pub async fn end_shutdown_drain_wait(state: &Arc<OverloadState>) {
+    state.drain_wait_ended.store(true, Ordering::Release);
+    state.drain_wait_ended_token.cancel();
+    let released = async {
+        while state.active_requests.load(Ordering::Relaxed) != 0 {
+            // `notify_one` keeps a permit, so a release between the load and
+            // this await is not lost; a bounded wait covers anything else.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(50), state.drain_complete.notified())
+                    .await;
+        }
+    };
+    if tokio::time::timeout(DRAIN_WAIT_END_SETTLE, released)
+        .await
+        .is_err()
+    {
+        warn!(
+            phase = "drain",
+            active_requests = state.active_requests.load(Ordering::Relaxed),
+            "In-flight requests were still held after shutdown closed their connections"
+        );
+    }
+}
+
 pub fn begin_shutdown_drain(state: &Arc<OverloadState>) {
     begin_drain(state);
     crate::plugins::utils::fault_delay::cancel_fault_delays_for_shutdown();

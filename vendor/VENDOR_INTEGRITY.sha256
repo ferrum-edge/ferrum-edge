@@ -198,11 +198,11 @@ a8b3c5cd24b1f83770576ba21d5fcd555f144afd88f246f7d5dbe9e39563c74a  vendor/h2-0.4.
 6d6d85ccbd0e7d0a549b9212061dae0386a09d4ac18099e78253047fac442b80  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/prioritize.rs
 f8a3d085c88d117f510478c194e7c9375fde89033f0bfead9cc6805d6da3ffab  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/recv.rs
 178949880fff49f1918b00b9662e58b8d8056e0875e7a6d6d4d2cde9fdc07088  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/send.rs
-486b99b293d0f874b72724e1511cb0b11b44b3906ea20eb176fae1821772794d  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/state.rs
+1bab7862f3f1f2c07c61d423a27c258ce5a329e59121375b4734ac0873c1b835  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/state.rs
 cbce79b0c680b20a5b98fdd5b886c41caca0c773edb526d11caf4896b55dcff3  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/store.rs
 fdf5a6b68fdf64edbbfe522759c1c9f345e72e5eaaf2abd860e357f66399d8ce  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/stream.rs
-4018a22be3b807e87bab359775453a59e4f44c3329297f3ce7f961d3fd826e69  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/streams.rs
-a567d950e49e897f844e865b945a748b3bf6226645c2d9c97af214d66118d596  vendor/h2-0.4.20-ferrum-patched/src/server.rs
+e7a2525276d478a7725832a18ba06b899e73e9700ec5f13ef13195af9417e8a5  vendor/h2-0.4.20-ferrum-patched/src/proto/streams/streams.rs
+6debee9494378f8ec3da72142051713157cc51853efdacb1c22a2f2ab0b4e538  vendor/h2-0.4.20-ferrum-patched/src/server.rs
 85f3a74d113477216d607a9e008d89d5a105ded9e3d94f74251a2a9e2c5673c6  vendor/h2-0.4.20-ferrum-patched/src/share.rs
 b52f03458bc1de3279a8b30db891518bbdf612b34e040204a5962b23c0812aae  vendor/h3-0.0.8-ferrum-patched/Cargo.toml
 a0d039cdafe68f363893abddb5e4d50dbe6f8b56611e2650aaab4237103285f1  vendor/h3-0.0.8-ferrum-patched/LICENSE
@@ -288,8 +288,9 @@ c32a8e92836e0bd55a0939bcf3a1eff5f407ec26c15cfc22bcd7ab315095c18a  vendor/hyper-1
 bc07d9d804ca06140d01cf7c45f4d61b14df0d657de3fc20e4d4034a6ab0ce9e  vendor/hyper-1.10.0-ferrum-patched/src/error.rs
 db6fed7c4aec000af820989f0508a2534d864f3cce32cb19a12aca59b0705a22  vendor/hyper-1.10.0-ferrum-patched/src/ext/h1_reason_phrase.rs
 e8b1f5e927d276a792ef441ae24cf3d0fc4eb64cb9d0e83788cb7365d4da0cd7  vendor/hyper-1.10.0-ferrum-patched/src/ext/h2_body_write_timeout.rs
+a064a160e1e8535588343b96423c7bfad327401849915b91d0bf80f2f5bb64a1  vendor/hyper-1.10.0-ferrum-patched/src/ext/h2_stream_termination.rs
 83a9b2a9cd7086f2be65d508d4cf0f45a2977fb90f94926d6a3cfbc98bdba073  vendor/hyper-1.10.0-ferrum-patched/src/ext/informational.rs
-4b0c57d4e73bb92cab922d41e05bb49f22454b6640396f447358877a9494f768  vendor/hyper-1.10.0-ferrum-patched/src/ext/mod.rs
+14f6d5e587887e1343950b5edf3b8abbb3ef922d58860a7684e2d6b70bd7a6dd  vendor/hyper-1.10.0-ferrum-patched/src/ext/mod.rs
 614955cfca938025a7b471d9bc91004edfd1ff028b66553ce757b5b0ec040dce  vendor/hyper-1.10.0-ferrum-patched/src/ffi/body.rs
 f3e7b519d9725b99ddc18a25ab527014c804d5e112fe130ef3dd539eac6e5a09  vendor/hyper-1.10.0-ferrum-patched/src/ffi/client.rs
 dd269cd749cfe2679ba499e9dc0832469cbf4f8101157fd88d00c0fb526868d8  vendor/hyper-1.10.0-ferrum-patched/src/ffi/error.rs
@@ -311,7 +312,7 @@ bdb49167f68428e34b9b60a46c535fa44d9a3a6a849b1f232a466f8379efd792  vendor/hyper-1
 323d957facddb0f881515dbb162c22ddfce47eeb3042b85439f55629c8e6bd2b  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/client.rs
 5495ca4ef2a6c6d177937700c3c9528588401e1cf8c9130aed460e3b95077745  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/mod.rs
 b091b7c2123a4003805992ea369d748ccbf65895e5f5b45ed2806da6cf1df171  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/ping.rs
-95e96a9fc3ce476a9613500233bd4c530202d05a171c16ce1adb1db5c8496dd5  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/server.rs
+a0871194c7fe778821aa7c7c6e21d781eb2a7e06a5003f6774bca75897ae8d99  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/server.rs
 bbafd7712757b5e2994e265e188bf7f55c430d54ff86cf9fcc3e2a5435a32610  vendor/hyper-1.10.0-ferrum-patched/src/proto/h2/upgrade.rs
 7a1ac66edcc24b364eae3581abf151459a5259b4c521561aa7203c9ca4473da4  vendor/hyper-1.10.0-ferrum-patched/src/proto/mod.rs
 291fad36357caf76f3821164c98adb643cee1a8cfae8d5e917524fdf3dda50d9  vendor/hyper-1.10.0-ferrum-patched/src/rt/bounds.rs

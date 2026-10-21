@@ -28,6 +28,22 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
+
+Every HTTP-family transaction record now includes `response_delivery`
+(`not_observed` or `observed`). Log pipelines with a closed column set must
+accept the new key, or drop it with a `schema` `omit`. An HTTP/1.1 or HTTP/2
+request whose client resets or disconnects before any response head now
+produces a transaction record and a `499` status sample (rejection phase
+`client_disconnect_before_response`) where it previously produced none;
+dashboards that treat every `4xx` as a client error will start counting these
+cancellations. A request the gateway's HTTP/2 stack reset for a client
+protocol violation is recorded as `400` (`protocol_error_before_response`), and
+one still pending when the gateway itself closes its connection (withdrawn
+client-certificate trust, a sibling's authorization-lifetime close, shutdown
+teardown after the drain wait) as `444` with a `gateway_close_*` rejection
+phase.
+
 ### Every gateway `401` carries an applicable `WWW-Authenticate` challenge (#6774)
 
 Authentication `401`s now always carry a challenge for the mechanism that

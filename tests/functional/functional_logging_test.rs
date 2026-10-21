@@ -820,3 +820,145 @@ async fn test_logging_multiple_requests_produce_individual_entries() {
 
     println!("Multiple request log verification passed!");
 }
+
+// ============================================================================
+// Client abort before any response (issue #6768)
+// ============================================================================
+
+/// A backend that reads each request head, reports it, and never answers, so
+/// the gateway stays parked waiting for response headers.
+async fn start_silent_backend() -> (u16, tokio::sync::mpsc::UnboundedReceiver<()>) {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("Failed to bind silent backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                let mut reported = false;
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            seen.extend_from_slice(&buf[..n]);
+                            if !reported && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                                reported = true;
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (port, rx)
+}
+
+async fn backend_saw_request(rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>, case: &str) {
+    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{case}: the backend never received the request"))
+        .unwrap_or_else(|| panic!("{case}: the backend stopped"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_logging_client_abort_before_response_logs_one_499() {
+    let mut harness = LoggingTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+    let (backend_port, mut backend_seen) = start_silent_backend().await;
+
+    let client = reqwest::Client::new();
+    let token = harness.generate_token().expect("Failed to generate token");
+    let auth_header = format!("Bearer {}", token);
+    let proxy_id = "client-abort-proxy";
+    harness
+        .create_proxy_with_plugins(
+            &client,
+            &auth_header,
+            proxy_id,
+            "/abort-test",
+            backend_port,
+            &[("stdout_logging", json!({}))],
+        )
+        .await
+        .expect("Failed to create proxy with plugins");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let gateway_authority = harness
+        .proxy_base_url
+        .trim_start_matches("http://")
+        .to_string();
+
+    // HTTP/2: the client resets the stream while the gateway waits for the
+    // backend's response headers.
+    let io = tokio::net::TcpStream::connect(&gateway_authority)
+        .await
+        .expect("connect gateway");
+    let (h2_client, connection) = h2::client::handshake(io).await.expect("h2c handshake");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut h2_client = h2_client.ready().await.expect("h2 client ready");
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(format!("http://{gateway_authority}/abort-test/h2"))
+        .body(())
+        .expect("h2 request");
+    let (_h2_response, mut h2_stream) = h2_client
+        .send_request(request, true)
+        .expect("h2 request HEADERS");
+    backend_saw_request(&mut backend_seen, "h2").await;
+    h2_stream.send_reset(h2::Reason::CANCEL);
+
+    // HTTP/1.1: the client closes its connection at the same point.
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut h1 = tokio::net::TcpStream::connect(&gateway_authority)
+            .await
+            .expect("connect gateway");
+        h1.write_all(b"GET /abort-test/h1 HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .expect("h1 request head");
+        backend_saw_request(&mut backend_seen, "h1").await;
+    }
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let logs = harness.stop_and_collect_logs();
+    let access_logs: Vec<Value> = extract_access_logs(&parse_log_lines(&logs))
+        .into_iter()
+        .filter(|entry| entry["proxy_id"] == proxy_id)
+        .collect();
+
+    for path in ["/abort-test/h2", "/abort-test/h1"] {
+        let records: Vec<&Value> = access_logs
+            .iter()
+            .filter(|entry| entry["request_path"] == path)
+            .collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "{path}: exactly one terminal record, got {access_logs:?}"
+        );
+        let record = records[0];
+        assert_eq!(record["response_status_code"], 499, "{path}: {record}");
+        assert_eq!(record["client_disconnected"], true, "{path}: {record}");
+        assert_eq!(
+            record["error_class"], "client_disconnect",
+            "{path}: {record}"
+        );
+        assert_eq!(record["response_delivery"], "observed", "{path}: {record}");
+        assert_eq!(
+            record["metadata"]["rejection_phase"], "client_disconnect_before_response",
+            "{path}: {record}"
+        );
+    }
+    drop(h2_client);
+}
