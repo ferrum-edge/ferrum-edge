@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import math
+import shutil
 from pathlib import Path
 import sys
 
@@ -28,6 +29,7 @@ def summarize():
                     failures.append('profile failed independent identity/coverage/loss gate')
             if failures:
                 errors.append(dict(phase=phase, errors=failures))
+            row["valid"] = not failures
             rows.append(row)
         except (OSError, ValueError, TypeError, KeyError) as error:
             errors.append(dict(phase=phase, errors=[str(error)]))
@@ -49,7 +51,35 @@ def summarize():
     return 0 if result['valid'] else 1
 
 
+def export_public():
+    # Explicit paths avoid traversing private perf caches even when an artifact
+    # glob implementation descends into directories excluded from its matches.
+    destination = ROOT/'profile-public'
+    destination.mkdir(exist_ok=False)
+    patterns = ['*.json', '*.txt', 'images/*']
+    for phase in ('before', 'profile', 'after'):
+        base = f'profile-envoy/{phase}/payload_1024'
+        patterns += [base+'/*.json', base+'/*.log', base+'/logs/*', base+'/perf-leaf/capture.json']
+        for role in ('source', 'destination'):
+            patterns += [base+f'/perf-leaf/{role}/*'+suffix for suffix in ('.txt', '.jsonl', '.stderr')]
+            patterns.append(base+f'/perf-leaf/{role}/perf.data')
+    total = 0
+    for pattern in patterns:
+        for source in ROOT.glob(pattern):
+            if source.is_symlink() or not source.is_file():
+                continue
+            total += source.stat().st_size
+            if total > 256*1024**2:
+                raise ValueError('public profile artifact exceeds 256 MiB')
+            target = destination/source.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+    return 0
+
+
 if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'export':
+        raise SystemExit(export_public())
     if len(sys.argv) > 1 and sys.argv[1] == 'accept':
         raise SystemExit(0 if json.loads((ROOT/'profile-qualification.json').read_text())['valid'] else 1)
     raise SystemExit(summarize())

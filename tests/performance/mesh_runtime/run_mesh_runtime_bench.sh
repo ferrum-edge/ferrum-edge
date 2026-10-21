@@ -636,8 +636,11 @@ run_cell() {
     if [ "$rc" -ne 0 ] || ! grep -q '"rps"' "$out"; then
         echo "[bench] cell failed (rc=$rc); recording zero-result JSON" >&2
         [ ! -f "$out" ] || cp "$out" "${out%.json}.failed-output.json"
-        printf '{"gateway":"%s","mesh":"%s","protocol":"http1","payload_size":%s,"rps":0,"total_errors":-1,"error":"loadgen failed"}\n' \
-            "$MESH" "$MESH" "$payload" > "$out"
+        # The privileged collector owns its output file. Preserve it, then
+        # replace the pathname atomically through this run's owned directory.
+        printf '{"gateway":"%s","mesh":"%s","protocol":"http1","payload_size":%s,"rps":0,"total_errors":-1,"error":"loadgen or evidence qualification failed"}\n' \
+            "$MESH" "$MESH" "$payload" > "${out}.failed.tmp"
+        mv "${out}.failed.tmp" "$out"
         return 1
     fi
     if ! grep -q '"total_errors": 0' "$out" || ! grep -qE '"total_requests": [1-9]' "$out"; then

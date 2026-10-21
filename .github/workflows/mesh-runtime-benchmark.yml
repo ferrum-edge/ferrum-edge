@@ -116,18 +116,15 @@ jobs:
       - name: Render full observer qualification
         if: always()
         run: python3 .github/scripts/mesh_production_profile_campaign.py >> "$GITHUB_STEP_SUMMARY"
+      - name: Stage only public profile artifacts
+        if: always()
+        run: python3 .github/scripts/mesh_production_profile_campaign.py export
       - name: Retain raw samples and identity evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: mesh-profile-envoy-${{ github.sha }}
-          path: |
-            results
-            !results/**/runtime/**
-            !results/**/perf-leaf/elfs/**
-            !results/**/perf-leaf/buildid-cache/**
-            !results/**/perf-leaf/home/**
-            !results/**/perf-leaf/**/symfs/**
+          path: results/profile-public
           retention-days: 30
       - name: Require observer qualification
         if: always()

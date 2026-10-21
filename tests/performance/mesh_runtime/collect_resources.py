@@ -216,6 +216,11 @@ def run(args: argparse.Namespace) -> int:
         profile = perf_capture.decode(begin["monotonic"] if begin else None, finish["monotonic"] if finish else None)
         report["perf_leaf"] = {"path": str(args.resources.parent / "perf-leaf/capture.json"), "valid": profile["valid"]}
         if not profile["valid"]:
+            print(json.dumps({"perf_qualification_errors": profile.get("errors", []),
+                "roles": [{"role": role.get("role"), "errors": role.get("errors", []),
+                    "known_leaf_fraction": role.get("known_leaf_fraction"),
+                    "measurement_sample_count": role.get("measurement_sample_count")}
+                    for role in profile.get("roles", [])]}), file=sys.stderr, flush=True)
             report["errors"].append("leaf profile failed identity, loss, or coverage qualification")
             report["valid"] = False
         atexit.unregister(perf_capture.stop)

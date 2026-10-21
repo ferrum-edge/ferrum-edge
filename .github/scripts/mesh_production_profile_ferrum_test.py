@@ -167,12 +167,13 @@ class BuildInputs(unittest.TestCase):
 
 class CommandBounds(unittest.TestCase):
     def test_owned_cleanup_has_separate_bounded_budget_after_total_timeout(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "time") as clock:
+            clock.monotonic.return_value = 1.0
             commands = M.Commands(Path(temp), {})
-            commands.started = 0
+            clock.monotonic.return_value = 1.0 + M.LIMITS["total_seconds"] + 1.0
             _, code = commands.run([sys.executable, "-c", "pass"], "cleanup", cleanup=True)
             self.assertEqual(code, 0)
-            self.assertLessEqual(commands.report["commands"][0]["timeout_seconds"], 30)
+            self.assertEqual(commands.report["commands"][0]["timeout_seconds"], 30)
 
     def test_command_receipt_and_nonzero_failure(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -187,11 +188,41 @@ class CommandBounds(unittest.TestCase):
             self.assertEqual(report["commands"][1]["returncode"], 3)
 
     def test_shared_build_budget_expires_before_launch(self):
-        with tempfile.TemporaryDirectory() as temp:
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "time") as clock, \
+                patch.object(M.subprocess, "Popen") as launch:
+            clock.monotonic.return_value = 2.0
             commands = M.Commands(Path(temp), {})
-            commands.build_started = 0
+            commands.build_started = clock.monotonic()
+            clock.monotonic.return_value = 2.0 + M.LIMITS["build_seconds"] + 1.0
             with self.assertRaisesRegex(ValueError, "budget exhausted"):
                 commands.run(["never-executed"], "no-build", build=True)
+            launch.assert_not_called()
+
+    def test_short_host_uptime_is_not_an_expired_build_budget(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "time") as clock, \
+                patch.object(M.subprocess, "Popen") as launch:
+            clock.monotonic.return_value = 0.25
+            commands = M.Commands(Path(temp), {})
+            commands.build_started = clock.monotonic()
+            clock.monotonic.return_value = 0.75
+            launch.return_value.poll.return_value = 0
+            launch.return_value.returncode = 0
+            _, code = commands.run(["fake-command"], "short-uptime", build=True)
+            self.assertEqual(code, 0)
+            self.assertEqual(commands.report["commands"][0]["timeout_seconds"], 60)
+            launch.assert_called_once()
+
+    def test_short_uptime_expired_budget_still_rejects_before_launch(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "time") as clock, \
+                patch.object(M.subprocess, "Popen") as launch, \
+                patch.dict(M.LIMITS, build_seconds=0.25):
+            clock.monotonic.return_value = 0.25
+            commands = M.Commands(Path(temp), {})
+            commands.build_started = clock.monotonic()
+            clock.monotonic.return_value = 0.75
+            with self.assertRaisesRegex(ValueError, "budget exhausted"):
+                commands.run(["never-executed"], "short-expired", build=True)
+            launch.assert_not_called()
 
     def test_low_disk_build_stops_and_reaps_child(self):
         with tempfile.TemporaryDirectory() as temp:
