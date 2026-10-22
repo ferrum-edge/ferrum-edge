@@ -76,6 +76,23 @@ def planned_cells(results_root: Path, warnings: list[str]) -> dict[Path, dict] |
         return {}
 
 
+def load_evidence(path: Path, warnings: list[str]) -> dict | None:
+    """Read an arm status or manifest; malformed evidence fails acceptance."""
+    try:
+        document = json.loads(path.read_text())
+        if not isinstance(document, dict):
+            raise ValueError("not a JSON object")
+        if not isinstance(document.get("mesh"), str) or not document["mesh"]:
+            raise ValueError("mesh must be a nonempty string")
+        sizes = document.get("payload_sizes", [])
+        if not isinstance(sizes, list) or any(type(s) is not int for s in sizes):
+            raise ValueError("payload_sizes must be a list of integers")
+    except (OSError, ValueError) as exc:
+        warnings.append(f"malformed evidence {path}: {exc}")
+        return None
+    return document
+
+
 def parse_mem_bytes(mem_usage: str) -> float | None:
     """Parse the used side of a docker-stats MemUsage field to bytes."""
     used = mem_usage.split("/")[0].strip()
@@ -203,22 +220,19 @@ def collect(results_root: Path) -> dict:
         record["source_file"] = str(f)
         cells.setdefault((mesh, payload), []).append(record)
 
+    statuses: dict[Path, dict] = {}
     for status_file in sorted(results_root.rglob("*_arm_status.json")):
-        try:
-            st = json.loads(status_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        arm = st.get("mesh")
-        if arm:
-            arm_status.setdefault(arm, st)
+        st = load_evidence(status_file, warnings)
+        if st is not None:
+            statuses[status_file] = st
+            arm_status.setdefault(st["mesh"], st)
 
+    manifest_docs: list[tuple[Path, dict]] = []
     manifests: dict[str, dict] = {}
     for manifest_file in sorted(results_root.rglob("*_manifest.json")):
-        try:
-            man = json.loads(manifest_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if man.get("mesh"):
+        man = load_evidence(manifest_file, warnings)
+        if man is not None:
+            manifest_docs.append((manifest_file, man))
             manifests.setdefault(man["mesh"], man)
     for mesh_name, man in sorted(manifests.items()):
         if arm_status.get(mesh_name, {}).get("status") == "unsupported-standalone":
@@ -232,14 +246,8 @@ def collect(results_root: Path) -> dict:
 
     # Each manifest's own directory must contain every expected cell, so
     # a complete first repetition cannot hide a missing later one.
-    for manifest_file in sorted(results_root.rglob("*_manifest.json")):
-        try:
-            man = json.loads(manifest_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        mesh_name = man.get("mesh")
-        if not mesh_name:
-            continue
+    for manifest_file, man in manifest_docs:
+        mesh_name = man["mesh"]
         if arm_status.get(mesh_name, {}).get("status") == "unsupported-standalone":
             continue
         for payload in man.get("payload_sizes") or []:
@@ -253,12 +261,8 @@ def collect(results_root: Path) -> dict:
     aggregated: dict[str, dict] = {}
     if planned is not None:
         for expected, identity in planned.items():
-            status = expected.parent / f"{identity['mesh']}_arm_status.json"
-            try:
-                status_doc = json.loads(status.read_text()) if status.exists() else {}
-            except (OSError, ValueError):
-                status_doc = {}
-            unsupported = isinstance(status_doc, dict) and status_doc.get("status") == "unsupported-standalone"
+            status = statuses.get(expected.parent / f"{identity['mesh']}_arm_status.json", {})
+            unsupported = status.get("status") == "unsupported-standalone"
             if not unsupported and (not expected.exists() or not expected.with_suffix(".resources.json").exists()):
                 warnings.append(f"missing expected cell or resource interval {expected}")
     for (mesh, payload), records in sorted(cells.items()):
@@ -535,7 +539,7 @@ def check_acceptance(summary: dict) -> int:
     if not summary.get("meshes"):
         failures.append("no benchmark cells collected")
     for w in summary.get("warnings") or []:
-        if w.startswith("missing expected cell") or w.startswith("unpublishable cell"):
+        if w.startswith(("missing expected cell", "unpublishable cell", "malformed evidence")):
             failures.append(w)
     for mesh, st in sorted((summary.get("arm_status") or {}).items()):
         if st.get("status") == "failed":

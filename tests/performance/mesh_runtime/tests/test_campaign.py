@@ -228,17 +228,45 @@ class Contracts(unittest.TestCase):
             self.assertEqual((relabeled["mesh"], relabeled["gateway"]), ("ferrumbaseline", "ferrumbaseline"))
             self.assertEqual((root / "ferrumbaseline_http1_1024.resources.json").read_text(), "{trunc")
 
-    def test_malformed_side_files_fail_acceptance_without_crashing(self):
+    def test_non_object_resource_interval_fails_acceptance_without_crashing(self):
+        for body in ("null", "[]", "7"):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.write_campaign(root)
+                self.write_campaign_cell(root)
+                file = self.write_campaign_cell(root, repetition=2)
+                file.with_suffix(".resources.json").write_text(body)
+                collected = summary.collect(root)
+                self.assertEqual(collected["meshes"]["ferrum"]["1024"]["publishable_runs"], 1)
+                self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+    def test_malformed_arm_status_or_manifest_alone_fails_acceptance(self):
+        # Every cell and resource interval is valid; only one side file is bad.
+        bodies = {"truncated": '{"mesh":"ferr', "null": "null", "list": "[]",
+                  "missing mesh": '{"status":"ready"}', "bad payloads": '{"mesh":"ferrum","payload_sizes":["x"]}'}
+        for kind in ("arm_status", "manifest"):
+            for label, body in bodies.items():
+                with self.subTest(kind=kind, body=label), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.write_campaign(root)
+                    self.write_campaign_cell(root)
+                    file = self.write_campaign_cell(root, repetition=2)
+                    bad = file.parent / f"ferrum_{kind}.json"
+                    bad.write_text(body)
+                    collected = summary.collect(root)
+                    self.assertTrue(any(w.startswith(f"malformed evidence {bad}") for w in collected["warnings"]))
+                    self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+    def test_well_formed_arm_status_and_manifest_still_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.write_campaign(root)
-            self.write_campaign_cell(root)
-            file = self.write_campaign_cell(root, repetition=2)
-            file.with_suffix(".resources.json").write_text("null")
-            (file.parent / "ferrum_arm_status.json").write_text('{"mesh":"ferr')
+            for cell in self.write_campaign(root):
+                file = self.write_campaign_cell(root, repetition=cell["repetition"])
+                (file.parent / "ferrum_arm_status.json").write_text('{"mesh":"ferrum","status":"ready","detail":"echo probe passed"}')
+                (file.parent / "ferrum_manifest.json").write_text('{"mesh":"ferrum","payload_sizes":[1024]}')
             collected = summary.collect(root)
-            self.assertEqual(collected["meshes"]["ferrum"]["1024"]["publishable_runs"], 1)
-            self.assertNotEqual(summary.check_acceptance(collected), 0)
+            self.assertEqual(collected["warnings"], [])
+            self.assertEqual(summary.check_acceptance(collected), 0)
 
 
 if __name__ == "__main__":
