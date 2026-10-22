@@ -78,7 +78,8 @@ def prepare():
         scope='Exact original baseline build reused; no candidate runtime or candidate-check receipt is represented. Origin performance outcome is not selected.'))
     command(['docker','load','--input',str(directory/'image.tar')],OUTPUT,'load-baseline',timeout=180)
     baseline=inspect(receipt['image_id']);labels=baseline['Config']['Labels']
-    require(baseline['Id']==receipt['image_id'] and baseline['Config']['User']=='65532:65532'
+    require(baseline['Id']==receipt['image_id'] and baseline['Config']['User']=='65532'
+        and baseline['Os']=='linux' and baseline['Architecture']=='amd64'
         and labels.get('org.opencontainers.image.revision')==BASELINE
         and labels.get('io.ferrum.benchmark.profile')=='release'
         and labels.get('io.ferrum.benchmark.features')=='cloud-secrets','loaded baseline identity differs')

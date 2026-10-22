@@ -102,6 +102,7 @@ class HeaderCampaignContracts(unittest.TestCase):
         text = (ROOT / '.github/workflows/mesh-runtime-benchmark.yml').read_text()
         self.assertIn("inputs.phase != 'header-ladder-diagnostic'", text)
         self.assertEqual(text.count("if: inputs.phase == 'header-ladder-diagnostic'"), 1)
+        self.assertIn("baseline['Config']['User']=='65532'", (ROOT/'.github/scripts/mesh_header_ladder_campaign.py').read_text())
         self.assertIn('cargo fmt --manifest-path tests/performance/mesh_runtime/Cargo.toml -- --check', text)
         self.assertIn('cargo clippy --locked --manifest-path tests/performance/mesh_runtime/Cargo.toml --all-targets -- -D warnings', text)
 
