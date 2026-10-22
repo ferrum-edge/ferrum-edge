@@ -142,6 +142,8 @@ ARG CARGO_PROFILE=release
 # parallel codegen units; the amd64 image and the native release binaries keep
 # the fat-LTO profile. Both cargo invocations below must see the same profile
 # or the dependency cache layer is invalidated by the fingerprint change.
+# PROFILING EXPERIMENT ONLY (bench branch, not for merge): unstripped, frame pointers.
+ENV CARGO_PROFILE_RELEASE_STRIP=none CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
 ENV FERRUM_ARM64_RELEASE_PROFILE_ENV="CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16"
 
 # Both builds pass `--locked`: they compile exactly the committed Cargo.lock
