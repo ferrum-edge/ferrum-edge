@@ -163,6 +163,13 @@ impl Counts {
         self.num_send_streams != 0 || self.num_recv_streams != 0
     }
 
+    /// FERRUM PATCH (h2-005-deferred-concurrent-flush): whether more than one
+    /// stream is open on this connection, so other streams may produce frames
+    /// in the same scheduler pass.
+    pub fn has_concurrent_streams(&self) -> bool {
+        self.num_send_streams + self.num_recv_streams > 1
+    }
+
     /// Returns true if we can issue another local reset due to protocol error.
     pub fn can_inc_num_local_error_resets(&self) -> bool {
         if let Some(max) = self.max_local_error_reset_streams {

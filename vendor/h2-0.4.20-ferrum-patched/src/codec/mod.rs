@@ -168,6 +168,12 @@ where
         self.framed_write().flush(cx)
     }
 
+    /// FERRUM PATCH (h2-005-deferred-concurrent-flush): see
+    /// `FramedWrite::defer_flush_once`.
+    pub(crate) fn defer_flush_once(&mut self) -> bool {
+        self.framed_write().defer_flush_once()
+    }
+
     /// Shutdown the send half
     pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().shutdown(cx)

@@ -84,7 +84,10 @@ version = "0.4.2"
 
 [dependencies.tokio]
 version = "1"
-features = ["io-util"]
+features = [
+    "io-util",
+    "rt",
+]
 
 [dependencies.tokio-util]
 version = "0.7.1"

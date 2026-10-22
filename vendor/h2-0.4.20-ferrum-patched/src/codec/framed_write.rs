@@ -25,6 +25,11 @@ pub struct FramedWrite<T, B> {
     inner: T,
     final_flush_done: bool,
 
+    /// FERRUM PATCH (h2-005-deferred-concurrent-flush): one flush of the
+    /// currently staged frames has been deferred to a later scheduler pass.
+    /// Cleared when a flush completes.
+    flush_deferred: bool,
+
     encoder: Encoder<B>,
 }
 
@@ -96,6 +101,10 @@ const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
 /// copying.
 const COALESCE_LIMIT: usize = 64 * 1_024;
 
+/// FERRUM PATCH (h2-005-deferred-concurrent-flush): staged writes at least
+/// this large are flushed without deferral (one full TLS record of payload).
+const DEFERRED_FLUSH_LIMIT: usize = 16 * 1_024;
+
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>
 where
@@ -111,6 +120,7 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
+            flush_deferred: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -195,7 +205,31 @@ where
         // Flush the upstream
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
 
+        self.flush_deferred = false;
         Poll::Ready(Ok(()))
+    }
+
+    /// FERRUM PATCH (h2-005-deferred-concurrent-flush): whether the frames
+    /// staged right now should wait one scheduler pass before being written.
+    ///
+    /// Defers at most once per flush, and only a small staged write: once
+    /// `DEFERRED_FLUSH_LIMIT` bytes are staged the write is already large
+    /// enough to fill a TLS record, so it goes out immediately. The caller
+    /// guarantees the task is woken again, so a deferred flush always runs.
+    pub(crate) fn defer_flush_once(&mut self) -> bool {
+        if self.flush_deferred || self.encoder.is_empty() {
+            return false;
+        }
+        let staged = self.encoder.buf.remaining()
+            + match self.encoder.next {
+                Some(Next::Data(ref frame)) => frame.payload().remaining(),
+                _ => 0,
+            };
+        if staged >= DEFERRED_FLUSH_LIMIT {
+            return false;
+        }
+        self.flush_deferred = true;
+        true
     }
 
     /// Close the codec

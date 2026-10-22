@@ -198,7 +198,7 @@ where
             // Make any required socket progress before taking stream locks.
             ready!(dst.poll_ready(cx))?;
 
-            let status = {
+            let (status, concurrent) = {
                 let mut me = self.inner.lock().unwrap();
                 let status = me.buffer_pending(&self.send_buffer, dst)?;
 
@@ -210,12 +210,27 @@ where
                     me.actions.task = Some(cx.waker().clone());
                 }
 
-                status
+                (status, me.counts.has_concurrent_streams())
             };
 
             match status {
                 BufferStatus::Complete => {}
                 BufferStatus::CodecFull => continue,
+            }
+
+            // FERRUM PATCH (h2-005-deferred-concurrent-flush): with other
+            // streams open, their frames are often produced by tasks that are
+            // already runnable. Flushing now writes this stream's frames alone,
+            // and each of those tasks then wakes this one for a write of its
+            // own: one TLS record and one syscall per response. Yield once
+            // instead, behind every task that is ready now and the next I/O
+            // driver poll, and then write everything staged by then together,
+            // as an event-loop proxy writes a connection once per loop pass.
+            // The yield re-wakes this task, so the staged frames are always
+            // flushed.
+            if concurrent && dst.defer_flush_once() {
+                defer_wake(cx);
+                return Poll::Pending;
             }
 
             // Flush any frames staged by `buffer_pending` without holding the
@@ -1889,4 +1904,14 @@ impl Actions {
         self.recv.clear_queues(clear_pending_accept, store, counts);
         self.send.clear_queues(store, counts);
     }
+}
+
+/// FERRUM PATCH (h2-005-deferred-concurrent-flush): wake the current task only
+/// after the runtime has run every task that is ready now and polled its I/O
+/// driver once more (`tokio::task::yield_now` semantics). Outside a Tokio
+/// runtime the waker is woken immediately.
+fn defer_wake(cx: &mut Context) {
+    let mut yield_once = std::pin::pin!(tokio::task::yield_now());
+    // The first poll registers the waker and is always pending.
+    let _ = std::future::Future::poll(yield_once.as_mut(), cx);
 }
