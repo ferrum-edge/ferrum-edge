@@ -614,6 +614,44 @@ run_cell() {
         resource_args+=(--allocation-url http://127.0.0.1:15120/metrics --allocation-url http://127.0.0.1:15020/metrics)
     fi
     local rc=0
+    # PROFILING EXPERIMENT ONLY (bench branch): perf stat on both proxies,
+    # loadgen and backend, plus on-CPU call graphs per Ferrum sidecar, in the
+    # middle half of the measured window.
+    local perf_bg="" perf_bin=""
+    perf_bin=$(command -v perf || ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -1 || true)
+    if [ -n "${PERF_PROFILE:-}" ] && [ "$MESH" != direct ] && [ -n "$perf_bin" ]; then
+        local pdir="$OUTPUT_DIR/perf" window lead
+        mkdir -p "$pdir"
+        window=$(( DURATION / 2 > 3 ? DURATION / 2 : 3 ))
+        lead=$(( WARMUP + 3 + DURATION / 4 ))
+        (
+            sleep "$lead"
+            local cpid spid lpid bpid
+            cpid=$(docker inspect -f '{{.State.Pid}}' "$CLIENT_NAME" 2>/dev/null || true)
+            spid=$(docker inspect -f '{{.State.Pid}}' "$SERVER_NAME" 2>/dev/null || true)
+            lpid=$(docker inspect -f '{{.State.Pid}}' "$LOADGEN_NAME" 2>/dev/null || true)
+            bpid=$(docker inspect -f '{{.State.Pid}}' "$BACKEND_NAME" 2>/dev/null || true)
+            echo "client=$cpid server=$spid loadgen=$lpid backend=$bpid window=$window" > "$pdir/${MESH}_${payload}_pids.txt"
+            for role in client server loadgen backend; do
+                local pid
+                case $role in client) pid=$cpid;; server) pid=$spid;; loadgen) pid=$lpid;; backend) pid=$bpid;; esac
+                [ -n "$pid" ] && [ "$pid" != 0 ] || continue
+                sudo "$perf_bin" stat -e task-clock,context-switches,cpu-migrations,raw_syscalls:sys_enter,syscalls:sys_enter_futex,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_writev,syscalls:sys_enter_write,syscalls:sys_enter_read \
+                    -p "$pid" -o "$pdir/${MESH}_${payload}_${role}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
+            done
+            if [ "$MESH" = ferrum ] || [ "$MESH" = envoy ]; then
+                for role in client server; do
+                    local pid
+                    case $role in client) pid=$cpid;; server) pid=$spid;; esac
+                    [ -n "$pid" ] && [ "$pid" != 0 ] || continue
+                    sudo "$perf_bin" record -F 1999 -g -p "$pid" -o "/tmp/perf_${MESH}_${payload}_${role}.data" \
+                        -- sleep "$window" >/dev/null 2>&1 &
+                done
+            fi
+            wait
+        ) &
+        perf_bg=$!
+    fi
     local cell_budget
     cell_budget=$(cell_wall_timeout_secs)
     echo "[bench] cell wall budget=${cell_budget}s exchange budget=${EXCHANGE_TIMEOUT_SECS}s"
@@ -625,6 +663,26 @@ run_cell() {
         --duration "$DURATION" --concurrency "$eff_concurrency" \
         --warmup "$WARMUP" --payload-size "$payload" || rc=$?
 
+    if [ -n "$perf_bg" ]; then
+        wait "$perf_bg" || true
+        local pdir="$OUTPUT_DIR/perf" reqs dur
+        sudo chown -R "$(id -u):$(id -g)" "$pdir" || true
+        reqs=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('total_requests',0))" "$out" 2>/dev/null || echo 0)
+        for f in "$pdir/${MESH}_${payload}"_*_stat.txt; do
+            [ -f "$f" ] && echo "total_requests_full_run=$reqs duration=$DURATION" >> "$f"
+        done
+        for role in client server; do
+            local data="/tmp/perf_${MESH}_${payload}_${role}.data"
+            [ -f "$data" ] || continue
+            sudo "$perf_bin" report -i "$data" --no-children --sort symbol --stdio 2>/dev/null \
+                | grep -v '^#' | grep -v '^$' | head -200 | cut -c1-220 > "$pdir/${MESH}_${payload}_${role}_symbols.txt" || true
+            sudo "$perf_bin" report -i "$data" --no-children --sort dso --stdio 2>/dev/null \
+                | grep -v '^#' | grep -v '^$' | head -25 > "$pdir/${MESH}_${payload}_${role}_dso.txt" || true
+            sudo "$perf_bin" script -i "$data" 2>/dev/null \
+                | python3 "$SCRIPT_DIR/perf_fold.py" | gzip > "$pdir/${MESH}_${payload}_${role}_oncpu_folded.txt.gz" || true
+            sudo rm -f "$data"
+        done
+    fi
     timeout --signal=KILL 2s docker rm -f "$LOADGEN_NAME" >/dev/null 2>&1 || true
     if [ "$rc" -ne 0 ] || ! grep -q '"rps"' "$out"; then
         echo "[bench] cell failed (rc=$rc); recording zero-result JSON" >&2
