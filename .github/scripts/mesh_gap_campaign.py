@@ -17,6 +17,7 @@ import uuid
 
 from mesh_gap_candidate import BASELINE, GATEWAY_HARNESS, IMAGE, ROOT, digest, require_remote, selection, write
 from mesh_gap_build import checked_receipt, command
+from mesh_gap_baseline_reuse import requested as baseline_requested, validate_reuse
 from mesh_gap_plan import DECISION, comparisons, gateway_blocks, mesh_cells, screen
 import mesh_production_campaign as production
 
@@ -30,14 +31,21 @@ def read(path):
 def prepare_images(chosen):
     checks = ROOT / 'results/gap/checks/receipt.json'
     checked_receipt(chosen, checks)
-    receipts = {}
+    receipts, baseline_reuse = {}, None
+    reuse_request = baseline_requested()
     for role in ('baseline', 'candidate'):
         directory = ROOT / 'results/gap/images' / role
         receipt = read(directory / 'receipt.json')
         expected = BASELINE if role == 'baseline' else chosen['candidate_sha']
-        if (receipt.get('selection') != chosen or receipt.get('role') != role or receipt.get('source_sha') != expected
+        reused = role == 'baseline' and reuse_request is not None
+        if reused:
+            baseline_reuse = validate_reuse(directory, chosen, checks, reuse_request,
+                os.environ['GITHUB_REPOSITORY'], int(os.environ['GITHUB_REPOSITORY_ID']))
+        elif (directory / 'baseline-reuse.json').exists():
+            raise ValueError('unexpected baseline reuse receipt without explicit selection')
+        if ((not reused and receipt.get('selection') != chosen) or receipt.get('role') != role or receipt.get('source_sha') != expected
                 or receipt.get('complete') is not True or receipt.get('errors') != []
-                or receipt.get('checks_receipt_sha256') != digest(checks)
+                or (not reused and receipt.get('checks_receipt_sha256') != digest(checks))
                 or receipt.get('dockerfile_sha256') != chosen['dockerfile_sha256']
                 or IMAGE.fullmatch(str(receipt.get('image_id'))) is None
                 or receipt.get('image_archive_sha256') != digest(directory / 'image.tar')
@@ -60,7 +68,7 @@ def prepare_images(chosen):
     write(OUTPUT / 'tools-image.json', tools)
     source = dict(selection=chosen, builds=receipts,
         image_ids={role: item['image_id'] for role, item in receipts.items()} | {'tools': tools['Id']},
-        same_image_aa=True, checks_receipt_sha256=digest(checks),
+        same_image_aa=True, checks_receipt_sha256=digest(checks), baseline_reuse=baseline_reuse,
         limits=['fresh representative release comparison, not a shipping-image ranking',
                 'synthetic localized file configuration and mTLS identities; no cross-node deployment',
                 'shared-runner CPU, backend and load-generator contention retained in resources',

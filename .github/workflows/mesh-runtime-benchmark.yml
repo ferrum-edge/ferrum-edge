@@ -12,6 +12,14 @@ on:
         description: "Exact reviewed 40-hex candidate commit; required for candidate gap phases; unused by representative profile"
         type: string
         default: ""
+      baseline_run_id:
+        description: "Optional exact prior baseline artifact run ID; blank builds a new baseline"
+        type: string
+        default: ""
+      baseline_run_attempt:
+        description: "Exact attempt for baseline reuse; required with baseline_run_id"
+        type: string
+        default: ""
       candidate_kind:
         description: "Fixed correctness test allowlist; telemetry never builds performance images"
         type: choice
@@ -24,6 +32,8 @@ concurrency:
   cancel-in-progress: false
 env:
   BENCH_PHASE: ${{ inputs.phase }}
+  GAP_BASELINE_RUN_ID: ${{ inputs.baseline_run_id }}
+  GAP_BASELINE_RUN_ATTEMPT: ${{ inputs.baseline_run_attempt }}
 jobs:
   benchmark:
     name: Production mesh qualification and ranking
@@ -254,6 +264,8 @@ jobs:
       - name: Validate exact inputs before setup
         run: |
           python3 -c 'import sys; sys.path.insert(0, ".github/scripts"); from mesh_gap_candidate import selection; print(selection())'
+          python3 .github/scripts/mesh_gap_baseline_reuse.py validate-inputs
+          python3 -m unittest discover -s tests/performance/mesh_runtime/tests -p test_gap_baseline_reuse.py
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
@@ -261,7 +273,7 @@ jobs:
       - name: Install native test prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libcurl4-openssl-dev protobuf-compiler clang libclang-dev cmake openssl mold
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libcurl4-openssl-dev protobuf-compiler clang libclang-dev cmake openssl mold iproute2 iptables util-linux
       - name: Restore existing CI dependencies without saving a cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, repository CI pin
         with:
@@ -281,6 +293,9 @@ jobs:
 
   gap-build:
     name: Matched release image (${{ matrix.role }})
+    permissions:
+      contents: read
+      actions: read
     needs: gap-checks
     if: inputs.phase == 'gap-compare'
     runs-on: ubuntu-26.04
@@ -303,7 +318,14 @@ jobs:
         with:
           name: mesh-gap-checks-${{ github.run_id }}-${{ github.run_attempt }}
           path: results/gap/checks
+      - name: Reuse only the explicitly selected verified original baseline artifact
+        if: matrix.role == 'baseline' && inputs.baseline_run_id != ''
+        timeout-minutes: 20
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -u .github/scripts/mesh_gap_baseline_reuse.py reuse
       - name: Build exact submitted source with unchanged release recipe
+        if: matrix.role != 'baseline' || inputs.baseline_run_id == ''
         run: python3 -u .github/scripts/mesh_gap_build.py
       - name: Retain immutable image and bounded build metadata
         if: always()
