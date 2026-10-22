@@ -37,13 +37,86 @@ def require_test_counts(counts, expected_passed=None, expected_ignored=None):
             (expected_passed is None or counts['passed'] == expected_passed))
 
 
+MEMORY_READ_BYTES = 4096
+MEMINFO_KEYS = ('MemTotal', 'MemAvailable', 'SwapTotal', 'SwapFree')
+CGROUP_MEMORY_FILES = ('memory.current', 'memory.peak', 'memory.max', 'memory.swap.current',
+                       'memory.swap.max', 'memory.events', 'memory.events.local')
+CGROUP_EVENT_KEYS = ('low', 'high', 'max', 'oom', 'oom_kill', 'oom_group_kill', 'sock_throttled')
+
+
+def memory_snapshot(proc=Path('/proc'), cgroup=Path('/sys/fs/cgroup')):
+    """Read at most16 fixed-size files; numeric memory evidence, no env/argv."""
+    result = dict(schema='mesh_gap_check_memory.v1', captured_unix_seconds=time.time(),
+                  host_meminfo_kib={}, cgroups=[], errors=[])
+
+    def text(path):
+        with path.open('rb') as stream:
+            data = stream.read(MEMORY_READ_BYTES + 1)
+        if len(data) > MEMORY_READ_BYTES:
+            raise ValueError('memory evidence exceeds fixed read bound')
+        return data.decode('ascii')
+
+    def error(target, source, exception):
+        # File paths and exception strings can contain external text. Retain
+        # only an internal source label, exception type and numeric errno.
+        target.append(dict(source=source, error=type(exception).__name__,
+                           errno=getattr(exception, 'errno', None)))
+
+    try:
+        values = dict(re.findall(r'^([A-Za-z_]+):\s+(\d+) kB$', text(proc / 'meminfo'), re.MULTILINE))
+        result['host_meminfo_kib'] = {key: int(values[key]) for key in MEMINFO_KEYS if key in values}
+        if len(result['host_meminfo_kib']) != len(MEMINFO_KEYS):
+            raise ValueError('required host memory fields unavailable')
+    except (OSError, ValueError, UnicodeError) as exception:
+        error(result['errors'], 'host_meminfo', exception)
+    try:
+        memberships = [line.split(':', 2) for line in text(proc / 'self/cgroup').splitlines()]
+        v2 = [parts[2] for parts in memberships if len(parts) == 3 and parts[:2] == ['0', '']]
+        if len(v2) != 1:
+            raise ValueError('one current cgroup v2 membership required')
+        relative = Path(v2[0])
+        if not relative.is_absolute() or '..' in relative.parts:
+            raise ValueError('invalid current cgroup path')
+        current = cgroup.joinpath(*relative.parts[1:])
+        scopes = [('current', current), ('root', cgroup)] if current != cgroup else [('root', cgroup)]
+        for scope, directory in scopes:
+            record = dict(scope=scope, current=directory == current, version=2, values={}, errors=[])
+            for filename in CGROUP_MEMORY_FILES:
+                try:
+                    value = text(directory / filename).strip()
+                    if filename in ('memory.events', 'memory.events.local'):
+                        pairs = [line.split() for line in value.splitlines()]
+                        if not pairs or len(pairs) > 32 or any(len(pair) != 2 or not re.fullmatch(r'[a-z_]{1,32}', pair[0])
+                                                              or not pair[1].isdecimal() for pair in pairs):
+                            raise ValueError('invalid numeric memory events')
+                        record['values'][filename] = {key: int(count) for key, count in pairs if key in CGROUP_EVENT_KEYS}
+                    elif value == 'max' and filename.endswith('.max'):
+                        record['values'][filename] = 'max'
+                    elif value.isdecimal():
+                        record['values'][filename] = int(value)
+                    else:
+                        raise ValueError('invalid numeric memory counter')
+                except (OSError, ValueError, UnicodeError) as exception:
+                    error(record['errors'], filename, exception)
+            result['cgroups'].append(record)
+    except (OSError, ValueError, UnicodeError) as exception:
+        error(result['errors'], 'cgroup_membership', exception)
+    return result
+
+
+def emit_memory_snapshot(name, phase):
+    print('[gap-check-memory] ' + json.dumps(dict(check=name, phase=phase, **memory_snapshot()),
+                                           sort_keys=True), flush=True)
+
+
 def run_command(command, checkout, output, name, *, test=False, allow_failure=False,
                 vendor_lints=False, batch_control=None, expected_passed=None, expected_ignored=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith('FERRUM_')}
     for key in ('CARGO_TARGET_DIR', 'RUSTFLAGS', 'RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WRAPPER', 'UPDATE_VENDOR_INTEGRITY'):
         env.pop(key, None)
     # Correctness-only resource settings; never inherited by release image builds.
-    env.update(CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_BUILD_JOBS='2')
+    clippy = command[:2] == ['cargo', 'clippy']
+    env.update(CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_BUILD_JOBS='1' if clippy else '2')
     if vendor_lints:
         env['RUSTFLAGS'] = '--cap-lints=warn'
     if batch_control is not None:
@@ -52,6 +125,8 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
         env['RUSTFLAGS'] = batch_rustflags(batch_control)
     started = time.monotonic()
     print('[gap-check] start ' + name, flush=True)
+    if clippy:
+        emit_memory_snapshot(name, 'before')
     timed_out = False
     with (output / (name + '.log')).open('w') as log:
         process = subprocess.Popen(command, cwd=checkout, env=env, stdout=log,
@@ -63,12 +138,16 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
             except subprocess.TimeoutExpired:
                 elapsed = time.monotonic() - started
                 print(f'[gap-check] {name}: elapsed={elapsed:.0f}s log_bytes={(output / (name + ".log")).stat().st_size}', flush=True)
+                emit_memory_snapshot(name, 'heartbeat')
                 if elapsed >= 7200:
                     import signal
                     timed_out = True
                     os.killpg(process.pid, signal.SIGKILL)
                     exit_code = process.wait()
                     break
+
+    if clippy:
+        emit_memory_snapshot(name, 'after')
 
     text = (output / (name + '.log')).read_text(errors='replace')
     counts = test_counts(text)
