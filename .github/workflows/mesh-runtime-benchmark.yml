@@ -7,16 +7,16 @@ on:
         description: "Qualification, production ranking, or labeled H1 idle-cap configuration diagnostic"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum, gap-vendor-preflight, gap-checks, gap-compare, gap-telemetry-reproduce, gap-telemetry-verify, worker-locality-diagnostic]
+        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum, gap-vendor-preflight, gap-checks, gap-compare, gap-telemetry-reproduce, gap-telemetry-verify, worker-locality-diagnostic, gap-profile-representative]
       candidate_sha:
-        description: "Exact reviewed 40-hex candidate commit; required for gap phases"
+        description: "Exact reviewed 40-hex candidate commit; required for candidate gap phases; unused by representative profile"
         type: string
         default: ""
       candidate_kind:
         description: "Fixed correctness test allowlist; telemetry never builds performance images"
         type: choice
         default: h2-handoff
-        options: [h2-handoff, header-boundary, label-interner, telemetry-reproduce, telemetry-verify]
+        options: [h2-handoff, h2-response-groups, header-boundary, label-interner, telemetry-reproduce, telemetry-verify]
 permissions:
   contents: read
 concurrency:
@@ -237,7 +237,7 @@ jobs:
 
   gap-checks:
     name: Exact candidate correctness or explicitly labeled preflight
-    if: startsWith(inputs.phase, 'gap-')
+    if: startsWith(inputs.phase, 'gap-') && inputs.phase != 'gap-profile-representative'
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     env:
@@ -430,3 +430,65 @@ jobs:
             !results/locality/**/runtime/**
             results/locality-host
           retention-days: 30
+
+
+  gap-profile-representative:
+    name: One representative own-image CPU profile bracket
+    if: inputs.phase == 'gap-profile-representative'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 220
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check bounded profile contracts
+        run: |
+          python3 .github/scripts/mesh_gap_profile_test.py
+          python3 -m unittest discover -s tests/performance/mesh_runtime/tests -p test_gap_profile_campaign.py
+      - name: Install observation and fixture prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl sysstat binutils iproute2 iptables linux-perf linux-tools-generic linux-tools-common
+          mkdir -p results/gap-profile-host
+          lscpu > results/gap-profile-host/lscpu.txt
+          free -b > results/gap-profile-host/memory.txt
+          docker version > results/gap-profile-host/docker-version.txt
+          dpkg-query -W > results/gap-profile-host/native-packages.txt
+          vmstat 1 6 > results/gap-profile-host/host-before.txt
+      - name: Require original-link equivalence canary
+        timeout-minutes: 16
+        run: bash .github/scripts/mesh_production_profile_ferrum.sh canary "$RUNNER_TEMP/gap-profile-canary"
+      - name: Build fixed baseline once and qualify its own symbol companion
+        timeout-minutes: 133
+        run: |
+          timeout --signal=TERM --kill-after=10s 7900s python3 -u .github/scripts/mesh_gap_profile_prepare.py \
+            --repo "$GITHUB_WORKSPACE" --canary-report "$RUNNER_TEMP/gap-profile-canary/report.json" \
+            --output "$RUNNER_TEMP/gap-profile-build"
+      - name: Prepare immutable load tools and disposable collector wrapper
+        timeout-minutes: 23
+        run: python3 -u .github/scripts/mesh_gap_profile_campaign.py prepare
+      - name: Run all three same-image controls and profile serially
+        timeout-minutes: 25
+        run: python3 -u .github/scripts/mesh_gap_profile_campaign.py measure
+      - name: Cleanup only this run's labeled fixtures
+        if: always()
+        run: |
+          mapfile -t leaked < <(docker ps -aq --filter "label=ferrum.meshbench.owner=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+          if [ "${#leaked[@]}" -gt 0 ]; then docker rm -f "${leaked[@]}" 2>/dev/null || true; fi
+      - name: Delete private traces and stage only bounded derived evidence
+        if: always()
+        timeout-minutes: 5
+        run: |
+          sudo env GITHUB_ACTIONS=true RUNNER_TEMP="$RUNNER_TEMP" \
+            python3 .github/scripts/mesh_gap_profile_campaign.py finalize | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Retain complete profile qualification without raw memory or binaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-gap-representative-profile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/gap-profile-public
+          retention-days: 30
+      - name: Require all identity coverage loss and control gates
+        if: always()
+        run: python3 .github/scripts/mesh_gap_profile_campaign.py accept
