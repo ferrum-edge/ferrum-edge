@@ -94,6 +94,9 @@ def read_cell(cell, image_ids, runner_exit_code=None):
     campaign.ROOT = cell_root(cell)
     row = campaign.read_cell(cell, runner_exit_code=runner_exit_code)
     extra = validate_workers(cell, row['resources'], image_ids[cell['arm']])
+    directory, _, _ = campaign.cell_paths(cell)
+    if runner_exit_code is None and not (directory / 'cell-classification.json').is_file():
+        extra.append('missing completed runner classification for planned cell')
     row['measurement_errors'].extend(extra)
     row['capacity_errors'].extend(extra)
     if extra:
