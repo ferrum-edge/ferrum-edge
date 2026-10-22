@@ -512,13 +512,12 @@ async fn fetch_with_credential(
 
     if let (Some(requested), Some(returned)) =
         (parsed.version.as_deref(), fetched_version.as_deref())
+        && requested != returned
     {
-        if requested != returned {
-            return Err(format!(
-                "Azure secret for {} returned a different version than requested",
-                key
-            ));
-        }
+        return Err(format!(
+            "Azure secret for {} returned a different version than requested",
+            key
+        ));
     }
 
     Ok(AzureSecret {
