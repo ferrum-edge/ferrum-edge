@@ -67,10 +67,7 @@ elif [ "$mode" = measure ]; then
         if [ "$arm" = ferrumbaseline ]; then
             python3 .github/scripts/mesh_runtime_campaign.py relabel --results "$directory"
         fi
-        if [ "$failed" -ne 0 ]; then
-            echo "[campaign] stopping after failed arm; remaining planned cells stay missing" >&2
-            break
-        fi
+        # EXPERIMENT ONLY: record a failed cell and keep measuring the rest.
     done < results/plan.txt
     exit "$failed"
 else
