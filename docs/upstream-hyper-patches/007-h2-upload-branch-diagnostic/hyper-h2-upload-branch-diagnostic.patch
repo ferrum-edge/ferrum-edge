@@ -6,7 +6,7 @@ index f161708b0..3fccfc5a0 100644
      "dep:smallvec",
  ]
  default = []
-+# FERRUM PATCH 008: compile-time diagnostic only, excluded from full/default.
++# FERRUM PATCH 007: compile-time diagnostic only, excluded from full/default.
 +ferrum-h2-upload-diagnostic = ["client", "http2"]
  ffi = [
      "dep:http-body-util",
@@ -101,7 +101,7 @@ index 000000000..8b1aab789
 --- /dev/null
 +++ b/src/ext/h2_upload_diagnostic.rs
 @@ -0,0 +1,96 @@
-+//! FERRUM PATCH 008: fixed counters for an isolated diagnostic build.
++//! FERRUM PATCH 007: fixed counters for an isolated diagnostic build.
 +//!
 +//! Only POST requests that reach ClientTask::poll_pipe are counted. No request
 +//! identifiers, field values, body bytes, clocks, or per-request allocations.

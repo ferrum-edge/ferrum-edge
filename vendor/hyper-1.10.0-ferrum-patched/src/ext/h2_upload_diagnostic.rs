@@ -1,4 +1,4 @@
-//! FERRUM PATCH 008: fixed counters for an isolated diagnostic build.
+//! FERRUM PATCH 007: fixed counters for an isolated diagnostic build.
 //!
 //! Only POST requests that reach ClientTask::poll_pipe are counted. No request
 //! identifiers, field values, body bytes, clocks, or per-request allocations.
