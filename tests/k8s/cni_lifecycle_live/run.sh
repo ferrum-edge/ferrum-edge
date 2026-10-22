@@ -87,18 +87,31 @@ kind load docker-image "$IMAGE" --name "$KIND_CLUSTER"
 
 # ---------------------------------------------------------------------------
 # Discover the worker's primary CNI configuration.
+#
+# `kind create cluster --wait` only waits for the control plane. The worker
+# can still be NotReady with kindnet not yet having written its conflist, so
+# wait for the worker to report Ready (kubelet needs a CNI config for that)
+# and then poll the directory briefly before concluding there is no primary.
 # ---------------------------------------------------------------------------
+kubectl wait --for=condition=Ready "node/${WORKER}" --timeout=180s
+
 primary_file=""
-while IFS= read -r candidate; do
-  case "$candidate" in
-    *.conf|*.conflist)
-      primary_file="$candidate"
-      break
-      ;;
-  esac
-done < <(docker exec "$WORKER" ls -1 /etc/cni/net.d)
+for _ in $(seq 1 30); do
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      *.conf|*.conflist)
+        primary_file="$candidate"
+        break
+        ;;
+    esac
+  done < <(docker exec "$WORKER" ls -1 /etc/cni/net.d)
+  [ -n "$primary_file" ] && break
+  sleep 2
+done
 
 if [ -z "$primary_file" ]; then
+  docker exec "$WORKER" ls -la /etc/cni/net.d > "$RESULTS_DIR/worker-cni-net-d.txt" 2>&1 || true
+  kubectl get nodes -o wide > "$RESULTS_DIR/nodes-at-primary-discovery.txt" 2>&1 || true
   echo "::error title=No primary CNI config on the kind worker::cannot chain behind nothing"
   exit 1
 fi
