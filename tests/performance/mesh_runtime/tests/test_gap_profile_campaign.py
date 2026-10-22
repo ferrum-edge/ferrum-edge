@@ -99,6 +99,43 @@ class ProfileCampaignTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 campaign.transform_runner(text)
 
+    def test_environment_preflight_reuses_exact_privileged_collector_invocation(self):
+        with mock.patch.dict(campaign.os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
+             mock.patch.object(campaign.os, 'uname', return_value=mock.Mock(sysname='Linux', machine='x86_64')), \
+             mock.patch.object(campaign.subprocess, 'run') as run:
+            campaign.preflight()
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ['bash', '-c'])
+        self.assertIn('runner_prefix=(sudo -n)\n' + campaign.REPLACEMENT[1] + ' --environment-preflight\n', argv[2])
+        self.assertIn('env GITHUB_ACTIONS="${GITHUB_ACTIONS:?', argv[2])
+        self.assertNotIn('GITHUB_ACTIONS=true', argv[2])
+        self.assertEqual(run.call_args.kwargs, dict(cwd=campaign.ROOT, check=True, timeout=15))
+
+    def test_environment_preflight_rejects_environment_or_invocation_drift_before_launch(self):
+        for actions, system, machine in ((None, 'Linux', 'x86_64'), ('false', 'Linux', 'x86_64'),
+                ('TRUE', 'Linux', 'x86_64'), ('true', 'Darwin', 'x86_64'), ('true', 'Linux', 'aarch64')):
+            with self.subTest(actions=actions, system=system, machine=machine), \
+                 mock.patch.dict(campaign.os.environ, {} if actions is None else {'GITHUB_ACTIONS': actions}, clear=True), \
+                 mock.patch.object(campaign.os, 'uname', return_value=mock.Mock(sysname=system, machine=machine)), \
+                 mock.patch.object(campaign.subprocess, 'run') as run:
+                with self.assertRaises(ValueError):
+                    campaign.preflight()
+                run.assert_not_called()
+        original = (campaign.ROOT / 'tests/performance/mesh_runtime/run_mesh_runtime_bench.sh').read_text()
+        for text in (original.replace('runner_prefix=(sudo -n)', 'runner_prefix=()'),
+                     original.replace(campaign.REPLACEMENT[0], 'changed-collector')):
+            with self.subTest(invocation=text[-60:]), mock.patch.object(campaign, 'require_remote'), \
+                 mock.patch.object(Path, 'read_text', return_value=text), mock.patch.object(campaign.subprocess, 'run') as run:
+                with self.assertRaises(ValueError):
+                    campaign.preflight()
+                run.assert_not_called()
+
+    def test_environment_preflight_propagates_child_failure(self):
+        with mock.patch.object(campaign, 'require_remote'), \
+             mock.patch.object(campaign.subprocess, 'run', side_effect=campaign.subprocess.CalledProcessError(1, ['synthetic'])):
+            with self.assertRaises(campaign.subprocess.CalledProcessError):
+                campaign.preflight()
+
     def test_public_copy_refuses_binary_key_and_linked_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

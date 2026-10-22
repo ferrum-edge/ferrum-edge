@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import mesh_gap_profile_capture as profile
 import mesh_gap_profile_prepare as prepare
@@ -104,6 +105,35 @@ class ContractTests(unittest.TestCase):
     def test_nonfinite_bracket_fails(self):
         with self.assertRaises(ValueError):
             profile.parse_callchains(sample(), 101, float('nan'), 20, {DSO: {}})
+
+    def test_guarded_environment_preflight_starts_no_collector(self):
+        with mock.patch.dict(profile.os.environ, {'GITHUB_ACTIONS': 'true'}, clear=True), \
+             mock.patch.object(profile.platform, 'system', return_value='Linux'), \
+             mock.patch.object(profile.platform, 'machine', return_value='x86_64'), \
+             mock.patch.object(profile.os, 'geteuid', return_value=0), \
+             mock.patch.object(profile.sys, 'argv', ['capture.py', '--environment-preflight']), \
+             mock.patch.object(profile.importlib.util, 'spec_from_file_location') as load, \
+             mock.patch.object(profile, 'DwarfCapture') as capture, mock.patch('builtins.print') as output:
+            self.assertEqual(profile.main(), 0)
+        load.assert_not_called()
+        capture.assert_not_called()
+        self.assertEqual(json.loads(output.call_args.args[0]), dict(mode='environment-preflight', github_actions='true',
+                                                                  system='Linux', machine='x86_64', euid=0))
+
+    def test_environment_preflight_keeps_remote_platform_and_privilege_guards(self):
+        for actions, system, machine, euid in ((None, 'Linux', 'x86_64', 0), ('false', 'Linux', 'x86_64', 0),
+                ('TRUE', 'Linux', 'x86_64', 0), ('true', 'Darwin', 'x86_64', 0),
+                ('true', 'Linux', 'aarch64', 0), ('true', 'Linux', 'x86_64', 1000)):
+            with self.subTest(actions=actions, system=system, machine=machine, euid=euid), \
+                 mock.patch.dict(profile.os.environ, {} if actions is None else {'GITHUB_ACTIONS': actions}, clear=True), \
+                 mock.patch.object(profile.platform, 'system', return_value=system), \
+                 mock.patch.object(profile.platform, 'machine', return_value=machine), \
+                 mock.patch.object(profile.os, 'geteuid', return_value=euid), \
+                 mock.patch.object(profile.sys, 'argv', ['capture.py', '--environment-preflight']), \
+                 mock.patch.object(profile.importlib.util, 'spec_from_file_location') as load:
+                with self.assertRaises(ValueError):
+                    profile.main()
+                load.assert_not_called()
 
     def test_cpu_snapshot_retains_user_system_split(self):
         with tempfile.TemporaryDirectory() as tmp:

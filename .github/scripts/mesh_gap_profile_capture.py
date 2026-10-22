@@ -264,6 +264,12 @@ def export_derived(source, destination):
 def main():
     if os.environ.get('GITHUB_ACTIONS') != 'true' or platform.system() != 'Linux' or platform.machine() != 'x86_64':
         raise ValueError('capture execution is restricted to remote GitHub Actions Linux x64')
+    if sys.argv[1:] == ['--environment-preflight']:
+        if os.geteuid() != 0:
+            raise ValueError('privileged collector preflight requires root')
+        print(json.dumps(dict(mode='environment-preflight', github_actions=os.environ['GITHUB_ACTIONS'],
+                              system=platform.system(), machine=platform.machine(), euid=os.geteuid())))
+        return 0
     if len(sys.argv) == 4 and sys.argv[1] == '--export':
         return export_derived(sys.argv[2], sys.argv[3])
     base.record_argv, base.validate_attributes, base.PerfCapture = record_argv, validate_attributes, DwarfCapture

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One representative own-image DWARF bracket; no shipping attribution or retry.
 
-Only `prepare` and `measure` execute tools. `finalize` runs as root remotely to
+`preflight` checks the exact privileged collector invocation without a workload.
+`prepare` and `measure` execute tools. `finalize` runs as root remotely to
 stop this attempt's recorders, delete private raw traces/caches, and export an
 explicit public allowlist. Pure qualification helpers support synthetic tests.
 """
@@ -35,7 +36,8 @@ SCOPE = ('Fresh representative release of baseline ' + BASELINE + '; own origina
          'same-image controls. User CPU leaf and synchronous inclusive sampled stacks only; overlapping inclusive '
          'rows are not additive. No shipping attribution, async request CPU, Tokio wake counts, or source-line claim. '
          'Three small-payload cells qualify this observer only, not a performance improvement or competitor ranking.')
-REPLACEMENT = ('python3 -u "$SCRIPT_DIR/collect_resources.py"',
+REPLACEMENT = ('"${runner_prefix[@]}" python3 -u "$SCRIPT_DIR/collect_resources.py"',
+               '"${runner_prefix[@]}" env GITHUB_ACTIONS="${GITHUB_ACTIONS:?validated GitHub Actions environment required}" '
                'python3 -u "$SCRIPT_DIR/../../../.github/scripts/mesh_gap_profile_capture.py"')
 
 
@@ -57,6 +59,23 @@ def transform_runner(original):
     if original.count(REPLACEMENT[0]) != 1:
         raise ValueError('collector substitution requires exactly one literal occurrence')
     return original.replace(*REPLACEMENT)
+
+
+def preflight():
+    require_remote()
+    runner = ROOT / 'tests/performance/mesh_runtime/run_mesh_runtime_bench.sh'
+    original = runner.read_text()
+    transform_runner(original)
+    privileged_prefix = 'runner_prefix=(sudo -n)'
+    if original.count(privileged_prefix) != 1:
+        raise ValueError('preflight requires the exact privileged collector prefix')
+    # Share the transformed invocation, including expansion before sudo strips
+    # the environment. The child retains its remote/platform guard and starts
+    # no collector, fixture, workload, build, or perf recorder in this mode.
+    script = ('set -euo pipefail\nSCRIPT_DIR="$1"\n' + privileged_prefix + '\n'
+              + REPLACEMENT[1] + ' --environment-preflight\n')
+    subprocess.run(['bash', '-c', script, 'mesh-gap-profile-preflight', str(runner.parent)],
+                   cwd=ROOT, check=True, timeout=15)
 
 
 def preparation_errors(report):
@@ -439,7 +458,9 @@ def finalize():
 def main():
     require_remote()
     action = sys.argv[1] if len(sys.argv) == 2 else ''
-    if action == 'prepare':
+    if action == 'preflight':
+        preflight()
+    elif action == 'prepare':
         prepare()
     elif action == 'measure':
         measure()
@@ -448,7 +469,7 @@ def main():
     elif action == 'accept':
         return 0 if read(PUBLIC / 'qualification.json').get('valid') is True else 1
     else:
-        raise ValueError('expected prepare, measure, finalize or accept')
+        raise ValueError('expected preflight, prepare, measure, finalize or accept')
     return 0
 
 
