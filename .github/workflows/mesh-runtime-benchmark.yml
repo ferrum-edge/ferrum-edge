@@ -7,7 +7,16 @@ on:
         description: "Qualification, production ranking, or labeled H1 idle-cap configuration diagnostic"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum]
+        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum, gap-vendor-preflight, gap-checks, gap-telemetry-reproduce]
+      candidate_sha:
+        description: "Exact reviewed 40-hex candidate commit; required for gap phases"
+        type: string
+        default: ""
+      candidate_kind:
+        description: "Fixed correctness test allowlist; telemetry never builds performance images"
+        type: choice
+        default: h2-handoff
+        options: [h2-handoff, header-boundary, telemetry-reproduce]
 permissions:
   contents: read
 concurrency:
@@ -18,7 +27,7 @@ env:
 jobs:
   benchmark:
     name: Production mesh qualification and ranking
-    if: inputs.phase != 'symbols' && inputs.phase != 'profile-envoy' && inputs.phase != 'ferrum-symbol-canary' && inputs.phase != 'profile-ferrum'
+    if: ${{ !startsWith(inputs.phase, 'gap-') && inputs.phase != 'symbols' && inputs.phase != 'profile-envoy' && inputs.phase != 'ferrum-symbol-canary' && inputs.phase != 'profile-ferrum' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -225,3 +234,40 @@ jobs:
       - name: Require observer qualification
         if: always()
         run: python3 .github/scripts/mesh_production_profile_campaign.py accept
+
+  gap-checks:
+    name: Exact candidate correctness or explicitly labeled preflight
+    if: startsWith(inputs.phase, 'gap-')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    env:
+      GAP_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      GAP_CANDIDATE_KIND: ${{ inputs.candidate_kind }}
+      RUSTFLAGS: ""
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact inputs before setup
+        run: |
+          python3 -c 'import sys; sys.path.insert(0, ".github/scripts"); from mesh_gap_candidate import selection; print(selection())'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Install native test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler clang libclang-dev cmake openssl
+      - name: Run only the selected fixed check plan
+        run: python3 -u .github/scripts/mesh_gap_checks.py
+      - name: Retain checks and generated manifest without build trees
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-gap-checks-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/gap/checks
+          retention-days: 30
