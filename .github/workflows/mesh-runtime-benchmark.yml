@@ -7,7 +7,7 @@ on:
         description: "Qualification, production ranking, or labeled H1 idle-cap configuration diagnostic"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum, gap-vendor-preflight, gap-checks, gap-telemetry-reproduce]
+        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum, gap-vendor-preflight, gap-checks, gap-compare, gap-telemetry-reproduce, worker-locality-diagnostic]
       candidate_sha:
         description: "Exact reviewed 40-hex candidate commit; required for gap phases"
         type: string
@@ -27,7 +27,7 @@ env:
 jobs:
   benchmark:
     name: Production mesh qualification and ranking
-    if: ${{ !startsWith(inputs.phase, 'gap-') && inputs.phase != 'symbols' && inputs.phase != 'profile-envoy' && inputs.phase != 'ferrum-symbol-canary' && inputs.phase != 'profile-ferrum' }}
+    if: ${{ !startsWith(inputs.phase, 'gap-') && inputs.phase != 'worker-locality-diagnostic' && inputs.phase != 'symbols' && inputs.phase != 'profile-envoy' && inputs.phase != 'ferrum-symbol-canary' && inputs.phase != 'profile-ferrum' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     steps:
@@ -262,6 +262,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libcurl4-openssl-dev protobuf-compiler clang libclang-dev cmake openssl mold
+      - name: Restore existing CI dependencies without saving a cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2, repository CI pin
+        with:
+          shared-key: ci-test
+          workspaces: ". -> target"
+          save-if: "false"
+          cache-on-failure: false
       - name: Run only the selected fixed check plan
         run: python3 -u .github/scripts/mesh_gap_checks.py
       - name: Retain checks and generated manifest without build trees
@@ -270,4 +277,156 @@ jobs:
         with:
           name: mesh-gap-checks-${{ github.run_id }}-${{ github.run_attempt }}
           path: results/gap/checks
+          retention-days: 30
+
+  gap-build:
+    name: Matched release image (${{ matrix.role }})
+    needs: gap-checks
+    if: inputs.phase == 'gap-compare'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        role: [baseline, candidate]
+    env:
+      GAP_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      GAP_CANDIDATE_KIND: ${{ inputs.candidate_kind }}
+      GAP_BUILD_ROLE: ${{ matrix.role }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mesh-gap-checks-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/gap/checks
+      - name: Build exact submitted source with unchanged release recipe
+        run: python3 -u .github/scripts/mesh_gap_build.py
+      - name: Retain immutable image and bounded build metadata
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-gap-image-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/gap/images/${{ matrix.role }}
+          compression-level: 1
+          retention-days: 14
+
+  gap-compare:
+    name: Serial80-cell exact-image AA and candidate comparison
+    needs: [gap-checks, gap-build]
+    if: inputs.phase == 'gap-compare'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    env:
+      GAP_CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      GAP_CANDIDATE_KIND: ${{ inputs.candidate_kind }}
+      RUSTFLAGS: ""
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Install load-tool and fixture prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl sysstat binutils iproute2 iptables pkg-config libssl-dev libcurl4-openssl-dev protobuf-compiler clang libclang-dev cmake mold
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mesh-gap-checks-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/gap/checks
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mesh-gap-image-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/gap/images/baseline
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mesh-gap-image-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/gap/images/candidate
+      - name: Record shared runner environment
+        run: |
+          mkdir -p results/gap/host
+          lscpu > results/gap/host/lscpu.txt
+          free -b > results/gap/host/memory.txt
+          docker version > results/gap/host/docker-version.txt
+          dpkg-query -W > results/gap/host/native-packages.txt
+          vmstat 1 6 > results/gap/host/host-before.txt
+      - name: Measure frozen48 mesh and32 gateway cells serially
+        timeout-minutes: 145
+        run: python3 -u .github/scripts/mesh_gap_campaign.py run
+      - name: Cleanup only this run's labeled mesh fixtures
+        if: always()
+        run: |
+          mapfile -t leaked < <(docker ps -aq --filter "label=ferrum.meshbench.owner=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+          if [ "${#leaked[@]}" -gt 0 ]; then docker rm -f "${leaked[@]}" 2>/dev/null || true; fi
+      - name: Render every planned ratio and failed or undefined position
+        if: always()
+        run: python3 .github/scripts/mesh_gap_campaign.py summarize >> "$GITHUB_STEP_SUMMARY"
+      - name: Stage bounded public evidence without keys or build trees
+        if: always()
+        run: python3 .github/scripts/mesh_gap_campaign.py export
+      - name: Retain all outcomes and host metadata
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-gap-comparison-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            results/gap/public
+            results/gap/host
+          retention-days: 30
+      - name: Require complete zero-error capacity evidence
+        if: always()
+        run: python3 .github/scripts/mesh_gap_campaign.py accept
+
+  worker-locality:
+    name: Shipping-image worker locality discriminator
+    if: inputs.phase == 'worker-locality-diagnostic'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install fixture and observation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssl sysstat binutils iproute2 iptables
+      - name: Record host metadata
+        run: |
+          mkdir -p results/locality-host
+          lscpu > results/locality-host/lscpu.txt
+          free -b > results/locality-host/memory.txt
+          docker version > results/locality-host/docker-version.txt
+          vmstat 1 6 > results/locality-host/host-before.txt
+      - name: Prepare immutable shipping images and tools
+        timeout-minutes: 25
+        run: python3 -u .github/scripts/mesh_locality_diagnostic.py prepare
+      - name: Measure16 balanced worker-count cells
+        timeout-minutes: 20
+        run: python3 -u .github/scripts/mesh_locality_diagnostic.py measure
+      - name: Cleanup only this run's labeled fixtures
+        if: always()
+        run: |
+          mapfile -t leaked < <(docker ps -aq --filter "label=ferrum.meshbench.owner=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}")
+          if [ "${#leaked[@]}" -gt 0 ]; then docker rm -f "${leaked[@]}" 2>/dev/null || true; fi
+      - name: Retain every worker-count result
+        if: always()
+        run: python3 .github/scripts/mesh_locality_diagnostic.py summarize >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-worker-locality-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            results/locality
+            !results/locality/**/runtime/**
+            results/locality-host
           retention-days: 30

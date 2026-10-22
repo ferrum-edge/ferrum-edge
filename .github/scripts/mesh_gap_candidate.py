@@ -43,6 +43,7 @@ def validate_inputs(candidate, kind, phase):
         raise ValueError('vendor preflight only applies to the vendored Hyper candidate')
     return dict(baseline_sha=BASELINE, candidate_sha=candidate, candidate_kind=kind,
                 phase=phase, profile='release', features='cloud-secrets',
+                recipe_scope='intended performance image recipe only; correctness uses its recorded command, manifest feature defaults or explicit features, and test/dev profile environment',
                 allocation_instrumentation=False, builder_image=BUILDER,
                 gateway_harness_sha=GATEWAY_HARNESS)
 
@@ -63,7 +64,7 @@ def selection():
     result['harness_sha'] = git('rev-parse', 'HEAD')
     # Candidate work can change runtime source, tests and patch notes, but not
     # choose a different build recipe, dependency graph or compiler configuration.
-    immutable = ['Dockerfile', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
+    immutable = ['Dockerfile', '.dockerignore', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
                  '.cargo', 'build.rs', 'build', 'custom_plugins', 'proto', 'ebpf']
     changed = git('diff', '--name-only', BASELINE, result['candidate_sha'], '--', *immutable)
     if changed:
@@ -95,16 +96,16 @@ def cargo_tests(kind):
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'mesh_hbone_tests::'],
         ]
     if kind == 'header-boundary':
-        return common + [
+        return [
+            ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'header_merge_reconciliation_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--lib', 'proxy::headers::tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'grpc_proxy_tests::'],
-            ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'header_merge_reconciliation_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'consumer_assertion_namespace_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'request_context_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'request_trailer_boundary_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'response_trailer_policy_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'response_representation_tests::'],
-        ]
+        ] + common
     raise ValueError('no performance check plan for this kind')
 
 

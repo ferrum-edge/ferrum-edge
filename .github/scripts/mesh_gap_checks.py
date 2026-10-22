@@ -23,17 +23,24 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
     if vendor_lints:
         env['RUSTFLAGS'] = '--cap-lints=warn'
     started = time.monotonic()
+    print('[gap-check] start ' + name, flush=True)
     timed_out = False
     with (output / (name + '.log')).open('w') as log:
         process = subprocess.Popen(command, cwd=checkout, env=env, stdout=log,
                                    stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            exit_code = process.wait(timeout=7200)
-        except subprocess.TimeoutExpired:
-            import signal
-            timed_out = True
-            os.killpg(process.pid, signal.SIGKILL)
-            exit_code = process.wait()
+        while True:
+            try:
+                exit_code = process.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - started
+                print(f'[gap-check] {name}: elapsed={elapsed:.0f}s log_bytes={(output / (name + ".log")).stat().st_size}', flush=True)
+                if elapsed >= 7200:
+                    import signal
+                    timed_out = True
+                    os.killpg(process.pid, signal.SIGKILL)
+                    exit_code = process.wait()
+                    break
 
     text = (output / (name + '.log')).read_text(errors='replace')
     passed = sum(int(x) for x in re.findall(r'test result: ok\. (\d+) passed', text))
@@ -41,6 +48,7 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
                   correctness_environment={key: env[key] for key in ('CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG', 'CARGO_BUILD_JOBS')},
                   elapsed_seconds=time.monotonic() - started, passed_tests=passed)
     write(output / (name + '.json'), record)
+    print(f'[gap-check] complete {name}: exit={exit_code} passed_tests={passed}', flush=True)
     if not allow_failure and (exit_code or timed_out or test and not passed):
         raise ValueError(name + ' failed or matched no executed tests; retained log is authoritative')
     return record, text
@@ -63,7 +71,7 @@ def standalone_hyper(checkout, scratch, output):
         run_command(command, hyper, output, prefix + '-lock', vendor_lints=True)
         _, tree = run_command(['cargo', 'tree', '--locked', '--manifest-path', str(manifest), '--features', 'full', '-i', 'h2', *config], hyper, output, prefix + '-tree', vendor_lints=True)
         expected = 'h2 v0.4.20' + (' (' + str(h2) + ')' if graph == 'patched' else '')
-        if tree.splitlines()[0] != expected:
+        if [line for line in tree.splitlines() if re.match(r'^h2 v', line)] != [expected]:
             raise ValueError(prefix + ' did not resolve the exact intended h2 graph')
         shutil.copy2(hyper / 'Cargo.lock', output / (prefix + '.Cargo.lock'))
         write(output / (prefix + '-graph.json'), dict(scope='standalone tests only',
@@ -97,6 +105,13 @@ def main():
     checkout = Path(tempfile.mkdtemp(prefix='mesh-gap-checks-', dir=os.environ['RUNNER_TEMP'])) / 'source'
     subprocess.run(['git', 'worktree', 'add', '--detach', str(checkout), chosen['candidate_sha']], cwd=ROOT, check=True)
     try:
+        # The restore-only action targets the harness checkout. Move its ignored
+        # target into this one owned source checkout; never share targets between
+        # worktrees or export them as artifacts. Cargo verifies fingerprints.
+        restored = ROOT / 'target'
+        result['restored_ci_target_moved'] = restored.is_dir()
+        if restored.is_dir():
+            shutil.move(str(restored), str(checkout / 'target'))
         (output / 'rustc.txt').write_text(subprocess.check_output(['rustc', '-Vv'], text=True))
         (output / 'cargo.txt').write_text(subprocess.check_output(['cargo', '-Vv'], text=True))
         (output / 'native-packages.txt').write_text(subprocess.check_output(['dpkg-query', '-W'], text=True))
@@ -125,11 +140,11 @@ def main():
             if chosen['candidate_kind'] == 'h2-handoff':
                 hyper_source_gates(checkout, output)
             run_command(['cargo', 'fmt', '--all', '--', '--check'], checkout, output, 'fmt')
-            run_command(['cargo', 'clippy', '--locked', '--features', 'cloud-secrets', '--lib', '--tests', '-p', 'ferrum-edge', '--', '-D', 'warnings'], checkout, output, 'clippy')
             if chosen['candidate_kind'] == 'h2-handoff':
                 standalone_hyper(checkout, checkout.parent / 'standalone', output)
             for index, command in enumerate(cargo_tests(chosen['candidate_kind']), 1):
                 run_command(command, checkout, output, 'targeted-' + str(index), test=True)
+            run_command(['cargo', 'clippy', '--locked', '--features', 'cloud-secrets', '--lib', '--tests', '-p', 'ferrum-edge', '--', '-D', 'warnings'], checkout, output, 'clippy')
             run_command(['cargo', 'build', '--locked', '--features', 'cloud-secrets', '--bin', 'ferrum-edge'], checkout, output, 'functional-binary')
             for index, test_filter in enumerate(('functional_http1_direct_pool_test::', 'functional_grpc_test::', 'functional_mesh_sidecar_egress_routes_a_to_b_over_mtls', 'functional_mesh_sidecar_egress_grpc_routes_a_to_b_with_trailers', 'functional_mesh_mtls_retry_replays_exact_grpc_request_once_and_rejects_native_trailers'), 1):
                 run_command(['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'functional_tests', test_filter, '--', '--ignored'], checkout, output, 'functional-' + str(index), test=True)
