@@ -103,7 +103,7 @@ jobs:
   benchmark:
     name: Mesh runtime benchmark
     runs-on: ubuntu-26.04
-    timeout-minutes: 240
+    timeout-minutes: 340
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
@@ -153,8 +153,10 @@ jobs:
         run: |
           bash .github/scripts/mesh_runtime_campaign.sh build
 
+      # Every cell restarts its arm. A full 30s x 4-round paired campaign
+      # across all arms is roughly 170 cells at ~40s+ each.
       - name: Run benchmark (balanced blocks, paired Ferrum images, same runner)
-        timeout-minutes: 110
+        timeout-minutes: 200
         run: |
           bash .github/scripts/mesh_runtime_campaign.sh measure
 

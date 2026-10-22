@@ -145,7 +145,7 @@ if "python3" in sys.argv:
     open(path, "w").write("partial loadgen output")
     raise SystemExit(124)
 ''')
-            script = functions("effective_concurrency", "run_cell") + '\nrun_cell 1024 http://fixture/echo'
+            script = functions("effective_concurrency", "cell_wall_timeout_secs", "run_cell") + '\nrun_cell 1024 http://fixture/echo'
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5,
                 env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                      "OUTPUT_DIR": str(root), "CALLS": str(root / "calls"), "MESH": "direct",
@@ -158,6 +158,27 @@ if "python3" in sys.argv:
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
             self.assertEqual(calls[0][:3], ["--signal=TERM", "--kill-after=5s", "45s"])
             self.assertTrue(any("fixture-loadgen" in call and "rm" in call for call in calls))
+
+    def test_consul_deny_probe_cut_short_by_budget_is_not_a_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "logs").mkdir()
+            # Plaintext is refused, then the deny-loop probe outlives the
+            # shared budget and fails only because readiness expired.
+            mocks = (
+                'docker() { :; }\nwait_ready() { echo restored-wait; }\n'
+                'probe_loadgen() { case "$1" in *21000*) return 1 ;; esac; sleep 2; return 1; }\n'
+            )
+            script = mocks + functions("consul_intention_probe") + (
+                '\nREADINESS_DEADLINE=$((SECONDS + 1)); consul_intention_probe')
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10,
+                env={**os.environ, "OUTPUT_DIR": str(root), "OUTBOUND_PORT": "15101",
+                     "AGENT_NAME": "fixture-agent", "READINESS_TIMEOUT_SECS": "90"})
+            self.assertNotEqual(result.returncode, 0)
+            evidence = (root / "logs/auth_probes.log").read_text()
+            self.assertIn("readiness budget exhausted before the deny probe completed", evidence)
+            self.assertNotIn("deny intention broke echo", evidence)
+            self.assertNotIn("restored-wait", result.stdout)
 
     def test_campaign_streams_progress_stops_on_failure_and_retags_exact_aa(self):
         wrapper = (ROOT / ".github/scripts/mesh_runtime_campaign.sh").read_text()
@@ -185,7 +206,7 @@ if "python3" in sys.argv:
     path = sys.argv[sys.argv.index("--output") + 1]
     open(path, "w").write(json.dumps({"rps": 1, "total_requests": 1, "total_errors": 2}))
 ''')
-            script = functions("effective_concurrency", "run_cell") + '\nrun_cell 1024 http://fixture/echo'
+            script = functions("effective_concurrency", "cell_wall_timeout_secs", "run_cell") + '\nrun_cell 1024 http://fixture/echo'
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5,
                 env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                      "OUTPUT_DIR": str(root), "MESH": "direct", "DURATION": "3", "WARMUP": "2",

@@ -24,6 +24,8 @@ if [ "$mode" = build ]; then
             docker tag ferrum-edge:bench ferrum-edge:baseline
         else
             baseline_source="${RUNNER_TEMP:?}/mesh-baseline-source"
+            # Branch/tag history does not include unmerged PR heads.
+            git cat-file -e "$baseline^{commit}" 2>/dev/null || git fetch --no-tags origin "$baseline"
             git worktree add --detach "$baseline_source" "$baseline"
             trap 'git worktree remove "$baseline_source"' EXIT
             docker build --build-arg "CARGO_PROFILE=$profile" --build-arg "FEATURES=$features" \
@@ -56,7 +58,7 @@ elif [ "$mode" = measure ]; then
         if timeout --signal=TERM --kill-after=10s "${arm_budget}s" \
             bash tests/performance/mesh_runtime/run_mesh_runtime_bench.sh "$measured_arm" \
             --payload-sizes "$payload" --duration "$BENCH_DURATION" --concurrency "$BENCH_CONCURRENCY" \
-            --output-dir "$directory" --skip-build 2>&1 | tee "$directory/run.log"; then
+            --output-dir "$directory" --skip-build < /dev/null 2>&1 | tee "$directory/run.log"; then
             :
         else
             failed=1

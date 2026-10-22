@@ -212,5 +212,34 @@ class Contracts(unittest.TestCase):
             self.assertIn("| ferrum | 1KiB | 21 | 80µs | 1.50s | 2.00s | 3.00s |", cohort)
 
 
+    def test_relabel_keeps_empty_failed_output_as_raw_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ferrum_http1_1024.json").write_text('{"mesh":"ferrum","gateway":"ferrum","rps":0}')
+            (root / "ferrum_http1_1024.failed-output.json").write_text("")
+            (root / "ferrum_http1_1024.resources.json").write_text("{trunc")
+            campaign.relabel(root)
+            self.assertEqual(sorted(f.name for f in root.iterdir()), [
+                "ferrumbaseline_http1_1024.failed-output.json",
+                "ferrumbaseline_http1_1024.json",
+                "ferrumbaseline_http1_1024.resources.json",
+            ])
+            relabeled = json.loads((root / "ferrumbaseline_http1_1024.json").read_text())
+            self.assertEqual((relabeled["mesh"], relabeled["gateway"]), ("ferrumbaseline", "ferrumbaseline"))
+            self.assertEqual((root / "ferrumbaseline_http1_1024.resources.json").read_text(), "{trunc")
+
+    def test_malformed_side_files_fail_acceptance_without_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_campaign(root)
+            self.write_campaign_cell(root)
+            file = self.write_campaign_cell(root, repetition=2)
+            file.with_suffix(".resources.json").write_text("null")
+            (file.parent / "ferrum_arm_status.json").write_text('{"mesh":"ferr')
+            collected = summary.collect(root)
+            self.assertEqual(collected["meshes"]["ferrum"]["1024"]["publishable_runs"], 1)
+            self.assertNotEqual(summary.check_acceptance(collected), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

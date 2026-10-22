@@ -5,12 +5,12 @@
 # (mTLS east-west hop) into mesh_backend at every requested payload size,
 # plus same-runner resource sampling. Writes per-cell JSON named
 # `<mesh>_http1_<payload>.json` (gateway-bench compatible fields) and
-# `<mesh>_http1_<payload>.stats.jsonl` (docker stats samples of the proxy
-# containers) to the output directory.
+# `<mesh>_http1_<payload>.resources.json` (marker-bracketed host /proc CPU
+# and sampled RSS of the proxy processes) to the output directory.
 #
 # Usage: ./run_mesh_runtime_bench.sh <mesh> [options]
 #        ./run_mesh_runtime_bench.sh --build-only [options]
-#   Mesh: direct | ferrum | envoy | consul | linkerd
+#   Mesh: direct | ferrum | envoy | consul | consulhttp | linkerd
 #
 # Options:
 #   --payload-sizes "1024 10240 71680 512000 1048576 5242880"
@@ -64,7 +64,7 @@ if [ "${1:-}" = "--build-only" ]; then
     shift
 else
     MESH="${1:-}"
-    [ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|linkerd> [options]" >&2; exit 2; }
+    [ -z "$MESH" ] && { echo "usage: $0 <direct|ferrum|envoy|consul|consulhttp|linkerd> [options]" >&2; exit 2; }
     shift
     case "$MESH" in
         direct|ferrum|envoy|consul|consulhttp|linkerd) ;;
@@ -503,15 +503,21 @@ consul_intention_probe() {
     fi
     echo "[auth-probe] ok: plaintext refused on public listener" | tee -a "$evidence"
     docker exec "$AGENT_NAME" consul config write /tmp/intention-deny.json >> "$evidence" 2>&1
-    local attempt denied=false
+    local attempt denied=false exhausted=false
     for attempt in $(seq 1 20); do
-        [ "$SECONDS" -lt "$READINESS_DEADLINE" ] || break
+        [ "$SECONDS" -lt "$READINESS_DEADLINE" ] || { exhausted=true; break; }
         if ! probe_loadgen "http://127.0.0.1:$OUTBOUND_PORT/echo"; then
+            # A probe cut short by the shared budget is not a denial.
+            [ "$SECONDS" -lt "$READINESS_DEADLINE" ] || { exhausted=true; break; }
             denied=true; break
         fi
         sleep 0.5
     done
     docker exec "$AGENT_NAME" consul config delete -kind service-intentions -name svc >> "$evidence" 2>&1
+    if [ "$exhausted" = true ]; then
+        echo "[auth-probe] FAIL: shared ${READINESS_TIMEOUT_SECS}s readiness budget exhausted before the deny probe completed" | tee -a "$evidence" >&2
+        return 1
+    fi
     if [ "$denied" != true ]; then
         echo "[auth-probe] FAIL: deny intention did not break the echo path" | tee -a "$evidence" >&2
         return 1
@@ -575,10 +581,14 @@ effective_concurrency() {
     fi
 }
 
+# One exchange budget each for a warmup and a measured drain, plus setup.
+cell_wall_timeout_secs() {
+    echo $((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))
+}
+
 run_cell() {
     local payload="$1" target="$2"
     local out="$OUTPUT_DIR/${MESH}_http1_${payload}.json"
-    local stats="$OUTPUT_DIR/${MESH}_http1_${payload}.stats.jsonl"
     local eff_concurrency
     eff_concurrency=$(effective_concurrency "$payload")
     echo "[bench] $MESH payload=${payload}B duration=${DURATION}s concurrency=$eff_concurrency"
@@ -593,7 +603,8 @@ run_cell() {
         resource_args+=(--allocation-url http://127.0.0.1:15120/metrics --allocation-url http://127.0.0.1:15020/metrics)
     fi
     local rc=0
-    local cell_budget=$((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))
+    local cell_budget
+    cell_budget=$(cell_wall_timeout_secs)
     echo "[bench] cell wall budget=${cell_budget}s exchange budget=${EXCHANGE_TIMEOUT_SECS}s"
     timeout --signal=TERM --kill-after=5s "${cell_budget}s" \
         python3 -u "$SCRIPT_DIR/collect_resources.py" "${resource_args[@]}" \
@@ -678,7 +689,7 @@ write_manifest() {
     done
     printf '{"mesh":"%s","payload_sizes":[%s],"duration":%s,"concurrency":%s,"warmup":%s,"exchange_timeout_secs":%s,"readiness_timeout_secs":%s,"cell_wall_timeout_secs":%s,"cell_kill_grace_secs":5,"cell_cleanup_timeout_secs":2}\n' \
         "$MESH" "$cells" "$DURATION" "$CONCURRENCY" "$WARMUP" "$EXCHANGE_TIMEOUT_SECS" "$READINESS_TIMEOUT_SECS" \
-        "$((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))" \
+        "$(cell_wall_timeout_secs)" \
         > "$OUTPUT_DIR/${MESH}_manifest.json"
 }
 

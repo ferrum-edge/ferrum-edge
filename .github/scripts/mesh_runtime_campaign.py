@@ -100,11 +100,18 @@ def measure(args):
 
 def relabel(directory):
     for file in list(directory.glob("ferrum*.json")):
-        document = json.loads(file.read_text())
+        renamed = file.with_name(file.name.replace("ferrum", "ferrumbaseline", 1))
+        try:
+            document = json.loads(file.read_text())
+        except ValueError:
+            # Empty or truncated failed-cell evidence keeps its raw bytes.
+            document = None
+        if not isinstance(document, dict):
+            file.rename(renamed)
+            continue
         for key in ("mesh", "gateway"):
             if document.get(key) == "ferrum":
                 document[key] = "ferrumbaseline"
-        renamed = file.with_name(file.name.replace("ferrum", "ferrumbaseline", 1))
         renamed.write_text(json.dumps(document, indent=2) + "\n")
         file.unlink()
 

@@ -188,6 +188,8 @@ def collect(results_root: Path) -> dict:
         if resource_file.exists():
             try:
                 resources = json.loads(resource_file.read_text())
+                if not isinstance(resources, dict):
+                    raise ValueError("resource interval is not a JSON object")
                 seconds = resources.get("elapsed_seconds", 0)
                 if not resources.get("valid") or not seconds or resources.get("host_cpu_steal_percent", 100) > 5:
                     record["resource_error"] = "invalid /proc interval or CPU steal above 5%"
@@ -252,7 +254,11 @@ def collect(results_root: Path) -> dict:
     if planned is not None:
         for expected, identity in planned.items():
             status = expected.parent / f"{identity['mesh']}_arm_status.json"
-            unsupported = status.exists() and json.loads(status.read_text()).get("status") == "unsupported-standalone"
+            try:
+                status_doc = json.loads(status.read_text()) if status.exists() else {}
+            except (OSError, ValueError):
+                status_doc = {}
+            unsupported = isinstance(status_doc, dict) and status_doc.get("status") == "unsupported-standalone"
             if not unsupported and (not expected.exists() or not expected.with_suffix(".resources.json").exists()):
                 warnings.append(f"missing expected cell or resource interval {expected}")
     for (mesh, payload), records in sorted(cells.items()):
