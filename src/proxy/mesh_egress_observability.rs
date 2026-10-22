@@ -558,40 +558,106 @@ mod tests {
 
     #[tokio::test]
     async fn set_target_stamps_principal_before_tcp_finalize_marker() {
-        let mut ctx = stream_context();
-        let metadata = ctx.metadata.get_or_insert_with(Default::default);
-        metadata.insert("mesh.request_protocol".to_string(), "tcp".to_string());
-        metadata.insert(
-            crate::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
-                .to_string(),
-            "1".to_string(),
-        );
-        metadata.insert(
-            crate::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA
-                .to_string(),
-            "1".to_string(),
-        );
-        let mut lifecycle = CapturedMeshEgressLifecycle {
-            plugins: vec![],
-            stream_ctx: Some(ctx),
-            namespace: "default".to_string(),
-            proxy_id: "mesh-egress".to_string(),
-            proxy_name: Some("orders.default.svc.cluster.local".to_string()),
-            client_ip: "10.0.0.2".to_string(),
-            backend_target: "orders.default.svc.cluster.local".to_string(),
-            protocol: "tcp".to_string(),
-            connected_wall_at: chrono::Utc::now(),
-            connected_at: std::time::Instant::now(),
-            bytes_sent: 0,
-            bytes_received: 0,
-            connection_error: Some("setup failed".to_string()),
-            error_class: Some(ErrorClass::ConnectionPoolError),
-            disconnect_direction: Some(Direction::ClientToBackend),
-            disconnect_cause: Some(DisconnectCause::BackendError),
-            udp_outcome_signal: None,
-            udp_byte_counters: None,
-            completion_recorded: false,
+        // Exercise production admission instead of supplying observation
+        // markers by hand. Both real builtins must already be in the epoch.
+        let mut proxy: crate::config::types::Proxy = serde_json::from_value(serde_json::json!({
+            "id": "captured-egress-real-start-regression",
+            "namespace": "default",
+            "name": "orders.default.svc.cluster.local",
+            "backend_scheme": "tcp",
+            "backend_host": "10.0.0.8",
+            "backend_port": 5432,
+            "listen_port": 15432
+        }))
+        .expect("test TCP proxy");
+        proxy.dispatch_kind = crate::config::types::DispatchKind::from(BackendScheme::Tcp);
+        let plugin = |id: &str, name: &str, config: serde_json::Value| {
+            serde_json::from_value::<crate::config::types::PluginConfig>(serde_json::json!({
+                "id": id,
+                "namespace": "default",
+                "plugin_name": name,
+                "scope": "global",
+                "enabled": true,
+                "config": config
+            }))
+            .expect("test global plugin")
         };
+        let config = crate::config::types::GatewayConfig {
+            proxies: vec![proxy.clone()],
+            plugin_configs: vec![
+                plugin(
+                    "captured-egress-workload",
+                    "workload_metrics",
+                    serde_json::json!({
+                        "namespace": "default",
+                        "workload_spiffe_id": "spiffe://cluster.local/ns/default/sa/frontend",
+                        "span_reporting_disabled": true
+                    }),
+                ),
+                plugin(
+                    "captured-egress-prometheus",
+                    "prometheus_metrics",
+                    serde_json::json!({}),
+                ),
+            ],
+            ..Default::default()
+        };
+        let plugin_cache = crate::plugin_cache::PluginCache::new(&config)
+            .expect("both configured builtin metric plugins");
+        let consumers = ConsumerIndex::new(&config.consumers);
+        let load_balancer = crate::load_balancer::LoadBalancerCache::new(&config);
+        let store = crate::request_epoch::RequestEpochStore::from_runtime_parts(
+            config,
+            &plugin_cache,
+            &consumers,
+            &load_balancer,
+        );
+        let epoch = store.load();
+        let chain = epoch.plugin_cache.plugins_for_protocol(
+            &proxy.namespace,
+            &proxy.id,
+            ProxyProtocol::Tcp,
+        );
+        for name in ["workload_metrics", "prometheus_metrics"] {
+            assert_eq!(
+                chain
+                    .iter()
+                    .filter(|plugin| {
+                        plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())
+                    })
+                    .count(),
+                1,
+                "the real TCP cache must contain exactly one builtin {name}"
+            );
+        }
+        let mut lifecycle = CapturedMeshEgressLifecycle::start(
+            &epoch,
+            &proxy,
+            ProxyProtocol::Tcp,
+            "10.0.0.2".parse().expect("test source IP"),
+            "orders.default.svc.cluster.local",
+            5432,
+            None,
+        )
+        .await
+        .expect("workload_metrics establishes the captured lifecycle");
+        let metadata = lifecycle
+            .stream_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.metadata.as_ref())
+            .expect("metadata from actual connect hooks");
+        assert!(
+            metadata.contains_key(
+                crate::plugins::mesh::prometheus_helpers::MESH_WORKLOAD_METRICS_OBSERVED_METADATA
+            ),
+            "the builtin workload_metrics hook must observe the captured stream"
+        );
+        assert!(
+            metadata.contains_key(
+                crate::plugins::mesh::prometheus_helpers::MESH_PROMETHEUS_METRICS_OBSERVED_METADATA
+            ),
+            "configured builtin prometheus_metrics must observe real captured start"
+        );
 
         let mut target = crate::config::types::UpstreamTarget {
             host: "10.0.0.8".to_string(),
@@ -633,6 +699,11 @@ mod tests {
             .and_then(|ctx| ctx.metadata.as_ref())
             .expect("stream metadata");
         assert!(crate::plugins::mesh::prometheus_helpers::mesh_tcp_opened_finalized(metadata));
+        lifecycle.complete_tcp(&crate::proxy::tcp_proxy::StreamCopyResult {
+            bytes_client_to_backend: 42,
+            bytes_backend_to_client: 84,
+            first_failure: None,
+        });
     }
 
     #[tokio::test]
