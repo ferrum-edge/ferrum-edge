@@ -124,9 +124,11 @@ jobs:
           # `--network host` with a real port: a replica-set member advertises
           # its own host:port and the driver reconnects to whatever is
           # advertised, so a `-p` mapping would point the driver at the wrong
-          # port.
+          # port. GLIBC_TUNABLES keeps mongo:9 clear of its kernel 6.19-7.0.13
+          # startup gate on the ubuntu-26.04 runners; see ci.yml (issue #6589).
           docker run -d --name ferrum-scale-test-mongo --network host \
-            mongo:7 --replSet rs0 --port 27117 --bind_ip_all
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
+            mongo:9 --replSet rs0 --port 27117 --bind_ip_all
 
           echo "Waiting for MongoDB to be ready..."
           for i in $(seq 1 30); do
