@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -16,6 +17,7 @@ def module(name, path):
 
 campaign = module("campaign", ROOT / ".github/scripts/mesh_runtime_campaign.py")
 resources = module("resources", Path(__file__).resolve().parents[1] / "collect_resources.py")
+observer = module("observer", Path(__file__).resolve().parents[1] / "production_observer.py")
 protocol = module("protocol", Path(__file__).resolve().parents[1] / "verify_consul_protocol.py")
 summary = module("summary", ROOT / ".github/scripts/summarize_mesh_runtime_results.py")
 
@@ -44,6 +46,57 @@ class Contracts(unittest.TestCase):
             self.assertEqual(snapshot["starttime"], 90)
             self.assertEqual(snapshot["cpu_ticks"], 23)
             self.assertGreater(snapshot["rss_bytes"], 0)
+            self.assertEqual((snapshot["user_ticks"], snapshot["system_ticks"]), (20, 3))
+
+    def cpu_snapshot_fixture(self, proc, user, system, *, thread=False, truncated=False):
+        directory = proc / ("123/task/124" if thread else "123")
+        directory.mkdir(parents=True)
+        tail = ["0"] * 37
+        tail[0], tail[11], tail[12], tail[19], tail[21] = "S", user, system, "90", "7"
+        if truncated:
+            tail = tail[:12]
+        stat = directory / "stat"
+        stat.write_text(("124" if thread else "123") + " (worker ) odd) " + " ".join(tail))
+        if thread:
+            (directory / "status").write_text("voluntary_ctxt_switches: 4\nnonvoluntary_ctxt_switches: 2\n")
+            (directory / "schedstat").write_text("100 20 3\n")
+        return stat
+
+    def read_cpu_snapshot(self, proc, thread):
+        if thread:
+            with patch.object(observer, "Path", return_value=proc):
+                return observer.thread_snapshot(123)[0]
+        return resources.process_snapshot(123, proc)
+
+    def test_process_and_thread_cpu_split_preserves_combined_same_read(self):
+        for thread in (False, True):
+            for user, system in ((0, 0), (20, 3), (2**60, 2**59)):
+                with self.subTest(thread=thread, user=user, system=system), tempfile.TemporaryDirectory() as tmp:
+                    proc = Path(tmp)
+                    stat = self.cpu_snapshot_fixture(proc, str(user), str(system), thread=thread)
+                    original_read = Path.read_text
+                    with patch.object(Path, "read_text", autospec=True, side_effect=original_read) as reads:
+                        snapshot = self.read_cpu_snapshot(proc, thread)
+                    self.assertEqual(sum(call.args[0] == stat for call in reads.call_args_list), 1)
+                    self.assertEqual((snapshot["user_ticks"], snapshot["system_ticks"], snapshot["cpu_ticks"]),
+                                     (user, system, user + system))
+                    self.assertTrue(all(type(snapshot[key]) is int and snapshot[key] >= 0
+                                        for key in ("user_ticks", "system_ticks", "cpu_ticks")))
+                    self.assertEqual(snapshot["user_ticks"] + snapshot["system_ticks"], snapshot["cpu_ticks"])
+                    self.assertEqual(snapshot["starttime"], 90)
+                    if thread:
+                        self.assertEqual((snapshot["runtime_ns"], snapshot["runqueue_wait_ns"], snapshot["timeslices"]), (100, 20, 3))
+                        self.assertEqual((snapshot["voluntary_context_switches"], snapshot["involuntary_context_switches"]), (4, 2))
+
+    def test_process_and_thread_cpu_split_rejects_malformed_counters(self):
+        for thread in (False, True):
+            for user, system, truncated in (("-1", "3", False), ("20", "-3", False),
+                    ("1.5", "3", False), ("20", "NaN", False), ("true", "3", False), ("20", "3", True)):
+                with self.subTest(thread=thread, user=user, system=system, truncated=truncated), tempfile.TemporaryDirectory() as tmp:
+                    proc = Path(tmp)
+                    self.cpu_snapshot_fixture(proc, user, system, thread=thread, truncated=truncated)
+                    with self.assertRaises((ValueError, IndexError)):
+                        self.read_cpu_snapshot(proc, thread)
 
     def test_consul_http_requires_live_http_filters_in_both_proxies(self):
         tcp = {"name": "envoy.filters.network.tcp_proxy"}

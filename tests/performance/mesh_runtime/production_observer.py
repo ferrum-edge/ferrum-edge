@@ -66,13 +66,17 @@ def thread_snapshot(pid):
         try:
             raw = (task / "stat").read_text()
             stat = raw.rsplit(")", 1)[1].split()
+            user_ticks, system_ticks = int(stat[11]), int(stat[12])
+            if user_ticks < 0 or system_ticks < 0:
+                raise ValueError("negative thread CPU ticks")
             status = dict(line.split(":", 1) for line in (task / "status").read_text().splitlines())
             sched = [int(x) for x in (task / "schedstat").read_text().split()]
             result.append({"tid": int(task.name), "comm": raw.split("(", 1)[1].rsplit(")", 1)[0],
-                "starttime": int(stat[19]), "cpu_ticks": int(stat[11])+int(stat[12]),
+                "starttime": int(stat[19]), "cpu_ticks": user_ticks + system_ticks,
                 "last_cpu": int(stat[36]), "runtime_ns": sched[0], "runqueue_wait_ns": sched[1],
                 "timeslices": sched[2], "voluntary_context_switches": int(status["voluntary_ctxt_switches"]),
-                "involuntary_context_switches": int(status["nonvoluntary_ctxt_switches"])})
+                "involuntary_context_switches": int(status["nonvoluntary_ctxt_switches"]),
+                "user_ticks": user_ticks, "system_ticks": system_ticks})
         except FileNotFoundError:
             pass
     return result
