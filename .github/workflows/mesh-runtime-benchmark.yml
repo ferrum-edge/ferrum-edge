@@ -391,6 +391,13 @@ jobs:
       - name: Render every planned ratio and failed or undefined position
         if: always()
         run: python3 .github/scripts/mesh_gap_campaign.py summarize >> "$GITHUB_STEP_SUMMARY"
+      - name: Verify reused baseline bytes before bounded public export
+        if: always() && inputs.baseline_run_id != ''
+        timeout-minutes: 5
+        run: |
+          python3 .github/scripts/audit_mesh_gap_gateway_identity.py results/gap/campaign \
+            --candidate-sha "$GAP_CANDIDATE_SHA" --harness-sha "$GITHUB_SHA" \
+            --checks-receipt results/gap/checks/receipt.json --verify-baseline-reuse
       - name: Stage bounded public evidence without keys or build trees
         if: always()
         run: python3 .github/scripts/mesh_gap_campaign.py export
