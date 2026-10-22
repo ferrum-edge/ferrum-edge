@@ -20,7 +20,7 @@ use pin_project_lite::pin_project;
 use super::ping::{Ponger, Recorder};
 use super::{ping, PipeToSendStream, SendBuf};
 use crate::body::{Body, Incoming as IncomingBody};
-use crate::client::dispatch::{Callback, SendWhen, TrySendError};
+use crate::client::dispatch::{Callback, SendBatch, SendWhen, TrySendError};
 use crate::common::either::Either;
 use crate::common::io::Compat;
 use crate::common::time::Time;
@@ -31,6 +31,7 @@ use crate::rt::bounds::{Http2ClientConnExec, Http2UpgradedExec};
 use crate::upgrade::Upgraded;
 use crate::{Request, Response};
 use h2::client::ResponseFuture;
+use smallvec::SmallVec;
 
 type ClientRx<B> = crate::client::dispatch::Receiver<Request<B>, Response<IncomingBody>>;
 
@@ -382,6 +383,10 @@ pin_project! {
             #[pin]
             send_when: SendWhen<B, E>,
         },
+        Batch {
+            #[pin]
+            send_batch: SendBatch<B, E>,
+        },
         Task {
             #[pin]
             task: ConnTask<T, B>,
@@ -404,6 +409,7 @@ where
         match this {
             H2ClientFutureProject::Pipe { pipe } => pipe.poll(cx),
             H2ClientFutureProject::Send { send_when } => send_when.poll(cx),
+            H2ClientFutureProject::Batch { send_batch } => send_batch.poll(cx),
             H2ClientFutureProject::Task { task } => task.poll(cx),
         }
     }
@@ -529,7 +535,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     T: Read + Write + Unpin,
 {
-    fn poll_pipe(&mut self, f: FutCtx<B>, cx: &mut Context<'_>) {
+    fn poll_pipe(&mut self, f: FutCtx<B>, cx: &mut Context<'_>) -> SendWhen<B, E> {
         let ping = self.ping.clone();
 
         // A one-shot channel so that send_task can tell pipe_task to
@@ -578,18 +584,51 @@ where
             Some(f.body_tx)
         };
 
-        self.executor.execute_h2_future(H2ClientFuture::Send {
-            send_when: SendWhen {
-                when: ResponseFutMap {
-                    fut: f.fut,
-                    ping: Some(ping),
-                    send_stream: Some(send_stream),
-                    exec: self.executor.clone(),
-                    cancel_tx: Some(cancel_tx),
-                },
-                call_back: Some(f.cb),
+        SendWhen {
+            when: ResponseFutMap {
+                fut: f.fut,
+                ping: Some(ping),
+                send_stream: Some(send_stream),
+                exec: self.executor.clone(),
+                cancel_tx: Some(cancel_tx),
             },
-        });
+            call_back: Some(f.cb),
+        }
+    }
+
+    fn queue_send(
+        &mut self,
+        f: FutCtx<B>,
+        cx: &mut Context<'_>,
+        sends: &mut SmallVec<[SendWhen<B, E>; 1]>,
+    ) {
+        let waiter = self.poll_pipe(f, cx);
+        if sends.len() == 1 {
+            // Spill once, only when this poll already has a second waiter.
+            sends.reserve_exact(7);
+        }
+        sends.push(waiter);
+        if sends.len() == 8 {
+            self.flush_sends(sends);
+        }
+    }
+
+    fn flush_sends(&mut self, sends: &mut SmallVec<[SendWhen<B, E>; 1]>) {
+        if sends.len() == 1 {
+            // The singleton retains the original task type and allocation.
+            if let Some(send_when) = sends.pop() {
+                self.executor
+                    .execute_h2_future(H2ClientFuture::Send { send_when });
+            }
+        } else if !sends.is_empty() {
+            // This vector has already spilled and holds at most eight waiters.
+            // into_vec transfers its allocation; there is no per-child box.
+            let send_batch = SendBatch {
+                waiters: std::mem::take(sends).into_vec(),
+            };
+            self.executor
+                .execute_h2_future(H2ClientFuture::Batch { send_batch });
+        }
     }
 }
 
@@ -691,6 +730,29 @@ where
     type Output = crate::Result<Dispatched>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // FERRUM PATCH 007: the local batch cannot outlive this driver poll.
+        // All ready!, ?, and explicit returns are inside poll_dispatch; flush
+        // runs after every normal exit, including errors and shutdown.
+        let mut sends = SmallVec::new();
+        let result = self.poll_dispatch(cx, &mut sends);
+        self.flush_sends(&mut sends);
+        result
+    }
+}
+
+impl<B, E, T> ClientTask<B, E, T>
+where
+    B: Body + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    E: Http2ClientConnExec<B, T> + Clone + Unpin,
+    T: Read + Write + Unpin,
+{
+    fn poll_dispatch(
+        &mut self,
+        cx: &mut Context<'_>,
+        sends: &mut SmallVec<[SendWhen<B, E>; 1]>,
+    ) -> Poll<crate::Result<Dispatched>> {
         loop {
             match ready!(self.h2_tx.poll_ready(cx)) {
                 Ok(()) => (),
@@ -708,7 +770,7 @@ where
             // If we were waiting on pending open
             // continue where we left off.
             if let Some(f) = self.fut_ctx.take() {
-                self.poll_pipe(f, cx);
+                self.queue_send(f, cx, sends);
                 continue;
             }
 
@@ -804,7 +866,7 @@ where
                             continue;
                         }
                     }
-                    self.poll_pipe(f, cx);
+                    self.queue_send(f, cx, sends);
                     continue;
                 }
 
@@ -827,3 +889,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client/ferrum_send_batch_tests.rs"]
+mod ferrum_send_batch_tests;

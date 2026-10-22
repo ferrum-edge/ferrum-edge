@@ -964,6 +964,37 @@
       ]
     },
     {
+      "id": "hyper-007-bounded-h2-response-groups",
+      "label": "bounded autonomous HTTP/2 response waiter groups",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/007-bounded-h2-response-groups/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Experimental task grouping: collect at most eight already-dequeued response waiters within a dispatcher poll and flush on every normal exit. Preserve autonomous SendWhen, singleton task allocation, response-first cancellation, early-upload continuation, CONNECT, retry ownership, and keepalive behavior. No performance gain established.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Remove if balanced remote controls reject grouping or any lifecycle regression appears; otherwise adopt equivalent bounded upstream task sharing or retire this Hyper client. Retain lifecycle and singleton regressions.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::client::ferrum_send_batch_tests)",
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_body_write_timeout_tests, ferrum_h2_flow_control_progress_tests, upgrade::ferrum_connect_error_reset_tests)"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",
