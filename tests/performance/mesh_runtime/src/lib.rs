@@ -96,7 +96,7 @@ impl FixedRateSchedule {
     pub fn claim_slot(&self) -> Option<ScheduledSlot> {
         let index = self
             .next
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 if next < self.offered_requests {
                     Some(next + 1)
                 } else {

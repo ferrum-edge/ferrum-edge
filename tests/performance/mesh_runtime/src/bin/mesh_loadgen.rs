@@ -35,7 +35,7 @@ fn report_error(
     error: &anyhow::Error,
 ) {
     if ERROR_LINES
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < MAX_ERROR_LINES).then_some(count + 1)
         })
         .is_err()
