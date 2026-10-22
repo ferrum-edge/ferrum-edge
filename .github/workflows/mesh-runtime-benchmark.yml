@@ -261,7 +261,7 @@ jobs:
       - name: Install native test prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler clang libclang-dev cmake openssl
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libcurl4-openssl-dev protobuf-compiler clang libclang-dev cmake openssl mold
       - name: Run only the selected fixed check plan
         run: python3 -u .github/scripts/mesh_gap_checks.py
       - name: Retain checks and generated manifest without build trees

@@ -18,6 +18,8 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
     env = {k: v for k, v in os.environ.items() if not k.startswith('FERRUM_')}
     for key in ('CARGO_TARGET_DIR', 'RUSTFLAGS', 'RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WRAPPER', 'UPDATE_VENDOR_INTEGRITY'):
         env.pop(key, None)
+    # Correctness-only resource settings; never inherited by release image builds.
+    env.update(CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_BUILD_JOBS='2')
     if vendor_lints:
         env['RUSTFLAGS'] = '--cap-lints=warn'
     started = time.monotonic()
@@ -36,6 +38,7 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
     text = (output / (name + '.log')).read_text(errors='replace')
     passed = sum(int(x) for x in re.findall(r'test result: ok\. (\d+) passed', text))
     record = dict(command=command, exit_code=exit_code, timed_out=timed_out, rustflags=env.get('RUSTFLAGS'),
+                  correctness_environment={key: env[key] for key in ('CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG', 'CARGO_BUILD_JOBS')},
                   elapsed_seconds=time.monotonic() - started, passed_tests=passed)
     write(output / (name + '.json'), record)
     if not allow_failure and (exit_code or timed_out or test and not passed):
