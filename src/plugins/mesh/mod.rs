@@ -6,6 +6,7 @@ pub mod authz;
 pub mod bpf_metrics;
 pub(crate) mod diagnostics;
 pub mod ext_authz;
+mod label_interner;
 pub mod outbound_registry;
 pub mod prometheus_helpers;
 pub mod service_graph;

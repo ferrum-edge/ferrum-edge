@@ -1,14 +1,14 @@
 //! Prometheus helpers for Istio/GAMMA-style mesh metrics.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
 
 use crate::identity::ca::PublishedTrustBundle;
 use crate::identity::spiffe::SpiffeId;
@@ -21,6 +21,8 @@ use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 use crate::tls::backend::{BackendTlsRefusalSurface, backend_tls_refusal_count};
+
+use super::label_interner::{LabelFrontCache, LabelInterner};
 
 const MESH_CERT_EXPIRY_STALE_RETENTION_SECONDS: u64 = 6 * 60 * 60;
 const MESH_CERT_EXPIRY_EVICTION_INTERVAL_SECONDS: u64 = 60;
@@ -1931,44 +1933,32 @@ fn mesh_cert_expiry_series_is_stale(expires_at: u64, last_observed_at: u64, now:
 /// and falls back to a per-call allocation (no worse than the prior behavior).
 const MESH_LABEL_INTERN_CAP: usize = 4096;
 
-/// Process-wide intern pool that turns repeated mesh-label `&str` values into a
-/// shared `Arc<str>` so [`mesh_request_key`] can clone (atomic increment)
-/// instead of heap-allocating a fresh `Arc` per field on every call.
-static MESH_LABEL_INTERN: LazyLock<DashMap<Box<str>, Arc<str>>> =
-    LazyLock::new(|| DashMap::with_shard_amount(super::observability_shard_amount()));
-static MESH_LABEL_INTERN_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Process-wide intern pool. The fixed-size worker cache below only retains
+/// values admitted here; overflow allocations never enter either cache.
+static MESH_LABEL_INTERN: LazyLock<LabelInterner<MESH_LABEL_INTERN_CAP>> =
+    LazyLock::new(|| LabelInterner::new(super::observability_shard_amount()));
 
-/// Intern a mesh label value into a shared `Arc<str>`.
+thread_local! {
+    static MESH_LABEL_FRONT_CACHE: RefCell<LabelFrontCache> =
+        const { RefCell::new(LabelFrontCache::new()) };
+}
+
+/// Intern a mesh label without changing its value or the process-wide cap.
 ///
-/// On the steady-state hot path (a previously-seen value) this is a single
-/// hash lookup plus a cheap `Arc::clone`. A first-seen value allocates once and
-/// is cached. Once the pool reaches [`MESH_LABEL_INTERN_CAP`] distinct values
-/// it stops growing and falls back to a plain `Arc::from`, keeping memory
-/// bounded under adversarial cardinality.
+/// Exact, short values recently admitted on this worker return the same shared
+/// Arc without a global map lookup. Cold, colliding and long values use the
+/// existing reservation-bounded interner. A reentrant borrow or TLS teardown
+/// also uses that path, so neither can panic or change the emitted label.
+#[inline]
 fn intern_label(value: &str) -> Arc<str> {
-    if let Some(existing) = MESH_LABEL_INTERN.get(value) {
-        return Arc::clone(existing.value());
-    }
-    if MESH_LABEL_INTERN_COUNT
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-            (count < MESH_LABEL_INTERN_CAP).then_some(count + 1)
+    MESH_LABEL_FRONT_CACHE
+        .try_with(|cache| {
+            let Ok(mut cache) = cache.try_borrow_mut() else {
+                return MESH_LABEL_INTERN.intern(value).into_arc();
+            };
+            cache.intern_with(value, |value| MESH_LABEL_INTERN.intern(value))
         })
-        .is_err()
-    {
-        return Arc::from(value);
-    }
-
-    match MESH_LABEL_INTERN.entry(Box::from(value)) {
-        Entry::Occupied(entry) => {
-            MESH_LABEL_INTERN_COUNT.fetch_sub(1, Ordering::Relaxed);
-            Arc::clone(entry.get())
-        }
-        Entry::Vacant(entry) => {
-            let interned = Arc::from(value);
-            entry.insert(Arc::clone(&interned));
-            interned
-        }
-    }
+        .unwrap_or_else(|_| MESH_LABEL_INTERN.intern(value).into_arc())
 }
 
 /// True when metadata carries mesh identity/routing keys rather than only the
@@ -1986,9 +1976,9 @@ fn metadata_has_mesh_identity_keys(metadata: &HashMap<String, String>) -> bool {
 ///
 /// Per-field label values are interned via [`intern_label`] so repeated label
 /// values (the common case — a bounded set of workloads / namespaces /
-/// protocols) become a hash lookup plus an `Arc` clone rather than ~11 fresh
-/// heap allocations per call. This runs on the `log` phase (RED metrics,
-/// service-graph aggregation, log shaping) and is gated off unless mesh
+/// protocols) reuse an `Arc` through the bounded worker/global intern caches
+/// rather than making fresh heap allocations per field. This runs on the `log`
+/// phase (RED metrics, service-graph aggregation, log shaping) and is gated off unless mesh
 /// metrics / the service graph are enabled.
 pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> {
     if !metadata_has_mesh_identity_keys(&summary.metadata) {

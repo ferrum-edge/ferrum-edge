@@ -3316,3 +3316,200 @@ fn prometheus_metrics_parity_lists_implemented_observation_hooks() {
         "stream-hook table must keep on_stream_disconnect: {stream_row}"
     );
 }
+
+#[test]
+fn mesh_label_cache_keeps_changed_metadata_and_wire_escaping_exact() {
+    let fields = [
+        ("mesh.source.workload", "source_workload"),
+        ("mesh.source.namespace", "source_namespace"),
+        ("mesh.source.principal", "source_principal"),
+        ("mesh.source.app", "source_app"),
+        ("mesh.source.service", "source_service"),
+        ("mesh.destination.workload", "destination_workload"),
+        ("mesh.destination.namespace", "destination_namespace"),
+        ("mesh.destination.principal", "destination_principal"),
+        ("mesh.destination.app", "destination_app"),
+        ("mesh.destination.service", "destination_service"),
+        ("mesh.request_protocol", "request_protocol"),
+        ("mesh.response_flags", "response_flags"),
+        (
+            "mesh.connection_security_policy",
+            "connection_security_policy",
+        ),
+    ];
+    let mut summary = make_summary("interner-reload", "GET", 200, 1.0, 0.5);
+    for generation in ["first", "reloaded", "first"] {
+        for (metadata, label) in fields {
+            summary
+                .metadata
+                .insert(metadata.into(), format!("{generation}-{label}-é\"\\\n"));
+        }
+        let key = prometheus_helpers::mesh_request_key(&summary).expect("mesh key");
+        let rendered = prometheus_helpers::mesh_label_fragment(&key, None);
+        for (_, label) in fields {
+            let expected = format!("{label}=\"{generation}-{label}-é\\\"\\\\\\n\"");
+            assert!(rendered.contains(&expected), "{expected}: {rendered}");
+        }
+    }
+    // A label beyond the front-cache limit still reaches metrics byte-exact.
+    let long = "é".repeat(300);
+    summary
+        .metadata
+        .insert("mesh.source.workload".into(), long.clone());
+    let key = prometheus_helpers::mesh_request_key(&summary).expect("mesh key");
+    assert_eq!(key.source_workload.as_ref(), long);
+    assert!(
+        prometheus_helpers::mesh_label_fragment(&key, None)
+            .contains(&format!("source_workload=\"{long}\""))
+    );
+}
+
+#[test]
+fn mesh_label_cache_keeps_worker_and_metadata_changes_independent() {
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for worker in 0..4 {
+            workers.push(scope.spawn(move || {
+                let mut summary = make_summary("interner-workers", "GET", 200, 1.0, 0.5);
+                summary
+                    .metadata
+                    .insert("mesh.source.namespace".into(), format!("worker-{worker}"));
+                summary.metadata.insert(
+                    "mesh.destination.workload".into(),
+                    "shared-destination".into(),
+                );
+                summary
+                    .metadata
+                    .insert("mesh.request_protocol".into(), "grpc".into());
+                for generation in (0..8).chain((0..8).rev()) {
+                    let source = format!("worker-{worker}-generation-{generation}");
+                    summary
+                        .metadata
+                        .insert("mesh.source.workload".into(), source.clone());
+                    let key = prometheus_helpers::mesh_request_key(&summary).expect("mesh key");
+                    assert_eq!(key.source_workload.as_ref(), source);
+                    assert_eq!(key.source_namespace.as_ref(), format!("worker-{worker}"));
+                    assert_eq!(key.source_app.as_ref(), source);
+                    assert_eq!(key.source_service.as_ref(), source);
+                    assert_eq!(key.destination_workload.as_ref(), "shared-destination");
+                    assert_eq!(key.request_protocol.as_ref(), "grpc");
+                    assert_eq!(key.response_flags.as_ref(), "-");
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+}
+
+/// Component timing only: excludes proxy I/O, TLS, scheduling across await
+/// points and end-to-end CPU. Run remotely on baseline/candidate test binaries
+/// with this identical external test file; retain every A/A and A/B sample.
+#[test]
+#[ignore = "remote-only mesh label interner diagnostic; no timing assertion"]
+fn mesh_label_interner_component_diagnostic() {
+    use std::hint::black_box;
+    use std::sync::Barrier;
+    use std::time::Instant;
+
+    const KEYS_PER_WORKER: usize = 250_000;
+    let fields = [
+        ("mesh.source.workload", "frontend-v1"),
+        ("mesh.source.namespace", "default"),
+        (
+            "mesh.source.principal",
+            "spiffe://cluster.local/ns/default/sa/frontend",
+        ),
+        ("mesh.source.app", "frontend"),
+        ("mesh.source.service", "frontend.default.svc.cluster.local"),
+        ("mesh.destination.workload", "payments-v1"),
+        ("mesh.destination.namespace", "default"),
+        (
+            "mesh.destination.principal",
+            "spiffe://cluster.local/ns/default/sa/payments",
+        ),
+        ("mesh.destination.app", "payments"),
+        (
+            "mesh.destination.service",
+            "payments.default.svc.cluster.local",
+        ),
+        ("mesh.request_protocol", "http"),
+        ("mesh.response_flags", "-"),
+        ("mesh.connection_security_policy", "mutual_tls"),
+    ];
+    for regime in ["hot13", "rotating32", "long_source"] {
+        let mut inputs = Vec::new();
+        let variants = if regime == "rotating32" { 32 } else { 1 };
+        for variant in 0..variants {
+            let mut summary = make_summary("label-component", "GET", 200, 1.0, 0.5);
+            for (field, value) in fields {
+                summary.metadata.insert(field.into(), value.into());
+            }
+            if regime == "rotating32" {
+                summary
+                    .metadata
+                    .insert("mesh.source.workload".into(), format!("rotating-{variant}"));
+            } else if regime == "long_source" {
+                summary
+                    .metadata
+                    .insert("mesh.source.workload".into(), "é".repeat(129));
+            }
+            inputs.push(summary);
+        }
+        for workers in [1, 4] {
+            let ready = Barrier::new(workers + 1);
+            let go = Barrier::new(workers + 1);
+            let (wall_ns, worker_ns) = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let inputs = &inputs;
+                        let ready = &ready;
+                        let go = &go;
+                        scope.spawn(move || {
+                            for _ in 0..16 {
+                                for input in inputs {
+                                    black_box(
+                                        prometheus_helpers::mesh_request_key(black_box(input))
+                                            .unwrap(),
+                                    );
+                                }
+                            }
+                            ready.wait();
+                            go.wait();
+                            let started = Instant::now();
+                            for iteration in 0..KEYS_PER_WORKER {
+                                let input = &inputs[iteration % inputs.len()];
+                                black_box(
+                                    prometheus_helpers::mesh_request_key(black_box(input)).unwrap(),
+                                );
+                            }
+                            started.elapsed().as_nanos()
+                        })
+                    })
+                    .collect();
+                ready.wait();
+                let started = Instant::now();
+                go.wait();
+                let elapsed: Vec<_> = handles
+                    .into_iter()
+                    .map(|worker| worker.join().unwrap())
+                    .collect();
+                (started.elapsed().as_nanos(), elapsed)
+            });
+            println!(
+                "{}",
+                json!({
+                    "schema": "mesh_label_interner_component.v1",
+                    "regime": regime,
+                    "workers": workers,
+                    "keys_per_worker": KEYS_PER_WORKER,
+                    "dimensions_per_key": fields.len(),
+                    "wall_ns": wall_ns,
+                    "worker_ns": worker_ns,
+                    "keys_per_second": (KEYS_PER_WORKER * workers) as f64 * 1_000_000_000.0 / wall_ns as f64,
+                })
+            );
+        }
+    }
+}
