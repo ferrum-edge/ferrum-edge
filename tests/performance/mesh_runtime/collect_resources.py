@@ -57,7 +57,24 @@ def host_snapshot(proc: Path = Path("/proc")) -> dict:
     return {"total_ticks": sum(values[:8]), "steal_ticks": values[7]}
 
 
+def header_diagnostic_args(args: argparse.Namespace) -> list[str]:
+    count = getattr(args, "diagnostic_header_count", None)
+    value_bytes = getattr(args, "diagnostic_header_value_bytes", None)
+    if count is None and value_bytes is None:
+        if getattr(args, "header_ladder_diagnostic", False):
+            raise ValueError("header diagnostic profile is missing")
+        return []
+    if (type(count) is not int or type(value_bytes) is not int or not 0 <= count <= 32
+            or not 0 <= value_bytes <= 256 or getattr(args, "header_ladder_diagnostic", False) is not True
+            or args.mesh not in ("direct", "ferrum", "envoy") or not args.production_observe
+            or args.perf_leaf or args.allocation_url or args.rate != 0 or args.payload_size != "1024"
+            or (args.duration, args.concurrency, args.warmup) not in (("3", "100", "1"), ("30", "100", "3"))):
+        raise ValueError("synthetic header diagnostic requires its fixed smoke or measured contract")
+    return ["--diagnostic-header-count", str(count), "--diagnostic-header-value-bytes", str(value_bytes)]
+
+
 def run(args: argparse.Namespace) -> int:
+    diagnostic_args = header_diagnostic_args(args)
     containers = []
     for name in args.container:
         inspected = json.loads(subprocess.check_output(["docker", "inspect", name], timeout=5))[0]
@@ -146,7 +163,7 @@ def run(args: argparse.Namespace) -> int:
             "--target", args.target, "--host-header", args.host_header, "--mesh", args.mesh,
             "--duration", args.duration, "--concurrency", args.concurrency,
             "--warmup", args.warmup, "--payload-size", args.payload_size,
-            "--exchange-timeout-secs", str(args.exchange_timeout_secs), "--rate", str(args.rate), "--resource-end-grace-ms", "250", "--json"],
+            "--exchange-timeout-secs", str(args.exchange_timeout_secs), "--rate", str(args.rate), "--resource-end-grace-ms", "250", "--json", *diagnostic_args],
             stdout=output, stderr=subprocess.PIPE, text=True, bufsize=1)
         if observer is not None:
             # Discover the child during warmup, before the CPU boundary. The
@@ -254,6 +271,9 @@ def main() -> int:
     parser.add_argument("--production-observe", action="store_true")
     parser.add_argument("--h2-upload-diagnostic", action="store_true")
     parser.add_argument("--h2-upload-image")
+    parser.add_argument("--header-ladder-diagnostic", action="store_true")
+    parser.add_argument("--diagnostic-header-count", type=int)
+    parser.add_argument("--diagnostic-header-value-bytes", type=int)
     parser.add_argument("--perf-leaf", action="store_true")
     parser.add_argument("--symbol-elf", action="append", default=[])
     parser.add_argument("--symbol-qualification-report")

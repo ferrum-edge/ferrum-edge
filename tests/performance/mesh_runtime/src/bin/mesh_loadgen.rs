@@ -16,6 +16,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1::SendRequest;
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
+use mesh_runtime_perf::header_diagnostic::{
+    HeaderDiagnostic, HeaderDiagnosticArgs, HeaderDiagnosticMetadata,
+};
 use mesh_runtime_perf::{BenchMetrics, FixedRateSchedule, MeasurementWindow};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
@@ -119,6 +122,8 @@ struct Cli {
     /// and is outside the measured interval; duration and RPS are unchanged.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1000))]
     resource_end_grace_ms: u64,
+    #[command(flatten)]
+    diagnostic_headers: HeaderDiagnosticArgs,
     #[arg(long, default_value_t = false)]
     json: bool,
 }
@@ -127,6 +132,7 @@ struct Cli {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::try_init().ok();
     let args = Cli::parse();
+    let diagnostic_headers = args.diagnostic_headers.profile()?.map(Arc::new);
 
     let url: http::Uri = args.target.parse().context("invalid target URL")?;
     let host = url.host().context("no host in URL")?.to_string();
@@ -159,6 +165,7 @@ async fn main() -> Result<()> {
         host_header: args.host_header.clone(),
         payload,
         exchange_timeout: Duration::from_secs(args.exchange_timeout_secs),
+        diagnostic_headers: diagnostic_headers.clone(),
     };
     let mut handles = Vec::with_capacity(args.concurrency as usize);
     for _ in 0..args.concurrency {
@@ -206,17 +213,35 @@ async fn main() -> Result<()> {
     }
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&combined.json(
-                &args.mesh,
-                &args.target,
-                args.concurrency,
-                args.duration,
-                args.payload_size,
-            ))
-            .unwrap_or_default()
+        let report = combined.json(
+            &args.mesh,
+            &args.target,
+            args.concurrency,
+            args.duration,
+            args.payload_size,
         );
+        if let Some(diagnostic) = &diagnostic_headers {
+            #[derive(serde::Serialize)]
+            struct DiagnosticReport<T> {
+                #[serde(flatten)]
+                report: T,
+                diagnostic_headers: HeaderDiagnosticMetadata,
+            }
+            let validated_exchanges = combined
+                .warmup_requests
+                .saturating_add(combined.total_requests)
+                .saturating_add(combined.drained_requests);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&DiagnosticReport {
+                    report,
+                    diagnostic_headers: diagnostic.metadata(validated_exchanges),
+                })?
+            );
+        } else {
+            // Keep the default report fields and serialization unchanged.
+            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        }
     } else {
         let r = combined.json(
             &args.mesh,
@@ -342,6 +367,7 @@ struct ExchangeTarget {
     host_header: String,
     payload: Bytes,
     exchange_timeout: Duration,
+    diagnostic_headers: Option<Arc<HeaderDiagnostic>>,
 }
 
 #[derive(Clone, Copy)]
@@ -514,19 +540,26 @@ async fn complete_exchange(
     let mut stage = "request_build";
     let mut response_status = None;
     match tokio::time::timeout(target.exchange_timeout, async {
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("POST")
             .uri(&target.path)
             .header("host", &target.host_header)
             .header("content-length", target.payload.len().to_string())
             .body(Full::new(target.payload.clone()))
             .map_err(|_| anyhow::anyhow!("stage=request_build cause=invalid_request"))?;
+        if let Some(diagnostic) = &target.diagnostic_headers {
+            diagnostic.append_request_headers(req.headers_mut());
+        }
 
         stage = "sender_ready";
         send.ready().await.map_err(|error| hyper_error("sender_ready", error))?;
         stage = "response_head";
         let resp = send.send_request(req).await.map_err(|error| hyper_error("response_head", error))?;
         let status = resp.status();
+        let receipt_valid = target
+            .diagnostic_headers
+            .as_ref()
+            .is_none_or(|diagnostic| diagnostic.validate_response_headers(resp.headers()));
         response_status = Some(status.as_u16());
         stage = "response_body";
         let bytes = resp.into_body().collect().await.map_err(|error| {
@@ -542,6 +575,10 @@ async fn complete_exchange(
             bytes == target.payload,
             "stage=response_validation cause=body_mismatch status={} expected_status=200 expected_body_bytes={} actual_body_bytes={}",
             status.as_u16(), target.payload.len(), bytes.len()
+        );
+        anyhow::ensure!(
+            receipt_valid,
+            "stage=response_validation cause=diagnostic_receipt_mismatch"
         );
         Ok((send, bytes.len()))
     })

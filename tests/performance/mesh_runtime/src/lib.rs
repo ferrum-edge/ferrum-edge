@@ -9,6 +9,8 @@
 //! measurement window. `cohort_*` latency fields also include successful
 //! drains from requests admitted inside that window, exposing their tail.
 
+pub mod header_diagnostic;
+
 use hdrhistogram::Histogram;
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -147,6 +147,19 @@ if [ "${BENCH_PHASE:-}" = h2-upload-diagnostic ] && [ "$BENCH_FERRUM_FEATURES" !
     echo "diagnostic phase requires its observer feature" >&2; exit 2
 fi
 
+# Opt-in, synthetic header diagnostic. Shipping/ranking calls cannot inherit it.
+HEADER_DIAGNOSTIC_ARGS=()
+if [ -n "${BENCH_DIAGNOSTIC_HEADER_COUNT+x}" ] || [ -n "${BENCH_DIAGNOSTIC_HEADER_VALUE_BYTES+x}" ]; then
+    [ "${BENCH_PHASE:-}" = header-ladder-diagnostic ] || { echo 'header diagnostic requires its explicit phase' >&2; exit 2; }
+    case "$MESH" in ferrum|envoy|direct) ;; *) exit 2 ;; esac
+    [[ "${BENCH_DIAGNOSTIC_HEADER_COUNT:-}" =~ ^(0|[1-9][0-9]?)$ ]] || exit 2
+    [[ "${BENCH_DIAGNOSTIC_HEADER_VALUE_BYTES:-}" =~ ^(0|[1-9][0-9]{0,2})$ ]] || exit 2
+    [ "$BENCH_DIAGNOSTIC_HEADER_COUNT" -le 32 ] && [ "$BENCH_DIAGNOSTIC_HEADER_VALUE_BYTES" -le 256 ] || exit 2
+    [ "$BENCH_FERRUM_FEATURES" = cloud-secrets ] && [ "${BENCH_PERF_LEAF:-false}" = false ] || exit 2
+    HEADER_DIAGNOSTIC_ARGS=(--diagnostic-header-count "$BENCH_DIAGNOSTIC_HEADER_COUNT"
+                            --diagnostic-header-value-bytes "$BENCH_DIAGNOSTIC_HEADER_VALUE_BYTES")
+fi
+
 BACKEND_PORT=18080
 OUTBOUND_PORT=15101
 HOST_HEADER="svc.ferrum.svc.cluster.local"
@@ -328,7 +341,7 @@ start_backend() {
     if [ "$MESH" = ferrumtcp ] || [ "$MESH" = consultcp ]; then bind_addr=0.0.0.0; fi
     docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$BACKEND_NAME" \
         --entrypoint /usr/local/bin/mesh_backend \
-        "$TOOLS_IMAGE" --listen "$bind_addr:$BACKEND_PORT" >/dev/null
+        "$TOOLS_IMAGE" --listen "$bind_addr:$BACKEND_PORT" "${HEADER_DIAGNOSTIC_ARGS[@]}" >/dev/null
 }
 
 # One short loadgen run used as the readiness probe: portable across
@@ -338,7 +351,7 @@ probe_loadgen() {
     local rc=0
     readiness_command 10 docker run --label "$BENCH_OWNER_LABEL" --rm "${LOADGEN_NETWORK_ARGS[@]}" --name "$PROBE_NAME" "$TOOLS_IMAGE" \
         --target "$target" --host-header "$HOST_HEADER" --mesh probe \
-        --duration 1 --concurrency 1 --payload-size 64 --exchange-timeout-secs 2 --json \
+        --duration 1 --concurrency 1 --payload-size 64 --exchange-timeout-secs 2 --json "${HEADER_DIAGNOSTIC_ARGS[@]}" \
         > "$out" 2> "$OUTPUT_DIR/logs/probe.stderr.log" || rc=$?
     if [ "$rc" -ne 0 ]; then
         timeout --signal=KILL 2s docker rm -f "$PROBE_NAME" >/dev/null 2>&1 || true
@@ -662,6 +675,8 @@ run_cell() {
     if [ "${BENCH_PHASE:-}" = h2-upload-diagnostic ]; then
         resource_args+=(--h2-upload-diagnostic --h2-upload-image "$FERRUM_IMAGE")
     fi
+    resource_args+=("${HEADER_DIAGNOSTIC_ARGS[@]}")
+    if [ "${#HEADER_DIAGNOSTIC_ARGS[@]}" -ne 0 ]; then resource_args+=(--header-ladder-diagnostic); fi
     resource_args+=(--fixture-owner "$BENCH_OWNER" --rate "${BENCH_RATE:-0}" --loadgen-network "${LOADGEN_NETWORK:-host}" --loadgen-user "${LOADGEN_USER:-}")
     local runner_prefix=()
     if [ "${BENCH_PRODUCTION_OBSERVE:-false}" = true ] || [ "${BENCH_PERF_LEAF:-false}" = true ]; then runner_prefix=(sudo -n); fi
