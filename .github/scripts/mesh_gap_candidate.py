@@ -12,7 +12,8 @@ import subprocess
 BASELINE = '4a7be250e45a367314e3dec872ecbd512220558e'
 GATEWAY_HARNESS = '766a3947caadc114cb62aa915a7209a43b94b03d'
 BUILDER = 'rust:latest@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a'
-PERFORMANCE_KINDS = ('h2-handoff', 'header-boundary', 'label-interner')
+PERFORMANCE_KINDS = ('h2-handoff', 'h2-response-groups', 'header-boundary', 'label-interner')
+HYPER_KINDS = ('h2-handoff', 'h2-response-groups')
 KINDS = (*PERFORMANCE_KINDS, 'telemetry-reproduce', 'telemetry-verify')
 PHASES = ('gap-vendor-preflight', 'gap-checks', 'gap-compare', 'gap-telemetry-reproduce', 'gap-telemetry-verify')
 SHA = re.compile(r'[0-9a-f]{40}')
@@ -40,7 +41,7 @@ def validate_inputs(candidate, kind, phase):
     for telemetry in ('reproduce', 'verify'):
         if (phase == 'gap-telemetry-' + telemetry) != (kind == 'telemetry-' + telemetry):
             raise ValueError('telemetry reproduction/verification use separate checks-only phases')
-    if phase == 'gap-vendor-preflight' and kind != 'h2-handoff':
+    if phase == 'gap-vendor-preflight' and kind not in HYPER_KINDS:
         raise ValueError('vendor preflight only applies to the vendored Hyper candidate')
     return dict(baseline_sha=BASELINE, candidate_sha=candidate, candidate_kind=kind,
                 phase=phase, profile='release', features='cloud-secrets',
@@ -91,7 +92,7 @@ def cargo_tests(kind):
         ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'gateway_mesh_trust_retirement_tests::'],
         ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'mesh_grpc_transport_tests::'],
     ]
-    if kind == 'h2-handoff':
+    if kind in HYPER_KINDS:
         return common + [
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'http2_pool_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'mesh_hbone_tests::'],

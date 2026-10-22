@@ -11,10 +11,34 @@ import subprocess
 import tempfile
 import time
 
-from mesh_gap_candidate import ROOT, cargo_tests, digest, expected_telemetry_red, git, require_remote, selection, write
+from mesh_gap_candidate import BASELINE, HYPER_KINDS, ROOT, cargo_tests, digest, expected_telemetry_red, git, require_remote, selection, write
 
 
-def run_command(command, checkout, output, name, *, test=False, allow_failure=False, vendor_lints=False):
+def batch_rustflags(control):
+    if type(control) is not bool:
+        raise ValueError('batch control selector must be a boolean')
+    flags = '--cap-lints=warn --check-cfg=cfg(ferrum_h2_batch_control)'
+    return flags + (' --cfg ferrum_h2_batch_control' if control else '')
+
+
+def test_counts(text):
+    summaries = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', text)
+    return dict(passed=sum(int(passed) for passed, _, _ in summaries),
+                failed=sum(int(failed) for _, failed, _ in summaries),
+                ignored=sum(int(ignored) for _, _, ignored in summaries))
+
+
+def require_test_counts(counts, expected_passed=None, expected_ignored=None):
+    if expected_ignored is not None:
+        # These five existing tests are compile contracts with ignored runtime
+        # bodies. Zero matches, an added executed test, or fewer contracts fail.
+        return counts == dict(passed=0, failed=0, ignored=expected_ignored)
+    return (counts['failed'] == 0 and counts['passed'] > 0 and
+            (expected_passed is None or counts['passed'] == expected_passed))
+
+
+def run_command(command, checkout, output, name, *, test=False, allow_failure=False,
+                vendor_lints=False, batch_control=None, expected_passed=None, expected_ignored=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith('FERRUM_')}
     for key in ('CARGO_TARGET_DIR', 'RUSTFLAGS', 'RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WRAPPER', 'UPDATE_VENDOR_INTEGRITY'):
         env.pop(key, None)
@@ -22,6 +46,10 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
     env.update(CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_BUILD_JOBS='2')
     if vendor_lints:
         env['RUSTFLAGS'] = '--cap-lints=warn'
+    if batch_control is not None:
+        if not vendor_lints:
+            raise ValueError('batch cfg flags are confined to standalone vendored checks')
+        env['RUSTFLAGS'] = batch_rustflags(batch_control)
     started = time.monotonic()
     print('[gap-check] start ' + name, flush=True)
     timed_out = False
@@ -43,13 +71,17 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
                     break
 
     text = (output / (name + '.log')).read_text(errors='replace')
-    passed = sum(int(x) for x in re.findall(r'test result: ok\. (\d+) passed', text))
+    counts = test_counts(text)
+    passed = counts['passed']
     record = dict(command=command, exit_code=exit_code, timed_out=timed_out, rustflags=env.get('RUSTFLAGS'),
                   correctness_environment={key: env[key] for key in ('CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG', 'CARGO_BUILD_JOBS')},
-                  elapsed_seconds=time.monotonic() - started, passed_tests=passed)
+                  elapsed_seconds=time.monotonic() - started, passed_tests=passed,
+                  ignored_tests=counts['ignored'], expected_passed=expected_passed,
+                  expected_ignored=expected_ignored, batch_control=batch_control)
     write(output / (name + '.json'), record)
     print(f'[gap-check] complete {name}: exit={exit_code} passed_tests={passed}', flush=True)
-    if not allow_failure and (exit_code or timed_out or test and not passed):
+    if not allow_failure and (exit_code or timed_out or
+            test and not require_test_counts(counts, expected_passed, expected_ignored)):
         raise ValueError(name + ' failed or matched no executed tests; retained log is authoritative')
     return record, text
 
@@ -81,6 +113,127 @@ def standalone_hyper(checkout, scratch, output):
         run_command(['cargo', 'test', '--locked', '--manifest-path', str(manifest), '--lib', '--features', 'full', test_filter, *config, '--', '--nocapture'], hyper, output, prefix + '-tests', test=True, vendor_lints=True)
         if digest(manifest) != digest(source / 'Cargo.toml'):
             raise ValueError('standalone test changed governed manifest')
+
+
+BATCH_TEST = 'src/proto/h2/client/ferrum_send_batch_tests.rs'
+BATCH_HOOK = '\n#[cfg(test)]\n#[path = "client/ferrum_send_batch_tests.rs"]\nmod ferrum_send_batch_tests;\n'
+HYPER_VENDOR = 'vendor/hyper-1.10.0-ferrum-patched'
+H2_VENDOR = 'vendor/h2-0.4.20-ferrum-patched'
+
+
+def copy_baseline_tree(relative, destination):
+    """Read only the fixed Git tree; do not borrow a mutable worktree's source."""
+    names = git('ls-tree', '-r', '--name-only', BASELINE, '--', relative).splitlines()
+    if not names:
+        raise ValueError('fixed baseline tree is empty: ' + relative)
+    for name in names:
+        target = destination / Path(name).relative_to(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(subprocess.check_output(['git', 'show', BASELINE + ':' + name], cwd=ROOT))
+
+
+def source_hashes(root):
+    # Exclude only Cargo's generated lock and target tree. Inspect all other
+    # source/manifest paths, including unexpected files created by a test.
+    result = {}
+    for child in sorted(root.iterdir()):
+        if child.name in ('target', 'Cargo.lock'):
+            continue
+        paths = [child] if child.is_file() else sorted(child.rglob('*'))
+        for path in paths:
+            if path.is_file():
+                result[str(path.relative_to(root))] = digest(path)
+    return result
+
+
+def validate_control_overlay(before, after, original_client, final_client, test_bytes, candidate_test_bytes):
+    expected = set(before) | {BATCH_TEST}
+    if set(after) != expected or BATCH_TEST in before:
+        raise ValueError('baseline overlay changed the governed file set unexpectedly')
+    if any(after[name] != value for name, value in before.items() if name != 'src/proto/h2/client.rs'):
+        raise ValueError('baseline overlay changed source outside the test module declaration')
+    if final_client != original_client + BATCH_HOOK.encode() or test_bytes != candidate_test_bytes:
+        raise ValueError('baseline overlay must contain only the literal test hook and identical tests')
+
+
+def standalone_hyper_groups(checkout, scratch, output):
+    """Fixed 16-test paired control; four isolated copies, two frozen graphs."""
+    source = checkout / HYPER_VENDOR
+    run_command(['rustfmt', '--edition', '2021', '--config', 'skip_children=true', '--check',
+                 str(source / BATCH_TEST)], checkout, output, 'hyper-groups-new-tests-fmt')
+    scratch.mkdir(parents=True, exist_ok=False)
+    baseline = scratch / 'baseline-source'
+    copy_baseline_tree(HYPER_VENDOR, baseline)
+    if (source / 'Cargo.toml').read_bytes() != (baseline / 'Cargo.toml').read_bytes():
+        raise ValueError('group candidate must preserve the exact baseline Hyper manifest')
+    h2 = scratch / 'h2'
+    copy_baseline_tree(H2_VENDOR, h2)
+    if source_hashes(h2) != source_hashes(checkout / H2_VENDOR):
+        raise ValueError('group candidate must preserve the exact baseline h2 source')
+    before = source_hashes(baseline)
+    original_client = (baseline / 'src/proto/h2/client.rs').read_bytes()
+    preparer = checkout / 'docs/upstream-hyper-patches/007-bounded-h2-response-groups/prepare_test_control.py'
+    run_command(['python3', str(preparer), str(baseline)], checkout, output, 'hyper-groups-control-overlay')
+    after = source_hashes(baseline)
+    validate_control_overlay(before, after, original_client,
+        (baseline / 'src/proto/h2/client.rs').read_bytes(),
+        (baseline / BATCH_TEST).read_bytes(), (source / BATCH_TEST).read_bytes())
+    write(output / 'hyper-groups-control-source.json', dict(base_sha=BASELINE,
+        scope='isolated test-only overlay; no candidate runtime source',
+        preparer_sha256=digest(preparer), before_sha256=before, after_sha256=after,
+        literal_test_hook=BATCH_HOOK, runtime_bytes_preserved=True,
+        shared_test_sha256=digest(source / BATCH_TEST)))
+    candidate_hashes = source_hashes(source)
+    baseline_hashes = source_hashes(baseline)
+    write(output / 'hyper-groups-source.json', dict(candidate=candidate_hashes,
+        baseline_with_test_overlay=baseline_hashes, h2=source_hashes(h2)))
+    for graph in ('stock', 'patched'):
+        config = ['--config', 'patch.crates-io.h2.path="' + str(h2) + '"'] if graph == 'patched' else []
+        expected = 'h2 v0.4.20' + (' (' + str(h2) + ')' if graph == 'patched' else '')
+        copies = {arm: scratch / (graph + '-' + arm) for arm in ('baseline', 'candidate')}
+        for arm, original in (('baseline', baseline), ('candidate', source)):
+            shutil.copytree(original, copies[arm])
+        # Resolve once, then use the identical lock for both source arms. Neither
+        # cfg flags nor a registry change between invocations can pick a new graph.
+        candidate = copies['candidate']
+        manifest = candidate / 'Cargo.toml'
+        lock_prefix = 'hyper-groups-' + graph + '-resolve'
+        run_command(['cargo', 'update', '--manifest-path', str(manifest),
+                     *(['-p', 'h2', '--precise', '0.4.20'] if graph == 'stock' else config)],
+                    candidate, output, lock_prefix, vendor_lints=True, batch_control=False)
+        lock_hash = digest(candidate / 'Cargo.lock')
+        shutil.copy2(candidate / 'Cargo.lock', copies['baseline'] / 'Cargo.lock')
+        for arm in ('baseline', 'candidate'):
+            hyper = copies[arm]
+            manifest = hyper / 'Cargo.toml'
+            control = arm == 'baseline'
+            prefix = 'hyper-groups-' + graph + '-' + arm
+            flags = dict(vendor_lints=True, batch_control=control)
+            _, tree = run_command(['cargo', 'tree', '--locked', '--manifest-path', str(manifest),
+                '--features', 'full', '-i', 'h2', *config], hyper, output, prefix + '-tree', **flags)
+            if [line for line in tree.splitlines() if re.match(r'^h2 v', line)] != [expected]:
+                raise ValueError(prefix + ' did not resolve the exact intended h2 graph')
+            shutil.copy2(hyper / 'Cargo.lock', output / (prefix + '.Cargo.lock'))
+            write(output / (prefix + '-graph.json'), dict(scope='standalone correctness only',
+                source_arm=arm, source_sha=BASELINE if control else git('rev-parse', 'HEAD', cwd=checkout),
+                test_only_overlay=control, manifest_sha256=digest(manifest),
+                original_manifest_sha256=digest(source / 'Cargo.toml'), h2_resolution=expected,
+                lock_sha256=lock_hash, rustflags=batch_rustflags(control),
+                controlled_occupancy_only=True, production_occupancy_measured=False))
+            command = ['cargo', 'test', '--locked', '--manifest-path', str(manifest), '--lib', '--features', 'full']
+            run_command([*command, 'ferrum_send_batch_tests', *config, '--', '--nocapture'],
+                        hyper, output, prefix + '-focused', test=True, expected_passed=16, **flags)
+            if graph == 'patched':
+                run_command([*command, 'ferrum_', *config, '--', '--nocapture'], hyper, output,
+                            prefix + '-full-ferrum', test=True, **flags)
+            run_command([*command, 'client::conn::http2::tests', *config], hyper, output,
+                        prefix + '-executor-contracts', test=True, expected_ignored=5, **flags)
+            if digest(hyper / 'Cargo.lock') != lock_hash:
+                raise ValueError(prefix + ' changed the paired lock')
+            expected_hashes = baseline_hashes if control else candidate_hashes
+            # Cargo target/lock are outside this captured source file set.
+            if source_hashes(hyper) != expected_hashes:
+                raise ValueError(prefix + ' changed standalone source or manifest bytes')
 
 
 def hyper_source_gates(checkout, output):
@@ -147,11 +300,13 @@ def main():
             result.update(complete=True, passed=True, modified_checkout=True,
                           scope='generated manifest only; apply/review/commit before definitive exact-head checks')
         else:
-            if chosen['candidate_kind'] == 'h2-handoff':
+            if chosen['candidate_kind'] in HYPER_KINDS:
                 hyper_source_gates(checkout, output)
             run_command(['cargo', 'fmt', '--all', '--', '--check'], checkout, output, 'fmt')
             if chosen['candidate_kind'] == 'h2-handoff':
                 standalone_hyper(checkout, checkout.parent / 'standalone', output)
+            elif chosen['candidate_kind'] == 'h2-response-groups':
+                standalone_hyper_groups(checkout, checkout.parent / 'standalone-groups', output)
             for index, command in enumerate(cargo_tests(chosen['candidate_kind']), 1):
                 run_command(command, checkout, output, 'targeted-' + str(index), test=True)
             run_command(['cargo', 'clippy', '--locked', '--features', 'cloud-secrets', '--lib', '--tests', '-p', 'ferrum-edge', '--', '-D', 'warnings'], checkout, output, 'clippy')
