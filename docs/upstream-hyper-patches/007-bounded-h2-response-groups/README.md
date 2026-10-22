@@ -148,8 +148,18 @@ new `SendBatch` type. The retained checks artifact is `12395741084`, with ZIP
 SHA-256 `1bb96ed8b946c24fba941d54b1d980d7d2219dfc76fee7e04c871a40d4a1c699`.
 The repair adds a manual `Debug` implementation reporting only the waiter count;
 it adds no `B`/`E` trait bounds and changes no polling, ownership, or scheduling.
-The failed source and evidence remain preserved. This repair still needs a new
-remote preflight and all correctness gates; it establishes no performance gain.
+The failed source and evidence remain preserved.
+
+Generated-manifest preflight [39708299251](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39708299251)
+subsequently passed seven vendor tests; its generated manifest was committed as
+`ad8439007dbdf128e8b42cf728ab9108500eb999`. This was generation preflight only.
+Exact-head comparison [39713142704](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39713142704)
+then failed while compiling the shared stock-H2 baseline tests: the free
+`h2::server::handshake` accepts one type parameter and already returns a Bytes
+connection. The shared fixture and ordered patch now use `handshake(server_io)`.
+Zero lifecycle tests executed in that failed run; release builds and performance
+sampling were skipped. This test-only correction changes no runtime source and
+still requires remote manifest generation followed by all exact-head gates.
 
 ## Integrity and retirement
 

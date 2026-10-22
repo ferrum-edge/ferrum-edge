@@ -279,7 +279,7 @@ impl Fixture {
         let (accepted_tx, accepted) = mpsc::unbounded_channel();
         let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let mut conn = h2::server::handshake::<_, Bytes>(server_io).await.unwrap();
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
             ping_tx.send(conn.ping_pong().unwrap()).unwrap();
             while let Some(request) = conn.accept().await {
                 if accepted_tx.send(request.unwrap()).is_err() {
