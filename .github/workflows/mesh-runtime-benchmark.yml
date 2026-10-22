@@ -7,7 +7,7 @@ on:
         description: "Qualification, production ranking, or labeled H1 idle-cap configuration diagnostic"
         type: choice
         default: smoke-l7
-        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum, gap-vendor-preflight, gap-checks, gap-compare, gap-telemetry-reproduce, gap-telemetry-verify, worker-locality-diagnostic, gap-profile-representative, h2-upload-vendor-preflight, h2-upload-diagnostic]
+        options: [smoke-l7, smoke, smoke-fixed, ranking, h1-idle-diagnostic, symbols, profile-envoy, ferrum-symbol-canary, profile-ferrum, gap-vendor-preflight, gap-checks, gap-compare, gap-telemetry-reproduce, gap-telemetry-verify, worker-locality-diagnostic, gap-profile-representative, gap-h1-reuse-diagnostic, h2-upload-vendor-preflight, h2-upload-diagnostic]
       candidate_sha:
         description: "Exact reviewed 40-hex candidate commit; required for candidate gap phases; unused by representative profile"
         type: string
@@ -247,7 +247,7 @@ jobs:
 
   gap-checks:
     name: Exact candidate correctness or explicitly labeled preflight
-    if: startsWith(inputs.phase, 'gap-') && inputs.phase != 'gap-profile-representative'
+    if: startsWith(inputs.phase, 'gap-') && inputs.phase != 'gap-profile-representative' && inputs.phase != 'gap-h1-reuse-diagnostic'
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     env:
@@ -585,4 +585,52 @@ jobs:
           path: |
             results/h2-upload-public
             results/h2-upload-host
+          retention-days: 30
+
+  h1-reuse-diagnostic:
+    name: Exact baseline and label candidate H1 correctness reproduction
+    if: inputs.phase == 'gap-h1-reuse-diagnostic'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 160
+    env:
+      RUSTFLAGS: ""
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - name: Check paired reproduction contracts without a workload
+        run: python3 -m unittest discover -s tests/performance/mesh_runtime/tests -p test_h1_reuse_diagnostic.py
+      - name: Install original functional target prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libcurl4-openssl-dev protobuf-compiler clang libclang-dev cmake openssl mold iproute2 iptables util-linux
+      - name: Restore compatible dependencies without publishing a cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-test
+          workspaces: ". -> target"
+          save-if: "false"
+          cache-on-failure: false
+      - name: Record diagnostic host
+        run: |
+          mkdir -p results/h1-reuse-host
+          lscpu > results/h1-reuse-host/lscpu.txt
+          free -b > results/h1-reuse-host/memory.txt
+      - name: Build each unchanged debug source once and retain both ABBA blocks
+        timeout-minutes: 145
+        run: python3 -u .github/scripts/mesh_h1_reuse_diagnostic.py
+      - name: Retain every planned outcome without binaries or test stores
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mesh-h1-reuse-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            results/h1-reuse-diagnostic
+            results/h1-reuse-host
           retention-days: 30
