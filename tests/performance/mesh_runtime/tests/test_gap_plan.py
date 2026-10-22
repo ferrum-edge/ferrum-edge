@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
 import unittest
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -83,6 +85,45 @@ class GapPlanContracts(unittest.TestCase):
         (directory / 'ferrum_http1_1024.resources.json').write_text(json.dumps(resource))
         source = dict(image_ids=dict(baseline=image, candidate=image, tools=tools))
         return cell, source, resource
+
+    def test_gateway_rss_wiring_keeps_frozen_validation_and_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            block = dict(pair=1, scenario='http1-tls')
+            cell = dict(arm='ferrum', leg='comparison', image_id='sha256:' + 'a' * 64)
+            raw = dict(process_usage=dict(measurement=[]), rps=100, cpu_per_request=0.001,
+                       total_errors=1, total_requests=3000, drain_requests=2,
+                       p50_us=10, p95_us=20, p99_us=30)
+            path = directory / 'protocol/pairs/pair_001/ferrum_http1-tls_1048576.json'
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(raw))
+            calls = []
+            producer = lambda *args: None
+            def observed(*args):
+                calls.append('frozen-observed')
+                return raw, dict(existing='proof')
+            def rss(*args, **kwargs):
+                calls.append('external-rss')
+                self.assertIs(kwargs['measurement_usage'], producer)
+                self.assertEqual(kwargs['image_id'], cell['image_id'])
+                return dict(proxy_rss_bytes_mean=100, proxy_rss_bytes_peak=200, rss_samples=3,
+                            evidence_sha256={'external-usage.json': 'b' * 64})
+            module = SimpleNamespace(observed=observed, measurement_usage=producer)
+            with patch.object(campaign, 'gateway_rss', rss):
+                row = campaign.gateway_observation(module, block, cell, directory)
+            self.assertEqual(calls, ['frozen-observed', 'external-rss'])
+            self.assertTrue(row['measurement_valid'], row['issues'])
+            self.assertFalse(row['capacity_qualified'])
+            self.assertEqual(row['metrics']['total_errors'], 1)
+            self.assertEqual(row['metrics']['proxy_rss_bytes_mean'], 100)
+            self.assertEqual(row['rss_evidence']['rss_samples'], 3)
+            self.assertEqual(row['evidence_sha256']['external-usage.json'], 'b' * 64)
+            with patch.object(module, 'observed', side_effect=ValueError('frozen identity failure')):
+                with patch.object(campaign, 'gateway_rss') as external:
+                    failed = campaign.gateway_observation(module, block, cell, directory)
+                external.assert_not_called()
+                self.assertFalse(failed['measurement_valid'])
+                self.assertIn('frozen identity failure', failed['issues'])
 
     def test_conserved_error_is_retained_and_capacity_fails(self):
         with tempfile.TemporaryDirectory() as temporary:

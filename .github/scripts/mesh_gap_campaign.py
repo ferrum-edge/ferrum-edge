@@ -17,6 +17,8 @@ import uuid
 
 from mesh_gap_candidate import BASELINE, GATEWAY_HARNESS, IMAGE, ROOT, digest, require_remote, selection, write
 from mesh_gap_build import checked_receipt, command
+from mesh_gap_export import export_public
+from mesh_gap_gateway_rss import gateway_rss
 from mesh_gap_baseline_reuse import requested as baseline_requested, validate_reuse
 from mesh_gap_plan import DECISION, comparisons, gateway_blocks, mesh_cells, screen
 import mesh_production_campaign as production
@@ -82,6 +84,10 @@ def load_gateway_module(checkout):
     spec = importlib.util.spec_from_file_location('gap_frozen_tail', checkout / '.github/scripts/mesh_tail_confirmation.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    producer = module.gateway_order.__globals__['measurement_usage']
+    if Path(producer.__code__.co_filename).resolve() != (checkout / 'tests/performance/multi_protocol/process_usage.py').resolve():
+        raise ValueError('gateway measurement producer is not from the pinned checkout')
+    module.measurement_usage = producer
     original = module.sample_issues
 
     def observation_issues(raw):
@@ -215,15 +221,12 @@ def gateway_observation(module, block, cell, directory):
             evidence = dict(zero_successful_window=True, cpu_per_completion='undefined; retained full process usage')
         # Retain successful-window service quantiles and independent error/drain counts.
         measurement = raw['process_usage']['measurement']
-        proxies = [item for item in measurement if item['role'] == 'gateway']
-        start = raw['phases']['measurement_start_unix_secs']
-        samples = [sum(p['rss_bytes'] for p in item['processes'] if p['role'] == 'gateway')
-                   for item in raw['process_usage'].get('timeline', []) if start <= item['unix_secs'] <= start + 30]
-        if not samples or not all(samples):
-            raise ValueError('gateway RSS measurement samples missing')
+        rss = gateway_rss(raw, directory, arm=cell['arm'], image_id=cell['image_id'],
+                          measurement_usage=module.measurement_usage)
+        row['evidence_sha256'].update(rss.pop('evidence_sha256'))
         metrics = dict(goodput_rps=raw['rps'], cpu_us_per_completion=raw['cpu_per_request'] * 1e6 if raw['cpu_per_request'] is not None else None,
             total_errors=raw['total_errors'], total_requests=raw['total_requests'], drained_requests=raw['drain_requests'],
-            proxy_rss_bytes_mean=sum(samples) / len(samples), proxy_rss_bytes_peak=max(samples))
+            proxy_rss_bytes_mean=rss['proxy_rss_bytes_mean'], proxy_rss_bytes_peak=rss['proxy_rss_bytes_peak'])
         for quantile in ('p50', 'p95', 'p99'):
             value = raw.get(quantile + '_us')
             if raw['total_requests'] == 0:
@@ -233,7 +236,7 @@ def gateway_observation(module, block, cell, directory):
                 raise ValueError('missing successful completion-window quantile')
             metrics['completion_' + quantile + '_us'] = value
         row.update(measurement_valid=True, capacity_qualified=raw['total_errors'] == 0 and raw['total_requests'] > 0,
-                   raw=raw, evidence=evidence, metrics=metrics, resource_headroom=measurement)
+                   raw=raw, evidence=evidence, rss_evidence=rss, metrics=metrics, resource_headroom=measurement)
     except (OSError, ValueError, TypeError, KeyError, IndexError, ArithmeticError) as error:
         row['issues'].append(str(error))
         # Raw files stay retained even when zero successful gateway completions
@@ -388,26 +391,7 @@ def summarize():
 
 
 def export():
-    destination = ROOT / 'results/gap/public'
-    destination.mkdir(parents=True, exist_ok=False)
-    total = 0
-    sources = [(OUTPUT, 'campaign'), (ROOT / 'results/gap/images', 'images')]
-    for source_root, label in sources:
-        for path in source_root.rglob('*'):
-            relative = path.relative_to(source_root)
-            if (not path.is_file() or path.is_symlink() or any(part in ('runtime', 'target', 'fixture') for part in relative.parts)
-                    or path.suffix not in ('.json', '.jsonl', '.log', '.txt', '.md', '.err') or path.name == 'image.tar'):
-                continue
-            content = path.read_bytes()
-            if b'PRIVATE KEY-----' in content:
-                raise ValueError('private key material found in public allowlist: ' + str(relative))
-            total += len(content)
-            if total > 256 * 1024**2:
-                raise ValueError('public artifact exceeds fixed 256MiB bound')
-            target = destination / label / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-    write(destination / 'export.json', dict(bytes=total, private_fixture_included=False, build_trees_included=False))
+    export_public(OUTPUT, ROOT / 'results/gap/images', ROOT / 'results/gap/public')
 
 
 if __name__ == '__main__':
