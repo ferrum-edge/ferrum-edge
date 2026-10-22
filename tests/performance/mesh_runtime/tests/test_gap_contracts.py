@@ -19,7 +19,7 @@ class GapContracts(unittest.TestCase):
         self.assertEqual(validate_inputs(CANDIDATE, 'h2-handoff', 'gap-checks')['baseline_sha'], BASELINE)
 
     def test_telemetry_cannot_enter_performance_or_preflight(self):
-        for kind, phase in (('telemetry-reproduce', 'gap-compare'), ('telemetry-reproduce', 'gap-checks'), ('header-boundary', 'gap-vendor-preflight'), ('h2-handoff', 'gap-telemetry-reproduce'), ('arbitrary', 'gap-checks')):
+        for kind, phase in (('telemetry-reproduce', 'gap-compare'), ('telemetry-reproduce', 'gap-checks'), ('telemetry-verify', 'gap-compare'), ('telemetry-verify', 'gap-telemetry-reproduce'), ('header-boundary', 'gap-vendor-preflight'), ('h2-handoff', 'gap-telemetry-reproduce'), ('arbitrary', 'gap-checks')):
             with self.subTest(kind=kind, phase=phase), self.assertRaises(ValueError):
                 validate_inputs(CANDIDATE, kind, phase)
 
@@ -33,6 +33,14 @@ class GapContracts(unittest.TestCase):
     def test_header_plan_contains_new_semantic_suite(self):
         filters = {command[-1] for command in cargo_tests('header-boundary')}
         self.assertTrue({'header_merge_reconciliation_tests::', 'consumer_assertion_namespace_tests::', 'request_context_tests::', 'mesh_grpc_transport_tests::'}.issubset(filters))
+
+    def test_interner_plan_preserves_policy_and_cardinality_coverage(self):
+        filters = {command[-1] for command in cargo_tests('label-interner')}
+        self.assertTrue({'mesh_label_interner_tests', 'mesh_label_cache_', 'mesh_telemetry_tag_cel_tests',
+                         'mesh_telemetry_metric_families_tests', 'admin_mesh_service_graph_tests',
+                         'mesh_telemetry_tracing_tests'}.issubset(filters))
+        selected = validate_inputs(CANDIDATE, 'telemetry-verify', 'gap-telemetry-verify')
+        self.assertEqual(selected['phase'], 'gap-telemetry-verify')
 
     def test_hyper_plan_contains_cancellation_and_hbone(self):
         filters = {command[-1] for command in cargo_tests('h2-handoff')}

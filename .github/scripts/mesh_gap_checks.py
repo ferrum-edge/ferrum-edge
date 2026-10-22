@@ -127,6 +127,16 @@ def main():
                           expected_assertion=expected, scope='correctness reproduction only; not a passing runtime test')
             if not reproduced:
                 raise ValueError('expected exact runtime assertion was not reproduced; compile/environment failures do not qualify')
+        elif phase == 'gap-telemetry-verify':
+            run_command(['cargo', 'fmt', '--all', '--', '--check'], checkout, output, 'fmt')
+            run_command(['cargo', 'test', '--locked', '--lib', 'proxy::mesh_egress_observability::tests::',
+                         '--', '--test-threads=1'], checkout, output, 'telemetry-lifecycle-tests', test=True)
+            run_command(['cargo', 'clippy', '--locked', '--lib', '--tests', '-p', 'ferrum-edge', '--', '-D', 'warnings'],
+                        checkout, output, 'clippy')
+            if git('status', '--porcelain', '--untracked-files=normal', cwd=checkout):
+                raise ValueError('telemetry verification changed submitted source')
+            result.update(complete=True, passed=True, performance_eligible=False,
+                          scope='correctness only; manifest-default test features; no release images or performance samples')
         elif phase == 'gap-vendor-preflight':
             run_command(['bash', 'scripts/update_vendor_integrity.sh'], checkout, output, 'vendor-manifest-generation', test=True)
             changes = git('diff', '--name-only', cwd=checkout).splitlines()

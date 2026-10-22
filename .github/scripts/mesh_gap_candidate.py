@@ -12,9 +12,9 @@ import subprocess
 BASELINE = '4a7be250e45a367314e3dec872ecbd512220558e'
 GATEWAY_HARNESS = '766a3947caadc114cb62aa915a7209a43b94b03d'
 BUILDER = 'rust:latest@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a'
-PERFORMANCE_KINDS = ('h2-handoff', 'header-boundary')
-KINDS = (*PERFORMANCE_KINDS, 'telemetry-reproduce')
-PHASES = ('gap-vendor-preflight', 'gap-checks', 'gap-compare', 'gap-telemetry-reproduce')
+PERFORMANCE_KINDS = ('h2-handoff', 'header-boundary', 'label-interner')
+KINDS = (*PERFORMANCE_KINDS, 'telemetry-reproduce', 'telemetry-verify')
+PHASES = ('gap-vendor-preflight', 'gap-checks', 'gap-compare', 'gap-telemetry-reproduce', 'gap-telemetry-verify')
 SHA = re.compile(r'[0-9a-f]{40}')
 IMAGE = re.compile(r'sha256:[0-9a-f]{64}')
 ROOT = Path(__file__).resolve().parents[2]
@@ -37,8 +37,9 @@ def validate_inputs(candidate, kind, phase):
         raise ValueError('candidate must differ from the fixed baseline')
     if kind not in KINDS or phase not in PHASES:
         raise ValueError('unknown allowlisted candidate kind or phase')
-    if (phase == 'gap-telemetry-reproduce') != (kind == 'telemetry-reproduce'):
-        raise ValueError('telemetry reproduction is a separate checks-only phase')
+    for telemetry in ('reproduce', 'verify'):
+        if (phase == 'gap-telemetry-' + telemetry) != (kind == 'telemetry-' + telemetry):
+            raise ValueError('telemetry reproduction/verification use separate checks-only phases')
     if phase == 'gap-vendor-preflight' and kind != 'h2-handoff':
         raise ValueError('vendor preflight only applies to the vendored Hyper candidate')
     return dict(baseline_sha=BASELINE, candidate_sha=candidate, candidate_kind=kind,
@@ -105,6 +106,20 @@ def cargo_tests(kind):
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'request_trailer_boundary_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'response_trailer_policy_tests::'],
             ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_gateway_core_tests', 'response_representation_tests::'],
+        ] + common
+    if kind == 'label-interner':
+        unit_filters = ('mesh_label_interner_tests', 'mesh_label_cache_',
+            'test_mesh_request_key_interns_repeated_label_values', 'prometheus_metrics_tests',
+            'mesh_telemetry_metric_families_tests', 'mesh_telemetry_tag_cel_tests', 'mesh_plugins_tests')
+        return [
+            ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_plugins_b_tests', test_filter]
+            for test_filter in unit_filters
+        ] + [
+            ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--lib', test_filter]
+            for test_filter in ('plugins::mesh::prometheus_helpers::tests', 'plugins::mesh::service_graph::tests')
+        ] + [
+            ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', test_filter]
+            for test_filter in ('admin_mesh_service_graph_tests', 'deferred_log_tests', 'mesh_telemetry_tracing_tests')
         ] + common
     raise ValueError('no performance check plan for this kind')
 
