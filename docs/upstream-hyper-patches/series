@@ -4,3 +4,4 @@
 004-h2-body-write-timeout/hyper-h2-body-write-timeout.patch
 005-h2-small-window-coalescing/hyper-h2-small-window-coalescing.patch
 006-h2-stream-termination-origin/hyper-h2-stream-termination-origin.patch
+007-lazy-h2-upload-cancellation/hyper-lazy-h2-upload-cancellation.patch

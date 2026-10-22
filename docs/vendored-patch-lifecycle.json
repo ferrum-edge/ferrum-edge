@@ -964,6 +964,37 @@
       ]
     },
     {
+      "id": "hyper-007-lazy-h2-upload-cancellation",
+      "label": "hyper allocates upload cancellation only for a suspended body",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/007-lazy-h2-upload-cancellation/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Experimental allocation candidate: EOS, CONNECT and eagerly completed or failed uploads have no body task to receive cancellation. Create the oneshot only for an eagerly Pending upload; retain the existing response waiter, task ownership, reset, early-response and timeout semantics. No performance gain established.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Remove if balanced remote controls reject the candidate; otherwise adopt a compatible Hyper release with equivalent lazy upload cancellation, or retire this Hyper client. Retain behavioral tests.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::client::ferrum_lazy_cancel_tests)",
+        "vendor/hyper-1.10.0-ferrum-patched (proto::h2::ferrum_body_write_timeout_tests, ferrum_h2_flow_control_progress_tests, upgrade::ferrum_connect_error_reset_tests)"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",

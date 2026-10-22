@@ -532,9 +532,10 @@ where
     fn poll_pipe(&mut self, f: FutCtx<B>, cx: &mut Context<'_>) {
         let ping = self.ping.clone();
 
-        // A one-shot channel so that send_task can tell pipe_task to
-        // reset the stream when the client cancels the request.
-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        // FERRUM PATCH 007: only a suspended body pipe needs a cancellation
+        // channel. EOS, CONNECT and eagerly completed uploads have no pipe
+        // task to notify; their response future still owns stream cancellation.
+        let mut cancel_tx = None;
 
         let send_stream = if !f.is_connect {
             if !f.eos {
@@ -554,6 +555,10 @@ where
                 match Pin::new(&mut pipe).poll(cx) {
                     Poll::Ready(_) => (),
                     Poll::Pending => {
+                        // Create both ends before spawning: an executor may
+                        // poll the pipe immediately, before SendWhen exists.
+                        let (tx, cancel_rx) = oneshot::channel();
+                        cancel_tx = Some(tx);
                         let conn_drop_ref = self.conn_drop_ref.clone();
                         // keep the ping recorder's knowledge of an
                         // "open stream" alive while this body is
@@ -585,7 +590,7 @@ where
                     ping: Some(ping),
                     send_stream: Some(send_stream),
                     exec: self.executor.clone(),
-                    cancel_tx: Some(cancel_tx),
+                    cancel_tx,
                 },
                 call_back: Some(f.cb),
             },
@@ -827,3 +832,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client/ferrum_lazy_cancel_tests.rs"]
+mod ferrum_lazy_cancel_tests;

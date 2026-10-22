@@ -1,0 +1,490 @@
+diff --git a/src/proto/h2/client.rs b/src/proto/h2/client.rs
+index 0fa6c990c..1690c42ba 100644
+--- a/src/proto/h2/client.rs
++++ b/src/proto/h2/client.rs
+@@ -532,9 +532,10 @@ where
+     fn poll_pipe(&mut self, f: FutCtx<B>, cx: &mut Context<'_>) {
+         let ping = self.ping.clone();
+ 
+-        // A one-shot channel so that send_task can tell pipe_task to
+-        // reset the stream when the client cancels the request.
+-        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
++        // FERRUM PATCH 007: only a suspended body pipe needs a cancellation
++        // channel. EOS, CONNECT and eagerly completed uploads have no pipe
++        // task to notify; their response future still owns stream cancellation.
++        let mut cancel_tx = None;
+ 
+         let send_stream = if !f.is_connect {
+             if !f.eos {
+@@ -554,6 +555,10 @@ where
+                 match Pin::new(&mut pipe).poll(cx) {
+                     Poll::Ready(_) => (),
+                     Poll::Pending => {
++                        // Create both ends before spawning: an executor may
++                        // poll the pipe immediately, before SendWhen exists.
++                        let (tx, cancel_rx) = oneshot::channel();
++                        cancel_tx = Some(tx);
+                         let conn_drop_ref = self.conn_drop_ref.clone();
+                         // keep the ping recorder's knowledge of an
+                         // "open stream" alive while this body is
+@@ -585,7 +590,7 @@ where
+                     ping: Some(ping),
+                     send_stream: Some(send_stream),
+                     exec: self.executor.clone(),
+-                    cancel_tx: Some(cancel_tx),
++                    cancel_tx,
+                 },
+                 call_back: Some(f.cb),
+             },
+@@ -827,3 +832,7 @@ where
+         }
+     }
+ }
++
++#[cfg(test)]
++#[path = "client/ferrum_lazy_cancel_tests.rs"]
++mod ferrum_lazy_cancel_tests;
+diff --git a/src/proto/h2/client/ferrum_lazy_cancel_tests.rs b/src/proto/h2/client/ferrum_lazy_cancel_tests.rs
+new file mode 100644
+index 000000000..3d91db4e7
+--- /dev/null
++++ b/src/proto/h2/client/ferrum_lazy_cancel_tests.rs
+@@ -0,0 +1,438 @@
++//! Behavioral regressions and private branch observations for patch 007.
++//! Duplex transports, positive barriers, and owned tasks keep the tests isolated.
++
++use std::{
++    collections::VecDeque,
++    future::Future,
++    io,
++    pin::Pin,
++    task::{Context, Poll},
++    time::Duration,
++};
++
++use bytes::Bytes;
++use futures_util::future::poll_fn;
++use http_body::{Body, Frame};
++use http_body_util::BodyExt;
++use tokio::sync::mpsc;
++
++use super::H2ClientFuture;
++use crate::common::io::Compat;
++use crate::proto::h2::upgrade::UpgradedSendStreamTask;
++use crate::rt::Executor;
++
++type Frames = Result<Frame<Bytes>, io::Error>;
++type Accepted = (
++    http::Request<h2::RecvStream>,
++    h2::server::SendResponse<Bytes>,
++);
++type ClientFuture = H2ClientFuture<TestBody, Compat<tokio::io::DuplexStream>, ProbeExecutor>;
++
++enum TestBody {
++    Eos,
++    Full(http_body_util::Full<Bytes>),
++    Ready(VecDeque<Frames>),
++    Streaming(mpsc::Receiver<Frames>),
++}
++
++impl Body for TestBody {
++    type Data = Bytes;
++    type Error = io::Error;
++
++    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Frames>> {
++        match &mut *self {
++            Self::Eos => Poll::Ready(None),
++            Self::Full(body) => Pin::new(body)
++                .poll_frame(cx)
++                .map(|frame| frame.map(|frame| frame.map_err(|never| match never {}))),
++            Self::Ready(frames) => Poll::Ready(frames.pop_front()),
++            Self::Streaming(rx) => rx.poll_recv(cx),
++        }
++    }
++
++    fn size_hint(&self) -> http_body::SizeHint {
++        match self {
++            Self::Eos => http_body::SizeHint::with_exact(0),
++            Self::Full(body) => body.size_hint(),
++            _ => http_body::SizeHint::default(),
++        }
++    }
++
++    fn is_end_stream(&self) -> bool {
++        // Ready deliberately reaches EOS through poll_frame, exercising the
++        // eager-completion branch instead of the HEADERS END_STREAM branch.
++        match self {
++            Self::Eos => true,
++            Self::Full(body) => body.is_end_stream(),
++            _ => false,
++        }
++    }
++}
++
++#[derive(Clone)]
++struct ProbeExecutor {
++    observations: mpsc::UnboundedSender<Event>,
++}
++
++#[derive(Debug, PartialEq)]
++enum Event {
++    Pipe,
++    Head { has_cancel: bool },
++}
++
++impl Executor<ClientFuture> for ProbeExecutor {
++    fn execute(&self, future: ClientFuture) {
++        let observation = match &future {
++            H2ClientFuture::Pipe { .. } => Some(Event::Pipe),
++            H2ClientFuture::Send { send_when } => Some(Event::Head {
++                has_cancel: send_when.when.cancel_tx.is_some(),
++            }),
++            H2ClientFuture::Task { .. } => None,
++        };
++        if let Some(observation) = observation {
++            let _ = self.observations.send(observation);
++        }
++        tokio::spawn(future);
++    }
++}
++
++impl Executor<UpgradedSendStreamTask<Bytes>> for ProbeExecutor {
++    fn execute(&self, future: UpgradedSendStreamTask<Bytes>) {
++        tokio::spawn(future);
++    }
++}
++
++struct Fixture {
++    sender: crate::client::conn::http2::SendRequest<TestBody>,
++    accepted: mpsc::UnboundedReceiver<Accepted>,
++    observations: mpsc::UnboundedReceiver<Event>,
++    server: tokio::task::JoinHandle<()>,
++    client: tokio::task::JoinHandle<()>,
++}
++
++impl Drop for Fixture {
++    fn drop(&mut self) {
++        self.server.abort();
++        self.client.abort();
++    }
++}
++
++async fn bounded<F: Future>(future: F) -> F::Output {
++    tokio::time::timeout(Duration::from_secs(5), future)
++        .await
++        .expect("operation completed within its bound")
++}
++
++impl Fixture {
++    async fn new() -> Self {
++        let (client_io, server_io) = tokio::io::duplex(1 << 20);
++        let (accepted_tx, accepted) = mpsc::unbounded_channel();
++        let server = tokio::spawn(async move {
++            let mut conn = h2::server::handshake::<_, Bytes>(server_io).await.unwrap();
++            while let Some(request) = conn.accept().await {
++                if accepted_tx.send(request.unwrap()).is_err() {
++                    break;
++                }
++            }
++        });
++        let (observations_tx, observations) = mpsc::unbounded_channel();
++        let executor = ProbeExecutor {
++            observations: observations_tx,
++        };
++        let (sender, conn) = crate::client::conn::http2::Builder::new(executor)
++            .handshake(Compat::new(client_io))
++            .await
++            .unwrap();
++        let client = tokio::spawn(async move {
++            let _ = conn.await;
++        });
++        Self {
++            sender,
++            accepted,
++            observations,
++            server,
++            client,
++        }
++    }
++
++    async fn accept(&mut self) -> Accepted {
++        bounded(self.accepted.recv())
++            .await
++            .expect("server received request")
++    }
++
++    async fn head(&mut self, expected_cancel: bool) {
++        if expected_cancel {
++            assert_eq!(bounded(self.observations.recv()).await, Some(Event::Pipe));
++        }
++        assert_eq!(
++            bounded(self.observations.recv()).await,
++            Some(Event::Head {
++                has_cancel: expected_cancel
++            })
++        );
++    }
++}
++
++fn request(body: TestBody) -> http::Request<TestBody> {
++    http::Request::post("http://test/upload")
++        .body(body)
++        .unwrap()
++}
++
++fn upload() -> (mpsc::Sender<Frames>, TestBody) {
++    let (tx, rx) = mpsc::channel(2);
++    (tx, TestBody::Streaming(rx))
++}
++
++async fn read_upload(mut body: h2::RecvStream) -> (Vec<u8>, Option<http::HeaderMap>) {
++    let mut bytes = Vec::new();
++    while let Some(chunk) = bounded(body.data()).await {
++        let chunk = chunk.unwrap();
++        body.flow_control().release_capacity(chunk.len()).unwrap();
++        bytes.extend_from_slice(&chunk);
++    }
++    (bytes, bounded(body.trailers()).await.unwrap())
++}
++
++#[tokio::test]
++async fn eos_and_eager_uploads_omit_the_channel_and_preserve_trailers() {
++    let mut fixture = Fixture::new().await;
++    let mut trailers = http::HeaderMap::new();
++    trailers.insert("upload-check", "complete".parse().unwrap());
++    let cases = [
++        (TestBody::Eos, Vec::new(), None),
++        (TestBody::Ready(VecDeque::new()), Vec::new(), None),
++        (
++            TestBody::Ready(VecDeque::from([
++                Ok(Frame::data(Bytes::from_static(b"payload"))),
++                Ok(Frame::trailers(trailers.clone())),
++            ])),
++            b"payload".to_vec(),
++            Some(trailers.clone()),
++        ),
++    ];
++    for (body, expected, expected_trailers) in cases {
++        let response = fixture.sender.send_request(request(body));
++        fixture.head(false).await;
++        let (req, mut respond) = fixture.accept().await;
++        assert_eq!(
++            read_upload(req.into_body()).await,
++            (expected, expected_trailers)
++        );
++        let mut stream = respond
++            .send_response(http::Response::new(()), false)
++            .unwrap();
++        stream
++            .send_data(Bytes::from_static(b"reply"), false)
++            .unwrap();
++        stream.send_trailers(trailers.clone()).unwrap();
++        let collected = bounded(response)
++            .await
++            .unwrap()
++            .into_body()
++            .collect()
++            .await
++            .unwrap();
++        assert_eq!(collected.trailers(), Some(&trailers));
++        assert_eq!(collected.to_bytes(), "reply");
++    }
++}
++
++#[tokio::test]
++async fn eager_body_error_omits_channel_and_still_fails_request() {
++    let mut fixture = Fixture::new().await;
++    let response = fixture
++        .sender
++        .send_request(request(TestBody::Ready(VecDeque::from([Err(
++            io::Error::new(io::ErrorKind::Other, "synthetic upload failure"),
++        )]))));
++    fixture.head(false).await;
++    assert!(bounded(response).await.is_err());
++}
++
++#[tokio::test]
++async fn connect_omits_upload_channel_and_still_upgrades() {
++    let mut fixture = Fixture::new().await;
++    let response = fixture.sender.send_request(
++        http::Request::connect("test:443")
++            .body(TestBody::Eos)
++            .unwrap(),
++    );
++    fixture.head(false).await;
++    let (_req, mut respond) = fixture.accept().await;
++    let mut stream = respond
++        .send_response(http::Response::new(()), false)
++        .unwrap();
++    stream
++        .send_data(Bytes::from_static(b"tunnel"), true)
++        .unwrap();
++    let mut response = bounded(response).await.unwrap();
++    let upgraded = bounded(crate::upgrade::on(&mut response)).await.unwrap();
++    let mut io = Compat::new(upgraded);
++    let mut bytes = Vec::new();
++    bounded(tokio::io::AsyncReadExt::read_to_end(&mut io, &mut bytes))
++        .await
++        .unwrap();
++    assert_eq!(bytes, b"tunnel");
++}
++
++#[tokio::test]
++async fn cancelling_head_wait_resets_eos_and_suspended_upload_streams() {
++    let mut fixture = Fixture::new().await;
++    for pending_upload in [false, true] {
++        let (upload_tx, body) = upload();
++        let response =
++            fixture
++                .sender
++                .send_request(request(if pending_upload { body } else { TestBody::Eos }));
++        fixture.head(pending_upload).await;
++        let (_req, mut respond) = fixture.accept().await;
++        drop(response);
++        assert_eq!(
++            bounded(poll_fn(|cx| respond.poll_reset(cx))).await.unwrap(),
++            h2::Reason::CANCEL
++        );
++        if pending_upload {
++            bounded(upload_tx.closed()).await;
++        }
++    }
++    let response = fixture.sender.send_request(request(TestBody::Eos));
++    fixture.head(false).await;
++    let (_req, mut respond) = fixture.accept().await;
++    respond
++        .send_response(http::Response::new(()), true)
++        .unwrap();
++    assert_eq!(
++        bounded(response).await.unwrap().status(),
++        http::StatusCode::OK
++    );
++}
++
++#[tokio::test]
++async fn early_response_does_not_cancel_a_suspended_upload() {
++    let mut fixture = Fixture::new().await;
++    let (upload_tx, body) = upload();
++    let response = fixture.sender.send_request(request(body));
++    fixture.head(true).await;
++    let (req, mut respond) = fixture.accept().await;
++    respond
++        .send_response(http::Response::new(()), true)
++        .unwrap();
++    let response = bounded(response).await.unwrap();
++    assert_eq!(response.status(), http::StatusCode::OK);
++    let mut trailers = http::HeaderMap::new();
++    trailers.insert("upload-check", "after-head".parse().unwrap());
++    upload_tx
++        .send(Ok(Frame::data(Bytes::from_static(b"after response"))))
++        .await
++        .unwrap();
++    upload_tx
++        .send(Ok(Frame::trailers(trailers.clone())))
++        .await
++        .unwrap();
++    drop(upload_tx);
++    assert_eq!(
++        read_upload(req.into_body()).await,
++        (b"after response".to_vec(), Some(trailers))
++    );
++}
++
++#[tokio::test]
++async fn pending_upload_and_many_head_waits_do_not_block_ready_responses() {
++    const COUNT: usize = 64;
++    let mut fixture = Fixture::new().await;
++    let (upload_tx, body) = upload();
++    let stalled = fixture.sender.send_request(request(body));
++    fixture.head(true).await;
++    let (_stalled_req, mut stalled_respond) = fixture.accept().await;
++    let mut responses = Vec::new();
++    for _ in 0..COUNT {
++        responses.push(fixture.sender.send_request(request(TestBody::Eos)));
++    }
++    let mut held = Vec::new();
++    for _ in 0..COUNT {
++        fixture.head(false).await;
++        held.push(fixture.accept().await);
++    }
++    // All heads remain pending together, then complete in reverse order while
++    // the first upload is still suspended. No sleep or throughput threshold.
++    for (_, mut respond) in held.into_iter().rev() {
++        respond
++            .send_response(http::Response::new(()), true)
++            .unwrap();
++    }
++    for response in responses {
++        assert!(bounded(response).await.is_ok());
++    }
++    assert!(!upload_tx.is_closed());
++    drop(stalled);
++    assert_eq!(
++        bounded(poll_fn(|cx| stalled_respond.poll_reset(cx)))
++            .await
++            .unwrap(),
++        h2::Reason::CANCEL
++    );
++    bounded(upload_tx.closed()).await;
++}
++
++#[tokio::test]
++async fn connection_loss_fails_all_waiters_and_releases_the_upload() {
++    let mut fixture = Fixture::new().await;
++    let (upload_tx, body) = upload();
++    let streaming = fixture.sender.send_request(request(body));
++    fixture.head(true).await;
++    let _streaming_request = fixture.accept().await;
++    let empty = fixture.sender.send_request(request(TestBody::Eos));
++    fixture.head(false).await;
++    let _empty_request = fixture.accept().await;
++    fixture.server.abort();
++    assert!(bounded(&mut fixture.server)
++        .await
++        .unwrap_err()
++        .is_cancelled());
++    assert!(bounded(streaming).await.is_err());
++    assert!(bounded(empty).await.is_err());
++    bounded(upload_tx.closed()).await;
++}
++
++#[tokio::test]
++async fn buffered_1k_post_branch_probe() {
++    let mut fixture = Fixture::new().await;
++    for _ in 0..32 {
++        let payload = Bytes::from(vec![b'x'; 1024]);
++        let response =
++            fixture
++                .sender
++                .send_request(request(TestBody::Full(http_body_util::Full::new(
++                    payload.clone(),
++                ))));
++        fixture.head(false).await;
++        let (req, mut respond) = fixture.accept().await;
++        assert_eq!(read_upload(req.into_body()).await, (payload.to_vec(), None));
++        respond
++            .send_response(http::Response::new(()), true)
++            .unwrap();
++        assert!(bounded(response).await.is_ok());
++    }
++    eprintln!("buffered 1KiB POST diagnostic: 32 eager completions; 0 upload tasks; 32 response-head tasks; 0 upload cancellation channels; default h2 windows, in-memory transport");
++}
++
++#[tokio::test]
++async fn backend_reset_releases_pending_upload_and_preserves_sibling() {
++    let mut fixture = Fixture::new().await;
++    let (upload_tx, body) = upload();
++    let response = fixture.sender.send_request(request(body));
++    fixture.head(true).await;
++    let (_req, mut respond) = fixture.accept().await;
++    let sibling = fixture.sender.send_request(request(TestBody::Eos));
++    fixture.head(false).await;
++    let (_sibling_req, mut sibling_respond) = fixture.accept().await;
++    respond.send_reset(h2::Reason::REFUSED_STREAM);
++    assert!(bounded(response).await.is_err());
++    bounded(upload_tx.closed()).await;
++    sibling_respond
++        .send_response(http::Response::new(()), true)
++        .unwrap();
++    assert!(bounded(sibling).await.is_ok());
++}
