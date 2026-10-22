@@ -783,7 +783,9 @@ fn encode_request_trailers(trailers: &[(String, String)]) -> Result<String, &'st
 /// [`staged_request_trailers`] can still emit the backend's native trailers.
 /// `metadata_redaction::is_internal_only_metadata_key` classifies the same key
 /// so a custom log schema cannot project it back either.
-pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     metadata.remove(META_GRPC_WEB_REQUEST_TRAILERS);
 }
 
@@ -794,8 +796,8 @@ pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String
 /// block being present is not evidence that this plugin wrote it. Any anomaly
 /// answers `None` (dispatch without trailers) rather than forwarding a block
 /// this function cannot prove is the one the owner validated.
-pub(crate) fn staged_request_trailers(
-    metadata: &HashMap<String, String>,
+pub(crate) fn staged_request_trailers<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
 ) -> Option<http::HeaderMap> {
     let encoded = metadata.get(META_GRPC_WEB_REQUEST_TRAILERS)?;
     if encoded.len() > MAX_REQUEST_TRAILER_STAGING_BYTES {
@@ -2304,8 +2306,8 @@ fn encode_trailer_names_for_frame(trailers: &HashMap<String, String>) -> String 
 /// in the merged plugin view cannot leak into the frame. Unit helpers that never
 /// call this keep the metadata key absent and therefore unrestricted beyond the
 /// ordinary name/value safety filters.
-pub fn record_backend_trailer_names_for_frame(
-    metadata: &mut HashMap<String, String>,
+pub fn record_backend_trailer_names_for_frame<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     trailers: &HashMap<String, String>,
 ) {
     metadata.insert(
@@ -2343,8 +2345,8 @@ fn encode_shadowed_trailers_for_frame(
     }
 }
 
-fn shadowed_trailers_from_metadata(
-    metadata: &HashMap<String, String>,
+fn shadowed_trailers_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
 ) -> Option<HashMap<String, [String; 2]>> {
     let encoded = metadata.get(META_GRPC_WEB_SHADOWED_TRAILERS)?;
     decode_shadowed_trailers_payload(encoded)
@@ -2353,8 +2355,8 @@ fn shadowed_trailers_from_metadata(
 /// Record both the backend trailer allowlist and collision provenance needed
 /// to preserve a true trailer value when the same name also appeared in the
 /// backend's initial headers.
-pub fn record_backend_trailer_provenance_for_frame(
-    metadata: &mut HashMap<String, String>,
+pub fn record_backend_trailer_provenance_for_frame<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     response_headers: &HashMap<String, String>,
     trailers: &HashMap<String, String>,
 ) {
@@ -2503,8 +2505,8 @@ fn fail_closed_bridged_trailer_split(
 /// response hooks run. The collision payload can contain application metadata
 /// values and therefore must become redacted request-local metadata before a
 /// debugger or custom hook can observe the backend response headers.
-pub fn promote_bridged_trailer_provenance(
-    metadata: &mut HashMap<String, String>,
+pub fn promote_bridged_trailer_provenance<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     response_headers: &mut HashMap<String, String>,
 ) {
     if let Some(encoded) = response_headers.remove(HEADER_GRPC_WEB_TRAILER_NAMES) {
@@ -2520,8 +2522,8 @@ fn decode_shadowed_trailers_payload(encoded: &str) -> Option<HashMap<String, [St
     serde_json::from_slice(&decoded).ok()
 }
 
-fn trailer_name_allowlist_from_metadata(
-    metadata: &HashMap<String, String>,
+fn trailer_name_allowlist_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
 ) -> Option<HashSet<String>> {
     metadata.get(META_GRPC_WEB_TRAILER_NAMES).map(|encoded| {
         encoded
@@ -3144,7 +3146,10 @@ impl PassthroughGrpcStatus {
 
     /// Record this outcome in transaction metadata, unless a status is already
     /// recorded there: a gateway-authored terminal owns its own status.
-    pub(crate) fn record(self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn record<MS: std::hash::BuildHasher>(
+        self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         if metadata.contains_key("grpc_status") {
             return;
         }

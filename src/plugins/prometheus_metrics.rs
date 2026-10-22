@@ -495,7 +495,9 @@ fn method_label(method: &str) -> &'static str {
 /// Convert the internal gRPC terminal-status metadata to a bounded Prometheus
 /// label. Standard codes retain their numeric representation; malformed or
 /// future non-standard codes share one `OTHER` bucket.
-fn grpc_status_label(metadata: &std::collections::HashMap<String, String>) -> Option<&'static str> {
+fn grpc_status_label<MS: std::hash::BuildHasher>(
+    metadata: &std::collections::HashMap<String, String, MS>,
+) -> Option<&'static str> {
     let status = match metadata.get("grpc_status")?.trim().parse::<u32>() {
         Ok(status) => status,
         Err(_) => return Some("OTHER"),
@@ -1324,9 +1326,9 @@ impl MetricsRegistry {
     /// reached both the Prometheus and workload-metrics hooks finalize here too
     /// so opened/closed stay balanced. The stamp gates
     /// `record_mesh_tcp_closed_and_bytes`.
-    pub fn finalize_mesh_tcp_opened(
+    pub fn finalize_mesh_tcp_opened<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &mut std::collections::HashMap<String, String>,
+        metadata: &mut std::collections::HashMap<String, String, MS>,
         proxy_id: &str,
         proxy_name: Option<&str>,
     ) {
@@ -1342,9 +1344,9 @@ impl MetricsRegistry {
 
     /// Record TCP_OPENED_CONNECTIONS under the finalized mesh metadata of a
     /// stream. Reached only through `finalize_mesh_tcp_opened`.
-    fn record_mesh_tcp_opened(
+    fn record_mesh_tcp_opened<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &std::collections::HashMap<String, String>,
+        metadata: &std::collections::HashMap<String, String, MS>,
         proxy_id: &str,
         proxy_name: Option<&str>,
     ) {
@@ -6394,7 +6396,6 @@ mod tests {
     use crate::tls::inventory::{
         TlsInventory, TlsInventoryEntry, TlsInventorySource, TlsInventoryState, TlsInventoryUsage,
     };
-    use std::collections::HashMap;
 
     fn mesh_summary() -> TransactionSummary {
         TransactionSummary {
@@ -6402,7 +6403,7 @@ mod tests {
             proxy_name: Some("orders".to_string()),
             response_status_code: 200,
             latency_total_ms: 12.0,
-            metadata: HashMap::from([
+            metadata: crate::plugins::MetadataMap::from_iter([
                 ("mesh.source.workload".to_string(), "frontend".to_string()),
                 (
                     "mesh.destination.workload".to_string(),

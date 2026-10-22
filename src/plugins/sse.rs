@@ -484,7 +484,9 @@ fn write_normalized_sse_text(
 /// while preserving safe correlation hints. Raw `Last-Event-ID` must never reach
 /// logging sinks. Correlation keys intentionally avoid the `last_event_id`
 /// substring so default metadata redaction does not blank them.
-pub fn redact_sse_log_metadata(metadata: &mut HashMap<String, String>) {
+pub fn redact_sse_log_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     if let Some(raw) = metadata.remove(LAST_EVENT_ID_METADATA_KEY) {
         metadata.insert("sse:leid_present".to_string(), "1".to_string());
         metadata.insert("sse:leid_bytes".to_string(), raw.len().to_string());

@@ -8062,7 +8062,9 @@ fn mcp_request_content_type_is_json(value: &str) -> bool {
     mcp_content_type_is_json(value) && mcp_jsonrpc::content_type_charset_is_utf8(value)
 }
 
-pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     metadata.remove(METADATA_RESPONSE_REWRITE_KEY);
     metadata.remove(METADATA_RESPONSE_REWRITE_METHOD_KEY);
     metadata.remove(METADATA_RESPONSE_REWRITE_SERVER_KEY);

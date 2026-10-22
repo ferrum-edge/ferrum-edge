@@ -4159,7 +4159,10 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn has_staged_candidate(&self, metadata: &HashMap<String, String>) -> bool {
+    fn has_staged_candidate<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> bool {
         metadata
             .get(MD_RECORD_ID)
             .is_some_and(|record_id| self.staging.contains_key(record_id))
@@ -4171,7 +4174,10 @@ impl AiTranscriptAudit {
     /// no `MD_SAMPLE_HIT` fallback: that key is shared and peer-writable, so
     /// falling back to it would let a peer's roll drive this instance's stream
     /// selection, commit admission, and client-visible fail-closed 503.
-    fn owned_sample_hit(&self, metadata: &HashMap<String, String>) -> Option<bool> {
+    fn owned_sample_hit<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> Option<bool> {
         metadata
             .get(MD_RECORD_ID)
             .and_then(|record_id| self.staging.get(record_id))
@@ -4198,7 +4204,10 @@ impl AiTranscriptAudit {
     /// emit is pure amplification: `emit_decision` / `enqueue` would discard
     /// the result. This also keeps the mode off the reqwest-pinned dispatch
     /// path, since `forces_reqwest_dispatch` shares this predicate.
-    fn stream_tee_wanted(&self, metadata: &HashMap<String, String>) -> bool {
+    fn stream_tee_wanted<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> bool {
         if self.capture.streaming == StreamingCapture::Off {
             return false;
         }
@@ -4304,7 +4313,10 @@ impl AiTranscriptAudit {
         }
     }
 
-    fn harvest_metadata(&self, metadata: &HashMap<String, String>) -> Harvest {
+    fn harvest_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> Harvest {
         let mut harvest = Harvest::default();
         // `ai_federation` publishes both `ai_provider` (the provider type) and
         // `ai_federation_provider` (the configured federation name). Resolve them
@@ -4402,11 +4414,11 @@ impl AiTranscriptAudit {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn build_record(
+    fn build_record<MS: std::hash::BuildHasher>(
         &self,
         record_id: &str,
         envelope: EnvelopeOwned,
-        metadata: &HashMap<String, String>,
+        metadata: &HashMap<String, String, MS>,
         staging: Option<&AuditStaging>,
         response: ResponseCapture,
         sampled: bool,
@@ -4718,7 +4730,10 @@ impl AiTranscriptAudit {
     }
 
     /// The bounded `mcp_gateway` decisions recorded beside an MCP call.
-    fn mcp_gateway_metadata(&self, metadata: &HashMap<String, String>) -> BTreeMap<String, String> {
+    fn mcp_gateway_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> BTreeMap<String, String> {
         let redact_names = self.mode != AuditMode::FullBody;
         let mut gateway = BTreeMap::new();
         for key in MCP_GATEWAY_METADATA_KEYS {
@@ -6446,7 +6461,9 @@ fn classify_batch_delivery(
 
 // ---- free helpers ----
 
-pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     let candidate = flag(metadata, MD_CANDIDATE);
     let saturation_outcome = metadata
         .get(MD_SINK_STATUS)
@@ -7571,8 +7588,8 @@ fn redact_headers(headers: &HashMap<String, String>) -> BTreeMap<String, String>
 /// (`metadata.grpc_status_unreadable`) is `None`, both matching
 /// [`TransactionSummary::grpc_status`], so an unreadable status never triggers
 /// `always_capture_on_error`.
-fn final_grpc_status(
-    metadata: &HashMap<String, String>,
+fn final_grpc_status<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     response_headers: Option<&HashMap<String, String>>,
 ) -> Option<u32> {
     if let Some(status) = metadata.get("grpc_status") {
@@ -7600,8 +7617,8 @@ fn final_grpc_status(
 /// Whether this transaction ended as a FAILED gRPC call, which
 /// `always_capture_on_error` must retain exactly like an HTTP error status.
 /// `false` for every non-gRPC transaction, so HTTP retention is unchanged.
-fn grpc_call_failed(
-    metadata: &HashMap<String, String>,
+fn grpc_call_failed<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     response_headers: Option<&HashMap<String, String>>,
 ) -> bool {
     final_grpc_status(metadata, response_headers).is_some_and(|status| status != 0)
@@ -7610,7 +7627,7 @@ fn grpc_call_failed(
 /// Whether any guard plugin fired on this transaction (drives
 /// `always_capture_on_guardrail`). A curated heuristic over the metadata other
 /// AI plugins publish.
-fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
+fn guardrail_fired<MS: std::hash::BuildHasher>(metadata: &HashMap<String, String, MS>) -> bool {
     const FIRED_TRUE_KEYS: &[&str] = &[
         "ai_semantic_firewall_rejected",
         "ai_semantic_firewall_response_blocked",
@@ -8224,7 +8241,7 @@ fn sample_from_record_id(record_id: &str) -> f64 {
     (u64::from_be_bytes(buffer) as f64) / (u64::MAX as f64 + 1.0)
 }
 
-fn flag(metadata: &HashMap<String, String>, key: &str) -> bool {
+fn flag<MS: std::hash::BuildHasher>(metadata: &HashMap<String, String, MS>, key: &str) -> bool {
     metadata.get(key).is_some_and(|value| value == "true")
 }
 

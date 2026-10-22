@@ -2395,7 +2395,11 @@ fn parse_severity(value: &str) -> Option<Severity> {
 /// Union a comma-separated `value` into `map[key]`, preserving first-seen order
 /// and dropping duplicates. Lets repeated stream WAF hits on one session
 /// accumulate matched rule ids instead of overwriting them (last-hit-wins).
-fn merge_csv_into(map: &mut HashMap<String, String>, key: &str, value: &str) {
+fn merge_csv_into<MS: std::hash::BuildHasher>(
+    map: &mut HashMap<String, String, MS>,
+    key: &str,
+    value: &str,
+) {
     if value.is_empty() {
         return;
     }

@@ -1153,7 +1153,7 @@ impl RateLimiting {
         let Some(outcome) = decision.outcome else {
             if decision.local_fallback {
                 ctx.metadata
-                    .get_or_insert_with(HashMap::new)
+                    .get_or_insert_with(crate::plugins::MetadataMap::default)
                     .insert("ratelimit_local_fallback".to_string(), "true".to_string());
                 super::prometheus_metrics::global_registry()
                     .record_rate_limit_local_fallback_decision();
@@ -1162,7 +1162,7 @@ impl RateLimiting {
         };
         if outcome.local_fallback {
             ctx.metadata
-                .get_or_insert_with(HashMap::new)
+                .get_or_insert_with(crate::plugins::MetadataMap::default)
                 .insert("ratelimit_local_fallback".to_string(), "true".to_string());
             super::prometheus_metrics::global_registry()
                 .record_rate_limit_local_fallback_decision();
@@ -1897,8 +1897,8 @@ static EXPOSED_RATELIMIT_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
             .collect()
     });
 
-fn inject_rate_limit_headers_from_metadata(
-    metadata: &HashMap<String, String>,
+fn inject_rate_limit_headers_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     headers: &mut HashMap<String, String>,
 ) {
     for &(meta_key, header_name) in EXPOSED_RATELIMIT_HEADERS {

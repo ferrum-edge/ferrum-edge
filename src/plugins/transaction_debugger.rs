@@ -1914,8 +1914,8 @@ impl<'a> SchemaSerializable for DebugWsRecord<'a> {
     }
 }
 
-fn selected_metadata_value<'a>(
-    metadata: &'a HashMap<String, String>,
+fn selected_metadata_value<'a, MS: std::hash::BuildHasher>(
+    metadata: &'a HashMap<String, String, MS>,
     key: &str,
 ) -> Option<&'a str> {
     metadata.get(key).map(|value| {

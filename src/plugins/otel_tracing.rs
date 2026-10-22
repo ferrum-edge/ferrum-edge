@@ -764,14 +764,20 @@ impl OtelTracing {
         }
     }
 
-    fn store_sampling(metadata: &mut HashMap<String, String>, sampled: bool) {
+    fn store_sampling<MS: std::hash::BuildHasher>(
+        metadata: &mut HashMap<String, String, MS>,
+        sampled: bool,
+    ) {
         metadata.insert(
             "trace_sampled".to_string(),
             if sampled { "true" } else { "false" }.to_string(),
         );
     }
 
-    fn apply_generated_root(&self, ctx_metadata: &mut HashMap<String, String>) -> String {
+    fn apply_generated_root<MS: std::hash::BuildHasher>(
+        &self,
+        ctx_metadata: &mut HashMap<String, String, MS>,
+    ) -> String {
         let sampled = self.decide_root_sampled();
         let generated = Self::generate_trace_context(sampled);
         ctx_metadata.insert("trace_id".to_string(), generated.trace_id);
@@ -3384,8 +3390,8 @@ pub(crate) fn build_traceparent(
     traceparent
 }
 
-pub(crate) fn ensure_trace_metadata(
-    metadata: &mut HashMap<String, String>,
+pub(crate) fn ensure_trace_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     headers: &HashMap<String, String>,
 ) {
     if metadata.contains_key("trace_id") && metadata.contains_key("span_id") {
@@ -3441,7 +3447,9 @@ pub(crate) fn ensure_trace_metadata(
 ///
 /// Missing `trace_sampled` and traceparent flags are treated as not sampled;
 /// callers that want fallback local sampling should apply it explicitly.
-pub(crate) fn trace_is_sampled(metadata: &HashMap<String, String>) -> bool {
+pub(crate) fn trace_is_sampled<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     if let Some(value) = metadata.get("trace_sampled") {
         return value.eq_ignore_ascii_case("true");
     }
@@ -3587,8 +3595,8 @@ fn sample_ratio(ratio: f64) -> bool {
 /// request metadata and can be attacker-shaped, so they get the same
 /// per-attribute ceiling and `...` truncation marker as every other span
 /// string field.
-fn bounded_mesh_attributes(
-    metadata: &HashMap<String, String>,
+fn bounded_mesh_attributes<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     max_attribute_bytes: usize,
 ) -> Vec<(String, String)> {
     mesh_trace_attributes(metadata)
@@ -3687,8 +3695,8 @@ fn http_span_is_error(summary: &TransactionSummary) -> bool {
     status >= 500 || summary.is_terminal_failure()
 }
 
-fn server_authority_from_metadata(
-    metadata: &HashMap<String, String>,
+fn server_authority_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
 ) -> (Option<String>, Option<u16>) {
     let address = metadata.get("server_address").cloned();
     let port = metadata

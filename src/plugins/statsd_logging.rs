@@ -18,7 +18,7 @@
 use crate::fips::approved::Sha256;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -1227,7 +1227,7 @@ fn minimum_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: String::new(),
         timestamp_disconnected: String::new(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: crate::plugins::MetadataMap::default(),
         proxy_lifecycle_generation: None,
         plugin_trigger_decisions: Default::default(),
     }
@@ -1257,7 +1257,7 @@ fn minimum_ws_context() -> WsDisconnectContext {
         error_class: None,
         consumer_username: None,
         auth_method: None,
-        metadata: HashMap::new(),
+        metadata: crate::plugins::MetadataMap::default(),
         proxy_lifecycle_generation: None,
     }
 }
