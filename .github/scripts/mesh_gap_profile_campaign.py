@@ -21,7 +21,7 @@ import tempfile
 import time
 import uuid
 
-from mesh_gap_candidate import BASELINE, BUILDER, IMAGE, ROOT, digest, require_remote, write
+from mesh_gap_candidate import ORIGINAL_BASELINE as BASELINE, BUILDER, IMAGE, ROOT, digest, require_remote, write
 from mesh_gap_build import command
 from mesh_gap_campaign import mesh_observation
 import mesh_production_campaign as production

@@ -16,6 +16,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / '.github/scripts'))
 import mesh_gap_baseline_reuse as reuse
+from mesh_gap_candidate import MAINTENANCE_EVIDENCE
 
 
 class BaselineReuseTests(unittest.TestCase):
@@ -69,7 +70,7 @@ class BaselineReuseTests(unittest.TestCase):
         for name, content in (('image.tar', b'image'), ('compiler-native-packages.log', b'compiler'), ('Dockerfile.source', b'recipe')):
             (directory / name).write_bytes(content)
         chosen = dict(baseline_sha=reuse.BASELINE, profile='release', features='cloud-secrets', allocation_instrumentation=False,
-                      builder_image=reuse.BUILDER, dockerfile_sha256=reuse.digest(directory / 'Dockerfile.source'), harness_sha='e' * 40)
+                      builder_image=reuse.BUILDER, maintenance_origin=copy.deepcopy(MAINTENANCE_EVIDENCE), dockerfile_sha256=reuse.digest(directory / 'Dockerfile.source'), harness_sha='e' * 40)
         receipt = dict(role='baseline', source_sha=reuse.BASELINE, complete=True, errors=[],
             selection=dict(chosen, harness_sha=run['head_sha'], phase='gap-compare'), source_file_sha256=inputs,
             recipe_scope='unchanged source Dockerfile; no linker wrapper or instrumentation',
@@ -90,7 +91,7 @@ class BaselineReuseTests(unittest.TestCase):
         return request, chosen, checks, inputs, helper
 
     def test_receipt_binding_rejects_tamper_stale_checks_and_recipe_changes(self):
-        for mutation in ('none', 'receipt', 'archive', 'compiler', 'wrapper_digest', 'checks', 'recipe', 'helper', 'no_request'):
+        for mutation in ('none', 'receipt', 'archive', 'compiler', 'wrapper_digest', 'checks', 'recipe', 'helper', 'no_request', 'maintenance'):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
                 directory = Path(temp)
                 request, chosen, checks, inputs, helper = self.fixture(directory)
@@ -112,6 +113,8 @@ class BaselineReuseTests(unittest.TestCase):
                     helper = b'other executor'
                 elif mutation == 'no_request':
                     request = None
+                elif mutation == 'maintenance':
+                    chosen['maintenance_origin']['old_sha256'] = '0' * 64
                 with mock.patch.object(reuse, 'fixed_input_hashes', return_value=inputs), \
                      mock.patch.object(reuse.subprocess, 'check_output', return_value=helper):
                     call = lambda: reuse.validate_reuse(directory, chosen, checks, request, 'o/r', 8)

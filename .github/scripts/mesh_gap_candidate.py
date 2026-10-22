@@ -9,7 +9,16 @@ from pathlib import Path
 import re
 import subprocess
 
-BASELINE = '4a7be250e45a367314e3dec872ecbd512220558e'
+ORIGINAL_BASELINE = '4a7be250e45a367314e3dec872ecbd512220558e'
+BASELINE = '7bddb58ae8cf547c9bb875f597557dd842bcb786'
+MAINTENANCE_EVIDENCE = dict(
+    origin_sha=ORIGINAL_BASELINE, baseline_sha=BASELINE, parent_sha=ORIGINAL_BASELINE,
+    changed_paths=['src/secrets/azure.rs'], path='src/secrets/azure.rs',
+    old_blob='165508f980193f8883dee2f022ca648af5f49519',
+    new_blob='63403bddeacd79a38e0b4879bbc9705af62f2276', old_mode='100644', new_mode='100644',
+    old_sha256='0c7ab0d5e4cc0b4d0c91049d9d57a30117396af29ea3d50d79733bf6febec599',
+    new_sha256='1e0ad38ed6f23a905778ddc6a81bb7bd8860adbdd48514ee8296acd723925451',
+    scope='common Azure if-let-chain maintenance on both performance arms; exact committed source, no overlay or lint suppression')
 GATEWAY_HARNESS = '766a3947caadc114cb62aa915a7209a43b94b03d'
 BUILDER = 'rust:latest@sha256:e259494b14672950a909b4c54527e19d29cae6ebf980672114c8bb85e5594e4a'
 PERFORMANCE_KINDS = ('h2-handoff', 'h2-response-groups', 'header-boundary', 'label-interner')
@@ -34,16 +43,17 @@ def digest(path):
 def validate_inputs(candidate, kind, phase):
     if not isinstance(candidate, str) or SHA.fullmatch(candidate) is None:
         raise ValueError('candidate must be an exact lowercase 40-hex commit SHA')
-    if candidate == BASELINE:
-        raise ValueError('candidate must differ from the fixed baseline')
     if kind not in KINDS or phase not in PHASES:
         raise ValueError('unknown allowlisted candidate kind or phase')
+    baseline = BASELINE if kind in PERFORMANCE_KINDS else ORIGINAL_BASELINE
+    if candidate == baseline:
+        raise ValueError('candidate must differ from its fixed baseline')
     for telemetry in ('reproduce', 'verify'):
         if (phase == 'gap-telemetry-' + telemetry) != (kind == 'telemetry-' + telemetry):
             raise ValueError('telemetry reproduction/verification use separate checks-only phases')
     if phase == 'gap-vendor-preflight' and kind not in HYPER_KINDS:
         raise ValueError('vendor preflight only applies to the vendored Hyper candidate')
-    return dict(baseline_sha=BASELINE, candidate_sha=candidate, candidate_kind=kind,
+    return dict(baseline_sha=baseline, candidate_sha=candidate, candidate_kind=kind,
                 phase=phase, profile='release', features='cloud-secrets',
                 recipe_scope='intended performance image recipe only; correctness uses its recorded command, manifest feature defaults or explicit features, and test/dev profile environment',
                 allocation_instrumentation=False, builder_image=BUILDER,
@@ -54,28 +64,52 @@ def git(*args, cwd=ROOT):
     return subprocess.check_output(['git', *args], cwd=cwd, text=True).strip()
 
 
+def validate_maintenance_evidence(evidence):
+    if evidence != MAINTENANCE_EVIDENCE:
+        raise ValueError('performance baseline must contain only the exact attested Azure maintenance change')
+
+
+def maintenance_origin():
+    path = MAINTENANCE_EVIDENCE['path']
+    observed = dict(origin_sha=ORIGINAL_BASELINE, baseline_sha=BASELINE,
+        parent_sha=git('show', '-s', '--format=%P', BASELINE),
+        changed_paths=git('diff', '--no-ext-diff', '--no-renames', '--name-only', ORIGINAL_BASELINE, BASELINE).splitlines(),
+        path=path, scope=MAINTENANCE_EVIDENCE['scope'])
+    for side, revision in (('old', ORIGINAL_BASELINE), ('new', BASELINE)):
+        observed[side + '_blob'] = git('rev-parse', revision + ':' + path)
+        observed[side + '_mode'] = git('ls-tree', revision, '--', path).split()[0]
+        observed[side + '_sha256'] = hashlib.sha256(subprocess.check_output(
+            ['git', 'show', revision + ':' + path], cwd=ROOT)).hexdigest()
+    validate_maintenance_evidence(observed)
+    return observed
+
+
 def selection():
     result = validate_inputs(os.environ.get('GAP_CANDIDATE_SHA', ''),
                              os.environ.get('GAP_CANDIDATE_KIND', ''),
                              os.environ.get('BENCH_PHASE', ''))
-    for revision in (BASELINE, result['candidate_sha'], GATEWAY_HARNESS):
+    baseline = result['baseline_sha']
+    for revision in (baseline, result['candidate_sha'], GATEWAY_HARNESS):
         if git('rev-parse', '--verify', revision + '^{commit}') != revision:
             raise ValueError('exact source commit is unavailable')
-    subprocess.run(['git', 'merge-base', '--is-ancestor', BASELINE, result['candidate_sha']],
+    subprocess.run(['git', 'merge-base', '--is-ancestor', baseline, result['candidate_sha']],
                    cwd=ROOT, check=True)
+    result['maintenance_origin'] = maintenance_origin() if result['candidate_kind'] in PERFORMANCE_KINDS else None
     result['harness_sha'] = git('rev-parse', 'HEAD')
     # Candidate work can change runtime source, tests and patch notes, but not
     # choose a different build recipe, dependency graph or compiler configuration.
     immutable = ['Dockerfile', '.dockerignore', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml',
                  '.cargo', 'build.rs', 'build', 'custom_plugins', 'proto', 'ebpf']
-    changed = git('diff', '--name-only', BASELINE, result['candidate_sha'], '--', *immutable)
+    if result['candidate_kind'] in PERFORMANCE_KINDS:
+        immutable.append(MAINTENANCE_EVIDENCE['path'])
+    changed = git('diff', '--name-only', baseline, result['candidate_sha'], '--', *immutable)
     if changed:
         raise ValueError('candidate changes frozen build inputs: ' + changed)
-    result['changed_paths'] = git('diff', '--name-only', BASELINE, result['candidate_sha']).splitlines()
+    result['changed_paths'] = git('diff', '--name-only', baseline, result['candidate_sha']).splitlines()
     if not result['changed_paths']:
         raise ValueError('candidate has no source delta')
     result['dockerfile_sha256'] = hashlib.sha256(subprocess.check_output(
-        ['git', 'show', BASELINE + ':Dockerfile'], cwd=ROOT)).hexdigest()
+        ['git', 'show', baseline + ':Dockerfile'], cwd=ROOT)).hexdigest()
     result['selection_sha256'] = hashlib.sha256(json.dumps(result, sort_keys=True).encode()).hexdigest()
     return result
 
@@ -87,6 +121,7 @@ def require_remote():
 
 def cargo_tests(kind):
     common = [
+        ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'unit_tests', 'unit::secrets::azure_tests::'],
         ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'vendor_integrity'],
         ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'mesh_retry_rotation_tests::'],
         ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test', 'integration_tests', 'gateway_mesh_trust_retirement_tests::'],

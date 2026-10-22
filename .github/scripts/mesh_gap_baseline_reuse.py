@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-from mesh_gap_candidate import BASELINE, BUILDER, IMAGE, ROOT, SHA, digest, require_remote, selection, write
+from mesh_gap_candidate import BASELINE, BUILDER, IMAGE, ROOT, SHA, digest, require_remote, selection, validate_maintenance_evidence, write
 from mesh_gap_build import checked_receipt
 
 HEX = re.compile(r'[0-9a-f]{64}')
@@ -34,7 +34,7 @@ COMMANDS = ('build-builder', 'compiler-native-packages', 'build-runtime', 'ident
             'binary-notes', 'binary-sections', 'runtime-version', 'export-image')
 FILES = {'receipt.json', 'image.json', 'image.tar', 'Dockerfile.source'} | {
     name + suffix for name in COMMANDS for suffix in ('.log', '.command.json')}
-RECIPE_KEYS = ('baseline_sha', 'profile', 'features', 'allocation_instrumentation', 'builder_image', 'dockerfile_sha256')
+RECIPE_KEYS = ('baseline_sha', 'profile', 'features', 'allocation_instrumentation', 'builder_image', 'dockerfile_sha256', 'maintenance_origin')
 
 
 def require(condition, reason):
@@ -95,6 +95,7 @@ def fixed_input_hashes():
 
 
 def validate_original(receipt, chosen, origin_head, expected_inputs):
+    validate_maintenance_evidence(chosen.get('maintenance_origin'))
     require(receipt.get('role') == 'baseline' and receipt.get('source_sha') == BASELINE
             and receipt.get('complete') is True and receipt.get('errors') == [], 'original baseline receipt is incomplete')
     old = receipt.get('selection', {})

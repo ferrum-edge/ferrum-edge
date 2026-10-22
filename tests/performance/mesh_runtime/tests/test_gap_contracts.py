@@ -1,4 +1,5 @@
 """Cheap input/classification contracts: never launches Rust, Docker or sockets."""
+import copy
 import importlib.util
 from pathlib import Path
 import sys
@@ -6,7 +7,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / '.github/scripts'))
-from mesh_gap_candidate import BASELINE, cargo_tests, expected_telemetry_red, validate_inputs
+from mesh_gap_candidate import (BASELINE, ORIGINAL_BASELINE, MAINTENANCE_EVIDENCE, PERFORMANCE_KINDS,
+                                cargo_tests, expected_telemetry_red, validate_inputs, validate_maintenance_evidence)
 
 CANDIDATE = 'a' * 40
 
@@ -22,6 +24,40 @@ class GapContracts(unittest.TestCase):
         for kind, phase in (('telemetry-reproduce', 'gap-compare'), ('telemetry-reproduce', 'gap-checks'), ('telemetry-verify', 'gap-compare'), ('telemetry-verify', 'gap-telemetry-reproduce'), ('header-boundary', 'gap-vendor-preflight'), ('h2-handoff', 'gap-telemetry-reproduce'), ('arbitrary', 'gap-checks')):
             with self.subTest(kind=kind, phase=phase), self.assertRaises(ValueError):
                 validate_inputs(CANDIDATE, kind, phase)
+
+    def test_performance_and_diagnostic_baselines_remain_separate(self):
+        for kind in PERFORMANCE_KINDS:
+            self.assertEqual(validate_inputs(CANDIDATE, kind, 'gap-compare')['baseline_sha'], BASELINE)
+        for variant in ('reproduce', 'verify'):
+            kind = 'telemetry-' + variant
+            phase = 'gap-telemetry-' + variant
+            self.assertEqual(validate_inputs(CANDIDATE, kind, phase)['baseline_sha'], ORIGINAL_BASELINE)
+            with self.assertRaises(ValueError):
+                validate_inputs(ORIGINAL_BASELINE, kind, phase)
+        import mesh_gap_profile_campaign as campaign
+        import mesh_gap_profile_prepare as prepare
+        self.assertEqual(campaign.BASELINE, ORIGINAL_BASELINE)
+        self.assertEqual(prepare.capture.SOURCE, ORIGINAL_BASELINE)
+        self.assertNotEqual(BASELINE, ORIGINAL_BASELINE)
+
+    def test_maintenance_attestation_rejects_missing_or_changed_identity(self):
+        validate_maintenance_evidence(copy.deepcopy(MAINTENANCE_EVIDENCE))
+        for key in MAINTENANCE_EVIDENCE:
+            with self.subTest(key=key):
+                altered = copy.deepcopy(MAINTENANCE_EVIDENCE)
+                altered[key] = ['src/secrets/azure.rs', 'src/proxy/http.rs'] if key == 'changed_paths' else 'different'
+                with self.assertRaises(ValueError):
+                    validate_maintenance_evidence(altered)
+        for absent in (None, {}, dict(MAINTENANCE_EVIDENCE, unverified=True)):
+            with self.assertRaises(ValueError):
+                validate_maintenance_evidence(absent)
+
+    def test_performance_checks_include_common_azure_semantics(self):
+        expected = ['cargo', 'test', '--locked', '--features', 'cloud-secrets', '--test',
+                    'unit_tests', 'unit::secrets::azure_tests::']
+        for kind in PERFORMANCE_KINDS:
+            with self.subTest(kind=kind):
+                self.assertEqual(cargo_tests(kind).count(expected), 1)
 
     def test_reproducer_requires_runtime_failure_and_exact_assertion(self):
         assertion = 'configured builtin prometheus_metrics must observe real captured start'
