@@ -86,6 +86,99 @@ def run_command(command, checkout, output, name, *, test=False, allow_failure=Fa
     return record, text
 
 
+TELEMETRY_UNIT_FILTERS = (
+    'unit::plugins::mesh_telemetry_metric_families_tests::',
+    'unit::plugins::plugin_trigger_gate_tests::',
+    'unit::plugins::prometheus_metrics_tests::',
+)
+LIVE_SOURCE_FILTER = 'functional_mesh_live_source_capture'
+LIVE_SOURCE_PREREQUISITES = ('sudo', 'unshare', 'nsenter', 'setpriv', 'timeout', 'ip', 'iptables', 'iptables-save')
+
+
+def telemetry_unit_commands():
+    # Match the ordinary/default-feature gateway used by the CI capture suite.
+    return [['cargo', 'test', '--locked', '--test', 'unit_plugins_b_tests', test_filter]
+            for test_filter in TELEMETRY_UNIT_FILTERS]
+
+
+def functional_test_executable(text):
+    """Select exactly one Cargo functional-test artifact, never a glob/latest."""
+    binaries = []
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            # Cargo's rendered diagnostics/status messages share the retained log.
+            continue
+        if (isinstance(item, dict) and item.get('reason') == 'compiler-artifact'
+                and isinstance(item.get('profile'), dict) and item['profile'].get('test') is True
+                and isinstance(item.get('target'), dict)
+                and item['target'].get('name') == 'functional_tests'
+                and isinstance(item['target'].get('kind'), list) and 'test' in item['target']['kind']
+                and item.get('executable') is not None):
+            binaries.append(item['executable'])
+    if len(binaries) != 1 or not isinstance(binaries[0], str) or not Path(binaries[0]).is_absolute():
+        raise ValueError('expected exactly one absolute Cargo functional_tests executable')
+    return Path(binaries[0])
+
+
+def source_capture_command(binary):
+    return ['sudo', '-n', 'env', 'FERRUM_LIVE_TESTS_REQUIRED=1', 'FERRUM_SKIP_GATEWAY_BUILD=1',
+            'timeout', '--signal=KILL', '240s', str(binary), LIVE_SOURCE_FILTER,
+            '--ignored', '--nocapture', '--test-threads=1']
+
+
+def live_source_qualification(exit_code, text):
+    summaries = re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', text, re.MULTILINE)
+    # With --nocapture, libtest can place the marker after a test-name prefix.
+    skips = [line for line in text.splitlines() if re.search(r'(?<!\w)SKIP:', line)]
+    return dict(valid=type(exit_code) is int and exit_code == 0 and summaries == [('2', '0', '0')] and not skips,
+                expected_passed=2, expected_ignored=0, test_counts=test_counts(text), skip_markers=skips)
+
+
+def require_nonroot_telemetry_runner():
+    if os.geteuid() == 0:
+        raise ValueError('telemetry Cargo checks and builds require the nonroot runner user')
+
+
+def telemetry_source_capture(checkout, output):
+    """Reuse CI's two strict source-capture e2e tests; Cargo stays nonroot."""
+    require_nonroot_telemetry_runner()
+    missing = [name for name in LIVE_SOURCE_PREREQUISITES if shutil.which(name) is None]
+    if missing:
+        raise ValueError('strict source-capture prerequisites missing: ' + ', '.join(missing))
+    run_command(['sudo', '-n', 'true'], checkout, output, 'telemetry-live-sudo-preflight')
+    # The only iptables preflight runs inside a new, unnamed disposable netns.
+    # It never changes host routing, firewall rules or security settings.
+    run_command(['sudo', '-n', 'unshare', '--net', 'sh', '-c',
+                 'ip link set lo up; iptables -t nat -L >/dev/null'],
+                checkout, output, 'telemetry-live-netns-preflight')
+    run_command(['cargo', 'build', '--locked', '--bin', 'ferrum-edge'],
+                checkout, output, 'telemetry-functional-gateway-build')
+    _, text = run_command(['cargo', 'test', '--locked', '--test', 'functional_tests', '--no-run',
+                          '--message-format=json-render-diagnostics'],
+                         checkout, output, 'telemetry-functional-test-build')
+    binary = functional_test_executable(text)
+    expected_directory = (checkout / 'target/debug/deps').resolve()
+    if (not binary.is_file() or not os.access(binary, os.X_OK)
+            or not binary.resolve().is_relative_to(expected_directory)):
+        raise ValueError('Cargo functional executable is not in the owned default-feature debug target')
+    gateway = checkout / 'target/debug/ferrum-edge'
+    if not gateway.is_file() or not os.access(gateway, os.X_OK):
+        raise ValueError('prebuilt default-feature gateway binary is unavailable')
+    write(output / 'telemetry-functional-binaries.json', dict(source_sha=git('rev-parse', 'HEAD', cwd=checkout),
+        features='manifest defaults; no explicit feature override', cargo_run_as_root=False,
+        functional_binary=str(binary), functional_binary_sha256=digest(binary),
+        gateway_binary=str(gateway), gateway_binary_sha256=digest(gateway),
+        scope='existing CI Ambient UDP/HBONE and raw-TCP/mesh-mTLS source capture in throwaway netns'))
+    record, text = run_command(source_capture_command(binary), checkout, output,
+                               'telemetry-source-capture-live', test=True, expected_passed=2)
+    qualification = live_source_qualification(record['exit_code'], text)
+    write(output / 'telemetry-source-capture-qualification.json', qualification)
+    if not qualification['valid']:
+        raise ValueError('source capture requires exactly two passes, zero ignored tests and zero SKIP markers')
+
+
 def standalone_hyper(checkout, scratch, output):
     """Two test-only graphs; unchanged source/manifests, recorded resolved locks."""
     source = checkout / 'vendor/hyper-1.10.0-ferrum-patched'
@@ -281,15 +374,19 @@ def main():
             if not reproduced:
                 raise ValueError('expected exact runtime assertion was not reproduced; compile/environment failures do not qualify')
         elif phase == 'gap-telemetry-verify':
+            require_nonroot_telemetry_runner()
             run_command(['cargo', 'fmt', '--all', '--', '--check'], checkout, output, 'fmt')
             run_command(['cargo', 'test', '--locked', '--lib', 'proxy::mesh_egress_observability::tests::',
                          '--', '--test-threads=1'], checkout, output, 'telemetry-lifecycle-tests', test=True)
+            for index, command in enumerate(telemetry_unit_commands(), 1):
+                run_command(command, checkout, output, 'telemetry-plugin-tests-' + str(index), test=True)
             run_command(['cargo', 'clippy', '--locked', '--lib', '--tests', '-p', 'ferrum-edge', '--', '-D', 'warnings'],
                         checkout, output, 'clippy')
+            telemetry_source_capture(checkout, output)
             if git('status', '--porcelain', '--untracked-files=normal', cwd=checkout):
                 raise ValueError('telemetry verification changed submitted source')
             result.update(complete=True, passed=True, performance_eligible=False,
-                          scope='correctness only; manifest-default test features; no release images or performance samples')
+                          scope='correctness only; manifest-default library/plugin tests and strict two-test source-capture e2e; no release images or performance samples')
         elif phase == 'gap-vendor-preflight':
             run_command(['bash', 'scripts/update_vendor_integrity.sh'], checkout, output, 'vendor-manifest-generation', test=True)
             changes = git('diff', '--name-only', cwd=checkout).splitlines()
