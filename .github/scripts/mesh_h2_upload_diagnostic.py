@@ -20,7 +20,12 @@ from mesh_gap_build import command
 import mesh_production_campaign as production
 
 SOURCE_ORIGIN = 'cf6bf5981217f0e1906ed3c42dbfaff7ad634a56'
-SOURCE = 'f0f6f6ad23604d29f3bc340833392e669f221efd'
+SOURCE_ORIGINAL = 'f0f6f6ad23604d29f3bc340833392e669f221efd'
+TEST_MAINTENANCE = '76a97661c44f5e849846a1e6195a8089b269f3aa'
+TEST_MAINTENANCE_PATHS = ('tests/secrets_functional/aws_backend.rs',
+                          'tests/secrets_functional/azure_backend.rs',
+                          'tests/secrets_functional/vault_backend.rs')
+SOURCE = '2c694f0ec67f417ec986283e0766f1f342821dc9'
 FEATURES = 'cloud-secrets,bench-h2-upload-profile'
 PHASES = ('h2-upload-vendor-preflight', 'h2-upload-diagnostic')
 OUTPUT = ROOT / 'results/h2-upload'
@@ -50,6 +55,10 @@ def selection():
         raise ValueError('candidate must resolve exactly')
     subprocess.run(['git', 'merge-base', '--is-ancestor', SOURCE, candidate], cwd=ROOT, check=True)
     observed = dict(performance_eligible=False, baseline_sha=BASELINE, observer_source_sha=SOURCE,
+        observer_original_source_sha=SOURCE_ORIGINAL,
+        test_maintenance=dict(source_sha=TEST_MAINTENANCE, parent_sha=BASELINE,
+            changed_paths=list(TEST_MAINTENANCE_PATHS),
+            scope='test-only Clippy repair; production/diagnostic/vendor source and original manifest unchanged'),
         candidate_sha=candidate, phase=phase, harness_sha=git('rev-parse', 'HEAD'),
         maintenance_origin=maintenance_origin(), profile='release', features=FEATURES,
         builder_image=BUILDER, cells=CELLS, duration=30, warmup=3, workers=4, rate=0,

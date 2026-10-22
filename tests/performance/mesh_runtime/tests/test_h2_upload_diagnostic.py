@@ -235,6 +235,26 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn('ferrum_lazy_cancel_tests', source)
         self.assertNotIn('SendBatch', source)
         self.assertEqual(subprocess.check_output(['git', 'show', '-s', '--format=%P', controller.SOURCE_ORIGIN], cwd=ROOT, text=True).strip(), controller.BASELINE)
+        self.assertEqual(controller.git('show', '-s', '--format=%P', controller.SOURCE), controller.SOURCE_ORIGINAL)
+        self.assertEqual(controller.git('show', '-s', '--format=%P', controller.TEST_MAINTENANCE), controller.BASELINE)
+        expected = {'tests/secrets_functional/aws_backend.rs', 'tests/secrets_functional/azure_backend.rs',
+                    'tests/secrets_functional/vault_backend.rs'}
+        self.assertEqual(set(controller.TEST_MAINTENANCE_PATHS), expected)
+        self.assertEqual(set(controller.git('diff', '--name-only', controller.SOURCE_ORIGINAL, controller.SOURCE).splitlines()), expected)
+        self.assertEqual(set(controller.git('diff', '--name-only', controller.BASELINE, controller.TEST_MAINTENANCE).splitlines()), expected)
+        for path in sorted(expected):
+            self.assertEqual(controller.git('ls-tree', controller.SOURCE, '--', path),
+                             controller.git('ls-tree', controller.TEST_MAINTENANCE, '--', path))
+        self.assertEqual(controller.git('rev-parse', controller.SOURCE + ':' + controller.MANIFEST),
+                         controller.git('rev-parse', controller.SOURCE_ORIGINAL + ':' + controller.MANIFEST))
+        with patch.dict('os.environ', {'GAP_CANDIDATE_SHA': controller.SOURCE,
+                                      'BENCH_PHASE': 'h2-upload-vendor-preflight',
+                                      'GAP_BASELINE_RUN_ID': '', 'GAP_BASELINE_RUN_ATTEMPT': ''}):
+            selected = controller.selection()
+        self.assertEqual(selected['observer_original_source_sha'], controller.SOURCE_ORIGINAL)
+        self.assertEqual(selected['test_maintenance']['source_sha'], controller.TEST_MAINTENANCE)
+        self.assertEqual(selected['test_maintenance']['parent_sha'], controller.BASELINE)
+        self.assertEqual(set(selected['test_maintenance']['changed_paths']), expected)
 
 
 if __name__ == '__main__':
