@@ -72,6 +72,18 @@ else
     esac
 fi
 
+# The worker-count diagnostic holds the same explicit four-CPU ceiling on
+# both roles. This is a fixture variable, never a shipping runtime setting.
+PROXY_CPU_ARGS=()
+if [ -n "${BENCH_PROXY_CPUS:-}" ]; then
+    if [ "${BENCH_PHASE:-}" != worker-locality-diagnostic ] || [ "$BENCH_PROXY_CPUS" != 4 ]; then
+        echo "proxy CPU override is restricted to the fixed worker diagnostic" >&2
+        exit 2
+    fi
+    case "$MESH" in ferrum|envoy) ;; *) exit 2 ;; esac
+    PROXY_CPU_ARGS=(--cpus 4)
+fi
+
 PAYLOAD_SIZES="1024 10240 71680 512000 1048576 5242880"
 DURATION=10
 CONCURRENCY=100
@@ -385,7 +397,7 @@ start_ferrum() {
     cp "$SCRIPT_DIR/configs/ferrum/mesh.yaml" "$RUNTIME_DIR/ferrum/mesh.yaml"
     chmod 644 "$RUNTIME_DIR/ferrum/mesh.yaml"
     # Server (destination) sidecar: inbound :15006 STRICT mTLS.
-    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" "${PROXY_CPU_ARGS[@]}" -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/ferrum/svid:ro" \
         -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
@@ -411,7 +423,7 @@ start_ferrum() {
         -e FERRUM_LOG_LEVEL=error \
         "${destination_idle_args[@]}" "$FERRUM_IMAGE" >/dev/null
     # Client sidecar: outbound :15101 dials destination :15006, pins SVID.
-    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" "${PROXY_CPU_ARGS[@]}" -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/ferrum/mesh.yaml:/etc/ferrum/mesh.yaml:ro" \
         -v "$CERT_DIR/client:/etc/ferrum/svid:ro" \
         -e FERRUM_WORKER_THREADS="${BENCH_WORKERS:-4}" \
@@ -455,11 +467,11 @@ start_envoy() {
     # otherwise collide on the base-id domain socket and the second exits.
     # v1.39.1's root entrypoint uses su-exec, which rebuilds groups. Start
     # nonroot so its direct-exec branch retains Docker's fixture group.
-    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" "${PROXY_CPU_ARGS[@]}" -d --network host --name "$SERVER_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/server.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/svc:/etc/mesh-certs/svc:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 0 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null
-    docker run --label "$BENCH_OWNER_LABEL" -d --network host --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
+    docker run --label "$BENCH_OWNER_LABEL" "${PROXY_CPU_ARGS[@]}" -d --network host --name "$CLIENT_NAME" --user 65532:65532 --group-add "$CERT_GID" \
         -v "$RUNTIME_DIR/envoy/client.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$CERT_DIR/client:/etc/mesh-certs/client:ro" \
         "$ENVOY_IMAGE" -c /etc/envoy/envoy.yaml --base-id 1 --concurrency "${BENCH_WORKERS:-4}" -l error >/dev/null

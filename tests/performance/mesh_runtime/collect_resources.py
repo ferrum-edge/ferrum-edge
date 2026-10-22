@@ -82,7 +82,7 @@ def run(args: argparse.Namespace) -> int:
         observed = [observer.inspect_container(c["name"]) for c in containers]
         auxiliary = [observer.inspect_container(name) for name in args.aux_container]
         report["production"] = {"proxy_containers": observed, "auxiliary_containers": auxiliary,
-            "limits": "shared runner; no CPU quota; thread scheduling is not Tokio task wakes; sampled sockets can miss churn",
+            "limits": "shared runner; CPU limits are recorded per container; thread scheduling is not Tokio task wakes; sampled sockets can miss churn",
             "metric_scope": "before loadgen launch through completed drain (includes warmup)",
             "socket_interval_seconds": 1.0}
         observer.metrics(args.mesh, observed, args.resources.parent, "before")
