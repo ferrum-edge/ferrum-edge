@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING (custom plugins) — request metadata maps use a faster hasher.**
+  `RequestContext.metadata`, the transaction and stream summaries'
+  `metadata`, and the stream-session metadata are now
+  `ferrum_edge::plugins::MetadataMap`, a `HashMap<String, String>` keyed with
+  `ahash`'s per-process randomly seeded hasher instead of std's SipHash-1-3.
+  Mesh telemetry stamps and reads a few dozen metadata keys on every request,
+  and SipHash was about 5% of a mesh sidecar's CPU. Keys, values, redaction and
+  every serialized log/metric output are unchanged. Custom plugins that name
+  the type, build it with `HashMap::new()`, or pass it to a function taking
+  `&HashMap<String, String>` switch to `MetadataMap::default()` or a
+  `BuildHasher`-generic signature.
 - **HTTP transaction records state their delivery-observation boundary**
   (issue #6769). Every `TransactionSummary` now carries `response_delivery`:
   `not_observed` when the record was finalized before the frontend transport
