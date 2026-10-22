@@ -674,11 +674,7 @@ run_cell() {
         for role in client server; do
             local data="/tmp/perf_${MESH}_${payload}_${role}.data"
             [ -f "$data" ] || continue
-            sudo "$perf_bin" report -i "$data" --no-children --sort symbol --stdio 2>/dev/null \
-                | grep -v '^#' | grep -v '^$' | head -200 | cut -c1-220 > "$pdir/${MESH}_${payload}_${role}_symbols.txt" || true
-            sudo "$perf_bin" report -i "$data" --no-children --sort dso --stdio 2>/dev/null \
-                | grep -v '^#' | grep -v '^$' | head -25 > "$pdir/${MESH}_${payload}_${role}_dso.txt" || true
-            sudo "$perf_bin" script -i "$data" 2>/dev/null \
+            timeout 120 sudo "$perf_bin" script --no-inline -i "$data" 2>/dev/null \
                 | python3 "$SCRIPT_DIR/perf_fold.py" | gzip > "$pdir/${MESH}_${payload}_${role}_oncpu_folded.txt.gz" || true
             sudo rm -f "$data"
         done
