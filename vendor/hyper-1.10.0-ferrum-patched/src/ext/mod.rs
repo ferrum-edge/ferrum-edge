@@ -59,6 +59,13 @@ mod h2_body_write_timeout;
 #[cfg(feature = "http2")]
 pub use h2_body_write_timeout::Http2BodyWriteTimeout;
 
+#[cfg(feature = "ferrum-h2-upload-diagnostic")]
+mod h2_upload_diagnostic;
+#[cfg(feature = "ferrum-h2-upload-diagnostic")]
+pub use h2_upload_diagnostic::{http2_upload_diagnostic_snapshot, Http2UploadDiagnosticSnapshot};
+#[cfg(feature = "ferrum-h2-upload-diagnostic")]
+pub(crate) use h2_upload_diagnostic::{record_h2_upload_branch, H2UploadBranch};
+
 #[cfg(all(feature = "http2", feature = "server"))]
 mod h2_stream_termination;
 #[cfg(all(feature = "http2", feature = "server"))]

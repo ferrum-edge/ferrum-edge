@@ -21,6 +21,8 @@ root. Each patch is based on the output of all preceding patches:
 | [005](005-h2-small-window-coalescing/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 | Coalesce DATA frames cut from small HTTP/2 window increments |
 | [006](006-h2-stream-termination-origin/README.md) | Hyper 1.10.0 + 001 + 002 + 003 + 004 + 005 | Publish why an HTTP/2 server stream ended while its service future is dropped |
 
+| [007](007-h2-upload-branch-diagnostic/README.md) | Hyper 1.10.0 + 001–006 | Default-off baseline POST upload branch observer; no lazy allocation or response grouping |
+
 Patch 002 supplies `pending_data`; patches 004 and 005 build on it. Patch 002
 is a complete diff from its stated baseline, replacing the former incremental
 correction that required the old fixed-minimum patch and patch 004 first.
@@ -41,12 +43,12 @@ at `capacity()`.
 The **Dependency Audit (cargo-deny)** job in
 [CI](../../.github/workflows/ci.yml) downloads and checks the pinned archive,
 then runs [the reconstruction verifier](../../.github/scripts/verify_hyper_patch_stack.py)
-before Cargo touches the vendor tree. It applies all six patches with
+before Cargo touches the vendor tree. It applies all seven patches with
 `git apply` to a fresh extracted crate. It neither formats the result nor
 copies source from `vendor/` over it.
 
 The verifier requires the complete file sets to match for all shipped Hyper
-files: `src/**`, `Cargo.toml`, `LICENSE` and `README.md`. Those are the 69 files
+files: `src/**`, `Cargo.toml`, `LICENSE` and `README.md`. Those are the 71 files
 currently retained in `vendor/hyper-1.10.0-ferrum-patched/`. Upstream packaging
 files, examples and upstream integration tests outside that retained set are
 not shipped by this vendor copy. Every retained file, including untouched

@@ -3851,6 +3851,41 @@ async fn handle_admin_request_inner(
             }
         }
         let mut metrics_output = registry.render();
+        #[cfg(feature = "bench-h2-upload-profile")]
+        {
+            use std::fmt::Write as _;
+            let counters = hyper::ext::http2_upload_diagnostic_snapshot();
+            // Existing native state, sampled only on this authorized cold path.
+            // request_count records finalized response status, not body EOF.
+            // Presence fields distinguish missing state from an actual zero.
+            let native = state.proxy_state.as_ref();
+            let status_200 = native.and_then(|ps| ps.status_counts.get(&200));
+            for (name, value) in [
+                ("schema", 2),
+                ("pid", u64::from(std::process::id())),
+                ("post_eos_total", counters.post_eos),
+                ("post_ready_ok_total", counters.post_ready_ok),
+                ("post_ready_err_total", counters.post_ready_err),
+                ("post_pending_total", counters.post_pending),
+                ("counter_overflow", u64::from(counters.overflow)),
+                ("native_state_present", u64::from(native.is_some())),
+                (
+                    "native_finalized_total",
+                    native.map_or(0, |ps| ps.request_count.load(Ordering::Relaxed)),
+                ),
+                ("native_status200_present", u64::from(status_200.is_some())),
+                (
+                    "native_status200_total",
+                    status_200.map_or(0, |count| count.load(Ordering::Relaxed)),
+                ),
+                (
+                    "native_active_requests",
+                    native.map_or(0, |ps| ps.overload.active_requests.load(Ordering::Relaxed)),
+                ),
+            ] {
+                let _ = writeln!(metrics_output, "ferrum_h2_upload_diagnostic_{name} {value}");
+            }
+        }
         #[cfg(feature = "bench-h1-profile")]
         metrics_output.push_str(&crate::h1_profile::render_prometheus());
         #[cfg(feature = "bench-pool-profile")]

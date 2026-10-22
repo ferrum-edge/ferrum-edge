@@ -268,6 +268,36 @@ async fn test_metrics_gated_and_live_minimal() {
         );
     }
 
+    // Default-off diagnostic retains the same authorization boundary above.
+    let diagnostic: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("ferrum_h2_upload_diagnostic_"))
+        .collect();
+    #[cfg(not(feature = "bench-h2-upload-profile"))]
+    assert!(
+        diagnostic.is_empty(),
+        "diagnostic must be absent by default"
+    );
+    #[cfg(feature = "bench-h2-upload-profile")]
+    {
+        let fields: std::collections::BTreeMap<_, _> = diagnostic
+            .iter()
+            .map(|line| {
+                let (name, value) = line.split_once(' ').expect("integer metric");
+                (name, value.parse::<u64>().expect("u64 metric"))
+            })
+            .collect();
+        assert_eq!(diagnostic.len(), 12);
+        assert_eq!(fields.len(), 12, "no duplicate fields");
+        assert_eq!(fields["ferrum_h2_upload_diagnostic_schema"], 2);
+        assert!(fields["ferrum_h2_upload_diagnostic_pid"] > 0);
+        assert_eq!(fields["ferrum_h2_upload_diagnostic_counter_overflow"], 0);
+        assert_eq!(
+            fields["ferrum_h2_upload_diagnostic_native_state_present"],
+            1
+        );
+    }
+
     // /health keeps sink internals in the authenticated detail tier.
     let unauth_health: serde_json::Value = client
         .get(format!("{}/health", harness.admin_base_url))

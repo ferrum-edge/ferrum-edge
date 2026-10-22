@@ -414,6 +414,8 @@ where
     B: Body,
 {
     is_connect: bool,
+    #[cfg(feature = "ferrum-h2-upload-diagnostic")]
+    is_post: bool,
     eos: bool,
     fut: ResponseFuture,
     body_tx: SendStream<SendBuf<B::Data>>,
@@ -552,8 +554,23 @@ where
                 // eagerly see if the body pipe is ready and
                 // can thus skip allocating in the executor
                 match Pin::new(&mut pipe).poll(cx) {
-                    Poll::Ready(_) => (),
+                    Poll::Ready(_result) => {
+                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
+                        crate::ext::record_h2_upload_branch(
+                            f.is_post,
+                            if _result.is_ok() {
+                                crate::ext::H2UploadBranch::ReadyOk
+                            } else {
+                                crate::ext::H2UploadBranch::ReadyErr
+                            },
+                        );
+                    }
                     Poll::Pending => {
+                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
+                        crate::ext::record_h2_upload_branch(
+                            f.is_post,
+                            crate::ext::H2UploadBranch::Pending,
+                        );
                         let conn_drop_ref = self.conn_drop_ref.clone();
                         // keep the ping recorder's knowledge of an
                         // "open stream" alive while this body is
@@ -571,6 +588,9 @@ where
                             .execute_h2_future(H2ClientFuture::Pipe { pipe });
                     }
                 }
+            } else {
+                #[cfg(feature = "ferrum-h2-upload-diagnostic")]
+                crate::ext::record_h2_upload_branch(f.is_post, crate::ext::H2UploadBranch::Eos);
             }
 
             None
@@ -729,6 +749,8 @@ where
                     }
 
                     let is_connect = req.method() == Method::CONNECT;
+                    #[cfg(feature = "ferrum-h2-upload-diagnostic")]
+                    let is_post = req.method() == Method::POST;
                     let eos = body.is_end_stream();
 
                     if is_connect
@@ -778,6 +800,8 @@ where
 
                     let f = FutCtx {
                         is_connect,
+                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
+                        is_post,
                         eos,
                         fut,
                         body_tx,

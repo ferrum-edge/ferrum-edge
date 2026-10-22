@@ -407,6 +407,8 @@ bench-h1-profile = []
 bench-pool-profile = ["bench-h1-profile"]
 # Bounded plain-UDP observations; no allocator or crypto changes.
 bench-udp-profile = []
+# Isolated HTTP/2 POST upload branch counts; diagnostic builds only.
+bench-h2-upload-profile = ["hyper/ferrum-h2-upload-diagnostic"]
 
 # ── Cryptographic backend (mutually exclusive) ─────────────────────────────
 #

@@ -3551,3 +3551,14 @@ family to the existing authenticated `/metrics` response. See
 [UDP profile contract](udp_internal_profile.md) for its literal schema, sampled
 synchronous timings, direction attribution, and explicit partial-data limits.
 Authentication and ordinary builds are unchanged.
+
+### Diagnostic HTTP/2 upload branch counts
+
+The isolated, default-off `bench-h2-upload-profile` feature adds twelve fixed
+`ferrum_h2_upload_diagnostic_*` integer fields to authenticated `/metrics`.
+They report namespace PID, schema, POST EOS/eager-success/eager-error/Pending
+counts, sticky overflow, native state/status presence, finalized-response and
+HTTP-200 totals, and active requests. No request content, labels, clocks or allocator
+instrumentation are included. The diagnostic is excluded from ranking.
+See [the complete diagnostic contract](upstream-hyper-patches/007-h2-upload-branch-diagnostic/README.md)
+for source coverage, receipt identity, warmup/drain scope and retirement.

@@ -1923,6 +1923,12 @@ paths:
       operationId: getPrometheusMetrics
       summary: Prometheus metrics (gated)
       description: |
+        Diagnostic-only `bench-h2-upload-profile` builds append fixed, label-free
+        `ferrum_h2_upload_diagnostic_*` integers: schema (2), namespace PID, POST
+        EOS/eager success/eager error/Pending totals, sticky counter overflow, native state/status presence, finalized-response and HTTP-200 totals, and active requests.
+        Counts cover HTTP/2 client POSTs reaching the upload pipe, not CPU or
+        allocations. Reads are individually atomic; they never reset counts.
+        This experimental family is excluded from performance ranking.
         Default-off `bench-h1-profile` diagnostic builds additionally emit fixed
         `ferrum_h1_profile_*` counters and completeness metadata. These are bounded
         Rust allocator, source-copy, body-poll and frontend AsyncWrite observations;

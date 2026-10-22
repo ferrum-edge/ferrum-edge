@@ -964,6 +964,37 @@
       ]
     },
     {
+      "id": "hyper-007-h2-upload-branch-diagnostic",
+      "label": "diagnostic-only HTTP/2 POST upload branch counters",
+      "crate": "hyper",
+      "vendored_version": "1.10.0",
+      "vendor_path": "vendor/hyper-1.10.0-ferrum-patched",
+      "docs_path": "docs/upstream-hyper-patches/007-h2-upload-branch-diagnostic/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Separate, default-off diagnostic for the production Incoming-backed POST branch distribution. Records fixed EOS, eager success/error and Pending counts, with no request content or logs. Excluded from performance ranking; counts belong to the instrumented run.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/hyper",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Remove after the bounded branch-frequency diagnostic, including root/Hyper features, admin rendering and patch metadata. Not intended for permanent shipping.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/hyper-1.10.0-ferrum-patched (ext::h2_upload_diagnostic::ferrum_h2_upload_diagnostic_tests)",
+        "tests/functional/functional_admin_observability_test.rs (test_metrics_gated_and_live_minimal)"
+      ]
+    },
+    {
       "id": "h2-001-coalesce-data-frame-writes",
       "label": "h2 writes several DATA frames per write call",
       "crate": "h2",
