@@ -796,8 +796,8 @@ pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
 /// block being present is not evidence that this plugin wrote it. Any anomaly
 /// answers `None` (dispatch without trailers) rather than forwarding a block
 /// this function cannot prove is the one the owner validated.
-pub(crate) fn staged_request_trailers<MS: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, MS>,
+pub(crate) fn staged_request_trailers(
+    metadata: &crate::plugins::MetadataMap,
 ) -> Option<http::HeaderMap> {
     let encoded = metadata.get(META_GRPC_WEB_REQUEST_TRAILERS)?;
     if encoded.len() > MAX_REQUEST_TRAILER_STAGING_BYTES {

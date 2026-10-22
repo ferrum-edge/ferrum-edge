@@ -8319,8 +8319,8 @@ pub mod _test_support {
     ///
     /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
     /// the sort is stable, so repeated values of one name keep wire order.
-    pub fn staged_grpc_web_request_trailers<MS: std::hash::BuildHasher>(
-        metadata: &std::collections::HashMap<String, String, MS>,
+    pub fn staged_grpc_web_request_trailers(
+        metadata: &crate::plugins::MetadataMap,
     ) -> Option<Vec<(String, String)>> {
         crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
             let mut entries: Vec<(String, String)> = map
