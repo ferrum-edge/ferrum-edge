@@ -937,7 +937,7 @@ Connection/Session In
 
 **Phase 2 — `on_stream_disconnect`**: Runs after the stream completes (TCP connection closed, or a UDP/DTLS session expires, is cleaned up, or otherwise ends). Receives a `StreamTransactionSummary` with bytes transferred, duration, error info, and metadata from the connect phase. Fire-and-forget — does not block cleanup.
 
-Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream proxy because it is relayed through a mesh CONNECT tunnel. Those handlers run only the `workload_metrics` connect/disconnect lifecycle, once per logical captured session, to produce the source-side outbound CLIENT span with final duration, bytes, and error state. They do not run authentication, authorization, throttling, or other policy plugins a second time; destination-side mesh authorization remains the enforcement point.
+Captured Sidecar/Ambient raw-TCP and UDP **egress** bypasses the generic stream proxy because it is relayed through a mesh CONNECT tunnel. Those handlers run only the configured built-in observability plugins — `workload_metrics` and `prometheus_metrics` — through the connect/disconnect lifecycle, once per logical captured session, in the configured chain's order and with its priority overrides and execution-trigger wrappers. `workload_metrics` produces the source-side outbound CLIENT span with final duration, bytes, and error state; `prometheus_metrics` records the stream summary and the mesh TCP opened/closed and byte families. Custom plugins that reuse either name are never selected. They do not run authentication, authorization, throttling, or other policy plugins a second time; destination-side mesh authorization remains the enforcement point.
 
 ### Stream Hook Implementations by Plugin
 

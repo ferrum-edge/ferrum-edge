@@ -62,12 +62,7 @@ impl CapturedMeshEgressLifecycle {
             .plugin_cache
             .plugins_for_protocol(&proxy.namespace, &proxy.id, protocol)
             .iter()
-            .filter(|plugin| {
-                matches!(
-                    plugin.name(),
-                    WORKLOAD_METRICS_PLUGIN | PROMETHEUS_METRICS_PLUGIN
-                ) && crate::plugins::is_builtin_plugin(plugin.as_ref())
-            })
+            .filter(|plugin| is_captured_lifecycle_plugin(plugin.as_ref()))
             .cloned()
             .collect();
         if plugins.is_empty() {
@@ -100,16 +95,17 @@ impl CapturedMeshEgressLifecycle {
         stream_ctx.authenticated_identity =
             asserted_source_identity.map(|identity| identity.to_string());
         stream_ctx.mesh_direction = Some(MeshTrafficDirection::Outbound);
-        let mut rejected = false;
+        let mut rejected_by = None;
         for plugin in &plugins {
             if matches!(
                 plugin.on_stream_connect(&mut stream_ctx).await,
                 PluginResult::Reject { .. }
             ) {
-                rejected = true;
+                rejected_by = Some(plugin.name().to_string());
                 break;
             }
         }
+        let rejected = rejected_by.is_some();
         stream_ctx.insert_metadata(
             "mesh.connection_security_policy".to_string(),
             "mutual_tls".to_string(),
@@ -158,14 +154,12 @@ impl CapturedMeshEgressLifecycle {
             connected_at: std::time::Instant::now(),
             bytes_sent: 0,
             bytes_received: 0,
-            connection_error: Some(
-                if rejected {
-                    "workload metrics rejected captured mesh egress lifecycle"
-                } else {
-                    "captured mesh egress setup failed"
+            connection_error: Some(match rejected_by {
+                Some(plugin) => {
+                    format!("{plugin} rejected captured mesh egress lifecycle")
                 }
-                .to_string(),
-            ),
+                None => "captured mesh egress setup failed".to_string(),
+            }),
             error_class: Some(ErrorClass::ConnectionPoolError),
             disconnect_direction: Some(Direction::ClientToBackend),
             disconnect_cause: Some(DisconnectCause::BackendError),
@@ -336,6 +330,15 @@ impl CapturedMeshEgressLifecycle {
     }
 }
 
+/// The configured builtin observers the captured lifecycle runs. Provenance is
+/// checked so a custom plugin reusing either name never runs here.
+fn is_captured_lifecycle_plugin(plugin: &dyn Plugin) -> bool {
+    matches!(
+        plugin.name(),
+        WORKLOAD_METRICS_PLUGIN | PROMETHEUS_METRICS_PLUGIN
+    ) && crate::plugins::is_builtin_plugin(plugin)
+}
+
 impl Drop for CapturedMeshEgressLifecycle {
     fn drop(&mut self) {
         if !self.completion_recorded
@@ -366,8 +369,8 @@ impl Drop for CapturedMeshEgressLifecycle {
         let plugins = std::mem::take(&mut self.plugins);
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(
-                plugin = WORKLOAD_METRICS_PLUGIN,
-                "captured mesh egress ended outside a Tokio runtime; span lifecycle was dropped"
+                plugins = ?plugins.iter().map(|plugin| plugin.name()).collect::<Vec<_>>(),
+                "captured mesh egress ended outside a Tokio runtime; disconnect hooks were dropped"
             );
             return;
         };
@@ -495,10 +498,7 @@ mod tests {
         .expect("workload_metrics establishes the captured lifecycle");
         let expected: Vec<_> = chain
             .iter()
-            .filter(|plugin| {
-                matches!(plugin.name(), "workload_metrics" | "prometheus_metrics")
-                    && crate::plugins::is_builtin_plugin(plugin.as_ref())
-            })
+            .filter(|plugin| is_captured_lifecycle_plugin(plugin.as_ref()))
             .collect();
         assert_eq!(lifecycle.plugins.len(), expected.len());
         for (actual, expected) in lifecycle.plugins.iter().zip(expected) {
