@@ -31,10 +31,11 @@ async fn vault_address_validation_precedes_reference_parsing_without_panicking()
     guard.set("VAULT_TOKEN", "address-token-sentinel");
     for &(address, reason) in INVALID_ADDRESSES {
         guard.set("VAULT_ADDR", address);
-        let error = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
-            .await
-            .err()
-            .expect("invalid address must return an ordinary error");
+        let Err(error) =
+            resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST").await
+        else {
+            panic!("invalid address must return an ordinary error");
+        };
         assert!(error.contains("VAULT_ADDR") && error.contains(reason));
         assert!(!error.contains("address-user"));
         assert!(!error.contains("address-password"));
@@ -46,10 +47,11 @@ async fn vault_address_validation_precedes_reference_parsing_without_panicking()
     // both schemes constructed successfully without requiring a network call.
     for address in ["https://vault.example.com:8200", "http://127.0.0.1:8200"] {
         guard.set("VAULT_ADDR", address);
-        let error = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
-            .await
-            .err()
-            .expect("construction succeeds before the reference is rejected");
+        let Err(error) =
+            resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST").await
+        else {
+            panic!("construction succeeds before the reference is rejected");
+        };
         assert!(error.contains("Invalid Vault KV v2 reference"), "{error}");
     }
 }
@@ -62,10 +64,9 @@ async fn vault_invalid_address_fails_single_and_batch_resolution() {
     guard.set("FERRUM_ADMIN_JWT_SECRET_VAULT", "secret/data/app#field");
     for &(address, reason) in INVALID_ADDRESSES {
         guard.set("VAULT_ADDR", address);
-        let single = resolve_secret("FERRUM_ADMIN_JWT_SECRET")
-            .await
-            .err()
-            .expect("single-key resolution must reject the address");
+        let Err(single) = resolve_secret("FERRUM_ADMIN_JWT_SECRET").await else {
+            panic!("single-key resolution must reject the address");
+        };
         let batch = resolve_all_env_secrets()
             .await
             .err()
@@ -286,7 +287,7 @@ async fn vault_missing_field_errors() {
     const ABSENT_FIELD: &str = "ferrum-absent-vault-field-sentinel";
     guard.set(
         "FERRUM_ADMIN_JWT_SECRET_VAULT",
-        &format!("secret/data/ferrum#{ABSENT_FIELD}"),
+        format!("secret/data/ferrum#{ABSENT_FIELD}"),
     );
 
     let err = resolve_all_env_secrets()
@@ -536,10 +537,11 @@ async fn vault_construction_outcome(guard: &EnvGuard, address: &str, allow: &str
     guard.set("VAULT_ADDR", address);
     guard.set("VAULT_TOKEN", "plaintext-token-sentinel");
     guard.set("FERRUM_VAULT_ALLOW_PLAINTEXT", allow);
-    resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST")
-        .await
-        .err()
-        .expect("a malformed reference never resolves")
+    let Err(error) = resolve_external_reference("vault", "invalid-reference", "FERRUM_TEST").await
+    else {
+        panic!("a malformed reference never resolves");
+    };
+    error
 }
 
 fn kv2_body(field: &str) -> serde_json::Value {

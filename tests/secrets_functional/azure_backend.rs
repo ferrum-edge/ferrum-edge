@@ -389,7 +389,7 @@ async fn azure_tls_inventory_reports_fetched_version() {
     // Distinct source identities: path-pinned vs query-pinned must not collapse.
     let path_source = CertSource::parse(&azure_uri, MaterialKind::Cert);
     let query_source = CertSource::parse(
-        &format!("azure://{}?version=v1", fake.secret_url("edge-cert")),
+        format!("azure://{}?version=v1", fake.secret_url("edge-cert")),
         MaterialKind::Cert,
     );
     assert_ne!(
@@ -406,7 +406,7 @@ async fn azure_tls_inventory_reports_fetched_version() {
                 query_uri.options.get("version").map(String::as_str),
                 Some("v1")
             );
-            assert!(path_uri.options.get("version").is_none());
+            assert!(!path_uri.options.contains_key("version"));
         }
         _ => panic!("expected azure:// URIs"),
     }
