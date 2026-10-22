@@ -50,6 +50,9 @@ use tokio_rustls::TlsAcceptor;
 const APP_PORT: u16 = 8080;
 /// Peer path answered with a 1 KiB body instead of the 2-byte `ok`.
 const KIB_PATH: &str = "/kib";
+/// Peer path that never reads its request body and holds its response, so an
+/// upload larger than the stream window stalls on flow control.
+const STALL_PATH: &str = "/stall";
 const PEER_MAX_CONCURRENT_STREAMS: u32 = 1024;
 
 // ===== identity fixtures =====
@@ -259,8 +262,16 @@ async fn start_holding_peer(server_slot: SharedSvidBundle) -> HoldingPeer {
                     } else {
                         Bytes::from_static(b"ok")
                     };
+                    let stall = request.uri().path() == STALL_PATH;
                     async move {
-                        let _ = request.into_body().collect().await;
+                        // A stalling peer keeps the body unread (no WINDOW_UPDATE)
+                        // until the response is released.
+                        let _unread_body = if stall {
+                            Some(request.into_body())
+                        } else {
+                            let _ = request.into_body().collect().await;
+                            None
+                        };
                         let _ = release_rx.wait_for(|released| *released).await;
                         Ok::<_, std::convert::Infallible>(Response::new(Full::new(body)))
                     }
@@ -660,4 +671,43 @@ async fn one_connection_carries_hundreds_of_concurrent_small_responses() {
         1,
         "every round rode the single bounded connection; nothing was torn down"
     );
+}
+
+/// The sidecar mesh-mTLS dispatcher bounds an unauthenticated upload with
+/// hyper's HTTP/2 pipe instead of a gateway-owned pump (vendored hyper patch
+/// 004): a peer that stops granting stream window must reset the upload once
+/// `backend_write_timeout_ms` passes with a ready chunk unwritten, and the
+/// shared flag must report that the bound fired.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_stops_reading_trips_the_h2_pipe_write_timeout() {
+    let fixture = fixture(1, None).await;
+    fixture.peer.hold();
+    let mut sender = fixture.checkout().await;
+    let write_timeout = hyper::ext::Http2BodyWriteTimeout::new(Duration::from_millis(200));
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(format!("https://orders.example.com{STALL_PATH}"))
+        .body(MeshMtlsRequestBody::Grpc(GrpcBody::Buffered(Full::new(
+            // Larger than hyper's default 1 MiB stream window, so the pipe
+            // parks on capacity once the peer stops reading.
+            Bytes::from(vec![b'x'; 8 * 1024 * 1024]),
+        ))))
+        .expect("request");
+    request.extensions_mut().insert(write_timeout.clone());
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        sender.send_request(request).expect("send"),
+    )
+    .await
+    .expect("the write bound, not the test timeout, must end the stalled upload");
+    assert!(
+        outcome.is_err(),
+        "an upload the peer stopped reading must not complete"
+    );
+    assert!(
+        write_timeout.expired(),
+        "the reset must be attributed to the HTTP/2 pipe write bound"
+    );
+    fixture.peer.release_all();
 }

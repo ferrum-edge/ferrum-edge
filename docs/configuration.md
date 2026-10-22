@@ -1547,9 +1547,11 @@ blocked on bridge capacity — that expiry surfaces as `504` /
 `X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout` (native
 gRPC: `grpc-status: 4` / `DEADLINE_EXCEEDED`, `error_class=read_write_timeout`).
 
-Two HTTP/2 uploads with no authorization lifetime need no pump for it: the
-fully streamed native gRPC upload, and the direct-HTTP/2 upload with no
-request-size limit (the passthrough arm). For those, hyper's own HTTP/2 body
+Three HTTP/2 uploads with no authorization lifetime need no pump for it: the
+fully streamed native gRPC upload, the direct-HTTP/2 upload with no
+request-size limit (the passthrough arm), and the streamed upload a mesh
+Sidecar forwards over its mesh-mTLS (or h2c Unix-socket) HTTP/2 connection.
+For those, hyper's own HTTP/2 body
 pipe enforces the bound (vendored hyper patch 004,
 [`docs/upstream-hyper-patches/004-h2-body-write-timeout/`](upstream-hyper-patches/004-h2-body-write-timeout/README.md)),
 the way nginx's `grpc_send_timeout` bounds "two successive write operations".
