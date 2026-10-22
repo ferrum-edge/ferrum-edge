@@ -30,9 +30,67 @@ import statistics
 import sys
 from pathlib import Path
 
-MESH_ORDER = ("direct", "ferrum", "envoy", "consul", "linkerd")
+MESH_ORDER = ("direct", "ferrumbaseline", "ferrum", "envoy", "consul", "consulhttp", "linkerd")
 CELL_RE = re.compile(r"^(?P<mesh>[a-z]+)_http1_(?P<payload>[0-9]+)\.json$")
 MEM_RE = re.compile(r"^([0-9.]+)\s*([KMGT]?i?B)")
+
+
+def effective_concurrency(base: int, payload: int) -> int:
+    """Match run_mesh_runtime_bench.sh's common bulk-payload schedule."""
+    divisor = 4 if payload >= 5242880 else 2 if payload >= 1048576 else 1
+    return max(1, base // divisor)
+
+
+def planned_cells(results_root: Path, warnings: list[str]) -> dict[Path, dict] | None:
+    """Return each campaign file's required metadata; None keeps legacy mode."""
+    campaign_file = results_root / "campaign.json"
+    if not campaign_file.exists():
+        return None
+    try:
+        campaign = json.loads(campaign_file.read_text())
+        duration, concurrency = campaign["duration"], campaign["concurrency"]
+        if type(duration) is not int or duration <= 0 or type(concurrency) is not int or concurrency <= 0:
+            raise ValueError("duration and concurrency must be positive integers")
+        if campaign.get("protocol", "http1") != "http1":
+            raise ValueError("the campaign must use the harness's http1 protocol")
+        if not isinstance(campaign["cells"], list) or not campaign["cells"]:
+            raise ValueError("cells must be a nonempty list")
+        planned: dict[Path, dict] = {}
+        for cell in campaign["cells"]:
+            arm, payload, repetition = cell["arm"], cell["payload"], cell["repetition"]
+            if not isinstance(arm, str) or not re.fullmatch(r"[a-z]+", arm):
+                raise ValueError("each cell must name an arm")
+            if type(payload) is not int or payload <= 0 or type(repetition) is not int or repetition <= 0:
+                raise ValueError("each cell must have a positive payload and repetition")
+            file = results_root / arm / f"run_{repetition}" / f"payload_{payload}" / f"{arm}_http1_{payload}.json"
+            if file in planned:
+                raise ValueError(f"duplicate planned cell {file}")
+            planned[file] = {
+                "mesh": arm, "gateway": arm, "payload_size": payload,
+                "protocol": "http1", "duration_secs": duration,
+                "concurrency": effective_concurrency(concurrency, payload),
+            }
+        return planned
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        warnings.append(f"unpublishable cell campaign metadata {campaign_file}: {exc}")
+        return {}
+
+
+def load_evidence(path: Path, warnings: list[str]) -> dict | None:
+    """Read an arm status or manifest; malformed evidence fails acceptance."""
+    try:
+        document = json.loads(path.read_text())
+        if not isinstance(document, dict):
+            raise ValueError("not a JSON object")
+        if not isinstance(document.get("mesh"), str) or not document["mesh"]:
+            raise ValueError("mesh must be a nonempty string")
+        sizes = document.get("payload_sizes", [])
+        if not isinstance(sizes, list) or any(type(s) is not int for s in sizes):
+            raise ValueError("payload_sizes must be a list of integers")
+    except (OSError, ValueError) as exc:
+        warnings.append(f"malformed evidence {path}: {exc}")
+        return None
+    return document
 
 
 def parse_mem_bytes(mem_usage: str) -> float | None:
@@ -107,6 +165,7 @@ def collect(results_root: Path) -> dict:
     arm_status: dict[str, dict] = {}
     # (mesh, payload) -> list of per-run records
     cells: dict[tuple[str, int], list[dict]] = {}
+    planned = planned_cells(results_root, warnings)
 
     cell_files = sorted(results_root.rglob("*_http1_*.json"))
     for f in cell_files:
@@ -118,33 +177,62 @@ def collect(results_root: Path) -> dict:
         try:
             data = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError) as e:
-            warnings.append(f"unparsable cell {f}: {e}")
+            warnings.append(f"unpublishable cell {f}: unparsable JSON: {e}")
             continue
-        mesh = data.get("mesh") or m.group("mesh")
-        payload = int(data.get("payload_size") or m.group("payload"))
+        mesh = m.group("mesh")
+        payload = int(m.group("payload"))
+        if not isinstance(data, dict) or data.get("mesh") != mesh or data.get("gateway") != mesh or data.get("payload_size") != payload:
+            warnings.append(f"unpublishable cell {f}: metadata does not match its planned identity")
+            continue
+        if planned is not None:
+            expected = planned.get(f)
+            if expected is None:
+                warnings.append(f"unpublishable cell {f}: file is not a planned campaign cell")
+                continue
+            mismatches = [
+                f"{key}={data.get(key)!r} (expected {value!r})"
+                for key, value in expected.items()
+                if data.get(key) != value or type(data.get(key)) is not type(value)
+            ]
+            if mismatches:
+                warnings.append(f"unpublishable cell {f}: campaign metadata mismatch: " + "; ".join(mismatches))
+                continue
         record = dict(data)
         stats = parse_stats(f.with_name(f.name.replace(".json", ".stats.jsonl")))
         if stats is not None:
             record["resources"] = stats
+        resource_file = f.with_name(f.name.replace(".json", ".resources.json"))
+        if resource_file.exists():
+            try:
+                resources = json.loads(resource_file.read_text())
+                if not isinstance(resources, dict):
+                    raise ValueError("resource interval is not a JSON object")
+                seconds = resources.get("elapsed_seconds", 0)
+                if not resources.get("valid") or not seconds or resources.get("host_cpu_steal_percent", 100) > 5:
+                    record["resource_error"] = "invalid /proc interval or CPU steal above 5%"
+                else:
+                    resources["proxy_cpu_percent_mean"] = 100 * resources["proxy_cpu_seconds"] / seconds
+                    resources["proxy_mem_bytes_peak_sum"] = resources["proxy_rss_bytes_peak"]
+                    resources["proxy_mem_bytes_mean"] = resources["proxy_rss_bytes_mean"]
+                    record["resources"] = resources
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                record["resource_error"] = str(exc)
         record["source_file"] = str(f)
         cells.setdefault((mesh, payload), []).append(record)
 
+    statuses: dict[Path, dict] = {}
     for status_file in sorted(results_root.rglob("*_arm_status.json")):
-        try:
-            st = json.loads(status_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        arm = st.get("mesh")
-        if arm:
-            arm_status.setdefault(arm, st)
+        st = load_evidence(status_file, warnings)
+        if st is not None:
+            statuses[status_file] = st
+            arm_status.setdefault(st["mesh"], st)
 
+    manifest_docs: list[tuple[Path, dict]] = []
     manifests: dict[str, dict] = {}
     for manifest_file in sorted(results_root.rglob("*_manifest.json")):
-        try:
-            man = json.loads(manifest_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if man.get("mesh"):
+        man = load_evidence(manifest_file, warnings)
+        if man is not None:
+            manifest_docs.append((manifest_file, man))
             manifests.setdefault(man["mesh"], man)
     for mesh_name, man in sorted(manifests.items()):
         if arm_status.get(mesh_name, {}).get("status") == "unsupported-standalone":
@@ -158,14 +246,8 @@ def collect(results_root: Path) -> dict:
 
     # Each manifest's own directory must contain every expected cell, so
     # a complete first repetition cannot hide a missing later one.
-    for manifest_file in sorted(results_root.rglob("*_manifest.json")):
-        try:
-            man = json.loads(manifest_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        mesh_name = man.get("mesh")
-        if not mesh_name:
-            continue
+    for manifest_file, man in manifest_docs:
+        mesh_name = man["mesh"]
         if arm_status.get(mesh_name, {}).get("status") == "unsupported-standalone":
             continue
         for payload in man.get("payload_sizes") or []:
@@ -177,13 +259,21 @@ def collect(results_root: Path) -> dict:
                 )
 
     aggregated: dict[str, dict] = {}
+    if planned is not None:
+        for expected, identity in planned.items():
+            status = statuses.get(expected.parent / f"{identity['mesh']}_arm_status.json", {})
+            unsupported = status.get("status") == "unsupported-standalone"
+            if not unsupported and (not expected.exists() or not expected.with_suffix(".resources.json").exists()):
+                warnings.append(f"missing expected cell or resource interval {expected}")
     for (mesh, payload), records in sorted(cells.items()):
         runs = []
         publishable = []
         for r in records:
             errors = r.get("total_errors")
+            warmup_errors = r.get("warmup_errors", None if planned is not None else 0)
             rps = float(r.get("rps") or 0)
-            ok = errors == 0 and rps > 0
+            ok = (errors == 0 and type(warmup_errors) is int and warmup_errors == 0
+                  and rps > 0 and not r.get("resource_error"))
             entry = {
                 "rps": rps,
                 "total_errors": errors,
@@ -197,7 +287,16 @@ def collect(results_root: Path) -> dict:
                 "p50_us": r.get("p50_us"),
                 "p95_us": r.get("p95_us"),
                 "p99_us": r.get("p99_us"),
+                "cohort_requests": r.get("cohort_requests"),
+                "cohort_p50_us": r.get("cohort_p50_us"),
+                "cohort_p95_us": r.get("cohort_p95_us"),
+                "cohort_p99_us": r.get("cohort_p99_us"),
+                "cohort_latency_max_us": r.get("cohort_latency_max_us"),
                 "resources": r.get("resources"),
+                "drained_requests": r.get("drained_requests"),
+                "warmup_requests": r.get("warmup_requests"),
+                "warmup_errors": r.get("warmup_errors"),
+                "resource_error": r.get("resource_error"),
             }
             runs.append(entry)
             if ok:
@@ -205,7 +304,7 @@ def collect(results_root: Path) -> dict:
             else:
                 warnings.append(
                     f"unpublishable cell mesh={mesh} payload={payload} "
-                    f"rps={rps} total_errors={errors} ({r.get('source_file')})"
+                    f"rps={rps} total_errors={errors} warmup_errors={warmup_errors} ({r.get('source_file')})"
                 )
         cell: dict = {"runs": runs, "publishable_runs": len(publishable)}
         if publishable:
@@ -217,7 +316,7 @@ def collect(results_root: Path) -> dict:
             cell["median_run_rps"] = median_run.get("rps")
             cell["rps_min"] = rps_values[0]
             cell["rps_max"] = rps_values[-1]
-            for key in ("latency_avg_us", "p50_us", "p95_us", "p99_us"):
+            for key in ("latency_avg_us", "p50_us", "p95_us", "p99_us", "cohort_requests", "cohort_p50_us", "cohort_p95_us", "cohort_p99_us", "cohort_latency_max_us"):
                 cell[key] = median_run.get(key)
             if median_run.get("resources"):
                 cell["resources"] = median_run["resources"]
@@ -275,7 +374,8 @@ def render_markdown(summary: dict) -> str:
         "Topology: loadgen -> client proxy -> **mTLS east-west hop** -> "
         "server proxy -> echo backend. `direct` skips both proxies. "
         "Median RPS across iterations; latency from the median-RPS run. "
-        "Cells with errors are excluded and listed under Warnings.\n"
+        "Cells with errors fail acceptance and are listed under Warnings. "
+        "`consul` is a separate L4 TCP control; `consulhttp` is the verified L7 HTTP arm.\n"
     )
     for arm, st in sorted(summary["arm_status"].items()):
         if st.get("status") != "ready":
@@ -321,7 +421,7 @@ def render_markdown(summary: dict) -> str:
                 )
             lines.append("| " + " | ".join(row) + " |")
 
-    lines.append("\n## Latency (median-RPS run)\n")
+    lines.append("\n## In-window successful-completion latency (median-RPS run)\n")
     lines.append("| Mesh | Payload | Avg | P50 | P95 | P99 |")
     lines.append("|------|---------|----:|----:|----:|----:|")
     for mesh in meshes:
@@ -335,7 +435,27 @@ def render_markdown(summary: dict) -> str:
                 f"| {fmt_us(c.get('p99_us'))} |"
             )
 
-    lines.append("\n## Proxy-pair CPU / memory (docker stats cgroup usage, measured window)\n")
+    if any(cell(mesh, p).get("cohort_requests") is not None for mesh in meshes for p in payloads):
+        lines.append("\n## Admitted-success cohort latency including drains (median-RPS run)\n")
+        lines.append(
+            "Successful echoes admitted during the common measurement window, "
+            "including responses completed after its deadline. Failed exchanges "
+            "remain in `total_errors`; drains do not contribute to useful RPS.\n"
+        )
+        lines.append("| Mesh | Payload | Successful exchanges | P50 | P95 | P99 | Max |")
+        lines.append("|------|---------|--------------------:|----:|----:|----:|----:|")
+        for mesh in meshes:
+            for p in payloads:
+                c = cell(mesh, p)
+                if not c.get("median_rps") or c.get("cohort_requests") is None:
+                    continue
+                lines.append(
+                    f"| {mesh} | {fmt_bytes(p)} | {c['cohort_requests']:,} "
+                    f"| {fmt_us(c.get('cohort_p50_us'))} | {fmt_us(c.get('cohort_p95_us'))} "
+                    f"| {fmt_us(c.get('cohort_p99_us'))} | {fmt_us(c.get('cohort_latency_max_us'))} |"
+                )
+
+    lines.append("\n## Proxy-pair resources (/proc process CPU/RSS for new campaigns; legacy docker stats where present)\n")
     lines.append("| Mesh | Payload | CPU mean | CPU peak (Σ) | Mem mean | Mem peak (Σ) |")
     lines.append("|------|---------|---------:|---------:|---------:|---------:|")
     for mesh in meshes:
@@ -419,7 +539,7 @@ def check_acceptance(summary: dict) -> int:
     if not summary.get("meshes"):
         failures.append("no benchmark cells collected")
     for w in summary.get("warnings") or []:
-        if w.startswith("missing expected cell") or w.startswith("unpublishable cell"):
+        if w.startswith(("missing expected cell", "unpublishable cell", "malformed evidence")):
             failures.append(w)
     for mesh, st in sorted((summary.get("arm_status") or {}).items()):
         if st.get("status") == "failed":
