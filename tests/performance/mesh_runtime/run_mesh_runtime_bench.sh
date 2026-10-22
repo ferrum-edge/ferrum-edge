@@ -130,7 +130,22 @@ TOOLS_IMAGE="${TOOLS_IMAGE:-mesh-bench-tools:local}"
 BENCH_CARGO_PROFILE="${BENCH_CARGO_PROFILE:-release}"
 case "$BENCH_CARGO_PROFILE" in release|ci-release) ;; *) echo "invalid build profile" >&2; exit 2 ;; esac
 BENCH_FERRUM_FEATURES="${BENCH_FERRUM_FEATURES:-cloud-secrets}"
-case "$BENCH_FERRUM_FEATURES" in cloud-secrets|cloud-secrets,bench-h1-profile) ;; *) echo "invalid build features" >&2; exit 2 ;; esac
+case "$BENCH_FERRUM_FEATURES" in
+    cloud-secrets|cloud-secrets,bench-h1-profile) ;;
+    cloud-secrets,bench-h2-upload-profile)
+        if [ "${BENCH_PHASE:-}" != h2-upload-diagnostic ] || [ "$MESH" != ferrum ] ||
+           [ "${BENCH_PRODUCTION_OBSERVE:-}" != true ] || [ "${BENCH_RATE:-0}" != 0 ] ||
+           [ "${BENCH_WORKERS:-4}" != 4 ] || [ "${BENCH_PERF_LEAF:-false}" != false ] ||
+           [ "$DURATION" != 30 ] || [ "$WARMUP" != 3 ] || [ "$CONCURRENCY" != 100 ] || ! $SKIP_BUILD; then
+            echo "upload feature requires the fixed diagnostic phase" >&2; exit 2
+        fi
+        case "$PAYLOAD_SIZES" in 1024|1048576) ;; *) exit 2 ;; esac
+        ;;
+    *) echo "invalid build features" >&2; exit 2 ;;
+esac
+if [ "${BENCH_PHASE:-}" = h2-upload-diagnostic ] && [ "$BENCH_FERRUM_FEATURES" != cloud-secrets,bench-h2-upload-profile ]; then
+    echo "diagnostic phase requires its observer feature" >&2; exit 2
+fi
 
 BACKEND_PORT=18080
 OUTBOUND_PORT=15101
@@ -644,11 +659,15 @@ run_cell() {
         resource_args+=(--perf-leaf --symbol-elf "${BENCH_SYMBOL_ELF:?qualified symbol ELF required}"
             --symbol-qualification-report "${BENCH_SYMBOL_REPORT:?qualification report required}")
     fi
+    if [ "${BENCH_PHASE:-}" = h2-upload-diagnostic ]; then
+        resource_args+=(--h2-upload-diagnostic --h2-upload-image "$FERRUM_IMAGE")
+    fi
     resource_args+=(--fixture-owner "$BENCH_OWNER" --rate "${BENCH_RATE:-0}" --loadgen-network "${LOADGEN_NETWORK:-host}" --loadgen-user "${LOADGEN_USER:-}")
     local runner_prefix=()
     if [ "${BENCH_PRODUCTION_OBSERVE:-false}" = true ] || [ "${BENCH_PERF_LEAF:-false}" = true ]; then runner_prefix=(sudo -n); fi
     local rc=0
     local cell_budget=$((DURATION + WARMUP + 2 * EXCHANGE_TIMEOUT_SECS + 20))
+    if [ "${BENCH_PHASE:-}" = h2-upload-diagnostic ]; then cell_budget=$((cell_budget + 14)); fi
     if [ "${BENCH_PERF_LEAF:-false}" = true ]; then cell_budget=$((cell_budget + 150)); fi
     echo "[bench] cell wall budget=${cell_budget}s exchange budget=${EXCHANGE_TIMEOUT_SECS}s"
     timeout --signal=TERM --kill-after=5s "${cell_budget}s" \

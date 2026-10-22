@@ -90,6 +90,17 @@ def run(args: argparse.Namespace) -> int:
             "metric_scope": "before loadgen launch through completed drain (includes warmup)",
             "socket_interval_seconds": 1.0}
         observer.metrics(args.mesh, observed, args.resources.parent, "before")
+    upload_epoch = None
+    if args.h2_upload_diagnostic:
+        if (not args.production_observe or args.mesh != "ferrum" or args.perf_leaf
+                or args.allocation_url or args.rate != 0 or args.duration != "30"
+                or args.warmup != "3" or args.payload_size not in ("1024", "1048576")
+                or args.concurrency != ("100" if args.payload_size == "1024" else "50")
+                or len(containers) != 2):
+            raise ValueError("upload diagnostic requires its fixed two-cell contract")
+        from h2_upload_observer import Epoch
+        upload_epoch = Epoch([c["name"] for c in containers], args.h2_upload_image,
+                             args.resources.parent / "upload-epoch")
     perf_capture = None
     if args.perf_leaf:
         if args.mesh not in ("ferrum", "envoy") or len(containers) != 2:
@@ -182,6 +193,11 @@ def run(args: argparse.Namespace) -> int:
                                      "socket_samples": observations})
         if detail_begin is not None and detail_end is not None:
             report["production"]["scheduler_deltas"] = observer.scheduler_deltas(detail_begin, detail_end)
+    if upload_epoch is not None:
+        upload = upload_epoch.finish(args.output, int(args.payload_size), status)
+        report["h2_upload_diagnostic"] = {"accepted": upload["accepted"], "performance_eligible": False}
+        if not upload["accepted"]:
+            report["errors"].append("upload diagnostic epoch did not conserve completed echoes")
     if begin is None or finish is None:
         report["errors"].append("missing measurement phase marker")
     else:
@@ -236,6 +252,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--container", action="append", default=[])
     parser.add_argument("--production-observe", action="store_true")
+    parser.add_argument("--h2-upload-diagnostic", action="store_true")
+    parser.add_argument("--h2-upload-image")
     parser.add_argument("--perf-leaf", action="store_true")
     parser.add_argument("--symbol-elf", action="append", default=[])
     parser.add_argument("--symbol-qualification-report")
