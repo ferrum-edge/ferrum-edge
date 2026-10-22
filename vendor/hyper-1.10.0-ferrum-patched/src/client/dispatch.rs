@@ -385,6 +385,37 @@ where
     }
 }
 
+// FERRUM PATCH 007: these are the same autonomous response waiters as Send.
+// A wake can repoll at most eight children. Completed/canceled children are
+// dropped in this poll, releasing their stream and cancellation guards promptly.
+#[cfg(feature = "http2")]
+pub struct SendBatch<B: Body + 'static, E> {
+    pub(crate) waiters: Vec<SendWhen<B, E>>,
+}
+
+#[cfg(feature = "http2")]
+impl<B, E> Future for SendBatch<B, E>
+where
+    B: Body + 'static,
+    E: crate::rt::bounds::Http2UpgradedExec<B::Data>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SendWhen's pinned fields are h2 handles and an oneshot sender, all
+        // Unpin. Its executor is not pinned. No body/executor Unpin bound is
+        // added, and no child is moved while pinned.
+        let this = self.get_mut();
+        this.waiters
+            .retain_mut(|waiter| Pin::new(waiter).poll(cx).is_pending());
+        if this.waiters.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "nightly")]
