@@ -93,6 +93,7 @@ mod h3_retained_upload_tests;
 mod h3_retry_eligibility_tests;
 mod h3_streaming_upload_end_tests;
 mod hbone_inner_reuse_classification_tests;
+mod header_merge_reconciliation_tests;
 mod health_check_tests;
 mod http3_address_validation_tests;
 mod http3_config_tests;
