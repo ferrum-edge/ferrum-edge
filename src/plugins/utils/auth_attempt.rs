@@ -8,7 +8,7 @@ use crate::plugins::{JwtAuthAttributeValue, RequestContext};
 #[derive(Default)]
 pub struct AuthenticationAttempt {
     claim_headers: HashMap<String, String>,
-    principal_metadata: HashMap<String, String>,
+    principal_metadata: crate::plugins::MetadataMap,
     mesh_request_auth_audiences: Option<Vec<String>>,
     mesh_request_auth_claims: HashMap<String, JwtAuthAttributeValue>,
     stripping_metadata: HashSet<String>,

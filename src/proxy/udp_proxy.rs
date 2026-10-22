@@ -325,7 +325,7 @@ struct UdpSession {
     /// Authentication mechanism that succeeded, carried to `on_stream_disconnect`.
     auth_method: Option<&'static str>,
     /// Plugin metadata from on_stream_connect, carried to on_stream_disconnect.
-    metadata: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    metadata: std::sync::Mutex<crate::plugins::MetadataMap>,
     /// Per-instance execution-trigger decisions taken during
     /// `on_stream_connect`, carried so `on_stream_disconnect` agrees. Opaque and
     /// immutable for the session's lifetime — unlike `metadata`, no plugin can
@@ -2270,9 +2270,9 @@ pub(crate) fn maybe_touch_udp_idle_activity(
 /// Restore private correlation ownership after every plugin-writable metadata
 /// merge and immediately before the disconnect summary becomes observable.
 pub(crate) fn finalize_stream_summary_metadata(
-    mut metadata: std::collections::HashMap<String, String>,
+    mut metadata: crate::plugins::MetadataMap,
     correlation_ids: &CorrelationIdState,
-) -> std::collections::HashMap<String, String> {
+) -> crate::plugins::MetadataMap {
     correlation_ids.project_correlation_ids(&mut metadata);
     metadata
 }
@@ -2387,7 +2387,7 @@ struct UdpSetupAttribution {
     consumer_username: Option<String>,
     auth_method: Option<&'static str>,
     sni_hostname: Option<String>,
-    metadata: std::collections::HashMap<String, String>,
+    metadata: crate::plugins::MetadataMap,
     /// The proxy's configured host/port, used only when the attempt failed
     /// before any target selection settled.
     configured_backend_target: String,
@@ -2594,7 +2594,7 @@ struct DtlsDisconnectContext<'a> {
     /// `StreamConnectionContext` during `on_stream_connect`. Carried into the
     /// disconnect summary so logging sinks keep connect/disconnect parity.
     sni_hostname: Option<String>,
-    metadata: &'a std::collections::HashMap<String, String>,
+    metadata: &'a crate::plugins::MetadataMap,
     correlation_ids: &'a CorrelationIdState,
     /// Per-instance execution-trigger decisions captured from the accepted
     /// connection's `StreamConnectionContext`, so `on_stream_disconnect` agrees
@@ -5014,8 +5014,7 @@ async fn process_new_session_datagram(
         &stream_ctx.plugin_trigger_decisions(),
     );
 
-    let first_datagram_metadata =
-        std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
+    let first_datagram_metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
     // The first-datagram policy hooks are post-admission awaitable setup: a
     // deliberately slow `on_udp_datagram` hook must not carry this session past
     // the credential that admitted it. No circuit-breaker probe has been
@@ -6309,7 +6308,7 @@ struct DtlsHandlerResult {
     bytes_received: u64,
     /// Session metadata recorded by per-datagram hooks during forwarding (e.g.
     /// WAF `waf.*` signature hits), merged into the disconnect summary.
-    metadata: std::collections::HashMap<String, String>,
+    metadata: crate::plugins::MetadataMap,
     outcome: Result<(), anyhow::Error>,
 }
 
@@ -6356,7 +6355,7 @@ async fn handle_dtls_client(
     // Shared sink for per-datagram WAF metadata recorded by the forwarding tasks
     // inside `handle_dtls_client_inner`; drained into the disconnect summary
     // below so DTLS hits are observable by default (parity with plain UDP/TCP).
-    let datagram_metadata = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let datagram_metadata = Arc::new(std::sync::Mutex::new(crate::plugins::MetadataMap::default()));
     let outcome = handle_dtls_client_inner(
         client_conn,
         identity,
@@ -6616,7 +6615,7 @@ pub(crate) fn is_dtls_authorization_expired(error: &anyhow::Error) -> bool {
 pub(crate) fn settle_stream_udp_auth_expiry(
     termination: crate::proxy::auth_lifetime::StreamAuthTermination,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
 ) -> bool {
     let won = latch.record_once(
         termination,
@@ -6640,7 +6639,7 @@ pub(crate) fn settle_stream_udp_auth_expiry(
 pub(crate) fn settle_dtls_auth_expiry(
     termination: crate::proxy::auth_lifetime::StreamAuthTermination,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
 ) {
     let _settled = settle_stream_udp_auth_expiry(termination, latch, session_metadata);
 }
@@ -7059,7 +7058,7 @@ where
 pub(crate) async fn dtls_c2b_until_expiry<F>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     stage: F,
 ) -> Result<F::Output, crate::proxy::auth_lifetime::StreamAuthTermination>
 where
@@ -7099,7 +7098,7 @@ pub(crate) enum DtlsRelayInterrupt {
 pub(crate) async fn dtls_c2b_under_bounds<F>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     trust: &DtlsClientTrustFence,
     stage: F,
 ) -> Result<F::Output, DtlsRelayInterrupt>
@@ -7338,7 +7337,7 @@ pub(crate) fn udp_authorization_expired_before_commit(
 pub(crate) async fn stream_udp_setup_stage_under_authorization<S, F>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     context: &'static str,
     release_probe: impl FnOnce(),
     stage: S,
@@ -7381,7 +7380,7 @@ where
 pub(crate) async fn stream_udp_setup_stage_under_bounds<S, F>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     context: &'static str,
     trust: &DtlsClientTrustFence,
     release_probe: impl FnOnce(),
@@ -7426,7 +7425,7 @@ where
 pub(crate) async fn dtls_setup_stage_under_bounds<S, F>(
     plan: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    session_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     trust: &DtlsClientTrustFence,
     release_probe: impl FnOnce(),
     stage: S,
@@ -7465,7 +7464,7 @@ async fn handle_dtls_client_inner(
     bytes_received: Arc<AtomicU64>,
     last_request_size: Arc<AtomicU64>,
     response_budget_remaining: Arc<AtomicU64>,
-    datagram_metadata: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    datagram_metadata: Arc<std::sync::Mutex<crate::plugins::MetadataMap>>,
     datagram_plugins: &Arc<[Arc<dyn Plugin>]>,
     proxy_name: Option<&str>,
     listen_port: u16,
@@ -8454,7 +8453,7 @@ async fn create_session(
     node_waypoint_destination: Option<NodeWaypointUdpSessionDestination>,
     auth_deadline: Option<crate::proxy::auth_lifetime::StreamAuthDeadline>,
     auth_latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-    setup_metadata: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    setup_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     progress: &mut UdpSetupProgress,
     // Per-effective-source-IP slot already taken by `reserve_udp_session_slot`
     // (issue #4544), transferred onto the session so it is released exactly
@@ -10230,7 +10229,7 @@ impl UdpAuthorizationSessionProbe {
             sni_hostname: None,
             consumer_username: Some("probe-consumer".to_string()),
             auth_method: Some("key_auth"),
-            metadata: std::sync::Mutex::new(std::collections::HashMap::new()),
+            metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::default()),
             plugin_trigger_decisions: Default::default(),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
@@ -10359,7 +10358,7 @@ impl UdpAuthorizationSessionProbe {
     }
 
     /// The session metadata the disconnect summary is built from.
-    pub fn metadata(&self) -> std::collections::HashMap<String, String> {
+    pub fn metadata(&self) -> crate::plugins::MetadataMap {
         self.session
             .metadata
             .lock()
@@ -10654,7 +10653,7 @@ impl UdpEgressWriterProbe {
             sni_hostname: None,
             consumer_username: None,
             auth_method: None,
-            metadata: std::sync::Mutex::new(std::collections::HashMap::new()),
+            metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::default()),
             plugin_trigger_decisions: Default::default(),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
@@ -10894,7 +10893,6 @@ mod tests {
     };
     use crate::proxy::GatewayConfig;
     use async_trait::async_trait;
-    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -10923,7 +10921,7 @@ mod tests {
             sni_hostname: None,
             consumer_username: None,
             auth_method: None,
-            metadata: std::sync::Mutex::new(HashMap::from([(
+            metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::from_iter([(
                 "request_id".to_string(),
                 "stream-123".to_string(),
             )])),
@@ -11124,7 +11122,10 @@ backend_tls_verify_server_cert: false
         // prove duration_ms is not derived from civil-clock subtraction.
         let connected_at = chrono::Utc::now() - chrono::TimeDelta::hours(2);
         let disconnected_at = chrono::Utc::now() - chrono::TimeDelta::hours(3);
-        let metadata = HashMap::from([("request_id".to_string(), "dtls-123".to_string())]);
+        let metadata = crate::plugins::MetadataMap::from_iter([(
+            "request_id".to_string(),
+            "dtls-123".to_string(),
+        )]);
         let correlation_ids = Default::default();
 
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
@@ -11190,7 +11191,7 @@ backend_tls_verify_server_cert: false
         let client_addr: SocketAddr = "127.0.0.1:54000".parse().unwrap();
         let connected_at = chrono::Utc::now();
         let disconnected_at = connected_at + chrono::TimeDelta::milliseconds(42);
-        let metadata = HashMap::new();
+        let metadata = crate::plugins::MetadataMap::default();
         let correlation_ids = Default::default();
         let sni = Some("device.example".to_string());
 
@@ -11418,7 +11419,7 @@ backend_tls_verify_server_cert: false
         // Wall jumped backward an hour while the Instant-derived duration is 900 ms.
         let disconnected_at = connected_at - chrono::TimeDelta::hours(1);
         let correlation_ids = Default::default();
-        let metadata = HashMap::new();
+        let metadata = crate::plugins::MetadataMap::default();
         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
             plugin_trigger_decisions: Default::default(),
             namespace: "ferrum",
@@ -11463,7 +11464,7 @@ backend_tls_verify_server_cert: false
         let connected_wall = chrono::Utc::now();
         let disconnected_wall_rollback = connected_wall - chrono::TimeDelta::hours(1);
         let correlation_ids = Default::default();
-        let metadata = HashMap::new();
+        let metadata = crate::plugins::MetadataMap::default();
 
         // Production pattern: duration_ms = connected_mono.elapsed(), never
         // (disconnected_wall - connected_wall).
@@ -12258,7 +12259,7 @@ backend_tls_verify_server_cert: false
             sni_hostname: None,
             consumer_username: None,
             auth_method: None,
-            metadata: std::sync::Mutex::new(HashMap::new()),
+            metadata: std::sync::Mutex::new(crate::plugins::MetadataMap::default()),
             correlation_ids: Default::default(),
             local_addr: std::sync::OnceLock::new(),
             node_waypoint_destination: None,

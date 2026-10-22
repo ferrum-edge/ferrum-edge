@@ -1636,7 +1636,10 @@ fn clear_instance_stats(ctx: &mut RequestContext, keys: &CompressionMetadataKeys
     }
 }
 
-fn metadata_usize(metadata: &HashMap<String, String>, key: &str) -> usize {
+fn metadata_usize<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    key: &str,
+) -> usize {
     metadata
         .get(key)
         .and_then(|value| value.parse::<usize>().ok())

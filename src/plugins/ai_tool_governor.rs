@@ -686,7 +686,10 @@ fn label_rank(label: &str) -> u8 {
 /// while a higher-severity label still upgrades a recorded `allow`. Enforce mode
 /// is unaffected: it rejects at the first blocking surface, so no later write
 /// runs to clobber the decision.
-fn set_decision_metadata(m: &mut HashMap<String, String>, label: &str) {
+fn set_decision_metadata<MS: std::hash::BuildHasher>(
+    m: &mut HashMap<String, String, MS>,
+    label: &str,
+) {
     let keep_existing = m
         .get("ai_tool_governor.decision")
         .is_some_and(|existing| label_rank(existing) >= label_rank(label));
@@ -752,7 +755,10 @@ fn bounded_csv_merge<'a>(existing: &'a str, values: &[&'a str]) -> (String, u64)
 
 /// Accumulate the count of observations dropped by [`bounded_csv_merge`] under
 /// [`OBSERVATIONS_OMITTED_KEY`], so a capped ledger is never silently short.
-fn record_omitted_observations(m: &mut HashMap<String, String>, omitted: u64) {
+fn record_omitted_observations<MS: std::hash::BuildHasher>(
+    m: &mut HashMap<String, String, MS>,
+    omitted: u64,
+) {
     if omitted == 0 {
         return;
     }
@@ -769,8 +775,8 @@ fn record_omitted_observations(m: &mut HashMap<String, String>, omitted: u64) {
 /// while an equal-severity batch merges values so multiple inspected surfaces
 /// or plugin instances cannot hide one another's findings. Either way the
 /// stored ledger stays bounded (see [`bounded_csv_merge`]).
-fn set_ranked_csv_metadata(
-    m: &mut HashMap<String, String>,
+fn set_ranked_csv_metadata<MS: std::hash::BuildHasher>(
+    m: &mut HashMap<String, String, MS>,
     key: &str,
     previous_rank: u8,
     batch_rank: u8,
@@ -805,8 +811,8 @@ fn set_ranked_csv_metadata(
 /// replaces a weaker decision's risk even when the weaker call happened to
 /// carry a higher risk label; lower-severity later batches cannot downgrade or
 /// overwrite the winning decision's risk.
-fn set_ranked_risk_metadata(
-    m: &mut HashMap<String, String>,
+fn set_ranked_risk_metadata<MS: std::hash::BuildHasher>(
+    m: &mut HashMap<String, String, MS>,
     previous_rank: u8,
     batch_rank: u8,
     risk: RiskLevel,
@@ -1869,9 +1875,9 @@ impl AiToolGovernor {
     /// into an inspector-owned slot, then the terminal hook merges that slot
     /// into `ctx.metadata`; keeping the formatter shared prevents observability
     /// config or key-shape drift between the two paths.
-    fn write_metadata_into(
+    fn write_metadata_into<MS: std::hash::BuildHasher>(
         engine: &GovernorEngine,
-        m: &mut HashMap<String, String>,
+        m: &mut HashMap<String, String, MS>,
         batch: &BatchDecision,
     ) {
         let obs = engine.observability;
@@ -1965,9 +1971,9 @@ impl AiToolGovernor {
         );
     }
 
-    fn write_uninspectable_metadata_into(
+    fn write_uninspectable_metadata_into<MS: std::hash::BuildHasher>(
         engine: &GovernorEngine,
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut HashMap<String, String, MS>,
     ) {
         if !engine.observability.emit_metadata {
             return;
@@ -1985,9 +1991,9 @@ impl AiToolGovernor {
     /// `decision=dry_run` (never `deny`) so logs cannot claim the bytes were
     /// blocked, and reuses [`set_decision_metadata`] so a stronger earlier
     /// decision from another surface/instance is not erased.
-    fn write_ambiguity_observation_into(
+    fn write_ambiguity_observation_into<MS: std::hash::BuildHasher>(
         engine: &GovernorEngine,
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut HashMap<String, String, MS>,
     ) {
         // This label describes observation without enforcement and is valid
         // only for global dry-run mode. In particular, an enforce-mode plugin
@@ -2020,9 +2026,9 @@ impl AiToolGovernor {
     /// were not evaluated against policy, so neither `allow` nor `deny` would
     /// be a truthful label. The reason label is fixed-cardinality and never
     /// echoes body, provider, model, tool, or backend-controlled bytes.
-    fn write_unrecognized_shape_observation_into(
+    fn write_unrecognized_shape_observation_into<MS: std::hash::BuildHasher>(
         engine: &GovernorEngine,
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut HashMap<String, String, MS>,
     ) {
         if !engine.observability.emit_metadata {
             return;
@@ -2091,8 +2097,8 @@ impl AiToolGovernor {
             || reason == AMBIGUOUS_TOOL_ARGUMENTS
     }
 
-    fn merge_stream_metadata(
-        target: &mut HashMap<String, String>,
+    fn merge_stream_metadata<MS: std::hash::BuildHasher>(
+        target: &mut HashMap<String, String, MS>,
         source: &HashMap<String, String>,
     ) {
         // Observation keys are merged BEFORE the decision gate (issue #4232).

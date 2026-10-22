@@ -26,7 +26,6 @@ use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -823,7 +822,7 @@ fn minimum_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: LOKI_MIN_TIMESTAMP.to_string(),
         timestamp_disconnected: LOKI_MIN_TIMESTAMP.to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: crate::plugins::MetadataMap::default(),
     }
 }
 

@@ -218,9 +218,9 @@ impl BackendAttemptTrace {
     /// The attempt recorder for a request `otel_tracing` has decided to sample,
     /// parented under the request's SERVER span. `None` for an unsampled
     /// request or trace metadata that is not W3C-shaped.
-    pub(crate) fn for_request(
+    pub(crate) fn for_request<MS: std::hash::BuildHasher>(
         sink: &Arc<AttemptSpanSink>,
-        metadata: &HashMap<String, String>,
+        metadata: &HashMap<String, String, MS>,
         method: &str,
     ) -> Option<Arc<Self>> {
         if !trace_is_sampled(metadata) {

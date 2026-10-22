@@ -625,7 +625,7 @@ mod tests {
             BackendScheme::Tcp,
             Arc::new(ConsumerIndex::new(&[])),
         );
-        ctx.metadata = Some(std::collections::HashMap::from([(
+        ctx.metadata = Some(crate::plugins::MetadataMap::from_iter([(
             "mesh.direction".to_string(),
             "outbound".to_string(),
         )]));

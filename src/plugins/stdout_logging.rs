@@ -484,7 +484,6 @@ impl Plugin for StdoutLogging {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use serde_json::json;
 
@@ -528,7 +527,7 @@ mod tests {
             timestamp_connected: "2026-05-10T00:00:00Z".to_string(),
             timestamp_disconnected: "2026-05-10T00:00:01Z".to_string(),
             sni_hostname: None,
-            metadata: HashMap::new(),
+            metadata: crate::plugins::MetadataMap::default(),
         }
     }
 
@@ -764,7 +763,7 @@ mod tests {
             consumer_username: None,
             auth_method: None,
             connection_id: 7,
-            metadata: HashMap::new(),
+            metadata: crate::plugins::MetadataMap::default(),
         }
     }
 

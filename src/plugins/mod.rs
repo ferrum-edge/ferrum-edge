@@ -149,6 +149,16 @@ use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+
+/// String-keyed metadata attached to a request, a stream session, or their
+/// transaction summaries.
+///
+/// Keyed with `ahash`'s randomly seeded hasher rather than std's SipHash-1-3:
+/// mesh telemetry stamps and reads a few dozen of these keys on every request,
+/// and SipHash was about 5% of a mesh sidecar's CPU. The per-process random
+/// seed keeps keys a peer can influence from being turned into collision
+/// floods, as for the UDP session maps.
+pub type MetadataMap = HashMap<String, String, ahash::RandomState>;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
@@ -1382,12 +1392,12 @@ pub struct UdpDatagramContext<'a> {
 /// `log_to_stdout`, matching the TCP behavior.
 #[derive(Clone, Copy)]
 pub struct UdpMetadataSink<'a> {
-    map: &'a std::sync::Mutex<HashMap<String, String>>,
+    map: &'a std::sync::Mutex<MetadataMap>,
 }
 
 impl<'a> UdpMetadataSink<'a> {
     /// Wrap a session metadata map as a sink.
-    pub fn new(map: &'a std::sync::Mutex<HashMap<String, String>>) -> Self {
+    pub fn new(map: &'a std::sync::Mutex<MetadataMap>) -> Self {
         Self { map }
     }
 
@@ -1399,7 +1409,7 @@ impl<'a> UdpMetadataSink<'a> {
     /// cannot erase earlier hits (last-write-wins). Holding the lock across the
     /// whole read-modify-write also keeps the concurrent bidirectional datagram
     /// tasks from racing on the same key.
-    pub fn update<F: FnOnce(&mut HashMap<String, String>)>(&self, f: F) {
+    pub fn update<F: FnOnce(&mut MetadataMap)>(&self, f: F) {
         let mut map = self
             .map
             .lock()
@@ -1573,7 +1583,7 @@ pub struct WsDisconnectContext {
     /// Authentication mechanism that succeeded for the upgrade request.
     pub auth_method: Option<&'static str>,
     /// Correlation ID / tracing metadata inherited from the upgrade request.
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Ownership generation captured at WebSocket upgrade admission. Not
     /// serialized; used by `proxy_alerts` to reject stale disconnect samples
     /// after delete→recreate of the same proxy ID.
@@ -1654,7 +1664,10 @@ impl CorrelationIdState {
         })
     }
 
-    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn project_correlation_ids<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         for (key, value) in &self.instances {
             metadata.insert(key.clone(), value.clone());
         }
@@ -1716,7 +1729,10 @@ impl CanonicalClientIpCache {
         self.correlation_ids.is_correlation_header(name)
     }
 
-    fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+    fn project_correlation_ids<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         self.correlation_ids.project_correlation_ids(metadata);
     }
 }
@@ -2715,7 +2731,7 @@ pub struct RequestContext {
     /// triggered instances on the published chain.
     plugin_trigger_decisions: Vec<(u64, bool)>,
     /// Extra metadata plugins can attach
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Most complete built-in AI usage snapshot for Prometheus export.
     /// Kept outside public metadata so backend/operator metadata cannot mint or
     /// overwrite trusted token and cost series.
@@ -3878,7 +3894,11 @@ pub(crate) fn meaningful_identity(identity: Option<&str>) -> Option<&str> {
     identity.filter(|identity| !identity.trim().is_empty())
 }
 
-fn merge_metadata_value(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+fn merge_metadata_value<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    key: &str,
+    value: &str,
+) {
     metadata
         .entry(key.to_string())
         .and_modify(|existing| {
@@ -4284,7 +4304,7 @@ impl RequestContext {
             request_is_grpc_web: false,
             request_is_grpc_web_text: false,
             plugin_trigger_decisions: Vec::new(),
-            metadata: HashMap::new(),
+            metadata: MetadataMap::default(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
             ai_usage_export_cost_prefix: None,
@@ -4464,7 +4484,10 @@ impl RequestContext {
         self.canonical_client_ip.canonical_correlation_id()
     }
 
-    pub(crate) fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn project_correlation_ids<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         self.canonical_client_ip.project_correlation_ids(metadata);
     }
 
@@ -6364,7 +6387,10 @@ impl RequestContext {
             .map(String::as_str)
     }
 
-    pub(crate) fn apply_waf_owned_log_metadata(&self, metadata: &mut HashMap<String, String>) {
+    pub(crate) fn apply_waf_owned_log_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         metadata.retain(|key, _| !key.starts_with("waf."));
         let Some(state) = self.plugin_state() else {
             return;
@@ -9039,7 +9065,7 @@ pub struct TransactionSummary {
     /// plus operator extras from `FERRUM_LOG_REDACT_METADATA_KEYS`) are
     /// replaced with `[REDACTED]` at serialize time. The in-memory value is
     /// untouched so other plugin phases can still read the original.
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Built-in AI usage provenance for Prometheus. This is intentionally not
     /// serialized into transaction logs; the operator-visible usage metadata
     /// remains in `metadata` while trust stays typed and private to the request
@@ -9797,7 +9823,7 @@ pub struct StreamConnectionContext {
     peer_spiffe_certificate_principal: bool,
     /// Plugin metadata. Lazily allocated on first write to avoid a HashMap allocation
     /// for stream connections that have no metadata-writing plugins configured.
-    pub metadata: Option<HashMap<String, String>>,
+    pub metadata: Option<MetadataMap>,
     /// Core-owned admission permits. External plugins should leave this empty
     /// and use metadata for their own connection state. Built-in admission
     /// plugins attach opaque permits through `add_admission_permit()` so state
@@ -9964,7 +9990,7 @@ impl StreamConnectionContext {
             request_id.clone(),
             generated,
         );
-        let metadata = self.metadata.get_or_insert_with(HashMap::new);
+        let metadata = self.metadata.get_or_insert_with(MetadataMap::default);
         metadata.insert(instance_key.to_string(), request_id.clone());
         if publish_canonical {
             metadata.insert(REQUEST_ID_METADATA_KEY.to_string(), request_id);
@@ -10073,12 +10099,12 @@ impl StreamConnectionContext {
     /// Insert a metadata value, lazily allocating the map on first write.
     pub fn insert_metadata(&mut self, key: String, value: String) {
         self.metadata
-            .get_or_insert_with(HashMap::new)
+            .get_or_insert_with(MetadataMap::default)
             .insert(key, value);
     }
 
     /// Take the metadata map, returning an empty map if never allocated.
-    pub fn take_metadata(&mut self) -> HashMap<String, String> {
+    pub fn take_metadata(&mut self) -> MetadataMap {
         let mut metadata = self.metadata.take().unwrap_or_default();
         self.correlation_ids.project_correlation_ids(&mut metadata);
         metadata
@@ -10093,7 +10119,7 @@ impl StreamConnectionContext {
     /// replacing the authoritative terminal values.
     pub(crate) fn take_metadata_with_correlation_ids(
         &mut self,
-    ) -> (HashMap<String, String>, CorrelationIdState) {
+    ) -> (MetadataMap, CorrelationIdState) {
         (
             self.metadata.take().unwrap_or_default(),
             std::mem::take(&mut self.correlation_ids),
@@ -10106,7 +10132,7 @@ impl StreamConnectionContext {
     ///
     /// Used by setup-failure paths that must describe an admitted-but-never-
     /// published stream while the context is still owned by the setup chain.
-    pub(crate) fn snapshot_summary_metadata(&self) -> HashMap<String, String> {
+    pub(crate) fn snapshot_summary_metadata(&self) -> MetadataMap {
         let mut metadata = self.metadata.clone().unwrap_or_default();
         self.correlation_ids.project_correlation_ids(&mut metadata);
         metadata
@@ -10290,7 +10316,7 @@ pub struct StreamTransactionSummary {
         skip_serializing_if = "HashMap::is_empty",
         serialize_with = "crate::plugins::utils::metadata_redaction::serialize_redacted_metadata"
     )]
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
     /// Ownership generation captured at stream admission. Not serialized;
     /// used by `proxy_alerts` to reject samples from a prior delete→recreate
     /// incarnation of the same proxy ID.
