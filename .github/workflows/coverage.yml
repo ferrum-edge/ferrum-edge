@@ -277,11 +277,15 @@ jobs:
           set -euo pipefail
 
           docker run -d --name ferrum-cov-redis -p 6379:6379 redis:7-alpine
-          docker run -d --name ferrum-cov-mongo -p 27017:27017 mongo:7
+          # GLIBC_TUNABLES keeps mongo:9 clear of its kernel 6.19-7.0.13 startup
+          # gate on the ubuntu-26.04 runners; see ci.yml (issue #6589).
+          docker run -d --name ferrum-cov-mongo -p 27017:27017 \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 mongo:9
           # A replica-set member advertises its own host:port, so it must run
           # on the host network at the port the driver dials.
           docker run -d --name ferrum-cov-mongo-rs --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
+            mongo:9 --replSet rs0 --port 27020 --bind_ip_all \
             --setParameter enableTestCommands=1
           docker run -d --name ferrum-cov-postgres \
             -e POSTGRES_DB=ferrum \

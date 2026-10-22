@@ -125,12 +125,16 @@ services:
   # interpolation of unrelated profiles. Initialization variables never rotate
   # the user in an existing volume; see docs/upgrade_guide.md.
   mongodb:
-    image: mongo:7-jammy@sha256:f71f6d0913c945096cd058557cbadf4ad435007f378d84b3c4c636c928735e72
+    image: mongo:9@sha256:dc28ed5a9d0fc616903c3f463bb1e53b92b49f441721b91926e87d90bf957ce8
     container_name: ferrum-mongodb-db
     environment:
       MONGO_INITDB_ROOT_USERNAME: ferrum
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-}
       MONGO_INITDB_DATABASE: ferrum
+      # Let glibc keep rseq so tcmalloc skips its per-CPU caches. Without this
+      # MongoDB 9 refuses to start on Linux kernels 6.19 through 7.0.13
+      # (SERVER-121912), including Ubuntu 26.04's 7.0.0. See docs/mongodb.md.
+      GLIBC_TUNABLES: glibc.pthread.rseq=1
     entrypoint:
       - bash
       - -ec

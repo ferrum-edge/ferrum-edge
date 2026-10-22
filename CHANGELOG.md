@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invisible to the config's own `ETag` — is refused with `412` under the
   namespace config admission lease, atomically with the write. Clients
   must send the parameter on every plugin-config update and delete.
+- **CI and compose MongoDB fixtures move from 7.0 to 9.0** (issue #6589).
+  `mongo:9` exits on the `ubuntu-26.04` runner kernel (7.0.0), which falls in
+  the server's 6.19–7.0.13 tcmalloc/rseq startup gate (SERVER-121912). mongod
+  checks that gate only while tcmalloc's per-CPU caches are active, so every
+  9.0 fixture now runs with `GLIBC_TUNABLES=glibc.pthread.rseq=1`. This leaves
+  rseq with glibc and keeps tcmalloc on per-thread caches. The replica-set,
+  TLS, mTLS, coverage, and scale fixtures and the conditional-live-stores
+  digest pin run 9.0, and the standalone plaintext fixture stays on 4.4.29 as
+  the supported floor. The `docker-compose.yml` `mongodb` profile moves to
+  `mongo:9` with the same override. A compose volume created by MongoDB 7.0
+  cannot be opened by 9.0, so remove the old volume (`docker compose down -v`)
+  before upgrading a compose stack.
 
 ### Fixed
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**

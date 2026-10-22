@@ -23,8 +23,8 @@ so the practical floor is **4.4.2**.
 
 | Server | Status |
 |---|---|
-| MongoDB 9.0 | Supported and recommended. |
-| MongoDB 5.0 – 8.x | Supported. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 7.0 (see the kernel note below). |
+| MongoDB 9.0 | Supported and recommended. CI runs the replica-set, TLS, mTLS, coverage, and scale suites on 9.0 (with the rseq override in the kernel note below). |
+| MongoDB 5.0 – 8.x | Supported. |
 | MongoDB 4.4.2+ | Oldest supported version. CI runs the standalone plaintext functional matrix on 4.4.29. Upstream support has ended, so use it only while you upgrade. |
 | MongoDB 4.4.0 – 4.4.1, 4.2 and older | Not supported (no `hello` command, or wire version 8 or lower). |
 | MongoDB Atlas | Supported on any Atlas-offered version. |
@@ -44,10 +44,27 @@ is in [SERVER-125742](https://jira.mongodb.org/browse/SERVER-125742).
   there.
 - 7.0 is unaffected.
 
-The `mongo:9` image (9.0.2 and 9.0.4) therefore exits on hosts whose kernel
-reports 7.0.0, such as Ubuntu 26.04 kernels and the GitHub-hosted
-`ubuntu-26.04` runners ("Linux kernel versions 6.19.0 through 7.0.13 have a
-known incompatibility", SERVER-121912). Ferrum's CI uses 7.0 for this reason.
+Hosts whose kernel reports 7.0.0, such as Ubuntu 26.04 and the GitHub-hosted
+`ubuntu-26.04` runners, fall inside that range, and the `mongo:9` image (9.0.4
+included) exits there with "Linux kernel versions 6.19.0 through 7.0.13 have a
+known incompatibility" ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)).
+
+mongod enforces the range only while tcmalloc's per-CPU caches are active.
+Those caches need the kernel's rseq registration, which the official image
+frees for tcmalloc with `GLIBC_TUNABLES=glibc.pthread.rseq=0`. Setting
+`GLIBC_TUNABLES=glibc.pthread.rseq=1` leaves rseq with glibc, so tcmalloc falls
+back to per-thread caches and mongod starts on an affected kernel:
+
+```bash
+docker run -d --name mongo -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
+  -p 127.0.0.1:27017:27017 mongo:9
+```
+
+`db.serverStatus({tcmalloc: 1}).tcmalloc.usingPerCPUCaches` then reports
+`false`. The cost is some allocator throughput, which is acceptable for
+development and CI. Ferrum's CI fixtures and the `docker-compose.yml`
+`mongodb` service set this override. On a production host, prefer a kernel at
+7.0.14 or later.
 
 Replica-set features (transactions, `POST /batch`, change streams) need a
 replica set on any version; see [Replica Sets and
@@ -57,7 +74,7 @@ Transactions](#replica-sets-and-transactions).
 
 ```bash
 # Start MongoDB (Docker)
-docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:7
+docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:9
 
 # Start Ferrum Edge
 FERRUM_MODE=database \
@@ -442,7 +459,7 @@ available.
 
 ```bash
 # Start a single-node replica set for development
-docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:7 --replSet rs0
+docker run -d --name mongo-rs -p 127.0.0.1:27017:27017 mongo:9 --replSet rs0
 
 # Wait for mongod to accept connections
 until docker exec mongo-rs mongosh --quiet --eval "db.adminCommand('ping').ok" >/dev/null 2>&1; do sleep 1; done

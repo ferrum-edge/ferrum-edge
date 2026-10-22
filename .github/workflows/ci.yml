@@ -1412,10 +1412,12 @@ jobs:
           set -euo pipefail
           set +x
           # Docker Hub OCI index digests verified against registry-1.docker.io
-          # on 2026-10-04. Preserve the existing tags/majors and client versions.
+          # on 2026-10-04 (mongo:9 on 2026-10-22). Preserve the existing
+          # tags/majors and client versions. mongo:9 runs with glibc owning
+          # rseq; see the data-services step for why (issue #6589).
           postgres_image='postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea'
           mysql_image='mysql:8@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242'
-          mongo_image='mongo:7@sha256:1f995ad6fdb93244a1addab1b58f934a0bc2f5643c38e02f5e9d7f0c7d227a7b'
+          mongo_image='mongo:9@sha256:dc28ed5a9d0fc616903c3f463bb1e53b92b49f441721b91926e87d90bf957ce8'
           deadline=$((SECONDS + 480))
           fixture_phase='initializing credentials'
           cleanup_on_failure() {
@@ -1479,6 +1481,7 @@ jobs:
             -e MYSQL_DATABASE=ferrum -e MYSQL_USER=ferrum -e MYSQL_PASSWORD \
             -e MYSQL_ROOT_PASSWORD "$mysql_image"
           bounded 30 docker run -d --name conditional-mongo --network host \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
             "$mongo_image" --replSet rs0 --port 27020 --bind_ip 127.0.0.1 \
             --setParameter transactionLifetimeLimitSeconds=180
           # These sleeping client containers share the RUNNER network namespace.
@@ -2314,14 +2317,16 @@ jobs:
         # - TLS 27018: verify-full + require modes (issue #2399)
         # - mTLS 27019: client certificate authentication (issue #2399)
         # Neither plaintext topology can substitute for the TLS fixtures. The
-        # others stay on MongoDB 7.0: the official mongo:9 image (9.0.2 and
-        # 9.0.4 alike) exits at startup on the ubuntu-26.04 runner kernel,
-        # which reports 7.0.0 and so falls inside the server's 6.19-7.0.13
-        # tcmalloc/rseq startup gate (SERVER-125742/SERVER-121912; 8.0.21+ and
-        # 8.3 have the same gate). Move them to mongo:9 only once a 9.x build
-        # starts there or the runner kernel reaches 7.0.14+ (issue #6589), and
-        # prove it with a run of the branch's own workflow (workflow_dispatch):
-        # pull_request runs execute main's ci.yml.
+        # others run MongoDB 9.0 with GLIBC_TUNABLES=glibc.pthread.rseq=1.
+        # The ubuntu-26.04 runner kernel reports 7.0.0, inside the server's
+        # 6.19-7.0.13 tcmalloc/rseq startup gate (SERVER-121912/SERVER-125742),
+        # which 9.0.4 still enforces. mongod checks that gate only while
+        # tcmalloc's per-CPU caches are active (startup_check_rseq.cpp), and
+        # those need rseq, which the image frees by setting rseq=0. Letting
+        # glibc keep rseq leaves tcmalloc on per-thread caches and mongod
+        # starts. Drop the override once the runner kernel reaches 7.0.14+
+        # (issue #6589). PR runs execute main's ci.yml, so prove a change
+        # here with a workflow_dispatch run of the branch.
         run: |
           set -euo pipefail
 
@@ -2332,7 +2337,8 @@ jobs:
           # advertised. Behind a `-p` mapping it would advertise the container
           # port and the driver would dial the wrong process.
           docker run -d --name ferrum-ci-mongo-rs --network host \
-            mongo:7 --replSet rs0 --port 27020 --bind_ip_all \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
+            mongo:9 --replSet rs0 --port 27020 --bind_ip_all \
             --setParameter enableTestCommands=1
           docker run -d --name ferrum-ci-postgres \
             -e POSTGRES_DB=ferrum \
@@ -2548,8 +2554,9 @@ jobs:
             --health-interval=2s \
             --health-timeout=5s \
             --health-retries=60 \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
             --entrypoint bash \
-            mongo:7 \
+            mongo:9 \
             -c '
               set -e
               mkdir -p /certs
@@ -2577,8 +2584,9 @@ jobs:
             --health-interval=2s \
             --health-timeout=5s \
             --health-retries=60 \
+            -e GLIBC_TUNABLES=glibc.pthread.rseq=1 \
             --entrypoint bash \
-            mongo:7 \
+            mongo:9 \
             -c '
               set -e
               mkdir -p /certs

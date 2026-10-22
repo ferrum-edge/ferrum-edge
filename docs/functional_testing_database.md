@@ -470,7 +470,7 @@ The MongoDB functional test (`tests/functional/functional_mongodb_test.rs`) prov
 
 ```bash
 # Start MongoDB (plaintext)
-docker run -d --name mongo-test -p 127.0.0.1:27017:27017 mongo:7
+docker run -d --name mongo-test -p 127.0.0.1:27017:27017 mongo:9
 
 # MongoDB TLS/mTLS fixtures are provisioned inline by hosted data-plane CI.
 # Local TLS cells skip unless FERRUM_TEST_MONGO_CERT_DIR and ports 27018/27019
