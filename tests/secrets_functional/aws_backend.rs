@@ -201,7 +201,7 @@ async fn aws_missing_json_field_errors() {
     set_aws_env(&guard, &ls.endpoint);
     guard.set(
         "FERRUM_ADMIN_JWT_SECRET_AWS",
-        &format!("ferrum/json#{ABSENT_FIELD}"),
+        format!("ferrum/json#{ABSENT_FIELD}"),
     );
 
     let err = resolve_all_env_secrets()
@@ -329,7 +329,7 @@ async fn aws_negative_resolution_does_not_break_later_success() {
     // 2. The fetch succeeds but the requested JSON field is absent.
     guard.set(
         "FERRUM_ADMIN_JWT_SECRET_AWS",
-        &format!("ferrum/json#{ABSENT_FIELD}"),
+        format!("ferrum/json#{ABSENT_FIELD}"),
     );
     let err = resolve_all_env_secrets()
         .await
