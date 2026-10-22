@@ -75,7 +75,10 @@ impl HeaderDiagnostic {
     }
 
     pub fn new(count: u16, value_bytes: u16) -> Result<Self> {
-        anyhow::ensure!(count <= MAX_HEADER_COUNT, "diagnostic header count exceeds 32");
+        anyhow::ensure!(
+            count <= MAX_HEADER_COUNT,
+            "diagnostic header count exceeds 32"
+        );
         anyhow::ensure!(
             value_bytes <= MAX_HEADER_VALUE_BYTES,
             "diagnostic header value size exceeds 256"

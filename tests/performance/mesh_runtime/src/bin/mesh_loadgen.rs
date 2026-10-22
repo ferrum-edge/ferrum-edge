@@ -240,7 +240,10 @@ async fn main() -> Result<()> {
             );
         } else {
             // Keep the default report fields and serialization unchanged.
-            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).unwrap_or_default()
+            );
         }
     } else {
         let r = combined.json(

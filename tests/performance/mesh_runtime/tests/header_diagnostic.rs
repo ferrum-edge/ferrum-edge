@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use http::{HeaderMap, HeaderValue};
-use mesh_runtime_perf::header_diagnostic::{HeaderDiagnostic, HeaderDiagnosticArgs, RECEIPT_HEADER};
+use mesh_runtime_perf::header_diagnostic::{
+    HeaderDiagnostic, HeaderDiagnosticArgs, RECEIPT_HEADER,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -24,7 +26,11 @@ fn headers(profile: &HeaderDiagnostic) -> HeaderMap {
 
 #[test]
 fn flags_are_paired_bounded_and_default_off() {
-    assert!(HeaderDiagnostic::from_options(None, None).unwrap().is_none());
+    assert!(
+        HeaderDiagnostic::from_options(None, None)
+            .unwrap()
+            .is_none()
+    );
     assert!(HeaderDiagnostic::from_options(Some(0), None).is_err());
     assert!(HeaderDiagnostic::from_options(None, Some(0)).is_err());
     assert!(HeaderDiagnostic::new(33, 0).is_err());
@@ -40,9 +46,27 @@ fn flags_are_paired_bounded_and_default_off() {
     for args in [
         vec!["tool", "--diagnostic-header-count", "0"],
         vec!["tool", "--diagnostic-header-value-bytes", "0"],
-        vec!["tool", "--diagnostic-header-count", "33", "--diagnostic-header-value-bytes", "0"],
-        vec!["tool", "--diagnostic-header-count", "0", "--diagnostic-header-value-bytes", "257"],
-        vec!["tool", "--diagnostic-header-count", "-1", "--diagnostic-header-value-bytes", "0"],
+        vec![
+            "tool",
+            "--diagnostic-header-count",
+            "33",
+            "--diagnostic-header-value-bytes",
+            "0",
+        ],
+        vec![
+            "tool",
+            "--diagnostic-header-count",
+            "0",
+            "--diagnostic-header-value-bytes",
+            "257",
+        ],
+        vec![
+            "tool",
+            "--diagnostic-header-count",
+            "-1",
+            "--diagnostic-header-value-bytes",
+            "0",
+        ],
     ] {
         assert!(DiagnosticCli::try_parse_from(args).is_err());
     }
