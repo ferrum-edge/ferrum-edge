@@ -570,7 +570,7 @@ fn stream_summary() -> StreamTransactionSummary {
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: Some("service.example".to_string()),
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             ("request_id".to_string(), "req-stream".to_string()),
             ("authorization".to_string(), "stream-secret".to_string()),
         ]),
@@ -602,7 +602,7 @@ fn websocket_summary() -> WsDisconnectContext {
         consumer_username: Some("alice".to_string()),
         auth_method: Some("jwt_auth"),
         connection_id: 0,
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             ("request_id".to_string(), "req-ws".to_string()),
             ("cookie".to_string(), "ws-secret".to_string()),
         ]),

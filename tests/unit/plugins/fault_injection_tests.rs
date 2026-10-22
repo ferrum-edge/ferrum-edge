@@ -1553,7 +1553,6 @@ mod udp_datagram_faults {
         StreamBytesKind, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
         UdpMetadataSink,
     };
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     fn datagram_ctx<'a>(
@@ -1581,7 +1580,7 @@ mod udp_datagram_faults {
         }))
         .unwrap();
 
-        let metadata = Mutex::new(HashMap::new());
+        let metadata = Mutex::new(ferrum_edge::plugins::MetadataMap::default());
         let ctx = datagram_ctx(
             UdpDatagramDirection::ClientToBackend,
             b"ping",
@@ -1618,7 +1617,7 @@ mod udp_datagram_faults {
         }))
         .unwrap();
 
-        let metadata = Mutex::new(HashMap::new());
+        let metadata = Mutex::new(ferrum_edge::plugins::MetadataMap::default());
         let ctx = datagram_ctx(
             UdpDatagramDirection::ClientToBackend,
             b"ping",
@@ -1641,7 +1640,7 @@ mod udp_datagram_faults {
         }))
         .unwrap();
 
-        let metadata = Mutex::new(HashMap::new());
+        let metadata = Mutex::new(ferrum_edge::plugins::MetadataMap::default());
         let ctx = datagram_ctx(
             UdpDatagramDirection::ClientToBackend,
             b"ping",

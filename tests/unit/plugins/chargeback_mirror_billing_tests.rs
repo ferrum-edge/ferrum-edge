@@ -5,7 +5,6 @@
 //! mirror summary with `mirror: true`. Both `api_chargeback` and
 //! `api_chargeback_sink` must record exactly one client charge.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -82,7 +81,7 @@ fn primary_summary(consumer: &str, proxy_id: &str, status: u16) -> TransactionSu
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }

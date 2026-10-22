@@ -20,7 +20,7 @@ async fn metadata_after_before_proxy(plugin: &impl Plugin) -> HashMap<String, St
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    ctx.metadata
+    ctx.metadata.into_iter().collect()
 }
 
 #[tokio::test]

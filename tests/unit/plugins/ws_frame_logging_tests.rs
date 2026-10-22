@@ -255,7 +255,7 @@ fn disconnect_context_with_id(
         error_class: None,
         consumer_username: None,
         auth_method: None,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     }
 }
 
@@ -467,7 +467,9 @@ async fn correlation_id_composition_reaches_generated_and_preserved_disconnect_l
         assert_ne!(expected, "attacker-controlled-alias");
 
         logger
-            .on_ws_disconnect(&disconnect_context(request_ctx.metadata.clone()))
+            .on_ws_disconnect(&disconnect_context(
+                request_ctx.metadata.clone().into_iter().collect(),
+            ))
             .await;
 
         let event = capture

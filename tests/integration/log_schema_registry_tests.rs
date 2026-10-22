@@ -10,7 +10,7 @@
 //! renames against non-existent fields (or reject valid ones), and
 //! operators would get confusing errors.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ChargeEvent, compile_charge_event_projection, serialize_json_each_row,
@@ -68,7 +68,7 @@ fn fully_populated_http() -> TransactionSummary {
         grpc_request_messages: 3,
         grpc_response_messages: 5,
         mirror: true,
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             ("trace_id".to_string(), "abc".to_string()),
             ("request_protocol".to_string(), "grpc".to_string()),
             ("grpc_status".to_string(), "14".to_string()),
@@ -102,7 +102,10 @@ fn fully_populated_stream() -> StreamTransactionSummary {
         timestamp_connected: "2026-05-11T12:00:00Z".into(),
         timestamp_disconnected: "2026-05-11T12:01:40Z".into(),
         sni_hostname: Some("db.internal".into()),
-        metadata: HashMap::from([("session_id".to_string(), "xyz".to_string())]),
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([(
+            "session_id".to_string(),
+            "xyz".to_string(),
+        )]),
     }
 }
 

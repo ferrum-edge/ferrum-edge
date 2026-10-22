@@ -594,7 +594,7 @@ fn make_summary(proxy_id: &str) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -624,7 +624,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -728,7 +728,7 @@ fn representative_exposition() -> String {
     ]);
     registry.finalize_mesh_tcp_opened(&mut tcp_meta, "mesh-tcp", Some("db"));
     let mut tcp_summary = make_stream_summary("mesh-tcp", "tcp");
-    tcp_summary.metadata = tcp_meta;
+    tcp_summary.metadata = tcp_meta.into_iter().collect();
     tcp_summary.bytes_sent = 1024;
     tcp_summary.bytes_received = 2048;
     registry.record_stream(&tcp_summary);

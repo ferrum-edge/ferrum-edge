@@ -7231,7 +7231,7 @@ async fn stream_waf_udp_monitor_hit_records_metadata_via_sink() {
     // the hit rides the stream transaction summary by default (log_to_metadata is
     // on), not only when log_to_stdout is enabled — parity with the TCP path.
     let plugin = sig_waf("monitor");
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let mut ctx = udp_ctx(b"q=1 union select 1", StreamBytesKind::PlaintextWire);
     ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
 
@@ -7269,7 +7269,7 @@ async fn stream_waf_udp_enforce_hit_records_blocked_metadata() {
     // An enforced UDP hit drops the datagram AND records a `blocked` action with
     // a block reason, so the drop is not silent in the transaction log.
     let plugin = sig_waf("enforce");
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let mut ctx = udp_ctx(b"q=1 union select 1", StreamBytesKind::PlaintextWire);
     ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
 
@@ -7294,7 +7294,7 @@ async fn stream_waf_udp_clean_datagram_records_no_metadata() {
     // No hit → nothing recorded, so clean UDP traffic does not pollute the
     // transaction summary with WAF fields.
     let plugin = sig_waf("monitor");
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let mut ctx = udp_ctx(b"perfectly benign payload", StreamBytesKind::PlaintextWire);
     ctx.metadata_sink = Some(UdpMetadataSink::new(&meta));
 
@@ -7323,7 +7323,7 @@ async fn stream_waf_udp_metadata_merges_across_datagrams_and_keeps_max_severity(
         }
     }))
     .unwrap();
-    let meta = std::sync::Mutex::new(std::collections::HashMap::new());
+    let meta = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
     let sink = UdpMetadataSink::new(&meta);
 
     // Datagram 1: high-severity hit.

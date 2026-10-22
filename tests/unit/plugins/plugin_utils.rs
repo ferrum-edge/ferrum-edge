@@ -342,7 +342,7 @@ pub fn create_test_transaction_summary() -> ferrum_edge::plugins::TransactionSum
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -374,7 +374,7 @@ pub fn create_test_stream_transaction_summary() -> ferrum_edge::plugins::StreamT
         timestamp_connected: Utc::now().to_rfc3339(),
         timestamp_disconnected: Utc::now().to_rfc3339(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
