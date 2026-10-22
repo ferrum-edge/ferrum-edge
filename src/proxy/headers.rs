@@ -776,32 +776,6 @@ pub(crate) fn sanitize_backend_request_trailers(trailers: &mut http::HeaderMap) 
     }
 }
 
-/// Remove reserved gateway-asserted headers from a request `HeaderMap`.
-///
-/// The whole `x-consumer-*` namespace ([`is_consumer_assertion_header`]) is
-/// gateway-owned: `x-consumer-username` / `x-consumer-custom-id` are injected
-/// only after a principal is resolved, and no other name beneath the prefix is
-/// ever trusted from a client. `x-geo-country` is likewise emitted only after a
-/// successful GeoIP lookup. `HeaderMap::remove` clears every value for a name,
-/// and `HeaderMap` names are already lowercase, so any client-supplied casing
-/// or duplication is dropped.
-///
-/// Linear in the number of distinct names: matching names are collected in one
-/// pass and then removed. The common no-assertion request does one prefix
-/// compare per distinct name and allocates nothing (collecting an empty
-/// iterator does not allocate).
-fn strip_reserved_gateway_assertion_headers(headers: &mut http::HeaderMap) {
-    let forged: Vec<http::HeaderName> = headers
-        .keys()
-        .filter(|name| is_consumer_assertion_header(name.as_str()))
-        .cloned()
-        .collect();
-    for name in forged {
-        headers.remove(name);
-    }
-    headers.remove("x-geo-country");
-}
-
 /// Whether the materialized single-value view still represents the exact raw
 /// field-line sequence. Keeping the raw lines in that case preserves repeated
 /// gRPC metadata (including `-bin` metadata) instead of collapsing it into one
@@ -909,17 +883,21 @@ pub fn merge_proxy_headers_preserving_repeated(
     headers: &mut http::HeaderMap,
     proxy_headers: &std::collections::HashMap<String, String>,
 ) {
-    // Drop client-supplied reserved assertion headers from the raw base BEFORE
-    // the merge, so a verified gateway value carried in `proxy_headers`
-    // (post-auth) is layered back on and preserved.
-    strip_reserved_gateway_assertion_headers(headers);
-
-    // The materialized map is the authoritative post-plugin view. A missing
-    // key therefore represents a plugin removal, not permission to resurrect
-    // the pristine inbound value from the replay snapshot.
+    // Remove untrusted assertions and plugin-removed fields in one pass over
+    // the raw names. Assertions must go even when their folded value matches
+    // the authoritative map: only the verified gateway value layered in below
+    // may survive. The materialized map is also the complete removal set, so a
+    // missing key must never be resurrected from a pristine retry snapshot.
+    // Keep the exact raw-assertion predicate here: consumer/identity aliases
+    // plus the canonical GeoIP field. Broader plugin-output scrubbing belongs
+    // to refresh_backend_gateway_assertion_headers before this boundary.
     let removed: Vec<http::HeaderName> = headers
         .keys()
-        .filter(|name| !proxy_headers.contains_key(name.as_str()))
+        .filter(|name| {
+            is_consumer_assertion_header(name.as_str())
+                || name.as_str() == "x-geo-country"
+                || !proxy_headers.contains_key(name.as_str())
+        })
         .cloned()
         .collect();
     for name in removed {
