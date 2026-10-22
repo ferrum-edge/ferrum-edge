@@ -74,7 +74,7 @@ client = [
     "dep:smallvec",
 ]
 default = []
-# FERRUM PATCH 008: compile-time diagnostic only, excluded from full/default.
+# FERRUM PATCH 007: compile-time diagnostic only, excluded from full/default.
 ferrum-h2-upload-diagnostic = ["client", "http2"]
 ffi = [
     "dep:http-body-util",

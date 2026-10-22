@@ -1,5 +1,5 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index f161708b0..3fccfc5a0 100644
+index f161708b0..57b9f0756 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -74,6 +74,8 @@ client = [
@@ -11,93 +11,9 @@ index f161708b0..3fccfc5a0 100644
  ffi = [
      "dep:http-body-util",
      "dep:futures-util",
-diff --git a/src/ext/mod.rs b/src/ext/mod.rs
-index 8690f2502..3dcc5afd9 100644
---- a/src/ext/mod.rs
-+++ b/src/ext/mod.rs
-@@ -59,6 +59,13 @@ mod h2_body_write_timeout;
- #[cfg(feature = "http2")]
- pub use h2_body_write_timeout::Http2BodyWriteTimeout;
- 
-+#[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+mod h2_upload_diagnostic;
-+#[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+pub use h2_upload_diagnostic::{http2_upload_diagnostic_snapshot, Http2UploadDiagnosticSnapshot};
-+#[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+pub(crate) use h2_upload_diagnostic::{record_h2_upload_branch, H2UploadBranch};
-+
- #[cfg(all(feature = "http2", feature = "server"))]
- mod h2_stream_termination;
- #[cfg(all(feature = "http2", feature = "server"))]
-diff --git a/src/proto/h2/client.rs b/src/proto/h2/client.rs
-index 0fa6c990c..047cce8b6 100644
---- a/src/proto/h2/client.rs
-+++ b/src/proto/h2/client.rs
-@@ -414,6 +414,8 @@ where
-     B: Body,
- {
-     is_connect: bool,
-+    #[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+    is_post: bool,
-     eos: bool,
-     fut: ResponseFuture,
-     body_tx: SendStream<SendBuf<B::Data>>,
-@@ -552,8 +554,23 @@ where
-                 // eagerly see if the body pipe is ready and
-                 // can thus skip allocating in the executor
-                 match Pin::new(&mut pipe).poll(cx) {
--                    Poll::Ready(_) => (),
-+                    Poll::Ready(_result) => {
-+                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+                        crate::ext::record_h2_upload_branch(
-+                            f.is_post,
-+                            if _result.is_ok() {
-+                                crate::ext::H2UploadBranch::ReadyOk
-+                            } else {
-+                                crate::ext::H2UploadBranch::ReadyErr
-+                            },
-+                        );
-+                    }
-                     Poll::Pending => {
-+                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+                        crate::ext::record_h2_upload_branch(
-+                            f.is_post,
-+                            crate::ext::H2UploadBranch::Pending,
-+                        );
-                         let conn_drop_ref = self.conn_drop_ref.clone();
-                         // keep the ping recorder's knowledge of an
-                         // "open stream" alive while this body is
-@@ -571,6 +588,9 @@ where
-                             .execute_h2_future(H2ClientFuture::Pipe { pipe });
-                     }
-                 }
-+            } else {
-+                #[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+                crate::ext::record_h2_upload_branch(f.is_post, crate::ext::H2UploadBranch::Eos);
-             }
- 
-             None
-@@ -729,6 +749,8 @@ where
-                     }
- 
-                     let is_connect = req.method() == Method::CONNECT;
-+                    #[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+                    let is_post = req.method() == Method::POST;
-                     let eos = body.is_end_stream();
- 
-                     if is_connect
-@@ -778,6 +800,8 @@ where
- 
-                     let f = FutCtx {
-                         is_connect,
-+                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
-+                        is_post,
-                         eos,
-                         fut,
-                         body_tx,
 diff --git a/src/ext/h2_upload_diagnostic.rs b/src/ext/h2_upload_diagnostic.rs
 new file mode 100644
-index 000000000..8b1aab789
+index 000000000..ddb0b335a
 --- /dev/null
 +++ b/src/ext/h2_upload_diagnostic.rs
 @@ -0,0 +1,96 @@
@@ -248,3 +164,87 @@ index 000000000..f91738b49
 +    counters.record(true, H2UploadBranch::ReadyOk);
 +    assert!(counters.snapshot().overflow);
 +}
+diff --git a/src/ext/mod.rs b/src/ext/mod.rs
+index 8690f2502..3dcc5afd9 100644
+--- a/src/ext/mod.rs
++++ b/src/ext/mod.rs
+@@ -59,6 +59,13 @@ mod h2_body_write_timeout;
+ #[cfg(feature = "http2")]
+ pub use h2_body_write_timeout::Http2BodyWriteTimeout;
+ 
++#[cfg(feature = "ferrum-h2-upload-diagnostic")]
++mod h2_upload_diagnostic;
++#[cfg(feature = "ferrum-h2-upload-diagnostic")]
++pub use h2_upload_diagnostic::{http2_upload_diagnostic_snapshot, Http2UploadDiagnosticSnapshot};
++#[cfg(feature = "ferrum-h2-upload-diagnostic")]
++pub(crate) use h2_upload_diagnostic::{record_h2_upload_branch, H2UploadBranch};
++
+ #[cfg(all(feature = "http2", feature = "server"))]
+ mod h2_stream_termination;
+ #[cfg(all(feature = "http2", feature = "server"))]
+diff --git a/src/proto/h2/client.rs b/src/proto/h2/client.rs
+index 0fa6c990c..047cce8b6 100644
+--- a/src/proto/h2/client.rs
++++ b/src/proto/h2/client.rs
+@@ -414,6 +414,8 @@ where
+     B: Body,
+ {
+     is_connect: bool,
++    #[cfg(feature = "ferrum-h2-upload-diagnostic")]
++    is_post: bool,
+     eos: bool,
+     fut: ResponseFuture,
+     body_tx: SendStream<SendBuf<B::Data>>,
+@@ -552,8 +554,23 @@ where
+                 // eagerly see if the body pipe is ready and
+                 // can thus skip allocating in the executor
+                 match Pin::new(&mut pipe).poll(cx) {
+-                    Poll::Ready(_) => (),
++                    Poll::Ready(_result) => {
++                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
++                        crate::ext::record_h2_upload_branch(
++                            f.is_post,
++                            if _result.is_ok() {
++                                crate::ext::H2UploadBranch::ReadyOk
++                            } else {
++                                crate::ext::H2UploadBranch::ReadyErr
++                            },
++                        );
++                    }
+                     Poll::Pending => {
++                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
++                        crate::ext::record_h2_upload_branch(
++                            f.is_post,
++                            crate::ext::H2UploadBranch::Pending,
++                        );
+                         let conn_drop_ref = self.conn_drop_ref.clone();
+                         // keep the ping recorder's knowledge of an
+                         // "open stream" alive while this body is
+@@ -571,6 +588,9 @@ where
+                             .execute_h2_future(H2ClientFuture::Pipe { pipe });
+                     }
+                 }
++            } else {
++                #[cfg(feature = "ferrum-h2-upload-diagnostic")]
++                crate::ext::record_h2_upload_branch(f.is_post, crate::ext::H2UploadBranch::Eos);
+             }
+ 
+             None
+@@ -729,6 +749,8 @@ where
+                     }
+ 
+                     let is_connect = req.method() == Method::CONNECT;
++                    #[cfg(feature = "ferrum-h2-upload-diagnostic")]
++                    let is_post = req.method() == Method::POST;
+                     let eos = body.is_end_stream();
+ 
+                     if is_connect
+@@ -778,6 +800,8 @@ where
+ 
+                     let f = FutCtx {
+                         is_connect,
++                        #[cfg(feature = "ferrum-h2-upload-diagnostic")]
++                        is_post,
+                         eos,
+                         fut,
+                         body_tx,
