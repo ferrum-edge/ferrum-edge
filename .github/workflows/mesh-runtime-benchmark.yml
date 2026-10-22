@@ -75,6 +75,22 @@ on:
         default: release
         type: choice
         options: [release, ci-release]
+      perf_mode:
+        description: "EXPERIMENT: perf mode (off, stat, record)"
+        required: false
+        default: stat
+        type: choice
+        options: ["off", stat, record]
+      candidate_env:
+        description: "EXPERIMENT: extra Ferrum env for the candidate image (space-separated K=V)"
+        required: false
+        default: ""
+        type: string
+      baseline_env:
+        description: "EXPERIMENT: extra Ferrum env for the baseline image (space-separated K=V)"
+        required: false
+        default: ""
+        type: string
       features:
         description: "Matched features (allocation instrumentation is diagnostic only)"
         required: false
@@ -165,7 +181,9 @@ jobs:
       - name: Run benchmark (balanced blocks, paired Ferrum images, same runner)
         timeout-minutes: 200
         env:
-          PERF_PROFILE: "1"
+          PERF_PROFILE: ${{ inputs.perf_mode == 'off' && '' || inputs.perf_mode }}
+          MESH_FERRUM_CANDIDATE_ENV: ${{ inputs.candidate_env }}
+          MESH_FERRUM_BASELINE_ENV: ${{ inputs.baseline_env }}
         run: |
           bash .github/scripts/mesh_runtime_campaign.sh measure
 

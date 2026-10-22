@@ -363,6 +363,13 @@ start_ferrum() {
     # only sees mounted host subtrees, and Docker would otherwise create
     # an empty directory at the source path).
     mkdir -p "$RUNTIME_DIR/ferrum"
+    # EXPERIMENT ONLY: per-image extra Ferrum env (space-separated K=V).
+    FERRUM_EXTRA_ENV_ARGS=()
+    local extra="${MESH_FERRUM_CANDIDATE_ENV:-}"
+    [ "$FERRUM_IMAGE" = ferrum-edge:baseline ] && extra="${MESH_FERRUM_BASELINE_ENV:-}"
+    for kv in $extra; do FERRUM_EXTRA_ENV_ARGS+=(-e "$kv"); done
+    [ ${#FERRUM_EXTRA_ENV_ARGS[@]} -gt 0 ] || FERRUM_EXTRA_ENV_ARGS=(-e FERRUM_EXPERIMENT_ARM=none)
+    echo "[ferrum] image=$FERRUM_IMAGE extra env: ${FERRUM_EXTRA_ENV_ARGS[*]}"
     cp "$SCRIPT_DIR/configs/ferrum/mesh.yaml" "$RUNTIME_DIR/ferrum/mesh.yaml"
     chmod 644 "$RUNTIME_DIR/ferrum/mesh.yaml"
     # Server (destination) sidecar: inbound :15006 STRICT mTLS.
@@ -388,6 +395,7 @@ start_ferrum() {
         -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
         -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
+        "${FERRUM_EXTRA_ENV_ARGS[@]}" \
         "$FERRUM_IMAGE" >/dev/null
     # Client sidecar: outbound :15101 dials destination :15006, pins SVID.
     docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
@@ -413,6 +421,7 @@ start_ferrum() {
         -e FERRUM_ADMIN_BIND_ADDRESS=127.0.0.1 \
         -e FERRUM_METRICS_ALLOWED_CIDRS=127.0.0.1/32 \
         -e FERRUM_LOG_LEVEL=error \
+        "${FERRUM_EXTRA_ENV_ARGS[@]}" \
         "$FERRUM_IMAGE" >/dev/null
 }
 
@@ -628,7 +637,7 @@ run_cell() {
                 sudo "$perf_bin" stat -e task-clock,context-switches,cpu-migrations,raw_syscalls:sys_enter,syscalls:sys_enter_futex,syscalls:sys_enter_epoll_wait,syscalls:sys_enter_sendto,syscalls:sys_enter_recvfrom,syscalls:sys_enter_writev,syscalls:sys_enter_write,syscalls:sys_enter_read \
                     -p "$pid" -o "$pdir/${MESH}_${payload}_${role}_stat.txt" -- sleep "$window" >/dev/null 2>&1 &
             done
-            if [ "$MESH" = ferrum ] || [ "$MESH" = envoy ]; then
+            if [ "${PERF_PROFILE:-}" = record ] && { [ "$MESH" = ferrum ] || [ "$MESH" = envoy ]; }; then
                 for role in client server; do
                     local pid
                     case $role in client) pid=$cpid;; server) pid=$spid;; esac
