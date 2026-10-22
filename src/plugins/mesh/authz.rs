@@ -3764,7 +3764,8 @@ impl Plugin for MeshAuthz {
         // stream listener that runs this chain stamps `Outbound` — captured
         // raw-TCP egress is relayed over HBONE outside the plugin chain and
         // captured UDP egress goes through the mesh UDP capture path, both of
-        // which invoke only `workload_metrics` — so this is a fail-safe gate
+        // which invoke only the builtin `workload_metrics` and
+        // `prometheus_metrics` observers — so this is a fail-safe gate
         // rather than a live behavior change on the L4 leg. It is here because
         // the HTTP defect existed exactly because a global plugin ran on a leg
         // nobody had gated, and a future outbound stream listener that stamps
