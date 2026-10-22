@@ -19,7 +19,7 @@ class ProfileCampaignTests(unittest.TestCase):
         prep = dict(qualified=True, ready_for_dwarf_capture=True, source=campaign.BASELINE, builder=campaign.BUILDER,
             runtime_flags_changed=False, shipping_attribution_allowed=False, runtime_image=dict(Id=image),
             own_pair=dict(qualified=True, shipping_build_id='aaa', diagnostic_build_id='aaa'),
-            unwind_preflight=dict(qualified_for_one_dwarf_attempt=True))
+            unwind_preflight=dict(qualified_for_one_dwarf_attempt=True, input_complete=True))
         snapshot = dict(user_cpu_ticks=100, system_cpu_ticks=20, cpu_ticks=120)
         rows = [dict(cell=dict(phase=phase), measurement_valid=True, capacity_qualified=True,
                      resources=dict(containers=[dict(image_id=image)] * 2, clock_ticks_per_second=100,
@@ -43,6 +43,7 @@ class ProfileCampaignTests(unittest.TestCase):
             lambda r, c, p, x: p['own_pair'].update(diagnostic_build_id='different'),
             lambda r, c, p, x: x['raw'].append(dict(loss_denominator=None)),
             lambda r, c, p, x: p.update(runtime_flags_changed=True),
+            lambda r, c, p, x: p['unwind_preflight'].update(input_complete=False),
             lambda r, c, p, x: r[0]['resources']['begin']['processes'][0].update(cpu_ticks=121)]
         for mutate in mutations:
             args = self.sample()

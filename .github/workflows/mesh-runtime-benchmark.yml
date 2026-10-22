@@ -467,7 +467,7 @@ jobs:
       - name: Check bounded profile contracts
         run: |
           python3 .github/scripts/mesh_gap_profile_test.py
-          python3 -m unittest discover -s tests/performance/mesh_runtime/tests -p test_gap_profile_campaign.py
+          python3 -m unittest discover -s tests/performance/mesh_runtime/tests -p 'test_gap_profile_*.py'
       - name: Install observation and fixture prerequisites
         run: |
           sudo apt-get update

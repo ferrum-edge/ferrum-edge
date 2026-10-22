@@ -20,6 +20,7 @@ import signal
 import time
 
 import mesh_production_profile_ferrum as capture
+import mesh_gap_profile_fde as fde
 
 FDE = re.compile(r"\bFDE\b.*\bpc=([0-9a-fA-F]+)\.\.([0-9a-fA-F]+)")
 MINIMUM_FDE_TEXT_FRACTION = 0.80
@@ -101,9 +102,17 @@ def prepare(args, output, commands, report):
         capture.require(section is not None, 'missing .text')
         report['unwind_sections'] = {name: elf.sections[name][5]
                                     for name in ('.eh_frame', '.debug_frame', '.eh_frame_hdr') if name in elf.sections}
-        frames, _ = commands.run(['readelf', '--debug-dump=frames', str(companion / 'ferrum-edge/symbols')],
-                                  'unwind-frames', cap=64 * 1024**2, seconds=30)
-        report['unwind_preflight'] = fde_coverage(frames.read_text(), section[3], section[5])
+        commands.serial += 1
+        frames = output / f'{commands.serial:02d}-unwind-frames.stdout'
+        errors = output / f'{commands.serial:02d}-unwind-frames.stderr'
+        receipt = {}
+        report.setdefault('commands', []).append(receipt)
+        remaining = commands.started + capture.LIMITS['total_seconds'] - time.monotonic()
+        fde.capture_ranges(['readelf', '--debug-dump=frames', str(companion / 'ferrum-edge/symbols')],
+                           frames, errors, timeout=min(30, remaining), record=receipt)
+        capture.require(receipt['complete'], 'unwind-frames incomplete (see bounded stream receipt)')
+        report['unwind_preflight'] = dict(fde_coverage(frames.read_text(), section[3], section[5]),
+                                         input_complete=True, command_label='unwind-frames')
     finally:
         elf.close()
     report['qualified'] = True
@@ -126,7 +135,8 @@ def main():
     report = dict(schema=1, qualified=False, ready_for_dwarf_capture=False, source=capture.SOURCE,
                   scope='fresh representative release; own-image controls; no shipping attribution',
                   builder=capture.BUILDER, helpers=capture.helper_hashes(),
-                  helper_sha256=capture.sha256_file(Path(__file__)), limits=capture.LIMITS,
+                  helper_sha256=capture.sha256_file(Path(__file__)),
+                  fde_helper_sha256=capture.sha256_file(Path(fde.__file__)), limits=capture.LIMITS,
                   runtime_flags_changed=False, shipping_attribution_allowed=False)
     commands = capture.Commands(output, report)
     def interrupted(signum, frame):

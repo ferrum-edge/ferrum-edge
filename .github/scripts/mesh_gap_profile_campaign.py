@@ -70,7 +70,8 @@ def preparation_errors(report):
     if (pair.get('qualified') is not True or not pair.get('shipping_build_id')
             or pair.get('shipping_build_id') != pair.get('diagnostic_build_id')):
         errors.append('own-image exact code/build-ID pairing missing')
-    if report.get('unwind_preflight', {}).get('qualified_for_one_dwarf_attempt') is not True:
+    if (report.get('unwind_preflight', {}).get('qualified_for_one_dwarf_attempt') is not True
+            or report.get('unwind_preflight', {}).get('input_complete') is not True):
         errors.append('prespecified unwind preflight failed; no alternate build or flags')
     return errors
 
@@ -79,7 +80,8 @@ def prepare():
     OUTPUT.mkdir(parents=True, exist_ok=False)
     report = read(build_dir() / 'report.json')
     errors = preparation_errors(report)
-    if errors or report.get('helper_sha256') != digest(Path(__file__).with_name('mesh_gap_profile_prepare.py')):
+    if (errors or report.get('helper_sha256') != digest(Path(__file__).with_name('mesh_gap_profile_prepare.py'))
+            or report.get('fde_helper_sha256') != digest(Path(__file__).with_name('mesh_gap_profile_fde.py'))):
         raise ValueError('; '.join(errors) or 'prepare helper revision differs')
     image = report['runtime_image']['Id']
     actual = json.loads(subprocess.check_output(['docker', 'image', 'inspect', image], text=True))[0]
