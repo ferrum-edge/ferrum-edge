@@ -138,6 +138,19 @@ gates include normal formatting/clippy, `integration_tests vendor_integrity`,
 `mesh_retry_rotation_tests`, and `gateway_mesh_trust_retirement_tests` as selected
 by the production harness. Preserve all failures, including drain-time failures.
 
+## Retained preflight failure
+
+Remote vendor preflight [39707376772](https://github.com/ferrum-edge/ferrum-edge/actions/runs/39707376772)
+checked candidate `f65d0801ae340f1745eda2847b49d88174e5e1ed` with harness
+`1fc903bb82776360a25c7396998ff729aa6c64a0` and exited 101 before generating
+any manifest change. Hyper's `deny(missing_debug_implementations)` rejected the
+new `SendBatch` type. The retained checks artifact is `12395741084`, with ZIP
+SHA-256 `1bb96ed8b946c24fba941d54b1d980d7d2219dfc76fee7e04c871a40d4a1c699`.
+The repair adds a manual `Debug` implementation reporting only the waiter count;
+it adds no `B`/`E` trait bounds and changes no polling, ownership, or scheduling.
+The failed source and evidence remain preserved. This repair still needs a new
+remote preflight and all correctness gates; it establishes no performance gain.
+
 ## Integrity and retirement
 
 The initial source preparation is not ready to merge: the approved remote

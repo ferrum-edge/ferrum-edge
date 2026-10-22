@@ -1,8 +1,8 @@
 diff --git a/src/client/dispatch.rs b/src/client/dispatch.rs
-index d02caffc2..26bf0c486 100644
+index d02caffc2..2277db21c 100644
 --- a/src/client/dispatch.rs
 +++ b/src/client/dispatch.rs
-@@ -385,6 +385,37 @@ where
+@@ -385,6 +385,46 @@ where
      }
  }
  
@@ -12,6 +12,15 @@ index d02caffc2..26bf0c486 100644
 +#[cfg(feature = "http2")]
 +pub struct SendBatch<B: Body + 'static, E> {
 +    pub(crate) waiters: Vec<SendWhen<B, E>>,
++}
++
++#[cfg(feature = "http2")]
++impl<B: Body + 'static, E> std::fmt::Debug for SendBatch<B, E> {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("SendBatch")
++            .field("waiters", &self.waiters.len())
++            .finish()
++    }
 +}
 +
 +#[cfg(feature = "http2")]

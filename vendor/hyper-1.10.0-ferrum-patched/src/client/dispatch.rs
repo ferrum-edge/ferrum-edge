@@ -394,6 +394,15 @@ pub struct SendBatch<B: Body + 'static, E> {
 }
 
 #[cfg(feature = "http2")]
+impl<B: Body + 'static, E> std::fmt::Debug for SendBatch<B, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendBatch")
+            .field("waiters", &self.waiters.len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "http2")]
 impl<B, E> Future for SendBatch<B, E>
 where
     B: Body + 'static,
