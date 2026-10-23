@@ -54800,9 +54800,11 @@ fn mesh_transport_hyper_error_response(
 
 /// An unpumped streaming upload's client-fault latch (issue #6776): `Some`
 /// exactly when [`install_streaming_upload_authorization`] will install no
-/// gateway-owned pump (no authorization lifetime and
-/// `backend_write_timeout_ms = 0`), so the size-limit adapter is the one
-/// reading the client body. The default path pays nothing.
+/// gateway-owned pump, so the size-limit adapter is the one reading the client
+/// body. Callers pass the write timeout they hand that installer: the route's
+/// `backend_write_timeout_ms`, or `0` on a dispatcher that bounds an
+/// unauthenticated upload in hyper's HTTP/2 pipe instead (the Sidecar
+/// mesh-mTLS dispatcher). A pumped upload pays nothing.
 fn unpumped_client_fault_latch(
     auth: Option<&RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
@@ -61299,85 +61301,114 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
         &client_request_body,
         MeshClientRequestBody::Replayable { .. }
     );
-    let (mut parts, body, mut upload_pump, client_fault_latch) = match client_request_body {
-        MeshClientRequestBody::Streaming(request) => {
-            let (parts, body) = request.into_parts();
-            // Read before `parts.version` is rewritten for the backend: an
-            // HTTP/2 client's upload EOF must be its own END_STREAM (issue
-            // #6022). Never for HTTP/1.1.
-            let require_end_stream = parts.version == hyper::Version::HTTP_2;
-            let body = body::SizeLimitedIncoming::new_with_counter(
+    let (mut parts, body, mut upload_pump, client_fault_latch, pipe_write_timeout) =
+        match client_request_body {
+            MeshClientRequestBody::Streaming(request) => {
+                let (parts, body) = request.into_parts();
+                // Read before `parts.version` is rewritten for the backend: an
+                // HTTP/2 client's upload EOF must be its own END_STREAM (issue
+                // #6022). Never for HTTP/1.1.
+                let require_end_stream = parts.version == hyper::Version::HTTP_2;
+                let body = body::SizeLimitedIncoming::new_with_counter(
+                    body,
+                    max_request_body_size,
+                    Arc::clone(&body_size_exceeded),
+                    Arc::clone(ctx_bytes_sent_observed),
+                )
+                .with_h2_end_stream_required(require_end_stream);
+                // Full upload lifecycle for the UPLOAD direction (#3815). With an
+                // authorization lifetime: the adapter deadline plus a
+                // gateway-owned pump, so the bound still fires while this pooled
+                // connection task is parked and not polling the body. The join
+                // is retained through the response-header wait so
+                // `backend_write_timeout_ms` is client-visible even when the
+                // transport is parked outside a body poll; after headers, the
+                // transport body and `UploadPumpSource` abort guard own teardown.
+                // Without one, hyper's pipe enforces the write bound (below).
+                let upload_auth = request_upload_auth_deadline(
+                    Some(request_ctx),
+                    state.env_config.authenticated_stream_max_lifetime_seconds,
+                );
+                // An upload with no authorization lifetime needs no pump: hyper's
+                // HTTP/2 pipe bounds how long a ready chunk may wait to be written
+                // and resets the stream when it fires (vendored hyper patch 004), as
+                // on the direct-H2 and native-gRPC dispatchers. The client body is
+                // then polled in place, with no channel or cross-task hop per frame.
+                // An authorization lifetime keeps the pump: its deadline must
+                // release the client body while the pipe is parked on capacity.
+                let pumped_write_timeout_ms = if upload_auth.is_some() {
+                    proxy.backend_write_timeout_ms
+                } else {
+                    0
+                };
+                let pipe_write_timeout = (upload_auth.is_none()
+                    && proxy.backend_write_timeout_ms > 0
+                    && !http_body::Body::is_end_stream(&body))
+                .then(|| {
+                    hyper::ext::Http2BodyWriteTimeout::new(Duration::from_millis(
+                        proxy.backend_write_timeout_ms,
+                    ))
+                });
+                // An unpumped adapter reads the client body itself, so it records
+                // why that body failed (issue #6776); a pump records it instead.
+                let client_fault_latch =
+                    unpumped_client_fault_latch(upload_auth.as_ref(), pumped_write_timeout_ms);
+                let body = match &client_fault_latch {
+                    Some(latch) => body.with_client_fault_latch(Arc::clone(latch)),
+                    None => body,
+                };
+                let (body, upload_pump) = install_streaming_upload_authorization(
+                    body,
+                    upload_auth.as_ref(),
+                    pumped_write_timeout_ms,
+                );
+                let grpc_tap =
+                    crate::plugins::grpc_web::request_stream_grpc_message_tap(request_ctx);
+                let body = match grpc_tap {
+                    Some(tap) => body.with_grpc_message_tap(tap),
+                    None => body,
+                };
+                (
+                    parts,
+                    mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body),
+                    upload_pump,
+                    client_fault_latch,
+                    pipe_write_timeout,
+                )
+            }
+            MeshClientRequestBody::Replayable {
                 body,
-                max_request_body_size,
-                Arc::clone(&body_size_exceeded),
-                Arc::clone(ctx_bytes_sent_observed),
-            )
-            .with_h2_end_stream_required(require_end_stream);
-            // Full upload lifecycle for the UPLOAD direction (#3815): the
-            // adapter deadline plus a gateway-owned pump, so the bound still
-            // fires while this pooled connection task is parked and not
-            // polling the body. Retain the join through the response-header
-            // wait so `backend_write_timeout_ms` is client-visible even when
-            // the transport is parked outside a body poll; after headers, the
-            // transport body and `UploadPumpSource` abort guard own teardown.
-            let upload_auth = request_upload_auth_deadline(
-                Some(request_ctx),
-                state.env_config.authenticated_stream_max_lifetime_seconds,
-            );
-            // An unpumped adapter reads the client body itself, so it records
-            // why that body failed (issue #6776); a pump records it instead.
-            let client_fault_latch =
-                unpumped_client_fault_latch(upload_auth.as_ref(), proxy.backend_write_timeout_ms);
-            let body = match &client_fault_latch {
-                Some(latch) => body.with_client_fault_latch(Arc::clone(latch)),
-                None => body,
-            };
-            let (body, upload_pump) = install_streaming_upload_authorization(
-                body,
-                upload_auth.as_ref(),
-                proxy.backend_write_timeout_ms,
-            );
-            let grpc_tap = crate::plugins::grpc_web::request_stream_grpc_message_tap(request_ctx);
-            let body = match grpc_tap {
-                Some(tap) => body.with_grpc_message_tap(tap),
-                None => body,
-            };
-            (
-                parts,
-                mesh_mtls_pool::MeshMtlsRequestBody::Streaming(body),
-                upload_pump,
-                client_fault_latch,
-            )
-        }
-        MeshClientRequestBody::Replayable {
-            body,
-            headers,
-            trailers,
-        } => {
-            let (mut parts, ()) = Request::new(()).into_parts();
-            parts.headers = headers;
-            // Same backend write watermark the streaming arm installs
-            // (#4055). A replayable body is already collected, so the pump
-            // arms no second authorization lifetime — the response-header wait
-            // below still composes the admitted stream's deadline — but its
-            // DATA is sliced into bounded refcounted views so backpressure
-            // stays coupled to what the transport has actually taken, through
-            // the last byte and the validated terminal trailers frame.
-            // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
-            // and timer-free direct path.
-            let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
-                body,
+                headers,
                 trailers,
-                proxy.backend_write_timeout_ms,
-            );
-            (
-                parts,
-                mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body),
-                upload_pump,
-                None,
-            )
-        }
-    };
+            } => {
+                let (mut parts, ()) = Request::new(()).into_parts();
+                parts.headers = headers;
+                // Same backend write watermark the streaming arm installs
+                // (#4055). A replayable body is already collected, so the pump
+                // arms no second authorization lifetime — the response-header wait
+                // below still composes the admitted stream's deadline — but its
+                // DATA is sliced into bounded refcounted views so backpressure
+                // stays coupled to what the transport has actually taken, through
+                // the last byte and the validated terminal trailers frame.
+                // `backend_write_timeout_ms == 0` keeps the allocation-, task-,
+                // and timer-free direct path.
+                let (body, upload_pump) = body::ReplayableRequestBody::with_gateway_upload_pump(
+                    body,
+                    trailers,
+                    proxy.backend_write_timeout_ms,
+                );
+                (
+                    parts,
+                    mesh_mtls_pool::MeshMtlsRequestBody::Replayable(body),
+                    upload_pump,
+                    None,
+                    None,
+                )
+            }
+        };
+    if let Some(write_timeout) = pipe_write_timeout.as_ref() {
+        parts.extensions.insert(write_timeout.clone());
+    }
     parts.uri = tunneled_uri;
     parts.version = hyper::Version::HTTP_2;
     parts.method = match parse_hyper_method(method) {
@@ -61680,6 +61711,32 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                         is_grpc_flavored,
                         request_body_limit,
                     ),
+                    None,
+                    None,
+                );
+            }
+            // hyper's pipe reset the stream because the backend stopped taking
+            // the upload: the same terminal as the pump's write watermark.
+            if pipe_write_timeout
+                .as_ref()
+                .is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)
+            {
+                warn!(
+                    proxy_id = %proxy.id,
+                    watermark_ms = proxy.backend_write_timeout_ms,
+                    write_bound = "h2_pipe",
+                    is_grpc_flavored,
+                    "sidecar mTLS backend write watermark expired before response headers"
+                );
+                return (
+                    if is_grpc_flavored {
+                        mesh_grpc_deadline_exceeded_response(resolved_ip)
+                    } else {
+                        http_backend_dispatch_error_response(
+                            retry::ErrorClass::ReadWriteTimeout,
+                            resolved_ip,
+                        )
+                    },
                     None,
                     None,
                 );
