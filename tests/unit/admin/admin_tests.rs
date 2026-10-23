@@ -91,6 +91,7 @@ async fn persistence_failures_are_redacted_from_admin_responses_and_logs() {
         .with_writer(writer.clone())
         .finish();
 
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let (
         batch_message,
         recovery_message,

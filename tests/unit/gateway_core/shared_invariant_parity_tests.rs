@@ -3363,3 +3363,84 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
     let path = item_body(&harness, "pub fn gateway_binary_path()", "\n}\n");
     assert!(path.contains("locate_binary(false)"));
 }
+
+// ---------------------------------------------------------------------------
+// Thread-local tracing captures register the process-wide interest floor
+// ---------------------------------------------------------------------------
+//
+// tracing-core caches each callsite's interest the first time it is hit. While
+// at most one dispatcher is registered it computes that interest from the
+// HITTING thread's default dispatcher alone, so a sibling test with no
+// subscriber that reaches a callsite first caches `never` for it, and the
+// capturing test's own event at that callsite is then skipped before its
+// thread-local subscriber is consulted. That emptied two captures in CI
+// (`test_proxy_allowed_ws_origins_load_warns_once_per_proxy` got zero warnings
+// because the sibling star-proxy load test hits the same `warn!`, and
+// `ceiling_refusal_warning_is_rate_limited_but_metric_is_exact` saw no
+// refusal warning). The remedy is the shared floor
+// (`tests/support/diagnostic_interest.rs` via `ensure_interest_floor()`, or
+// `plugin_utils::install_interest_floor()` in the plugin targets) registered
+// before the capture dispatch is built. Every capture install in the unit and
+// integration suites must be preceded by one inside the same function.
+
+const TRACING_CAPTURE_INSTALL_TOKENS: [&str; 4] = [
+    "subscriber::set_default(",
+    "subscriber::with_default(",
+    "dispatcher::with_default(",
+    "tracing::Dispatch::new(",
+];
+
+/// Installs that are not captures: a `NoSubscriber` silences a callsite and
+/// never reads output back, and a capture-local floor dispatch (bound as
+/// `_interest_floor`, as `plugin_cache_tests` does) IS the floor.
+const TRACING_NON_CAPTURE_INSTALLS: [&str; 2] =
+    ["tracing::subscriber::NoSubscriber", "let _interest_floor ="];
+
+/// Evidence, inside the installing function, that a floor is registered.
+const TRACING_INTEREST_FLOOR_MARKERS: [&str; 2] = ["interest_floor()", "let _interest_floor ="];
+
+#[test]
+fn every_tracing_capture_registers_the_interest_floor_first() {
+    const THIS_FILE: &str = "tests/unit/gateway_core/shared_invariant_parity_tests.rs";
+    let mut offenders = Vec::new();
+    let mut installs = 0usize;
+    for (path, text) in rust_sources_under(&["tests/unit", "tests/integration"]) {
+        if path == THIS_FILE {
+            continue;
+        }
+        for token in TRACING_CAPTURE_INSTALL_TOKENS {
+            for (at, _) in text.match_indices(token) {
+                let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+                let line = &text[line_start..line_end];
+                if line.trim_start().starts_with("//")
+                    || TRACING_NON_CAPTURE_INSTALLS
+                        .iter()
+                        .any(|exempt| line.contains(exempt))
+                {
+                    continue;
+                }
+                installs += 1;
+                let fn_start = text[..at].rfind("fn ").unwrap_or(0);
+                let window = &text[fn_start..at];
+                if !TRACING_INTEREST_FLOOR_MARKERS
+                    .iter()
+                    .any(|marker| window.contains(marker))
+                {
+                    let line_no = text[..at].matches('\n').count() + 1;
+                    offenders.push(format!("{path}:{line_no}: {}", line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        installs > 0,
+        "the scan must find the suites' tracing capture installs"
+    );
+    assert!(
+        offenders.is_empty(),
+        "call crate::diagnostic_test_interest::ensure_interest_floor() (or \
+         plugin_utils::install_interest_floor()) before installing a \
+         thread-local tracing capture: {offenders:#?}"
+    );
+}

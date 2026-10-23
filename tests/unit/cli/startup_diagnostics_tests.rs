@@ -169,6 +169,7 @@ fn destination_rule_translation_warning_withholds_document_fields_at_emission() 
         .with_max_level(tracing::Level::WARN)
         .with_writer(logs.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let _guard = tracing::subscriber::set_default(subscriber);
     let token = "UNREGISTERED_TRANSLATION_5591";
     let object = K8sObject {
@@ -363,6 +364,7 @@ async fn cni_startup_failures_withhold_paths_and_keep_watcher_fallback() {
             .without_time()
             .with_writer(logs.clone())
             .finish();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let _guard = tracing::subscriber::set_default(subscriber);
         let (sender, mut receiver) = cni_work_channel();
         let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -424,6 +426,7 @@ async fn mongo_failover_emissions_withhold_invalid_options_before_network_io() {
             .without_time()
             .with_writer(logs.clone())
             .finish();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let _guard = tracing::subscriber::set_default(subscriber);
         let url = format!("mongodb://localhost/?maxPoolSize={value}");
         let result = MongoStore::connect_with_failover(

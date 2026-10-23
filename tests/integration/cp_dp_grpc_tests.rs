@@ -7874,6 +7874,7 @@ mod configsync_identity_binding {
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let _guard = tracing::subscriber::set_default(subscriber);
 
         // The matching identity is admitted and owns the cluster registry row.
@@ -8138,6 +8139,7 @@ mod configsync_size_bounds {
             },
         );
         let logs = CapturedLogs::default();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         tracing::subscriber::with_default(logs.subscriber(), || {
             CpGrpcServer::broadcast_namespace_update(
                 &broadcasts,
@@ -8197,6 +8199,7 @@ mod configsync_size_bounds {
             .build();
         let tx = server.broadcasts().sender_for("ferrum");
         let logs = CapturedLogs::default();
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let _guard = tracing::subscriber::set_default(logs.subscriber());
         let status = server.subscribe(subscribe_request()).await.err().unwrap();
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);

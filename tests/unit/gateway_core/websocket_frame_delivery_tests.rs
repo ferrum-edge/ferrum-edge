@@ -199,6 +199,7 @@ impl Plugin for SizeReject {
 #[tokio::test(flavor = "current_thread")]
 async fn delivery_log_sees_restored_ping_after_control_guard() {
     let capture = Capture::default();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let _guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 
@@ -233,6 +234,7 @@ async fn delivery_log_sees_restored_ping_after_control_guard() {
 #[tokio::test(flavor = "current_thread")]
 async fn policy_close_emits_once_without_delivered_duplicate() {
     let capture = Capture::default();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let _guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 
@@ -275,6 +277,7 @@ async fn policy_close_emits_once_without_delivered_duplicate() {
 #[tokio::test(flavor = "current_thread")]
 async fn peer_close_delivery_helper_logs_both_directions() {
     let capture = Capture::default();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let _guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 
@@ -331,6 +334,7 @@ async fn peer_close_delivery_helper_logs_both_directions() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancelled_delivery_drops_prepared_observation() {
     let capture = Capture::default();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let _guard =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
 

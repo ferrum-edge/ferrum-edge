@@ -4347,6 +4347,7 @@ fn capture_registry_logs() -> (RegistryLogs, tracing::subscriber::DefaultGuard) 
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(logs.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     (logs, tracing::subscriber::set_default(subscriber))
 }
 

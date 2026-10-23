@@ -2795,6 +2795,7 @@ fn ceiling_refusal_warning_is_rate_limited_but_metric_is_exact() {
     let subscriber =
         tracing_subscriber::registry().with(CircuitBreakerWarnCounter(Arc::clone(&warnings)));
 
+    crate::diagnostic_test_interest::ensure_interest_floor();
     tracing::subscriber::with_default(subscriber, || {
         let cached = cache.get_or_create("audit", "p", Some("backend-a:80"), &config);
         for _ in 0..REFUSALS {
