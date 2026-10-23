@@ -675,9 +675,14 @@ async fn one_connection_carries_hundreds_of_concurrent_small_responses() {
 
 /// The sidecar mesh-mTLS dispatcher bounds an unauthenticated upload with
 /// hyper's HTTP/2 pipe instead of a gateway-owned pump (vendored hyper patch
-/// 004): a peer that stops granting stream window must reset the upload once
-/// `backend_write_timeout_ms` passes with a ready chunk unwritten, and the
-/// shared flag must report that the bound fired.
+/// 004). This proves the transport half of that: on a real mesh-mTLS pool
+/// connection, a request carrying `Http2BodyWriteTimeout` whose peer stops
+/// granting stream window is reset once the bound passes with a ready chunk
+/// unwritten, and the shared flag reports that the bound fired. It sends
+/// through the pool directly, so it does not run the dispatcher; the
+/// dispatcher's install-and-map wiring (pump kept for authorization
+/// lifetimes, `expired()` mapped to the write-watermark terminal) is pinned by
+/// `specialized_streaming_dispatchers_race_the_backend_write_watermark`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_that_stops_reading_trips_the_h2_pipe_write_timeout() {
     let fixture = fixture(1, None).await;
