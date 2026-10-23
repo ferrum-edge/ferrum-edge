@@ -35,7 +35,8 @@ pub mod data_path_metrics;
 pub mod date_cache;
 pub mod diagnostic_ref;
 #[cfg(test)]
-use diagnostic_test_logs::interest as diagnostic_test_interest;
+#[path = "../tests/support/diagnostic_interest.rs"]
+mod diagnostic_test_interest;
 #[cfg(test)]
 #[path = "../tests/common/diagnostic_logs.rs"]
 mod diagnostic_test_logs;
