@@ -3363,3 +3363,145 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
     let path = item_body(&harness, "pub fn gateway_binary_path()", "\n}\n");
     assert!(path.contains("locate_binary(false)"));
 }
+
+// ---------------------------------------------------------------------------
+// Thread-local tracing captures register the process-wide interest floor
+// ---------------------------------------------------------------------------
+//
+// tracing-core caches each callsite's interest the first time it is hit. While
+// at most one dispatcher is registered it computes that interest from the
+// HITTING thread's default dispatcher alone, so a sibling test with no
+// subscriber that reaches a callsite first caches `never` for it, and the
+// capturing test's own event at that callsite is then skipped before its
+// thread-local subscriber is consulted. That emptied two captures in CI
+// (`test_proxy_allowed_ws_origins_load_warns_once_per_proxy` got zero warnings
+// because the sibling star-proxy load test hits the same `warn!`, and
+// `ceiling_refusal_warning_is_rate_limited_but_metric_is_exact` saw no
+// refusal warning). The remedy is the shared floor
+// (`tests/support/diagnostic_interest.rs` via `ensure_interest_floor()`, or
+// `plugin_utils::install_interest_floor()` in the plugin targets) registered
+// before the capture dispatch is built. Every capture install in the unit and
+// integration suites must be preceded by one inside the same function.
+
+const TRACING_CAPTURE_INSTALL_TOKENS: [&str; 5] = [
+    "subscriber::set_default(",
+    "subscriber::with_default(",
+    "dispatcher::with_default(",
+    // Registering the dispatch is what rebuilds the interest cache, so the
+    // floor must come before it, in any spelling (`tracing::Dispatch::new(`
+    // or a bare `Dispatch::new(` after `use tracing::Dispatch`).
+    "Dispatch::new(",
+    // `WithSubscriber::with_subscriber` sets the dispatch as the polling
+    // thread's default on every poll of the wrapped future.
+    ".with_subscriber(",
+];
+
+/// The suites' sources, including the shared capture helpers they compile in.
+const TRACING_CAPTURE_SCAN_DIRS: [&str; 4] = [
+    "tests/unit",
+    "tests/integration",
+    "tests/common",
+    "tests/support",
+];
+
+/// Files exempt from the scan: this guard, and the floor itself (its own
+/// `Dispatch::new(InterestFloorSubscriber)`, its silent-sibling canary, and
+/// the regression macro that runs a caller's capture helper).
+const TRACING_CAPTURE_SCAN_EXEMPT_FILES: [&str; 2] = [
+    "tests/unit/gateway_core/shared_invariant_parity_tests.rs",
+    "tests/support/diagnostic_interest.rs",
+];
+
+/// Installs that are not captures: a `NoSubscriber` silences a callsite and
+/// never reads output back, and a capture-local floor dispatch (bound as
+/// `_interest_floor`, as `plugin_cache_tests` does) IS the floor.
+const TRACING_NON_CAPTURE_INSTALLS: [&str; 2] =
+    ["tracing::subscriber::NoSubscriber", "let _interest_floor ="];
+
+/// Evidence, on a non-comment line inside the installing function, that a
+/// floor is registered: a call statement or a bound floor dispatch.
+const TRACING_INTEREST_FLOOR_MARKERS: [&str; 2] = ["interest_floor();", "let _interest_floor ="];
+
+/// Whether a source line declares a function item (`fn`, optionally after
+/// visibility and `async`/`const`/`unsafe`), as opposed to mentioning `fn `.
+fn declares_fn(line: &str) -> bool {
+    let mut rest = line.trim_start();
+    loop {
+        let before = rest;
+        for prefix in [
+            "pub(crate) ",
+            "pub(super) ",
+            "pub ",
+            "async ",
+            "const ",
+            "unsafe ",
+        ] {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped;
+            }
+        }
+        if rest == before {
+            return rest.starts_with("fn ");
+        }
+    }
+}
+
+#[test]
+fn every_tracing_capture_registers_the_interest_floor_first() {
+    let mut offenders = Vec::new();
+    let mut installs = 0usize;
+    for (path, text) in rust_sources_under(&TRACING_CAPTURE_SCAN_DIRS) {
+        if TRACING_CAPTURE_SCAN_EXEMPT_FILES.contains(&path.as_str()) {
+            continue;
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        for token in TRACING_CAPTURE_INSTALL_TOKENS {
+            for (at, _) in text.match_indices(token) {
+                // `MeshRouteDispatch::new(` and the like are not tracing.
+                if text[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let line_idx = text[..at].matches('\n').count();
+                let line = lines[line_idx];
+                if line.trim_start().starts_with("//")
+                    || TRACING_NON_CAPTURE_INSTALLS
+                        .iter()
+                        .any(|exempt| line.contains(exempt))
+                {
+                    continue;
+                }
+                installs += 1;
+                let fn_line = (0..=line_idx)
+                    .rev()
+                    .find(|&i| declares_fn(lines[i]))
+                    .unwrap_or(0);
+                let floored = lines[fn_line..=line_idx]
+                    .iter()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .any(|l| {
+                        TRACING_INTEREST_FLOOR_MARKERS
+                            .iter()
+                            .any(|marker| l.contains(marker))
+                    });
+                if !floored {
+                    offenders.push(format!("{path}:{}: {}", line_idx + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        installs > 0,
+        "the scan must find the suites' tracing capture installs"
+    );
+    assert!(
+        offenders.is_empty(),
+        "call crate::diagnostic_test_interest::ensure_interest_floor(); (or \
+         plugin_utils::install_interest_floor();) as a statement in the \
+         installing function, before installing a thread-local tracing \
+         capture: {offenders:#?}"
+    );
+}

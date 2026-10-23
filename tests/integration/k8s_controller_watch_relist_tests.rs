@@ -160,6 +160,7 @@ fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(logs.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let guard = tracing::subscriber::set_default(subscriber);
     (logs, guard)
 }

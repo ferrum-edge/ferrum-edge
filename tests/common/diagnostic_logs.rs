@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-// Included once per test binary. The lib-test hook reuses this same owner;
-// integration callers compile it privately alongside their capture helper.
-#[path = "../support/diagnostic_interest.rs"]
-pub(crate) mod interest;
+// The interest floor is owned once per test binary at its crate root as
+// `crate::diagnostic_test_interest` (`src/lib.rs` for the lib tests,
+// `tests/integration_tests.rs` for the integration suite), so every capture in
+// that binary shares one floor and the support file is compiled only once.
 
 pub fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
     struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -19,7 +19,7 @@ pub fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
         }
     }
 
-    interest::ensure_interest_floor();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let output = bytes.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -33,4 +33,4 @@ pub fn capture_logs<T>(action: impl FnOnce() -> T) -> (T, String) {
     (result, logs)
 }
 
-interest::capture_regression!(capture_logs, tracing::Level::TRACE);
+crate::diagnostic_test_interest::capture_regression!(capture_logs, tracing::Level::TRACE);

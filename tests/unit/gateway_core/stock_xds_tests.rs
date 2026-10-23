@@ -2260,6 +2260,7 @@ fn capture_stock_logs() -> (StockLogBuffer, tracing::subscriber::DefaultGuard) {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(Writer(Arc::clone(&buffer)))
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let guard = tracing::subscriber::set_default(subscriber);
     (buffer, guard)
 }

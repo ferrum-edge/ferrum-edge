@@ -2718,6 +2718,7 @@ fn capture_ws_origin_logs() -> (CapturedWsOriginLogs, tracing::subscriber::Defau
         .without_time()
         .with_writer(writer.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let guard = tracing::subscriber::set_default(subscriber);
     (writer, guard)
 }

@@ -71,6 +71,7 @@ fn capture_backup_audit_logs() -> (
         .without_time()
         .with_writer(writer.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     (writer, tracing::subscriber::set_default(subscriber))
 }
 

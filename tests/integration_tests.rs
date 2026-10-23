@@ -13,6 +13,12 @@
 //!
 //! Run with: cargo test --test integration_tests
 
+// Process-wide tracing interest floor shared by every thread-local log
+// capture in this binary (see tests/support/diagnostic_interest.rs).
+#[allow(dead_code, unused_imports, unused_macros)]
+#[path = "support/diagnostic_interest.rs"]
+pub(crate) mod diagnostic_test_interest;
+
 mod common;
 mod integration;
 mod scaffolding;

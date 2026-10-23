@@ -36,6 +36,7 @@ fn construct_and_capture(config: &EnvConfig) -> (TlsPolicy, String) {
         .with_max_level(tracing::Level::INFO)
         .with_writer(move || writer.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let policy = tracing::subscriber::with_default(subscriber, || {
         TlsPolicy::from_env_config(config).expect("accepted TLS policy")
     });

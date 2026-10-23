@@ -374,6 +374,7 @@ fn capture_debug_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
         .with_max_level(tracing::Level::DEBUG)
         .with_writer(writer.clone())
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     (writer, tracing::subscriber::set_default(subscriber))
 }
 

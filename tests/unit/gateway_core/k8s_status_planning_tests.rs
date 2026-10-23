@@ -465,6 +465,7 @@ fn large_route_snapshots_scale_indexing_while_budget_bounds_planning() {
         .with_ansi(false)
         .without_time()
         .finish();
+    crate::diagnostic_test_interest::ensure_interest_floor();
     let dispatch = tracing::Dispatch::new(subscriber);
     tracing::dispatcher::with_default(&dispatch, || {
         // Table-driven scale regression (#2397): snapshot size grows with route

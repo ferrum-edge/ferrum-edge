@@ -74,18 +74,37 @@ use std::time::{Duration, Instant};
 ///   gRPC backend-error path in `src/proxy/mod.rs`. Same loading
 ///   requirements as `BODY_ERROR_CLASS_FIELD`.
 ///
-/// Escape-form note for the access-log signals: the `TransactionSummary`
-/// JSON is serialized into the *outer* tracing JSON's `fields.message`
-/// string, so `"` becomes `\"` on disk. Patterns below use the escaped
-/// form (`\\\"field\\\":\\\"` in Rust source, `\"field\":\"` on disk).
+/// Form note for the access-log signals: `stdout_logging` writes the
+/// `TransactionSummary` as its own raw JSON line through the non-blocking
+/// access-log writer, so the fields appear unescaped (`"field":"`). The
+/// escaped form (`\"field\":\"`), from a summary embedded in an outer tracing
+/// JSON `fields.message`, is accepted too, as the sibling suites'
+/// `has_read_write_timeout_class` helpers do. Matching only the escaped form
+/// made the post-headers RST_STREAM outcome (which records only
+/// `body_error_class`) fail whenever the reset lost the header race.
 const BACKEND_ERROR_LOG: &str = "gRPC backend request failed";
-const BODY_ERROR_CLASS_FIELD: &str = "\\\"body_error_class\\\":\\\"";
-const REJECTION_PHASE_FIELD: &str = "\\\"rejection_phase\\\":\\\"grpc_backend_error\\\"";
+const BODY_ERROR_CLASS_FIELD: &str = "\"body_error_class\":\"";
+const BODY_ERROR_CLASS_FIELD_ESCAPED: &str = "\\\"body_error_class\\\":\\\"";
+const REJECTION_PHASE_FIELD: &str = "\"rejection_phase\":\"grpc_backend_error\"";
+const REJECTION_PHASE_FIELD_ESCAPED: &str = "\\\"rejection_phase\\\":\\\"grpc_backend_error\\\"";
 
 fn has_backend_error_signal(logs: &str) -> bool {
     logs.contains(BACKEND_ERROR_LOG)
         || logs.contains(BODY_ERROR_CLASS_FIELD)
+        || logs.contains(BODY_ERROR_CLASS_FIELD_ESCAPED)
         || logs.contains(REJECTION_PHASE_FIELD)
+        || logs.contains(REJECTION_PHASE_FIELD_ESCAPED)
+}
+
+/// The pre-header backend-failure signals alone: the ERROR log and the
+/// `grpc_backend_error` rejection phase. Unlike [`has_backend_error_signal`]
+/// it does not accept any `body_error_class`, so a test that must see a
+/// post-header failure classified as a specific class can still accept the
+/// pre-header outcome without accepting a wrong class.
+fn has_pre_header_backend_failure_signal(logs: &str) -> bool {
+    logs.contains(BACKEND_ERROR_LOG)
+        || logs.contains(REJECTION_PHASE_FIELD)
+        || logs.contains(REJECTION_PHASE_FIELD_ESCAPED)
 }
 
 /// Poll the captured output until a backend-error signal appears, then
@@ -726,7 +745,7 @@ async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
     let body_protocol_error = logs.contains("\\\"body_error_class\\\":\\\"protocol_error\\\"")
         || logs.contains("\"body_error_class\":\"protocol_error\"");
     assert!(
-        body_protocol_error || has_backend_error_signal(&logs),
+        body_protocol_error || has_pre_header_backend_failure_signal(&logs),
         "backend CANCEL must be recorded as a backend failure; logs:\n{logs}"
     );
 }
