@@ -1884,6 +1884,20 @@ pub mod _test_support {
         crate::plugin_cache::grpc_web_view_omits_admission_policy_for_test(plugins)
     }
 
+    /// The capability bits of the request view a dispatcher resolves for
+    /// `(namespace, proxy_id, protocol)` — the same view the H1/H2 and H3
+    /// entry paths read before any plugin runs (issue #6793).
+    pub fn request_view_capabilities_for_test(
+        cache: &crate::plugin_cache::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> crate::plugin_cache::PluginCapabilities {
+        cache
+            .request_view(namespace, proxy_id, protocol)
+            .capabilities()
+    }
+
     /// Prepend a plugin onto one proxy's resolved list for external tests.
     ///
     /// Used to inject a gated `on_stream_connect` admission seam into a live

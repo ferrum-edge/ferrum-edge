@@ -2911,6 +2911,15 @@ impl Plugin for MeshAuthz {
         self.ext_authz.is_none()
     }
 
+    /// Audited (issue #6793): authorization reads only its own `mesh_authz.*`
+    /// coordination keys, `mesh.request_principal`, `request_protocol` and the
+    /// HBONE datagram marker, and a CUSTOM provider is handed only the headers
+    /// it names — never the `mesh.source.*` / `mesh.destination.*` workload
+    /// labels or a whole metadata map.
+    fn observes_mesh_label_metadata(&self) -> bool {
+        false
+    }
+
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         // Istio parity: `AuthorizationPolicy` is an INBOUND contract, so the
         // outbound capture leg is not judged at all (issue #4158). This is the

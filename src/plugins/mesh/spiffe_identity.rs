@@ -13,8 +13,8 @@
 //! finite-authenticated-stream-lifetime protections that `mtls_auth` already
 //! implements for Consumer-mapped certificates (issue #3816).
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -23,6 +23,7 @@ use x509_parser::prelude::*;
 
 use crate::identity::SpiffeId;
 use crate::identity::spiffe::UriSanError;
+use crate::plugins::mesh::telemetry_facts::RemoteSourceFacts;
 use crate::plugins::utils::auth_flow::{self, CredentialDeadline};
 use crate::plugins::utils::cert_validity::CertValidityWindow;
 use crate::plugins::{
@@ -165,6 +166,9 @@ fn admission_deadline(
 pub struct SpiffeIdentityConnectionCache {
     outcome: OnceLock<PeerSpiffeExtraction>,
     extraction_count: AtomicUsize,
+    /// The extracted peer's typed telemetry labels as a remote mesh source,
+    /// built at most once per connection (issue #6793).
+    remote_source_facts: OnceLock<Arc<RemoteSourceFacts>>,
 }
 
 impl std::fmt::Debug for SpiffeIdentityConnectionCache {
@@ -192,6 +196,30 @@ impl SpiffeIdentityConnectionCache {
             self.extraction_count.fetch_add(1, Ordering::Relaxed);
             derive_peer_spiffe_extraction(der)
         })
+    }
+
+    /// Typed telemetry facts for this connection's peer as a remote mesh
+    /// source (issue #6793), resolved once per connection instead of once per
+    /// multiplexed request.
+    ///
+    /// `Some` only when `identity` is exactly the SPIFFE ID this connection's
+    /// certificate yielded, so an honored HBONE assertion (or any other source)
+    /// never reuses the certificate peer's labels. These are labels only: the
+    /// plugin still decides admission — validity window and trust — per request.
+    pub(crate) fn remote_source_facts(
+        &self,
+        identity: &SpiffeId,
+    ) -> Option<Arc<RemoteSourceFacts>> {
+        let PeerSpiffeExtraction::Id { id, .. } = self.outcome.get()? else {
+            return None;
+        };
+        if id != identity {
+            return None;
+        }
+        Some(Arc::clone(
+            self.remote_source_facts
+                .get_or_init(|| Arc::new(RemoteSourceFacts::new(Some(id)))),
+        ))
     }
 
     /// The admitted leaf's own credential deadline, from the extraction this
@@ -363,6 +391,13 @@ impl Plugin for SpiffeIdentity {
     /// own expiry reaches no live tunnel, and those plugins must keep refusing.
     fn allows_hbone_inner_reuse(&self) -> bool {
         true
+    }
+
+    /// Audited (issue #6793): this plugin reads only the peer certificate and
+    /// writes only the peer identity; it never reads, iterates or forwards the
+    /// `mesh.*` workload labels in either metadata map.
+    fn observes_mesh_label_metadata(&self) -> bool {
+        false
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {

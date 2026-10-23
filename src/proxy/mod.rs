@@ -1254,6 +1254,9 @@ fn annotate_gateway_mesh_metadata(
             ctx.metadata.insert(metadata_key.to_string(), value.clone());
         }
     }
+    // Keep the typed label projection in step with the keys just written, so
+    // mesh metrics built from it report the dispatched peer (issue #6793).
+    ctx.record_mesh_gateway_destination_overlay(&target.tags);
 }
 
 /// Strip reserved identity baggage plus any configured egress prefixes from a
@@ -35491,6 +35494,14 @@ async fn handle_proxy_request_inner(
     // persisting a finalized representation can prove which rules produced it.
     ctx.set_response_presentation_policy_digest(
         plugin_cache_view.response_presentation_policy_digest(),
+    );
+    // Same view: when no plugin in it can observe the mesh label projection,
+    // `workload_metrics` keeps those labels in typed request state only
+    // (issue #6793).
+    ctx.set_mesh_label_projection_deferred(
+        plugin_cache_view
+            .capabilities()
+            .has(crate::plugin_cache::PluginCapabilities::MESH_LABEL_PROJECTION_DEFERRABLE),
     );
     // Establish the effective RPC budget before any request-plugin or body
     // await. The absolute instant is anchored to `timestamp_received` and is

@@ -4499,6 +4499,14 @@ async fn handle_h3_request(
     ctx.set_response_presentation_policy_digest(
         plugin_cache_view.response_presentation_policy_digest(),
     );
+    // Same view: when no plugin in it can observe the mesh label projection,
+    // `workload_metrics` keeps those labels in typed request state only
+    // (issue #6793).
+    ctx.set_mesh_label_projection_deferred(
+        plugin_cache_view
+            .capabilities()
+            .has(crate::plugin_cache::PluginCapabilities::MESH_LABEL_PROJECTION_DEFERRABLE),
+    );
     // Resolve the effective gRPC policy before any plugin/body await. Native
     // H3 and the H3→H2 bridge both consume this same monotonic absolute instant
     // instead of reconstructing a fresh timer from a rewritten header.

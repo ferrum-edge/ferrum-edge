@@ -47,8 +47,21 @@ pub fn record_transaction_with_mesh_key(
     GLOBAL_SERVICE_GRAPH.record_transaction_with_mesh_key(summary, mesh_key);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Process-random seed for service-graph edge hashes. Peer-influenced label
+/// values feed this hash, so it is keyed (HashDoS-resistant) and never
+/// persisted or compared across processes.
+static SERVICE_GRAPH_HASHER: LazyLock<ahash::RandomState> = LazyLock::new(ahash::RandomState::new);
+
+/// One service-graph edge.
+///
+/// `hash` is the keyed `SERVICE_GRAPH_HASHER` hash of the twelve labels,
+/// computed once when the key is built, so a lookup folds one `u64` instead of
+/// SipHashing every label string (issue #6793). It is a pure function of the
+/// labels, so equal keys always carry equal hashes and the derived `PartialEq`
+/// stays consistent with the manual `Hash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ServiceGraphKey {
+    hash: u64,
     source_principal: Arc<str>,
     source_workload: Arc<str>,
     source_namespace: Arc<str>,
@@ -61,6 +74,50 @@ struct ServiceGraphKey {
     destination_service: Arc<str>,
     request_protocol: Arc<str>,
     connection_security_policy: Arc<str>,
+}
+
+impl std::hash::Hash for ServiceGraphKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl ServiceGraphKey {
+    fn from_mesh_key(mesh_key: &MeshRequestKey) -> Self {
+        let hash = SERVICE_GRAPH_HASHER.hash_one((
+            (
+                &*mesh_key.source_principal,
+                &*mesh_key.source_workload,
+                &*mesh_key.source_namespace,
+                &*mesh_key.source_app,
+                &*mesh_key.source_service,
+            ),
+            (
+                &*mesh_key.destination_principal,
+                &*mesh_key.destination_workload,
+                &*mesh_key.destination_namespace,
+                &*mesh_key.destination_app,
+                &*mesh_key.destination_service,
+            ),
+            &*mesh_key.request_protocol,
+            &*mesh_key.connection_security_policy,
+        ));
+        Self {
+            hash,
+            source_principal: Arc::clone(&mesh_key.source_principal),
+            source_workload: Arc::clone(&mesh_key.source_workload),
+            source_namespace: Arc::clone(&mesh_key.source_namespace),
+            source_app: Arc::clone(&mesh_key.source_app),
+            source_service: Arc::clone(&mesh_key.source_service),
+            destination_principal: Arc::clone(&mesh_key.destination_principal),
+            destination_workload: Arc::clone(&mesh_key.destination_workload),
+            destination_namespace: Arc::clone(&mesh_key.destination_namespace),
+            destination_app: Arc::clone(&mesh_key.destination_app),
+            destination_service: Arc::clone(&mesh_key.destination_service),
+            request_protocol: Arc::clone(&mesh_key.request_protocol),
+            connection_security_policy: Arc::clone(&mesh_key.connection_security_policy),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -124,7 +181,9 @@ impl ServiceGraphCounters {
 
 #[derive(Debug)]
 pub struct ServiceGraphRegistry {
-    edges: DashMap<ServiceGraphKey, ServiceGraphCounters>,
+    /// Keyed by a precomputed keyed hash (see [`ServiceGraphKey`]), so the map
+    /// hasher only folds one `u64`.
+    edges: DashMap<ServiceGraphKey, ServiceGraphCounters, ahash::RandomState>,
     /// Live edge count, maintained alongside `edges` so admission never takes
     /// an all-shard `DashMap::len()`. Reserved before an insert and released
     /// on eviction, so it never exceeds [`MAX_SERVICE_GRAPH_EDGES`].
@@ -143,7 +202,10 @@ pub struct ServiceGraphRegistry {
 impl Default for ServiceGraphRegistry {
     fn default() -> Self {
         Self {
-            edges: DashMap::with_shard_amount(super::observability_shard_amount()),
+            edges: DashMap::with_hasher_and_shard_amount(
+                ahash::RandomState::new(),
+                super::observability_shard_amount(),
+            ),
             edge_count: AtomicUsize::new(0),
             dropped_edge_transactions: AtomicU64::new(0),
             snapshot: ArcSwap::from_pointee(ServiceGraphSnapshot::default()),
@@ -179,20 +241,7 @@ impl ServiceGraphRegistry {
             return;
         };
         let now_unix_ms = now_unix_ms();
-        let key = ServiceGraphKey {
-            source_principal: Arc::clone(&mesh_key.source_principal),
-            source_workload: Arc::clone(&mesh_key.source_workload),
-            source_namespace: Arc::clone(&mesh_key.source_namespace),
-            source_app: Arc::clone(&mesh_key.source_app),
-            source_service: Arc::clone(&mesh_key.source_service),
-            destination_principal: Arc::clone(&mesh_key.destination_principal),
-            destination_workload: Arc::clone(&mesh_key.destination_workload),
-            destination_namespace: Arc::clone(&mesh_key.destination_namespace),
-            destination_app: Arc::clone(&mesh_key.destination_app),
-            destination_service: Arc::clone(&mesh_key.destination_service),
-            request_protocol: Arc::clone(&mesh_key.request_protocol),
-            connection_security_policy: Arc::clone(&mesh_key.connection_security_policy),
-        };
+        let key = ServiceGraphKey::from_mesh_key(mesh_key);
         let is_error = service_graph_error(summary, mesh_key);
         // Steady state: the edge exists, so a shard read lock suffices.
         if let Some(counters) = self.edges.get(&key) {

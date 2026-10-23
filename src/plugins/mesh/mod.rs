@@ -10,6 +10,7 @@ pub mod outbound_registry;
 pub mod prometheus_helpers;
 pub mod service_graph;
 pub mod spiffe_identity;
+pub mod telemetry_facts;
 pub mod workload_metrics;
 
 pub(crate) const CUSTOM_TRACE_ATTRIBUTES_METADATA: &str = "workload_metrics.trace_attributes";

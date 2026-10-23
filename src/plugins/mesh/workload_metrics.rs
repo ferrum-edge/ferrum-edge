@@ -31,6 +31,9 @@ use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
     MeshMetricLabel,
 };
+use crate::plugins::mesh::telemetry_facts::{
+    LocalWorkloadFacts, MeshLabel, MeshLabelShadow, RemoteSourceFacts, SpiffeLabels,
+};
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
     trace_exporters_from_providers, trace_is_sampled, validate_trace_provider_endpoints,
@@ -323,13 +326,60 @@ fn parse_effective_authz_baggage_gate(
     })
 }
 
-#[derive(Default)]
+/// Resolve the local workload's `workload` / `app` / `service` metric labels.
+///
+/// Precedence (first non-empty wins): workload =
+/// `service.istio.io/canonical-name`, `app.kubernetes.io/name`, `app`,
+/// `k8s-app`, `workload`, then the SPIFFE service account, then `unknown`;
+/// app = `app.kubernetes.io/name`, `app`, `k8s-app`, then workload; service =
+/// `service.istio.io/canonical-name`, `service`, `app`, then workload.
+fn resolve_local_workload_facts(
+    labels: &HashMap<String, String>,
+    workload_spiffe_id: Option<&SpiffeId>,
+    namespace: Option<&str>,
+) -> LocalWorkloadFacts {
+    let workload = first_label(
+        labels,
+        &[
+            "service.istio.io/canonical-name",
+            "app.kubernetes.io/name",
+            "app",
+            "k8s-app",
+            "workload",
+        ],
+    )
+    .or_else(|| workload_spiffe_id.and_then(SpiffeId::service_account))
+    .unwrap_or("unknown");
+    let app =
+        first_label(labels, &["app.kubernetes.io/name", "app", "k8s-app"]).unwrap_or(workload);
+    let service = first_label(
+        labels,
+        &["service.istio.io/canonical-name", "service", "app"],
+    )
+    .unwrap_or(workload);
+    LocalWorkloadFacts::new(workload_spiffe_id, namespace, workload, app, service)
+}
+
+/// The source identity a stamp attributes, without cloning the verified peer.
+enum ResolvedSourceIdentity {
+    /// The authenticated peer (`ctx.peer_spiffe_id`).
+    Peer,
+    /// A baggage principal every effective trust gate honored.
+    Asserted(SpiffeId),
+    /// No source identity.
+    Absent,
+}
+
 pub struct WorkloadMetrics {
     node_id: Option<String>,
     topology: Option<String>,
     namespace: Option<String>,
     workload_spiffe_id: Option<SpiffeId>,
-    labels: HashMap<String, String>,
+    /// This workload's metric labels, resolved once from `labels`,
+    /// `namespace` and `workload_spiffe_id` at construction (one
+    /// config/identity generation) instead of probing the label map on every
+    /// stamp (issue #6793). Shared by every request this instance stamps.
+    local_facts: LocalWorkloadFacts,
     /// Compiled HBONE baggage trust policy. Direct instances use a single
     /// gate from this plugin's own config; mesh injection supplies a
     /// conjunctive set mirroring every enabled global `mesh_authz`.
@@ -456,6 +506,12 @@ impl WorkloadMetrics {
                 "workload_metrics: `workload_spiffe_id` is not a valid SPIFFE id".to_string()
             })?;
         let labels = string_map_config(config, "labels")?;
+        let namespace = string_config(config, "namespace");
+        let local_facts = resolve_local_workload_facts(
+            &labels,
+            workload_spiffe_id.as_ref(),
+            namespace.as_deref(),
+        );
         let baggage_trust = BaggageTrustPolicy::from_config(config).map_err(|e| {
             if e.starts_with("workload_metrics:") {
                 e
@@ -546,9 +602,9 @@ impl WorkloadMetrics {
         Ok(Self {
             node_id: string_config(config, "node_id"),
             topology: string_config(config, "topology"),
-            namespace: string_config(config, "namespace"),
+            namespace,
             workload_spiffe_id,
-            labels,
+            local_facts,
             baggage_trust,
             sampling_percentage,
             custom_tags,
@@ -588,45 +644,36 @@ impl WorkloadMetrics {
     }
 
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
+        let probe = TraceHeaderProbe::scan(headers);
+        self.annotate_http_context_with_probe(ctx, headers, &probe);
+    }
+
+    /// Stamp the request's mesh telemetry metadata and labels.
+    ///
+    /// The label keys are written through [`Self::stamp_http_labels`]; every
+    /// other key is written to `ctx.metadata` exactly as before. `probe` must
+    /// describe `headers`.
+    fn annotate_http_context_with_probe(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        probe: &TraceHeaderProbe<'_>,
+    ) {
         self.insert_common_metadata(&mut ctx.metadata);
-        self.apply_telemetry_metadata(&mut ctx.metadata, headers);
+        self.apply_telemetry_metadata_with_probe(&mut ctx.metadata, headers, probe);
         let cel_stamp_needs = effective_metric_tag_cel_stamp_needs(&ctx.metadata);
-        if self.should_ensure_http_trace_context(&ctx.metadata, headers) {
-            if !has_valid_traceparent(headers) {
-                import_b3_trace_metadata(&mut ctx.metadata, headers);
+        if self.should_ensure_http_trace_context(&ctx.metadata, probe) {
+            if !probe.has_valid_traceparent() {
+                import_b3_trace_metadata(&mut ctx.metadata, probe);
             }
             ensure_trace_metadata(&mut ctx.metadata, headers);
-            if let Some(tracestate) = header_value(headers, TRACESTATE_HEADER) {
+            if let Some(tracestate) = probe.tracestate {
                 ctx.metadata
                     .insert(TRACESTATE_HEADER.to_string(), tracestate.to_string());
             }
         }
         let hbone_identity = hbone_identity_from_headers(ctx, headers);
-        let peer_source_identity = self.resolve_peer_source_identity(ctx, hbone_identity.as_ref());
-        // This method runs before authorization and again after request-header
-        // transforms. Rebuild the SPIFFE-derived source identity as one atomic
-        // view so a final peer with fewer path segments cannot retain namespace
-        // or service-account labels from early trusted baggage. The clear is
-        // skipped only when the identity this call will stamp (per the
-        // direction match below) already matches the stamped labels exactly,
-        // which is the common repeat-annotate case; any identity change —
-        // including to or from `None` — still clears first.
-        let stamped_source_identity: Option<&SpiffeId> = match ctx.mesh_direction {
-            Some(MeshTrafficDirection::Inbound) => peer_source_identity.as_ref(),
-            Some(MeshTrafficDirection::Outbound) => {
-                if ctx.node_waypoint_pod_uid.is_some() {
-                    ctx.peer_spiffe_id.as_ref()
-                } else {
-                    self.workload_spiffe_id.as_ref()
-                }
-            }
-            None => peer_source_identity
-                .as_ref()
-                .or(self.workload_spiffe_id.as_ref()),
-        };
-        if !source_spiffe_labels_match(&ctx.metadata, stamped_source_identity) {
-            clear_source_spiffe_labels(&mut ctx.metadata);
-        }
+        let resolved_source = self.resolve_peer_source_identity(ctx, hbone_identity.as_ref());
         insert_metadata_if_changed(
             &mut ctx.metadata,
             "mesh.connection_security_policy",
@@ -636,7 +683,7 @@ impl WorkloadMetrics {
                 "none"
             },
         );
-        let protocol = request_protocol(ctx, headers);
+        let protocol = request_protocol(ctx, probe);
         insert_metadata_if_changed(&mut ctx.metadata, "mesh.request_protocol", protocol);
         // Stamp only attributes required by the active COMPOSED family plans.
         // Several effective instances may contribute different families or
@@ -701,61 +748,93 @@ impl WorkloadMetrics {
                 mesh_direction_str(direction),
             );
         }
+        self.stamp_http_labels(ctx, resolved_source);
+    }
 
+    /// Project the request's source and destination workload labels.
+    ///
+    /// Every label key goes through one [`LabelWriter`]: into `ctx.metadata`
+    /// exactly as it always has (unless the request's plugin view deferred the
+    /// string projection because nothing can observe it), and always into the
+    /// request's typed [`MeshLabelShadow`], from values resolved once per
+    /// instance or per connection (issue #6793).
+    ///
+    /// This runs before authorization and again after request-header
+    /// transforms. The SPIFFE-derived source labels are rebuilt as one atomic
+    /// view, so a final peer with fewer path segments cannot retain namespace
+    /// or service-account labels from early trusted baggage. The clear is
+    /// skipped only when the identity this call stamps already matches the
+    /// stamped labels exactly, which is the common repeat-annotate case; any
+    /// identity change — including to or from `None` — still clears first.
+    fn stamp_http_labels(&self, ctx: &mut RequestContext, resolved_source: ResolvedSourceIdentity) {
+        let peer_source_identity: Option<&SpiffeId> = match &resolved_source {
+            ResolvedSourceIdentity::Peer => ctx.peer_spiffe_id.as_ref(),
+            ResolvedSourceIdentity::Asserted(identity) => Some(identity),
+            ResolvedSourceIdentity::Absent => None,
+        };
+        let local = &self.local_facts;
+        // Resolve every remote fact before borrowing the label sinks.
+        let (source_identity, remote_source) = match ctx.mesh_direction {
+            Some(MeshTrafficDirection::Inbound) => (
+                peer_source_identity,
+                Some(remote_source_facts(ctx, peer_source_identity)),
+            ),
+            // A NodeWaypoint outbound listener serves many captured pods. Its
+            // accept path authenticates the originating pod and stamps both
+            // fields together; use that asserted identity directly so request
+            // baggage cannot spoof it and the shared waypoint is never
+            // reported as the application source. Other outbound topologies
+            // continue to attribute the local workload.
+            Some(MeshTrafficDirection::Outbound) if ctx.node_waypoint_pod_uid.is_some() => (
+                ctx.peer_spiffe_id.as_ref(),
+                ctx.peer_spiffe_id
+                    .as_ref()
+                    .map(|identity| remote_source_facts(ctx, Some(identity))),
+            ),
+            Some(MeshTrafficDirection::Outbound) => (self.workload_spiffe_id.as_ref(), None),
+            None => {
+                let identity = peer_source_identity.or(self.workload_spiffe_id.as_ref());
+                let remote = (identity != self.workload_spiffe_id.as_ref())
+                    .then(|| remote_source_facts(ctx, identity));
+                (identity, remote)
+            }
+        };
+        // Remote facts carry their own SPIFFE labels; otherwise the stamped
+        // identity is this workload's own.
+        let source_spiffe: Option<&SpiffeLabels> = match remote_source.as_ref() {
+            Some(remote) => remote.spiffe(),
+            None => local.spiffe(),
+        };
+        let route = match ctx.mesh_direction {
+            Some(MeshTrafficDirection::Inbound) => None,
+            _ => ctx.matched_proxy.as_deref().map(|proxy| {
+                (
+                    proxy.namespace.as_str(),
+                    proxy.name.as_deref().unwrap_or(&proxy.id),
+                )
+            }),
+        };
+        let shadow = ctx.mesh_labels.get_or_insert_with(Default::default);
+        let mut labels = LabelWriter {
+            metadata: (!ctx.mesh_label_projection_deferred).then_some(&mut ctx.metadata),
+            shadow,
+        };
+        labels.source_spiffe(source_identity, source_spiffe);
         match ctx.mesh_direction {
             Some(MeshTrafficDirection::Inbound) => {
-                if let Some(identity) = peer_source_identity.as_ref() {
-                    insert_source_spiffe_labels(&mut ctx.metadata, identity);
-                }
-                self.insert_remote_source_workload_labels(
-                    &mut ctx.metadata,
-                    peer_source_identity.as_ref(),
-                );
-                self.insert_local_destination_workload_labels(&mut ctx.metadata);
+                labels.remote_source_workload(remote_source.as_deref());
+                labels.local_destination(local);
             }
-            Some(MeshTrafficDirection::Outbound) => {
-                // A NodeWaypoint outbound listener serves many captured pods.
-                // Its accept path authenticates the originating pod and stamps
-                // both fields together; use that asserted identity directly so
-                // request baggage cannot spoof it and the shared waypoint is
-                // never reported as the application source. Other outbound
-                // topologies continue to attribute the local workload.
-                let node_waypoint_source_identity = if ctx.node_waypoint_pod_uid.is_some() {
-                    ctx.peer_spiffe_id.as_ref()
-                } else {
-                    None
-                };
-                if let Some(identity) = node_waypoint_source_identity {
-                    insert_source_spiffe_labels(&mut ctx.metadata, identity);
-                    self.insert_remote_source_workload_labels(&mut ctx.metadata, Some(identity));
-                } else {
-                    if let Some(identity) = self.workload_spiffe_id.as_ref() {
-                        insert_source_spiffe_labels(&mut ctx.metadata, identity);
+            Some(MeshTrafficDirection::Outbound) | None => {
+                match remote_source.as_deref() {
+                    // NodeWaypoint outbound attributes the captured pod.
+                    Some(remote) if ctx.mesh_direction.is_some() => {
+                        labels.remote_source_workload(Some(remote));
                     }
-                    self.insert_local_source_workload_labels(&mut ctx.metadata);
+                    _ => labels.local_source_workload(local),
                 }
-                if let Some(proxy) = ctx.matched_proxy.as_ref() {
-                    self.insert_proxy_destination_labels(
-                        &mut ctx.metadata,
-                        &proxy.namespace,
-                        proxy.name.as_deref().unwrap_or(&proxy.id),
-                    );
-                }
-            }
-            None => {
-                let source_identity = peer_source_identity
-                    .as_ref()
-                    .or(self.workload_spiffe_id.as_ref());
-                if let Some(identity) = source_identity {
-                    insert_source_spiffe_labels(&mut ctx.metadata, identity);
-                }
-                self.insert_local_source_workload_labels(&mut ctx.metadata);
-                if let Some(proxy) = ctx.matched_proxy.as_ref() {
-                    self.insert_proxy_destination_labels(
-                        &mut ctx.metadata,
-                        &proxy.namespace,
-                        proxy.name.as_deref().unwrap_or(&proxy.id),
-                    );
+                if let Some((namespace, destination)) = route {
+                    labels.route_destination(namespace, destination);
                 }
             }
         }
@@ -829,7 +908,7 @@ impl WorkloadMetrics {
         &self,
         ctx: &mut RequestContext,
         hbone_identity: Option<&HboneIdentity>,
-    ) -> Option<SpiffeId> {
+    ) -> ResolvedSourceIdentity {
         // Resolve the source identity using the SAME baggage trust relation as
         // `mesh_authz` (shared `hbone_baggage_honor`) so the telemetry
         // attribution can never diverge from the authorization decision. When
@@ -856,23 +935,23 @@ impl WorkloadMetrics {
                         "mesh.ignored_baggage".to_string(),
                         "untrusted_assertor".to_string(),
                     );
-                    Some(peer.clone())
+                    ResolvedSourceIdentity::Peer
                 }
                 HboneBaggageHonor::TrustDomainMismatch => {
                     ctx.metadata.insert(
                         "mesh.ignored_baggage".to_string(),
                         "trust_domain_mismatch".to_string(),
                     );
-                    Some(peer.clone())
+                    ResolvedSourceIdentity::Peer
                 }
                 HboneBaggageHonor::AssertionOutOfScope => {
                     ctx.metadata.insert(
                         "mesh.ignored_baggage".to_string(),
                         "assertion_out_of_scope".to_string(),
                     );
-                    Some(peer.clone())
+                    ResolvedSourceIdentity::Peer
                 }
-                HboneBaggageHonor::Honored => Some(baggage),
+                HboneBaggageHonor::Honored => ResolvedSourceIdentity::Asserted(baggage),
             },
             // An unauthenticated request must never have its source identity
             // rewritten by baggage; fall back to the workload hint below.
@@ -881,22 +960,23 @@ impl WorkloadMetrics {
                     "mesh.ignored_baggage".to_string(),
                     "unauthenticated_hbone".to_string(),
                 );
-                None
+                ResolvedSourceIdentity::Absent
             }
             // No baggage principal: use the authenticated peer identity if any.
-            (peer, None) => peer.cloned(),
+            (Some(_), None) => ResolvedSourceIdentity::Peer,
+            (None, None) => ResolvedSourceIdentity::Absent,
         }
     }
 
     fn should_ensure_http_trace_context<MS: std::hash::BuildHasher>(
         &self,
         metadata: &HashMap<String, String, MS>,
-        headers: &HashMap<String, String>,
+        probe: &TraceHeaderProbe<'_>,
     ) -> bool {
         self.trace_context_enabled()
             && (trace_is_sampled(metadata)
-                || has_valid_traceparent(headers)
-                || has_b3_trace_context(headers))
+                || probe.has_valid_traceparent()
+                || probe.has_b3_trace_context())
     }
 
     fn insert_common_metadata<MS: std::hash::BuildHasher>(
@@ -916,7 +996,22 @@ impl WorkloadMetrics {
         metadata: &mut HashMap<String, String, MS>,
         headers: &HashMap<String, String>,
     ) {
-        if let Some(sampled) = existing_sampling_decision(metadata, headers) {
+        self.apply_telemetry_metadata_with_probe(
+            metadata,
+            headers,
+            &TraceHeaderProbe::scan(headers),
+        );
+    }
+
+    /// [`Self::apply_telemetry_metadata`] with the trace-header probe the
+    /// caller already took over `headers`.
+    fn apply_telemetry_metadata_with_probe<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+        headers: &HashMap<String, String>,
+        probe: &TraceHeaderProbe<'_>,
+    ) {
+        if let Some(sampled) = existing_sampling_decision(metadata, probe) {
             metadata.insert(
                 "trace_sampled".to_string(),
                 if sampled { "true" } else { "false" }.to_string(),
@@ -998,31 +1093,11 @@ impl WorkloadMetrics {
     }
 
     fn local_workload_labels(&self) -> (&str, &str, &str) {
-        let workload = first_label(
-            &self.labels,
-            &[
-                "service.istio.io/canonical-name",
-                "app.kubernetes.io/name",
-                "app",
-                "k8s-app",
-                "workload",
-            ],
+        (
+            self.local_facts.workload(),
+            self.local_facts.app(),
+            self.local_facts.service(),
         )
-        .or_else(|| {
-            self.workload_spiffe_id
-                .as_ref()
-                .and_then(SpiffeId::service_account)
-        })
-        .unwrap_or("unknown");
-        let app = first_label(&self.labels, &["app.kubernetes.io/name", "app", "k8s-app"])
-            .unwrap_or(workload);
-        let service = first_label(
-            &self.labels,
-            &["service.istio.io/canonical-name", "service", "app"],
-        )
-        .unwrap_or(workload);
-
-        (workload, app, service)
     }
 
     fn insert_local_source_workload_labels<MS: std::hash::BuildHasher>(
@@ -1250,17 +1325,25 @@ impl Plugin for WorkloadMetrics {
         true
     }
 
+    /// The labels are this plugin's own projection; it reads them back only
+    /// to export spans (`log_span` serializes summary metadata into span
+    /// attributes). An instance that can export no span leaves them to the
+    /// typed label projection (issue #6793).
+    fn observes_mesh_label_metadata(&self) -> bool {
+        !self.span_reporting_disabled && !self.trace_exporters.is_empty()
+    }
+
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
         // The authorization phase runs after every plugin's request-received
         // phase. Stamp telemetry here so mesh_authz rejects still retain RED
         // labels and trace context; before_proxy refreshes the same metadata
         // after route selection for accepted requests.
         let headers = std::mem::take(&mut ctx.headers);
-        let captured_traceparent = has_valid_traceparent(&headers);
-        let captured_b3 =
-            has_b3_trace_context(&headers) || b3_sampling_decision(&headers).is_some();
-        let captured_tracestate = header_value(&headers, TRACESTATE_HEADER).is_some();
-        self.annotate_http_context(ctx, &headers);
+        let probe = TraceHeaderProbe::scan(&headers);
+        let captured_traceparent = probe.has_valid_traceparent();
+        let captured_b3 = probe.has_b3_trace_context() || probe.b3_sampling_decision().is_some();
+        let captured_tracestate = probe.tracestate.is_some();
+        self.annotate_http_context_with_probe(ctx, &headers, &probe);
         if captured_traceparent && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
             ctx.metadata.insert(
                 CAPTURED_TRACEPARENT_METADATA.to_string(),
@@ -1312,9 +1395,17 @@ impl Plugin for WorkloadMetrics {
         // The stale baggage-derived source keys are cleared first because the
         // attesting-peer fallback identity may not carry every SPIFFE path
         // segment the discarded baggage principal did.
+        // A deferred label projection keeps the stamped principal only in the
+        // request's typed shadow (issue #6793).
+        let stamped_source_principal = if ctx.mesh_label_projection_deferred {
+            ctx.mesh_labels
+                .as_deref()
+                .and_then(|labels| labels.get(MeshLabel::SourcePrincipal))
+        } else {
+            ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str)
+        };
         if ctx.metadata.contains_key(IGNORED_UDP_SOURCE_SCOPE_METADATA)
-            && ctx.metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str)
-                != ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str)
+            && stamped_source_principal != ctx.peer_spiffe_id.as_ref().map(SpiffeId::as_str)
         {
             clear_source_spiffe_labels(&mut ctx.metadata);
             let headers = std::mem::take(&mut ctx.headers);
@@ -2547,7 +2638,7 @@ fn mesh_service_namespace(service: &str) -> Option<&str> {
         .map(|(_, namespace)| namespace)
 }
 
-fn request_protocol(ctx: &RequestContext, headers: &HashMap<String, String>) -> &'static str {
+fn request_protocol(ctx: &RequestContext, probe: &TraceHeaderProbe<'_>) -> &'static str {
     if ctx
         .metadata
         .get("request_protocol")
@@ -2555,11 +2646,12 @@ fn request_protocol(ctx: &RequestContext, headers: &HashMap<String, String>) -> 
     {
         return "hbone";
     }
-    let content_type = header_value(headers, "content-type")
+    let content_type = probe
+        .content_type
         .or_else(|| ctx.raw_header_get("content-type"))
         .unwrap_or("");
     if content_type
-        .split(';')
+        .split(',')
         .next()
         .is_some_and(|value| is_grpc_content_type(value.trim()))
     {
@@ -2567,6 +2659,23 @@ fn request_protocol(ctx: &RequestContext, headers: &HashMap<String, String>) -> 
     } else {
         "http"
     }
+}
+
+/// Typed facts for a remote source identity: the facts cached on the TLS
+/// connection when the identity is that connection's verified certificate
+/// identity (resolved once per connection), otherwise built for this request
+/// (an honored HBONE assertion or a NodeWaypoint-attested pod).
+fn remote_source_facts(
+    ctx: &RequestContext,
+    identity: Option<&SpiffeId>,
+) -> Arc<RemoteSourceFacts> {
+    let Some(identity) = identity else {
+        return Arc::clone(RemoteSourceFacts::absent());
+    };
+    ctx.peer_spiffe_extraction_cache
+        .as_ref()
+        .and_then(|cache| cache.remote_source_facts(identity))
+        .unwrap_or_else(|| Arc::new(RemoteSourceFacts::new(Some(identity))))
 }
 
 fn hbone_identity_from_headers(
@@ -2605,7 +2714,7 @@ fn trace_sampled(sampling_percentage: f64) -> bool {
 
 fn existing_sampling_decision<MS: std::hash::BuildHasher>(
     metadata: &HashMap<String, String, MS>,
-    headers: &HashMap<String, String>,
+    probe: &TraceHeaderProbe<'_>,
 ) -> Option<bool> {
     if let Some(value) = metadata.get("trace_sampled") {
         return Some(value.eq_ignore_ascii_case("true"));
@@ -2613,10 +2722,8 @@ fn existing_sampling_decision<MS: std::hash::BuildHasher>(
     metadata
         .get(TRACEPARENT_HEADER)
         .and_then(|value| traceparent_sampling_decision(value))
-        .or_else(|| {
-            header_value(headers, TRACEPARENT_HEADER).and_then(traceparent_sampling_decision)
-        })
-        .or_else(|| b3_sampling_decision(headers))
+        .or_else(|| probe.traceparent.and_then(traceparent_sampling_decision))
+        .or_else(|| probe.b3_sampling_decision())
 }
 
 fn clear_http_trace_metadata<MS: std::hash::BuildHasher>(
@@ -2651,34 +2758,115 @@ fn traceparent_sampling_decision(value: &str) -> Option<bool> {
 }
 
 fn b3_sampling_decision(headers: &HashMap<String, String>) -> Option<bool> {
-    if let Some(value) = header_value(headers, "b3") {
-        return b3_single_sampling_decision(value);
-    }
-    if let Some(flags) = header_value(headers, "x-b3-flags")
-        && flags.trim() == "1"
-    {
-        return Some(true);
-    }
-    header_value(headers, "x-b3-sampled").and_then(|value| match value.trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        value if value.eq_ignore_ascii_case("true") => Some(true),
-        value if value.eq_ignore_ascii_case("false") => Some(false),
-        _ => None,
-    })
+    TraceHeaderProbe::scan(headers).b3_sampling_decision()
 }
 
 fn has_b3_trace_context(headers: &HashMap<String, String>) -> bool {
-    if let Some(value) = header_value(headers, "b3") {
-        return parse_b3_single_trace_context(value).is_some();
+    TraceHeaderProbe::scan(headers).has_b3_trace_context()
+}
+
+/// Every trace-context header (plus `content-type`) a stamp consults, found in
+/// ONE pass over the request headers.
+///
+/// Each field is exactly what `header_value(headers, name)` returns: the
+/// byte-exact key when present, otherwise the first ASCII-case-insensitive
+/// match in the map's iteration order. A stamp used to look each name up
+/// separately, and every miss — the common case, a request with no trace
+/// headers — rescanned the whole map. `scan` must be re-run after the headers
+/// change.
+#[derive(Debug, Clone, Copy, Default)]
+struct TraceHeaderProbe<'a> {
+    traceparent: Option<&'a str>,
+    tracestate: Option<&'a str>,
+    b3: Option<&'a str>,
+    x_b3_traceid: Option<&'a str>,
+    x_b3_spanid: Option<&'a str>,
+    x_b3_flags: Option<&'a str>,
+    x_b3_sampled: Option<&'a str>,
+    content_type: Option<&'a str>,
+}
+
+impl<'a> TraceHeaderProbe<'a> {
+    const NAMES: [&'static str; 8] = [
+        TRACEPARENT_HEADER,
+        TRACESTATE_HEADER,
+        "b3",
+        "x-b3-traceid",
+        "x-b3-spanid",
+        "x-b3-flags",
+        "x-b3-sampled",
+        "content-type",
+    ];
+
+    fn scan(headers: &'a HashMap<String, String>) -> Self {
+        let mut exact: [Option<&'a str>; 8] = [None; 8];
+        let mut folded: [Option<&'a str>; 8] = [None; 8];
+        for (name, value) in headers {
+            for (index, probed) in Self::NAMES.iter().enumerate() {
+                if name.len() != probed.len() {
+                    continue;
+                }
+                if name == probed {
+                    exact[index] = Some(value.as_str());
+                } else if folded[index].is_none() && name.eq_ignore_ascii_case(probed) {
+                    folded[index] = Some(value.as_str());
+                }
+            }
+        }
+        let [
+            traceparent,
+            tracestate,
+            b3,
+            x_b3_traceid,
+            x_b3_spanid,
+            x_b3_flags,
+            x_b3_sampled,
+            content_type,
+        ] = std::array::from_fn(|index| exact[index].or(folded[index]));
+        Self {
+            traceparent,
+            tracestate,
+            b3,
+            x_b3_traceid,
+            x_b3_spanid,
+            x_b3_flags,
+            x_b3_sampled,
+            content_type,
+        }
     }
 
-    header_value(headers, "x-b3-traceid")
-        .and_then(normalize_b3_trace_id)
-        .is_some()
-        && header_value(headers, "x-b3-spanid")
-            .and_then(normalize_b3_span_id)
+    fn has_valid_traceparent(&self) -> bool {
+        self.traceparent
+            .and_then(OtelTracing::parse_traceparent)
             .is_some()
+    }
+
+    fn b3_sampling_decision(&self) -> Option<bool> {
+        if let Some(value) = self.b3 {
+            return b3_single_sampling_decision(value);
+        }
+        if let Some(flags) = self.x_b3_flags
+            && flags.trim() == "1"
+        {
+            return Some(true);
+        }
+        self.x_b3_sampled.and_then(|value| match value.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            value if value.eq_ignore_ascii_case("true") => Some(true),
+            value if value.eq_ignore_ascii_case("false") => Some(false),
+            _ => None,
+        })
+    }
+
+    fn has_b3_trace_context(&self) -> bool {
+        if let Some(value) = self.b3 {
+            return parse_b3_single_trace_context(value).is_some();
+        }
+
+        self.x_b3_traceid.and_then(normalize_b3_trace_id).is_some()
+            && self.x_b3_spanid.and_then(normalize_b3_span_id).is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2732,23 +2920,21 @@ fn b3_sampling_state(value: &str) -> Option<bool> {
 
 fn import_b3_trace_metadata<MS: std::hash::BuildHasher>(
     metadata: &mut HashMap<String, String, MS>,
-    headers: &HashMap<String, String>,
+    probe: &TraceHeaderProbe<'_>,
 ) {
     if metadata.contains_key(TRACEPARENT_HEADER) {
         return;
     }
-    if let Some(value) = header_value(headers, "b3") {
+    if let Some(value) = probe.b3 {
         if let Some(context) = parse_b3_single_trace_context(value) {
             import_b3_trace_context(metadata, context.trace_id, context.span_id);
         }
         return;
     }
-    let Some(trace_id) = header_value(headers, "x-b3-traceid").and_then(normalize_b3_trace_id)
-    else {
+    let Some(trace_id) = probe.x_b3_traceid.and_then(normalize_b3_trace_id) else {
         return;
     };
-    let Some(parent_span_id) = header_value(headers, "x-b3-spanid").and_then(normalize_b3_span_id)
-    else {
+    let Some(parent_span_id) = probe.x_b3_spanid.and_then(normalize_b3_span_id) else {
         return;
     };
 
@@ -2857,9 +3043,7 @@ fn set_header_case_insensitive(headers: &mut HashMap<String, String>, name: &str
 }
 
 fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
-    header_value(headers, TRACEPARENT_HEADER)
-        .and_then(OtelTracing::parse_traceparent)
-        .is_some()
+    TraceHeaderProbe::scan(headers).has_valid_traceparent()
 }
 
 /// Insert `key -> value` only when the current value differs.
@@ -2880,6 +3064,118 @@ fn insert_metadata_if_changed<MS: std::hash::BuildHasher>(
         _ => {
             metadata.insert(key.to_string(), value.to_string());
         }
+    }
+}
+
+/// Writes one stamp's `mesh.source.*` / `mesh.destination.*` labels.
+///
+/// `metadata` is the request's string projection, present unless the
+/// request's plugin view deferred it; every write there is exactly the
+/// historical `insert_metadata_if_changed` / clear sequence. `shadow` is the
+/// request's typed copy, which receives the same value as a shared `Arc` and
+/// skips a write whose value is unchanged (issue #6793).
+struct LabelWriter<'a, MS: std::hash::BuildHasher> {
+    metadata: Option<&'a mut HashMap<String, String, MS>>,
+    shadow: &'a mut MeshLabelShadow,
+}
+
+impl<MS: std::hash::BuildHasher> LabelWriter<'_, MS> {
+    fn set(&mut self, label: MeshLabel, value: &Arc<str>) {
+        if let Some(metadata) = self.metadata.as_deref_mut() {
+            insert_metadata_if_changed(metadata, label.key(), value);
+        }
+        self.shadow.set_arc(label, value);
+    }
+
+    fn set_str(&mut self, label: MeshLabel, value: &str) {
+        if let Some(metadata) = self.metadata.as_deref_mut() {
+            insert_metadata_if_changed(metadata, label.key(), value);
+        }
+        self.shadow.set_str(label, value);
+    }
+
+    /// Rebuild the SPIFFE-derived source labels as one atomic view.
+    ///
+    /// The metadata half keeps its historical decision on `identity` exactly
+    /// (clear unless the stamped labels already equal its projection); the
+    /// shadow half decides on `labels`. Both then hold exactly `labels`'
+    /// projection.
+    fn source_spiffe(&mut self, identity: Option<&SpiffeId>, labels: Option<&SpiffeLabels>) {
+        if let Some(metadata) = self.metadata.as_deref_mut()
+            && !source_spiffe_labels_match(metadata, identity)
+        {
+            clear_source_spiffe_labels(metadata);
+        }
+        if !self.shadow.source_spiffe_matches(labels) {
+            for label in [
+                MeshLabel::SourcePrincipal,
+                MeshLabel::SourceTrustDomain,
+                MeshLabel::SourceNamespace,
+                MeshLabel::SourceServiceAccount,
+            ] {
+                self.shadow.remove(label);
+            }
+        }
+        if let Some(labels) = labels {
+            self.set(MeshLabel::SourcePrincipal, labels.principal());
+            self.set(MeshLabel::SourceTrustDomain, labels.trust_domain());
+            if let Some(namespace) = labels.namespace() {
+                self.set(MeshLabel::SourceNamespace, namespace);
+            }
+            if let Some(service_account) = labels.service_account() {
+                self.set(MeshLabel::SourceServiceAccount, service_account);
+            }
+        }
+    }
+
+    /// A remote source's workload, app and service: its service account, or
+    /// `unknown` without a source identity.
+    fn remote_source_workload(&mut self, remote: Option<&RemoteSourceFacts>) {
+        let workload = remote.map_or_else(
+            || crate::plugins::mesh::telemetry_facts::unknown_label(),
+            RemoteSourceFacts::workload,
+        );
+        self.set(MeshLabel::SourceWorkload, workload);
+        self.set(MeshLabel::SourceApp, workload);
+        self.set(MeshLabel::SourceService, workload);
+    }
+
+    /// The local workload as the source: its configured namespace (over any
+    /// SPIFFE namespace) and its workload, app and service labels.
+    fn local_source_workload(&mut self, local: &LocalWorkloadFacts) {
+        if let Some(namespace) = local.namespace() {
+            self.set(MeshLabel::SourceNamespace, namespace);
+        }
+        self.set(MeshLabel::SourceWorkload, local.workload());
+        self.set(MeshLabel::SourceApp, local.app());
+        self.set(MeshLabel::SourceService, local.service());
+    }
+
+    /// The local workload as the destination of inbound traffic: its SPIFFE
+    /// principal and namespace, then its configured namespace, then its
+    /// workload, app and service labels. Destination labels are never cleared.
+    fn local_destination(&mut self, local: &LocalWorkloadFacts) {
+        if let Some(spiffe) = local.spiffe() {
+            self.set(MeshLabel::DestinationPrincipal, spiffe.principal());
+            if let Some(namespace) = spiffe.namespace() {
+                self.set(MeshLabel::DestinationNamespace, namespace);
+            }
+        }
+        if let Some(namespace) = local.namespace() {
+            self.set(MeshLabel::DestinationNamespace, namespace);
+        }
+        self.set(MeshLabel::DestinationWorkload, local.workload());
+        self.set(MeshLabel::DestinationApp, local.app());
+        self.set(MeshLabel::DestinationService, local.service());
+    }
+
+    /// A matched route as the destination of outbound traffic: its namespace
+    /// and its name (or id) for workload, app and service.
+    fn route_destination(&mut self, namespace: &str, destination: &str) {
+        self.set_str(MeshLabel::DestinationNamespace, namespace);
+        self.set_str(MeshLabel::DestinationWorkload, destination);
+        self.set_str(MeshLabel::DestinationApp, destination);
+        self.set_str(MeshLabel::DestinationService, destination);
     }
 }
 

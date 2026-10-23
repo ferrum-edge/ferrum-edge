@@ -19,6 +19,9 @@ use crate::modes::mesh::metric_tag_cel::{
 };
 use crate::plugins::StreamConnectionContext;
 use crate::plugins::TransactionSummary;
+use crate::plugins::mesh::telemetry_facts::{
+    MeshLabel, MeshLabelShadow, UNKNOWN_LABEL, static_label, unknown_label,
+};
 use crate::plugins::prometheus_metrics::{HistogramBuckets, escape_label_value};
 use crate::tls::backend::{BackendTlsRefusalSurface, backend_tls_refusal_count};
 
@@ -2058,6 +2061,99 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
         connection_security_policy,
         removed_labels: 0,
     })
+}
+
+/// [`mesh_request_key`] for a request whose context carries the typed mesh
+/// label projection (issue #6793).
+///
+/// The labels come from the request's [`MeshLabelShadow`] as shared
+/// `Arc<str>` values: no per-label metadata parse and no intern-table lookup.
+/// The shadow is authoritative when the request's plugin view deferred the
+/// string projection, because then nothing else can have written the label
+/// keys. On an eager request it is used only after
+/// [`MeshLabelShadow::metric_key_labels_match`] proves the summary metadata
+/// still holds exactly its values; a label another plugin rewrote, added or
+/// removed sends the summary through the string parser, which reports it
+/// exactly as before. Protocol, response flags and security policy are always
+/// read from the summary metadata, which every request still carries.
+pub fn mesh_request_key_for_request(
+    summary: &TransactionSummary,
+    ctx: &crate::plugins::RequestContext,
+) -> Option<MeshRequestKey> {
+    let Some(shadow) = ctx.mesh_label_shadow() else {
+        return mesh_request_key(summary);
+    };
+    if !ctx.mesh_label_projection_deferred() && !shadow.metric_key_labels_match(&summary.metadata) {
+        return mesh_request_key(summary);
+    }
+    Some(mesh_request_key_from_shadow(summary, shadow))
+}
+
+/// Build the key [`mesh_request_key`] would parse from metadata holding
+/// `shadow`'s label projection, applying the parser's own defaults to every
+/// absent label.
+fn mesh_request_key_from_shadow(
+    summary: &TransactionSummary,
+    shadow: &MeshLabelShadow,
+) -> MeshRequestKey {
+    let label_or =
+        |label: MeshLabel, default: &Arc<str>| Arc::clone(shadow.get_arc(label).unwrap_or(default));
+    let unknown = unknown_label();
+    let source_workload = label_or(MeshLabel::SourceWorkload, unknown);
+    let destination_workload = match shadow.get_arc(MeshLabel::DestinationWorkload) {
+        Some(workload) => Arc::clone(workload),
+        None => Arc::from(
+            summary
+                .proxy_name
+                .as_deref()
+                .or(summary.proxy_id.as_deref())
+                .unwrap_or(UNKNOWN_LABEL),
+        ),
+    };
+    MeshRequestKey {
+        source_namespace: label_or(MeshLabel::SourceNamespace, unknown),
+        source_principal: label_or(MeshLabel::SourcePrincipal, unknown),
+        source_app: label_or(MeshLabel::SourceApp, &source_workload),
+        source_service: label_or(MeshLabel::SourceService, &source_workload),
+        source_workload,
+        destination_namespace: label_or(MeshLabel::DestinationNamespace, unknown),
+        destination_principal: label_or(MeshLabel::DestinationPrincipal, unknown),
+        destination_app: label_or(MeshLabel::DestinationApp, &destination_workload),
+        destination_service: label_or(MeshLabel::DestinationService, &destination_workload),
+        destination_workload,
+        request_protocol: shared_label(
+            ["mesh.request_protocol", "request_protocol"]
+                .iter()
+                .find_map(|key| summary.metadata.get(*key).map(String::as_str))
+                .unwrap_or("http"),
+        ),
+        response_code: summary.response_status_code,
+        response_code_override: None,
+        response_flags: shared_label(
+            summary
+                .metadata
+                .get("mesh.response_flags")
+                .map(String::as_str)
+                .unwrap_or_else(|| inferred_response_flags(summary)),
+        ),
+        connection_security_policy: shared_label(
+            summary
+                .metadata
+                .get("mesh.connection_security_policy")
+                .map(String::as_str)
+                .unwrap_or("none"),
+        ),
+        removed_labels: 0,
+    }
+}
+
+/// A shared label value: the static `Arc` for a value the gateway itself
+/// stamps, otherwise the interned one.
+fn shared_label(value: &str) -> Arc<str> {
+    match static_label(value) {
+        Some(label) => Arc::clone(label),
+        None => intern_label(value),
+    }
 }
 
 pub(crate) fn mesh_metric_disabled(summary: &TransactionSummary, family: MeshMetricFamily) -> bool {
