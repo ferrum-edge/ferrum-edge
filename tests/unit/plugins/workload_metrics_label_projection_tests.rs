@@ -683,7 +683,14 @@ fn only_audited_sources_name_the_mesh_label_keys() {
                 .map_or(source.as_str(), |index| &source[..index]);
             let names_keys =
                 production.contains("\"mesh.source.") || production.contains("\"mesh.destination.");
-            let uses_typed = ["MeshLabel::", "MeshLabelShadow", "mesh_label_shadow"]
+            // `.mesh_labels` catches a reader of the crate-private field that
+            // names no typed item, e.g. one that iterates `projection()`.
+            let uses_typed = [
+                "MeshLabel::",
+                "MeshLabelShadow",
+                "mesh_label_shadow",
+                ".mesh_labels",
+            ]
                 .iter()
                 .any(|needle| production.contains(needle));
             if !names_keys && !uses_typed {

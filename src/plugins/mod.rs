@@ -3613,8 +3613,9 @@ pub struct RequestContext {
     /// Typed copy of the `mesh.source.*` / `mesh.destination.*` label
     /// projection that `workload_metrics` and the gateway's mesh dispatch
     /// overlay produced for this request (issue #6793). Allocated by the first
-    /// stamp. Private, so no plugin can author it; metric emission builds its
-    /// key from it.
+    /// stamp or dispatch overlay, so its presence does not mean a stamp ran.
+    /// Private, so no plugin can author it; metric emission builds its key from
+    /// it.
     pub(crate) mesh_labels: Option<Box<crate::plugins::mesh::telemetry_facts::MeshLabelShadow>>,
     /// Whether `workload_metrics` may leave the label keys out of `metadata`
     /// for this request. Set by the dispatcher from the request's plugin view
@@ -4141,8 +4142,9 @@ impl RequestContext {
     }
 
     /// The typed mesh label projection for this request (issue #6793), once a
-    /// `workload_metrics` stamp has run. Read-only observability state; public
-    /// only for external contract tests.
+    /// `workload_metrics` stamp or the gateway's mesh dispatch overlay has
+    /// written it. Read-only observability state; public only for external
+    /// contract tests.
     #[doc(hidden)]
     pub fn mesh_label_shadow(
         &self,
