@@ -611,9 +611,10 @@ async fn start_mesh_mtls_stalling_http_server(
     (addr, reset_rx)
 }
 
-/// A real SVID-mTLS HTTP/2 Sidecar peer that accepts ONE request and resets
-/// its upload itself with `RST_STREAM(CANCEL)` shortly after it starts, while
-/// the upload is still parked on the peer's closed stream window.
+/// A real SVID-mTLS HTTP/2 Sidecar peer that accepts ONE request, consumes the
+/// upload's first stream window without releasing any capacity, so the
+/// gateway's pipe is parked on the closed window, and then resets the upload
+/// itself with `RST_STREAM(CANCEL)`.
 async fn start_mesh_mtls_resetting_http_server(server_slot: SharedSvidBundle) -> SocketAddr {
     let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -628,6 +629,7 @@ async fn start_mesh_mtls_resetting_http_server(server_slot: SharedSvidBundle) ->
         let tls = acceptor.accept(tcp).await.expect("accept spiffe tls");
         let mut h2 = h2::server::handshake(tls).await.expect("h2 server");
         let (request, mut respond) = h2.accept().await.expect("http stream").expect("stream ok");
+        let mut body = request.into_body();
         let driver = tokio::spawn(async move {
             while let Some(next) = h2.accept().await {
                 if next.is_err() {
@@ -635,13 +637,24 @@ async fn start_mesh_mtls_resetting_http_server(server_slot: SharedSvidBundle) ->
                 }
             }
         });
-        // Let the first window's worth arrive so the gateway's pipe is parked
-        // on capacity, then reset well inside the gateway's write bound.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Observe the whole default 64 KiB stream window arrive without
+        // releasing it: the gateway can send no more, so its pipe is parked on
+        // capacity when the reset lands. The bound only keeps a misbehaving
+        // run from hanging here; the reset is correct either way.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut received = 0usize;
+            while received < 65_535 {
+                match body.data().await {
+                    Some(Ok(chunk)) => received += chunk.len(),
+                    _ => break,
+                }
+            }
+        })
+        .await;
         respond.send_reset(h2::Reason::CANCEL);
         // Hold the request body and connection until the gateway has answered.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        drop(request);
+        drop(body);
         driver.abort();
     });
 
@@ -1974,9 +1987,10 @@ async fn http_mesh_mtls_upload_the_peer_stops_reading_ends_at_the_write_watermar
 
 /// The converse of the write-watermark test: `Http2BodyWriteTimeout` reports
 /// expiry only when hyper's own write-stall timer reset the stream. A peer
-/// that resets the upload itself, well inside `backend_write_timeout_ms`, is a
-/// backend failure, never the gateway's write-watermark `504` /
-/// `backend_timeout`.
+/// that resets the upload itself while the pipe is parked on its closed window
+/// is a backend failure, never the gateway's write-watermark `504` /
+/// `backend_timeout`. The write bound is set well past the test's own wait, so
+/// the bound cannot be what ends the request.
 #[tokio::test]
 async fn http_mesh_mtls_peer_reset_of_the_upload_is_not_a_write_timeout() {
     let files = mesh_identities_on_disk();
@@ -1996,8 +2010,8 @@ async fn http_mesh_mtls_peer_reset_of_the_upload_is_not_a_write_timeout() {
             "backend_host": "127.0.0.1",
             "backend_port": APP_PORT,
             "upstream_id": "orders-mesh",
-            "backend_write_timeout_ms": 2_000,
-            "backend_read_timeout_ms": 20_000
+            "backend_write_timeout_ms": 60_000,
+            "backend_read_timeout_ms": 120_000
         }],
         "upstreams": [{
             "id": "orders-mesh",
@@ -2048,20 +2062,15 @@ async fn http_mesh_mtls_peer_reset_of_the_upload_is_not_a_write_timeout() {
         .body(Full::new(Bytes::from(vec![b'x'; 1024 * 1024])))
         .expect("client request");
 
-    let started = std::time::Instant::now();
+    // Far below the 60 s write bound: only the peer's reset can end it in time.
     let response = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(20),
         sender.send_request(request),
     )
     .await
-    .expect("the peer's reset must end the request")
+    .expect("the peer's reset, not the 60 s write bound, must end the request")
     .expect("gateway response");
-    let elapsed = started.elapsed();
 
-    assert!(
-        elapsed < std::time::Duration::from_millis(1_500),
-        "the peer reset, not the 2 s write bound, must end the request; took {elapsed:?}"
-    );
     assert_ne!(
         response.status(),
         StatusCode::GATEWAY_TIMEOUT,
