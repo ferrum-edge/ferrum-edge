@@ -96,6 +96,17 @@ fn has_backend_error_signal(logs: &str) -> bool {
         || logs.contains(REJECTION_PHASE_FIELD_ESCAPED)
 }
 
+/// The pre-header backend-failure signals alone: the ERROR log and the
+/// `grpc_backend_error` rejection phase. Unlike [`has_backend_error_signal`]
+/// it does not accept any `body_error_class`, so a test that must see a
+/// post-header failure classified as a specific class can still accept the
+/// pre-header outcome without accepting a wrong class.
+fn has_pre_header_backend_failure_signal(logs: &str) -> bool {
+    logs.contains(BACKEND_ERROR_LOG)
+        || logs.contains(REJECTION_PHASE_FIELD)
+        || logs.contains(REJECTION_PHASE_FIELD_ESCAPED)
+}
+
 /// Poll the captured output until a backend-error signal appears, then
 /// return the full snapshot. Polling is necessary because the
 /// `stdout_logging` access-log routes through Ferrum's bounded
@@ -734,7 +745,7 @@ async fn h2_backend_cancel_mid_response_is_logged_as_protocol_error() {
     let body_protocol_error = logs.contains("\\\"body_error_class\\\":\\\"protocol_error\\\"")
         || logs.contains("\"body_error_class\":\"protocol_error\"");
     assert!(
-        body_protocol_error || has_backend_error_signal(&logs),
+        body_protocol_error || has_pre_header_backend_failure_signal(&logs),
         "backend CANCEL must be recorded as a backend failure; logs:\n{logs}"
     );
 }

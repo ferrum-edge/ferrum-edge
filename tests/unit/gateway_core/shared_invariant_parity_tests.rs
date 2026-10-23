@@ -3383,11 +3383,14 @@ fn every_functional_gateway_spawner_launches_the_harness_selected_binary() {
 // before the capture dispatch is built. Every capture install in the unit and
 // integration suites must be preceded by one inside the same function.
 
-const TRACING_CAPTURE_INSTALL_TOKENS: [&str; 4] = [
+const TRACING_CAPTURE_INSTALL_TOKENS: [&str; 5] = [
     "subscriber::set_default(",
     "subscriber::with_default(",
     "dispatcher::with_default(",
     "tracing::Dispatch::new(",
+    // `WithSubscriber::with_subscriber` sets the dispatch as the polling
+    // thread's default on every poll of the wrapped future.
+    ".with_subscriber(",
 ];
 
 /// Installs that are not captures: a `NoSubscriber` silences a callsite and

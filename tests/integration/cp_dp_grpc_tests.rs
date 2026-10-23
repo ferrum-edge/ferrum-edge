@@ -8392,6 +8392,7 @@ mod configsync_size_bounds {
         let dp_connection = connection.clone();
         // Capture the DP's own ConfigSync decisions so a failed wait can say
         // whether an update arrived, was refused, or ended the stream.
+        crate::diagnostic_test_interest::ensure_interest_floor();
         let logs = CapturedLogs::default();
         let dp_subscriber = logs.subscriber();
         let mut dp_task = tokio::spawn(
