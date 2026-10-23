@@ -70,7 +70,7 @@ fn make_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -121,7 +121,7 @@ fn make_stream_summary(metadata: HashMap<String, String>) -> StreamTransactionSu
         timestamp_connected: "2026-03-23T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-23T12:00:00.042Z".to_string(),
         sni_hostname: None,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     }
 }
 
@@ -211,7 +211,7 @@ fn make_rich_summary(metadata: HashMap<String, String>) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -699,7 +699,7 @@ async fn test_workload_metrics_exporters_preserve_composed_custom_tags() {
     for plugin in &plugins {
         plugin.before_proxy(&mut ctx, &mut headers).await;
     }
-    let summary = make_summary(ctx.metadata);
+    let summary = make_summary(ctx.metadata.into_iter().collect());
     for plugin in &plugins {
         plugin.log(&summary).await;
     }
@@ -1548,7 +1548,7 @@ async fn test_otel_tracing_parent_not_sampled_skips_export() {
         Some("false")
     );
 
-    let mut summary = make_summary(ctx.metadata.clone());
+    let mut summary = make_summary(ctx.metadata.clone().into_iter().collect());
     summary.proxy_name = Some("api".to_string());
     plugin.log(&summary).await;
     assert_no_requests(&mock_server).await;
@@ -1735,7 +1735,7 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
         consumer_username: None,
         auth_method: None,
         connection_id: 0,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     };
     plugin.on_ws_disconnect(&ctx).await;
 
@@ -1826,7 +1826,7 @@ async fn test_otel_tracing_ws_disconnect_distinguishes_client_and_backend_failur
             consumer_username: None,
             auth_method: None,
             connection_id: 0,
-            metadata: make_trace_metadata(),
+            metadata: make_trace_metadata().into_iter().collect(),
         };
         plugin.on_ws_disconnect(&ctx).await;
 

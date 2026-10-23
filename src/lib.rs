@@ -1573,7 +1573,7 @@ pub mod _test_support {
 
     pub fn udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
         ctx: &mut crate::plugins::StreamConnectionContext,
-        datagram_metadata: HashMap<String, String>,
+        datagram_metadata: crate::plugins::MetadataMap,
     ) -> (HashMap<String, String>, HashMap<String, String>) {
         let (connect_metadata, correlation_ids) = ctx.take_metadata_with_correlation_ids();
 
@@ -1596,7 +1596,10 @@ pub mod _test_support {
             &correlation_ids,
         );
 
-        (udp_metadata, dtls_metadata)
+        (
+            udp_metadata.into_iter().collect(),
+            dtls_metadata.into_iter().collect(),
+        )
     }
 
     /// Signal a UDP reply task to stop using the production flag+`notify_one`
@@ -8317,7 +8320,7 @@ pub mod _test_support {
     /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
     /// the sort is stable, so repeated values of one name keep wire order.
     pub fn staged_grpc_web_request_trailers(
-        metadata: &HashMap<String, String>,
+        metadata: &crate::plugins::MetadataMap,
     ) -> Option<Vec<(String, String)>> {
         crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
             let mut entries: Vec<(String, String)> = map
@@ -8817,7 +8820,7 @@ pub mod _test_support {
     pub fn clone_log_metadata_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> HashMap<String, String> {
-        crate::proxy::clone_log_metadata(ctx)
+        crate::proxy::clone_log_metadata(ctx).into_iter().collect()
     }
 
     /// The stamped `Content-Length` a LATER buffered body transform will read
@@ -8892,8 +8895,8 @@ pub mod _test_support {
     /// Drive the transaction-metadata status refresh the buffered gRPC paths run
     /// after trailer reconciliation, including the body-framed gRPC-Web case
     /// where the terminal status is deliberately absent from both maps.
-    pub fn refresh_grpc_status_metadata_for_test(
-        metadata: &mut HashMap<String, String>,
+    pub fn refresh_grpc_status_metadata_for_test<MS: std::hash::BuildHasher>(
+        metadata: &mut std::collections::HashMap<String, String, MS>,
         trailers: &HashMap<String, String>,
         headers: &HashMap<String, String>,
         terminal_metadata_is_body_framed: bool,
@@ -10199,8 +10202,8 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::tcp_fault_admission_should_cancel(&readiness, &socket_error)
     }
 
-    pub fn insert_grpc_error_metadata(
-        metadata: &mut HashMap<String, String>,
+    pub fn insert_grpc_error_metadata<MS: std::hash::BuildHasher>(
+        metadata: &mut std::collections::HashMap<String, String, MS>,
         grpc_status: u32,
         grpc_message: &str,
     ) {
@@ -10208,7 +10211,7 @@ pub mod _test_support {
     }
 
     pub fn clone_log_metadata(ctx: &crate::plugins::RequestContext) -> HashMap<String, String> {
-        crate::proxy::clone_log_metadata(ctx)
+        crate::proxy::clone_log_metadata(ctx).into_iter().collect()
     }
 
     /// Whether this request has materialized the boxed per-plugin working state
@@ -10323,7 +10326,7 @@ pub mod _test_support {
         backend_target: String,
         listen_port: u16,
         consumer_username: Option<String>,
-        metadata: HashMap<String, String>,
+        metadata: crate::plugins::MetadataMap,
         session_start: chrono::DateTime<chrono::Utc>,
     ) -> crate::proxy::WsSessionMeta {
         crate::proxy::WsSessionMeta {
@@ -10355,7 +10358,7 @@ pub mod _test_support {
         backend_target: String,
         listen_port: u16,
         consumer_username: Option<String>,
-        metadata: HashMap<String, String>,
+        metadata: crate::plugins::MetadataMap,
         session_start: chrono::DateTime<chrono::Utc>,
         session_start_mono: std::time::Instant,
     ) -> crate::proxy::WsSessionMeta {
@@ -11257,7 +11260,7 @@ pub mod _test_support {
         /// The session metadata map `handle_dtls_client` drains into
         /// `DtlsHandlerResult::metadata`, which the accept loop merges into the
         /// `StreamTransactionSummary` and delivers to `on_stream_disconnect`.
-        pub metadata: HashMap<String, String>,
+        pub metadata: crate::plugins::MetadataMap,
         /// `Display` of the returned typed error.
         pub error: String,
         /// The typed setup kind, when the error carries one.
@@ -11271,7 +11274,7 @@ pub mod _test_support {
     fn classify_dtls_session_failure_for_test(
         error: &anyhow::Error,
         probe_releases: usize,
-        metadata: HashMap<String, String>,
+        metadata: crate::plugins::MetadataMap,
     ) -> DtlsAuthorizationExpiryForTest {
         let error_class = crate::proxy::udp_proxy::dtls_error_class(error);
         DtlsAuthorizationExpiryForTest {
@@ -11306,7 +11309,7 @@ pub mod _test_support {
         F: std::future::Future,
     {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         let releases = std::sync::atomic::AtomicUsize::new(0);
         let unarmed = crate::proxy::udp_proxy::DtlsClientTrustFence::unarmed();
         let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
@@ -11379,7 +11382,11 @@ pub mod _test_support {
         #[must_use]
         pub fn settle_withdrawal(&self) -> DtlsAuthorizationExpiryForTest {
             let error = self.0.settle_withdrawal();
-            classify_dtls_session_failure_for_test(&error, 0, HashMap::new())
+            classify_dtls_session_failure_for_test(
+                &error,
+                0,
+                crate::plugins::MetadataMap::default(),
+            )
         }
     }
 
@@ -11438,7 +11445,7 @@ pub mod _test_support {
         F: std::future::Future,
     {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         let releases = std::sync::atomic::AtomicUsize::new(0);
         let outcome = crate::proxy::udp_proxy::dtls_setup_stage_under_bounds(
             plan,
@@ -11483,7 +11490,7 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         crate::proxy::udp_proxy::dtls_c2b_under_bounds(plan, latch, &metadata, &trust.0, stage)
             .await
             .map_err(|interrupt| match interrupt {
@@ -11554,7 +11561,7 @@ pub mod _test_support {
     pub fn settle_dtls_relay_authorization_expiry_for_test(
         termination: crate::proxy::auth_lifetime::StreamAuthTermination,
         latch: &crate::proxy::auth_lifetime::StreamAuthTerminationLatch,
-        session_metadata: &std::sync::Mutex<HashMap<String, String>>,
+        session_metadata: &std::sync::Mutex<crate::plugins::MetadataMap>,
     ) -> DtlsAuthorizationExpiryForTest {
         crate::proxy::udp_proxy::settle_dtls_auth_expiry(termination, latch, session_metadata);
         let error: anyhow::Error = crate::proxy::udp_proxy::DtlsAuthorizationExpired.into();
@@ -11604,7 +11611,7 @@ pub mod _test_support {
         F: std::future::Future,
     {
         let latch = crate::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-        let metadata = std::sync::Mutex::new(HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         let releases = std::sync::atomic::AtomicUsize::new(0);
         let outcome = crate::proxy::udp_proxy::stream_udp_setup_stage_under_authorization(
             plan,
@@ -11750,7 +11757,7 @@ pub mod _test_support {
     where
         F: std::future::Future,
     {
-        let metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+        let metadata = std::sync::Mutex::new(crate::plugins::MetadataMap::default());
         crate::proxy::udp_proxy::dtls_c2b_until_expiry(plan, latch, &metadata, stage).await
     }
 
@@ -11857,7 +11864,7 @@ pub mod _test_support {
         pub body: Vec<u8>,
         /// Exactly what `TransactionSummary::metadata` receives, including the
         /// bounded `authorization.termination_reason` the gate latched.
-        pub log_metadata: HashMap<String, String>,
+        pub log_metadata: crate::plugins::MetadataMap,
     }
 
     /// Apply the AUTHORITATIVE pre-commitment authorization gate the buffered
@@ -14460,11 +14467,11 @@ pub mod _test_support {
 
     /// Record a pass-through body's terminal status into `metadata` exactly as
     /// the buffered response paths do.
-    pub fn record_grpc_web_passthrough_status_for_test(
+    pub fn record_grpc_web_passthrough_status_for_test<MS: std::hash::BuildHasher>(
         ctx: &crate::plugins::RequestContext,
         response_headers: &HashMap<String, String>,
         body: &[u8],
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut std::collections::HashMap<String, String, MS>,
     ) {
         if let Some(passthrough) =
             crate::plugins::grpc_web::passthrough_body_trailer_status(ctx, response_headers, body)
@@ -15211,8 +15218,8 @@ pub mod _test_support {
     /// Record a buffered native-gRPC terminal's header status into transaction
     /// metadata, exactly as the generic dispatch handler does before it builds
     /// the terminal summary (issue #6776).
-    pub fn record_buffered_native_grpc_header_status_for_test(
-        metadata: &mut std::collections::HashMap<String, String>,
+    pub fn record_buffered_native_grpc_header_status_for_test<MS: std::hash::BuildHasher>(
+        metadata: &mut std::collections::HashMap<String, String, MS>,
         native_grpc_request: bool,
         response_is_buffered: bool,
         response_headers: &std::collections::HashMap<String, String>,

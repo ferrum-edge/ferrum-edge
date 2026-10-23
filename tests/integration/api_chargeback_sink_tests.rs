@@ -60,7 +60,7 @@ fn per_event_summary(request_id: &str) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -250,7 +250,7 @@ async fn clickhouse_insert_round_trip_when_configured() {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     };

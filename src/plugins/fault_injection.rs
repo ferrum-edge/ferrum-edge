@@ -115,7 +115,10 @@ pub(crate) enum FaultDelayDisposition {
 
 /// Record a non-completing delay outcome. Values are compiled-in labels from a
 /// closed enum, never request-, peer-, or credential-derived.
-fn record_delay_outcome(metadata: &mut HashMap<String, String>, outcome: FaultDelayOutcome) {
+fn record_delay_outcome<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    outcome: FaultDelayOutcome,
+) {
     let key = FAULT_DELAY_OUTCOME_METADATA_KEY.to_string();
     let label = outcome.metadata_label().to_string();
     metadata.insert(key, label);

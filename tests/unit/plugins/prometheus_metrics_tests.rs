@@ -72,7 +72,7 @@ fn make_summary(
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -102,7 +102,7 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -168,7 +168,7 @@ fn make_ws_summary(proxy_id: &str) -> WsDisconnectContext {
         consumer_username: None,
         auth_method: None,
         connection_id: 0,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -479,7 +479,7 @@ async fn test_registry_ignores_mirror_summary() {
 async fn test_registry_renders_mesh_red_metrics_when_metadata_present() {
     let registry = MetricsRegistry::new();
     let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
-    summary.metadata = HashMap::from([
+    summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.source.workload".to_string(), "frontend".to_string()),
         ("mesh.source.namespace".to_string(), "default".to_string()),
         (
@@ -546,7 +546,7 @@ async fn test_registry_distinguishes_mesh_identity_from_prometheus_observation_m
     );
 
     let mut mesh_summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
-    mesh_summary.metadata = HashMap::from([
+    mesh_summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.source.workload".to_string(), "frontend".to_string()),
         ("mesh.source.namespace".to_string(), "default".to_string()),
         (
@@ -1954,7 +1954,7 @@ fn test_mesh_metrics_use_distinct_gateway_namespace_label() {
     let registry = MetricsRegistry::new();
     registry.configure(5, 3600, 0, 10_000, "staging");
     let mut summary = make_summary("mesh-namespace", "GET", 200, 10.0, 5.0);
-    summary.metadata = HashMap::from([
+    summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.source.workload".to_string(), "frontend".to_string()),
         (
             "mesh.source.namespace".to_string(),
@@ -2171,7 +2171,7 @@ async fn test_namespace_label_with_stream_metrics() {
         timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
     registry.record_stream(&summary);
 
@@ -2192,7 +2192,7 @@ async fn test_namespace_label_with_stream_metrics() {
 fn test_mesh_request_key_interns_repeated_label_values() {
     fn mesh_summary() -> TransactionSummary {
         let mut summary = make_summary("payments-proxy", "GET", 200, 42.0, 35.0);
-        summary.metadata = HashMap::from([
+        summary.metadata = ferrum_edge::plugins::MetadataMap::from_iter([
             ("mesh.source.workload".to_string(), "frontend".to_string()),
             ("mesh.source.namespace".to_string(), "default".to_string()),
             (
@@ -2448,7 +2448,7 @@ fn spoofed_backend_custom_and_malformed_ai_metadata_cannot_export_usage() {
     ];
     for (index, metadata) in cases.into_iter().enumerate() {
         let mut summary = make_summary(&format!("malformed-{index}"), "POST", 200, 1.0, 1.0);
-        summary.metadata = metadata;
+        summary.metadata = metadata.into_iter().collect();
         registry.record(&summary);
     }
     let output = registry.render_uncached();
@@ -2475,7 +2475,7 @@ fn ai_usage_recording_is_concurrent_reload_safe_and_invalidates_render_cache() {
             scope.spawn(move || {
                 for _ in 0..100 {
                     let mut summary = make_summary("concurrent-ai", "POST", 200, 1.0, 1.0);
-                    summary.metadata = metadata.clone();
+                    summary.metadata = metadata.clone().into_iter().collect();
                     summary.ai_usage_export = Some(AiUsageExport {
                         prefix: Arc::from("ai"),
                         provider: "anthropic",

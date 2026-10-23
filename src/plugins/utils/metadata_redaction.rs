@@ -1612,7 +1612,9 @@ pub fn is_grpc_web_request_trailers_metadata_key(key: &str) -> bool {
 /// the legacy names into the public metadata map. Mesh metrics coordination keys
 /// are intentionally retained here so built-in observers can consume disable and
 /// tag-override plans before external serialization omits them.
-pub fn strip_dedup_internal_metadata(metadata: &mut HashMap<String, String>) {
+pub fn strip_dedup_internal_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     metadata.retain(|key, _| !is_dedup_internal_metadata_key(key));
 }
 
@@ -1688,8 +1690,8 @@ pub(crate) fn is_operator_sensitive_metadata_key(key: &str) -> bool {
 /// The serialized order is the natural HashMap iteration order — same as the
 /// default `Serialize` impl for `HashMap`. Logs are not sorted by key today,
 /// so this preserves existing dashboard semantics.
-pub fn serialize_redacted_metadata<S>(
-    metadata: &HashMap<String, String>,
+pub fn serialize_redacted_metadata<MS: std::hash::BuildHasher, S>(
+    metadata: &HashMap<String, String, MS>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
@@ -1701,9 +1703,11 @@ where
 /// Serializable borrowed view used by manual summary serializers and schema
 /// views. Keeping this wrapper here preserves one redaction implementation for
 /// every transaction-log sink.
-pub struct RedactedMetadata<'a>(pub &'a HashMap<String, String>);
+pub struct RedactedMetadata<'a, MS = std::collections::hash_map::RandomState>(
+    pub &'a HashMap<String, String, MS>,
+);
 
-impl Serialize for RedactedMetadata<'_> {
+impl<MS: std::hash::BuildHasher> Serialize for RedactedMetadata<'_, MS> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,

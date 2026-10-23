@@ -28,7 +28,6 @@ use ferrum_edge::plugins::{
     validate_plugin_config, ws_logging::WsLogging,
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1396,7 +1395,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         error_class: None,
         consumer_username: Some("alice".to_string()),
         auth_method: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         proxy_lifecycle_generation: None,
     }
 }

@@ -1309,7 +1309,10 @@ impl AiRateLimiter {
         }
     }
 
-    fn read_tokens_from_metadata(&self, metadata: &HashMap<String, String>) -> Option<u64> {
+    fn read_tokens_from_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> Option<u64> {
         let key = match self.count_mode.as_str() {
             "prompt_tokens" => "ai_prompt_tokens",
             "completion_tokens" => "ai_completion_tokens",

@@ -261,8 +261,8 @@ struct LogState {
 /// The gRPC terminal-status classification a deferred logger captures at
 /// header commit. `summary_metadata` is the projection the caller put on the
 /// summary, which may be empty when that caller defers it to fire time.
-pub(crate) fn request_protocol_is_grpc(
-    summary_metadata: &std::collections::HashMap<String, String>,
+pub(crate) fn request_protocol_is_grpc<MS: std::hash::BuildHasher>(
+    summary_metadata: &std::collections::HashMap<String, String, MS>,
     ctx: &RequestContext,
 ) -> bool {
     summary_metadata
@@ -284,8 +284,8 @@ pub(crate) fn request_protocol_is_grpc(
 ///
 /// It deliberately differs from [`native_grpc_request_protocol_is_grpc`]; see
 /// that function for why the two defaults are opposites.
-pub fn streaming_request_protocol_is_grpc(
-    request_metadata: &std::collections::HashMap<String, String>,
+pub fn streaming_request_protocol_is_grpc<MS: std::hash::BuildHasher>(
+    request_metadata: &std::collections::HashMap<String, String, MS>,
 ) -> bool {
     request_metadata
         .get("request_protocol")
@@ -307,8 +307,8 @@ pub fn streaming_request_protocol_is_grpc(
 /// HTTP 200 and drop its UNKNOWN terminal status; using this function on the
 /// generic arm would stamp `grpc_status: 2` on every streamed non-gRPC
 /// response. Keep the two apart.
-pub fn native_grpc_request_protocol_is_grpc(
-    request_metadata: &std::collections::HashMap<String, String>,
+pub fn native_grpc_request_protocol_is_grpc<MS: std::hash::BuildHasher>(
+    request_metadata: &std::collections::HashMap<String, String, MS>,
 ) -> bool {
     request_metadata
         .get("request_protocol")

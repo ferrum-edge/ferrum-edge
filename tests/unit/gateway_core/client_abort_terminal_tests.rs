@@ -140,7 +140,7 @@ fn a_client_abort_counts_exactly_one_disconnect() {
         response_status_code: 200,
         error_class: Some(terminal.error_class),
         client_disconnected: terminal.client_disconnected,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..TransactionSummary::default()
     });
     assert_eq!(metrics.client_disconnects(), 2);

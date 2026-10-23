@@ -888,9 +888,9 @@ impl WorkloadMetrics {
         }
     }
 
-    fn should_ensure_http_trace_context(
+    fn should_ensure_http_trace_context<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &HashMap<String, String>,
+        metadata: &HashMap<String, String, MS>,
         headers: &HashMap<String, String>,
     ) -> bool {
         self.trace_context_enabled()
@@ -899,7 +899,10 @@ impl WorkloadMetrics {
                 || has_b3_trace_context(headers))
     }
 
-    fn insert_common_metadata(&self, metadata: &mut HashMap<String, String>) {
+    fn insert_common_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         if let Some(node_id) = self.node_id.as_ref() {
             insert_metadata_if_changed(metadata, "mesh.node_id", node_id);
         }
@@ -908,9 +911,9 @@ impl WorkloadMetrics {
         }
     }
 
-    fn apply_telemetry_metadata(
+    fn apply_telemetry_metadata<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut HashMap<String, String, MS>,
         headers: &HashMap<String, String>,
     ) {
         if let Some(sampled) = existing_sampling_decision(metadata, headers) {
@@ -975,7 +978,10 @@ impl WorkloadMetrics {
         }
     }
 
-    fn should_export_metadata(&self, metadata: &HashMap<String, String>) -> bool {
+    fn should_export_metadata<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &HashMap<String, String, MS>,
+    ) -> bool {
         if trace_is_sampled(metadata) {
             return true;
         }
@@ -1019,7 +1025,10 @@ impl WorkloadMetrics {
         (workload, app, service)
     }
 
-    fn insert_local_source_workload_labels(&self, metadata: &mut HashMap<String, String>) {
+    fn insert_local_source_workload_labels<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         if let Some(namespace) = self.namespace.as_ref() {
             insert_metadata_if_changed(metadata, "mesh.source.namespace", namespace);
         }
@@ -1029,7 +1038,10 @@ impl WorkloadMetrics {
         insert_metadata_if_changed(metadata, "mesh.source.service", service);
     }
 
-    fn insert_local_destination_workload_labels(&self, metadata: &mut HashMap<String, String>) {
+    fn insert_local_destination_workload_labels<MS: std::hash::BuildHasher>(
+        &self,
+        metadata: &mut HashMap<String, String, MS>,
+    ) {
         if let Some(identity) = self.workload_spiffe_id.as_ref() {
             insert_destination_spiffe_labels(metadata, identity);
         }
@@ -1042,9 +1054,9 @@ impl WorkloadMetrics {
         insert_metadata_if_changed(metadata, "mesh.destination.service", service);
     }
 
-    fn insert_remote_source_workload_labels(
+    fn insert_remote_source_workload_labels<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut HashMap<String, String, MS>,
         identity: Option<&SpiffeId>,
     ) {
         let workload = identity
@@ -1055,9 +1067,9 @@ impl WorkloadMetrics {
         insert_metadata_if_changed(metadata, "mesh.source.service", workload);
     }
 
-    fn insert_proxy_destination_labels(
+    fn insert_proxy_destination_labels<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut HashMap<String, String, MS>,
         namespace: &str,
         destination: &str,
     ) {
@@ -1730,8 +1742,8 @@ fn mesh_metric_destination_port(ctx: &RequestContext) -> Option<u16> {
 /// CEL or allocate. A missing/malformed marker beside an active plan falls
 /// back to all inputs so coordination corruption cannot silently evaluate a
 /// valid expression against absent authoritative data.
-fn effective_metric_tag_cel_stamp_needs(
-    metadata: &HashMap<String, String>,
+fn effective_metric_tag_cel_stamp_needs<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
 ) -> MetricTagCelStampNeeds {
     let mut effective = MetricTagCelStampNeeds::default();
     for family in MeshMetricFamily::ALL {
@@ -2591,8 +2603,8 @@ fn trace_sampled(sampling_percentage: f64) -> bool {
     (random as f64 / u64::MAX as f64) * 100.0 < sampling_percentage
 }
 
-fn existing_sampling_decision(
-    metadata: &HashMap<String, String>,
+fn existing_sampling_decision<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     headers: &HashMap<String, String>,
 ) -> Option<bool> {
     if let Some(value) = metadata.get("trace_sampled") {
@@ -2607,7 +2619,9 @@ fn existing_sampling_decision(
         .or_else(|| b3_sampling_decision(headers))
 }
 
-fn clear_http_trace_metadata(metadata: &mut HashMap<String, String>) {
+fn clear_http_trace_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     for key in [
         "trace_id",
         "span_id",
@@ -2620,7 +2634,9 @@ fn clear_http_trace_metadata(metadata: &mut HashMap<String, String>) {
     }
 }
 
-fn metadata_has_sampling_decision(metadata: &HashMap<String, String>) -> bool {
+fn metadata_has_sampling_decision<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.contains_key("trace_sampled")
         || metadata
             .get(TRACEPARENT_HEADER)
@@ -2714,8 +2730,8 @@ fn b3_sampling_state(value: &str) -> Option<bool> {
     }
 }
 
-fn import_b3_trace_metadata(
-    metadata: &mut HashMap<String, String>,
+fn import_b3_trace_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     headers: &HashMap<String, String>,
 ) {
     if metadata.contains_key(TRACEPARENT_HEADER) {
@@ -2739,8 +2755,8 @@ fn import_b3_trace_metadata(
     import_b3_trace_context(metadata, trace_id, parent_span_id);
 }
 
-fn import_b3_trace_context(
-    metadata: &mut HashMap<String, String>,
+fn import_b3_trace_context<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     trace_id: String,
     parent_span_id: String,
 ) {
@@ -2854,7 +2870,11 @@ fn has_valid_traceparent(headers: &HashMap<String, String>) -> bool {
 /// per key per call to rewrite the same value. The borrowed `get` first
 /// keeps the repeat stamp allocation-free while preserving the final map
 /// exactly (a changed value still takes the insert path).
-fn insert_metadata_if_changed(metadata: &mut HashMap<String, String>, key: &str, value: &str) {
+fn insert_metadata_if_changed<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    key: &str,
+    value: &str,
+) {
     match metadata.get(key) {
         Some(existing) if existing == value => {}
         _ => {
@@ -2866,8 +2886,8 @@ fn insert_metadata_if_changed(metadata: &mut HashMap<String, String>, key: &str,
 /// Whether the SPIFFE-derived source labels already in `metadata` are
 /// exactly the labels `identity` would stamp (including key absence for
 /// a missing namespace / service account, and all-absent for `None`).
-fn source_spiffe_labels_match(
-    metadata: &HashMap<String, String>,
+fn source_spiffe_labels_match<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     identity: Option<&SpiffeId>,
 ) -> bool {
     let principal = metadata.get(MESH_SOURCE_PRINCIPAL).map(String::as_str);
@@ -2892,7 +2912,9 @@ fn source_spiffe_labels_match(
     }
 }
 
-fn clear_source_spiffe_labels(metadata: &mut HashMap<String, String>) {
+fn clear_source_spiffe_labels<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     for key in [
         MESH_SOURCE_PRINCIPAL,
         MESH_SOURCE_TRUST_DOMAIN,
@@ -2903,7 +2925,10 @@ fn clear_source_spiffe_labels(metadata: &mut HashMap<String, String>) {
     }
 }
 
-fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
+fn insert_source_spiffe_labels<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    identity: &SpiffeId,
+) {
     insert_metadata_if_changed(metadata, MESH_SOURCE_PRINCIPAL, identity.as_str());
     insert_metadata_if_changed(
         metadata,
@@ -2918,7 +2943,10 @@ fn insert_source_spiffe_labels(metadata: &mut HashMap<String, String>, identity:
     }
 }
 
-fn insert_destination_spiffe_labels(metadata: &mut HashMap<String, String>, identity: &SpiffeId) {
+fn insert_destination_spiffe_labels<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    identity: &SpiffeId,
+) {
     insert_metadata_if_changed(metadata, "mesh.destination.principal", identity.as_str());
     if let Some(namespace) = identity.namespace() {
         insert_metadata_if_changed(metadata, "mesh.destination.namespace", namespace);
@@ -3702,7 +3730,7 @@ mod tests {
             spans: Arc::clone(&spans),
         })];
         let summary = TransactionSummary {
-            metadata: HashMap::from([
+            metadata: crate::plugins::MetadataMap::from_iter([
                 ("trace_sampled".to_string(), "true".to_string()),
                 (
                     "trace_id".to_string(),

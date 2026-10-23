@@ -379,7 +379,7 @@ fn an_empty_content_coded_body_has_no_unreadable_status() {
     record_grpc_web_passthrough_status_for_test(&ctx, &encoded, b"", &mut metadata);
     assert!(!metadata.contains_key("grpc_status_unreadable"));
     let summary = TransactionSummary {
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..Default::default()
     };
     assert_eq!(summary.grpc_status(), Some(2));
@@ -679,7 +679,7 @@ fn an_unreadable_status_stays_unset_instead_of_unknown() {
         Some("compressed_trailer_frame")
     );
     let summary = TransactionSummary {
-        metadata: metadata.clone(),
+        metadata: metadata.clone().into_iter().collect(),
         ..Default::default()
     };
     assert_eq!(
@@ -698,7 +698,7 @@ fn an_unreadable_status_stays_unset_instead_of_unknown() {
     );
     assert!(!missing.contains_key("grpc_status_unreadable"));
     let summary = TransactionSummary {
-        metadata: missing,
+        metadata: missing.into_iter().collect(),
         ..Default::default()
     };
     assert_eq!(summary.grpc_status(), Some(2));

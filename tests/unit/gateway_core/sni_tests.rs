@@ -2178,7 +2178,6 @@ use ferrum_edge::circuit_breaker::CircuitBreaker;
 use ferrum_edge::config::types::CircuitBreakerConfig;
 use ferrum_edge::plugins::{Direction, DisconnectCause, StreamTransactionSummary};
 use ferrum_edge::retry::ErrorClass;
-use std::collections::HashMap;
 
 /// Mirror the TCP accept-loop pre-copy summary for an SNI admission
 /// refusal: no backend was selected, so `backend_target` stays empty and
@@ -2213,7 +2212,7 @@ fn sni_admission_summary(error: &anyhow::Error) -> StreamTransactionSummary {
         timestamp_connected: String::new(),
         timestamp_disconnected: String::new(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 

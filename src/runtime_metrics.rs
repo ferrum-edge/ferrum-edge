@@ -1078,7 +1078,9 @@ fn is_grpc_summary(summary: &TransactionSummary) -> bool {
 /// The metadata reading that files a terminal error under the gRPC counters
 /// rather than the HTTP ones. Shared with the summary-free terminal path so
 /// both classify identically.
-pub fn terminal_metadata_is_grpc(metadata: &HashMap<String, String>) -> bool {
+pub fn terminal_metadata_is_grpc<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata
         .get("request_protocol")
         .or_else(|| metadata.get("mesh.request_protocol"))

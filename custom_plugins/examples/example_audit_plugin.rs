@@ -547,7 +547,7 @@ pub fn classify_stream_audit_protocol(summary: &StreamTransactionSummary) -> Str
 /// Deterministic, redacted, bounded metadata snapshot for tests and context
 /// encoding. Sensitive values are redacted before persistence; entry/value
 /// bounds are hard caps; truncation collisions and omitted entries are marked.
-pub fn bounded_redacted_metadata(metadata: &std::collections::HashMap<String, String>) -> Value {
+pub fn bounded_redacted_metadata(metadata: &crate::plugins::MetadataMap) -> Value {
     use crate::plugins::utils::metadata_redaction::{
         REDACTED_PLACEHOLDER, metadata_value_is_redacted,
     };

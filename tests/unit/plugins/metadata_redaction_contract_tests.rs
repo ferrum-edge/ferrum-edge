@@ -87,7 +87,7 @@ fn planted_metadata() -> HashMap<String, String> {
 
 fn summary_with(metadata: HashMap<String, String>) -> TransactionSummary {
     TransactionSummary {
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..TransactionSummary::default()
     }
 }
@@ -190,7 +190,7 @@ fn classifier_covers_api_key_spellings_and_non_secret_controls() {
 #[test]
 fn clone_log_metadata_strips_all_four_legacy_dedup_fields() {
     let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/pay".into());
-    ctx.metadata = planted_metadata();
+    ctx.metadata = planted_metadata().into_iter().collect();
 
     let logged = clone_log_metadata(&ctx);
     for key in LEGACY_DEDUP_FIELDS {
@@ -242,7 +242,7 @@ fn classifier_splits_dedup_strip_from_mesh_metrics_serialization() {
 #[test]
 fn clone_log_metadata_preserves_mesh_metrics_coordination_keys() {
     let mut ctx = RequestContext::new("203.0.113.10".into(), "POST".into(), "/orders".into());
-    ctx.metadata = planted_metadata();
+    ctx.metadata = planted_metadata().into_iter().collect();
     for (idx, key) in MESH_METRICS_COORDINATION_KEYS.iter().enumerate() {
         ctx.metadata
             .insert((*key).to_string(), format!("mesh-plan-{idx}"));
@@ -358,7 +358,7 @@ fn prometheus_consumes_disable_and_tag_override_from_clone_log_metadata_projecti
         proxy_name: Some("orders".to_string()),
         response_status_code: 200,
         latency_total_ms: 12.0,
-        metadata: projected,
+        metadata: projected.into_iter().collect(),
         ..TransactionSummary::default()
     };
 
@@ -828,7 +828,7 @@ fn credential_classes_redact_unlisted_spellings_and_keep_ordinary_dimensions() {
     }
     metadata.insert("request_id".to_string(), "visible-request-id".to_string());
     let summary = TransactionSummary {
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..TransactionSummary::default()
     };
     let json = serde_json::to_string(&summary).expect("serialize summary");

@@ -333,7 +333,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: "2026-03-29T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-29T12:00:01.5Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -792,14 +792,14 @@ async fn udp_and_dtls_restore_correlation_after_public_cache_and_metadata_mutati
     let (udp_metadata, dtls_metadata) =
         ferrum_edge::_test_support::udp_dtls_disconnect_metadata_after_datagram_metadata_for_test(
             &mut ctx,
-            datagram_metadata,
+            datagram_metadata.into_iter().collect(),
         );
     let mut udp_summary = make_stream_summary();
     udp_summary.protocol = "udp".to_string();
-    udp_summary.metadata = udp_metadata;
+    udp_summary.metadata = udp_metadata.into_iter().collect();
     let mut dtls_summary = make_stream_summary();
     dtls_summary.protocol = "dtls".to_string();
-    dtls_summary.metadata = dtls_metadata;
+    dtls_summary.metadata = dtls_metadata.into_iter().collect();
 
     for summary in [&udp_summary, &dtls_summary] {
         assert_eq!(

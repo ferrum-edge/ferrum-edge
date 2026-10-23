@@ -5285,7 +5285,9 @@ pub(crate) fn effective_request_body_limit_for_protocol(
     )
 }
 
-pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
+pub(crate) fn redact_request_body_from_log_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+) {
     metadata.remove("request_body");
     metadata.remove(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY);
     metadata.remove(ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY);
@@ -5315,7 +5317,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     crate::plugins::utils::metadata_redaction::strip_dedup_internal_metadata(metadata);
 }
 
-pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
+pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> crate::plugins::MetadataMap {
     let mut metadata = ctx.metadata.clone();
     // Detached uploads publish through the shared latch. Import its bounded
     // class even when no response relay copied it into the request context.
@@ -19587,7 +19589,7 @@ pub struct WsSessionMeta {
     pub connection_id: u64,
     pub consumer_username: Option<String>,
     pub auth_method: Option<&'static str>,
-    pub metadata: HashMap<String, String>,
+    pub metadata: crate::plugins::MetadataMap,
     /// Ownership generation captured at WebSocket upgrade admission.
     pub proxy_lifecycle_generation: Option<u64>,
     /// Civil/UTC connect time for human-readable `timestamp_connected` only.
@@ -19725,7 +19727,7 @@ pub(crate) async fn wait_for_websocket_session_stop(
 fn ws_disconnect_metadata(
     session_meta: &WsSessionMeta,
     termination_reason: WsTerminationReason,
-) -> HashMap<String, String> {
+) -> crate::plugins::MetadataMap {
     let mut metadata = session_meta.metadata.clone();
     metadata.insert(
         WS_TERMINATION_METADATA_KEY.to_string(),
@@ -28453,8 +28455,8 @@ fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {
     )
 }
 
-pub(crate) fn insert_grpc_error_metadata(
-    metadata: &mut HashMap<String, String>,
+pub(crate) fn insert_grpc_error_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     grpc_status: u32,
     grpc_message: &str,
 ) {
@@ -40468,7 +40470,7 @@ async fn handle_proxy_request_inner(
                             .or_insert_with(|| "grpc".to_string());
                         metadata
                     } else {
-                        HashMap::new()
+                        crate::plugins::MetadataMap::default()
                     };
                     let summary = TransactionSummary {
                         namespace: proxy.namespace.clone(),
@@ -44632,7 +44634,7 @@ async fn handle_proxy_request_inner(
                 // projecting it now would be the second of two
                 // `clone_log_metadata` calls per streamed request.
                 metadata: if body_will_stream {
-                    HashMap::new()
+                    crate::plugins::MetadataMap::default()
                 } else {
                     clone_log_metadata(&ctx)
                 },
@@ -55025,8 +55027,8 @@ pub(crate) fn pre_header_upload_termination_response(
 /// A status already recorded (a gateway terminal that stamped its own) wins.
 /// gRPC-Web is excluded by the caller: its terminal status rides a body
 /// trailer frame, recorded by the gRPC-Web rules.
-pub(crate) fn record_buffered_native_grpc_header_status(
-    metadata: &mut HashMap<String, String>,
+pub(crate) fn record_buffered_native_grpc_header_status<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     native_grpc_request: bool,
     response_is_buffered: bool,
     response_headers: &HashMap<String, String>,
@@ -56219,7 +56221,7 @@ pub mod authorization_dispatch_test_support {
     }
 
     pub fn log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
-        clone_log_metadata(ctx)
+        clone_log_metadata(ctx).into_iter().collect()
     }
 }
 

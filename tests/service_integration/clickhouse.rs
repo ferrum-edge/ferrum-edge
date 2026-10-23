@@ -267,7 +267,7 @@ fn http_summary(request_id: &str, consumer: &str) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -321,7 +321,7 @@ fn stream_summary(consumer: &str) -> StreamTransactionSummary {
         timestamp_connected: "2026-05-23T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-05-23T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     }
 }
 

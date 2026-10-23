@@ -4850,7 +4850,7 @@ async fn staged_request_trailers_are_omitted_from_transaction_summaries() {
     // Serialize the real summary the way every logger sink does, and prove the
     // canary is absent even if a producer put the container back.
     let mut summary = TransactionSummary {
-        metadata: log_metadata,
+        metadata: log_metadata.into_iter().collect(),
         ..TransactionSummary::default()
     };
     summary.metadata.insert(

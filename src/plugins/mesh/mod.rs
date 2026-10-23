@@ -29,7 +29,9 @@ fn observability_shard_amount() -> usize {
 /// exported to a trace even though it carries the mesh prefix (issue #6619).
 /// Custom attribute names are an explicit operator declaration in
 /// `workload_metrics` config, so they take only the deny layer.
-pub fn mesh_trace_attributes(metadata: &HashMap<String, String>) -> Vec<(String, String)> {
+pub fn mesh_trace_attributes<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> Vec<(String, String)> {
     let mut attributes: Vec<_> = metadata
         .iter()
         .filter(|(key, _)| {

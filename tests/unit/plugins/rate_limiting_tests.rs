@@ -2771,7 +2771,10 @@ fn jsonrpc_refusal(result: PluginResult) -> (Value, HashMap<String, String>) {
     }
 }
 
-fn header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+fn header<'a, S: std::hash::BuildHasher>(
+    headers: &'a HashMap<String, String, S>,
+    name: &str,
+) -> Option<&'a str> {
     headers.get(name).map(String::as_str)
 }
 

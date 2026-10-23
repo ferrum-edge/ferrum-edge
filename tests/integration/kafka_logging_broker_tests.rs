@@ -12,7 +12,6 @@
 //! Unlike the historical vacuous check, this requires successful delivery
 //! (`delivered_total >= 1` with zero failures) against that external broker.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -65,7 +64,7 @@ fn summary() -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }

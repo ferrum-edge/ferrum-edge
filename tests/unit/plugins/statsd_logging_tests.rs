@@ -22,7 +22,6 @@ use ferrum_edge::plugins::{
 };
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -57,7 +56,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -882,7 +881,7 @@ async fn test_statsd_websocket_session_metrics_and_opt_in() {
         consumer_username: None,
         auth_method: None,
         connection_id: 0,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
     let mut buf = String::new();
     format_ws_metrics(&ctx, "ferrum", "", None, &mut buf);
@@ -1274,7 +1273,7 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
         consumer_username: None,
         auth_method: None,
         connection_id: 0,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
     plugin.on_ws_disconnect(&ctx).await;
 

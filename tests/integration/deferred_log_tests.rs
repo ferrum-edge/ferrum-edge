@@ -205,7 +205,7 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -1682,7 +1682,7 @@ async fn deferred_terminal_projects_context_metadata_without_a_header_commit_cop
 
     // Exactly what the streaming arm now hands in: no header-commit projection.
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
 
     let logger = DeferredTransactionLogger::new_with_start_time(
         summary,
@@ -1720,7 +1720,7 @@ async fn deferred_grpc_terminal_without_trailer_status_is_unknown_with_empty_sum
         .insert("request_protocol".to_string(), "grpc".to_string());
 
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
 
     let logger = DeferredTransactionLogger::new_with_start_time(
         summary,
@@ -1755,7 +1755,7 @@ async fn deferred_terminal_without_grpc_classification_leaves_status_unstamped()
         .insert("request_protocol".to_string(), "grpc-web".to_string());
 
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
 
     let logger = DeferredTransactionLogger::new_with_start_time(
         summary,
@@ -1918,7 +1918,7 @@ fn grpc_terminal_logger(plugins: Arc<Vec<Arc<dyn Plugin>>>) -> Arc<DeferredTrans
     ctx.metadata
         .insert("request_protocol".to_string(), "grpc".to_string());
     let mut summary = make_summary_with_status(200);
-    summary.metadata = HashMap::new();
+    summary.metadata = ferrum_edge::plugins::MetadataMap::default();
     DeferredTransactionLogger::new_with_start_time(
         summary,
         plugins,

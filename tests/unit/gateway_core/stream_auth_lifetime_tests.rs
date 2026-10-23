@@ -5612,7 +5612,7 @@ async fn the_pre_relay_gate_refuses_an_elapsed_plan_and_admits_a_live_one() {
 async fn a_relay_phase_dtls_expiry_publishes_the_bounded_class_exactly_once() {
     let _guard = counter_delta_guard().await;
     let latch = ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-    let session_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+    let session_metadata = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
 
     let before = counters();
     let first = settle_dtls_relay_authorization_expiry_for_test(

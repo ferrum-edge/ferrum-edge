@@ -187,7 +187,7 @@ fn seed_service_graph_edge(source_principal: &str, destination_principal: &str) 
         proxy_name: Some("reviews".to_string()),
         response_status_code: 503,
         latency_total_ms: 7.5,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..TransactionSummary::default()
     };
     let mesh_key = mesh_request_key(&summary);

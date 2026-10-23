@@ -83,7 +83,7 @@ fn test_ws_disconnect_context() -> WsDisconnectContext {
         consumer_username: Some("alice".to_string()),
         auth_method: None,
         connection_id: 0,
-        metadata,
+        metadata: metadata.into_iter().collect(),
     }
 }
 
