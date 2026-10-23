@@ -1221,7 +1221,7 @@ fn gateway_hbone_mtls_observed(
 /// Stamp mesh transport metadata for an outbound mesh-mTLS-secured dispatch.
 /// `transport` is `Some("hbone")` for Ambient HBONE and `Some("mtls")` for
 /// Sidecar SVID-mTLS; `None` (non-mesh dispatch) stamps nothing.
-fn annotate_gateway_mesh_metadata(
+pub(crate) fn annotate_gateway_mesh_metadata(
     ctx: &mut RequestContext,
     target: Option<&UpstreamTarget>,
     transport: Option<&'static str>,
@@ -1244,16 +1244,25 @@ fn annotate_gateway_mesh_metadata(
     let Some(target) = target else {
         return;
     };
-    for (tag, metadata_key) in [
-        ("mesh.spiffe_id", "mesh.destination.principal"),
-        ("mesh.namespace", "mesh.destination.namespace"),
-        ("mesh.service", "mesh.destination.service"),
-        ("mesh.trust_domain", "mesh.destination.trust_domain"),
-    ] {
-        if let Some(value) = target.tags.get(tag) {
-            ctx.metadata.insert(metadata_key.to_string(), value.clone());
+    // A deferred request projects no label keys into metadata: nothing in its
+    // plugin view can read them, and its metric key comes from the typed
+    // projection below (issue #6793).
+    if !ctx.mesh_label_projection_deferred() {
+        for (tag, metadata_key) in [
+            ("mesh.spiffe_id", "mesh.destination.principal"),
+            ("mesh.namespace", "mesh.destination.namespace"),
+            ("mesh.service", "mesh.destination.service"),
+            ("mesh.trust_domain", "mesh.destination.trust_domain"),
+        ] {
+            if let Some(value) = target.tags.get(tag) {
+                ctx.metadata.insert(metadata_key.to_string(), value.clone());
+            }
         }
     }
+    // Keep the typed label projection in step with the keys an eager request
+    // carries, so mesh metrics built from it report the dispatched peer
+    // (issue #6793).
+    ctx.record_mesh_gateway_destination_overlay(&target.tags);
 }
 
 /// Strip reserved identity baggage plus any configured egress prefixes from a
@@ -35491,6 +35500,14 @@ async fn handle_proxy_request_inner(
     // persisting a finalized representation can prove which rules produced it.
     ctx.set_response_presentation_policy_digest(
         plugin_cache_view.response_presentation_policy_digest(),
+    );
+    // Same view: when no plugin in it can observe the mesh label projection,
+    // `workload_metrics` keeps those labels in typed request state only
+    // (issue #6793).
+    ctx.set_mesh_label_projection_deferred(
+        plugin_cache_view
+            .capabilities()
+            .has(crate::plugin_cache::PluginCapabilities::MESH_LABEL_PROJECTION_DEFERRABLE),
     );
     // Establish the effective RPC budget before any request-plugin or body
     // await. The absolute instant is anchored to `timestamp_received` and is

@@ -116,6 +116,7 @@ mod unit {
         mod waf_tuning_controls_tests;
         mod waf_unlisted_content_type_tests;
         mod workload_metrics_custom_env_tags_tests;
+        mod workload_metrics_label_projection_tests;
         mod workload_metrics_tests;
         mod ws_frame_logging_tests;
         mod ws_logging_tests;

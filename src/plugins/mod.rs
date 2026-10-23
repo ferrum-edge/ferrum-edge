@@ -3610,6 +3610,19 @@ pub struct RequestContext {
     /// drops the handler future, so a request cancelled while its own terminal
     /// log is in flight never also gets a client-abort record.
     pub(crate) terminal_record: TerminalRecordLatch,
+    /// Typed copy of the `mesh.source.*` / `mesh.destination.*` label
+    /// projection that `workload_metrics` and the gateway's mesh dispatch
+    /// overlay produced for this request (issue #6793). Allocated by the first
+    /// stamp or dispatch overlay, so its presence does not mean a stamp ran.
+    /// Private, so no plugin can author it; metric emission builds its key from
+    /// it.
+    pub(crate) mesh_labels: Option<Box<crate::plugins::mesh::telemetry_facts::MeshLabelShadow>>,
+    /// Whether `workload_metrics` may leave the label keys out of `metadata`
+    /// for this request. Set by the dispatcher from the request's plugin view
+    /// before any plugin runs, and only when no plugin in that view can
+    /// observe the labels (`Plugin::observes_mesh_label_metadata`); defaults
+    /// to the eager, always-projected behavior.
+    pub(crate) mesh_label_projection_deferred: bool,
 }
 
 /// Latch recording how far a request's terminal transaction record has got
@@ -4128,6 +4141,45 @@ impl RequestContext {
         self.diagnostic_slot.as_ref()
     }
 
+    /// The typed mesh label projection for this request (issue #6793), once a
+    /// `workload_metrics` stamp or the gateway's mesh dispatch overlay has
+    /// written it. Read-only observability state; public only for external
+    /// contract tests.
+    #[doc(hidden)]
+    pub fn mesh_label_shadow(
+        &self,
+    ) -> Option<&crate::plugins::mesh::telemetry_facts::MeshLabelShadow> {
+        self.mesh_labels.as_deref()
+    }
+
+    /// Whether this request's plugin view lets `workload_metrics` leave the
+    /// mesh label keys out of `metadata` (issue #6793).
+    #[doc(hidden)]
+    pub fn mesh_label_projection_deferred(&self) -> bool {
+        self.mesh_label_projection_deferred
+    }
+
+    /// Record whether the request's plugin view lets the mesh label projection
+    /// be deferred. Called once per request on the protocol entry paths,
+    /// before any plugin runs.
+    pub(crate) fn set_mesh_label_projection_deferred(&mut self, deferred: bool) {
+        self.mesh_label_projection_deferred = deferred;
+    }
+
+    /// Apply the gateway's outbound mesh-dispatch destination overlay
+    /// (`mesh.destination.*` from the selected target's tags) to the typed
+    /// label projection, matching the metadata keys an eager request carries.
+    /// Allocates the projection when the overlay lands before the first
+    /// `workload_metrics` stamp, so a later stamp keeps the overlay exactly as
+    /// it keeps the metadata keys.
+    pub(crate) fn record_mesh_gateway_destination_overlay<MS: std::hash::BuildHasher>(
+        &mut self,
+        tags: &HashMap<String, String, MS>,
+    ) {
+        let shadow = self.mesh_labels.get_or_insert_with(Default::default);
+        crate::plugins::mesh::telemetry_facts::apply_gateway_destination_overlay(shadow, tags);
+    }
+
     /// Attach the frontend's diagnostic-reference slot (issue #5767).
     pub(crate) fn set_diagnostic_slot(
         &mut self,
@@ -4415,6 +4467,8 @@ impl RequestContext {
             hbone_connect_relay: false,
             finalized_request_egress_dispatched: false,
             terminal_record: TerminalRecordLatch::default(),
+            mesh_labels: None,
+            mesh_label_projection_deferred: false,
         }
     }
 
@@ -6061,6 +6115,8 @@ impl RequestContext {
             finalized_request_egress_dispatched: self.finalized_request_egress_dispatched,
             // A compatibility clone never logs the request's terminal record.
             terminal_record: TerminalRecordLatch::default(),
+            mesh_labels: self.mesh_labels.clone(),
+            mesh_label_projection_deferred: self.mesh_label_projection_deferred,
         }
     }
 
@@ -9479,8 +9535,11 @@ async fn log_with_mirror_inner(
     let precompute_mesh_key = plugins
         .iter()
         .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
+    // Built from the request's typed mesh label projection when it is
+    // authoritative for this summary (issue #6793); parsed from the metadata
+    // strings otherwise.
     let mesh_key = if precompute_mesh_key {
-        crate::plugins::mesh::prometheus_helpers::mesh_request_key(summary)
+        crate::plugins::mesh::prometheus_helpers::mesh_request_key_for_request(summary, ctx)
     } else {
         None
     };
@@ -9596,7 +9655,9 @@ impl Drop for TerminalDeliveryGuard<'_> {
                 .iter()
                 .any(|plugin| matches!(plugin.name(), "workload_metrics" | "prometheus_metrics"));
             let mesh_key = if precompute_mesh_key {
-                crate::plugins::mesh::prometheus_helpers::mesh_request_key(&summary)
+                crate::plugins::mesh::prometheus_helpers::mesh_request_key_for_request(
+                    &summary, &ctx,
+                )
             } else {
                 None
             };
@@ -12809,6 +12870,25 @@ pub trait Plugin: Any + Send + Sync {
     /// facts; only the plugin generation may change.
     fn allows_hbone_inner_reuse_for(&self, _admission: &HboneReuseContext) -> bool {
         self.allows_hbone_inner_reuse()
+    }
+
+    /// Whether this plugin can observe the `mesh.source.*` /
+    /// `mesh.destination.*` workload labels that `workload_metrics` projects
+    /// into `RequestContext::metadata` and `TransactionSummary::metadata`
+    /// (issue #6793).
+    ///
+    /// When every plugin in a request's view answers `false`, nothing can read
+    /// those keys, so `workload_metrics` keeps them only in typed request state
+    /// and the built-in metric and service-graph emitters build their keys
+    /// from it. One `true` anywhere in the view keeps the string projection
+    /// exactly as it has always been, for every plugin in that view.
+    ///
+    /// The default is `true`, so every custom plugin — and every built-in not
+    /// explicitly audited — sees the labels. Answer `false` only for a plugin
+    /// that never reads those keys from either map, never iterates, clones,
+    /// serializes or forwards either whole map, and never writes them.
+    fn observes_mesh_label_metadata(&self) -> bool {
+        true
     }
 
     /// Returns hostnames that this plugin will send traffic to.

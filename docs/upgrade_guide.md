@@ -144,6 +144,19 @@ answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
 
+### Mesh workload labels in built-in-only chains (#6793)
+
+No action is required. `Plugin` gains `observes_mesh_label_metadata()`,
+defaulting to `true`, so custom plugins keep seeing the `mesh.source.*` /
+`mesh.destination.*` labels that `workload_metrics` stamps. A request whose
+chain contains only `spiffe_identity`, `mesh_authz` and a `workload_metrics`
+instance without span exporters (for example a sidecar with Telemetry access
+logging disabled) no longer carries those label keys in
+`RequestContext.metadata` / `TransactionSummary.metadata`; nothing in such a
+chain can read them, and mesh metrics and the service graph report the same
+labels as before. See [mesh.md → How workload labels reach
+metrics](mesh.md#how-workload-labels-reach-metrics-issue-6793).
+
 ### Custom plugins: request metadata is a `MetadataMap` (PR #6787)
 
 These metadata maps are now `ferrum_edge::plugins::MetadataMap`:

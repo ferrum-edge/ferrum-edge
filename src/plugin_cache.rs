@@ -1288,6 +1288,11 @@ impl Plugin for PluginInstanceWrapper {
     fn allows_hbone_inner_reuse_for(&self, admission: &HboneReuseContext) -> bool {
         self.inner.allows_hbone_inner_reuse_for(admission)
     }
+    /// A trigger only skips hooks and records its own skip key; it never reads
+    /// the mesh label projection, so the wrapped plugin's answer stands.
+    fn observes_mesh_label_metadata(&self) -> bool {
+        self.inner.observes_mesh_label_metadata()
+    }
     fn modifies_request_headers(&self) -> bool {
         self.inner.modifies_request_headers()
     }
@@ -5069,6 +5074,13 @@ impl PluginCapabilities {
     /// (issue #6655). `%3B` is an unambiguous literal and is unaffected, and a
     /// view without such a trigger never inspects the query on this path.
     pub const HAS_QUERY_READING_TRIGGER: u32 = 1 << 21;
+    /// No plugin in the view can observe the `mesh.source.*` /
+    /// `mesh.destination.*` label projection
+    /// (`Plugin::observes_mesh_label_metadata` is `false` for every instance),
+    /// so `workload_metrics` may keep those labels only in typed request state
+    /// (issue #6793). Set only when proven, so a view built without consulting
+    /// its plugins, or from an empty plugin list, keeps the eager projection.
+    pub const MESH_LABEL_PROJECTION_DEFERRABLE: u32 = 1 << 22;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
     // must widen `PluginCapabilities` (to `u64`) rather than shift further;
@@ -5211,7 +5223,12 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut presentation_policy_unprovable = false;
     let mut enforced_request_body_limit: Option<u64> = None;
     let mut enforced_response_body_limit: Option<u64> = None;
+    // An empty list proves nothing, so it keeps the eager projection.
+    let mut mesh_label_projection_deferrable = !plugins.is_empty();
     for p in plugins {
+        if p.observes_mesh_label_metadata() {
+            mesh_label_projection_deferrable = false;
+        }
         match p.response_presentation_policy() {
             Some(ResponsePresentationPolicy::Static(digest)) => {
                 presentation_policy_contributions.push((p.name(), digest));
@@ -5358,6 +5375,9 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
             enforced_response_body_limit =
                 Some(enforced_response_body_limit.map_or(limit, |current: u64| current.min(limit)));
         }
+    }
+    if mesh_label_projection_deferrable {
+        caps |= PluginCapabilities::MESH_LABEL_PROJECTION_DEFERRABLE;
     }
     PluginPhaseData {
         enforced_request_body_limit,

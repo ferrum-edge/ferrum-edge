@@ -1884,6 +1884,44 @@ pub mod _test_support {
         crate::plugin_cache::grpc_web_view_omits_admission_policy_for_test(plugins)
     }
 
+    /// The capability bits of the request view a dispatcher resolves for
+    /// `(namespace, proxy_id, protocol)` — the same view the H1/H2 and H3
+    /// entry paths read before any plugin runs (issue #6793).
+    pub fn request_view_capabilities_for_test(
+        cache: &crate::plugin_cache::PluginCache,
+        namespace: &str,
+        proxy_id: &str,
+        protocol: crate::plugins::ProxyProtocol,
+    ) -> crate::plugin_cache::PluginCapabilities {
+        cache
+            .request_view(namespace, proxy_id, protocol)
+            .capabilities()
+    }
+
+    /// Mark `ctx` as the dispatcher marks a request whose plugin view defers
+    /// the mesh label projection (issue #6793).
+    pub fn defer_mesh_label_projection_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.set_mesh_label_projection_deferred(true);
+    }
+
+    /// Run the gateway's real outbound mesh-dispatch overlay for a Sidecar
+    /// mesh-mTLS target carrying `tags` (issue #6793).
+    pub fn annotate_gateway_mesh_dispatch_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        tags: std::collections::HashMap<String, String>,
+    ) {
+        let target = crate::config::types::UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 8443,
+            service_port_policy_key: None,
+            weight: 1,
+            tags,
+            locality: None,
+            path: None,
+        };
+        crate::proxy::annotate_gateway_mesh_metadata(ctx, Some(&target), Some("mtls"), None);
+    }
+
     /// Prepend a plugin onto one proxy's resolved list for external tests.
     ///
     /// Used to inject a gated `on_stream_connect` admission seam into a live
