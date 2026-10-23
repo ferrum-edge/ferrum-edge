@@ -557,6 +557,110 @@ where
     }
 }
 
+/// A real SVID-mTLS HTTP/2 Sidecar peer that accepts ONE request and then
+/// stops reading it: it observes the request body without releasing any flow
+/// control capacity, so h2's default 64 KiB stream window is never reopened,
+/// and it never answers. Resolves with the reset reason it saw on the upload
+/// (`None` if the upload ended or nothing arrived within the bound).
+async fn start_mesh_mtls_stalling_http_server(
+    server_slot: SharedSvidBundle,
+) -> (SocketAddr, oneshot::Receiver<Option<h2::Reason>>) {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind stalling mesh mtls http server");
+    let addr = listener.local_addr().expect("listener addr");
+    let (reset_tx, reset_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(inbound);
+        let (tcp, _) = listener.accept().await.expect("accept mesh mtls tcp");
+        let tls = acceptor.accept(tcp).await.expect("accept spiffe tls");
+        let mut h2 = h2::server::handshake(tls).await.expect("h2 server");
+        let (request, respond) = h2.accept().await.expect("http stream").expect("stream ok");
+        let mut body = request.into_body();
+        // Keep driving the connection so the gateway's RST_STREAM is processed.
+        let driver = tokio::spawn(async move {
+            while let Some(next) = h2.accept().await {
+                if next.is_err() {
+                    break;
+                }
+            }
+        });
+        // Consume what already arrived but never release capacity, so the
+        // window stays closed until the gateway gives up on the upload.
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+            loop {
+                match body.data().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => break error.reason(),
+                    None => break None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        let _ = reset_tx.send(reason);
+        // Dropping the responder earlier could reset the stream from this side.
+        drop(respond);
+        driver.abort();
+    });
+
+    (addr, reset_rx)
+}
+
+/// A real SVID-mTLS HTTP/2 Sidecar peer that accepts ONE request, consumes the
+/// upload's first stream window without releasing any capacity, so the
+/// gateway's pipe is parked on the closed window, and then resets the upload
+/// itself with `RST_STREAM(CANCEL)`.
+async fn start_mesh_mtls_resetting_http_server(server_slot: SharedSvidBundle) -> SocketAddr {
+    let listener = TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind resetting mesh mtls http server");
+    let addr = listener.local_addr().expect("listener addr");
+
+    tokio::spawn(async move {
+        let inbound = build_spiffe_inbound_config(server_slot, true, Arc::new(Vec::new()))
+            .expect("server config");
+        let acceptor = TlsAcceptor::from(inbound);
+        let (tcp, _) = listener.accept().await.expect("accept mesh mtls tcp");
+        let tls = acceptor.accept(tcp).await.expect("accept spiffe tls");
+        let mut h2 = h2::server::handshake(tls).await.expect("h2 server");
+        let (request, mut respond) = h2.accept().await.expect("http stream").expect("stream ok");
+        let mut body = request.into_body();
+        let driver = tokio::spawn(async move {
+            while let Some(next) = h2.accept().await {
+                if next.is_err() {
+                    break;
+                }
+            }
+        });
+        // Observe the whole default 64 KiB stream window arrive without
+        // releasing it: the gateway can send no more, so its pipe is parked on
+        // capacity when the reset lands. The bound only keeps a misbehaving
+        // run from hanging here; the reset is correct either way.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut received = 0usize;
+            while received < 65_535 {
+                match body.data().await {
+                    Some(Ok(chunk)) => received += chunk.len(),
+                    _ => break,
+                }
+            }
+        })
+        .await;
+        respond.send_reset(h2::Reason::CANCEL);
+        // Hold the request body and connection until the gateway has answered.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        drop(body);
+        driver.abort();
+    });
+
+    addr
+}
+
 async fn start_http_test_gateway(state: ProxyState) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
@@ -1752,6 +1856,237 @@ async fn http_mesh_mtls_rewrites_authority_and_forwards_client_host() {
         "mesh-mTLS dispatch removes Host so it cannot duplicate :authority; \
          got {:?}",
         observed.host
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
+    gateway_handle.abort();
+}
+
+/// The Sidecar mesh-mTLS dispatcher bounds an unauthenticated streamed upload
+/// with hyper's HTTP/2 pipe instead of a gateway-owned pump (vendored hyper
+/// patch 004). Driven through `handle_proxy_request` into
+/// `proxy_to_backend_mesh_mtls`: when the peer stops granting stream window,
+/// the request must end with the same `504` / `backend_timeout` terminal the
+/// pump's write watermark produced, inside `backend_write_timeout_ms` rather
+/// than the much longer `backend_read_timeout_ms`, and the peer must see its
+/// upload reset with `CANCEL` rather than left open.
+#[tokio::test]
+async fn http_mesh_mtls_upload_the_peer_stops_reading_ends_at_the_write_watermark() {
+    let files = mesh_identities_on_disk();
+    let peer_id = files.identities.peer_id.as_str().to_string();
+    let (peer_addr, reset_rx) =
+        start_mesh_mtls_stalling_http_server(Arc::clone(&files.identities.server_slot)).await;
+
+    let mut config: GatewayConfig = serde_json::from_value(json!({
+        "version": "1",
+        "consumers": [],
+        "plugin_configs": [],
+        "proxies": [{
+            "id": "gw-to-mesh-stall",
+            "hosts": ["api.example.com"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": APP_PORT,
+            "upstream_id": "orders-mesh",
+            "backend_write_timeout_ms": 300,
+            "backend_read_timeout_ms": 20_000
+        }],
+        "upstreams": [{
+            "id": "orders-mesh",
+            "targets": [{
+                "host": "127.0.0.1",
+                "port": APP_PORT,
+                "tags": {
+                    "mesh.mtls": "true",
+                    "mesh.mtls_port": peer_addr.port().to_string(),
+                    "mesh.spiffe_id": peer_id
+                }
+            }]
+        }]
+    }))
+    .expect("test config should deserialize");
+    config.normalize_fields();
+
+    let env_config = EnvConfig {
+        gateway_svid_cert_path: Some(files.cert_path.clone()),
+        gateway_svid_key_path: Some(files.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(files.trust_bundle_path.clone()),
+        ..Default::default()
+    };
+    let (state, handles) = ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+    let (gateway_addr, gateway_handle) = start_http_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to test gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("h1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    // Far larger than the peer's 64 KiB stream window, so the pipe parks on
+    // capacity with a ready chunk once the peer stops reading.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/upload")
+        .header("host", "api.example.com")
+        .body(Full::new(Bytes::from(vec![b'x'; 1024 * 1024])))
+        .expect("client request");
+
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sender.send_request(request),
+    )
+    .await
+    .expect("the write watermark, not the test timeout, must end the stalled upload")
+    .expect("gateway response");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "a backend that stops reading the upload is the write-watermark terminal"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend_timeout"),
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "the 300 ms write bound, not the 20 s read bound, must end the request; took {elapsed:?}"
+    );
+
+    let reset = await_observation(reset_rx, "the stalled peer's upload outcome").await;
+    assert_eq!(
+        reset,
+        Some(h2::Reason::CANCEL),
+        "the gateway must reset the stalled upload rather than leave it open"
+    );
+
+    for handle in handles {
+        handle.abort();
+    }
+    gateway_handle.abort();
+}
+
+/// The converse of the write-watermark test: `Http2BodyWriteTimeout` reports
+/// expiry only when hyper's own write-stall timer reset the stream. A peer
+/// that resets the upload itself while the pipe is parked on its closed window
+/// is a backend failure, never the gateway's write-watermark `504` /
+/// `backend_timeout`. The write bound is set well past the test's own wait, so
+/// the bound cannot be what ends the request.
+#[tokio::test]
+async fn http_mesh_mtls_peer_reset_of_the_upload_is_not_a_write_timeout() {
+    let files = mesh_identities_on_disk();
+    let peer_id = files.identities.peer_id.as_str().to_string();
+    let peer_addr =
+        start_mesh_mtls_resetting_http_server(Arc::clone(&files.identities.server_slot)).await;
+
+    let mut config: GatewayConfig = serde_json::from_value(json!({
+        "version": "1",
+        "consumers": [],
+        "plugin_configs": [],
+        "proxies": [{
+            "id": "gw-to-mesh-peer-reset",
+            "hosts": ["api.example.com"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": APP_PORT,
+            "upstream_id": "orders-mesh",
+            "backend_write_timeout_ms": 60_000,
+            "backend_read_timeout_ms": 120_000
+        }],
+        "upstreams": [{
+            "id": "orders-mesh",
+            "targets": [{
+                "host": "127.0.0.1",
+                "port": APP_PORT,
+                "tags": {
+                    "mesh.mtls": "true",
+                    "mesh.mtls_port": peer_addr.port().to_string(),
+                    "mesh.spiffe_id": peer_id
+                }
+            }]
+        }]
+    }))
+    .expect("test config should deserialize");
+    config.normalize_fields();
+
+    let env_config = EnvConfig {
+        gateway_svid_cert_path: Some(files.cert_path.clone()),
+        gateway_svid_key_path: Some(files.key_path.clone()),
+        gateway_svid_trust_bundle_path: Some(files.trust_bundle_path.clone()),
+        ..Default::default()
+    };
+    let (state, handles) = ProxyState::new(
+        config,
+        DnsCache::new(DnsConfig::default()),
+        env_config,
+        None,
+        None,
+    )
+    .expect("proxy state");
+    let (gateway_addr, gateway_handle) = start_http_test_gateway(state).await;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to test gateway");
+    let _ = stream.set_nodelay(true);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("h1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/upload")
+        .header("host", "api.example.com")
+        .body(Full::new(Bytes::from(vec![b'x'; 1024 * 1024])))
+        .expect("client request");
+
+    // Far below the 60 s write bound: only the peer's reset can end it in time.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        sender.send_request(request),
+    )
+    .await
+    .expect("the peer's reset, not the 60 s write bound, must end the request")
+    .expect("gateway response");
+
+    assert_ne!(
+        response.status(),
+        StatusCode::GATEWAY_TIMEOUT,
+        "a peer's own reset is not the write-watermark terminal"
+    );
+    assert_ne!(
+        response
+            .headers()
+            .get("x-gateway-error")
+            .and_then(|value| value.to_str().ok()),
+        Some("backend_timeout"),
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "a backend-initiated reset of the upload is a backend failure"
     );
 
     for handle in handles {

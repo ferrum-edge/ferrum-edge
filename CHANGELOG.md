@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Sidecar mesh-mTLS uploads no longer cross a gateway upload pump** when the
+  request has no authorization lifetime. `backend_write_timeout_ms` on a streamed
+  upload forwarded over the Sidecar's mesh-mTLS (or h2c Unix-socket) HTTP/2
+  connection is now enforced by hyper's HTTP/2 body pipe (vendored hyper patch
+  004), as it already was for native gRPC and the direct-HTTP/2 passthrough arm.
+  The client body is polled in place, with no channel or cross-task hop per
+  frame. An expiry before response headers ends the request with the same
+  `504` / `read_write_timeout` (gRPC: `DEADLINE_EXCEEDED`) as the pump's write
+  watermark; after headers it resets the stream. Uploads with an authorization
+  lifetime keep the pump. On the mesh runtime benchmark (paired, four rounds)
+  sidecar-pair CPU per request fell 2.7% at 10 KiB and 1.5% at 1 MiB, and
+  throughput rose 2.2% and 1.6%.
 - **HTTP transaction records state their delivery-observation boundary**
   (issue #6769). Every `TransactionSummary` now carries `response_delivery`:
   `not_observed` when the record was finalized before the frontend transport
