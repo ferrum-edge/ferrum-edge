@@ -5150,6 +5150,11 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
         auth_pump < pipe_bound
             && mesh_mtls.contains("let pipe_write_timeout = (upload_auth.is_none()")
             && mesh_mtls.contains("parts.extensions.insert(write_timeout.clone());")
+            && mesh_mtls
+                .contains("unpumped_client_fault_latch(upload_auth.as_ref(), pumped_write_timeout_ms)")
+            && mesh_mtls.contains(
+                "upload_auth.as_ref(),\n                    pumped_write_timeout_ms,\n                );"
+            )
             && mesh_mtls.contains(".is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)")
             && mesh_mtls.contains("write_bound = \"h2_pipe\""),
         "sidecar mesh mTLS must keep the pump for authorization lifetimes and bound the write otherwise"

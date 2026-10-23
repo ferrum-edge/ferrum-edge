@@ -1532,7 +1532,7 @@ proxies it has three roles:
 `backend_write_timeout_ms` defaults to `30000` (30 seconds) and is the
 per-direction *idle* bound on writing the request body to the backend. HTTP-family
 uploads arm it in the gateway-owned upload pump (H1/H2/reqwest and native gRPC;
-two HTTP/2 uploads are bounded inside hyper instead, see below)
+three HTTP/2 uploads are bounded inside hyper instead, see below)
 or on each native-H3 `send_data`/`finish` — streaming uploads through their body
 adapter, and buffered uploads (retries, body-processing policy, retry replays)
 by handing the collected buffer to the same pump in bounded slices. `0` disables

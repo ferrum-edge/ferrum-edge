@@ -54798,9 +54798,11 @@ fn mesh_transport_hyper_error_response(
 
 /// An unpumped streaming upload's client-fault latch (issue #6776): `Some`
 /// exactly when [`install_streaming_upload_authorization`] will install no
-/// gateway-owned pump (no authorization lifetime and
-/// `backend_write_timeout_ms = 0`), so the size-limit adapter is the one
-/// reading the client body. The default path pays nothing.
+/// gateway-owned pump, so the size-limit adapter is the one reading the client
+/// body. Callers pass the write timeout they hand that installer: the route's
+/// `backend_write_timeout_ms`, or `0` on a dispatcher that bounds an
+/// unauthenticated upload in hyper's HTTP/2 pipe instead (the Sidecar
+/// mesh-mTLS dispatcher). A pumped upload pays nothing.
 fn unpumped_client_fault_latch(
     auth: Option<&RequestAuthLifetimePlan>,
     write_timeout_ms: u64,
@@ -61312,13 +61314,15 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                     Arc::clone(ctx_bytes_sent_observed),
                 )
                 .with_h2_end_stream_required(require_end_stream);
-                // Full upload lifecycle for the UPLOAD direction (#3815): the
-                // adapter deadline plus a gateway-owned pump, so the bound still
-                // fires while this pooled connection task is parked and not
-                // polling the body. Retain the join through the response-header
-                // wait so `backend_write_timeout_ms` is client-visible even when
-                // the transport is parked outside a body poll; after headers, the
+                // Full upload lifecycle for the UPLOAD direction (#3815). With an
+                // authorization lifetime: the adapter deadline plus a
+                // gateway-owned pump, so the bound still fires while this pooled
+                // connection task is parked and not polling the body. The join
+                // is retained through the response-header wait so
+                // `backend_write_timeout_ms` is client-visible even when the
+                // transport is parked outside a body poll; after headers, the
                 // transport body and `UploadPumpSource` abort guard own teardown.
+                // Without one, hyper's pipe enforces the write bound (below).
                 let upload_auth = request_upload_auth_deadline(
                     Some(request_ctx),
                     state.env_config.authenticated_stream_max_lifetime_seconds,
