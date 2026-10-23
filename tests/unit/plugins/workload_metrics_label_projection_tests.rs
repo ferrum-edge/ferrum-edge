@@ -96,7 +96,7 @@ fn configs() -> Vec<Value> {
 fn context(shape: Shape, deferred: bool) -> RequestContext {
     let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/api".into());
     if deferred {
-        ctx = ctx.with_deferred_mesh_label_projection();
+        ferrum_edge::_test_support::defer_mesh_label_projection_for_test(&mut ctx);
     }
     match shape {
         Shape::InboundPeer => {
@@ -345,37 +345,40 @@ async fn a_final_peer_with_fewer_spiffe_segments_keeps_no_stale_labels() {
     }
 }
 
-#[tokio::test]
-async fn gateway_mesh_dispatch_overlay_reaches_the_typed_projection() {
-    let plugins = chain(&configs()[1]);
-    let tags = HashMap::from([
+fn mesh_target_tags() -> HashMap<String, String> {
+    HashMap::from([
         ("mesh.spiffe_id".to_string(), PEER_ID.to_string()),
         ("mesh.namespace".to_string(), "storefront".to_string()),
         ("mesh.service".to_string(), "frontend".to_string()),
         ("mesh.trust_domain".to_string(), "cluster.local".to_string()),
-    ]);
+    ])
+}
+
+#[tokio::test]
+async fn gateway_mesh_dispatch_overlay_reaches_the_typed_projection() {
+    let plugins = chain(&configs()[1]);
     let mut eager = context(Shape::OutboundLocal, false);
     stamp(&plugins, &mut eager).await;
     let mut deferred = context(Shape::OutboundLocal, true);
     stamp(&plugins, &mut deferred).await;
     for ctx in [&mut eager, &mut deferred] {
-        // What the dispatcher writes for a mesh-mTLS / HBONE target.
-        for (tag, key) in [
-            ("mesh.spiffe_id", "mesh.destination.principal"),
-            ("mesh.namespace", "mesh.destination.namespace"),
-            ("mesh.service", "mesh.destination.service"),
-            ("mesh.trust_domain", "mesh.destination.trust_domain"),
-        ] {
-            ctx.metadata.insert(key.into(), tags[tag].clone());
-        }
-        ctx.metadata.insert(
-            "mesh.connection_security_policy".into(),
-            "mutual_tls".into(),
+        // The dispatcher's own overlay for a Sidecar mesh-mTLS target.
+        ferrum_edge::_test_support::annotate_gateway_mesh_dispatch_for_test(
+            ctx,
+            mesh_target_tags(),
         );
-        ctx.record_mesh_gateway_destination_overlay(&tags);
     }
     assert_eq!(shadow_projection(&eager), label_subset(&eager.metadata));
     assert_eq!(eager.mesh_label_shadow(), deferred.mesh_label_shadow());
+    assert!(
+        label_subset(&deferred.metadata).is_empty(),
+        "the dispatch overlay projects no label keys into a deferred request"
+    );
+    assert_eq!(
+        without_labels(&eager.metadata),
+        without_labels(&deferred.metadata),
+        "the overlay's non-label keys are written in both modes"
+    );
     let eager_summary = summary_for(&eager);
     let expected = mesh_request_key(&eager_summary).expect("mesh key");
     assert_eq!(&*expected.destination_principal, PEER_ID);
@@ -385,6 +388,39 @@ async fn gateway_mesh_dispatch_overlay_reaches_the_typed_projection() {
         mesh_request_key_for_request(&eager_summary, &eager).as_ref(),
         Some(&expected)
     );
+    assert_eq!(
+        mesh_request_key_for_request(&summary_for(&deferred), &deferred).as_ref(),
+        Some(&expected)
+    );
+}
+
+#[tokio::test]
+async fn a_dispatch_overlay_before_the_first_stamp_survives_it() {
+    let plugins = chain(&configs()[1]);
+    let mut eager = context(Shape::OutboundLocal, false);
+    let mut deferred = context(Shape::OutboundLocal, true);
+    for ctx in [&mut eager, &mut deferred] {
+        ferrum_edge::_test_support::annotate_gateway_mesh_dispatch_for_test(
+            ctx,
+            mesh_target_tags(),
+        );
+        stamp(&plugins, ctx).await;
+    }
+    assert_eq!(
+        shadow_projection(&eager),
+        label_subset(&eager.metadata),
+        "an overlay-first eager request keeps both projections in step"
+    );
+    assert_eq!(eager.mesh_label_shadow(), deferred.mesh_label_shadow());
+    assert_eq!(
+        eager
+            .mesh_label_shadow()
+            .and_then(|shadow| shadow.get(MeshLabel::DestinationPrincipal)),
+        Some(PEER_ID),
+        "the stamp keeps the overlay's destination principal"
+    );
+    assert!(label_subset(&deferred.metadata).is_empty());
+    let expected = mesh_request_key(&summary_for(&eager)).expect("mesh key");
     assert_eq!(
         mesh_request_key_for_request(&summary_for(&deferred), &deferred).as_ref(),
         Some(&expected)
@@ -461,14 +497,26 @@ impl Plugin for CustomObserver {
 }
 
 fn view_defers(plugins: Vec<(&str, &str, Value)>) -> bool {
-    let instances = plugins
+    view_defers_with_proxy_scoped(plugins, Vec::new())
+}
+
+/// `global` plugins apply to every proxy; `proxy_scoped` ones only to `p1`.
+fn view_defers_with_proxy_scoped(
+    global: Vec<(&str, &str, Value)>,
+    proxy_scoped: Vec<(&str, &str, Value)>,
+) -> bool {
+    let scoped_ids: Vec<&str> = proxy_scoped.iter().map(|(id, _, _)| *id).collect();
+    let instances = global
         .into_iter()
         .map(|(id, name, config)| {
             make_plugin_config_with_json(id, name, config, PluginScope::Global, None)
         })
+        .chain(proxy_scoped.into_iter().map(|(id, name, config)| {
+            make_plugin_config_with_json(id, name, config, PluginScope::Proxy, Some("p1"))
+        }))
         .collect();
     let cache = PluginCache::new(&GatewayConfig {
-        proxies: vec![make_proxy("p1", "/api", Vec::new())],
+        proxies: vec![make_proxy("p1", "/api", scoped_ids)],
         plugin_configs: instances,
         ..Default::default()
     })
@@ -500,6 +548,19 @@ async fn only_views_of_audited_non_observers_defer_the_projection() {
     let mut with_prometheus = mesh_chain();
     with_prometheus.push(("prom", "prometheus_metrics", json!({})));
     assert!(!view_defers(with_prometheus));
+
+    // A proxy-scoped observer is part of that proxy's view.
+    assert!(!view_defers_with_proxy_scoped(
+        mesh_chain(),
+        vec![("log", "stdout_logging", json!({}))],
+    ));
+    assert!(view_defers_with_proxy_scoped(
+        mesh_chain(),
+        vec![("authz2", "mesh_authz", json!({}))],
+    ));
+
+    // An empty chain proves nothing about observers.
+    assert!(!view_defers(Vec::new()));
 
     let mut exporting = mesh_chain();
     exporting[2].2 = json!({
@@ -593,9 +654,18 @@ fn only_audited_sources_name_the_mesh_label_keys() {
             "captured L4 egress stream summaries, not HTTP request metadata",
         ),
     ];
+    // The typed projection itself: a new reader outside these files would
+    // see a deferred request's labels that no observer audit covered.
+    let typed_allowed = [
+        "src/plugins/mesh/telemetry_facts.rs",
+        "src/plugins/mesh/workload_metrics.rs",
+        "src/plugins/mesh/prometheus_helpers.rs",
+        "src/plugins/mod.rs",
+    ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut pending = vec![root.join("src")];
     let mut offenders = Vec::new();
+    let mut typed_offenders = Vec::new();
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(&dir).expect("read src dir") {
             let path = entry.expect("dir entry").path();
@@ -611,8 +681,12 @@ fn only_audited_sources_name_the_mesh_label_keys() {
             let production = source
                 .find("#[cfg(test)]\nmod tests")
                 .map_or(source.as_str(), |index| &source[..index]);
-            if !production.contains("\"mesh.source.") && !production.contains("\"mesh.destination.")
-            {
+            let names_keys =
+                production.contains("\"mesh.source.") || production.contains("\"mesh.destination.");
+            let uses_typed = ["MeshLabel::", "MeshLabelShadow", "mesh_label_shadow"]
+                .iter()
+                .any(|needle| production.contains(needle));
+            if !names_keys && !uses_typed {
                 continue;
             }
             let relative = path
@@ -620,13 +694,20 @@ fn only_audited_sources_name_the_mesh_label_keys() {
                 .expect("under the manifest dir")
                 .to_string_lossy()
                 .replace('\\', "/");
-            if !allowed.iter().any(|(file, _)| *file == relative) {
-                offenders.push(relative);
+            if names_keys && !allowed.iter().any(|(file, _)| *file == relative) {
+                offenders.push(relative.clone());
+            }
+            if uses_typed && !typed_allowed.contains(&relative.as_str()) {
+                typed_offenders.push(relative);
             }
         }
     }
     assert!(
         offenders.is_empty(),
         "unaudited mesh label key users: {offenders:?}"
+    );
+    assert!(
+        typed_offenders.is_empty(),
+        "unaudited typed mesh label users: {typed_offenders:?}"
     );
 }

@@ -4164,28 +4164,18 @@ impl RequestContext {
         self.mesh_label_projection_deferred = deferred;
     }
 
-    /// A context whose plugin view defers the mesh label projection, as the
-    /// dispatcher marks one whose chain cannot observe it. Public only for
-    /// external contract tests; it consumes the context, so no plugin hook
-    /// holding `&mut RequestContext` can switch the projection off.
-    #[doc(hidden)]
-    pub fn with_deferred_mesh_label_projection(mut self) -> Self {
-        self.mesh_label_projection_deferred = true;
-        self
-    }
-
     /// Apply the gateway's outbound mesh-dispatch destination overlay
     /// (`mesh.destination.*` from the selected target's tags) to the typed
-    /// label projection, alongside the metadata keys the dispatcher writes.
-    /// Public only for external contract tests.
-    #[doc(hidden)]
-    pub fn record_mesh_gateway_destination_overlay<MS: std::hash::BuildHasher>(
+    /// label projection, matching the metadata keys an eager request carries.
+    /// Allocates the projection when the overlay lands before the first
+    /// `workload_metrics` stamp, so a later stamp keeps the overlay exactly as
+    /// it keeps the metadata keys.
+    pub(crate) fn record_mesh_gateway_destination_overlay<MS: std::hash::BuildHasher>(
         &mut self,
         tags: &HashMap<String, String, MS>,
     ) {
-        if let Some(shadow) = self.mesh_labels.as_deref_mut() {
-            crate::plugins::mesh::telemetry_facts::apply_gateway_destination_overlay(shadow, tags);
-        }
+        let shadow = self.mesh_labels.get_or_insert_with(Default::default);
+        crate::plugins::mesh::telemetry_facts::apply_gateway_destination_overlay(shadow, tags);
     }
 
     /// Attach the frontend's diagnostic-reference slot (issue #5767).

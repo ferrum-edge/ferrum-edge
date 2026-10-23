@@ -5079,7 +5079,7 @@ impl PluginCapabilities {
     /// (`Plugin::observes_mesh_label_metadata` is `false` for every instance),
     /// so `workload_metrics` may keep those labels only in typed request state
     /// (issue #6793). Set only when proven, so a view built without consulting
-    /// its plugins keeps the eager projection.
+    /// its plugins, or from an empty plugin list, keeps the eager projection.
     pub const MESH_LABEL_PROJECTION_DEFERRABLE: u32 = 1 << 22;
 
     // Bit 31 is the LAST bit of the `u32` backing store. A thirty-third flag
@@ -5223,7 +5223,8 @@ fn build_phase_data(plugins: &[Arc<dyn Plugin>]) -> PluginPhaseData {
     let mut presentation_policy_unprovable = false;
     let mut enforced_request_body_limit: Option<u64> = None;
     let mut enforced_response_body_limit: Option<u64> = None;
-    let mut mesh_label_projection_deferrable = true;
+    // An empty list proves nothing, so it keeps the eager projection.
+    let mut mesh_label_projection_deferrable = !plugins.is_empty();
     for p in plugins {
         if p.observes_mesh_label_metadata() {
             mesh_label_projection_deferrable = false;

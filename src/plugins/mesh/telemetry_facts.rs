@@ -244,15 +244,6 @@ impl RemoteSourceFacts {
     pub fn workload(&self) -> &Arc<str> {
         &self.workload
     }
-
-    /// Whether these facts were built from exactly `identity`.
-    pub fn describes(&self, identity: Option<&SpiffeId>) -> bool {
-        match (self.spiffe.as_ref(), identity) {
-            (None, None) => true,
-            (Some(labels), Some(identity)) => &*labels.principal == identity.as_str(),
-            _ => false,
-        }
-    }
 }
 
 /// Per-request typed copy of the `mesh.source.*` / `mesh.destination.*`

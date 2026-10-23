@@ -1898,6 +1898,30 @@ pub mod _test_support {
             .capabilities()
     }
 
+    /// Mark `ctx` as the dispatcher marks a request whose plugin view defers
+    /// the mesh label projection (issue #6793).
+    pub fn defer_mesh_label_projection_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.set_mesh_label_projection_deferred(true);
+    }
+
+    /// Run the gateway's real outbound mesh-dispatch overlay for a Sidecar
+    /// mesh-mTLS target carrying `tags` (issue #6793).
+    pub fn annotate_gateway_mesh_dispatch_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        tags: std::collections::HashMap<String, String>,
+    ) {
+        let target = crate::config::types::UpstreamTarget {
+            host: "10.0.0.8".to_string(),
+            port: 8443,
+            service_port_policy_key: None,
+            weight: 1,
+            tags,
+            locality: None,
+            path: None,
+        };
+        crate::proxy::annotate_gateway_mesh_metadata(ctx, Some(&target), Some("mtls"), None);
+    }
+
     /// Prepend a plugin onto one proxy's resolved list for external tests.
     ///
     /// Used to inject a gated `on_stream_connect` admission seam into a live

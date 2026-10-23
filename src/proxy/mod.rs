@@ -1221,7 +1221,7 @@ fn gateway_hbone_mtls_observed(
 /// Stamp mesh transport metadata for an outbound mesh-mTLS-secured dispatch.
 /// `transport` is `Some("hbone")` for Ambient HBONE and `Some("mtls")` for
 /// Sidecar SVID-mTLS; `None` (non-mesh dispatch) stamps nothing.
-fn annotate_gateway_mesh_metadata(
+pub(crate) fn annotate_gateway_mesh_metadata(
     ctx: &mut RequestContext,
     target: Option<&UpstreamTarget>,
     transport: Option<&'static str>,
@@ -1244,18 +1244,24 @@ fn annotate_gateway_mesh_metadata(
     let Some(target) = target else {
         return;
     };
-    for (tag, metadata_key) in [
-        ("mesh.spiffe_id", "mesh.destination.principal"),
-        ("mesh.namespace", "mesh.destination.namespace"),
-        ("mesh.service", "mesh.destination.service"),
-        ("mesh.trust_domain", "mesh.destination.trust_domain"),
-    ] {
-        if let Some(value) = target.tags.get(tag) {
-            ctx.metadata.insert(metadata_key.to_string(), value.clone());
+    // A deferred request projects no label keys into metadata: nothing in its
+    // plugin view can read them, and its metric key comes from the typed
+    // projection below (issue #6793).
+    if !ctx.mesh_label_projection_deferred() {
+        for (tag, metadata_key) in [
+            ("mesh.spiffe_id", "mesh.destination.principal"),
+            ("mesh.namespace", "mesh.destination.namespace"),
+            ("mesh.service", "mesh.destination.service"),
+            ("mesh.trust_domain", "mesh.destination.trust_domain"),
+        ] {
+            if let Some(value) = target.tags.get(tag) {
+                ctx.metadata.insert(metadata_key.to_string(), value.clone());
+            }
         }
     }
-    // Keep the typed label projection in step with the keys just written, so
-    // mesh metrics built from it report the dispatched peer (issue #6793).
+    // Keep the typed label projection in step with the keys an eager request
+    // carries, so mesh metrics built from it report the dispatched peer
+    // (issue #6793).
     ctx.record_mesh_gateway_destination_overlay(&target.tags);
 }
 

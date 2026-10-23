@@ -2083,6 +2083,12 @@ pub fn mesh_request_key_for_request(
     let Some(shadow) = ctx.mesh_label_shadow() else {
         return mesh_request_key(summary);
     };
+    // Same gate as the parser: a summary carrying no mesh key emits no mesh
+    // metric, whichever projection would build it. Every stamp writes
+    // non-label `mesh.*` keys, so a deferred request still passes it.
+    if !metadata_has_mesh_identity_keys(&summary.metadata) {
+        return None;
+    }
     if !ctx.mesh_label_projection_deferred() && !shadow.metric_key_labels_match(&summary.metadata) {
         return mesh_request_key(summary);
     }
