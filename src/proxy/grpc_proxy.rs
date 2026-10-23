@@ -3185,8 +3185,8 @@ fn parse_grpc_status_joined_value(status: &str) -> u32 {
 /// status was captured for health accounting. Missing terminal status is
 /// gRPC UNKNOWN for the client, so it must not leave a stale backend status in
 /// Prometheus/log metadata.
-pub(crate) fn refresh_grpc_status_metadata(
-    metadata: &mut HashMap<String, String>,
+pub(crate) fn refresh_grpc_status_metadata<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     trailers: &HashMap<String, String>,
     headers: &HashMap<String, String>,
 ) {
@@ -3215,8 +3215,8 @@ pub(crate) fn refresh_grpc_status_metadata(
 /// stays unset. A status present in either map is still authoritative and still
 /// refreshes, so a genuine post-hook edit is never ignored, and a request with
 /// no recorded status at all still falls back to `UNKNOWN`.
-pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal(
-    metadata: &mut HashMap<String, String>,
+pub(crate) fn refresh_grpc_status_metadata_with_body_framed_terminal<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
     trailers: &HashMap<String, String>,
     headers: &HashMap<String, String>,
     terminal_metadata_is_body_framed: bool,

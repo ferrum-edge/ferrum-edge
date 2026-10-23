@@ -865,7 +865,7 @@ fn a_malformed_upload_is_a_health_neutral_400_never_499() {
 fn grpc_summary(metadata: HashMap<String, String>) -> TransactionSummary {
     TransactionSummary {
         response_status_code: 200,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ..TransactionSummary::default()
     }
 }

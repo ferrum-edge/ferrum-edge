@@ -23,7 +23,7 @@
 //!   `fd1_` references keep resolving on the untagged store that minted them.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use ferrum_edge::diagnostic_ref::{
@@ -138,7 +138,7 @@ fn summary(status: u16, class: Option<ErrorClass>) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }

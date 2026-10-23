@@ -33,7 +33,6 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -147,15 +146,15 @@ struct WsDisconnectLogEntry<'a> {
         skip_serializing_if = "borrowed_metadata_is_empty",
         serialize_with = "serialize_borrowed_redacted_metadata"
     )]
-    metadata: &'a HashMap<String, String>,
+    metadata: &'a crate::plugins::MetadataMap,
 }
 
-fn borrowed_metadata_is_empty(metadata: &&HashMap<String, String>) -> bool {
+fn borrowed_metadata_is_empty(metadata: &&crate::plugins::MetadataMap) -> bool {
     metadata.is_empty()
 }
 
 fn serialize_borrowed_redacted_metadata<S>(
-    metadata: &&HashMap<String, String>,
+    metadata: &&crate::plugins::MetadataMap,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
@@ -1671,7 +1670,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::thread;
 
-    fn disconnect_entry<'a>(metadata: &'a HashMap<String, String>) -> WsDisconnectLogEntry<'a> {
+    fn disconnect_entry<'a>(metadata: &'a crate::plugins::MetadataMap) -> WsDisconnectLogEntry<'a> {
         WsDisconnectLogEntry {
             event: "websocket_disconnect",
             namespace: "ferrum",
@@ -1717,7 +1716,7 @@ mod tests {
         // never emits. Those specs must NOT reserve the flatten output key, so
         // disconnect metadata sharing the name survives under the default
         // `on_collision: skip`.
-        let mut metadata = HashMap::new();
+        let mut metadata = crate::plugins::MetadataMap::default();
         metadata.insert("http_method".to_string(), "GET".to_string());
         metadata.insert("request_path".to_string(), "/live".to_string());
         metadata.insert("response_status_code".to_string(), "101".to_string());
@@ -1894,7 +1893,7 @@ mod tests {
             "disconnect view must borrow metadata by reference"
         );
 
-        let mut metadata = HashMap::new();
+        let mut metadata = crate::plugins::MetadataMap::default();
         metadata.insert("correlation_id".to_string(), "cid-9".to_string());
         metadata.insert("authorization".to_string(), "Bearer secret".to_string());
         let ctx = WsDisconnectContext {

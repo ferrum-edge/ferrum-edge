@@ -18,7 +18,6 @@
 //! 4. Empty plugin slices skip the hook entirely (zero overhead when no
 //!    plugin opts in).
 //!
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -122,7 +121,7 @@ fn session_meta_with_id(connection_id: u64) -> ferrum_edge::proxy::WsSessionMeta
         "backend:9000".to_string(),
         8000,
         Some("user-42".to_string()),
-        HashMap::new(),
+        ferrum_edge::plugins::MetadataMap::default(),
         chrono::Utc::now() - chrono::Duration::seconds(2),
     );
     meta.connection_id = connection_id;
@@ -280,7 +279,7 @@ async fn test_tunnel_disconnect_duration_ignores_wall_clock_skew() {
         "backend:9000".to_string(),
         8000,
         None,
-        HashMap::new(),
+        ferrum_edge::plugins::MetadataMap::default(),
         chrono::Utc::now() - chrono::Duration::hours(1),
         Instant::now(),
     );
@@ -316,7 +315,7 @@ async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
         "backend:9001".to_string(),
         8443,
         None,
-        HashMap::new(),
+        ferrum_edge::plugins::MetadataMap::default(),
         wall_connect,
         Instant::now(),
     );
@@ -356,7 +355,7 @@ async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
         "backend:9001".to_string(),
         8443,
         None,
-        HashMap::new(),
+        ferrum_edge::plugins::MetadataMap::default(),
         wall_forward,
         Instant::now(),
     );

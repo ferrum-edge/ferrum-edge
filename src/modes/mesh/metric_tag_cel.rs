@@ -552,14 +552,18 @@ pub fn sanitize_metric_tag_value(value: &str) -> String {
 }
 
 /// Resolve `destination.port` from stamped metadata when present.
-pub fn metadata_destination_port(metadata: &HashMap<String, String>) -> Option<u16> {
+pub fn metadata_destination_port<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> Option<u16> {
     metadata
         .get(METRIC_TAG_CEL_DESTINATION_PORT_METADATA)
         .and_then(|value| value.parse::<u16>().ok())
 }
 
 /// Resolve `request.host` from stamped metadata when present.
-pub fn metadata_request_host(metadata: &HashMap<String, String>) -> Option<&str> {
+pub fn metadata_request_host<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> Option<&str> {
     metadata
         .get(METRIC_TAG_CEL_REQUEST_HOST_METADATA)
         .map(String::as_str)
@@ -567,7 +571,9 @@ pub fn metadata_request_host(metadata: &HashMap<String, String>) -> Option<&str>
 }
 
 /// Resolve `request.method` from stamped metadata when present.
-pub fn metadata_request_method(metadata: &HashMap<String, String>) -> Option<&str> {
+pub fn metadata_request_method<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> Option<&str> {
     metadata
         .get(METRIC_TAG_CEL_REQUEST_METHOD_METADATA)
         .map(String::as_str)

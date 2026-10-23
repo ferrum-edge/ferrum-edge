@@ -8,7 +8,7 @@
 //! gateways don't stomp the registry between the test's writes and its
 //! assertions.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use ferrum_edge::plugins::transaction_log_schema::TransactionLogSchema;
 use ferrum_edge::plugins::utils::log_schema::{
@@ -412,7 +412,10 @@ fn grpc_summary() -> TransactionSummary {
         response_status_code: 200,
         grpc_request_messages: 1,
         grpc_response_messages: 3,
-        metadata: HashMap::from([("grpc_status".to_string(), "0".to_string())]),
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([(
+            "grpc_status".to_string(),
+            "0".to_string(),
+        )]),
         ..TransactionSummary::default()
     }
 }
@@ -529,7 +532,7 @@ fn test_flatten_reservation_set_is_compiled_once_and_only_for_flatten() {
 #[test]
 fn test_flatten_collision_semantics_are_unchanged_by_precomputation() {
     let summary = TransactionSummary {
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             ("client_ip".to_string(), "from-metadata".to_string()),
             ("trace_id".to_string(), "abc-123".to_string()),
         ]),
@@ -569,7 +572,10 @@ fn test_flatten_collision_semantics_are_unchanged_by_precomputation() {
     });
     let no_backend = TransactionSummary {
         backend_target: None,
-        metadata: HashMap::from([("edge".to_string(), "from-metadata".to_string())]),
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([(
+            "edge".to_string(),
+            "from-metadata".to_string(),
+        )]),
         ..grpc_summary()
     };
     let projected = project(&no_backend, derived_flatten.clone());
@@ -577,7 +583,10 @@ fn test_flatten_collision_semantics_are_unchanged_by_precomputation() {
 
     // ...and when it IS emitted, it wins.
     let with_backend = TransactionSummary {
-        metadata: HashMap::from([("edge".to_string(), "from-metadata".to_string())]),
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([(
+            "edge".to_string(),
+            "from-metadata".to_string(),
+        )]),
         ..grpc_summary()
     };
     let projected = project(&with_backend, derived_flatten);

@@ -5114,7 +5114,7 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
             .next()
             .unwrap_or_else(|| panic!("bounded {label} streaming dispatcher"));
         assert!(
-            dispatch.contains("let (mut parts, body, mut upload_pump, client_fault_latch)")
+            dispatch.contains("let (mut parts, body, mut upload_pump, client_fault_latch")
                 && dispatch.contains("await_upload_write_watermark_first(")
                 && dispatch.contains("upload_pump.as_mut()")
                 && dispatch.contains("pump.cancel_and_join().await;")
@@ -5128,6 +5128,37 @@ fn specialized_streaming_dispatchers_race_the_backend_write_watermark() {
             "{label} must not discard the write-watermark receiver"
         );
     }
+
+    // The sidecar mesh-mTLS HTTP/2 upload keeps the pump for an authorization
+    // lifetime and otherwise lets hyper's HTTP/2 pipe bound the write from a
+    // request extension (vendored hyper patch 004), like direct-H2 and native
+    // gRPC; an expiry must still map to the pump's write-watermark terminal.
+    let mesh_mtls = PROXY_SOURCE
+        .split("async fn proxy_to_backend_mesh_mtls_after_ready(")
+        .nth(1)
+        .expect("sidecar mesh mTLS dispatcher")
+        .split("async fn proxy_to_backend_http2(")
+        .next()
+        .expect("bounded sidecar mesh mTLS dispatcher");
+    let auth_pump = mesh_mtls
+        .find("let pumped_write_timeout_ms = if upload_auth.is_some() {")
+        .expect("authorization lifetimes keep the write watermark on the pump");
+    let pipe_bound = mesh_mtls
+        .find("hyper::ext::Http2BodyWriteTimeout::new(")
+        .expect("an unauthenticated mesh mTLS upload bounds the write in hyper's pipe");
+    assert!(
+        auth_pump < pipe_bound
+            && mesh_mtls.contains("let pipe_write_timeout = (upload_auth.is_none()")
+            && mesh_mtls.contains("parts.extensions.insert(write_timeout.clone());")
+            && mesh_mtls
+                .contains("unpumped_client_fault_latch(upload_auth.as_ref(), pumped_write_timeout_ms)")
+            && mesh_mtls.contains(
+                "upload_auth.as_ref(),\n                    pumped_write_timeout_ms,\n                );"
+            )
+            && mesh_mtls.contains(".is_some_and(hyper::ext::Http2BodyWriteTimeout::expired)")
+            && mesh_mtls.contains("write_bound = \"h2_pipe\""),
+        "sidecar mesh mTLS must keep the pump for authorization lifetimes and bound the write otherwise"
+    );
 
     let native_grpc = GRPC_PROXY_SOURCE
         .split("pub async fn proxy_grpc_request_streaming(")
@@ -5581,7 +5612,7 @@ async fn the_pre_relay_gate_refuses_an_elapsed_plan_and_admits_a_live_one() {
 async fn a_relay_phase_dtls_expiry_publishes_the_bounded_class_exactly_once() {
     let _guard = counter_delta_guard().await;
     let latch = ferrum_edge::proxy::auth_lifetime::StreamAuthTerminationLatch::default();
-    let session_metadata = std::sync::Mutex::new(std::collections::HashMap::new());
+    let session_metadata = std::sync::Mutex::new(ferrum_edge::plugins::MetadataMap::default());
 
     let before = counters();
     let first = settle_dtls_relay_authorization_expiry_for_test(

@@ -1973,7 +1973,9 @@ fn intern_label(value: &str) -> Arc<str> {
 
 /// True when metadata carries mesh identity/routing keys rather than only the
 /// reserved internal `mesh.metrics.*` coordination namespace.
-fn metadata_has_mesh_identity_keys(metadata: &HashMap<String, String>) -> bool {
+fn metadata_has_mesh_identity_keys<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.keys().any(|key| {
         key.starts_with("mesh.")
             && !crate::plugins::utils::metadata_redaction::is_mesh_metrics_internal_metadata_key(
@@ -2509,7 +2511,11 @@ fn set_metric_label_value(key: &mut MeshRequestKey, label: MeshMetricLabel, valu
     }
 }
 
-fn metadata_arc(metadata: &HashMap<String, String>, key: &str, default: &str) -> Arc<str> {
+fn metadata_arc<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    key: &str,
+    default: &str,
+) -> Arc<str> {
     intern_label(metadata.get(key).map(String::as_str).unwrap_or(default))
 }
 
@@ -2526,7 +2532,11 @@ fn trust_bundle_fingerprint(roots_der: &[Vec<u8>]) -> u64 {
     hash
 }
 
-fn metadata_arc_any(metadata: &HashMap<String, String>, keys: &[&str], default: &str) -> Arc<str> {
+fn metadata_arc_any<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    keys: &[&str],
+    default: &str,
+) -> Arc<str> {
     intern_label(
         keys.iter()
             .find_map(|key| metadata.get(*key).map(String::as_str))
@@ -2534,8 +2544,8 @@ fn metadata_arc_any(metadata: &HashMap<String, String>, keys: &[&str], default: 
     )
 }
 
-fn metadata_arc_or_clone(
-    metadata: &HashMap<String, String>,
+fn metadata_arc_or_clone<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     key: &str,
     default: &Arc<str>,
 ) -> Arc<str> {
@@ -2616,8 +2626,8 @@ pub fn render_mesh_histogram_named(
 /// Build a mesh identity key from stream metadata (TCP/UDP connect or disconnect).
 ///
 /// TCP families omit `response_code` from the rendered label set (Istio parity).
-pub fn mesh_stream_key_from_metadata(
-    metadata: &HashMap<String, String>,
+pub fn mesh_stream_key_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     proxy_id: &str,
     proxy_name: Option<&str>,
 ) -> Option<MeshRequestKey> {
@@ -2668,8 +2678,8 @@ pub fn mesh_stream_key_from_metadata(
     Some(key)
 }
 
-pub(crate) fn mesh_metric_disabled_metadata(
-    metadata: &HashMap<String, String>,
+pub(crate) fn mesh_metric_disabled_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     family: MeshMetricFamily,
 ) -> bool {
     metadata
@@ -2681,8 +2691,8 @@ pub(crate) fn mesh_metric_disabled_metadata(
         })
 }
 
-pub(crate) fn mesh_request_key_for_family_from_metadata(
-    metadata: &HashMap<String, String>,
+pub(crate) fn mesh_request_key_for_family_from_metadata<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     base: &MeshRequestKey,
     family: MeshMetricFamily,
 ) -> MeshRequestKey {
@@ -2715,7 +2725,9 @@ pub(crate) fn mesh_request_key_for_family_from_metadata(
 /// incomplete/default labels and keeps mesh mode silent when its auto-injected
 /// `workload_metrics` plugin has no configured Prometheus exporter. The request
 /// protocol still defaults to `tcp` exactly as the key builder does.
-pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
+pub fn metadata_is_mesh_tcp_stream<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.contains_key(MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
         && metadata.contains_key(MESH_WORKLOAD_METRICS_OBSERVED_METADATA)
         && metadata
@@ -2725,7 +2737,9 @@ pub fn metadata_is_mesh_tcp_stream(metadata: &HashMap<String, String>) -> bool {
 }
 
 /// True when `TCP_OPENED_CONNECTIONS` was already finalized for this stream.
-pub fn mesh_tcp_opened_finalized(metadata: &HashMap<String, String>) -> bool {
+pub fn mesh_tcp_opened_finalized<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.contains_key(MESH_TCP_OPENED_FINALIZED_METADATA)
 }
 
@@ -2762,7 +2776,9 @@ pub fn is_mesh_grpc_protocol(protocol: &str) -> bool {
 
 /// True when the Prometheus hook observed a gRPC (or gRPC-Web) transaction that
 /// should populate authoritative length-prefixed message counters.
-pub fn metadata_observes_grpc_messages(metadata: &HashMap<String, String>) -> bool {
+pub fn metadata_observes_grpc_messages<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+) -> bool {
     metadata.contains_key(MESH_PROMETHEUS_METRICS_OBSERVED_METADATA)
         && metadata
             .get("request_protocol")
@@ -2798,8 +2814,8 @@ pub fn record_complete_grpc_message_count(counter: &AtomicU64, body: &[u8]) {
 ///
 /// Both directions therefore describe the native gRPC representation exchanged
 /// with the backend, and `fetch_max` keeps retried/replayed buffers idempotent.
-pub fn record_native_grpc_message_count(
-    metadata: &HashMap<String, String>,
+pub fn record_native_grpc_message_count<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
     counter: &AtomicU64,
     body: &[u8],
 ) {
@@ -3003,7 +3019,7 @@ mod tests {
     #[test]
     fn metric_override_plan_applies_after_base_attribution_in_order() {
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Copy the source workload into destination workload, then set
                 // the source to a new value. The order is observable.
@@ -3026,7 +3042,7 @@ mod tests {
     #[test]
     fn removed_and_renamed_labels_do_not_split_series_identity() {
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 // Remove source_principal, rename source_workload into
                 // source_app (removing source_workload).
@@ -3070,7 +3086,7 @@ mod tests {
         // `é` is UTF-8 C3 A9. Reading the lead byte then slicing at index 1
         // would panic on a char-boundary check; defensive parsing must return.
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 "m0;é".to_string(),
             )]),
@@ -3087,7 +3103,7 @@ mod tests {
         // Length is UTF-8 bytes so the body slice is well-formed as a str, but
         // opcode consumption must not panic mid-character.
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_REQUEST_COUNT_OVERRIDES_METADATA.to_string(),
                 "m0;x0,2:é;".to_string(),
             )]),
@@ -3127,7 +3143,7 @@ mod tests {
     #[test]
     fn metric_disable_marker_is_family_specific() {
         let summary = TransactionSummary {
-            metadata: HashMap::from([(
+            metadata: crate::plugins::MetadataMap::from_iter([(
                 MESH_METRICS_DISABLED_METADATA.to_string(),
                 "request_duration".to_string(),
             )]),

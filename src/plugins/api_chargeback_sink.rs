@@ -16044,7 +16044,10 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
     "http".to_string()
 }
 
-fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+fn metadata_value<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    keys: &[&str],
+) -> Option<String> {
     keys.iter()
         .find_map(|key| metadata.get(*key))
         .map(|value| bound_key_field(value, MAX_METADATA_FIELD_LEN))

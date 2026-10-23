@@ -85,7 +85,7 @@ fn make_summary(
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -153,7 +153,7 @@ fn make_stream_summary(
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 
@@ -3423,7 +3423,7 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
             auth_method: None,
-            metadata: HashMap::new(),
+            metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: Some(2),
         })
         .await;
@@ -3576,7 +3576,7 @@ async fn test_effective_chain_records_each_protocol_path_exactly_once() {
             error_class: None,
             consumer_username: Some(CONSUMER.to_string()),
             auth_method: None,
-            metadata: HashMap::new(),
+            metadata: ferrum_edge::plugins::MetadataMap::default(),
             proxy_lifecycle_generation: None,
         })
         .await;

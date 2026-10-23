@@ -6,7 +6,6 @@
 //! admission and OpenSSL-independent policy checks; see
 //! `tests/service_integration/README.md`.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -66,7 +65,7 @@ fn summary(path: &str, client_ip: &str) -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }

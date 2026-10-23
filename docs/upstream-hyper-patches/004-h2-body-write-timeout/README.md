@@ -73,13 +73,16 @@ Patch 004 never requires or restores the former fixed 1 KiB threshold.
   connection window needed by another stream. Without the extension, the
   pending DATA and positive-capacity behavior remain, with no write-stall timer.
 
-Ferrum attaches the extension instead of installing the pump on two paths:
+Ferrum attaches the extension instead of installing the pump on three paths:
 
 - the fully streamed native gRPC upload, when the request has no authorization
   lifetime (`UploadSource::for_streaming_grpc_upload`);
-- the direct-HTTP/2 passthrough arm.
+- the direct-HTTP/2 passthrough arm;
+- the streamed upload a mesh Sidecar forwards over its mesh-mTLS (or h2c
+  Unix-socket) HTTP/2 connection, when the request has no authorization
+  lifetime (`proxy_to_backend_mesh_mtls_after_ready`).
 
-On both, an expiry before response headers maps to the existing write-timeout
+On all three, an expiry before response headers maps to the existing write-timeout
 terminal: grpc-status 4 / `read_write_timeout` for gRPC, and 504 /
 `backend_timeout` / `read_write_timeout` for HTTP/2. An upload with an
 authorization lifetime keeps the pump, whose absolute deadline must release
@@ -187,6 +190,14 @@ Gateway coverage, run with `--ignored`:
   `write_bound="h2_pipe"` warning, which only the hyper path emits (the pump's
   warning says `upload_pump`). Both also assert that the backend saw
   `RST_STREAM(CANCEL)` on the request stream.
+- `http_mesh_mtls_upload_the_peer_stops_reading_ends_at_the_write_watermark`
+  in `tests/integration/mesh_grpc_transport_tests.rs` drives the Sidecar
+  mesh-mTLS dispatcher through `handle_proxy_request` against an SVID-mTLS
+  peer that stops granting window: the request ends with 504 /
+  `backend_timeout` inside the write bound and the peer sees
+  `RST_STREAM(CANCEL)`. `a_peer_that_stops_reading_trips_the_h2_pipe_write_timeout`
+  in `tests/integration/mesh_mtls_pool_width_tests.rs` checks the mesh-mTLS
+  pool's connections honour the extension. Neither needs `--ignored`.
 - `grpc_streaming_zero_write_timeout_is_not_cut`: with
   `backend_write_timeout_ms: 0`, the same stalled upload runs to the read
   timeout.

@@ -97,7 +97,9 @@ async fn cel_tag_override_evaluates_on_live_request_count_path() {
         http_method: "GET".into(),
         request_path: "/checkout".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -144,7 +146,9 @@ async fn cel_reads_original_attribution_not_prior_label_mutations() {
     let summary = TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -204,7 +208,9 @@ async fn cel_cannot_read_a_label_removed_earlier_in_the_override_plan() {
     let summary = TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -267,7 +273,9 @@ async fn missing_cel_attribute_emits_empty_label_not_invented_data() {
     let summary = TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     };
     registry.record(&summary);
@@ -449,7 +457,9 @@ async fn tag_override_reload_update_and_delete_change_emitted_labels() {
         let summary = TransactionSummary {
             http_method: "GET".into(),
             response_status_code: 200,
-            metadata: mesh_identity_metadata(ctx.metadata),
+            metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+                .into_iter()
+                .collect(),
             ..TransactionSummary::default()
         };
         registry.record(&summary);
@@ -504,7 +514,9 @@ async fn mesh_series_budget_caps_cel_cardinality_and_keeps_admitted_keys_updatin
         let summary = TransactionSummary {
             http_method: "GET".into(),
             response_status_code: 200,
-            metadata: mesh_identity_metadata(ctx.metadata),
+            metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+                .into_iter()
+                .collect(),
             ..TransactionSummary::default()
         };
         registry.record(&summary);
@@ -590,7 +602,7 @@ fn mesh_series_budget_admission_is_exact_under_concurrent_distinct_keys() {
             let summary = TransactionSummary {
                 http_method: "GET".into(),
                 response_status_code: 200,
-                metadata,
+                metadata: metadata.into_iter().collect(),
                 ..TransactionSummary::default()
             };
             barrier.wait();
@@ -635,7 +647,9 @@ async fn mesh_series_budget_releases_capacity_on_stale_eviction() {
         registry.record(&TransactionSummary {
             http_method: "GET".into(),
             response_status_code: 200,
-            metadata: mesh_identity_metadata(ctx.metadata),
+            metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+                .into_iter()
+                .collect(),
             ..TransactionSummary::default()
         });
     }
@@ -654,7 +668,9 @@ async fn mesh_series_budget_releases_capacity_on_stale_eviction() {
     registry.record(&TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     });
     assert_eq!(registry.mesh_series_live_for_test("REQUEST_COUNT"), Some(1));
@@ -805,7 +821,7 @@ async fn static_and_selective_cel_configs_stamp_only_required_attributes() {
         std::sync::Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
     );
     stream.destination_port = Some(15001);
-    stream.metadata = Some(HashMap::from([
+    stream.metadata = Some(ferrum_edge::plugins::MetadataMap::from_iter([
         ("mesh.metrics.cel.request_host".into(), "leak".into()),
         ("mesh.metrics.cel.request_method".into(), "GET".into()),
         ("mesh.metrics.cel.destination_port".into(), "1".into()),
@@ -891,7 +907,9 @@ async fn multiple_effective_instances_union_surviving_family_cel_inputs() {
     registry.record(&TransactionSummary {
         http_method: "POST".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     });
     let output = registry.render_uncached();
@@ -950,7 +968,9 @@ async fn later_same_family_plan_replaces_cel_input_requirements() {
     registry.record(&TransactionSummary {
         http_method: "GET".into(),
         response_status_code: 200,
-        metadata: mesh_identity_metadata(ctx.metadata),
+        metadata: mesh_identity_metadata(ctx.metadata.into_iter().collect())
+            .into_iter()
+            .collect(),
         ..TransactionSummary::default()
     });
     let output = registry.render_uncached();
@@ -998,7 +1018,7 @@ async fn multiple_stream_instances_preserve_surviving_destination_port_need() {
     );
     stream.destination_port = Some(15001);
     stream.connection_destination_port = Some(9080);
-    stream.metadata = Some(HashMap::from([(
+    stream.metadata = Some(ferrum_edge::plugins::MetadataMap::from_iter([(
         "mesh.metrics.prometheus_metrics_observed".into(),
         "1".into(),
     )]));

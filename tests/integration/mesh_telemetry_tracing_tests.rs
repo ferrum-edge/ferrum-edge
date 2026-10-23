@@ -91,7 +91,7 @@ fn traced_summary() -> TransactionSummary {
         latency_gateway_processing_ms: 2.0,
         latency_backend_ttfb_ms: 5.0,
         latency_backend_total_ms: 10.0,
-        metadata: HashMap::from([
+        metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             (
                 "trace_id".to_string(),
                 "abcdef1234567890abcdef1234567890".to_string(),

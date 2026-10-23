@@ -2424,10 +2424,10 @@ impl MeshAuthz {
         )
     }
 
-    fn decision_to_result(
+    fn decision_to_result<MS: std::hash::BuildHasher>(
         &self,
         decision: MeshAuthzDecision,
-        metadata: &mut HashMap<String, String>,
+        metadata: &mut HashMap<String, String, MS>,
     ) -> PluginResult {
         match decision {
             MeshAuthzDecision::Allow => PluginResult::Continue,
@@ -2567,9 +2567,9 @@ impl MeshAuthz {
     /// when the decision was a reject. The recorder degrades to a cheap
     /// `Mutex::lock` + ring push; capacity `0` short-circuits inside the
     /// recorder so we don't hide a branch behind a feature flag here.
-    fn record_policy_deny(
+    fn record_policy_deny<MS: std::hash::BuildHasher>(
         &self,
-        metadata: &HashMap<String, String>,
+        metadata: &HashMap<String, String, MS>,
         source_principal: Option<&str>,
     ) {
         let rule = match metadata.get("mesh_authz.deny_policy") {
@@ -4247,7 +4247,10 @@ fn is_hbone_request(ctx: &RequestContext) -> bool {
         .is_some_and(|value| value == "hbone")
 }
 
-fn record_ignored_baggage_reason(metadata: &mut HashMap<String, String>, reason: &'static str) {
+fn record_ignored_baggage_reason<MS: std::hash::BuildHasher>(
+    metadata: &mut HashMap<String, String, MS>,
+    reason: &'static str,
+) {
     metadata
         .entry("mesh_authz.ignored_baggage".to_string())
         .and_modify(|existing| {

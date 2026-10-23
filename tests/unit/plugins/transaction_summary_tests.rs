@@ -42,7 +42,7 @@ fn make_full_summary() -> TransactionSummary {
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }
@@ -595,7 +595,7 @@ fn make_stream_summary() -> StreamTransactionSummary {
         timestamp_connected: "2026-03-26T12:00:00Z".to_string(),
         timestamp_disconnected: "2026-03-26T12:00:01.5Z".to_string(),
         sni_hostname: None,
-        metadata: std::collections::HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 

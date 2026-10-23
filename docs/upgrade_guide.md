@@ -144,6 +144,32 @@ answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
 
+### Custom plugins: request metadata is a `MetadataMap` (PR #6787)
+
+These metadata maps are now `ferrum_edge::plugins::MetadataMap`:
+
+- `RequestContext.metadata`, `TransactionSummary.metadata` and
+  `StreamTransactionSummary.metadata`;
+- `WsDisconnectContext.metadata`, which every `on_ws_disconnect` receives;
+- `StreamConnectionContext.metadata` (an `Option<MetadataMap>`) and the map
+  `take_metadata()` returns, in `on_stream_connect`;
+- the map a `UdpMetadataSink::update` closure receives, in `on_udp_datagram`,
+  and the session map `UdpMetadataSink::new` wraps (it takes a
+  `&Mutex<MetadataMap>`; build one with `Mutex::new(MetadataMap::default())`).
+
+`MetadataMap` is a `HashMap<String, String>` keyed with
+`ahash`'s per-process randomly seeded hasher instead of std's SipHash. Keys,
+values, redaction and every serialized log or metric are unchanged, and
+`get`, `insert`, `remove` and iteration work as before. Built-in plugins are
+unaffected. Before upgrading, update custom plugins that name the type:
+
+- Build an empty map with `MetadataMap::default()`, not `HashMap::new()`, and
+  a populated one with `MetadataMap::from_iter([...])`.
+- A helper that takes `&HashMap<String, String>` and receives metadata should
+  take `&MetadataMap`, or be generic over `S: std::hash::BuildHasher` to accept
+  both maps.
+- Convert between the two map types with `.into_iter().collect()`.
+
 ### Custom plugins: `PluginHttpClient` accessors return an owned client (#6651, PR #6669)
 
 `PluginHttpClient::get()`, `get_http1()` and `get_http2()` now return

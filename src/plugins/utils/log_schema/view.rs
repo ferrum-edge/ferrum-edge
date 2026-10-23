@@ -627,16 +627,18 @@ impl SchemaSerializable for StreamTransactionSummary {
 
 /// Wrapper that serializes a metadata HashMap with redaction. Used when
 /// metadata is emitted as a nested object.
-pub(crate) struct MetadataNested<'a>(pub(crate) &'a std::collections::HashMap<String, String>);
+pub(crate) struct MetadataNested<'a, MS = std::collections::hash_map::RandomState>(
+    pub(crate) &'a std::collections::HashMap<String, String, MS>,
+);
 
-impl<'a> Serialize for MetadataNested<'a> {
+impl<MS: std::hash::BuildHasher> Serialize for MetadataNested<'_, MS> {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         crate::plugins::utils::metadata_redaction::serialize_redacted_metadata(self.0, ser)
     }
 }
 
-fn flatten_metadata<S>(
-    metadata: &std::collections::HashMap<String, String>,
+fn flatten_metadata<MS: std::hash::BuildHasher, S>(
+    metadata: &std::collections::HashMap<String, String, MS>,
     prefix: Option<&str>,
     on_collision: CollisionMode,
     emitted: &EmittedKeys<'_>,
@@ -677,8 +679,8 @@ where
 /// The nested form is emitted by `serialize_native`; this helper owns the
 /// omit / flatten behavior shared by the built-in summary types and
 /// WebSocket disconnect entries.
-pub(crate) fn serialize_schema_metadata<S>(
-    metadata: &std::collections::HashMap<String, String>,
+pub(crate) fn serialize_schema_metadata<MS: std::hash::BuildHasher, S>(
+    metadata: &std::collections::HashMap<String, String, MS>,
     policy: &MetadataPolicy,
     emitted: &EmittedKeys<'_>,
     map: &mut S,
@@ -706,7 +708,6 @@ mod tests {
         Direction, DisconnectCause, StreamTransactionSummary, TransactionSummary,
     };
     use serde_json::{Value, json};
-    use std::collections::HashMap;
 
     fn http_summary() -> TransactionSummary {
         TransactionSummary {
@@ -724,7 +725,7 @@ mod tests {
             bytes_received: 1024,
             grpc_request_messages: 0,
             grpc_response_messages: 0,
-            metadata: HashMap::from([
+            metadata: crate::plugins::MetadataMap::from_iter([
                 ("trace_id".to_string(), "abc-123".to_string()),
                 ("authorization".to_string(), "Bearer secret".to_string()),
             ]),
@@ -756,7 +757,10 @@ mod tests {
             timestamp_connected: "2026-05-11T12:00:00Z".into(),
             timestamp_disconnected: "2026-05-11T12:01:40Z".into(),
             sni_hostname: None,
-            metadata: HashMap::from([("session_id".to_string(), "xyz".to_string())]),
+            metadata: crate::plugins::MetadataMap::from_iter([(
+                "session_id".to_string(),
+                "xyz".to_string(),
+            )]),
         }
     }
 

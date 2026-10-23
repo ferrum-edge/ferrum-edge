@@ -5,7 +5,6 @@ use ferrum_edge::plugins::{
     validate_plugin_config,
 };
 use serde_json::json;
-use std::collections::HashMap;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
@@ -274,7 +273,7 @@ async fn test_stdout_logging_stream_disconnect() {
         timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     };
 
     plugin.on_stream_disconnect(&summary).await;
@@ -310,7 +309,7 @@ fn ws_disconnect_ctx(
         consumer_username: None,
         auth_method: None,
         connection_id: 7,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 

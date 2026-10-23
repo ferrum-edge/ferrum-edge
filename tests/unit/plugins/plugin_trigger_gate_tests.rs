@@ -1313,7 +1313,7 @@ fn stream_summary(client_ip: &str) -> StreamTransactionSummary {
         timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
         timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
         sni_hostname: None,
-        metadata: HashMap::new(),
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
     }
 }
 

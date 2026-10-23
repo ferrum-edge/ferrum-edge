@@ -467,7 +467,6 @@ fn unix_ms_rfc3339(unix_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use crate::plugins::mesh::prometheus_helpers::mesh_request_key;
 
@@ -882,8 +881,8 @@ mod tests {
     fn mesh_metadata(
         source_principal: &str,
         destination_principal: &str,
-    ) -> HashMap<String, String> {
-        HashMap::from([
+    ) -> crate::plugins::MetadataMap {
+        crate::plugins::MetadataMap::from_iter([
             (
                 "mesh.source.principal".to_string(),
                 source_principal.to_string(),

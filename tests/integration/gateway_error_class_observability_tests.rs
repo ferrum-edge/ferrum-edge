@@ -56,7 +56,7 @@ fn http_summary(status: u16, class: Option<ErrorClass>, phase: Option<&str>) -> 
         grpc_request_messages: 0,
         grpc_response_messages: 0,
         mirror: false,
-        metadata,
+        metadata: metadata.into_iter().collect(),
         ai_usage_export: None,
         proxy_lifecycle_generation: None,
     }

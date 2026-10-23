@@ -1532,7 +1532,7 @@ proxies it has three roles:
 `backend_write_timeout_ms` defaults to `30000` (30 seconds) and is the
 per-direction *idle* bound on writing the request body to the backend. HTTP-family
 uploads arm it in the gateway-owned upload pump (H1/H2/reqwest and native gRPC;
-two HTTP/2 uploads are bounded inside hyper instead, see below)
+three HTTP/2 uploads are bounded inside hyper instead, see below)
 or on each native-H3 `send_data`/`finish` — streaming uploads through their body
 adapter, and buffered uploads (retries, body-processing policy, retry replays)
 by handing the collected buffer to the same pump in bounded slices. `0` disables
@@ -1547,9 +1547,11 @@ blocked on bridge capacity — that expiry surfaces as `504` /
 `X-Gateway-Error: backend_timeout` / `error_class=read_write_timeout` (native
 gRPC: `grpc-status: 4` / `DEADLINE_EXCEEDED`, `error_class=read_write_timeout`).
 
-Two HTTP/2 uploads with no authorization lifetime need no pump for it: the
-fully streamed native gRPC upload, and the direct-HTTP/2 upload with no
-request-size limit (the passthrough arm). For those, hyper's own HTTP/2 body
+Three HTTP/2 uploads with no authorization lifetime need no pump for it: the
+fully streamed native gRPC upload, the direct-HTTP/2 upload with no
+request-size limit (the passthrough arm), and the streamed upload a mesh
+Sidecar forwards over its mesh-mTLS (or h2c Unix-socket) HTTP/2 connection.
+For those, hyper's own HTTP/2 body
 pipe enforces the bound (vendored hyper patch 004,
 [`docs/upstream-hyper-patches/004-h2-body-write-timeout/`](upstream-hyper-patches/004-h2-body-write-timeout/README.md)),
 the way nginx's `grpc_send_timeout` bounds "two successive write operations".
