@@ -3173,9 +3173,15 @@ impl<MS: std::hash::BuildHasher> LabelWriter<'_, MS> {
     /// and its name (or id) for workload, app and service.
     fn route_destination(&mut self, namespace: &str, destination: &str) {
         self.set_str(MeshLabel::DestinationNamespace, namespace);
-        self.set_str(MeshLabel::DestinationWorkload, destination);
-        self.set_str(MeshLabel::DestinationApp, destination);
-        self.set_str(MeshLabel::DestinationService, destination);
+        // One shared value for the three labels, reused from the shadow when
+        // an earlier stamp already holds it.
+        let destination = match self.shadow.get_arc(MeshLabel::DestinationWorkload) {
+            Some(existing) if &**existing == destination => Arc::clone(existing),
+            _ => Arc::from(destination),
+        };
+        self.set(MeshLabel::DestinationWorkload, &destination);
+        self.set(MeshLabel::DestinationApp, &destination);
+        self.set(MeshLabel::DestinationService, &destination);
     }
 }
 
