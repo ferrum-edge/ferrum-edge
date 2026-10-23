@@ -691,8 +691,8 @@ fn only_audited_sources_name_the_mesh_label_keys() {
                 "mesh_label_shadow",
                 ".mesh_labels",
             ]
-                .iter()
-                .any(|needle| production.contains(needle));
+            .iter()
+            .any(|needle| production.contains(needle));
             if !names_keys && !uses_typed {
                 continue;
             }
