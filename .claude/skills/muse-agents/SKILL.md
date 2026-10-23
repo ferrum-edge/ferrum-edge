@@ -1,6 +1,6 @@
 ---
 name: muse-agents
-description: Dispatch and orchestrate local Muse Wonder Full subagents via the standalone Muse Code muse CLI harness for ferrum-edge issue/PR work — implementer, fix-round, and shepherd modes, with low/medium/high/xhigh/max/ultra reasoning effort, worktree isolation, and the review loop. Use when the user asks Claude to spawn Muse/Muse Wonder Full agents on issues, PRs, review findings, or red CI.
+description: Dispatch and orchestrate local Muse Wonder Full subagents via the standalone Muse Code muse CLI harness for ferrum-edge issue/PR work — implementer, fix-round, shepherd, and read-only reviewer modes, with low/medium/high/xhigh/max/ultra reasoning effort, worktree isolation, and the review loop. Use when the user asks Claude to spawn Muse/Muse Wonder Full agents on issues, PRs, review findings, red CI, or an independent PR review.
 ---
 
 # Muse Wonder Full agents
