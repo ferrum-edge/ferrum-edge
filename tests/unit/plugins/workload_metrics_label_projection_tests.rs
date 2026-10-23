@@ -535,3 +535,74 @@ async fn service_graph_records_one_edge_for_eager_and_deferred_requests() {
     assert_eq!(edge.destination_principal, LOCAL_ID);
     assert_eq!(edge.destination_namespace, "payments");
 }
+
+#[test]
+fn only_audited_sources_name_the_mesh_label_keys() {
+    // A deferred request leaves the label keys out of metadata, which is
+    // sound only while nothing outside these files reads or writes them on
+    // the HTTP path. A new reader or writer must either go through the typed
+    // projection or make its plugin an observer; extend this table only after
+    // that audit.
+    let allowed: &[(&str, &str)] = &[
+        (
+            "src/plugins/mesh/workload_metrics.rs",
+            "the projection's single writer; stream-path stamping",
+        ),
+        (
+            "src/plugins/mesh/telemetry_facts.rs",
+            "the typed projection's key table",
+        ),
+        (
+            "src/plugins/mesh/prometheus_helpers.rs",
+            "the string key parser and metric label names",
+        ),
+        (
+            "src/plugins/utils/metadata_redaction.rs",
+            "log serialization allowlist, reached only through observing sinks",
+        ),
+        (
+            "src/proxy/mod.rs",
+            "the mesh-dispatch overlay, mirrored into the typed projection",
+        ),
+        (
+            "src/proxy/mesh_egress_observability.rs",
+            "captured L4 egress stream summaries, not HTTP request metadata",
+        ),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut pending = vec![root.join("src")];
+    let mut offenders = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            // Inline test modules may name the keys freely.
+            let production = source
+                .find("#[cfg(test)]\nmod tests")
+                .map_or(source.as_str(), |index| &source[..index]);
+            if !production.contains("\"mesh.source.") && !production.contains("\"mesh.destination.")
+            {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .expect("under the manifest dir")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !allowed.iter().any(|(file, _)| *file == relative) {
+                offenders.push(relative);
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "unaudited mesh label key users: {offenders:?}"
+    );
+}
