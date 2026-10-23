@@ -411,6 +411,36 @@ pub struct WorkloadMetrics {
     direction_emit: DirectionEmit,
 }
 
+/// An unconfigured instance, as the former `#[derive(Default)]` produced. Its
+/// local facts are resolved from no labels, no namespace and no SPIFFE
+/// identity, exactly what a stamp derived from that empty config before the
+/// facts were precomputed (issue #6793).
+impl Default for WorkloadMetrics {
+    fn default() -> Self {
+        Self {
+            node_id: None,
+            topology: None,
+            namespace: None,
+            workload_spiffe_id: None,
+            local_facts: resolve_local_workload_facts(&HashMap::new(), None, None),
+            baggage_trust: BaggageTrustPolicy::default(),
+            sampling_percentage: None,
+            custom_tags: HashMap::new(),
+            custom_header_tags: HashMap::new(),
+            redacted_header_tags: HashSet::new(),
+            tag_override_plans: Vec::new(),
+            disabled_metrics_marker: None,
+            custom_trace_attributes_marker: None,
+            tracing_providers: Vec::new(),
+            trace_exporters: Vec::new(),
+            export_drop_log_limiter: Mutex::default(),
+            span_reporting_disabled: false,
+            service_name: String::new(),
+            direction_emit: DirectionEmit::default(),
+        }
+    }
+}
+
 impl WorkloadMetrics {
     #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {

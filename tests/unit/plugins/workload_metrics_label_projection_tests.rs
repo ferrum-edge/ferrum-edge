@@ -427,6 +427,30 @@ async fn compatibility_clones_carry_the_typed_projection() {
     assert_eq!(clone.mesh_label_shadow(), ctx.mesh_label_shadow());
 }
 
+#[tokio::test]
+async fn the_default_instance_stamps_like_an_empty_config() {
+    // `WorkloadMetrics: Default` predates the precomputed local facts; the
+    // default instance must resolve them exactly as an empty config does.
+    let from_default: Vec<Arc<dyn Plugin>> = vec![Arc::new(WorkloadMetrics::default())];
+    let from_empty = chain(&json!({}));
+    for shape in SHAPES {
+        let mut default_ctx = context(shape, false);
+        stamp(&from_default, &mut default_ctx).await;
+        let mut empty_ctx = context(shape, false);
+        stamp(&from_empty, &mut empty_ctx).await;
+        assert_eq!(
+            label_subset(&default_ctx.metadata),
+            label_subset(&empty_ctx.metadata),
+            "{shape:?}: the default instance must project the empty-config labels"
+        );
+        assert_eq!(
+            shadow_projection(&default_ctx),
+            label_subset(&default_ctx.metadata),
+            "{shape:?}: the default instance's shadow must mirror its projection"
+        );
+    }
+}
+
 struct CustomObserver;
 
 #[async_trait]
