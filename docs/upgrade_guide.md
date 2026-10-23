@@ -146,9 +146,16 @@ source to each rule before upgrading.
 
 ### Custom plugins: request metadata is a `MetadataMap` (PR #6787)
 
-`RequestContext.metadata`, `TransactionSummary.metadata`,
-`StreamTransactionSummary.metadata` and stream-session metadata are now
-`ferrum_edge::plugins::MetadataMap`: a `HashMap<String, String>` keyed with
+These metadata maps are now `ferrum_edge::plugins::MetadataMap`:
+
+- `RequestContext.metadata`, `TransactionSummary.metadata` and
+  `StreamTransactionSummary.metadata`;
+- `WsDisconnectContext.metadata`, which every `on_ws_disconnect` receives;
+- `StreamConnectionContext.metadata` (an `Option<MetadataMap>`) and the map
+  `take_metadata()` returns, in `on_stream_connect`;
+- the map a `UdpMetadataSink::update` closure receives, in `on_udp_datagram`.
+
+`MetadataMap` is a `HashMap<String, String>` keyed with
 `ahash`'s per-process randomly seeded hasher instead of std's SipHash. Keys,
 values, redaction and every serialized log or metric are unchanged, and
 `get`, `insert`, `remove` and iteration work as before. Built-in plugins are

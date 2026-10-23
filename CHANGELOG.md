@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **BREAKING (custom plugins) — request metadata maps use a faster hasher**
-  (issue #6787). `RequestContext.metadata`, the transaction and stream summaries'
-  `metadata`, and the stream-session metadata are now
+  (issue/PR #6787). `RequestContext.metadata`, `TransactionSummary.metadata`,
+  `StreamTransactionSummary.metadata`, `WsDisconnectContext.metadata`,
+  `StreamConnectionContext.metadata` (and its `take_metadata()` return), and the
+  map a `UdpMetadataSink::update` closure receives are now
   `ferrum_edge::plugins::MetadataMap`, a `HashMap<String, String>` keyed with
   `ahash`'s per-process randomly seeded hasher instead of std's SipHash-1-3.
   Mesh telemetry stamps and reads a few dozen metadata keys on every request,

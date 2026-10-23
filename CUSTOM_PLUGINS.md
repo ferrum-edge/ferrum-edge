@@ -1202,8 +1202,10 @@ pub struct RequestContext {
     /// None when no auth plugin identified the client.
     pub auth_method: Option<&'static str>,
     pub timestamp_received: DateTime<Utc>,
-    /// Extra metadata plugins can attach (inter-plugin communication)
-    pub metadata: HashMap<String, String>,
+    /// Extra metadata plugins can attach (inter-plugin communication).
+    /// `ferrum_edge::plugins::MetadataMap`: a `HashMap<String, String>` with an
+    /// `ahash` hasher; build one with `MetadataMap::default()`.
+    pub metadata: MetadataMap,
     /// DER-encoded client certificate from mTLS handshake (first cert in chain).
     /// Shared via Arc to avoid cloning cert bytes on HTTP/2 connections.
     pub tls_client_cert_der: Option<Arc<Vec<u8>>>,
@@ -1322,7 +1324,7 @@ pub struct TransactionSummary {
     pub grpc_request_messages: u64,
     pub grpc_response_messages: u64,
     pub mirror: bool,
-    pub metadata: HashMap<String, String>,
+    pub metadata: MetadataMap,
 }
 ```
 
@@ -1354,7 +1356,7 @@ pub struct StreamTransactionSummary {
     pub timestamp_connected: String,
     pub timestamp_disconnected: String,
     pub sni_hostname: Option<String>,
-    pub metadata: HashMap<String, String>,     // Carried from on_stream_connect
+    pub metadata: MetadataMap,     // Carried from on_stream_connect
 }
 ```
 
