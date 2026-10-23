@@ -153,7 +153,9 @@ These metadata maps are now `ferrum_edge::plugins::MetadataMap`:
 - `WsDisconnectContext.metadata`, which every `on_ws_disconnect` receives;
 - `StreamConnectionContext.metadata` (an `Option<MetadataMap>`) and the map
   `take_metadata()` returns, in `on_stream_connect`;
-- the map a `UdpMetadataSink::update` closure receives, in `on_udp_datagram`.
+- the map a `UdpMetadataSink::update` closure receives, in `on_udp_datagram`,
+  and the session map `UdpMetadataSink::new` wraps (it takes a
+  `&Mutex<MetadataMap>`; build one with `Mutex::new(MetadataMap::default())`).
 
 `MetadataMap` is a `HashMap<String, String>` keyed with
 `ahash`'s per-process randomly seeded hasher instead of std's SipHash. Keys,
