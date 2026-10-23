@@ -4008,6 +4008,31 @@ Labels include:
 | `response_flags` | Error flags |
 | `connection_security_policy` | `mutual_tls` or `none` |
 
+#### How workload labels reach metrics (issue #6793)
+
+`workload_metrics` resolves the local workload's labels once per plugin
+generation and a verified TLS peer's SPIFFE labels once per connection, and
+keeps the request's `mesh.source.*` / `mesh.destination.*` labels as a typed
+copy in request state, alongside the gateway's outbound mesh-dispatch overlay
+(`mesh.destination.principal`, `namespace`, `service`, `trust_domain` from the
+selected target's tags). RED metrics and the service graph build their key
+from that typed copy instead of parsing and interning the metadata strings.
+
+The string labels in `RequestContext.metadata` and
+`TransactionSummary.metadata` are unchanged for anything that can read them.
+When at least one plugin in the request's chain can observe them — every
+custom plugin, access logging (`stdout_logging` and the other log sinks),
+`prometheus_metrics`, `otel_tracing`, and a `workload_metrics` instance that
+exports spans — they are written exactly as before, and metric emission uses
+the typed copy only after proving the summary still holds the same values; a
+label another plugin rewrote is reported as the metadata says. When every
+plugin in the chain is an audited non-observer (`spiffe_identity`,
+`mesh_authz`, and a `workload_metrics` instance without span exporters — the
+default sidecar chain with access logging disabled), the label keys are left
+out of both metadata maps, since nothing could read them. Every other `mesh.*`
+key (`mesh.request_protocol`, `mesh.connection_security_policy`,
+`mesh.direction`, trace and tag keys) is always written.
+
 ### Service Graph
 
 `GET /mesh/service-graph` exposes the same mesh identity labels as a node-local service graph. The graph is built by the auto-injected `workload_metrics` plugin at log time and aggregates HTTP-family traffic by `(source_principal, destination_principal)` with request count, error count, total duration, average duration, and last-seen timestamp. The admin endpoint is JWT-authenticated. Snapshots are built on demand: a read rebuilds the published `ArcSwap` snapshot only when it is at least one second old, so polling at any rate iterates the live `DashMap` at most once per second, and an unread graph costs only a background retention sweep every 30 seconds. Edges idle for five minutes are evicted. Each data plane tracks at most 10,000 live edges. Once the cap is reached, transactions for new edges are dropped (with a sampled warning) until retention frees a slot, and edges already tracked keep counting.

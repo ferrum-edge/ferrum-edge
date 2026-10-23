@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Mesh workload labels travel as typed facts** (issue #6793).
+  `workload_metrics` now resolves the local workload's labels once per plugin
+  generation and a verified TLS peer's SPIFFE labels once per connection, and
+  keeps each request's `mesh.source.*` / `mesh.destination.*` labels as a typed
+  copy in request state. RED metrics and the mesh service graph build their key
+  from it instead of parsing and interning the metadata strings, and service
+  graph edges are keyed by a precomputed keyed hash. When every plugin in a
+  request's chain is an audited non-observer of those labels (`spiffe_identity`,
+  `mesh_authz`, and a `workload_metrics` instance without span exporters), the
+  label keys are no longer written into `RequestContext.metadata` /
+  `TransactionSummary.metadata`, because nothing in that chain can read them.
+  Any custom plugin, log sink, `prometheus_metrics`, `otel_tracing`, or
+  span-exporting `workload_metrics` keeps the string labels exactly as before.
+  Metric labels, service-graph edges and every serialized output are
+  unchanged. New `Plugin::observes_mesh_label_metadata()` (default `true`)
+  declares whether a plugin can see the labels; custom plugins need no change.
 - **BREAKING (custom plugins) — request metadata maps use a faster hasher**
   (issue/PR #6787). `RequestContext.metadata`, `TransactionSummary.metadata`,
   `StreamTransactionSummary.metadata`, `WsDisconnectContext.metadata`, the
