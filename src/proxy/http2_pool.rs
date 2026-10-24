@@ -1293,21 +1293,32 @@ impl Http1Lanes {
     /// hyper reports it idle — the same rule as the Unix-socket pool's
     /// `checkin_h1_when_idle`.
     fn checkin(checkout: Http1Checkout) {
-        if checkout.sender.is_closed()
-            || checkout.lane.generation.load(Ordering::Acquire) != checkout.generation
-        {
+        use h1_churn_diag::*;
+        CHECKIN_CALLS.fetch_add(1, Ordering::Relaxed);
+        if checkout.sender.is_closed() {
+            CHECKIN_CLOSED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if checkout.lane.generation.load(Ordering::Acquire) != checkout.generation {
+            CHECKIN_GEN_STALE.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if checkout.sender.is_ready() {
+            CHECKIN_READY.fetch_add(1, Ordering::Relaxed);
             Self::push_idle(checkout);
             return;
         }
+        CHECKIN_WAIT_SPAWNED.fetch_add(1, Ordering::Relaxed);
         let mut checkout = checkout;
         tokio::spawn(async move {
-            if checkout.sender.ready().await.is_ok()
-                && checkout.lane.generation.load(Ordering::Acquire) == checkout.generation
-            {
+            if checkout.sender.ready().await.is_err() {
+                WAIT_READY_ERR.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if checkout.lane.generation.load(Ordering::Acquire) == checkout.generation {
                 Self::push_idle(checkout);
+            } else {
+                WAIT_GEN_STALE.fetch_add(1, Ordering::Relaxed);
             }
         });
     }
@@ -1322,12 +1333,20 @@ impl Http1Lanes {
         } = checkout;
         // A full lane drops the connection (the oldest-wins tradeoff of a
         // bounded idle set); `push` hands the entry back and it drops here.
-        let _ = lane.idle.push(IdleH1 {
-            sender,
-            socket,
-            idle_since: std::time::Instant::now(),
-            idle_timeout,
-        });
+        if lane
+            .idle
+            .push(IdleH1 {
+                sender,
+                socket,
+                idle_since: std::time::Instant::now(),
+                idle_timeout,
+            })
+            .is_ok()
+        {
+            h1_churn_diag::PUSH_OK.fetch_add(1, Ordering::Relaxed);
+        } else {
+            h1_churn_diag::PUSH_FULL.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn clear(&self) {
@@ -1496,10 +1515,59 @@ where
     Ok(sender)
 }
 
+/// EXPERIMENT (not for merge): direct-H1 lane churn counters, printed to
+/// stderr every 5 s while they change.
+pub(crate) mod h1_churn_diag {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    macro_rules! counters { ($($name:ident),*) => {
+        $(pub(crate) static $name: AtomicU64 = AtomicU64::new(0);)*
+        fn snapshot() -> String {
+            let mut s = String::new();
+            $(s.push_str(&format!(" {}={}", stringify!($name).to_ascii_lowercase(), $name.load(Ordering::Relaxed)));)*
+            s
+        }
+    } }
+    counters!(
+        CHECKIN_CALLS,
+        CHECKIN_CLOSED,
+        CHECKIN_GEN_STALE,
+        CHECKIN_READY,
+        CHECKIN_WAIT_SPAWNED,
+        WAIT_READY_ERR,
+        WAIT_GEN_STALE,
+        PUSH_OK,
+        PUSH_FULL,
+        POP_CLOSED,
+        POP_NOT_READY,
+        POP_EXPIRED,
+        POP_REUSED,
+        NEW_CONN,
+        NEW_CONN_FRESH
+    );
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    pub(crate) fn spawn_reporter(handle: &tokio::runtime::Handle) {
+        if STARTED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        handle.spawn(async move {
+            let mut last = String::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let now = snapshot();
+                if now != last {
+                    eprintln!("[h1-churn]{now}");
+                    last = now;
+                }
+            }
+        });
+    }
+}
+
 fn spawn_http1_lane_sweeper(lanes: &Arc<Http1Lanes>, interval: Duration) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
+    h1_churn_diag::spawn_reporter(&handle);
     let weak = Arc::downgrade(lanes);
     handle.spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -1759,9 +1827,19 @@ impl Http2ConnectionPool {
                 // Only ready senders are pooled; one that is no longer ready
                 // or open is closing, and waiting on it would park this
                 // request behind a connection that will never serve it.
-                if idle.sender.is_closed() || !idle.sender.is_ready() || idle.expired(now) {
+                if idle.sender.is_closed() {
+                    h1_churn_diag::POP_CLOSED.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                if !idle.sender.is_ready() {
+                    h1_churn_diag::POP_NOT_READY.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if idle.expired(now) {
+                    h1_churn_diag::POP_EXPIRED.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                h1_churn_diag::POP_REUSED.fetch_add(1, Ordering::Relaxed);
                 crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(Http1Checkout {
                     lane,
@@ -1772,6 +1850,10 @@ impl Http2ConnectionPool {
                     idle_timeout,
                 });
             }
+        }
+        h1_churn_diag::NEW_CONN.fetch_add(1, Ordering::Relaxed);
+        if fresh {
+            h1_churn_diag::NEW_CONN_FRESH.fetch_add(1, Ordering::Relaxed);
         }
         let setup_started = crate::plugins::otel_tracing::backend_connection_setup_clock();
         // Boxed: the dial (DNS, TCP, TLS handshake) is the cold path, and
