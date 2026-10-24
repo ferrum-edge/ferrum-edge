@@ -282,7 +282,7 @@ def _single_line_input(line: str, mapping_keys: frozenset[str] = frozenset()) ->
         return "'" not in value and '"' not in value and _strip_comment(value).endswith(closing)
     if value.startswith(("&", "*", "!")):
         return False  # anchors, aliases, and tags are not read here
-    plain = _strip_comment(value)
+    plain = re.split(r"[ \t]#", value, maxsplit=1)[0].strip()
     if plain.endswith(("'", '"')) and plain.count(plain[-1]) % 2:
         # An unbalanced closing quote ends a value opened on an earlier line.
         return False
@@ -644,7 +644,8 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
             job = None
             for back in range(index - 1, -1, -1):
                 if back in open_scalar:
-                    continue
+                    job = None  # crossed unread scalar text: no exemption
+                    break
                 job_match = JOB_KEY.match(lines[back])
                 if job_match is not None:
                     job = job_match.group("job")
@@ -1362,6 +1363,20 @@ def run_self_test() -> list[str]:
             "          persist-credentials: false\n" + tail,
         ),
         (
+            "flow sequence key hides env scalar",
+            pr + "      - env:\n          [X]: \"ignored\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: x#y\"\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "comment-bearing closer after single-quoted opener",
+            pr + "      - env:\n          X: 'ignored\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: x#y'\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "comment-like suffix on the value",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false#x\n" + tail,
+        ),
+        (
             "composite block scalar impersonation",
             "name: a\nruns:\n  using: composite\n  steps:\n"
             f"    - uses: {pin}\n      with:\n        ssh-known-hosts: |\n"
@@ -1423,6 +1438,18 @@ def run_self_test() -> list[str]:
     ) + f"      - uses: {pin}\n" + tail
     if not checkout_credential_errors(decoy_job, ".github/workflows/release.yml"):
         failures.append("checkout credential self-test: frozen job key inside a scalar was admitted")
+    # A flow plain scalar holding a quote must not hide a real job key from the
+    # frozen-job exemption: the checkout below belongs to `victim`, not `docker`.
+    hidden_job = (
+        pr.replace("  build:\n", "  docker:\n")
+        + "      - run: true\n"
+        + '  "probe":\n    runs-on: ubuntu-latest\n    env: {X: a"b}\n    steps:\n'
+        "      - run: true\n  victim:\n    runs-on: ubuntu-latest\n    steps:\n"
+        '      - run: echo "}"\n'
+        f"      - uses: {pin}\n"
+    )
+    if not checkout_credential_errors(hidden_job, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: frozen exemption reached a hidden job")
     frozen_true = frozen.replace(tail, "        with:\n          persist-credentials: true\n" + tail)
     if not checkout_credential_errors(frozen_true, ".github/workflows/release.yml"):
         failures.append("checkout credential self-test: policy-frozen job admitted true")
