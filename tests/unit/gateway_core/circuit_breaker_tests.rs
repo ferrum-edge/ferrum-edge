@@ -2973,7 +2973,7 @@ fn dropping_the_tcp_cache_probe_future_releases_the_admitted_breaker_slot() {
                     .expect("timeout 0 admits the TCP setup probe");
                 assert!(Arc::ptr_eq(&cb, &admitted_cb));
                 assert!(is_half_open_probe);
-                let mut cb_probe = HalfOpenProbeGuard::for_admitted_probe(
+                let cb_probe = HalfOpenProbeGuard::for_admitted_probe(
                     &admitted_cb,
                     is_half_open_probe,
                     admission_generation,
@@ -3103,7 +3103,7 @@ fn a_guard_for_a_closed_state_request_owns_nothing() {
 
 #[test]
 fn rearming_adopts_the_rotated_targets_slot_and_settles_the_previous_one() {
-    let (first, mut guard) = breaker_with_admitted_probe();
+    let (first, guard) = breaker_with_admitted_probe();
     let (second, second_guard) = breaker_with_admitted_probe();
     // The rotated target's slot is owned by the retry's own re-admission; this
     // fixture guard for it must not also hold it.
@@ -3135,7 +3135,7 @@ fn rearming_adopts_the_rotated_targets_slot_and_settles_the_previous_one() {
 
 #[test]
 fn rearming_onto_a_closed_state_retry_leaves_the_guard_empty() {
-    let (first, mut guard) = breaker_with_admitted_probe();
+    let (first, guard) = breaker_with_admitted_probe();
     let healthy = Arc::new(CircuitBreaker::new(probe_slot_breaker_config()));
 
     guard.rearm(&healthy, false, healthy.open_epoch());
@@ -3227,4 +3227,596 @@ fn a_probe_guard_that_outlives_a_reopen_cannot_free_a_current_cycle_slot() {
         assert_eq!(cb.half_open_in_flight(), 0);
         assert_eq!(cb.state_name(), "half_open");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #6799: an attempt's outcome settles on the breaker instance that
+// admitted it, and only while that instance is still the cached breaker for its
+// key. Admission may replace a breaker whose config changed; a completion must
+// never replace live state, nor settle on a NEW instance (A→B→A reload, prune
+// and recreate) it never ran against.
+// ---------------------------------------------------------------------------
+
+/// Breaker configuration "A": the one in force when the old request was admitted.
+fn stale_completion_config_a() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 5,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500, 502, 503],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    }
+}
+
+/// Breaker configuration "B": the reloaded one; differs from A.
+fn stale_completion_config_b() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 2,
+        ..stale_completion_config_a()
+    }
+}
+
+/// A proxy state whose only proxy runs breaker config A, plus that proxy's
+/// captured snapshot (what an in-flight request admitted under A holds).
+fn stale_completion_state() -> (ProxyState, ferrum_edge::config::types::Proxy) {
+    let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [],
+        "plugin_configs": [],
+        "proxies": [{
+            "id": "cb-stale-completion",
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "circuit_breaker": {
+                "failure_threshold": 5,
+                "success_threshold": 1,
+                "timeout_seconds": 60,
+                "failure_status_codes": [500, 502, 503],
+                "half_open_max_requests": 1,
+                "trip_on_connection_errors": true
+            }
+        }],
+        "upstreams": []
+    }))
+    .expect("test config should deserialize");
+    config.normalize_fields();
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (state, _) = ProxyState::new(
+        config,
+        dns_cache,
+        ferrum_edge::config::env_config::EnvConfig::default(),
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+    let proxy_a = state.request_epoch.load().config().proxies[0].clone();
+    assert_eq!(
+        proxy_a.circuit_breaker.as_ref(),
+        Some(&stale_completion_config_a()),
+        "the fixture proxy must run breaker config A"
+    );
+    (state, proxy_a)
+}
+
+/// `proxy` with its breaker config replaced (a reloaded snapshot).
+fn with_breaker(
+    proxy: &ferrum_edge::config::types::Proxy,
+    config: &CircuitBreakerConfig,
+) -> ferrum_edge::config::types::Proxy {
+    let mut reloaded = proxy.clone();
+    reloaded.circuit_breaker = Some(config.clone());
+    reloaded
+}
+
+/// One production cache admission and the guard that owns it.
+fn admit(
+    state: &ProxyState,
+    proxy: &ferrum_edge::config::types::Proxy,
+    key: &str,
+) -> (Arc<CircuitBreaker>, HalfOpenProbeGuard) {
+    let config = proxy.circuit_breaker.as_ref().expect("breaker configured");
+    let (cb, is_half_open_probe, admission_generation) = state
+        .circuit_breaker_cache
+        .can_execute(&proxy.namespace, &proxy.id, Some(key), config)
+        .expect("admission");
+    let guard =
+        HalfOpenProbeGuard::for_admitted_probe(&cb, is_half_open_probe, admission_generation);
+    (cb, guard)
+}
+
+/// Settle an attempt through the shared ordinary-completion recorder.
+fn complete(
+    state: &ProxyState,
+    proxy: &ferrum_edge::config::types::Proxy,
+    key: &str,
+    status: u16,
+    guard: &HalfOpenProbeGuard,
+) {
+    ferrum_edge::_test_support::record_backend_completion_for_test(
+        state,
+        proxy,
+        Some(key),
+        status,
+        false,
+        None,
+        guard,
+    );
+}
+
+fn live(
+    state: &ProxyState,
+    proxy: &ferrum_edge::config::types::Proxy,
+    key: &str,
+) -> Arc<CircuitBreaker> {
+    state
+        .circuit_breaker_cache
+        .peek(&proxy.namespace, &proxy.id, Some(key))
+        .expect("a breaker is cached for the key")
+}
+
+#[test]
+fn is_current_compares_breaker_identity_not_config() {
+    let cache = CircuitBreakerCache::new();
+    let cfg = stale_completion_config_a();
+    let tk = target_key("10.0.0.1", 8080);
+
+    let (first, _, _) = cache
+        .can_execute("ferrum", "proxy-x", Some(&tk), &cfg)
+        .expect("admits");
+    assert!(cache.is_current("ferrum", "proxy-x", Some(&tk), &first));
+    assert!(
+        !cache.is_current("ferrum", "proxy-x", None, &first),
+        "a different key is never current"
+    );
+
+    // Reclaim the key and recreate it with the SAME config: a new instance.
+    cache.prune_stale_targets(&std::collections::HashSet::new());
+    assert!(!cache.is_current("ferrum", "proxy-x", Some(&tk), &first));
+    let (second, _, _) = cache
+        .can_execute("ferrum", "proxy-x", Some(&tk), &cfg)
+        .expect("admits");
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(first.config(), second.config());
+    assert!(
+        !cache.is_current("ferrum", "proxy-x", Some(&tk), &first),
+        "an equal config does not make a retired instance current"
+    );
+    assert!(cache.is_current("ferrum", "proxy-x", Some(&tk), &second));
+    assert_eq!(cache.len(), 1, "the check never inserts");
+}
+
+#[tokio::test]
+async fn stale_ordinary_completion_cannot_reset_a_reloaded_breaker() {
+    let (state, proxy_a) = stale_completion_state();
+    let cfg_b = stale_completion_config_b();
+    let proxy_b = with_breaker(&proxy_a, &cfg_b);
+    let key = target_key("backend.local", 8080);
+    let cache = &state.circuit_breaker_cache;
+
+    // 1. A buffered request is admitted under A; its response is held.
+    let (cb_a, guard_a) = admit(&state, &proxy_a, &key);
+
+    // 2. Reload to B. The first B admission replaces the breaker and fails.
+    let (cb_b, guard_b1) = admit(&state, &proxy_b, &key);
+    assert!(!Arc::ptr_eq(&cb_a, &cb_b), "admission replaces on change");
+    complete(&state, &proxy_b, &key, 502, &guard_b1);
+    assert_eq!(cb_b.failure_count(), 1);
+
+    // 3. B's second failure opens it.
+    let (_, guard_b2) = admit(&state, &proxy_b, &key);
+    complete(&state, &proxy_b, &key, 502, &guard_b2);
+    assert_eq!(cb_b.state_name(), "open");
+
+    // 4. The old A request completes successfully.
+    complete(&state, &proxy_a, &key, 200, &guard_a);
+
+    // B's Arc, config, failures and open state survive the stale completion.
+    let current = live(&state, &proxy_a, &key);
+    assert!(
+        Arc::ptr_eq(&current, &cb_b),
+        "a stale completion must not replace the live breaker"
+    );
+    assert_eq!(current.config(), &cfg_b);
+    assert_eq!(current.state_name(), "open");
+    assert_eq!(current.failure_count(), 2);
+    assert_eq!(cache.len(), 1);
+
+    // 5. The next B admission is still refused.
+    assert!(
+        cache
+            .can_execute(&proxy_b.namespace, &proxy_b.id, Some(&key), &cfg_b)
+            .is_err(),
+        "B's open state must keep refusing admissions"
+    );
+}
+
+#[tokio::test]
+async fn stale_completion_after_an_a_b_a_reload_leaves_the_new_a_breaker_alone() {
+    let (state, proxy_a) = stale_completion_state();
+    let proxy_b = with_breaker(&proxy_a, &stale_completion_config_b());
+    let key = target_key("backend.local", 8080);
+
+    // Admitted under the first A instance, then the config goes A -> B -> A.
+    let (cb_a1, guard_a1) = admit(&state, &proxy_a, &key);
+    let _ = admit(&state, &proxy_b, &key);
+    let (cb_a2, _) = admit(&state, &proxy_a, &key);
+    assert!(
+        !Arc::ptr_eq(&cb_a1, &cb_a2),
+        "the second A is a new instance"
+    );
+    assert_eq!(cb_a1.config(), cb_a2.config());
+
+    // The current A accumulates failures from its own attempts.
+    for _ in 0..2 {
+        let (_, guard) = admit(&state, &proxy_a, &key);
+        complete(&state, &proxy_a, &key, 502, &guard);
+    }
+    assert_eq!(cb_a2.failure_count(), 2);
+
+    // The old A attempt's success must not reset the new A's streak: the two
+    // configs compare equal, but the completion never ran against it.
+    complete(&state, &proxy_a, &key, 200, &guard_a1);
+    let current = live(&state, &proxy_a, &key);
+    assert!(Arc::ptr_eq(&current, &cb_a2));
+    assert_eq!(
+        current.failure_count(),
+        2,
+        "a stale success must not reset the live breaker's failures"
+    );
+    assert_eq!(cb_a1.failure_count(), 0, "the stale outcome is discarded");
+}
+
+#[tokio::test]
+async fn stale_completion_after_prune_and_recreate_leaves_the_new_breaker_alone() {
+    let (state, proxy_a) = stale_completion_state();
+    let key = target_key("backend.local", 8080);
+
+    let (cb_old, guard_old) = admit(&state, &proxy_a, &key);
+    // The target is reclaimed and later rediscovered with the same config.
+    state
+        .circuit_breaker_cache
+        .prune_stale_targets(&std::collections::HashSet::new());
+    let (cb_new, _) = admit(&state, &proxy_a, &key);
+    assert!(!Arc::ptr_eq(&cb_old, &cb_new));
+    for _ in 0..2 {
+        let (_, guard) = admit(&state, &proxy_a, &key);
+        complete(&state, &proxy_a, &key, 502, &guard);
+    }
+
+    complete(&state, &proxy_a, &key, 200, &guard_old);
+    let current = live(&state, &proxy_a, &key);
+    assert!(Arc::ptr_eq(&current, &cb_new));
+    assert_eq!(current.failure_count(), 2);
+    assert_eq!(state.circuit_breaker_cache.len(), 1);
+}
+
+#[tokio::test]
+async fn stale_probe_completion_releases_only_its_admitting_breakers_slot() {
+    let (state, proxy) = stale_completion_state();
+    let probe_config = probe_slot_breaker_config();
+    let proxy_probe = with_breaker(&proxy, &probe_config);
+    let proxy_b = with_breaker(&proxy, &stale_completion_config_b());
+    let key = target_key("backend.local", 8080);
+    let cache = &state.circuit_breaker_cache;
+
+    // Instance 1 opens and admits a HALF_OPEN probe.
+    let (first, _) = admit(&state, &proxy_probe, &key);
+    first.record_failure(500, false, false);
+    let (same, guard_first) = admit(&state, &proxy_probe, &key);
+    assert!(Arc::ptr_eq(&first, &same));
+    assert!(guard_first.holds_slot());
+    assert_eq!(first.half_open_in_flight(), 1);
+
+    // Reload away and back: instance 2 runs the same config, opens, and
+    // admits its own probe.
+    let _ = admit(&state, &proxy_b, &key);
+    let (second, _) = admit(&state, &proxy_probe, &key);
+    assert!(!Arc::ptr_eq(&first, &second));
+    second.record_failure(500, false, false);
+    let (same, guard_second) = admit(&state, &proxy_probe, &key);
+    assert!(Arc::ptr_eq(&second, &same));
+    assert!(guard_second.holds_slot());
+    assert_eq!(second.half_open_in_flight(), 1);
+
+    // Instance 1's probe completes successfully. It must neither release
+    // instance 2's slot nor close it.
+    complete(&state, &proxy_probe, &key, 200, &guard_first);
+    assert_eq!(
+        second.half_open_in_flight(),
+        1,
+        "a stale probe must not free the current instance's probe slot"
+    );
+    assert_eq!(second.state_name(), "half_open");
+    assert!(
+        cache
+            .can_execute(
+                &proxy_probe.namespace,
+                &proxy_probe.id,
+                Some(&key),
+                &probe_config
+            )
+            .is_err(),
+        "instance 2's only slot stays held by its own probe"
+    );
+    assert_eq!(
+        first.half_open_in_flight(),
+        0,
+        "the stale probe's slot is returned on the breaker that admitted it"
+    );
+    drop(guard_first);
+    assert_eq!(second.half_open_in_flight(), 1);
+
+    // The current probe still settles its own breaker.
+    complete(&state, &proxy_probe, &key, 200, &guard_second);
+    assert_eq!(second.half_open_in_flight(), 0);
+    assert_eq!(second.state_name(), "closed");
+}
+
+#[tokio::test]
+async fn retry_admission_on_an_uncached_rotated_target_retains_its_failure() {
+    // The HTTP/3 native and cross-protocol retry loops admit every retry
+    // attempt through `admit_retry_attempt` before dialing. A rotated target
+    // the cache has never seen gets its breaker at that admission, so its
+    // failure is recorded and opens it (issue #6799).
+    let (state, proxy) = stale_completion_state();
+    let proxy = with_breaker(&proxy, &stale_completion_config_b()); // threshold 2
+    let first_key = target_key("10.0.0.1", 8080);
+    let rotated_key = target_key("10.0.0.2", 8080);
+    let cache = &state.circuit_breaker_cache;
+    let config = proxy.circuit_breaker.clone().expect("breaker configured");
+
+    // The first attempt fails and is recorded against the first target.
+    let (first, cb_probe) = admit(&state, &proxy, &first_key);
+    complete(&state, &proxy, &first_key, 502, &cb_probe);
+    assert_eq!(first.failure_count(), 1);
+    assert!(
+        cache
+            .peek(&proxy.namespace, &proxy.id, Some(&rotated_key))
+            .is_none()
+    );
+
+    // Retry 1 rotates onto the uncached target; retry 2 stays on it.
+    for _ in 0..2 {
+        assert!(ferrum_edge::_test_support::admit_retry_attempt_for_test(
+            &state,
+            &proxy,
+            Some(&rotated_key),
+            &cb_probe,
+        ));
+        complete(&state, &proxy, &rotated_key, 502, &cb_probe);
+    }
+    let rotated = live(&state, &proxy, &rotated_key);
+    assert_eq!(
+        rotated.failure_count(),
+        2,
+        "the rotated target's failures are retained"
+    );
+    assert_eq!(rotated.state_name(), "open");
+    assert_eq!(
+        first.failure_count(),
+        1,
+        "nothing is charged to the previous target"
+    );
+
+    // The next admission to the rotated target is refused.
+    assert!(
+        cache
+            .can_execute(&proxy.namespace, &proxy.id, Some(&rotated_key), &config)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn refused_retry_admission_retires_the_guard_so_the_outcome_settles_once() {
+    let (state, proxy) = stale_completion_state();
+    let proxy = with_breaker(&proxy, &stale_completion_config_b()); // threshold 2
+    let key = target_key("10.0.0.1", 8080);
+
+    // One failure recorded, then a second attempt's failure opens the breaker.
+    let (cb, cb_probe) = admit(&state, &proxy, &key);
+    complete(&state, &proxy, &key, 502, &cb_probe);
+    assert!(ferrum_edge::_test_support::admit_retry_attempt_for_test(
+        &state,
+        &proxy,
+        Some(&key),
+        &cb_probe,
+    ));
+    // The retry loop records the intermediate failure itself...
+    cb.record_failure(502, true, cb_probe.take_slot());
+    assert_eq!(cb.state_name(), "open");
+    let failures = cb.failure_count();
+
+    // ...and the next retry is refused by the now-OPEN breaker.
+    assert!(!ferrum_edge::_test_support::admit_retry_attempt_for_test(
+        &state,
+        &proxy,
+        Some(&key),
+        &cb_probe,
+    ));
+    assert!(!cb_probe.holds_slot());
+
+    // The loop serves the already-recorded attempt; its terminal record must
+    // not settle that outcome a second time.
+    complete(&state, &proxy, &key, 502, &cb_probe);
+    assert_eq!(cb.failure_count(), failures);
+    assert_eq!(cb.state_name(), "open");
+}
+
+/// Drive the production synchronous record for a deferred streaming outcome
+/// whose response body an `after_proxy` reject replaced.
+fn record_replaced(
+    state: &ProxyState,
+    proxy: &ferrum_edge::config::types::Proxy,
+    key: &str,
+    status: u16,
+    guard: &HalfOpenProbeGuard,
+    skip: bool,
+    admission_epoch: u64,
+) {
+    ferrum_edge::_test_support::record_replaced_streaming_outcome_for_test(
+        state,
+        proxy,
+        Some(key),
+        status,
+        guard,
+        skip,
+        admission_epoch,
+    );
+}
+
+/// A breaker that trips on one failure and stays OPEN for the test.
+fn trips_on_one_failure() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        ..stale_completion_config_a()
+    }
+}
+
+#[tokio::test]
+async fn replaced_streaming_response_heals_the_admitting_half_open_breaker() {
+    let (state, proxy) = stale_completion_state();
+    let proxy = with_breaker(&proxy, &probe_slot_breaker_config());
+    let key = target_key("backend.local", 8080);
+
+    let (cb, _) = admit(&state, &proxy, &key);
+    cb.record_failure(500, false, false);
+    let (same, cb_probe) = admit(&state, &proxy, &key);
+    assert!(Arc::ptr_eq(&cb, &same));
+    assert!(cb_probe.holds_slot());
+    let admission_epoch = cb.open_epoch();
+
+    // Header time: the deferred streaming path releases the probe slot
+    // without a health outcome and defers the record to body completion.
+    cb_probe.release_neutral();
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 0);
+
+    // An after_proxy reject replaced the streaming body, so the synchronous
+    // record is the attempt's only breaker record: the backend's success heals.
+    record_replaced(&state, &proxy, &key, 200, &cb_probe, false, admission_epoch);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "the replaced-body record must settle the backend success on the admitting breaker"
+    );
+}
+
+#[tokio::test]
+async fn replaced_streaming_response_counts_a_backend_failure_once() {
+    let (state, proxy) = stale_completion_state();
+    let config = trips_on_one_failure();
+    let proxy = with_breaker(&proxy, &config);
+    let key = target_key("backend.local", 8080);
+
+    let (cb, cb_probe) = admit(&state, &proxy, &key);
+    let admission_epoch = cb.open_epoch();
+    record_replaced(&state, &proxy, &key, 502, &cb_probe, false, admission_epoch);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.failure_count(), 1);
+    assert!(
+        state
+            .circuit_breaker_cache
+            .can_execute(&proxy.namespace, &proxy.id, Some(&key), &config)
+            .is_err(),
+        "the recorded failure must refuse the next admission"
+    );
+}
+
+#[tokio::test]
+async fn replaced_streaming_response_record_honours_skip_staleness_and_identity() {
+    let (state, proxy) = stale_completion_state();
+    let config = trips_on_one_failure();
+    let proxy = with_breaker(&proxy, &config);
+    let proxy_b = with_breaker(&proxy, &stale_completion_config_b());
+    let key = target_key("backend.local", 8080);
+
+    // An explicit skip (already recorded elsewhere) records nothing.
+    let (cb, cb_probe) = admit(&state, &proxy, &key);
+    let admission_epoch = cb.open_epoch();
+    record_replaced(&state, &proxy, &key, 502, &cb_probe, true, admission_epoch);
+    assert_eq!(cb.failure_count(), 0);
+    assert_eq!(cb.state_name(), "closed");
+
+    // The breaker opened a new cycle since admission: the outcome is stale.
+    cb.record_failure(502, false, false);
+    assert_eq!(cb.state_name(), "open");
+    record_replaced(&state, &proxy, &key, 200, &cb_probe, false, admission_epoch);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "a stale success must not heal a later cycle"
+    );
+
+    // A reload replaced the admitting breaker: nothing reaches the new one.
+    let (cb_a, guard_a) = admit(
+        &state,
+        &with_breaker(&proxy, &stale_completion_config_a()),
+        &key,
+    );
+    let epoch_a = cb_a.open_epoch();
+    let (cb_b, _) = admit(&state, &proxy_b, &key);
+    record_replaced(
+        &state,
+        &with_breaker(&proxy, &stale_completion_config_a()),
+        &key,
+        502,
+        &guard_a,
+        false,
+        epoch_a,
+    );
+    assert_eq!(cb_b.failure_count(), 0);
+    assert_eq!(cb_a.failure_count(), 0);
+    assert!(Arc::ptr_eq(&live(&state, &proxy, &key), &cb_b));
+}
+
+#[tokio::test]
+async fn retry_admitted_after_the_backoff_probes_a_breaker_whose_cooldown_ended() {
+    // The HTTP/3 retry loops admit the next attempt AFTER the backoff, like
+    // H1/H2: a breaker that opened on the failed attempt and whose cooldown
+    // elapses during the backoff admits the retry as its recovery probe, and no
+    // probe slot is held while the loop sleeps.
+    let (state, proxy) = stale_completion_state();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 1,
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let proxy = with_breaker(&proxy, &config);
+    let key = target_key("backend.local", 8080);
+
+    let (cb, cb_probe) = admit(&state, &proxy, &key);
+    complete(&state, &proxy, &key, 502, &cb_probe);
+    assert_eq!(cb.state_name(), "open");
+    assert!(
+        !cb_probe.holds_slot(),
+        "nothing is held while the loop backs off"
+    );
+    // Admitting before the backoff would have been refused here.
+    assert!(
+        state
+            .circuit_breaker_cache
+            .can_execute(&proxy.namespace, &proxy.id, Some(&key), &config)
+            .is_err()
+    );
+
+    // The backoff outlasts the breaker's cooldown.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    assert!(ferrum_edge::_test_support::admit_retry_attempt_for_test(
+        &state,
+        &proxy,
+        Some(&key),
+        &cb_probe,
+    ));
+    assert!(cb_probe.holds_slot(), "the retry is the recovery probe");
+    assert_eq!(cb.state_name(), "half_open");
+    complete(&state, &proxy, &key, 200, &cb_probe);
+    assert_eq!(cb.state_name(), "closed");
+    assert_eq!(cb.half_open_in_flight(), 0);
 }

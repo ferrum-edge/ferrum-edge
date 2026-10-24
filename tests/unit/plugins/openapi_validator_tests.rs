@@ -9771,9 +9771,10 @@ fn h1_h2_and_h3_run_the_same_client_contract_phase() {
 // ---------------------------------------------------------------------------
 // XML document nesting bounds (issue #4520)
 //
-// `roxmltree`'s tokenizer recurses once per open element, so the depth screen
-// runs over the raw bytes before `Document::parse` ever sees them. These tests
-// therefore run safely under the default test profile's 2 MiB thread stack.
+// The depth screen runs over the raw bytes before `Document::parse` ever sees
+// them (`roxmltree` before 0.21.2 recursed once per open element). These tests
+// run under the default test profile's 2 MiB thread stack; the 199-level
+// multipart case is the one roxmltree 0.21.1 overflowed (issue #6590).
 // ---------------------------------------------------------------------------
 
 const XML_DEPTH_ERROR: &str = "XML document nesting exceeds the supported depth";

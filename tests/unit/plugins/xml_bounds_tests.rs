@@ -1,15 +1,17 @@
 //! Tests for the shared pre-parse XML nesting-depth screen
 //! (`plugins::utils::xml_bounds`).
 //!
-//! The screen exists because `roxmltree`'s tokenizer recurses once per open
-//! element, so a parser node budget cannot keep a deeply nested document from
-//! overflowing the worker stack *inside* `Document::parse_with_options`. It
-//! must therefore be sound on raw bytes: never under-count real nesting (or the
-//! bomb gets through) and never over-count constructs that merely look like
-//! tags (or a legitimate document is refused).
+//! The screen was introduced because `roxmltree` before 0.21.2 recursed once
+//! per open element, so a parser node budget could not keep a deeply nested
+//! document from overflowing the worker stack *inside*
+//! `Document::parse_with_options`. It stays the fixed nesting ceiling ahead of
+//! the parser and the consumers' recursive walkers. It must be sound on raw
+//! bytes: never under-count real nesting (or the bomb gets through) and never
+//! over-count constructs that merely look like tags (or a legitimate document
+//! is refused).
 
 use ferrum_edge::plugins::utils::xml_bounds::{
-    XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit,
+    UnqualifiedAttribute, XML_MAX_NESTING_DEPTH, xml_nesting_depth_within_limit,
 };
 
 fn nested(levels: usize) -> String {
@@ -159,4 +161,16 @@ fn a_stray_close_tag_cannot_drive_depth_negative() {
     let mut xml = String::from("</a></a></a>");
     xml.push_str(&nested(300));
     assert!(!xml_nesting_depth_within_limit(&xml, 256));
+}
+
+#[test]
+fn unqualified_attribute_ignores_a_prefixed_look_alike() {
+    // roxmltree 0.21 `Node::attribute("ID")` returns the first attribute whose
+    // local name is `ID` in any namespace, here the attacker's `x:ID`.
+    let xml = r##"<a xmlns:x="urn:x" x:ID="forged" ID="real" x:URI="#forged"/>"##;
+    let doc = roxmltree::Document::parse(xml).expect("well-formed");
+    let root = doc.root_element();
+    assert_eq!(root.unqualified_attribute("ID"), Some("real"));
+    assert_eq!(root.unqualified_attribute("URI"), None);
+    assert_eq!(root.attribute(("urn:x", "ID")), Some("forged"));
 }

@@ -357,7 +357,7 @@ fn record_cross_protocol_header_write_disconnect(
         backend_outcome_status,
         false,
         Some(ErrorClass::ClientDisconnect),
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -407,7 +407,7 @@ where
         status,
         false,
         class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -681,7 +681,7 @@ where
         504,
         false,
         Some(ErrorClass::ReadWriteTimeout),
-        args.cb_probe.take_slot(),
+        args.cb_probe.settle(),
         false,
         args.backend_start.elapsed(),
     );
@@ -923,19 +923,18 @@ fn record_cross_protocol_retry_failure(
     cb_target_key: Option<&str>,
     response_status: u16,
     connection_error: bool,
-    is_half_open_probe: bool,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
 ) {
     // The failed attempt's connection ends now, not after the retry backoff.
     *lb_connection = None;
 
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            cb_target_key,
-            cb_config,
-        );
-        cb.record_failure(response_status, connection_error, is_half_open_probe);
+    if let Some(cb) = cb_probe.current_breaker(
+        &state.circuit_breaker_cache,
+        &proxy.namespace,
+        &proxy.id,
+        cb_target_key,
+    ) {
+        cb.record_failure(response_status, connection_error, cb_probe.take_slot());
     }
 }
 
@@ -2341,7 +2340,7 @@ fn record_cross_protocol_client_acquire_failure(
         502,
         true,
         None,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -2499,7 +2498,7 @@ where
             502,
             false,
             Some(ErrorClass::DispatchPolicyRejected),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -2546,7 +2545,7 @@ where
             502,
             false,
             Some(ErrorClass::DispatchPolicyRejected),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -2626,7 +2625,7 @@ where
                     502,
                     false,
                     Some(ErrorClass::DispatchPolicyRejected),
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -2720,7 +2719,7 @@ where
                     503,
                     false,
                     Some(ErrorClass::DispatchPolicyRejected),
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -2774,7 +2773,7 @@ fn record_plain_grpc_web_client_deadline(
         StatusCode::OK.as_u16(),
         false,
         Some(ErrorClass::ClientDisconnect),
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -2849,7 +2848,7 @@ fn record_plain_grpc_web_deadline_after_handoff(
         StatusCode::OK.as_u16(),
         false,
         class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -2977,7 +2976,7 @@ fn record_plain_grpc_web_client_deadline_after_backend_response(
         backend_status,
         backend_connection_error,
         backend_error_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -4055,7 +4054,7 @@ where
                                     current_cb_target_key.as_deref(),
                                     attempt_result.status_code,
                                     attempt_result.connection_error,
-                                    cb_probe.take_slot(),
+                                    cb_probe,
                                 );
                                 // A gRPC-Web route attempt budget (#5646) ends with the failed
                                 // attempt, so backoff is bounded by the total deadline alone.
@@ -4113,25 +4112,45 @@ where
                                     )
                                     .await;
                                 }
-                                attempt += 1;
-                                if let CrossProtocolRetryTarget::Selected(
-                                    next_target,
+                                // Admit the next attempt after the backoff, through the breaker
+                                // of the target it will dial (issue #6799), as the H1/H2 retry
+                                // loops do. An OPEN breaker ends the retries: this attempt,
+                                // already recorded, is served below, and the retired guard keeps
+                                // the terminal record from settling it twice.
+                                let next_cb_target_key = match &retry_target {
+                                    CrossProtocolRetryTarget::Selected(
+                                        _,
+                                        next_cb_target_key,
+                                        _,
+                                    ) => Some(next_cb_target_key.as_str()),
+                                    _ => current_cb_target_key.as_deref(),
+                                };
+                                if crate::proxy::admit_retry_attempt(
+                                    state,
+                                    proxy,
                                     next_cb_target_key,
-                                    next_url,
-                                ) = retry_target
-                                {
-                                    current_target = Some(next_target);
-                                    current_cb_target_key = Some(next_cb_target_key);
-                                    current_url = next_url;
+                                    cb_probe,
+                                ) {
+                                    attempt += 1;
+                                    if let CrossProtocolRetryTarget::Selected(
+                                        next_target,
+                                        next_cb_target_key,
+                                        next_url,
+                                    ) = retry_target
+                                    {
+                                        current_target = Some(next_target);
+                                        current_cb_target_key = Some(next_cb_target_key);
+                                        current_url = next_url;
+                                    }
+                                    warn!(
+                                        proxy_id = %proxy.id,
+                                        attempt = attempt,
+                                        max_retries = retry_config.max_retries,
+                                        connection_error = attempt_result.connection_error,
+                                        "Retrying cross-protocol H3→HTTP mesh backend request"
+                                    );
+                                    continue;
                                 }
-                                warn!(
-                                    proxy_id = %proxy.id,
-                                    attempt = attempt,
-                                    max_retries = retry_config.max_retries,
-                                    connection_error = attempt_result.connection_error,
-                                    "Retrying cross-protocol H3→HTTP mesh backend request"
-                                );
-                                continue;
                             }
                         }
 
@@ -4176,7 +4195,7 @@ where
                                 mesh_status,
                                 mesh_connection_error,
                                 mesh_error_class,
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -4262,7 +4281,7 @@ where
                                     401,
                                     false,
                                     None,
-                                    cb_probe.take_slot(),
+                                    cb_probe.settle(),
                                     false,
                                     backend_start.elapsed(),
                                 );
@@ -4608,7 +4627,7 @@ where
                                 401,
                                 false,
                                 None,
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -4735,7 +4754,7 @@ where
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         attempt_result.connection_error,
-                                        cb_probe.take_slot(),
+                                        cb_probe,
                                     );
                                     // A gRPC-Web route attempt budget (#5646) ends with the failed
                                     // attempt, so backoff is bounded by the total deadline alone.
@@ -4784,25 +4803,45 @@ where
                                         )
                                         .await;
                                     }
-                                    attempt += 1;
-                                    if let CrossProtocolRetryTarget::Selected(
-                                        next_target,
+                                    // Admit the next attempt after the backoff, through the breaker
+                                    // of the target it will dial (issue #6799), as the H1/H2 retry
+                                    // loops do. An OPEN breaker ends the retries: this attempt,
+                                    // already recorded, is served below, and the retired guard keeps
+                                    // the terminal record from settling it twice.
+                                    let next_cb_target_key = match &retry_target {
+                                        CrossProtocolRetryTarget::Selected(
+                                            _,
+                                            next_cb_target_key,
+                                            _,
+                                        ) => Some(next_cb_target_key.as_str()),
+                                        _ => current_cb_target_key.as_deref(),
+                                    };
+                                    if crate::proxy::admit_retry_attempt(
+                                        state,
+                                        proxy,
                                         next_cb_target_key,
-                                        next_url,
-                                    ) = retry_target
-                                    {
-                                        current_target = Some(next_target);
-                                        current_cb_target_key = Some(next_cb_target_key);
-                                        current_url = next_url;
+                                        cb_probe,
+                                    ) {
+                                        attempt += 1;
+                                        if let CrossProtocolRetryTarget::Selected(
+                                            next_target,
+                                            next_cb_target_key,
+                                            next_url,
+                                        ) = retry_target
+                                        {
+                                            current_target = Some(next_target);
+                                            current_cb_target_key = Some(next_cb_target_key);
+                                            current_url = next_url;
+                                        }
+                                        warn!(
+                                            proxy_id = %proxy.id,
+                                            attempt = attempt,
+                                            max_retries = retry_config.max_retries,
+                                            connection_error = false,
+                                            "Retrying cross-protocol H3→HTTP backend request"
+                                        );
+                                        continue;
                                     }
-                                    warn!(
-                                        proxy_id = %proxy.id,
-                                        attempt = attempt,
-                                        max_retries = retry_config.max_retries,
-                                        connection_error = false,
-                                        "Retrying cross-protocol H3→HTTP backend request"
-                                    );
-                                    continue;
                                 }
                             }
                             final_backend_admission_elapsed = backend_admission_start.elapsed();
@@ -4867,7 +4906,7 @@ where
                                         current_cb_target_key.as_deref(),
                                         attempt_result.status_code,
                                         attempt_result.connection_error,
-                                        cb_probe.take_slot(),
+                                        cb_probe,
                                     );
                                     // A gRPC-Web route attempt budget (#5646) ends with the failed
                                     // attempt, so backoff is bounded by the total deadline alone.
@@ -4916,25 +4955,45 @@ where
                                         )
                                         .await;
                                     }
-                                    attempt += 1;
-                                    if let CrossProtocolRetryTarget::Selected(
-                                        next_target,
+                                    // Admit the next attempt after the backoff, through the breaker
+                                    // of the target it will dial (issue #6799), as the H1/H2 retry
+                                    // loops do. An OPEN breaker ends the retries: this attempt,
+                                    // already recorded, is served below, and the retired guard keeps
+                                    // the terminal record from settling it twice.
+                                    let next_cb_target_key = match &retry_target {
+                                        CrossProtocolRetryTarget::Selected(
+                                            _,
+                                            next_cb_target_key,
+                                            _,
+                                        ) => Some(next_cb_target_key.as_str()),
+                                        _ => current_cb_target_key.as_deref(),
+                                    };
+                                    if crate::proxy::admit_retry_attempt(
+                                        state,
+                                        proxy,
                                         next_cb_target_key,
-                                        next_url,
-                                    ) = retry_target
-                                    {
-                                        current_target = Some(next_target);
-                                        current_cb_target_key = Some(next_cb_target_key);
-                                        current_url = next_url;
+                                        cb_probe,
+                                    ) {
+                                        attempt += 1;
+                                        if let CrossProtocolRetryTarget::Selected(
+                                            next_target,
+                                            next_cb_target_key,
+                                            next_url,
+                                        ) = retry_target
+                                        {
+                                            current_target = Some(next_target);
+                                            current_cb_target_key = Some(next_cb_target_key);
+                                            current_url = next_url;
+                                        }
+                                        warn!(
+                                            proxy_id = %proxy.id,
+                                            attempt = attempt,
+                                            max_retries = retry_config.max_retries,
+                                            connection_error = attempt_result.connection_error,
+                                            "Retrying cross-protocol H3→HTTP backend request"
+                                        );
+                                        continue;
                                     }
-                                    warn!(
-                                        proxy_id = %proxy.id,
-                                        attempt = attempt,
-                                        max_retries = retry_config.max_retries,
-                                        connection_error = attempt_result.connection_error,
-                                        "Retrying cross-protocol H3→HTTP backend request"
-                                    );
-                                    continue;
                                 }
                             }
 
@@ -4961,7 +5020,7 @@ where
                                 attempt_result.status_code,
                                 attempt_result.connection_error,
                                 attempt_result.error_class,
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -5161,7 +5220,7 @@ where
                                 401,
                                 false,
                                 None,
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -5813,7 +5872,7 @@ where
                             401,
                             false,
                             None,
-                            cb_probe.take_slot(),
+                            cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -5961,7 +6020,7 @@ where
                             413,
                             false,
                             None,
-                            cb_probe.take_slot(),
+                            cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -6025,7 +6084,7 @@ where
                             attempt_result.status_code,
                             attempt_result.connection_error,
                             attempt_result.error_class,
-                            cb_probe.take_slot(),
+                            cb_probe.settle(),
                             false,
                             backend_start.elapsed(),
                         );
@@ -6150,7 +6209,7 @@ where
             } else {
                 None
             },
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -6253,7 +6312,7 @@ where
             status,
             terminal_connection_error,
             terminal_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -6389,7 +6448,7 @@ where
                     reject_status,
                     false,
                     error_class,
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -6554,7 +6613,7 @@ where
             response_status,
             terminal_connection_error,
             terminal_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -6788,7 +6847,7 @@ where
                 status,
                 terminal_connection_error,
                 terminal_error_class,
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -7118,7 +7177,7 @@ where
         status,
         false,
         route_cut_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -7562,7 +7621,7 @@ where
             200,
             false,
             Some(ErrorClass::RequestBodyTooLarge),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -7704,7 +7763,7 @@ where
             outcome.response_status,
             false,
             None,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -8318,7 +8377,7 @@ where
         outcome_status,
         false,
         outcome_error_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -8944,7 +9003,7 @@ where
                 current_cb_target_key.as_deref(),
                 502,
                 true,
-                cb_probe.take_slot(),
+                cb_probe,
             );
             // This attempt is settled and a retry replaces it (issue #5867),
             // with its TLS failure detail as the other gRPC paths note it
@@ -8980,6 +9039,11 @@ where
             }
             attempt += 1;
 
+            // Kept so a breaker refusal below can restore the target that
+            // produced the result being served.
+            let pre_rotation_target = current_target.clone();
+            let pre_rotation_cb_target_key = current_cb_target_key.clone();
+            let pre_rotation_url = current_url.clone();
             if let CrossProtocolRetryTarget::Selected(next_target, next_cb_target_key, next_url) =
                 retry_target
             {
@@ -9032,6 +9096,25 @@ where
                     .await;
                 }
             };
+
+            // Admit this attempt through the breaker of the target it will dial
+            // (issue #6799) after the backoff and the rotated target's transport
+            // screen, immediately before backend admission — the H1/H2 gRPC
+            // retry loop's order. An OPEN breaker ends the retries: the previous
+            // attempt, already recorded, is served against the target that
+            // produced it, and the retired guard keeps the terminal record from
+            // settling it twice.
+            if !crate::proxy::admit_retry_attempt(
+                state,
+                proxy,
+                current_cb_target_key.as_deref(),
+                cb_probe,
+            ) {
+                current_target = pre_rotation_target;
+                current_cb_target_key = pre_rotation_cb_target_key;
+                current_url = pre_rotation_url;
+                break;
+            }
 
             warn!(
                 proxy_id = %proxy.id,
@@ -9326,7 +9409,7 @@ where
                     outcome.response_status,
                     false,
                     None,
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -10040,7 +10123,7 @@ where
                     response_status,
                     false,
                     None,
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -10189,7 +10272,7 @@ where
                 health_status,
                 connection_error,
                 Some(health_class),
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -10885,7 +10968,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 500,
                 false,
                 Some(ErrorClass::ProtocolError),
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -11082,7 +11165,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 health_status,
                 connection_error,
                 Some(health_class),
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -15321,7 +15404,7 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (_, is_half_open_probe, admission_generation) = state
+        let (admitted, is_half_open_probe, admission_generation) = state
             .circuit_breaker_cache
             .can_execute(&proxy.namespace, &proxy.id, target_key, &config)
             .expect("half-open probe should be admitted");
@@ -15336,9 +15419,7 @@ mod tests {
         );
 
         crate::proxy::HalfOpenProbeGuard::new(
-            &state,
-            &proxy,
-            target_key,
+            Some(&admitted),
             is_half_open_probe,
             admission_generation,
         )

@@ -1313,6 +1313,29 @@ async fn test_password_text_config_rejects_passworddigest_type() {
 }
 
 #[tokio::test]
+async fn test_prefixed_type_attribute_cannot_mask_the_password_type() {
+    // roxmltree 0.21 `attribute("Type")` matches the local name in any
+    // namespace and returns the first match. A preceding `x:Type` naming the
+    // configured PasswordText must not hide the real (unqualified) Type.
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password xmlns:x="urn:example:x" x:Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText" Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">secret123</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("Password Type does not match"),
+        "expected password-type-mismatch rejection, got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
 async fn test_username_token_unknown_user_rejects() {
     let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
     let ut = r#"<wsse:UsernameToken>
@@ -9456,12 +9479,12 @@ async fn test_timestamp_created_comment_truncation_rejected() {
 
 // ── Pre-parse XML nesting depth (issue #4565) ──────────────────────────────
 //
-// `roxmltree`'s tokenizer recurses once per open element
-// (`parse_element` -> `parse_content` -> `parse_element`), so `MAX_XML_NODES`
-// alone cannot stop a deeply nested envelope from overflowing the worker stack
-// *inside* `Document::parse_with_options`. `parse_bounded_xml` therefore
-// screens element nesting over the raw bytes first, bounded by the shared
-// `XML_MAX_NESTING_DEPTH` (256). `MAX_CANONICALIZATION_DEPTH` remains the
+// `roxmltree` before 0.21.2 recursed once per open element inside
+// `Document::parse_with_options`, so `MAX_XML_NODES` alone could not stop a
+// deeply nested envelope from overflowing the worker stack.
+// `parse_bounded_xml` screens element nesting over the raw bytes first,
+// bounded by the shared `XML_MAX_NESTING_DEPTH` (256), and the screen stays
+// now that the parser is iterative. `MAX_CANONICALIZATION_DEPTH` remains the
 // separate post-parse walk budget.
 
 /// `<soap:Body>` payload nested `levels` deep. The envelope itself contributes

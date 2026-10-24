@@ -275,7 +275,9 @@ struct DeferredBackendDispatchOutcome {
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    /// The breaker instance that admitted the attempt (issue #6799); the
+    /// deferred record settles only on it, and only while it is still cached.
+    cb_settlement: super::BreakerSettlement,
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
     request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -1211,7 +1213,7 @@ impl ProxyBody {
         response_status: u16,
         connection_error: bool,
         error_class: Option<ErrorClass>,
-        is_half_open_probe: bool,
+        cb_settlement: super::BreakerSettlement,
         skip_circuit_breaker_record: bool,
         backend_elapsed: Duration,
     ) -> Self {
@@ -1225,7 +1227,7 @@ impl ProxyBody {
             response_status,
             connection_error,
             error_class,
-            is_half_open_probe,
+            cb_settlement,
             skip_circuit_breaker_record,
             backend_elapsed,
             request_body_exceeded: None,
@@ -1889,7 +1891,7 @@ impl ProxyBody {
             response_status,
             connection_error,
             error_class,
-            outcome.is_half_open_probe,
+            outcome.cb_settlement,
             outcome.skip_circuit_breaker_record || cb_stale,
             outcome.backend_elapsed,
         );
