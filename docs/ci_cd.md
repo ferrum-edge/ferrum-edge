@@ -3724,7 +3724,24 @@ and the branch-pruning jobs in `prune-stale-prs.yml`).
 aggregate, rejects a checkout that omits the key, in workflows and in local
 composite actions under `.github/actions/`. It admits `true` only in a
 workflow started solely by `schedule` or `workflow_dispatch`, and refuses
-YAML-escaped checkout references.
+YAML-escaped checkout references. The decision is made on a real YAML parse
+(PyYAML's composed node graph, which the verifier requires and fails without):
+steps are `jobs.<job>.steps[*]` and `runs.steps[*]`, so text inside a scalar
+can never pose as a step, `with:`, or input (#6688). A step is a checkout when
+its `uses` names `actions/checkout`, compared case-insensitively. The runner
+splits repository references on both `/` and `\` and drops empty segments,
+so every repository `uses` must be the canonical `owner/repo[/path]@ref` with
+single `/` separators. `actions//checkout@...`, `actions\checkout@...`, and
+`.` / `..` segments are refused rather than classified. Each checkout's `with`
+must be a block mapping holding one `persist-credentials` whose scalar text is
+exactly `false`, plain or quoted. Spellings that differ only in case or
+spacing count as the same input, and no `env:` level may set
+`INPUT_PERSIST-CREDENTIALS`. Parsing is restricted to documents every reader
+agrees on. The verifier refuses anchors, aliases, tags, directives, merge
+keys, duplicate keys, multiple documents, and the NEL, LS, PS, and BOM
+characters that YAML 1.1 and 1.2 readers split into lines differently. A
+line-based reader still runs alongside as spelling policy (block-style literal
+`uses`, one complete line per step key), and both must accept.
 
 One set of checkouts still uses the action default. The trusted Cross policy
 freezes the bytes of these jobs, so a pull request cannot add the key: the

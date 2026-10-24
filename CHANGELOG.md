@@ -135,6 +135,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain, or a checkout that found the lane just before it was withdrawn, could
   leave the connection in the withdrawn lane, uncounted, until the last
   in-flight request on that lane finished.
+- **Checkout credential verifier reads nested step values** (issue #6688).
+  `verify_workflow_permissions.py` checked only the top-level keys of an
+  `actions/checkout` step for a value left open across lines, so an
+  unterminated quoted value under the step's `env:` could swallow later lines
+  that only looked like `with: persist-credentials: false`, or like a new
+  `- ` step that hid the real step's start. The verifier now decides on a
+  real YAML parse (PyYAML, required). It walks `jobs.<job>.steps` and
+  `runs.steps` and requires each checkout's parsed `with` to hold exactly one
+  `persist-credentials` with the text `false`. It refuses anchors, aliases,
+  tags, merge and duplicate keys, case variants of the input, an `env:` that
+  presets `INPUT_PERSIST-CREDENTIALS`, and line-break characters that YAML 1.1
+  and 1.2 readers split differently. A repository `uses` must be spelled
+  canonically (`owner/repo[/path]@ref`, single `/`), so separator variants
+  such as `actions//checkout` or `actions\checkout`, which the runner still
+  resolves to actions/checkout, cannot skip the check. The line-based reader remains as
+  additional spelling policy.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now
