@@ -82,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **Checkout credential verifier reads nested step values** (issue #6688).
+  `verify_workflow_permissions.py` checked only the top-level keys of an
+  `actions/checkout` step for a value left open across lines, so an
+  unterminated quoted value under the step's `env:` could swallow later lines
+  that only looked like `with: persist-credentials: false`. Every line of a
+  checkout step must now be a complete step key, a complete direct child of
+  `with:` / `env:`, or a block scalar body; anything else is refused.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

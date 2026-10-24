@@ -306,6 +306,65 @@ def _is_content(line: str) -> bool:
     return bool(line.strip()) and not line.lstrip().startswith("#")
 
 
+BLOCK_SCALAR_VALUE = re.compile(r"^[|>][1-9+-]{0,2} *(?:#.*)?$")
+
+
+def _checkout_step_readable(lines: list[str], start: int, end: int, key_indent: int) -> bool:
+    """Whether every line of a checkout step has the one shape this reader follows.
+
+    A step line is a complete `key: value` step key at `key_indent`, a complete
+    `key: value` direct child of an empty `with:` / `env:` key, or the body of a
+    block scalar (`|` / `>`) opened by one of those lines. Anything else,
+    including a quoted or flow value left open at any depth, a plain scalar
+    continued onto a deeper line, or a child nested below another child, is
+    refused: it would carry later lines that only look like `with:` and
+    `persist-credentials` into a scalar (#6688).
+
+    Block scalar bodies are tracked here from each header's own key column,
+    not from the file-wide pass, because a header on a `- key: |` line ends at
+    the step key column, not at the dash.
+    """
+
+    mapping_open = False
+    child_indent: int | None = None
+    block_indent: int | None = None
+    for number in range(start, end):
+        line = lines[number]
+        if not line.strip():
+            continue
+        if number == start and line.lstrip().startswith("- "):
+            line = " " * key_indent + line.lstrip()[2:].lstrip()
+        indent = _indent(line)
+        if block_indent is not None:
+            if indent > block_indent:
+                continue  # block scalar body, including lines that look like comments
+            block_indent = None
+        if line.lstrip().startswith("#"):
+            continue
+        if indent == key_indent:
+            if not _single_line_input(line, STEP_MAPPING_KEYS):
+                return False
+            match = CHILD_INPUT.match(line)
+            value = _strip_comment(match.group("value") or "") if match else ""
+            mapping_open = (
+                match is not None and not value and match.group("key") in STEP_MAPPING_KEYS
+            )
+            child_indent = None
+            if BLOCK_SCALAR_VALUE.match(value):
+                block_indent = key_indent
+            continue
+        if indent < key_indent or not mapping_open:
+            return False
+        if child_indent is None:
+            child_indent = indent
+        if indent != child_indent or not _single_line_input(line):
+            return False
+        match = CHILD_INPUT.match(line)
+        if match is not None and BLOCK_SCALAR_VALUE.match((match.group("value") or "").strip()):
+            block_indent = child_indent
+    return True
+
+
 def checkout_credential_errors(text: str, source: str, *, composite: bool = False) -> list[str]:
     """Every `actions/checkout` step states `persist-credentials` explicitly.
 
@@ -389,24 +448,10 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
             _is_content(lines[end]) and _indent(lines[end]) < key_indent
         ):
             end += 1
-        # Every step key must be one complete line. A quoted or flow value left
-        # open (`name: 'x`) would swallow later lines that only look like a
-        # `with:` mapping.
-        step_keys_readable = True
-        for number in range(start, end):
-            step_line = lines[number]
-            if not _is_content(step_line):
-                continue
-            if number == start and step_line.lstrip().startswith("- "):
-                step_line = " " * key_indent + step_line.lstrip()[2:].lstrip()
-            if _indent(step_line) == key_indent and not _single_line_input(
-                step_line, STEP_MAPPING_KEYS
-            ):
-                step_keys_readable = False
-                break
-        if not step_keys_readable:
+        if not _checkout_step_readable(lines, start, end, key_indent):
             errors.append(
-                f"{located} checkout step keys must each be one complete `key: value` "
+                f"{located} checkout step keys, and the direct children of its "
+                "`with:` / `env:` mappings, must each be one complete `key: value` "
                 "line; a value left open across lines is refused"
             )
             continue
@@ -645,6 +690,42 @@ def run_self_test() -> list[str]:
         "          path: \"src\"\n          persist-credentials: false\n" + tail
     if checkout_credential_errors(quoted_ok, "self-test checkout quoted single-line inputs"):
         failures.append("checkout credential self-test: single-line quoted inputs were rejected")
+    # Controls for the nested-scalar pass (#6688): complete `env:` children,
+    # block scalars at the step, `env:`, and `with:` depth, and a block scalar
+    # opened on the `- ` line must all still be accepted.
+    for label, text in (
+        (
+            "env children",
+            pr + f"      - name: Checkout\n        env:\n          A: plain\n"
+            "          B: 'single'  # note\n          C: \"double\"\n          D: ${{ github.sha }}\n"
+            f"        uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "env block scalar",
+            pr + f"      - uses: {pin}\n        env:\n          NOTE: |\n            \"open\n"
+            "            with:\n          OTHER: x\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "dash block scalar",
+            pr + "      - name: >-\n          Checkout 'the\n        uses: " + pin + "\n"
+            "        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "with block scalar and comments",
+            pr + f"      - uses: {pin}\n        # comment\n        with:\n          # inputs\n"
+            "          ssh-known-hosts: |\n            # host keys\n            'x\n"
+            "          persist-credentials: false\n" + tail,
+        ),
+        (
+            "composite env children",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      env:\n        A: \"x\"\n      with:\n"
+            "        persist-credentials: false\n    - run: true\n      shell: bash\n",
+        ),
+    ):
+        errors = checkout_credential_errors(text, f"self-test checkout {label}")
+        if errors:
+            failures.append(f"checkout credential self-test {label!r} rejected: {errors}")
     for label, text in (
         ("mixed-case missing", pr + f"      - uses: {mixed}\n" + tail),
         ("mixed-case true", pr + f"      - uses: {mixed}\n" + persist_true + tail),
@@ -754,6 +835,53 @@ def run_self_test() -> list[str]:
         (
             "tagged input",
             pr + f"      - uses: {pin}\n        with:\n          persist-credentials: !!str false\n" + tail,
+        ),
+        (
+            "env double-quoted scalar hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X: \"ignored\n        with:\n"
+            "          persist-credentials: false\n            \"\n" + tail,
+        ),
+        (
+            "env single-quoted scalar hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X: 'ignored\n        with:\n"
+            "          persist-credentials: false\n            '\n" + tail,
+        ),
+        (
+            "env scalar before uses hides with",
+            pr + "      - env:\n          X: \"ignored\n        with:\n"
+            f"          persist-credentials: false\n            \"\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "env flow scalar hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X: [\"ignored\n        with:\n"
+            "          persist-credentials: false\n            \"]\n" + tail,
+        ),
+        (
+            "env empty value hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X:\n            \"ignored\n"
+            "        with:\n          persist-credentials: false\n            \"\n" + tail,
+        ),
+        (
+            "plain scalar continuation",
+            pr + f"      - uses: {pin}\n        name: one\n          two\n        with:\n"
+            "          persist-credentials: false\n" + tail,
+        ),
+        (
+            "env nested below child",
+            pr + f"      - uses: {pin}\n        env:\n          X: a\n            Y: \"ignored\n"
+            "        with:\n          persist-credentials: false\n            \"\n" + tail,
+        ),
+        (
+            "dash block scalar does not cover env scalar",
+            pr + "      - name: |\n          x\n        uses: " + pin + "\n        env:\n"
+            "          X: \"ignored\n        with:\n          persist-credentials: false\n"
+            "            \"\n" + tail,
+        ),
+        (
+            "composite env scalar hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      env:\n        X: \"ignored\n      with:\n"
+            "        persist-credentials: false\n          \"\n    - run: true\n      shell: bash\n",
         ),
         (
             "composite block scalar impersonation",
