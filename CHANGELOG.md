@@ -87,11 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `actions/checkout` step for a value left open across lines, so an
   unterminated quoted value under the step's `env:` could swallow later lines
   that only looked like `with: persist-credentials: false`, or like a new
-  `- ` step that hid the real step's start. A forward lexer now marks lines
-  inside a quoted scalar or flow collection left open on an earlier line, and
-  those lines are never read as a step boundary, job key, or input. Every
-  line of a checkout step must also be a complete step key, a complete direct
-  child of `with:` / `env:`, or a block scalar body; anything else is refused.
+  `- ` step that hid the real step's start. The verifier now decides on a
+  real YAML parse (PyYAML, required). It walks `jobs.<job>.steps` and
+  `runs.steps` and requires each checkout's parsed `with` to hold exactly one
+  `persist-credentials` with the text `false`. It refuses anchors, aliases,
+  tags, merge and duplicate keys, case variants of the input, an `env:` that
+  presets `INPUT_PERSIST-CREDENTIALS`, and line-break characters that YAML 1.1
+  and 1.2 readers split differently. The line-based reader remains as
+  additional spelling policy.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

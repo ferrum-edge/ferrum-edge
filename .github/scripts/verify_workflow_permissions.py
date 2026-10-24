@@ -17,7 +17,9 @@ status-check rulesets trust). So every workflow must state its own default:
 * every `actions/checkout` step, in a workflow or a local composite action,
   states `persist-credentials: false`, so the token is not persisted for later
   steps. `true` is admitted only in a workflow started solely by `schedule`
-  or `workflow_dispatch` (#6581).
+  or `workflow_dispatch` (#6581). The decision is made on a real YAML parse
+  (PyYAML's composed node graph); a line-based reader runs alongside it as
+  extra spelling policy, and both must accept (#6688).
 
 Executed by verify_required_ci.py inside the `Tests` aggregate, so a pull
 request that adds or edits a workflow without explicit permissions fails CI.
@@ -29,6 +31,11 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+
+try:
+    import yaml
+except ImportError:  # the parsed checkout check fails closed without it
+    yaml = None
 
 WORKFLOW_DIR = Path(".github/workflows")
 ACTIONS_DIR = Path(".github/actions")
@@ -662,6 +669,239 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
                 f"{located} checkout persist-credentials must be `false` "
                 f"(found {values[0]!r})"
             )
+    errors.extend(
+        parsed_checkout_errors(text, source, composite=composite, line_triggers=triggers)
+    )
+    return errors
+
+
+# Characters PyYAML (YAML 1.1) reads as line breaks or strips, where a YAML 1.2
+# reader (the Actions runner's) sees ordinary content. Either side could then
+# see keys the other does not.
+LINE_BREAK_DIVERGENCE = ("\r", "\x85", "\u2028", "\u2029", "\ufeff")
+PINNED_CHECKOUT = re.compile(r"(?i:actions/checkout)@[0-9a-f]{40}")
+# The runner passes `with:` inputs as INPUT_<NAME> with spaces as underscores,
+# upper-cased, so names that differ only in case or spacing are one input.
+def _input_name(name: str) -> str:
+    return name.replace(" ", "_").upper()
+
+
+def _lookup(node: "yaml.MappingNode", key: str, located: str, errors: list[str]) -> "yaml.Node | None":
+    """The value of `key` in a mapping; any other spelling of it fails closed."""
+
+    found = None
+    for key_node, value in node.value:
+        name = key_node.value if isinstance(key_node, yaml.ScalarNode) else ""
+        if name.lower() != key:
+            continue
+        if name != key or found is not None:
+            errors.append(f"{located} `{key}` must be spelled once, in lower case")
+            return None
+        found = value
+    return found
+
+
+def _line(node: "yaml.Node") -> int:
+    return node.start_mark.line + 1
+
+
+def _mapping_policy_errors(node: "yaml.Node", source: str) -> list[str]:
+    """Duplicate keys, merge keys, and non-scalar keys anywhere in the document."""
+
+    errors: list[str] = []
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, yaml.SequenceNode):
+            pending.extend(current.value)
+            continue
+        if not isinstance(current, yaml.MappingNode):
+            continue
+        seen: set[str] = set()
+        for key_node, value in current.value:
+            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag.endswith(":merge"):
+                errors.append(f"{source}:{_line(key_node)} mapping keys must be plain scalars")
+            elif key_node.value in seen:
+                errors.append(
+                    f"{source}:{_line(key_node)} duplicate key {key_node.value!r}; "
+                    "YAML readers disagree on which one wins"
+                )
+            else:
+                seen.add(key_node.value)
+            pending.append(value)
+    return errors
+
+
+def _parsed_triggers(root: "yaml.MappingNode") -> set[str] | None:
+    """Trigger names from the parsed `on:` value, or None when unreadable."""
+
+    entries = [
+        value for key, value in root.value if isinstance(key, yaml.ScalarNode) and key.value == "on"
+    ]
+    if len(entries) != 1:
+        return None
+    value = entries[0]
+    if isinstance(value, yaml.ScalarNode):
+        names = [value]
+    elif isinstance(value, yaml.SequenceNode):
+        names = value.value
+    elif isinstance(value, yaml.MappingNode):
+        names = [key for key, _ in value.value]
+    else:
+        return None
+    if not names or not all(isinstance(name, yaml.ScalarNode) for name in names):
+        return None
+    return {name.value for name in names}
+
+
+def _input_env_errors(env: "yaml.Node | None", located: str, errors: list[str]) -> None:
+    """An `env:` that could preset the action's persist-credentials input is refused.
+
+    The action reads INPUT_PERSIST-CREDENTIALS from its environment; the
+    comparison ignores case so no spelling of it is left to a reader's rules.
+    """
+
+    if env is None:
+        return
+    if not isinstance(env, yaml.MappingNode):
+        errors.append(f"{located} `env:` must be a mapping so checkout inputs can be verified")
+        return
+    for key, _ in env.value:
+        if isinstance(key, yaml.ScalarNode) and key.value.upper() == "INPUT_PERSIST-CREDENTIALS":
+            errors.append(f"{located} `env:` must not set the checkout input {key.value}")
+
+
+def parsed_checkout_errors(
+    text: str,
+    source: str,
+    *,
+    composite: bool = False,
+    line_triggers: set[str] | None = None,
+) -> list[str]:
+    """Check every checkout step on the parsed YAML structure (#6688).
+
+    Steps are found as `jobs.<job>.steps[*]` (workflow) or `runs.steps[*]`
+    (composite action), never by line position, so text inside any scalar
+    cannot pose as a step, a `with:` key, or an input. The document must be
+    plain: one document, no anchors, aliases, tags, directives, merge keys, or
+    duplicate keys, and no characters that YAML 1.1 and 1.2 readers split into
+    lines differently. A checkout's `with` must be a block mapping holding one
+    `persist-credentials` whose scalar text is exactly `false` (plain or quoted,
+    which the action reads as the string "false"); `true` only where the line
+    reader also admits it.
+    """
+
+    if yaml is None:
+        return [f"{source} cannot be verified: PyYAML is not installed"]
+    for char in LINE_BREAK_DIVERGENCE:
+        if char in text:
+            return [f"{source} contains U+{ord(char):04X}; YAML readers split its lines differently"]
+    try:
+        for token in yaml.scan(text, Loader=yaml.SafeLoader):
+            if isinstance(token, (yaml.AnchorToken, yaml.AliasToken, yaml.TagToken, yaml.DirectiveToken)):
+                return [
+                    f"{source}:{token.start_mark.line + 1} uses a YAML anchor, alias, tag, or "
+                    "directive; write plain YAML so checkout steps can be verified"
+                ]
+        documents = list(yaml.compose_all(text, Loader=yaml.SafeLoader))
+    except yaml.YAMLError as error:
+        return [f"{source} could not be parsed as YAML: {error}"]
+    if len(documents) != 1 or not isinstance(documents[0], yaml.MappingNode):
+        return [f"{source} must be a single YAML mapping document"]
+    root = documents[0]
+    errors = _mapping_policy_errors(root, source)
+    if errors:
+        return errors
+
+    parsed_triggers = _parsed_triggers(root)
+    true_admitted = (
+        not composite
+        and line_triggers is not None
+        and parsed_triggers is not None
+        and line_triggers <= PERSIST_TRUE_TRIGGERS
+        and parsed_triggers <= PERSIST_TRUE_TRIGGERS
+    )
+    # Both step locations are read in every file, so a misfiled or mislabelled
+    # document is still checked rather than silently matching neither shape.
+    step_lists: list[tuple[str | None, "yaml.Node", list["yaml.Node | None"]]] = []
+    runs = _lookup(root, "runs", source, errors)
+    if isinstance(runs, yaml.MappingNode):
+        steps = _lookup(runs, "steps", f"{source}:{_line(runs)}", errors)
+        if steps is not None:
+            step_lists.append((None, steps, []))
+    workflow_env = _lookup(root, "env", source, errors)
+    jobs = _lookup(root, "jobs", source, errors)
+    if jobs is not None and not isinstance(jobs, yaml.MappingNode):
+        errors.append(f"{source}:{_line(jobs)} `jobs:` must be a mapping")
+    elif jobs is not None:
+        for job_key, job in jobs.value:
+            if not isinstance(job, yaml.MappingNode):
+                continue
+            located = f"{source}:{_line(job_key)}"
+            steps = _lookup(job, "steps", located, errors)
+            if steps is not None:
+                job_env = _lookup(job, "env", located, errors)
+                step_lists.append((job_key.value, steps, [workflow_env, job_env]))
+    for job, steps, inherited_env in step_lists:
+        if not isinstance(steps, yaml.SequenceNode):
+            errors.append(f"{source}:{_line(steps)} `steps:` must be a sequence")
+            continue
+        for step in steps.value:
+            located = f"{source}:{_line(step)}"
+            if not isinstance(step, yaml.MappingNode):
+                errors.append(f"{located} each step must be a mapping")
+                continue
+            uses = _lookup(step, "uses", located, errors)
+            if not isinstance(uses, yaml.ScalarNode) or "actions/checkout" not in uses.value.lower():
+                if uses is not None and not isinstance(uses, yaml.ScalarNode):
+                    errors.append(f"{located} `uses` must be a scalar")
+                continue
+            if PINNED_CHECKOUT.fullmatch(uses.value) is None:
+                errors.append(
+                    f"{located} checkout must be `actions/checkout@<40-hex SHA>` "
+                    f"(found {uses.value!r})"
+                )
+                continue
+            for env in [*inherited_env, _lookup(step, "env", located, errors)]:
+                _input_env_errors(env, located, errors)
+            inputs = _lookup(step, "with", located, errors)
+            values: list["yaml.Node"] = []
+            if inputs is not None:
+                if not isinstance(inputs, yaml.MappingNode) or inputs.flow_style:
+                    errors.append(f"{located} checkout `with:` must be a block mapping")
+                    continue
+                for key, value in inputs.value:
+                    name = key.value if isinstance(key, yaml.ScalarNode) else ""
+                    if _input_name(name) != "PERSIST-CREDENTIALS":
+                        continue
+                    if name != "persist-credentials":
+                        errors.append(f"{located} spell the input `persist-credentials`")
+                    values.append(value)
+            if len(values) > 1:
+                errors.append(f"{located} checkout sets persist-credentials more than once")
+                continue
+            if not values:
+                if (Path(source).name, job) in POLICY_FROZEN_CHECKOUT_JOBS:
+                    continue
+                errors.append(
+                    f"{located} checkout must set `persist-credentials: false` (parsed "
+                    "`with` has no such input) so the job token is not persisted"
+                )
+                continue
+            value = values[0]
+            text_value = value.value if isinstance(value, yaml.ScalarNode) else None
+            if not isinstance(value, yaml.ScalarNode) or value.style not in (None, "'", '"'):
+                errors.append(f"{located} checkout persist-credentials must be a one-line scalar")
+            elif text_value == "true":
+                if not true_admitted:
+                    errors.append(
+                        f"{located} checkout persists credentials outside a workflow "
+                        "started only by schedule or workflow_dispatch"
+                    )
+            elif text_value != "false":
+                errors.append(
+                    f"{located} checkout persist-credentials must be `false` (found {text_value!r})"
+                )
     return errors
 
 
@@ -1064,6 +1304,64 @@ def run_self_test() -> list[str]:
             f"        uses: {pin}\n" + tail,
         ),
         (
+            "composite quoted block key hides env scalar",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - \"name\": |\n        Checkout\n      env:\n        X: 'ignored\n"
+            "    - name: decoy\n      with:\n        persist-credentials: false\n"
+            f"        CLOSE: ignored#'\n      uses: {pin}\n",
+        ),
+        (
+            "quoted block key hides env scalar",
+            pr + "      - \"name\": >-\n          Checkout\n        env:\n          X: 'ignored\n"
+            "      - name: decoy\n        with:\n          persist-credentials: false\n"
+            f"          CLOSE: ignored#'\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "composite flow apostrophe hides env scalar",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - env: { X: foo'bar, Y: 'ignored }\n    - name: decoy\n      with:\n"
+            f"        persist-credentials: false\n        CLOSE: ignored#'}}\n      uses: {pin}\n",
+        ),
+        (
+            "flow double quote hides env scalar",
+            pr + "      - env: { X: foo\"bar, Y: \"ignored }\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: ignored#\"}}\n        uses: {pin}\n"
+            + tail,
+        ),
+        (
+            "duplicate with mapping",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "        with:\n          fetch-depth: 0\n" + tail,
+        ),
+        (
+            "input spelled in another case",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "          Persist-Credentials: true\n" + tail,
+        ),
+        (
+            "job env presets the input",
+            pr.replace("  build:\n", "  build:\n    env:\n      INPUT_PERSIST-CREDENTIALS: 'true'\n")
+            + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "YAML 1.1 boolean spelling",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: off\n" + tail,
+        ),
+        (
+            "upper-case step key",
+            pr + f"      - Uses: {pin}\n        with:\n          fetch-depth: 0\n" + tail,
+        ),
+        (
+            "anchor elsewhere in the file",
+            pr.replace("permissions:\n", "env:\n  A: &a x\npermissions:\n")
+            + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "line separator splits lines differently",
+            pr + f"      - uses: {pin}\n        env:\n          X: ignored         with: "
+            "          persist-credentials: false\n" + tail,
+        ),
+        (
             "composite block scalar impersonation",
             "name: a\nruns:\n  using: composite\n  steps:\n"
             f"    - uses: {pin}\n      with:\n        ssh-known-hosts: |\n"
@@ -1072,6 +1370,17 @@ def run_self_test() -> list[str]:
     ):
         if not checkout_credential_errors(text, f"self-test checkout {label}"):
             failures.append(f"checkout credential self-test {label!r} was accepted")
+
+    # Without PyYAML the parsed check cannot run, and the verifier must say so.
+    global yaml
+    parser = yaml
+    try:
+        yaml = None
+        compliant = pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+        if not checkout_credential_errors(compliant, "self-test checkout without PyYAML"):
+            failures.append("checkout credential self-test: accepted a checkout without PyYAML")
+    finally:
+        yaml = parser
 
     # Repository level: a compliant workflow cannot hide a credential-persisting
     # checkout inside a local composite action.
