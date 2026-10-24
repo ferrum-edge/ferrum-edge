@@ -4141,6 +4141,33 @@ impl RequestContext {
         self.diagnostic_slot.as_ref()
     }
 
+    /// The context a detached delivery of one already-final terminal summary
+    /// needs, instead of a deep copy of the whole request (issue #6793).
+    ///
+    /// Plugins' `log` hooks see only the summary, so terminal delivery reads
+    /// just these fields from the context: the trigger decisions and HTTP
+    /// flavor it stamps onto the summary, the method its `HEAD` byte rule
+    /// checks, the response-policy and dispatch state behind the diagnostic
+    /// detail, the typed mesh label projection behind the metric key, the RPC
+    /// deadline, and the mirror receivers. Every other field keeps the value
+    /// [`RequestContext::new`] gives it. Must stay in step with what
+    /// `log_with_mirror` and its cancellation guard read.
+    pub(crate) fn clone_for_detached_terminal_log(&self) -> Self {
+        let mut ctx = Self::new(String::new(), self.method.clone(), String::new());
+        ctx.plugin_trigger_decisions = self.plugin_trigger_decisions.clone();
+        ctx.request_http_flavor = self.request_http_flavor;
+        ctx.response_transform_size_refusal_selected =
+            self.response_transform_size_refusal_selected;
+        ctx.route_request_timeout_phase = self.route_request_timeout_phase;
+        ctx.backend_dispatch_state = self.backend_dispatch_state;
+        ctx.diagnostic_slot = self.diagnostic_slot.clone();
+        ctx.grpc_deadline_at = self.grpc_deadline_at;
+        ctx.mesh_labels = self.mesh_labels.clone();
+        ctx.mesh_label_projection_deferred = self.mesh_label_projection_deferred;
+        ctx.mirror_result_rxs = self.mirror_result_rxs.clone();
+        ctx
+    }
+
     /// The typed mesh label projection for this request (issue #6793), once a
     /// `workload_metrics` stamp or the gateway's mesh dispatch overlay has
     /// written it. Read-only observability state; public only for external
@@ -9731,7 +9758,7 @@ pub fn spawn_bounded_terminal_summary_log(
         crate::diagnostic_ref::record_request_detail(slot, &summary, ctx);
     }
     let plugins = plugins.to_vec();
-    let ctx = ctx.clone();
+    let ctx = ctx.clone_for_detached_terminal_log();
     let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
         if tokio::time::timeout(
             std::time::Duration::from_secs(5),

@@ -34,11 +34,12 @@ use ferrum_edge::_test_support::{
     proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test,
     proxy_body_streaming_for_test, proxy_body_with_grpc_admission_outcome_for_test,
 };
+use ferrum_edge::plugins::mesh::prometheus_helpers::MeshRequestKey;
 use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegistry};
 use ferrum_edge::plugins::{
-    Plugin, RequestContext, ResponseDelivery, ResponseStreamAction, ResponseStreamInspector,
-    TransactionSummary, create_plugin, create_response_stream_inspector,
-    log_with_mirror_before_buffered_response, spawn_bounded_terminal_summary_log,
+    MirrorResponseMeta, Plugin, RequestContext, ResponseDelivery, ResponseStreamAction,
+    ResponseStreamInspector, TransactionSummary, create_plugin, create_response_stream_inspector,
+    log_with_mirror, log_with_mirror_before_buffered_response, spawn_bounded_terminal_summary_log,
 };
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::body::ProxyBodyError;
@@ -306,6 +307,245 @@ async fn direct_terminal_dispatch_reaches_log_sinks() {
         "detached terminal delivery must be admitted for a fixture that opened it"
     );
     assert_eq!(delivered[0].response_status_code, 200);
+}
+
+/// Records the mesh key terminal delivery precomputes. Named like the built-in
+/// so `log_with_mirror` computes the key for it.
+struct MeshKeyCapture {
+    keys: Arc<Mutex<Vec<Option<MeshRequestKey>>>>,
+}
+
+#[async_trait]
+impl Plugin for MeshKeyCapture {
+    fn name(&self) -> &str {
+        "workload_metrics"
+    }
+
+    async fn log_with_mesh_key(
+        &self,
+        _summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+    ) {
+        self.keys.lock().unwrap().push(mesh_key.cloned());
+    }
+}
+
+/// Detached terminal delivery hands its task a slim copy of the request
+/// context instead of a deep clone (issue #6793). The sinks must still receive
+/// exactly what an inline delivery of the same summary gives them, with every
+/// context field that delivery reads set to a non-default value: the `HEAD`
+/// delivered-byte rule, the WebSocket flavor, a trigger decision, a response
+/// size refusal, the deferred typed mesh labels behind the metric key, and the
+/// mirror summary.
+#[tokio::test(flavor = "multi_thread")]
+async fn detached_terminal_delivery_matches_inline_delivery() {
+    async fn deliver(detached: bool) -> (Vec<TransactionSummary>, Vec<Option<MeshRequestKey>>) {
+        let (capturing, captured) = CapturingPlugin::new();
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        // Key capture runs first: each summary's plugins run in order, so a
+        // captured summary implies its key was already recorded.
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(MeshKeyCapture {
+                keys: Arc::clone(&keys),
+            }),
+            Arc::new(capturing),
+        ];
+        let mut ctx = make_ctx();
+        ctx.method = "HEAD".to_string();
+        ferrum_edge::_test_support::populate_terminal_delivery_state_for_test(&mut ctx);
+        ferrum_edge::_test_support::defer_mesh_label_projection_for_test(&mut ctx);
+        ferrum_edge::_test_support::annotate_gateway_mesh_dispatch_for_test(
+            &mut ctx,
+            HashMap::from([
+                (
+                    "mesh.spiffe_id".to_string(),
+                    "spiffe://cluster.local/ns/shop/sa/orders".to_string(),
+                ),
+                ("mesh.namespace".to_string(), "shop".to_string()),
+            ]),
+        );
+        let (mirror_tx, mirror_rx) = tokio::sync::watch::channel(None);
+        ctx.mirror_result_rxs.push(mirror_rx);
+        let mut summary = make_summary_with_status(200);
+        summary.http_method = "HEAD".to_string();
+        summary.bytes_received = 512;
+        summary
+            .metadata
+            .insert("mesh.request_protocol".to_string(), "http".to_string());
+        if detached {
+            spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
+        } else {
+            log_with_mirror(&plugins, &summary, &ctx).await;
+        }
+        drop(ctx);
+        mirror_tx.send_replace(Some(MirrorResponseMeta {
+            mirror_plugin_id: Some("mirror-1".to_string()),
+            mirror_target_url: "http://shadow:8080/things/42".to_string(),
+            mirror_response_status_code: Some(204),
+            mirror_response_size_bytes: Some(0),
+            mirror_response_advertised_size_bytes: None,
+            mirror_latency_ms: 1.5,
+            mirror_error: None,
+        }));
+        let mut delivered = wait_for_captures(&captured, 2).await;
+        delivered.sort_by_key(|summary| summary.mirror);
+        let keys = keys.lock().unwrap().clone();
+        (delivered, keys)
+    }
+
+    let (inline, inline_keys) = deliver(false).await;
+    let (detached, detached_keys) = deliver(true).await;
+    assert_eq!(inline.len(), 2, "inline: primary and mirror summaries");
+    assert_eq!(detached.len(), 2, "detached: primary and mirror summaries");
+    assert_eq!(inline_keys.len(), 2, "inline: primary and mirror keys");
+    assert_eq!(detached_keys.len(), 2, "detached: primary and mirror keys");
+    // The fixture really exercises each context-derived stamp.
+    let primary = &inline[0];
+    assert_eq!(
+        primary.bytes_received, 0,
+        "a HEAD response delivers no body"
+    );
+    assert_eq!(
+        primary.metadata.get("request_protocol").map(String::as_str),
+        Some("ws")
+    );
+    assert_eq!(
+        primary.error_class,
+        Some(ErrorClass::DispatchPolicyRejected)
+    );
+    assert_ne!(
+        format!("{:?}", primary.plugin_trigger_decisions),
+        format!(
+            "{:?}",
+            TransactionSummary::default().plugin_trigger_decisions
+        )
+    );
+    let primary_key = inline_keys
+        .first()
+        .and_then(Option::as_ref)
+        .expect("a mesh key from the typed labels");
+    assert_eq!(
+        &*primary_key.destination_principal,
+        "spiffe://cluster.local/ns/shop/sa/orders"
+    );
+    for (inline, detached) in inline.iter().zip(&detached) {
+        assert_eq!(inline.mirror, detached.mirror);
+        assert_eq!(inline.response_status_code, detached.response_status_code);
+        assert_eq!(inline.bytes_received, detached.bytes_received);
+        assert_eq!(inline.backend_target, detached.backend_target);
+        assert_eq!(inline.error_class, detached.error_class);
+        assert_eq!(inline.metadata, detached.metadata);
+        assert_eq!(
+            format!("{:?}", inline.plugin_trigger_decisions),
+            format!("{:?}", detached.plugin_trigger_decisions)
+        );
+    }
+    assert_eq!(
+        inline_keys, detached_keys,
+        "the same mesh keys, primary and mirror"
+    );
+}
+
+/// Every context read on the detached terminal-delivery path is one the slim
+/// detached context carries (issue #6793). A new `ctx.` read there must be
+/// added to `RequestContext::clone_for_detached_terminal_log` and this list.
+#[test]
+fn detached_terminal_delivery_reads_only_what_its_slim_context_carries() {
+    fn item<'a>(source: &'a str, start: &str) -> &'a str {
+        let begin = source
+            .find(start)
+            .unwrap_or_else(|| panic!("missing {start}"));
+        let rest = &source[begin..];
+        &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+    }
+    fn context_reads(body: &str, reads: &mut std::collections::BTreeSet<String>) {
+        for (index, _) in body.match_indices("ctx.") {
+            if index > 0
+                && body[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let name: String = body[index + 4..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            reads.insert(name);
+        }
+    }
+    let plugins = include_str!("../../src/plugins/mod.rs");
+    let mut reads = std::collections::BTreeSet::new();
+    for start in [
+        "async fn log_with_mirror_inner(",
+        "fn finish_terminal_delivery(",
+        "impl Drop for TerminalDeliveryGuard",
+    ] {
+        context_reads(item(plugins, start), &mut reads);
+    }
+    context_reads(
+        item(
+            include_str!("../../src/diagnostic_ref.rs"),
+            "pub(crate) fn record_request_detail(",
+        ),
+        &mut reads,
+    );
+    context_reads(
+        item(
+            include_str!("../../src/plugins/mesh/prometheus_helpers.rs"),
+            "pub fn mesh_request_key_for_request(",
+        ),
+        &mut reads,
+    );
+    let carried: std::collections::BTreeSet<String> = [
+        "backend_dispatch_state",
+        "clone",
+        "diagnostic_slot",
+        "grpc_deadline_at",
+        "has_plugin_trigger_decisions",
+        "mark_terminal_record_finished",
+        "mark_terminal_record_started",
+        "mesh_label_projection_deferred",
+        "mesh_label_shadow",
+        "method",
+        "mirror_result_rxs",
+        "plugin_trigger_decisions",
+        "request_http_flavor",
+        "response_policy_error_class",
+        "route_request_timeout_phase",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let uncarried: Vec<_> = reads.difference(&carried).collect();
+    assert!(
+        uncarried.is_empty(),
+        "detached terminal delivery reads context state its slim copy does not carry: {uncarried:?}"
+    );
+    let slim = {
+        let start = "pub(crate) fn clone_for_detached_terminal_log(";
+        let rest = &plugins[plugins.find(start).expect("slim detached context")..];
+        &rest[..rest.find("\n    }\n").expect("end of the method")]
+    };
+    assert!(slim.contains("Self::new(String::new(), self.method.clone(), String::new())"));
+    for field in [
+        "plugin_trigger_decisions",
+        "request_http_flavor",
+        "response_transform_size_refusal_selected",
+        "route_request_timeout_phase",
+        "backend_dispatch_state",
+        "diagnostic_slot",
+        "grpc_deadline_at",
+        "mesh_labels",
+        "mesh_label_projection_deferred",
+        "mirror_result_rxs",
+    ] {
+        assert!(
+            slim.contains(&format!("ctx.{field} =")) && slim.contains(&format!("self.{field}")),
+            "the slim detached context must carry `{field}`"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

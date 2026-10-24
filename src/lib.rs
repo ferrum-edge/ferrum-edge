@@ -1898,6 +1898,16 @@ pub mod _test_support {
             .capabilities()
     }
 
+    /// Give `ctx` non-default values for the request state detached terminal
+    /// delivery stamps onto the summary (issue #6793): the WebSocket flavor,
+    /// one plugin trigger decision and a selected response-transform size
+    /// refusal.
+    pub fn populate_terminal_delivery_state_for_test(ctx: &mut crate::plugins::RequestContext) {
+        ctx.set_request_http_flavor(crate::config::types::HttpFlavor::WebSocket);
+        ctx.record_plugin_trigger_decision(7, true);
+        ctx.mark_response_transform_size_refusal_selected();
+    }
+
     /// Mark `ctx` as the dispatcher marks a request whose plugin view defers
     /// the mesh label projection (issue #6793).
     pub fn defer_mesh_label_projection_for_test(ctx: &mut crate::plugins::RequestContext) {
