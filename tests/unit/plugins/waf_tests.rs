@@ -1335,6 +1335,25 @@ fn json_documents_the_parser_refuses() -> Vec<String> {
         r#"[+1,{"user":{"bio":"ordinary"}}]"#.to_string(),
         r#"[.5,{"user":{"bio":"ordinary"}}]"#.to_string(),
         "[\u{0}{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        // The same skippable forms where they compose: Unicode whitespace
+        // after a leading literal, a line comment ended by U+2028 / U+2029,
+        // whitespace or a comment before the anti-XSSI prefix.
+        "[true\u{A0},{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        "[null\u{FEFF},{\"user\":{\"bio\":\"ordinary\"}}]".to_string(),
+        "// c\u{2028}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "// c\u{2029}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        " )]}'\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "/* c */)]}'\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        // Gson-lenient names, values, separators and comments.
+        r#"{1:0,"user":{"bio":"ordinary"}}"#.to_string(),
+        r#"{x-y:0,"user":{"bio":"ordinary"}}"#.to_string(),
+        r#"{user={"bio":"ordinary"}}"#.to_string(),
+        r#"[foo,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        r#"[foo;{"user":{"bio":"ordinary"}}]"#.to_string(),
+        "# c\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        // Java / .NET whitespace: a record separator and NEL.
+        "\u{1E}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        "\u{85}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
     ]
 }
 
@@ -1509,36 +1528,81 @@ async fn body_json_path_rule_ignores_bodies_that_do_not_open_like_json() {
     }
 }
 
+/// One RPC envelope: a flags byte, a 4-byte big-endian length, the message.
+fn rpc_frame(flags: u8, message: &[u8]) -> Vec<u8> {
+    let mut frame = vec![flags];
+    frame.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(message);
+    frame
+}
+
 #[tokio::test]
-async fn body_json_path_grpc_json_codecs_are_not_declared_json() {
-    // `application/grpc+json` bodies are length-prefixed frames, never a bare
-    // JSON document, so neither the declaration nor a NUL-skipping sniff
-    // fails them closed. The length here is 32, an ASCII space: skipping the
-    // prefix's NULs would otherwise land on whitespace and then on `{"`.
-    let plugin = waf(json!({
-        "include_default_rules": false,
-        "custom_rules": [{
-            "id": "CUSTOM-JSON-CANARY",
-            "category": "custom",
-            "severity": "high",
-            "target": { "type": "body_json_path", "path": "user.bio" },
-            "match_kind": "contains",
-            "pattern": "forbidden-canary",
-            "action": "enforce"
-        }]
-    }))
-    .unwrap();
-    let message = br#"{"user":{"bio":"ordinary-1234"}}"#;
-    assert_eq!(message.len(), 32);
-    let mut framed = vec![0, 0, 0, 0, 32];
-    framed.extend_from_slice(message);
-    for content_type in ["application/grpc+json", "application/grpc-web+json"] {
-        let (result, ctx) = scan_body_with_content_type(&plugin, content_type, &framed).await;
-        assert!(matches!(result, PluginResult::Continue), "{content_type}");
-        assert!(
-            !ctx.metadata.contains_key("waf.rule_hits"),
-            "{content_type}"
-        );
+async fn body_json_path_reads_framed_rpc_streams_as_their_messages() {
+    // A validated gRPC / gRPC-Web / Connect stream is read as its messages:
+    // the envelope is NULs and lengths, never a JSON document, so it neither
+    // fails closed on its own nor hides the messages from the rules. The
+    // benign message is 32 bytes, an ASCII space as the length's low byte:
+    // skipping the envelope's NULs would otherwise land on whitespace and
+    // then on `{"`.
+    let plugin = enforcing_json_path_waf(false);
+    let benign = br#"{"user":{"bio":"ordinary-1234"}}"#;
+    assert_eq!(benign.len(), 32);
+    let forbidden = br#"{"user":{"bio":"forbidden-canary"}}"#;
+    for (content_type, end_flags) in [
+        ("application/grpc+json", 0x00),
+        ("application/grpc-web+json", 0x00),
+        ("application/connect+json", 0x02),
+    ] {
+        let mut clean = rpc_frame(0x00, benign);
+        clean.extend(rpc_frame(0x00, benign));
+        clean.extend(rpc_frame(end_flags, b"{}"));
+        // A compressed message cannot be read as JSON under any reading.
+        clean.extend(rpc_frame(0x01, b"\x1f\x8b compressed"));
+        let mut hidden = rpc_frame(0x00, benign);
+        hidden.extend(rpc_frame(0x00, forbidden));
+        let refused = rpc_frame(0x00, br#"{"user":{"bio":"ordinary"},"n":1e400}"#);
+        let mut after_empty = rpc_frame(0x00, b"");
+        after_empty.extend(rpc_frame(0x00, b"[\0{\"user\":{\"bio\":\"ordinary\"}}]"));
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &[hidden, refused, after_empty],
+            &[clean, Vec::new()],
+        )
+        .await;
+    }
+
+    // gRPC-Web text bodies are base64: no reading of them is a document.
+    assert_json_path_verdicts(
+        &plugin,
+        "application/grpc-web-text+json",
+        &[],
+        &[b"AAAAACB7InVzZXIiOnsiYmlvIjoib3JkaW5hcnkifX0=".to_vec()],
+    )
+    .await;
+
+    // A look-alike media type, or an exact one whose body is not a valid
+    // stream, is an ordinary body: Json.NET behind an `application/*+json`
+    // formatter reads this NUL-separated array.
+    let nul_array = b"[\0{\"user\":{\"bio\":\"forbidden-canary\"}}]".to_vec();
+    let mut overrun = rpc_frame(0x00, benign);
+    overrun.truncate(overrun.len() - 1);
+    for content_type in [
+        "application/grpcfake+json",
+        "application/grpc-website+json",
+        "application/connectx+json",
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+json",
+        "application/connect+json",
+    ] {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &[nul_array.clone(), overrun.clone()],
+            &[],
+        )
+        .await;
     }
 }
 
@@ -1567,6 +1631,16 @@ async fn body_json_path_rule_inspects_every_document_of_a_sequence() {
         b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"n\":1e400}",
         b"1\n{\"user\":{\"bio\":\"ordinary\"},\"n\":1e400}",
         b"null [NaN, {\"user\":{\"bio\":\"ordinary\"}}]",
+        // Documents read before a refused one are still inspected, and
+        // reading resumes on the next line after one, as a line-by-line
+        // consumer does.
+        b"null\n{\"user\":{\"bio\":\"forbidden-canary\"}}\nNaN",
+        b"null\n{\"user\":{\"bio\":\"forbidden-canary\"}}\ngarbage\n",
+        b"null\nNaN\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"null\n1e400\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"NaN\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"garbage\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"n\":1e400}\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
     ]
     .iter()
     .map(|body| body.to_vec())

@@ -468,9 +468,11 @@ body the strict parser accepts is read in place.
 
 The lenient reading also accepts several documents separated by whitespace
 (NDJSON, a leading scalar such as `null` followed by an object, or a document
-followed by another one): every document is inspected, so a backend that
-reads only the first, only the last, or each of them is covered by the same
-verdict.
+followed by another one), and when a document cannot be read it skips to the
+end of that line and resumes, as a line-by-line consumer does. Every document
+it reads is inspected — the ones before a part it could not read as well as
+the ones after — so a backend that reads only the first, only the last, or
+each of them is covered by the same verdict.
 
 A body that `body_json_path` rules cannot read **fails closed**: every
 applicable `body_json_path` rule records a hit, and that rule's own action,
@@ -480,47 +482,66 @@ only observed. The rule's `conditions` and request-wide exemptions still
 apply; value filters (`fp_filters`, global value exemptions) are not
 consulted because no value was selected. Backend parsers accept grammar the
 WAF's parser refuses — numbers beyond the `f64` range, nesting deeper than
-128 levels, `NaN` / `Infinity`, comments, trailing commas, unquoted member
-names, JavaScript whitespace, text after the document — so treating such a
-body as having nothing to select would let one such token switch every
-JSON-path rule off. A body cannot be read when a reading is refused by both
-the strict and the lenient parse and:
+128 levels, `NaN` / `Infinity`, comments, trailing commas, unquoted names and
+values, JavaScript and Unicode whitespace, an anti-XSSI prefix, text after the
+document — so treating such a body as having nothing to select would let one
+such token switch every JSON-path rule off. A body cannot be read when part of
+a reading is refused by both the strict and the lenient parse and:
 
-- the reading, or the document the lenient reading stopped at, **opens like a
-  JSON object or array** — whatever the `Content-Type` says and whatever the
-  other readings did. After an optional `)]}'` (or `)]}',`) anti-XSSI prefix
-  and anything lenient parsers skip between tokens (JSON whitespace, vertical
-  tab, form feed, U+00A0, U+FEFF, U+2028 / U+2029 and the other Unicode space
-  separators, `//` and `/* */` comments), it holds `{` followed by a quoted
-  member name, `}`, or an unquoted identifier and `:`, or `[` followed by `]`,
-  `{`, `[`, a quote, `-`, `+`, `.`, a digit, or `true` / `false` / `null` /
-  `NaN` / `Infinity` ending at a delimiter. Text that merely starts with a
-  bracket (`[INFO] …`, `[true-story] …`, `{{template}}`) does not; or
-- **no reading parsed** and either the `Content-Type` declares JSON
-  (`*/json` or a `+json` suffix, except the gRPC JSON codecs, whose bodies are
-  length-prefixed frames), or a reading opens like a JSON container once
-  U+0000 is skipped between tokens as Json.NET does (again except gRPC
-  framings). Under a JSON declaration no sniff is needed: any non-blank body
-  none of whose readings parse — including plain text or a form sent as
-  `application/json` — fails closed.
+- that part **opens like a JSON object or array** — at the start of the
+  reading, or at any document the lenient reading stopped at (judged within
+  its first 64 bytes) — whatever the `Content-Type` says and whatever the
+  other readings did. After anything lenient parsers skip before and between
+  tokens — JSON whitespace, vertical tab, form feed, U+001C–U+001F, U+0085,
+  U+00A0, U+FEFF, U+2028 / U+2029 and the other Unicode space separators,
+  `//` and `#` comments (ended by LF, CR, U+2028 or U+2029), `/* */`
+  comments, and the `)]}'` / `)]}',` anti-XSSI prefix — it holds `{`
+  followed by a quoted name, `}`, or an unquoted name (Gson-lenient literal
+  characters, so digits and `-` included) and then `:` or `=`; or `[`
+  followed by `]`, `{`, `[`, a quote, `-`, `+`, `.`, a digit, `true` /
+  `false` / `null` / `NaN` / `Infinity` ending at a delimiter or at anything
+  skippable, or an unquoted value and then `,` or `;`. Text that merely
+  starts with a bracket (`[INFO] …`, `[true-story] …`, `{{template}}`,
+  `{amount}`) does not; or
+- **no reading was read completely** and either the `Content-Type` declares
+  JSON (`*/json` or a `+json` suffix), or the part opens like a JSON
+  container once U+0000 is skipped between tokens as Json.NET does. Under a
+  JSON declaration no sniff is needed: any non-blank body none of whose
+  readings can be read completely fails closed — including plain text, a
+  form, a refused lone scalar such as `NaN` or `1e400`, or a body of only
+  JavaScript whitespace or comments sent as `application/json`.
 
-"No reading parsed" is what keeps an ordinary UTF-16 / UTF-32 body open: its
-raw bytes are refused (a NUL follows every ASCII character) while its
-transcoded reading parses. An empty or whitespace-only body, and a lone
-top-level scalar (which no non-empty path can select), are never judged. A
-body scanned only up to `max_scan_bytes` (`on_body_too_large:
+"No reading was read completely" is what keeps an ordinary UTF-16 / UTF-32
+body open: its raw bytes are refused (a NUL follows every ASCII character)
+while its transcoded reading parses. A blank body (empty or JSON whitespace
+only) and a lone top-level scalar the parser accepts (which no non-empty path
+can select) are never judged.
+
+A framed RPC stream is read as its messages instead of its raw bytes, but only
+when it really is one: an exact gRPC (`application/grpc[+codec]`), gRPC-Web
+(`application/grpc-web[+codec]`) or Connect streaming
+(`application/connect+codec`) media type, AND envelopes (a flags byte and a
+4-byte length) that cover the body exactly. Each uncompressed message of a
+`+json` codec is then a document of its own, and any message that cannot be
+read fails closed. Compressed messages and `application/grpc-web-text` bodies
+(accepted only when they are entirely base64) are not JSON under any reading
+and are not inspected by `body_json_path` rules. A look-alike media type, or a
+body whose framing does not validate, is judged as an ordinary body.
+
+A body scanned only up to `max_scan_bytes` (`on_body_too_large:
 scan_truncated`, or a prefix scan in a configuration that cannot block) is cut
-short by construction and is not judged either. WebSocket messages carry no
+short by construction and is not judged. WebSocket messages carry no
 `Content-Type`, so only the opening rules apply to them.
 
 What remains outside `body_json_path` inspection is a body that is not
-declared JSON, whose readings all fail to parse, and that does not open like
-a JSON container as described above — for example a leading scalar followed
-by text (`1 item`), or an opening only a non-default parser option accepts
-beyond those listed. `body_text` rules, byte rules and the body-scoped
-specials scan every body either way; pair a `body_json_path` rule with a
-`body_text` rule, or declare and validate JSON before it reaches the backend,
-when such a backend must be protected.
+declared JSON, of which nothing could be read as a JSON document, and no part
+of which opens like a JSON container as described above — for example a
+leading scalar followed by text (`1 item`), a container behind more than 64
+bytes of comments or Unicode whitespace part-way through a body, or an opening
+only a parser option beyond those listed accepts. `body_text` rules, byte
+rules and the body-scoped specials scan every body either way; pair a
+`body_json_path` rule with a `body_text` rule, or declare and validate JSON
+before it reaches the backend, when such a backend must be protected.
 
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).

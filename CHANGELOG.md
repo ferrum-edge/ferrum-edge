@@ -338,20 +338,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WAF `body_json_path` rules fail closed on JSON they cannot parse.** A
   body that neither the strict nor the lenient parse accepts — a number
   beyond the `f64` range, nesting deeper than 128 levels, `NaN` / `Infinity`,
-  a comment, a trailing comma, an unquoted member name, a leading form feed
+  a comment, a trailing comma, an unquoted name or value, a leading form feed
   or NBSP, the `)]}'` prefix, or text after the document, all of which some
   backend parsers accept — used to switch every JSON-path rule off for that
   request while the bytes were forwarded. Every applicable `body_json_path`
   rule now records a hit, and its own action and anomaly score decide
-  exactly as for a match, when a refused reading opens like a JSON object or
-  array (after the whitespace, comments and prefix lenient parsers skip), or
-  when no reading parsed and the `Content-Type` declares JSON (`*/json`,
-  `+json`; not the gRPC JSON codecs) or a reading opens like JSON once NULs
+  exactly as for a match, when a part that cannot be read opens like a JSON
+  object or array (after the whitespace, comments and prefix lenient parsers
+  skip), or when no reading can be read completely and the `Content-Type`
+  declares JSON (`*/json`, `+json`) or the part opens like JSON once NULs
   are skipped. Whitespace-separated documents (NDJSON, a leading scalar
   followed by an object, a document followed by another) are now all
-  inspected instead of being refused. A body scanned only up to
-  `max_scan_bytes` is not judged this way, an ordinary UTF-16 / UTF-32 body is
-  unaffected, and valid JSON bodies take the same single parse as before.
+  inspected, reading resumes on the next line after a document that cannot be
+  read, and documents read around such a part are inspected too. A validated
+  gRPC / gRPC-Web / Connect stream is read as its uncompressed `+json`
+  messages. A body scanned only up to `max_scan_bytes` is not judged this
+  way, an ordinary UTF-16 / UTF-32 body is unaffected, and valid JSON bodies
+  take the same single parse as before.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,

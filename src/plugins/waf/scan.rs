@@ -40,40 +40,66 @@ pub(super) struct ScanOutcome {
 /// What the JSON-path pass learned about every reading of one body.
 #[derive(Default)]
 struct JsonReadings {
-    /// Some reading parsed, strictly or leniently.
-    parsed: bool,
-    /// Some non-blank reading was refused by both parses.
+    /// Some reading was read completely (or is blank).
+    complete: bool,
+    /// Some reading held something neither parse could read.
     refused: bool,
-    /// The most JSON-like opening among the refused readings.
+    /// The most JSON-like opening among the parts that could not be read.
     refused_opening: json_doc::JsonOpening,
 }
 
+/// How one reading's refusal is weighed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadingKind {
+    /// The raw bytes or a UTF-16 / UTF-32 transcoding of an ordinary body:
+    /// several such readings coexist and at most one is the real document.
+    Alternative,
+    /// One message of a validated framed RPC stream: the document itself,
+    /// with no alternative reading, so any refusal fails closed.
+    FramedMessage,
+}
+
 impl JsonReadings {
+    fn record(&mut self, view: &json_doc::JsonView, kind: ReadingKind) {
+        match view.refused() {
+            None => self.complete = true,
+            Some(opening) => {
+                self.refused = true;
+                let opening = match kind {
+                    ReadingKind::Alternative => opening,
+                    ReadingKind::FramedMessage => json_doc::JsonOpening::Yes,
+                };
+                self.refused_opening = self.refused_opening.max(opening);
+            }
+        }
+    }
+
     /// Whether the body is JSON the rules could not read, so the rules fail
     /// closed:
     ///
-    /// - a refused reading opens like a JSON object or array, whatever the
-    ///   declared type and whatever the other readings did;
-    /// - no reading parsed, and a refused one opens like a JSON container
-    ///   once U+0000 is skipped between tokens (Json.NET) — except for the
-    ///   gRPC JSON codecs, whose length prefix is NULs and arbitrary bytes;
-    /// - no reading parsed and the `Content-Type` declares JSON. Under a JSON
-    ///   declaration no sniff is needed: the backend is told the body is
-    ///   JSON, and a reading the WAF cannot parse is exactly the gap a lenient
-    ///   parser reads through.
+    /// - a part that could not be read opens like a JSON object or array
+    ///   (in the reading's opening, or at any document the lenient reading
+    ///   stopped at), whatever the declared type and whatever the other
+    ///   readings did; or a message of a validated framed stream could not
+    ///   be read;
+    /// - no reading was read completely, and an unread part opens like a
+    ///   JSON container once U+0000 is skipped between tokens (Json.NET);
+    /// - no reading was read completely and the `Content-Type` declares JSON.
+    ///   Under a JSON declaration no sniff is needed: the backend is told the
+    ///   body is JSON, and a reading the WAF cannot parse is exactly the gap a
+    ///   lenient parser reads through.
     ///
-    /// "No reading parsed" is what keeps an ordinary UTF-16 / UTF-32 body
-    /// open: its raw bytes are refused (a NUL follows every ASCII character)
-    /// while its transcoded reading parses.
+    /// "No reading was read completely" is what keeps an ordinary UTF-16 /
+    /// UTF-32 body open: its raw bytes are refused (a NUL follows every ASCII
+    /// character) while its transcoded reading parses.
     fn fail_closed(&self, content_type: Option<&str>) -> bool {
         if self.refused_opening == json_doc::JsonOpening::Yes {
             return true;
         }
-        if self.parsed || !self.refused {
+        if self.complete || !self.refused {
             return false;
         }
-        (self.refused_opening == json_doc::JsonOpening::SkippingNul
-            && !json_doc::media_type_is_grpc(content_type))
+        self.refused_opening == json_doc::JsonOpening::SkippingNul
             || json_doc::media_type_declares_json(content_type)
     }
 }
@@ -401,9 +427,37 @@ impl Waf {
             // each UTF-16 / UTF-32 view — since a backend may accept any of
             // them as JSON.
             let mut readings = JsonReadings::default();
-            self.scan_json_path_rules(&mut outcome, body, subject, &mut readings);
+            // A validated gRPC / gRPC-Web / Connect stream is read as its
+            // messages, not as raw bytes: its envelope is NULs and lengths,
+            // never a JSON document.
+            match json_doc::framed_json_messages(content_type, body) {
+                Some(messages) => {
+                    for message in messages {
+                        self.scan_json_path_rules(
+                            &mut outcome,
+                            message,
+                            subject,
+                            ReadingKind::FramedMessage,
+                            &mut readings,
+                        );
+                    }
+                }
+                None => self.scan_json_path_rules(
+                    &mut outcome,
+                    body,
+                    subject,
+                    ReadingKind::Alternative,
+                    &mut readings,
+                ),
+            }
             for decoded in transcoded_views.iter() {
-                self.scan_json_path_rules(&mut outcome, decoded.as_bytes(), subject, &mut readings);
+                self.scan_json_path_rules(
+                    &mut outcome,
+                    decoded.as_bytes(),
+                    subject,
+                    ReadingKind::Alternative,
+                    &mut readings,
+                );
             }
             if readings.fail_closed(content_type) {
                 self.push_unparsed_json_hits(&mut outcome, subject, extent);
@@ -585,6 +639,7 @@ impl Waf {
         outcome: &mut ScanOutcome,
         body: &[u8],
         subject: ScanSubject<'_>,
+        kind: ReadingKind,
         readings: &mut JsonReadings,
     ) {
         if self.compiled.body_json_paths.is_empty() {
@@ -592,19 +647,14 @@ impl Waf {
         }
         // Duplicate-preserving parse: every occurrence of a repeated member
         // is inspected, so the verdict holds whichever one the backend reads.
+        // Every document read is inspected, including the ones around a part
+        // that could not be read.
         let view = json_doc::parse(body);
-        match view {
-            json_doc::JsonView::Document(_) | json_doc::JsonView::Documents(_) => {
-                readings.parsed = true;
-            }
-            json_doc::JsonView::Refused { opening } => {
-                readings.refused = true;
-                readings.refused_opening = readings.refused_opening.max(opening);
-                return;
-            }
-            json_doc::JsonView::Blank => return,
-        }
+        readings.record(&view, kind);
         let documents = view.documents();
+        if documents.is_empty() {
+            return;
+        }
         for path_rule in &self.compiled.body_json_paths {
             // One hit per rule is all the outcome records. Stop at it, and skip
             // a rule an earlier view already hit, so duplicated members cannot
