@@ -275,6 +275,10 @@ def _single_line_input(line: str, mapping_keys: frozenset[str] = frozenset()) ->
         return "'" not in value and '"' not in value and _strip_comment(value).endswith(closing)
     if value.startswith(("&", "*", "!")):
         return False  # anchors, aliases, and tags are not read here
+    plain = _strip_comment(value)
+    if plain.endswith(("'", '"')) and plain.count(plain[-1]) % 2:
+        # An unbalanced closing quote ends a value opened on an earlier line.
+        return False
     return True
 
 
@@ -307,6 +311,130 @@ def _is_content(line: str) -> bool:
 
 
 BLOCK_SCALAR_VALUE = re.compile(r"^[|>][1-9+-]{0,2} *(?:#.*)?$")
+# The first plain-key separator or comment on a line, whichever comes first.
+PLAIN_KEY_OR_COMMENT = re.compile(r":(?=[ \t]|$)|[ \t]#")
+
+
+def _scan_quoted(text: str, pos: int, quote: str) -> int | None:
+    """Index just past the quote closing a scalar whose body starts at `pos`."""
+
+    while pos < len(text):
+        char = text[pos]
+        if quote == '"' and char == "\\":
+            pos += 2
+            continue
+        if char == quote:
+            if quote == "'" and text.startswith("''", pos):
+                pos += 2
+                continue
+            return pos + 1
+        pos += 1
+    return None
+
+
+def _scan_flow(text: str, pos: int, depth: int, quote: str | None) -> tuple[int, str | None]:
+    """Advance a flow collection; return its remaining depth and any open quote."""
+
+    while pos < len(text):
+        if quote is not None:
+            closed = _scan_quoted(text, pos, quote)
+            if closed is None:
+                return depth, quote
+            pos, quote = closed, None
+            continue
+        char = text[pos]
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth <= 0:
+                return 0, None
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (pos == 0 or text[pos - 1] in " \t"):
+            break
+        pos += 1
+    return depth, quote
+
+
+def _lex_node(text: str, pos: int, column: int) -> tuple[str, object] | None:
+    """Lex the node(s) from `pos` to the end of the line.
+
+    Returns the construct the line leaves open: ("quote", q), ("flow",
+    (depth, q)), or ("block", parent column); None when nothing stays open.
+    """
+
+    while True:
+        while pos < len(text) and text[pos] in " \t":
+            pos += 1
+        if pos >= len(text) or text[pos] == "#":
+            return None
+        char = text[pos]
+        follows_space = pos + 1 == len(text) or text[pos + 1] in " \t"
+        if char in "-?:" and follows_space:
+            column = pos  # sequence entry or explicit key / value indicator
+            pos += 1
+            continue
+        if char in "'\"":
+            closed = _scan_quoted(text, pos + 1, char)
+            if closed is None:
+                return ("quote", char)
+            rest = text[closed:].lstrip(" \t")
+            if not rest.startswith(":"):
+                return None
+            pos = text.index(":", closed) + 1  # a quoted key; lex its value
+            continue
+        if char in "[{":
+            depth, quote = _scan_flow(text, pos, 0, None)
+            return ("flow", (depth, quote)) if depth else None
+        if char in "|>":
+            return ("block", column)
+        if char in "&!":
+            while pos < len(text) and text[pos] not in " \t":
+                pos += 1
+            continue
+        match = PLAIN_KEY_OR_COMMENT.search(text, pos)
+        if match is None or match.group().endswith("#"):
+            return None  # a plain scalar
+        column = pos
+        pos = match.end()
+
+
+def _open_scalar_lines(lines: list[str]) -> set[int]:
+    """Indices of lines that start inside a quoted scalar or flow collection.
+
+    A forward lexer over the whole file: a quote or bracket that opens a
+    value and does not close on its line makes every following line, up to and
+    including the one that closes it, scalar text rather than YAML structure.
+    Such text can look like a `- ` step, a `with:` key, or a job key, so step
+    boundaries and inputs are never read from these lines (#6688). Block
+    scalar bodies (`|` / `>`) are skipped from each header's parent column.
+    """
+
+    opaque: set[int] = set()
+    state: tuple[str, object] | None = None
+    for number, line in enumerate(lines):
+        if state is not None and state[0] == "block":
+            if not line.strip() or _indent(line) > int(state[1]):
+                continue
+            state = None
+        if state is None:
+            if line.strip():
+                state = _lex_node(line, _indent(line), _indent(line))
+            continue
+        opaque.add(number)
+        kind, data = state
+        if kind == "quote":
+            closed = _scan_quoted(line, 0, str(data))
+            if closed is None:
+                continue
+            rest = line[closed:].lstrip(" \t")
+            state = _lex_node(line, line.index(":", closed) + 1, closed) if rest.startswith(":") else None
+        else:
+            depth, quote = data
+            depth, quote = _scan_flow(line, 0, depth, quote)
+            state = ("flow", (depth, quote)) if depth else None
+    return opaque
 
 
 def _checkout_step_readable(lines: list[str], start: int, end: int, key_indent: int) -> bool:
@@ -391,6 +519,7 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
     )
     errors: list[str] = []
     block_bodies = _block_scalar_body_lines(lines)
+    open_scalar = _open_scalar_lines(lines)
     for index, line in enumerate(lines):
         if line.lstrip().startswith("#"):
             continue
@@ -434,6 +563,8 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
         if "-" not in match.group("lead"):
             start = -1
             for back in range(index - 1, -1, -1):
+                if back in open_scalar:
+                    continue  # scalar text, never a step boundary
                 if _is_content(lines[back]) and _indent(lines[back]) < key_indent:
                     start = back
                     break
@@ -448,7 +579,9 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
             _is_content(lines[end]) and _indent(lines[end]) < key_indent
         ):
             end += 1
-        if not _checkout_step_readable(lines, start, end, key_indent):
+        if any(number in open_scalar for number in range(start, end)) or not (
+            _checkout_step_readable(lines, start, end, key_indent)
+        ):
             errors.append(
                 f"{located} checkout step keys, and the direct children of its "
                 "`with:` / `env:` mappings, must each be one complete `key: value` "
@@ -503,6 +636,8 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
         elif not values:
             job = None
             for back in range(index - 1, -1, -1):
+                if back in open_scalar:
+                    continue
                 job_match = JOB_KEY.match(lines[back])
                 if job_match is not None:
                     job = job_match.group("job")
@@ -717,6 +852,16 @@ def run_self_test() -> list[str]:
             "          persist-credentials: false\n" + tail,
         ),
         (
+            "balanced quoted expressions",
+            pr + f"      - uses: {pin}\n        if: needs.plan.outputs.mode != 'skip'\n"
+            "        with:\n          persist-credentials: false\n          ref: x\n" + tail,
+        ),
+        (
+            "multi-line scalar in another step",
+            pr + "      - run: \"echo one\n          - name: two\"\n"
+            f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
             "composite env children",
             "name: a\nruns:\n  using: composite\n  steps:\n"
             f"    - uses: {pin}\n      env:\n        A: \"x\"\n      with:\n"
@@ -884,6 +1029,41 @@ def run_self_test() -> list[str]:
             "        persist-credentials: false\n          \"\n    - run: true\n      shell: bash\n",
         ),
         (
+            "fabricated step start inside env scalar",
+            pr + "      - env:\n          X: 'ignored\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: ignored'\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "composite fabricated step start inside env scalar",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - env:\n        X: 'ignored\n    - name: decoy\n      with:\n"
+            f"        persist-credentials: false\n        CLOSE: ignored'\n      uses: {pin}\n",
+        ),
+        (
+            "fabricated step start with escaped closing quote",
+            pr + "      - env:\n          X: \"ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: a\\\"b\"\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
+            "fabricated step start closed on its own line",
+            pr + "      - env:\n          X: \"ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: x\n            \"\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
+            "fabricated step start inside tab-separated scalar",
+            pr + "      - env:\n          X:\t'ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: x\n            '\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
+            "fabricated step start inside flow value",
+            pr + "      - env:\n          X: [ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: x\n            ]\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
             "composite block scalar impersonation",
             "name: a\nruns:\n  using: composite\n  steps:\n"
             f"    - uses: {pin}\n      with:\n        ssh-known-hosts: |\n"
@@ -928,6 +1108,12 @@ def run_self_test() -> list[str]:
         failures.append("checkout credential self-test: policy-frozen release job was rejected")
     if not checkout_credential_errors(frozen, ".github/workflows/ci.yml"):
         failures.append("checkout credential self-test: frozen-job exemption leaked to another file")
+    decoy_job = pr.replace(
+        "  build:\n    steps:\n",
+        "  build:\n    env:\n      X: 'ignored\n  docker:\n      '\n    steps:\n",
+    ) + f"      - uses: {pin}\n" + tail
+    if not checkout_credential_errors(decoy_job, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: frozen job key inside a scalar was admitted")
     frozen_true = frozen.replace(tail, "        with:\n          persist-credentials: true\n" + tail)
     if not checkout_credential_errors(frozen_true, ".github/workflows/release.yml"):
         failures.append("checkout credential self-test: policy-frozen job admitted true")

@@ -3724,11 +3724,14 @@ and the branch-pruning jobs in `prune-stale-prs.yml`).
 aggregate, rejects a checkout that omits the key, in workflows and in local
 composite actions under `.github/actions/`. It admits `true` only in a
 workflow started solely by `schedule` or `workflow_dispatch`, and refuses
-YAML-escaped checkout references. Every line of a checkout step must be a
-complete `key: value` step key, a complete direct child of its `with:` or
-`env:` mapping, or a block scalar body, so a quoted, flow, or plain value left
-open at any depth cannot carry later lines that only look like `with:` /
-`persist-credentials` (#6688).
+YAML-escaped checkout references. A forward lexer marks every line that sits
+inside a quoted scalar or flow collection left open on an earlier line; those
+lines never count as a step boundary or a job key, and a checkout step that
+contains one is refused. Every line of a checkout step must also be a complete
+`key: value` step key, a complete direct child of its `with:` or `env:`
+mapping, or a block scalar body, and a plain value ending in an unbalanced
+quote is refused. Text inside an open value therefore cannot pose as a
+`- ` step, `with:`, or `persist-credentials` (#6688).
 
 One set of checkouts still uses the action default. The trusted Cross policy
 freezes the bytes of these jobs, so a pull request cannot add the key: the

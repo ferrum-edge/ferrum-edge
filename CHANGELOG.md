@@ -86,9 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `verify_workflow_permissions.py` checked only the top-level keys of an
   `actions/checkout` step for a value left open across lines, so an
   unterminated quoted value under the step's `env:` could swallow later lines
-  that only looked like `with: persist-credentials: false`. Every line of a
-  checkout step must now be a complete step key, a complete direct child of
-  `with:` / `env:`, or a block scalar body; anything else is refused.
+  that only looked like `with: persist-credentials: false`, or like a new
+  `- ` step that hid the real step's start. A forward lexer now marks lines
+  inside a quoted scalar or flow collection left open on an earlier line, and
+  those lines are never read as a step boundary, job key, or input. Every
+  line of a checkout step must also be a complete step key, a complete direct
+  child of `with:` / `env:`, or a block scalar body; anything else is refused.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now
