@@ -340,26 +340,43 @@ def _scan_quoted(text: str, pos: int, quote: str) -> int | None:
 
 
 def _scan_flow(text: str, pos: int, depth: int, quote: str | None) -> tuple[int, str | None]:
-    """Advance a flow collection; return its remaining depth and any open quote."""
+    """Advance a flow collection; return its remaining depth and any open quote.
 
+    A quote opens a quoted scalar only where a flow node can start: after `[`,
+    `{`, `,`, or a `:` separator (whitespace in between is allowed), or at the
+    start of a continuation line. Inside a plain scalar such as `don't` or
+    `a"b` it is an ordinary character, as YAML readers treat it.
+    """
+
+    node_start = True
     while pos < len(text):
         if quote is not None:
             closed = _scan_quoted(text, pos, quote)
             if closed is None:
                 return depth, quote
-            pos, quote = closed, None
+            pos, quote, node_start = closed, None, False
             continue
         char = text[pos]
         if char in "[{":
             depth += 1
+            node_start = True
         elif char in "]}":
             depth -= 1
+            node_start = False
             if depth <= 0:
                 return 0, None
-        elif char in "'\"":
+        elif char == ",":
+            node_start = True
+        elif char == ":" and (pos + 1 == len(text) or text[pos + 1] in " \t,[]{}"):
+            node_start = True
+        elif char in " \t":
+            pass  # whitespace keeps whatever position came before it
+        elif char in "'\"" and node_start:
             quote = char
         elif char == "#" and (pos == 0 or text[pos - 1] in " \t"):
             break
+        else:
+            node_start = False
         pos += 1
     return depth, quote
 
@@ -1143,6 +1160,17 @@ def run_self_test() -> list[str]:
             "multi-line scalar in another step",
             pr + "      - run: \"echo one\n          - name: two\"\n"
             f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "flow plain scalar with apostrophe before checkout",
+            pr + "      - run: echo ready\n        env: {NOTE: don't}\n"
+            f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "composite flow plain scalar with quotes before checkout",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - run: echo ready\n      shell: bash\n      env: {NOTE: a\"b, OTHER: don't}\n"
+            f"    - uses: {pin}\n      with:\n        persist-credentials: false\n",
         ),
         (
             "composite env children",
