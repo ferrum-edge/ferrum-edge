@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
+  element content iteratively instead of recursing once per nesting level, so
+  the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
+  stack on a 199-level document the `openapi_validator` depth screen admits).
+  The 256-level pre-parse nesting screen in `body_validator`,
+  `soap_ws_security` and `openapi_validator` is unchanged. 0.21 also makes
+  `Node::attribute("ID")` return the first attribute with that local name in
+  any namespace, so `soap_ws_security` (WS-Security, SAML and XML-Signature
+  `ID`, `URI`, `Algorithm`, `Type`, validity and confirmation attributes) and
+  `openapi_validator` (attributes without `xml.namespace`) now read only the
+  unqualified attribute: a prefixed look-alike such as `x:ID` or `x:Type`
+  placed first cannot stand in for it. The XML parsers pass no
+  external-entity resolver.
 - **JWT signing and verification run on AWS-LC in the default build.**
   `jsonwebtoken` now selects its `aws_lc_rs` backend inline on both profiles
   instead of `rust_crypto` on the default `crypto-ring` profile; a `fips` build
