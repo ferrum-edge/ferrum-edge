@@ -126,6 +126,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **Stale request completions no longer reset a reloaded circuit breaker**
+  (issue #6799). A request completes with the breaker config it was admitted
+  under. When that config had since been reloaded, every completion recorder
+  (H1/H2 buffered and retry paths, WebSocket, gRPC, HTTP/3, HBONE, TCP, UDP
+  and DTLS) treated the older config as a change. It replaced the live
+  breaker, possibly OPEN, with a fresh CLOSED one, and the next admission
+  replaced it again. The new breaker's failures and open state were lost and
+  traffic was re-admitted. Each attempt now keeps the breaker instance its
+  admission returned, CLOSED admissions included, and settles its outcome and
+  probe slot on that instance only while it is still the cached breaker
+  (`CircuitBreakerCache::is_current`). A completion whose breaker was replaced
+  is dropped, including after an A→B→A reload or a prune that recreated the
+  key with the same config. Any probe slot it holds is returned on the
+  breaker that admitted it. Admission still replaces a breaker whose config
+  changed. HTTP/3 native and cross-protocol (HTTP and gRPC bridge) retries now
+  admit every attempt through the target's breaker, as the HTTP/1.1 and
+  HTTP/2 retry loops do: after the backoff, just before dispatch. A breaker
+  still OPEN at that point refuses the retry, and a rotated target that was
+  never admitted before now has its failures recorded.
 - **A direct HTTP/1.1 check-in racing a drain no longer lands in the drained
   pool** (issue #6793). A drain now marks the backend's lane retired under the
   lane lock, and check-in reads that mark under the same lock. A connection

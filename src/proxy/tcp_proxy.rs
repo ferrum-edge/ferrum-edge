@@ -4202,13 +4202,13 @@ async fn handle_tcp_connection_inner(
                     }
                     Ok(Ok(addresses)) => addresses,
                     Ok(Err(e)) => {
-                        if let Some(ref cb_config) = cb_info.cb_config {
-                            let cb = circuit_breaker_cache.get_or_create(
+                        if let Some(cb) = cb_info.cb_probe.current_breaker(
+                                circuit_breaker_cache,
                                 &cb_info.namespace,
                                 proxy_id,
                                 cb_info.cb_target_key.as_deref(),
-                                cb_config,
-                            );
+                            )
+                        {
                             // A gateway-side egress-policy denial (literal / dns_override /
                             // rebound passthrough host blocked) dialed no backend, so it
                             // must NOT trip the breaker as a connect failure — release any
@@ -4318,13 +4318,13 @@ async fn handle_tcp_connection_inner(
                                     params.backend_policy_port,
                                 ));
                             }
-                            if let Some(ref cb_config) = cb_info.cb_config {
-                                let cb = circuit_breaker_cache.get_or_create(
+                            if let Some(cb) = cb_info.cb_probe.current_breaker(
+                                    circuit_breaker_cache,
                                     &cb_info.namespace,
                                     proxy_id,
                                     cb_info.cb_target_key.as_deref(),
-                                    cb_config,
-                                );
+                                )
+                            {
                                 cb.record_failure(502, true, cb_info.cb_probe.take_slot());
                             }
                         })?,
@@ -4555,13 +4555,12 @@ async fn handle_tcp_connection_inner(
         }
 
         // Record circuit breaker outcome.
-        if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = circuit_breaker_cache.get_or_create(
-                &cb_info.namespace,
-                proxy_id,
-                cb_info.cb_target_key.as_deref(),
-                cb_config,
-            );
+        if let Some(cb) = cb_info.cb_probe.current_breaker(
+            circuit_breaker_cache,
+            &cb_info.namespace,
+            proxy_id,
+            cb_info.cb_target_key.as_deref(),
+        ) {
             match copy_result.first_failure.as_ref() {
                 Some(failure) if relay_failure_is_client_facing(failure) => {
                     cb_info.cb_probe.release_neutral();
@@ -4970,13 +4969,12 @@ async fn handle_tcp_connection_inner(
     // Helper: record circuit breaker failure for the current target.
     let record_cb_failure =
         |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
-            if let Some(ref cb_config) = cb_info.cb_config {
-                let cb = cb_cache.get_or_create(
-                    &cb_info.namespace,
-                    proxy_id,
-                    cb_info.cb_target_key.as_deref(),
-                    cb_config,
-                );
+            if let Some(cb) = cb_info.cb_probe.current_breaker(
+                cb_cache,
+                &cb_info.namespace,
+                proxy_id,
+                cb_info.cb_target_key.as_deref(),
+            ) {
                 cb.record_failure(502, true, cb_info.cb_probe.take_slot());
             }
         };
@@ -5910,13 +5908,12 @@ async fn handle_tcp_connection_inner(
     }
 
     // Record circuit breaker outcome based on copy result.
-    if let Some(ref cb_config) = current_cb_info.cb_config {
-        let cb = circuit_breaker_cache.get_or_create(
-            &current_cb_info.namespace,
-            proxy_id,
-            current_cb_info.cb_target_key.as_deref(),
-            cb_config,
-        );
+    if let Some(cb) = current_cb_info.cb_probe.current_breaker(
+        circuit_breaker_cache,
+        &current_cb_info.namespace,
+        proxy_id,
+        current_cb_info.cb_target_key.as_deref(),
+    ) {
         match copy_result.first_failure.as_ref() {
             Some(failure) if relay_failure_is_client_facing(failure) => {
                 current_cb_info.cb_probe.release_neutral();

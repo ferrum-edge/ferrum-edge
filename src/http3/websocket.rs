@@ -604,7 +604,7 @@ pub(crate) async fn handle_h3_websocket(
     // Ownership of the HALF_OPEN circuit-breaker probe slot admitted for this
     // upgrade, moved in from the H3 dispatcher. Dropping it releases the slot
     // NEUTRALLY (GHSA-4cq4-3f3f-mq76).
-    mut cb_probe: crate::proxy::HalfOpenProbeGuard,
+    cb_probe: crate::proxy::HalfOpenProbeGuard,
     backend_url: String,
     query_string: String,
     proxy_headers: HashMap<String, String>,
@@ -920,7 +920,7 @@ pub(crate) async fn handle_h3_websocket(
                 502,
                 false,
                 Some(retry::ErrorClass::DispatchPolicyRejected),
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 start_time.elapsed(),
             );
@@ -1245,13 +1245,12 @@ pub(crate) async fn handle_h3_websocket(
                         });
                         backend_outcome_already_recorded = true;
                     }
-                    if let Some(cb_config) = &proxy.circuit_breaker {
-                        let cb = state.circuit_breaker_cache.get_or_create(
-                            &proxy.namespace,
-                            &proxy.id,
-                            current_cb_target_key.as_deref(),
-                            cb_config,
-                        );
+                    if let Some(cb) = cb_probe.current_breaker(
+                        &state.circuit_breaker_cache,
+                        &proxy.namespace,
+                        &proxy.id,
+                        current_cb_target_key.as_deref(),
+                    ) {
                         cb.record_failure(
                             ws_failure_status.as_u16(),
                             ws_is_pre_wire,
@@ -1410,13 +1409,14 @@ pub(crate) async fn handle_h3_websocket(
                     });
                 }
 
-                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
+                if !cb_failure_already_recorded
+                    && let Some(cb) = cb_probe.current_breaker(
+                        &state.circuit_breaker_cache,
                         &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
-                        cb_config,
-                    );
+                    )
+                {
                     if ws_egress_denied {
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY so the breaker can
@@ -1478,13 +1478,12 @@ pub(crate) async fn handle_h3_websocket(
     // Backend handshake succeeded. If this request was admitted as a
     // half-open probe, record the success so the breaker can close.
     // Matches the H1/H2 path's behavior on the successful upgrade hop.
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            &proxy.id,
-            current_cb_target_key.as_deref(),
-            cb_config,
-        );
+    if let Some(cb) = cb_probe.current_breaker(
+        &state.circuit_breaker_cache,
+        &proxy.namespace,
+        &proxy.id,
+        current_cb_target_key.as_deref(),
+    ) {
         cb.record_success(cb_probe.take_slot());
     }
 

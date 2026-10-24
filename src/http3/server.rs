@@ -7021,17 +7021,19 @@ async fn handle_h3_request(
     // failure history refuse a tunnel to a destination the client named and the
     // route already admits, while a claimed HALF_OPEN probe slot would have to
     // be released again untested a few lines into the handler.
-    let circuit_breaker_admission: Result<(Option<String>, bool, u64), ()> =
-        if is_connect_udp_request {
-            Ok((None, false, 0))
-        } else {
-            crate::proxy::backend_dispatch::check_circuit_breaker(
-                &proxy,
-                &state,
-                upstream_target.as_deref(),
-            )
-        };
-    let (cb_target_key, cb_is_half_open_probe, cb_admission_generation) =
+    let circuit_breaker_admission: Result<
+        crate::proxy::backend_dispatch::CircuitBreakerAdmission,
+        (),
+    > = if is_connect_udp_request {
+        Ok((None, None, false, 0))
+    } else {
+        crate::proxy::backend_dispatch::check_circuit_breaker(
+            &proxy,
+            &state,
+            upstream_target.as_deref(),
+        )
+    };
+    let (cb_target_key, cb_admitted, cb_is_half_open_probe, cb_admission_generation) =
         match circuit_breaker_admission {
             Ok(result) => result,
             Err(()) => {
@@ -7133,9 +7135,7 @@ async fn handle_h3_request(
     // and the leaked slot wedges the breaker just the same. Dropping `cb_probe`
     // releases the slot NEUTRALLY on every such path.
     let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
-        &state,
-        &proxy,
-        cb_target_key.as_deref(),
+        cb_admitted.as_ref(),
         cb_is_half_open_probe,
         cb_admission_generation,
     );
@@ -7678,7 +7678,7 @@ async fn handle_h3_request(
             502,
             false,
             Some(crate::retry::ErrorClass::DispatchPolicyRejected),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -8016,7 +8016,7 @@ async fn handle_h3_request(
                                 413,
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -8047,7 +8047,7 @@ async fn handle_h3_request(
                                 0,
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -8080,7 +8080,7 @@ async fn handle_h3_request(
                                 StatusCode::REQUEST_TIMEOUT.as_u16(),
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -8113,7 +8113,7 @@ async fn handle_h3_request(
                                 StatusCode::REQUEST_TIMEOUT.as_u16(),
                                 false,
                                 Some(crate::retry::ErrorClass::ClientDisconnect),
-                                cb_probe.take_slot(),
+                                cb_probe.settle(),
                                 false,
                                 backend_start.elapsed(),
                             );
@@ -8535,7 +8535,7 @@ async fn handle_h3_request(
                         413,
                         false,
                         Some(crate::retry::ErrorClass::ClientDisconnect),
-                        cb_probe.take_slot(),
+                        cb_probe.settle(),
                         false,
                         backend_start.elapsed(),
                     );
@@ -8647,7 +8647,7 @@ async fn handle_h3_request(
                     reject_status_code,
                     outcome_connection_error,
                     outcome_error_class,
-                    cb_probe.take_slot(),
+                    cb_probe.settle(),
                     false,
                     backend_start.elapsed(),
                 );
@@ -8781,7 +8781,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -8872,7 +8872,7 @@ async fn handle_h3_request(
                 response_status,
                 false,
                 None,
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -9675,7 +9675,7 @@ async fn handle_h3_request(
             response_status,
             body_outcome_connection_error,
             body_outcome_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -10320,7 +10320,7 @@ async fn handle_h3_request(
             backend_status,
             connection_error,
             backend_outcome_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -10656,13 +10656,12 @@ async fn handle_h3_request(
                 // Same typed signal as the retry decision: a graceful close
                 // (or any other post-`send_request` fault) does not count
                 // as a transport-level failure for CB tripping.
-                if let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        &proxy.id,
-                        current_cb_target_key.as_deref(),
-                        cb_config,
-                    );
+                if let Some(cb) = cb_probe.current_breaker(
+                    &state.circuit_breaker_cache,
+                    &proxy.namespace,
+                    &proxy.id,
+                    current_cb_target_key.as_deref(),
+                ) {
                     // A retryable outcome carrying NO backend-health signal —
                     // today only a DestinationRule `maxConnections` refusal,
                     // which is pre-wire (so the loop may rotate) but is the
@@ -10709,6 +10708,10 @@ async fn handle_h3_request(
                 }
                 attempt += 1;
 
+                // Kept so a breaker refusal below can restore the target that
+                // produced the result being served.
+                let pre_rotation_target = current_target.clone();
+                let pre_rotation_cb_target_key = current_cb_target_key.clone();
                 if let Some((next, next_url)) = next_retry_target {
                     let target_changed = current_target.as_ref().is_some_and(|prev_target| {
                         next.host != prev_target.host || next.port != prev_target.port
@@ -10796,6 +10799,24 @@ async fn handle_h3_request(
                         request_on_wire: false,
                     };
                     sticky_dispatch_refused = true;
+                    break;
+                }
+
+                // Admit this attempt through the breaker of the target it will
+                // dial (issue #6799) after the backoff and the rotated target's
+                // egress/transport screens, immediately before backend
+                // admission — the H1/H2 retry loop's order. An OPEN breaker ends
+                // the retries: the previous attempt, already recorded, is served
+                // against the target that produced it, and the retired guard
+                // keeps the post-loop record from settling it twice.
+                if !crate::proxy::admit_retry_attempt(
+                    &state,
+                    &proxy,
+                    current_cb_target_key.as_deref(),
+                    &cb_probe,
+                ) {
+                    current_target = pre_rotation_target;
+                    current_cb_target_key = pre_rotation_cb_target_key;
                     break;
                 }
 
@@ -11056,7 +11077,7 @@ async fn handle_h3_request(
             response_status,
             !h3_request_on_wire,
             h3_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -15225,7 +15246,7 @@ async fn record_failed_h3_grpc_dispatch(
         health_status,
         outcome_connection_error,
         outcome_error_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
@@ -16119,7 +16140,7 @@ async fn dispatch_grpc_native_h3(
                 response_status,
                 false,
                 None,
-                cb_probe.take_slot(),
+                cb_probe.settle(),
                 false,
                 backend_start.elapsed(),
             );
@@ -16218,7 +16239,7 @@ async fn dispatch_grpc_native_h3(
             response_status,
             false,
             Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -16331,7 +16352,7 @@ async fn dispatch_grpc_native_h3(
             response_status,
             false,
             None,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -16577,7 +16598,7 @@ async fn dispatch_grpc_native_h3(
             response_status,
             false,
             health_error_class,
-            cb_probe.take_slot(),
+            cb_probe.settle(),
             false,
             backend_start.elapsed(),
         );
@@ -17712,7 +17733,7 @@ async fn dispatch_grpc_native_h3(
         response_status,
         body_outcome_connection_error,
         body_outcome_error_class,
-        cb_probe.take_slot(),
+        cb_probe.settle(),
         false,
         backend_start.elapsed(),
     );
