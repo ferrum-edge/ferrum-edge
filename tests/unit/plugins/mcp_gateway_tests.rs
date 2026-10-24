@@ -71,6 +71,12 @@ fn aggregate_config(upstream_url: &str) -> Value {
         },
         "policy": {
             "default_action": "deny",
+            // Prompts and resources inherit `default_action` unless their own
+            // family default is set; this shared fixture exercises routing for
+            // them, so it opens both families explicitly. Policy coverage for
+            // them lives in the prompt/resource policy tests.
+            "default_prompt_action": "allow",
+            "default_resource_action": "allow",
             "hide_denied_tools": true,
             "tools": {
                 "github.create_pr": { "action": "allow" },
@@ -12924,6 +12930,18 @@ fn schema_fixture(overrides: Value) -> Value {
     config
 }
 
+/// An aggregate fixture whose single `demo` server also carries `extra`.
+fn server_fixture(extra: Value) -> Value {
+    let mut server = json!({ "upstream_url": "http://127.0.0.1:9/mcp", "namespace": "demo" });
+    for (key, value) in extra
+        .as_object()
+        .expect("extra server fields are an object")
+    {
+        server[key] = value.clone();
+    }
+    schema_fixture(json!({ "servers": { "demo": server } }))
+}
+
 /// An aggregate fixture whose single `policy.tools` entry is `entry`.
 fn grant_fixture(entry: Value) -> Value {
     schema_fixture(json!({ "policy": { "tools": { "demo.thing": entry } } }))
@@ -12964,6 +12982,9 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
         config
     };
 
+    let too_many_server_headers: serde_json::Map<String, Value> = (0..33)
+        .map(|index| (format!("x-h{index}"), json!("v")))
+        .collect();
     let fixtures: Vec<(&str, Value)> = vec![
         // Minimal and documented shapes.
         ("minimal aggregate", schema_fixture_base()),
@@ -13307,6 +13328,117 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
                 }
             })),
         ),
+        // Per-server upstream headers and the client-credential opt-in.
+        (
+            "server headers",
+            server_fixture(
+                json!({ "headers": { "Authorization": "Bearer svc", "x-api-key": "k" } }),
+            ),
+        ),
+        (
+            "null server headers",
+            server_fixture(json!({ "headers": null })),
+        ),
+        (
+            "scalar server headers",
+            server_fixture(json!({ "headers": "Authorization: x" })),
+        ),
+        (
+            "empty server header value",
+            server_fixture(json!({ "headers": { "x-api-key": "" } })),
+        ),
+        (
+            "non-string server header value",
+            server_fixture(json!({ "headers": { "x-api-key": 7 } })),
+        ),
+        (
+            "invalid server header name",
+            server_fixture(json!({ "headers": { "bad header": "v" } })),
+        ),
+        (
+            "control-character server header value",
+            server_fixture(json!({ "headers": { "x-api-key": "a\nb" } })),
+        ),
+        (
+            "too many server headers",
+            server_fixture(json!({ "headers": too_many_server_headers })),
+        ),
+        (
+            "forward client credentials",
+            server_fixture(json!({ "forward_client_credentials": true })),
+        ),
+        (
+            "null forward client credentials",
+            server_fixture(json!({ "forward_client_credentials": null })),
+        ),
+        (
+            "transparent forward client credentials",
+            transparent_with(json!({
+                "servers": {
+                    "demo": {
+                        "upstream_url": "http://127.0.0.1:9/mcp",
+                        "namespace": "demo",
+                        "forward_client_credentials": false
+                    }
+                }
+            })),
+        ),
+        // Prompt and resource policy.
+        (
+            "prompt and resource policy",
+            schema_fixture(json!({
+                "policy": {
+                    "default_action": "deny",
+                    "default_prompt_action": "allow",
+                    "default_resource_action": "deny",
+                    "prompts": { "demo.review": { "action": "deny" } },
+                    "resources": { "mcp://demo/x": { "action": "allow" } }
+                }
+            })),
+        ),
+        (
+            "null prompt and resource policy",
+            schema_fixture(json!({
+                "policy": {
+                    "default_prompt_action": null,
+                    "default_resource_action": null,
+                    "prompts": null,
+                    "resources": null
+                }
+            })),
+        ),
+        (
+            "hidden prompt action",
+            schema_fixture(json!({
+                "policy": { "prompts": { "demo.review": { "action": "hide_from_discovery" } } }
+            })),
+        ),
+        (
+            "prompt policy without action",
+            schema_fixture(json!({ "policy": { "prompts": { "demo.review": {} } } })),
+        ),
+        (
+            "scalar resource policy entry",
+            schema_fixture(json!({ "policy": { "resources": { "mcp://demo/x": "allow" } } })),
+        ),
+        (
+            "unknown resource policy key",
+            schema_fixture(json!({
+                "policy": { "resources": { "mcp://demo/x": { "action": "allow", "bogus": 1 } } }
+            })),
+        ),
+        (
+            "invalid default prompt action",
+            schema_fixture(json!({ "policy": { "default_prompt_action": "hide_from_discovery" } })),
+        ),
+        (
+            "transparent prompt policy",
+            transparent_with(json!({ "policy": { "prompts": {} } })),
+        ),
+        (
+            "transparent default resource action",
+            transparent_with(json!({ "policy": { "default_resource_action": "allow" } })),
+        ),
     ];
 
     for (name, config) in fixtures {
@@ -13381,6 +13513,24 @@ async fn mcp_gateway_openapi_component_matches_runtime_admission() {
                 "action": "allow",
                 "allowed_groups": ["readers"],
                 "denied_groups": ["readers"]
+            })),
+        ),
+        (
+            "reserved server header name",
+            server_fixture(json!({ "headers": { "Content-Type": "text/plain" } })),
+        ),
+        (
+            "case-insensitive duplicate server header",
+            server_fixture(json!({ "headers": { "x-key": "a", "X-Key": "b" } })),
+        ),
+        (
+            "session header as a server header",
+            server_fixture(json!({ "headers": { "Mcp-Session-Id": "v" } })),
+        ),
+        (
+            "unset plugin secret server header reference",
+            server_fixture(json!({
+                "headers": { "authorization": "${FERRUM_PLUGIN_SECRET_MCP_GATEWAY_PARITY_UNSET}" }
             })),
         ),
         (
@@ -17012,5 +17162,881 @@ fn session_header_names_are_registered_as_credential_headers() {
     assert_eq!(
         plugin.request_headers_to_redact(),
         &["x-client-session".to_string(), "x-proof".to_string()]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review hardening
+// ---------------------------------------------------------------------------
+
+/// A mock MCP upstream answering every POST with `tools` as its tool list.
+async fn start_mcp_tools_server(tools: Value) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": { "tools": tools }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A tools-only aggregate gateway that never initializes its upstream and
+/// admits every discovered tool, so only schema admission can hide one.
+fn passthrough_tools_config(upstream_url: &str) -> Value {
+    json!({
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+        "sessions": { "initialize_upstreams": "passthrough" },
+        "discovery": {
+            "aggregate_resources": false,
+            "aggregate_prompts": false,
+            "on_new_tool": "allow"
+        },
+        "policy": { "default_action": "allow" },
+        "servers": {
+            "github": { "upstream_url": upstream_url, "namespace": "github" }
+        }
+    })
+}
+
+async fn session_request(
+    plugin: &Arc<dyn Plugin>,
+    session_id: &str,
+    body: Value,
+) -> (
+    PluginResult,
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
+    let (mut ctx, mut headers) = mcp_ctx(body);
+    headers.insert("mcp-session-id".to_string(), session_id.to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx, headers)
+}
+
+async fn session_list(
+    plugin: &Arc<dyn Plugin>,
+    session_id: &str,
+    list_method: &str,
+    request_id: i64,
+) -> Value {
+    let (result, _, _) = session_request(
+        plugin,
+        session_id,
+        json!({ "jsonrpc": "2.0", "id": request_id, "method": list_method, "params": {} }),
+    )
+    .await;
+    let (status, body, _) = reject_json(result);
+    assert_eq!(status, 200, "{list_method}: {body}");
+    body
+}
+
+fn create_pr_tools_call(request_id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
+        "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+    })
+}
+
+/// mcp_gateway-SOL-1: an upstream-supplied `inputSchema` reaches the recursive
+/// `jsonschema` compiler on the request worker, so it must pass the same
+/// bounded depth / node / local-`$ref` walk audit as `outputSchema` — whether
+/// or not argument validation is enforced. Only the hostile tool is omitted;
+/// its healthy sibling stays listed and callable.
+#[tokio::test]
+async fn hostile_discovered_input_schemas_are_refused_and_healthy_siblings_stay_usable() {
+    for validate_tool_arguments in [true, false] {
+        let server = start_mcp_tools_server(json!([
+            {
+                "name": "healthy",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "repo": { "type": "string" } }
+                }
+            },
+            { "name": "ref_chain", "inputSchema": ref_chain_output_schema(512) },
+            {
+                "name": "previsited_ref_chain",
+                "inputSchema": previsited_ref_chain_output_schema(512)
+            },
+            { "name": "too_deep", "inputSchema": deeply_nested_output_schema(40) },
+            { "name": "too_wide", "inputSchema": node_budget_output_schema(10_100) },
+            {
+                "name": "external_ref",
+                "inputSchema": { "$ref": "https://example.invalid/schemas/input.json" }
+            }
+        ]))
+        .await;
+        let mut config = passthrough_tools_config(&format!("{}/mcp", server.uri()));
+        config["validation"] = json!({ "validate_tool_arguments": validate_tool_arguments });
+        let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+        let session_id = initialize(&plugin).await;
+        assert_eq!(
+            aggregate_tool_names(&plugin, &session_id, 960).await,
+            vec!["github.healthy"],
+            "validate_tool_arguments={validate_tool_arguments}: every over-budget inputSchema is refused at catalog admission"
+        );
+        let (result, _, _) = session_request(
+            &plugin,
+            &session_id,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 961,
+                "method": "tools/call",
+                "params": { "name": "github.healthy", "arguments": { "repo": "x" } }
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "validate_tool_arguments={validate_tool_arguments}: the healthy sibling stays callable: {result:?}"
+        );
+    }
+}
+
+/// A local recursive `inputSchema` that makes progress is still admitted.
+#[tokio::test]
+async fn recursive_local_ref_input_schema_is_still_admitted() {
+    let server = start_mcp_tools_server(json!([
+        { "name": "tree", "inputSchema": recursive_local_ref_output_schema() }
+    ]))
+    .await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &passthrough_tools_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 962).await,
+        vec!["github.tree"]
+    );
+}
+
+/// mcp_gateway-SOL-2: two enabled aggregate instances on disjoint endpoints
+/// are both invoked for every buffered request body. The instance that did not
+/// admit the request must neither consume the owner's rewrite marker nor clear
+/// the private public→upstream tool mapping, in either chain order, so the
+/// governor's final recheck still decides under the public policy name.
+#[tokio::test]
+async fn disjoint_sibling_gateway_never_consumes_the_owners_trusted_tool_rewrite() {
+    for owner_first in [true, false] {
+        let server = start_mcp_catalog_server().await;
+        let upstream = format!("{}/mcp", server.uri());
+        let owner = create_plugin("mcp_gateway", &aggregate_config(&upstream))
+            .unwrap()
+            .unwrap();
+        let mut sibling_config = aggregate_config(&upstream);
+        sibling_config["endpoint"]["path"] = json!("/other");
+        let sibling = create_plugin("mcp_gateway", &sibling_config)
+            .unwrap()
+            .unwrap();
+        let governor = Arc::new(
+            AiToolGovernor::new(
+                &json!({
+                    "default_action": "deny",
+                    "tools": { "github.create_pr": { "action": "allow" } },
+                    "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+                }),
+                PluginHttpClient::default(),
+            )
+            .expect("governor with a public-name allowlist"),
+        );
+
+        let session_id = initialize(&owner).await;
+        let _ = aggregate_tool_names(&owner, &session_id, 970).await;
+        let public_body = create_pr_tools_call(971);
+        let (mut ctx, mut headers) = mcp_ctx(public_body.clone());
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+        assert!(matches!(
+            governor.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            owner.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        // The sibling's own before_proxy runs too: the request is outside its
+        // scope, so it does not claim it.
+        assert!(matches!(
+            sibling.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+
+        let order: [&Arc<dyn Plugin>; 2] = if owner_first {
+            [&owner, &sibling]
+        } else {
+            [&sibling, &owner]
+        };
+        let mut current = serde_json::to_vec(&public_body).unwrap();
+        for plugin in order {
+            if let Some(rewritten) = plugin
+                .transform_request_body_with_context(
+                    &mut ctx,
+                    &current,
+                    Some("application/json"),
+                    &headers,
+                )
+                .await
+            {
+                current = rewritten;
+            }
+        }
+        let rewritten: Value = serde_json::from_slice(&current).unwrap();
+        assert_eq!(
+            rewritten["params"]["name"], "create_pr",
+            "owner_first={owner_first}: the owner performs its own rewrite"
+        );
+        assert!(
+            !ferrum_edge::_test_support::mcp_trusted_tool_name_rewrite_is_none_for_test(&ctx),
+            "owner_first={owner_first}: the sibling must not clear the owner's trusted mapping"
+        );
+        assert!(
+            matches!(
+                governor
+                    .on_final_request_body_with_context(&mut ctx, &headers, &current)
+                    .await,
+                PluginResult::Continue
+            ),
+            "owner_first={owner_first}: the governor still allows under the public policy name"
+        );
+    }
+}
+
+/// mcp_gateway-SOL-3: a `hide_until_configured` schema-change quarantine is an
+/// instance-wide operator gate. A new session — for the same or any principal
+/// — has no old catalog, so it must not see the changed tool as fresh; only a
+/// configuration change (a new plugin instance) clears the quarantine.
+#[tokio::test]
+async fn schema_change_quarantine_survives_new_sessions_until_reconfigured() {
+    let server = start_mcp_schema_change_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({"initialize_upstreams": "passthrough"});
+    config["discovery"]["aggregate_resources"] = json!(false);
+    config["discovery"]["aggregate_prompts"] = json!(false);
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["discovery"]["on_schema_change"] = json!("hide_until_configured");
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config["policy"] = json!({
+        "default_action": "deny",
+        "tools": { "github.create_pr": { "action": "allow" } }
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let first = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &first, 980).await,
+        vec!["github.create_pr"],
+        "the first admitted schema is the instance baseline"
+    );
+
+    // The upstream now serves a changed schema. A brand-new session has no
+    // old catalog of its own, but the instance baseline still detects it.
+    let second = initialize(&plugin).await;
+    assert!(
+        aggregate_tool_names(&plugin, &second, 981).await.is_empty(),
+        "a new session must not see a schema-changed tool as new"
+    );
+    let (result, _, _) = session_request(&plugin, &second, create_pr_tools_call(982)).await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+
+    let third = initialize(&plugin).await;
+    assert!(
+        aggregate_tool_names(&plugin, &third, 983).await.is_empty(),
+        "the quarantine stays sticky for every later session"
+    );
+
+    // A configuration change constructs a new instance, which takes the
+    // current schema as its baseline.
+    let reconfigured = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let fresh = initialize(&reconfigured).await;
+    assert_eq!(
+        aggregate_tool_names(&reconfigured, &fresh, 984).await,
+        vec!["github.create_pr"]
+    );
+}
+
+const UPSTREAM_KEY_ENV: &str = "FERRUM_PLUGIN_SECRET_MCP_GATEWAY_TEST_UPSTREAM_KEY";
+const UPSTREAM_KEY: &str = "svc-key-6a1f";
+
+/// A protected MCP upstream: every request must carry `x-upstream-key`;
+/// anything else is refused with 401.
+async fn start_mcp_header_protected_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(wiremock::matchers::header("x-upstream-key", UPSTREAM_KEY))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "upstream",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": { "name": "protected", "version": "1" },
+                        "tools": [{
+                            "name": "create_pr",
+                            "inputSchema": {
+                                "type": "object",
+                                "required": ["repo"],
+                                "properties": { "repo": { "type": "string" } }
+                            }
+                        }]
+                    }
+                })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .and(wiremock::matchers::header("x-upstream-key", UPSTREAM_KEY))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/mcp"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// mcp_gateway-SOL-4 / mcp_gateway-CLAUDE-3 and mcp_gateway-CLAUDE-1:
+/// `servers.*.headers` (here from a `${FERRUM_PLUGIN_SECRET_<NAME>}`
+/// reference) authenticate every gateway-originated request — `initialize`,
+/// `notifications/initialized`, `tools/list`, and the session `DELETE` — and
+/// replace any client copy on routed calls, while the client's own
+/// credentials (and the route's credential-header registry) do not follow an
+/// aggregate-routed call to the tool-selected upstream by default.
+#[tokio::test]
+async fn configured_server_headers_authenticate_every_upstream_request_and_client_credentials_stay_home()
+ {
+    // SAFETY: this test owns a unique process env key and reads it only
+    // during plugin construction; no other test mutates it.
+    unsafe { std::env::set_var(UPSTREAM_KEY_ENV, UPSTREAM_KEY) };
+    let server = start_mcp_header_protected_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["servers"]["github"]["headers"] =
+        json!({ "X-Upstream-Key": format!("${{{UPSTREAM_KEY_ENV}}}") });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    assert!(
+        plugin
+            .request_headers_to_redact()
+            .iter()
+            .any(|name| name == "x-upstream-key"),
+        "configured upstream header names join the credential-header registry"
+    );
+
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 990).await,
+        vec!["github.create_pr"],
+        "initialize, the initialized notification, and tools/list all reach the protected upstream"
+    );
+
+    let (mut ctx, mut headers) = mcp_ctx(create_pr_tools_call(991));
+    ferrum_edge::_test_support::set_replay_credential_headers_for_test(
+        &mut ctx,
+        vec!["x-api-key".to_string()],
+    );
+    for (name, value) in [
+        ("mcp-session-id", session_id.as_str()),
+        ("authorization", "Bearer client-token"),
+        ("Cookie", "sid=client"),
+        ("proxy-authorization", "Basic Y2xpZW50"),
+        ("x-api-key", "client-api-key"),
+        ("X-Upstream-Key", "client-forged"),
+        ("x-trace-tag", "kept"),
+    ] {
+        headers.insert(name.to_string(), value.to_string());
+    }
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    for credential in [
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+    ] {
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case(credential)),
+            "{credential} must not follow an aggregate-routed call upstream: {headers:?}"
+        );
+    }
+    let upstream_keys: Vec<&String> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("x-upstream-key"))
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(
+        upstream_keys,
+        vec![UPSTREAM_KEY],
+        "the configured value replaces every client spelling"
+    );
+    assert_eq!(headers.get("x-trace-tag").map(String::as_str), Some("kept"));
+
+    let mut delete_ctx = create_test_context();
+    delete_ctx.method = "DELETE".to_string();
+    delete_ctx.path = "/mcp".to_string();
+    let mut delete_headers = HashMap::from([("mcp-session-id".to_string(), session_id)]);
+    let (status, _, _) = reject_json(
+        plugin
+            .before_proxy(&mut delete_ctx, &mut delete_headers)
+            .await,
+    );
+    assert_eq!(status, 200);
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.method.as_str() == "DELETE"),
+        "the session DELETE reaches the protected upstream"
+    );
+    for request in &requests {
+        assert_eq!(
+            request
+                .headers
+                .get("x-upstream-key")
+                .and_then(|value| value.to_str().ok()),
+            Some(UPSTREAM_KEY),
+            "every gateway-originated request carries the configured header: {} {}",
+            request.method,
+            request.url
+        );
+    }
+}
+
+/// mcp_gateway-CLAUDE-1: `forward_client_credentials: true` is the explicit
+/// per-server opt-in for end-user token propagation to a same-trust upstream;
+/// configured headers still apply.
+#[tokio::test]
+async fn forward_client_credentials_opt_in_keeps_client_credentials() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["servers"]["github"]["forward_client_credentials"] = json!(true);
+    config["servers"]["github"]["headers"] = json!({ "x-upstream-key": "literal-value" });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 995).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(create_pr_tools_call(996));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer end-user-token".to_string(),
+    );
+    headers.insert("cookie".to_string(), "sid=end-user".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer end-user-token")
+    );
+    assert_eq!(
+        headers.get("cookie").map(String::as_str),
+        Some("sid=end-user")
+    );
+    assert_eq!(
+        headers.get("x-upstream-key").map(String::as_str),
+        Some("literal-value")
+    );
+}
+
+/// `servers.*.headers` admission: gateway-owned names, session headers,
+/// case-insensitive duplicates, invalid values, references outside the
+/// plugin-secret namespace, and unset references are refused at load, and no
+/// diagnostic echoes a configured value.
+#[test]
+fn server_header_admission_refuses_gateway_owned_names_and_unsafe_values() {
+    let rejected = |headers: Value| -> String {
+        let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+        config["servers"]["github"]["headers"] = headers;
+        match create_plugin("mcp_gateway", &config) {
+            Err(error) => error,
+            Ok(_) => panic!("server headers must be rejected: {config}"),
+        }
+    };
+    for name in [
+        "Content-Type",
+        "accept",
+        "Host",
+        "connection",
+        "Transfer-Encoding",
+        "Proxy-Authorization",
+        "mcp-protocol-version",
+        "Last-Event-ID",
+        "x-ferrum-hops",
+        "X-Forwarded-For",
+        "forwarded",
+        "x-consumer-id",
+        "Mcp-Session-Id",
+    ] {
+        let error = rejected(json!({ (name): "MCP_HEADER_VALUE_SECRET" }));
+        assert!(
+            !error.contains("MCP_HEADER_VALUE_SECRET"),
+            "{name}: {error}"
+        );
+    }
+    let error = rejected(json!({ "x-key": "a", "X-Key": "b" }));
+    assert!(error.contains("more than once"), "{error}");
+    let error = rejected(json!({ "x-key": "line\r\nbreak" }));
+    assert!(error.contains("not a valid HTTP header value"), "{error}");
+    let error = rejected(json!({ "x-key": "" }));
+    assert!(error.contains("must not be empty"), "{error}");
+    let error = rejected(json!({ "x-key": 7 }));
+    assert!(error.contains("must be strings"), "{error}");
+    let error = rejected(json!({ "bad header": "value" }));
+    assert!(error.contains("valid HTTP header names"), "{error}");
+    let error = rejected(json!({ "authorization": "${FERRUM_ADMIN_JWT_SECRET}" }));
+    assert!(error.contains("FERRUM_PLUGIN_SECRET_"), "{error}");
+    let error = rejected(json!({
+        "authorization": "${FERRUM_PLUGIN_SECRET_MCP_GATEWAY_TEST_NEVER_SET}"
+    }));
+    assert!(error.contains("is not set"), "{error}");
+    assert!(!error.contains("NEVER_SET"), "{error}");
+
+    // Per-server header and credential settings are inert on an OpenAPI
+    // bridge server, which calls this proxy's own backend.
+    for (field, value) in [
+        ("headers", json!({ "x-key": "v" })),
+        ("forward_client_credentials", json!(true)),
+    ] {
+        let error = bridge_config_error(|config| {
+            config["servers"]["petstore"][field] = value;
+        });
+        assert!(
+            error.contains("requires `upstream_url`"),
+            "{field}: {error}"
+        );
+    }
+
+    // Transparent mode forwards the client's request unchanged, so the
+    // credential opt-in has nothing to opt into.
+    let mut transparent = transparent_config("http://127.0.0.1:9/mcp");
+    transparent["servers"]["github"]["forward_client_credentials"] = json!(false);
+    assert!(create_plugin("mcp_gateway", &transparent).is_err());
+}
+
+/// mcp_gateway-CLAUDE-2: prompts, resources, and resource templates are
+/// policy-gated like tools. With no family entry they inherit
+/// `policy.default_action`, so a deny-by-default gateway neither lists nor
+/// routes them; explicit `policy.prompts` / `policy.resources` entries (a
+/// resource keyed by public URI, a template by public URI template) open them,
+/// and a denied resource cannot be reached through an allowed template under
+/// an alternate public spelling.
+#[tokio::test]
+async fn prompt_and_resource_policy_gates_listing_and_routing() {
+    let server = start_mcp_catalog_server().await;
+    let upstream = format!("{}/mcp", server.uri());
+
+    // Discover the public identities with both families open.
+    let open = create_plugin("mcp_gateway", &aggregate_config(&upstream))
+        .unwrap()
+        .unwrap();
+    let open_session = initialize(&open).await;
+    let resources = session_list(&open, &open_session, "resources/list", 1001).await;
+    let readme = resources["result"]["resources"][0]["uri"]
+        .as_str()
+        .expect("README is listed")
+        .to_string();
+    let templates = session_list(&open, &open_session, "resources/templates/list", 1002).await;
+    let template = templates["result"]["resourceTemplates"][0]["uriTemplate"]
+        .as_str()
+        .expect("the project template is listed")
+        .to_string();
+    let generated = template.replace("{path}", "notes.txt");
+
+    let deny_tools_only = json!({
+        "default_action": "deny",
+        "tools": { "github.create_pr": { "action": "allow" } }
+    });
+
+    // Deny by default: nothing listed, nothing routed, tools unaffected.
+    let mut closed_config = aggregate_config(&upstream);
+    closed_config["policy"] = deny_tools_only.clone();
+    let closed = create_plugin("mcp_gateway", &closed_config)
+        .unwrap()
+        .unwrap();
+    let session = initialize(&closed).await;
+    assert_eq!(
+        session_list(&closed, &session, "prompts/list", 1003).await["result"]["prompts"],
+        json!([])
+    );
+    assert_eq!(
+        session_list(&closed, &session, "resources/list", 1004).await["result"]["resources"],
+        json!([])
+    );
+    assert_eq!(
+        session_list(&closed, &session, "resources/templates/list", 1005).await["result"]["resourceTemplates"],
+        json!([])
+    );
+    for (request, case) in [
+        (prompt_get(1006), "prompts/get"),
+        (
+            resource_read(1007, readme.as_str()),
+            "resources/read of an exact resource",
+        ),
+        (
+            resource_read(1008, generated.as_str()),
+            "resources/read through a template",
+        ),
+    ] {
+        let (result, ctx, _) = session_request(&closed, &session, request).await;
+        let (_, body, _) = reject_json(result);
+        assert_eq!(body["error"]["code"], json!(-32001), "{case}: {body}");
+        assert!(ctx.route_override_backend_host.is_none(), "{case}");
+    }
+    assert_eq!(
+        aggregate_tool_names(&closed, &session, 1009).await,
+        vec!["github.create_pr"]
+    );
+
+    // Explicit entries open exactly what they name.
+    let mut allowed_config = aggregate_config(&upstream);
+    let mut policy = deny_tools_only.clone();
+    policy["prompts"] = json!({ "github.code_review": { "action": "allow" } });
+    policy["resources"] = json!({
+        (readme.clone()): { "action": "allow" },
+        (template.clone()): { "action": "allow" }
+    });
+    allowed_config["policy"] = policy;
+    let allowed = create_plugin("mcp_gateway", &allowed_config)
+        .unwrap()
+        .unwrap();
+    let session = initialize(&allowed).await;
+    assert_eq!(
+        sorted_prompt_names(&session_list(&allowed, &session, "prompts/list", 1010).await),
+        vec!["github.code_review"]
+    );
+    assert_eq!(
+        sorted_resource_uris(&session_list(&allowed, &session, "resources/list", 1011).await),
+        vec![readme.clone()]
+    );
+    assert_eq!(
+        session_list(&allowed, &session, "resources/templates/list", 1012).await["result"]["resourceTemplates"]
+            [0]["uriTemplate"],
+        json!(template)
+    );
+    for (request, case) in [
+        (prompt_get(1013), "prompts/get"),
+        (resource_read(1014, readme.as_str()), "exact resource"),
+        (
+            resource_read(1015, generated.as_str()),
+            "template-generated resource",
+        ),
+    ] {
+        let (result, _, _) = session_request(&allowed, &session, request).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{case}: {result:?}"
+        );
+    }
+
+    // Deny wins across bindings of one upstream URI: README is denied while
+    // its template is allowed, so an alternate public spelling that routes
+    // through the template is still refused.
+    let mut mixed_config = aggregate_config(&upstream);
+    let mut policy = deny_tools_only;
+    policy["resources"] = json!({
+        (readme.clone()): { "action": "deny" },
+        (template.clone()): { "action": "allow" }
+    });
+    mixed_config["policy"] = policy;
+    let mixed = create_plugin("mcp_gateway", &mixed_config)
+        .unwrap()
+        .unwrap();
+    let session = initialize(&mixed).await;
+    let _ = session_list(&mixed, &session, "resources/list", 1016).await;
+    let _ = session_list(&mixed, &session, "resources/templates/list", 1017).await;
+    let alternate = template.replace("{path}", "README.md");
+    for (uri, case) in [
+        (readme.as_str(), "canonical"),
+        (alternate.as_str(), "template spelling"),
+    ] {
+        let (result, _, _) = session_request(&mixed, &session, resource_read(1018, uri)).await;
+        let (_, body, _) = reject_json(result);
+        assert_eq!(body["error"]["code"], json!(-32001), "{case}: {body}");
+    }
+    let (result, _, _) =
+        session_request(&mixed, &session, resource_read(1019, generated.as_str())).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+}
+
+#[test]
+fn prompt_and_resource_policy_admission() {
+    let rejected = |policy: Value| {
+        let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+        config["policy"] = policy;
+        create_plugin("mcp_gateway", &config).is_err()
+    };
+    assert!(rejected(
+        json!({ "prompts": { "github.p": { "action": "hide_from_discovery" } } })
+    ));
+    assert!(rejected(json!({ "prompts": { "github.p": {} } })));
+    assert!(rejected(
+        json!({ "prompts": { "github.p": { "action": "allow", "bogus": 1 } } })
+    ));
+    assert!(rejected(
+        json!({ "resources": { "mcp://github/x": "allow" } })
+    ));
+    assert!(rejected(json!({ "resources": [] })));
+    assert!(rejected(
+        json!({ "default_prompt_action": "hide_from_discovery" })
+    ));
+    assert!(rejected(json!({ "default_resource_action": true })));
+    assert!(!rejected(json!({
+        "default_action": "deny",
+        "default_prompt_action": "allow",
+        "default_resource_action": "deny",
+        "prompts": { "github.p": { "action": "deny" } },
+        "resources": { "mcp://github/x": { "action": "allow" } }
+    })));
+
+    // Transparent mode has no mediated catalog to apply them to.
+    for (field, value) in [
+        ("prompts", json!({})),
+        ("resources", json!({})),
+        ("default_prompt_action", json!("allow")),
+        ("default_resource_action", json!("deny")),
+    ] {
+        let mut config = transparent_config("http://127.0.0.1:9/mcp");
+        config["policy"] = json!({ (field): value });
+        assert!(create_plugin("mcp_gateway", &config).is_err(), "{field}");
+    }
+}
+
+/// mcp_gateway-CLAUDE-5: per-server discovery fans out concurrently, so one
+/// refresh against several slow upstreams costs about one upstream round
+/// trip, not their sum.
+#[tokio::test]
+async fn catalog_refresh_lists_servers_concurrently() {
+    let delay = std::time::Duration::from_millis(1500);
+    let slow_server = |tool: &'static str| async move {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": "tools",
+                        "result": { "tools": [{ "name": tool, "inputSchema": { "type": "object" } }] }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        server
+    };
+    let github = slow_server("create_pr").await;
+    let flaky = slow_server("ping").await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &multi_server_tools_config(
+            &format!("{}/mcp", github.uri()),
+            &format!("{}/mcp", flaky.uri()),
+        ),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let started = std::time::Instant::now();
+    let mut tools = aggregate_tool_names(&plugin, &session_id, 1020).await;
+    let elapsed = started.elapsed();
+    tools.sort();
+    assert_eq!(tools, vec!["flaky.ping", "github.create_pr"]);
+    assert!(
+        elapsed < delay * 2 - std::time::Duration::from_millis(300),
+        "two delayed upstreams must be listed concurrently, took {elapsed:?}"
+    );
+}
+
+/// mcp_gateway-CLAUDE-7: an expired session is reclaimed at rest by the
+/// instance's background reaper — with its upstream session `DELETE`d — even
+/// when no request ever presents that session again and no new `initialize`
+/// arrives.
+#[tokio::test]
+async fn expired_sessions_are_reaped_at_rest_and_upstream_sessions_deleted() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["sessions"] = json!({ "session_ttl_seconds": 1 });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 1030).await;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let requests = server.received_requests().await.unwrap();
+        if let Some(delete) = requests
+            .iter()
+            .find(|request| request.method.as_str() == "DELETE")
+        {
+            assert_eq!(
+                delete
+                    .headers
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some("upstream-session")
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reaper must reclaim the expired session and delete its upstream session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    drop(plugin);
+}
+
+/// mcp_gateway-CLAUDE-10: an aggregate `DELETE` without a session header
+/// terminates nothing, so it answers the POST path's HTTP 400 instead of a
+/// success, and leaves every live session alone.
+#[tokio::test]
+async fn aggregate_delete_without_session_header_returns_400() {
+    let server = start_mcp_catalog_server().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let mut ctx = create_test_context();
+    ctx.method = "DELETE".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::new();
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], json!(-32600));
+    assert_eq!(
+        ctx.metadata.get("mcp.route_decision").map(String::as_str),
+        Some("deny")
+    );
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 1040).await,
+        vec!["github.create_pr"],
+        "the live session is untouched"
     );
 }
