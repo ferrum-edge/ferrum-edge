@@ -3222,6 +3222,152 @@ mod tests {
         );
     }
 
+    /// The real ADS path for a NodeWaypoint: the prefilter runs without the
+    /// node's workload identity, then the snapshot builder applies it. The
+    /// capture inventory must come from the CP's pre-narrowing resolution: a
+    /// destination outside the bearer bound is never rebuilt from a
+    /// Sidecar-widened routing view, and an authorized destination keeps its
+    /// own DENY on the AuthorizationPolicy carrier.
+    #[test]
+    fn xds_prefilter_to_snapshot_keeps_the_capture_inventory_authoritative() {
+        use crate::modes::mesh::config::{MeshRule, NodeWaypointEndpoint, PolicyAction};
+        use crate::xds::carrier::MeshSliceCarrier;
+
+        let this_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+        let ledger = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger")
+                .expect("spiffe"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                namespace: Some("payments".to_string()),
+            },
+            service_name: "ledger".to_string(),
+            service_namespace: None,
+            addresses: vec!["10.244.1.7".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "payments".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("ledger".to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(this_waypoint).expect("spiffe"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![ledger],
+                mesh_policies: vec![MeshPolicy {
+                    name: "payments-deny".to_string(),
+                    namespace: "payments".to_string(),
+                    scope: PolicyScope::Namespace {
+                        namespace: "payments".to_string(),
+                    },
+                    rules: vec![MeshRule {
+                        action: PolicyAction::Deny,
+                        ..MeshRule::default()
+                    }],
+                }],
+                sidecars: vec![MeshSidecar {
+                    name: "default".to_string(),
+                    namespace: "ferrum".to_string(),
+                    workload_selector: None,
+                    egress_inherits_defaults: false,
+                    egress: vec![MeshSidecarEgress {
+                        hosts: vec!["payments/*".to_string()],
+                        port: None,
+                    }],
+                    ingress_declared: false,
+                    ingress: Vec::new(),
+                    outbound_traffic_policy: None,
+                }],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let scoping = XdsNodeScoping {
+            ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: true,
+        };
+        let capture_carriers = |server: &XdsAdsServer| {
+            server
+                .workload_identities
+                .insert("node-a".to_string(), this_waypoint.to_string());
+            server.node_scoping.insert("node-a".to_string(), scoping);
+            let filtered = server.filter_config_for_xds_request(&config, "ferrum", None, scoping);
+            let snapshot =
+                server.rebuild_snapshot_from_config_for_node("node-a", "node-a", &filtered);
+            let mut destinations = Vec::new();
+            let mut policies = None;
+            for resource in snapshot.resources(super::super::translator::ECDS_TYPE_URL) {
+                let typed_extension =
+                    crate::xds::proto::TypedExtensionConfig::decode(resource.value.as_slice())
+                        .expect("ECDS resource decodes");
+                let Some(inner) = typed_extension.typed_config.as_ref() else {
+                    continue;
+                };
+                match MeshSliceCarrier::decode(&inner.type_url, &inner.value)
+                    .expect("carrier decodes")
+                {
+                    Some(MeshSliceCarrier::NodeWaypointCaptureDestinations(value)) => {
+                        destinations = value;
+                    }
+                    Some(MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value)) => {
+                        policies = Some(value);
+                    }
+                    _ => {}
+                }
+            }
+            (destinations, policies)
+        };
+
+        let mut withheld =
+            test_server_with_sidecar_enforcement(config.clone(), true).with_scope(CpScope::All);
+        withheld.ambient_udp_source_bearer_namespaces = Some(HashSet::from(["ferrum".to_string()]));
+        let (destinations, policies) = capture_carriers(&withheld);
+        assert!(
+            destinations.is_empty(),
+            "a capture destination outside the bearer bound must not be rebuilt"
+        );
+        assert_eq!(
+            policies,
+            Some(Vec::new()),
+            "the resolved (empty) inventory still carries its completeness evidence"
+        );
+
+        let mut authorized =
+            test_server_with_sidecar_enforcement(config.clone(), true).with_scope(CpScope::All);
+        authorized.ambient_udp_source_bearer_namespaces = Some(HashSet::from([
+            "ferrum".to_string(),
+            "payments".to_string(),
+        ]));
+        let (destinations, policies) = capture_carriers(&authorized);
+        assert_eq!(
+            destinations
+                .iter()
+                .map(|workload| workload.service_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ledger"]
+        );
+        assert!(
+            policies
+                .expect("completeness evidence")
+                .iter()
+                .any(|policy| policy.name == "payments-deny"),
+            "the authorized destination keeps its own DENY through the ADS prefilter"
+        );
+    }
+
     #[test]
     fn xds_config_fingerprint_includes_runtime_capture_authorization_inventory() {
         let left = gateway_config_with_service(true, 0);

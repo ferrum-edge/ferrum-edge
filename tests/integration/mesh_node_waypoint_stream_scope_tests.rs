@@ -1298,7 +1298,10 @@ mod node_waypoint_capture_inventory {
         };
         let config = GatewayConfig {
             mesh: Some(Box::new(MeshConfig {
-                // What the CP filter leaves for a `ferrum` subscriber.
+                // What the CP filter leaves for a `ferrum` subscriber: an
+                // inventory it RESOLVED before narrowing.
+                node_waypoint_capture_inventory_state:
+                    ferrum_edge::modes::mesh::config::NodeWaypointCaptureInventoryState::Resolved,
                 mesh_policies: vec![policy(
                     "istio-system",
                     "root-deny",

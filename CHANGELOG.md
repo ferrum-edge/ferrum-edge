@@ -126,7 +126,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinary record for the same address, so their policies are evaluated instead
   of the relay being refused for a missing scope. The transparent capture
   resolver now compares destination addresses canonically, matching the relay
-  guard.
+  guard. The inventory is only certified complete when it was derived from the
+  authoritative, pre-narrowing configuration: the control plane records that it
+  resolved the inventory (including an empty answer) before narrowing, and a
+  slice is never rebuilt from a narrowed or Sidecar-widened routing view.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

@@ -1358,66 +1358,70 @@ impl MeshSlice {
         } else {
             mesh.node_waypoint_assertors.clone()
         };
-        // NodeWaypoint transparent-inbound-capture inventory (issue #3287).
-        // Computed from the PRE-narrowing view on purpose: an enrolled pod this
-        // NodeWaypoint captures for can live in another namespace, so deriving it
-        // after the `workloads` narrowing below would silently drop exactly the
-        // cross-namespace destinations whose PeerAuthentication posture must be
-        // enforced. When the CP already resolved it (`filter_mesh_config_to_request`
-        // runs BEFORE its own namespace retains and applies scope/bearer
-        // authorization), that authoritative value wins; the `is_empty` fallback
-        // covers the file/local source and any CP that resolved nothing, and can
-        // only ever yield a SUBSET of the authorized inventory — never a widening.
-        // Every capture-scoped build RESOLVES the destination AuthorizationPolicy
-        // inventory below — even when it comes out empty — so it stamps the
-        // completeness marker the consumers require before trusting an empty
-        // inventory.
-        let node_waypoint_capture_mesh_policies_resolved = request.node_waypoint_capture_scoping;
+        // NodeWaypoint transparent-inbound-capture inventory (issue #3287):
+        // capture destinations, their PeerAuthentication candidates, and their
+        // AuthorizationPolicy. Derived ONLY from an authoritative, pre-narrowing
+        // source, chosen by the config's explicit provenance — never inferred
+        // from whether the dedicated fields happen to be empty:
+        //
+        // * `Unfiltered` (file/local source, stock-xDS baseline, an unfiltered
+        //   snapshot): derive all three from the whole document.
+        // * `Resolved` (the CP filter resolved the inventory before narrowing
+        //   under CP scope + bearer bounds, or a DP back-projected a resolved
+        //   slice): the dedicated fields are authoritative EVEN WHEN EMPTY.
+        //   Destinations are re-narrowed to this exact NodeWaypoint identity
+        //   (the CP may hold an identity-agnostic candidate set), and the
+        //   candidates are re-narrowed to exactly those destinations. Nothing is
+        //   rebuilt from `workloads` / `peer_authentications` / `mesh_policies`,
+        //   which are narrowed (or Sidecar-widened) routing views here.
+        // * `NotResolved` (narrowed without an inventory): an empty inventory
+        //   WITHOUT completeness evidence, so captured connections resolve
+        //   nothing and the DP refuses capture policies — fail closed.
+        //
+        // The completeness marker is stamped only for the first two, i.e. only
+        // when the inventory really was derived from the authoritative source.
         let (
             node_waypoint_capture_destinations,
             node_waypoint_capture_peer_authentications,
             node_waypoint_capture_mesh_policies,
-        ) = if request.node_waypoint_capture_scoping {
-            let destinations = if mesh.node_waypoint_capture_destinations.is_empty() {
-                node_waypoint_capture_destinations_from_workloads(
-                    mesh.workloads.iter(),
-                    request.workload_spiffe_id.as_deref(),
-                )
-            } else {
-                mesh.node_waypoint_capture_destinations.clone()
-            };
-            let candidates = if mesh.node_waypoint_capture_peer_authentications.is_empty() {
-                &mesh.peer_authentications
-            } else {
-                &mesh.node_waypoint_capture_peer_authentications
-            };
-            let peer_authentications = node_waypoint_capture_peer_authentications_for_destinations(
-                candidates.iter(),
-                &destinations,
-            );
-            // Destination AuthorizationPolicy inventory. Same provenance
-            // rule as the PeerAuthentication candidates above: the
-            // CP-resolved value (scope/bearer-authorized, derived BEFORE
-            // `mesh_policies` was narrowed to the subscription namespace)
-            // wins; the fallback reads `mesh.mesh_policies`, which on the
-            // file/local source is the whole document and on a CP is the
-            // already-narrowed view, so it can only ever be a SUBSET of the
-            // authorized set. Either way the result is re-narrowed here to
-            // exactly the policies the scoped evaluator would apply to one
-            // of THESE destinations, so an unrelated foreign-namespace
-            // policy never rides it.
-            let policy_candidates = if mesh.node_waypoint_capture_mesh_policies.is_empty() {
-                &mesh.mesh_policies
-            } else {
-                &mesh.node_waypoint_capture_mesh_policies
-            };
-            let capture_mesh_policies = node_waypoint_capture_mesh_policies_for_destinations(
-                policy_candidates.iter(),
-                &destinations,
-            );
-            (destinations, peer_authentications, capture_mesh_policies)
+            node_waypoint_capture_mesh_policies_resolved,
+        ) = if !request.node_waypoint_capture_scoping {
+            (Vec::new(), Vec::new(), Vec::new(), false)
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            use crate::modes::mesh::config::NodeWaypointCaptureInventoryState;
+            let identity = request.workload_spiffe_id.as_deref();
+            let sources = match mesh.node_waypoint_capture_inventory_state {
+                NodeWaypointCaptureInventoryState::Unfiltered => Some((
+                    &mesh.workloads,
+                    &mesh.peer_authentications,
+                    &mesh.mesh_policies,
+                )),
+                NodeWaypointCaptureInventoryState::Resolved => Some((
+                    &mesh.node_waypoint_capture_destinations,
+                    &mesh.node_waypoint_capture_peer_authentications,
+                    &mesh.node_waypoint_capture_mesh_policies,
+                )),
+                NodeWaypointCaptureInventoryState::NotResolved => None,
+            };
+            match sources {
+                None => (Vec::new(), Vec::new(), Vec::new(), false),
+                Some((workloads, peer_authentications, mesh_policies)) => {
+                    let destinations = node_waypoint_capture_destinations_from_workloads(
+                        workloads.iter(),
+                        identity,
+                    );
+                    let peer_authentications =
+                        node_waypoint_capture_peer_authentications_for_destinations(
+                            peer_authentications.iter(),
+                            &destinations,
+                        );
+                    let mesh_policies = node_waypoint_capture_mesh_policies_for_destinations(
+                        mesh_policies.iter(),
+                        &destinations,
+                    );
+                    (destinations, peer_authentications, mesh_policies, true)
+                }
+            }
         };
         let workloads: Vec<Workload> = mesh
             .workloads

@@ -7651,6 +7651,87 @@ async fn mesh_authz_node_waypoint_inbound_relay_capture_scope_is_authoritative()
     assert_eq!(deny_policy(&ctx), Some("ferrum-deny"));
 }
 
+/// The relay ownership guard also admits capture destinations declared by
+/// hostname (matched ASCII-case-insensitively). Such a destination is scoped
+/// from the capture inventory too: an ordinary record declaring the same name
+/// never decides its scope.
+#[tokio::test]
+async fn mesh_authz_node_waypoint_inbound_relay_capture_scope_covers_hostnames() {
+    let old_app = capture_destination("ferrum", "old-app", "ledger.internal", &[8080]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            services: vec![MeshService {
+                name: "old-app".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Tcp,
+                    name: None,
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef {
+                    spiffe_id: old_app.spiffe_id.clone(),
+                }],
+                protocol_overrides: HashMap::new(),
+                cluster_ips: Vec::new(),
+                uid: None,
+                allow_path_parameters: false,
+            }],
+            workloads: vec![old_app],
+            mesh_policies: vec![namespace_deny("ferrum", "ferrum-deny")],
+            node_waypoint_capture_destinations: vec![capture_destination(
+                "payments",
+                "ledger",
+                "Ledger.Internal",
+                &[8080],
+            )],
+            node_waypoint_capture_mesh_policies: vec![namespace_deny("payments", "payments-deny")],
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+        "trusted_hbone_assertors": [{
+            "assertor": CAPTURE_RELAY_PEER,
+            "asserts": [CAPTURE_FRONTEND],
+        }],
+    }))
+    .expect("plugin config");
+
+    for host in ["ledger.internal", "LEDGER.internal"] {
+        let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, host, 8080);
+        let result = plugin.authorize(&mut ctx).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "{host}: expected the capture destination's DENY, got {result:?}"
+        );
+        assert_eq!(deny_policy(&ctx), Some("payments-deny"), "{host}");
+    }
+
+    // An undeclared port on the capture-declared name fails closed.
+    let mut ctx = capture_relay_request(
+        CAPTURE_RELAY_PEER,
+        CAPTURE_FRONTEND,
+        "ledger.internal",
+        9090,
+    );
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&ctx), Some("scope_missing"));
+}
+
 #[tokio::test]
 async fn workload_metrics_inbound_listener_stamps_mesh_direction_inbound() {
     // GAP-3F: the mesh inbound listener stamps `ctx.mesh_direction = Inbound`

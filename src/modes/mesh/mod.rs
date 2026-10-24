@@ -1725,6 +1725,15 @@ fn prepare_normalized_gateway_config_for_mesh(
         // back-projection keeps the prepared config's capture view complete.
         mesh.node_waypoint_capture_mesh_policies =
             mesh_slice.node_waypoint_capture_mesh_policies.clone();
+        // The prepared config's capture inventory IS the slice's; record its
+        // provenance so nothing ever rebuilds an inventory from this config's
+        // narrowed routing views.
+        mesh.node_waypoint_capture_inventory_state =
+            if mesh_slice.node_waypoint_capture_mesh_policies_resolved {
+                crate::modes::mesh::config::NodeWaypointCaptureInventoryState::Resolved
+            } else {
+                crate::modes::mesh::config::NodeWaypointCaptureInventoryState::NotResolved
+            };
         // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
         // SEPARATE from the egress-narrowed `services` — never folded in, per
         // the egress-scope security rule) so the router's inbound per-port

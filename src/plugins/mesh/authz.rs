@@ -398,7 +398,9 @@ enum NodeWaypointAuthorizedDestination {
 ///
 /// Resolution: the address is matched canonically (parsed and
 /// `IpAddr::to_canonical`, the same rule the inbound relay ownership guard and
-/// the transparent capture resolver apply), a workload that declares ports
+/// the transparent capture resolver apply; a non-IP declared name is matched
+/// ASCII-case-insensitively, as the relay guard matches it), a workload that
+/// declares ports
 /// admits only those ports (one that declares none does not constrain its
 /// address), and two matching records with divergent scopes resolve to NOTHING
 /// (fail closed) rather than picking whose policy applies. For the relay, an
@@ -410,6 +412,12 @@ enum NodeWaypointAuthorizedDestination {
 #[derive(Default)]
 struct NodeWaypointCaptureDestinationScopes {
     by_address: HashMap<std::net::IpAddr, Vec<NodeWaypointCaptureDestinationScope>>,
+    /// Non-IP declared addresses (hostnames, zone-qualified literals), keyed
+    /// lowercase exactly as the relay ownership guard declares them
+    /// (`MeshInboundRelayHost::Name`) and matched ASCII-case-insensitively as
+    /// it does, so a relay the guard admits under a capture-declared name is
+    /// scoped from the capture inventory too, never from an ordinary record.
+    by_name: HashMap<String, Vec<NodeWaypointCaptureDestinationScope>>,
 }
 
 struct NodeWaypointCaptureDestinationScope {
@@ -421,32 +429,49 @@ impl NodeWaypointCaptureDestinationScopes {
     fn from_workloads(workloads: &[crate::modes::mesh::config::Workload]) -> Self {
         let mut by_address: HashMap<std::net::IpAddr, Vec<NodeWaypointCaptureDestinationScope>> =
             HashMap::new();
+        let mut by_name: HashMap<String, Vec<NodeWaypointCaptureDestinationScope>> = HashMap::new();
         for workload in workloads {
             let scope = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
             let ports: Vec<u16> = workload.ports.iter().map(|port| port.port).collect();
             for address in &workload.addresses {
-                // Capture destinations are pod addresses; a non-IP record can
-                // never be the original destination of a captured or relayed
-                // connection, so it is not indexed (it resolves nothing).
-                let Ok(address) = address.trim().parse::<std::net::IpAddr>() else {
-                    continue;
+                let entry = NodeWaypointCaptureDestinationScope {
+                    ports: ports.clone(),
+                    scope: scope.clone(),
                 };
-                by_address.entry(address.to_canonical()).or_default().push(
-                    NodeWaypointCaptureDestinationScope {
-                        ports: ports.clone(),
-                        scope: scope.clone(),
-                    },
-                );
+                match address.trim().parse::<std::net::IpAddr>() {
+                    Ok(address) => by_address
+                        .entry(address.to_canonical())
+                        .or_default()
+                        .push(entry),
+                    Err(_) => {
+                        let name = address.trim();
+                        if !name.is_empty() {
+                            by_name
+                                .entry(name.to_ascii_lowercase())
+                                .or_default()
+                                .push(entry);
+                        }
+                    }
+                }
             }
         }
-        Self { by_address }
+        Self {
+            by_address,
+            by_name,
+        }
     }
 
     fn lookup(&self, host: &str, port: u16) -> NodeWaypointCaptureScopeLookup<'_> {
-        let Ok(address) = host.trim().parse::<std::net::IpAddr>() else {
-            return NodeWaypointCaptureScopeLookup::NotCaptured;
+        let entries = match host.trim().parse::<std::net::IpAddr>() {
+            Ok(address) => self.by_address.get(&address.to_canonical()),
+            // Name hosts are rare (pod relays use IP literals); only a name with
+            // uppercase letters pays for a lowercased copy.
+            Err(_) if host.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+                self.by_name.get(&host.to_ascii_lowercase())
+            }
+            Err(_) => self.by_name.get(host),
         };
-        let Some(entries) = self.by_address.get(&address.to_canonical()) else {
+        let Some(entries) = entries else {
             return NodeWaypointCaptureScopeLookup::NotCaptured;
         };
         if port == 0 {
@@ -474,8 +499,8 @@ impl NodeWaypointCaptureDestinationScopes {
 
 /// Outcome of a capture-destination scope lookup.
 enum NodeWaypointCaptureScopeLookup<'a> {
-    /// The inventory does not name this address (or it is not an IP); the
-    /// ordinary destination index decides.
+    /// The inventory does not name this address or hostname; the ordinary
+    /// destination index decides.
     NotCaptured,
     /// The inventory names this address and resolves exactly one scope.
     Resolved(&'a crate::modes::mesh::runtime::PolicyScopeCache),
