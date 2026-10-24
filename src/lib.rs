@@ -4866,6 +4866,37 @@ pub mod _test_support {
         )
     }
 
+    /// Drive the shared ordinary-completion recorder
+    /// (`record_backend_outcome_no_conn_end`) for a request admitted under
+    /// `proxy` — the request's captured snapshot, whose breaker config may be
+    /// older than the live one (issue #6799). No balancer or upstream target is
+    /// attributed, so only the circuit-breaker arm runs.
+    pub fn record_backend_completion_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        final_cb_target_key: Option<&str>,
+        response_status: u16,
+        connection_error: bool,
+        error_class: Option<crate::retry::ErrorClass>,
+        is_half_open_probe: bool,
+    ) {
+        let epoch = state.request_epoch.load();
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            None,
+            None,
+            final_cb_target_key,
+            response_status,
+            connection_error,
+            error_class,
+            is_half_open_probe,
+            false,
+            std::time::Duration::ZERO,
+        );
+    }
+
     /// Drive the production UDP setup-failure ownership + emit path.
     ///
     /// This is the same `UdpSetupProgress` value `spawn_new_session_datagram`

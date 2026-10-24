@@ -1325,13 +1325,21 @@ fn record_backend_outcome_inner(
     // Record circuit breaker result against the final target's breaker.
     // For retries, intermediate failures were already recorded per-target inside
     // the retry loop, so this only records the final attempt's outcome.
-    if !skip_circuit_breaker_record && let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
+    //
+    // `proxy` is the request's captured snapshot, so its breaker config may be
+    // older than the live one. Settle on the breaker that is still running that
+    // config, or drop the outcome as stale: a replacing lookup here would swap a
+    // live (possibly OPEN) breaker for a fresh CLOSED one built from the old
+    // config (issue #6799).
+    if !skip_circuit_breaker_record
+        && let Some(cb_config) = &proxy.circuit_breaker
+        && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
             &proxy.namespace,
             &proxy.id,
             final_cb_target_key,
             cb_config,
-        );
+        )
+    {
         apply_circuit_breaker_outcome(
             &cb,
             response_status,

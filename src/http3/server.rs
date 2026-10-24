@@ -10656,13 +10656,14 @@ async fn handle_h3_request(
                 // Same typed signal as the retry decision: a graceful close
                 // (or any other post-`send_request` fault) does not count
                 // as a transport-level failure for CB tripping.
-                if let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
+                if let Some(cb_config) = &proxy.circuit_breaker
+                    && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                         &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
-                    );
+                    )
+                {
                     // A retryable outcome carrying NO backend-health signal —
                     // today only a DestinationRule `maxConnections` refusal,
                     // which is pre-wire (so the loop may rotate) but is the

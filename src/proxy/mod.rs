@@ -5796,12 +5796,19 @@ impl HalfOpenProbeGuard {
         let Some(cb_config) = &proxy.circuit_breaker else {
             return Self::none();
         };
-        let cb = state.circuit_breaker_cache.get_or_create(
+        // Re-resolve read-only: if a concurrent reload already replaced the
+        // breaker that admitted this probe, a replacing lookup would swap the
+        // live breaker for a fresh one built from this request's older config
+        // (issue #6799). The admitting breaker is then unreachable, and so is
+        // its slot, so the guard owns nothing.
+        let Some(cb) = state.circuit_breaker_cache.get_for_completion(
             &proxy.namespace,
             &proxy.id,
             target_key,
             cb_config,
-        );
+        ) else {
+            return Self::none();
+        };
         Self {
             cb: Some(cb),
             admission_generation,
@@ -16649,13 +16656,14 @@ async fn handle_websocket_request_authenticated(
                     // here by construction, but using the same predicate
                     // value keeps the invariant readable and survives a
                     // future refactor that moves this block.)
-                    if let Some(cb_config) = &proxy.circuit_breaker {
-                        let cb = state.circuit_breaker_cache.get_or_create(
+                    if let Some(cb_config) = &proxy.circuit_breaker
+                        && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                             &proxy.namespace,
                             &proxy.id,
                             current_cb_target_key.as_deref(),
                             cb_config,
-                        );
+                        )
+                    {
                         cb.record_failure(
                             ws_failure_status.as_u16(),
                             ws_is_pre_wire,
@@ -16838,13 +16846,15 @@ async fn handle_websocket_request_authenticated(
                 // (the default), WS backend connect failures never fed the
                 // breaker at all on H1/H2, and an admitted probe slot leaked
                 // permanently.
-                if !cb_failure_already_recorded && let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
+                if !cb_failure_already_recorded
+                    && let Some(cb_config) = &proxy.circuit_breaker
+                    && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                         &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
-                    );
+                    )
+                {
                     if ws_egress_denied {
                         // Gateway-side egress denial dialed no backend: release any
                         // admitted HALF_OPEN probe slot NEUTRALLY (no failure count)
@@ -16999,13 +17009,14 @@ async fn handle_websocket_request_authenticated(
     // consumed a `half_open_in_flight` slot, and after `half_open_max_requests`
     // upgrades the breaker wedged in HALF_OPEN, 503ing ALL traffic to the
     // target. Mirrors the H3 WS path (`src/http3/websocket.rs`).
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
+    if let Some(cb_config) = &proxy.circuit_breaker
+        && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
             &proxy.namespace,
             &proxy.id,
             current_cb_target_key.as_deref(),
             cb_config,
-        );
+        )
+    {
         cb.record_success(cb_probe.take_slot());
     }
 
@@ -38981,14 +38992,18 @@ async fn handle_proxy_request_inner(
                 // only the probe-slot release; CLOSED-state requests still defer the
                 // health outcome to the join.
                 let upload_observer: Option<Arc<dyn grpc_proxy::GrpcUploadTerminationObserver>> =
-                    match proxy.circuit_breaker.as_ref() {
-                        Some(cb_config) => {
-                            let cb = state.circuit_breaker_cache.get_or_create(
-                                &proxy.namespace,
-                                &proxy.id,
-                                grpc_final_cb_key.as_deref(),
-                                cb_config,
-                            );
+                    // Resolve the breaker read-only (issue #6799): this request's
+                    // captured config must never replace a breaker a concurrent
+                    // reload already installed.
+                    match proxy.circuit_breaker.as_ref().and_then(|cb_config| {
+                        state.circuit_breaker_cache.get_for_completion(
+                            &proxy.namespace,
+                            &proxy.id,
+                            grpc_final_cb_key.as_deref(),
+                            cb_config,
+                        )
+                    }) {
+                        Some(cb) => {
                             // Pass the guard window as a duration; the recorder
                             // anchors it to response-header arrival rather than
                             // dispatch start (see `start_post_header_upload_timeout`).
@@ -39013,8 +39028,12 @@ async fn handle_proxy_request_inner(
                                 recorder;
                             Some(observer)
                         }
-                        // No breaker: nothing to record. The deferred dispatch
-                        // outcome still records passive-health + least-latency.
+                        // No breaker, or the admitted breaker was already
+                        // replaced/reclaimed (stale): nothing to record. The
+                        // deferred dispatch outcome still records passive-health +
+                        // least-latency, and its own read-only stale check drops
+                        // the breaker outcome; `cb_probe` keeps any slot and
+                        // releases it on the admitting breaker.
                         None => None,
                     };
                 backend_admission_permits = match backend_dispatch::run_backend_admission_plugins(
@@ -39471,13 +39490,14 @@ async fn handle_proxy_request_inner(
                 drop(grpc_lb_connection_guard.take());
 
                 // Record circuit breaker failure for current target
-                if let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
+                if let Some(cb_config) = &proxy.circuit_breaker
+                    && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                         &proxy.namespace,
                         &proxy.id,
                         grpc_current_cb_key.as_deref(),
                         cb_config,
-                    );
+                    )
+                {
                     // A `maxConnections` refusal is retryable (pre-wire, so the
                     // loop may rotate to another target) but carries no backend
                     // signal — the ceiling is the gateway's own policy. Settle
@@ -39897,13 +39917,15 @@ async fn handle_proxy_request_inner(
         // failures (and disarmed the guard) for rotated targets, and
         // grpc_skip_final_cb_record marks the case where a rotated retry's
         // breaker rejected (already recorded for the prior target).
-        if !grpc_skip_final_cb_record && let Some(cb_config) = &proxy.circuit_breaker {
-            let cb = state.circuit_breaker_cache.get_or_create(
+        if !grpc_skip_final_cb_record
+            && let Some(cb_config) = &proxy.circuit_breaker
+            && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                 &proxy.namespace,
                 &proxy.id,
                 grpc_final_cb_key.as_deref(),
                 cb_config,
-            );
+            )
+        {
             match &grpc_result {
                 // Classify buffered responses by the backend's HTTP status,
                 // like the HTTP path. An oversized client request detected
@@ -40164,20 +40186,23 @@ async fn handle_proxy_request_inner(
                     );
                     grpc_recorder_owns_ended_response = true;
                     false
-                } else if let Some(cb_config) = &proxy.circuit_breaker {
-                    let cb = state.circuit_breaker_cache.get_or_create(
+                } else if let Some(cb_config) = &proxy.circuit_breaker
+                    && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                         &proxy.namespace,
                         &proxy.id,
                         grpc_final_cb_key.as_deref(),
                         cb_config,
-                    );
+                    )
+                {
                     record_grpc_backend_status_outcome(&cb, grpc_backend_dispatch_status, false);
                     if let Some(recorder) = &grpc_streaming_probe_recorder {
                         recorder.mark_health_recorded();
                     }
                     true
                 } else {
-                    // No breaker configured — nothing to record or defer.
+                    // No breaker configured, or the breaker this request was
+                    // admitted on has been replaced/reclaimed since (a stale
+                    // completion, issue #6799) — nothing to record or defer.
                     true
                 };
                 {
@@ -42687,13 +42712,14 @@ async fn handle_proxy_request_inner(
             }
             // Record the failed attempt against the current target's circuit breaker
             // before potentially switching to a different target for the next retry.
-            if let Some(cb_config) = &proxy.circuit_breaker {
-                let cb = state.circuit_breaker_cache.get_or_create(
+            if let Some(cb_config) = &proxy.circuit_breaker
+                && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                     &proxy.namespace,
                     &proxy.id,
                     current_cb_target_key.as_deref(),
                     cb_config,
-                );
+                )
+            {
                 // A retryable outcome that carries NO backend-health signal must
                 // settle the breaker NEUTRALLY here, not as a failure. Until
                 // `BackendConnectionLimit` there was no such class — every other

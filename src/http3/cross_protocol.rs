@@ -928,13 +928,14 @@ fn record_cross_protocol_retry_failure(
     // The failed attempt's connection ends now, not after the retry backoff.
     *lb_connection = None;
 
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
+    if let Some(cb_config) = &proxy.circuit_breaker
+        && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
             &proxy.namespace,
             &proxy.id,
             cb_target_key,
             cb_config,
-        );
+        )
+    {
         cb.record_failure(response_status, connection_error, is_half_open_probe);
     }
 }

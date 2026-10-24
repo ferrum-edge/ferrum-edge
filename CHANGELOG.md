@@ -82,6 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **Stale request completions no longer reset a reloaded circuit breaker**
+  (issue #6799). A request completes with the breaker config it was admitted
+  under. When that config had since been reloaded, every completion recorder
+  (H1/H2 buffered and retry paths, WebSocket, gRPC, HTTP/3, HBONE, TCP, UDP
+  and DTLS) treated the older config as a change. It replaced the live
+  breaker, possibly OPEN, with a fresh CLOSED one, and the next admission
+  replaced it again. The new breaker's failures and open state were lost and
+  traffic was re-admitted. Completions now settle through a read-only
+  `CircuitBreakerCache::get_for_completion` lookup. It returns the cached
+  breaker only while that breaker still runs the captured config, so an
+  outcome for a replaced or pruned breaker is discarded. Admission still
+  replaces a breaker whose config changed.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

@@ -812,7 +812,11 @@ impl CircuitBreakerCache {
     /// `target_key` should be `Some("host:port")` when the request resolved to
     /// a concrete upstream target or direct backend override, and `None` when a
     /// direct backend proxy should use one breaker for the proxy.
-    /// If the config has changed, replaces the breaker with a fresh one.
+    /// If the config has changed, replaces the breaker with a fresh one. That
+    /// replacement belongs to ADMISSION only: a request completion must settle
+    /// through [`get_for_completion`](Self::get_for_completion), which never
+    /// replaces live state with the completion's captured (possibly older)
+    /// config.
     ///
     /// Concurrent callers for the same key/config generation receive the same
     /// `Arc`. New distinct keys are admitted only while under `max_entries`;
@@ -926,6 +930,44 @@ impl CircuitBreakerCache {
             self.breakers
                 .get(key.as_str())
                 .map(|entry| entry.value().clone())
+        })
+    }
+
+    /// Read-only lookup of the breaker a request admitted under `config` must
+    /// settle its completion on, WITHOUT creating or replacing one.
+    ///
+    /// Admission ([`can_execute`](Self::can_execute)) replaces a cached breaker
+    /// whose config differs, so a configuration change starts a fresh breaker
+    /// at the next admission. A completion, however, carries the config it was
+    /// admitted under, which may be older than the live one. Resolving it with
+    /// [`get_or_create`](Self::get_or_create) would treat that captured config
+    /// as a change and replace the live (possibly OPEN) breaker with a fresh
+    /// CLOSED one, and the next admission under the current config would
+    /// replace it again — discarding the live breaker's failures and open state
+    /// and re-admitting traffic (issue #6799).
+    ///
+    /// Returns the cached breaker only while it still runs `config`. `None`
+    /// means the breaker the request was admitted on is gone — replaced by a
+    /// reload or reclaimed by a prune — so the completion is stale and must be
+    /// discarded rather than written into (or resurrected as) live state. Any
+    /// HALF_OPEN probe slot it held belonged to that retired breaker, which no
+    /// admission can reach any more. The lookup uses the same thread-local key
+    /// buffer and shard read lock as a matching-config `get_or_create` hit, so
+    /// it adds no allocation or lock to the completion path.
+    pub fn get_for_completion(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        target_key: Option<&str>,
+        config: &CircuitBreakerConfig,
+    ) -> Option<Arc<CircuitBreaker>> {
+        CB_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_circuit_breaker_key(&mut key, namespace, proxy_id, target_key);
+            self.breakers
+                .get(key.as_str())
+                .filter(|existing| existing.config() == config)
+                .map(|existing| existing.value().clone())
         })
     }
 

@@ -488,6 +488,42 @@ fn taking_the_probe_slot_is_what_disarms_the_guard() {
     );
 }
 
+/// Issue #6799: only admission (`CircuitBreakerCache::can_execute`, inside
+/// `src/circuit_breaker.rs`) may replace a cached breaker whose config changed.
+/// Every completion, probe-guard and recorder site resolves its breaker through
+/// the read-only `get_for_completion`, so a request's captured (possibly older)
+/// config can never swap a live — possibly OPEN — breaker for a fresh one.
+#[test]
+fn no_breaker_completion_path_uses_the_replacing_lookup() {
+    for (path, text) in production_sources() {
+        if path == "src/circuit_breaker.rs" {
+            continue;
+        }
+        let production = without_inline_test_module(&text);
+        for replacing in [
+            "circuit_breaker_cache.get_or_create(",
+            "cb_cache.get_or_create(",
+        ] {
+            assert!(
+                !production.contains(replacing),
+                "{path} resolves a circuit breaker with `{replacing}`; completions must use \
+                 `get_for_completion` (read-only, config-matched) and admissions \
+                 `can_execute`, so a stale config cannot replace live breaker state"
+            );
+        }
+    }
+    let shared_recorder = source("src/proxy/backend_dispatch.rs");
+    let recorder = item_body(
+        &shared_recorder,
+        "fn record_backend_outcome_inner(",
+        "\n}\n",
+    );
+    assert!(
+        recorder.contains("circuit_breaker_cache.get_for_completion("),
+        "the shared ordinary-completion recorder must settle through `get_for_completion`"
+    );
+}
+
 fn probe_breaker_config() -> CircuitBreakerConfig {
     CircuitBreakerConfig {
         failure_threshold: 1,

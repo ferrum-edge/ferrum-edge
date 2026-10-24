@@ -1401,13 +1401,14 @@ pub(super) async fn handle_hbone_request(
                     (err.status, err.body, err.phase, err.class, false)
                 }
             };
-            if let Some(cb_config) = &proxy.circuit_breaker {
-                let cb = state.circuit_breaker_cache.get_or_create(
+            if let Some(cb_config) = &proxy.circuit_breaker
+                && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
                     &proxy.namespace,
                     &proxy.id,
                     cb_target_key.as_deref(),
                     cb_config,
-                );
+                )
+            {
                 settle_hbone_backend_connect_circuit_breaker_outcome(
                     &cb,
                     status,
@@ -1441,13 +1442,14 @@ pub(super) async fn handle_hbone_request(
     };
     let backend_elapsed = backend_start.elapsed();
 
-    if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state.circuit_breaker_cache.get_or_create(
+    if let Some(cb_config) = &proxy.circuit_breaker
+        && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
             &proxy.namespace,
             &proxy.id,
             cb_target_key.as_deref(),
             cb_config,
-        );
+        )
+    {
         cb.record_success(cb_probe.take_slot());
     }
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())

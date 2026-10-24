@@ -3228,3 +3228,289 @@ fn a_probe_guard_that_outlives_a_reopen_cannot_free_a_current_cycle_slot() {
         assert_eq!(cb.state_name(), "half_open");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #6799: a completion carries the breaker config its request was
+// admitted under. Admission may replace a breaker whose config changed, but a
+// completion must settle on the breaker still running its config or be dropped
+// as stale — never replace live breaker state from its captured config.
+// ---------------------------------------------------------------------------
+
+/// Breaker configuration "A": the one in force when the old request was admitted.
+fn stale_completion_config_a() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 5,
+        success_threshold: 1,
+        timeout_seconds: 60,
+        failure_status_codes: vec![500, 502, 503],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    }
+}
+
+/// Breaker configuration "B": the reloaded one; differs from A.
+fn stale_completion_config_b() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 2,
+        ..stale_completion_config_a()
+    }
+}
+
+/// A proxy state whose only proxy runs breaker config A, plus that proxy's
+/// captured snapshot (what an in-flight request admitted under A holds).
+fn stale_completion_state() -> (ProxyState, ferrum_edge::config::types::Proxy) {
+    let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+        "version": "1",
+        "consumers": [],
+        "plugin_configs": [],
+        "proxies": [{
+            "id": "cb-stale-completion",
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "backend.local",
+            "backend_port": 8080,
+            "circuit_breaker": {
+                "failure_threshold": 5,
+                "success_threshold": 1,
+                "timeout_seconds": 60,
+                "failure_status_codes": [500, 502, 503],
+                "half_open_max_requests": 1,
+                "trip_on_connection_errors": true
+            }
+        }],
+        "upstreams": []
+    }))
+    .expect("test config should deserialize");
+    config.normalize_fields();
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig::default());
+    let (state, _) = ProxyState::new(
+        config,
+        dns_cache,
+        ferrum_edge::config::env_config::EnvConfig::default(),
+        None,
+        None,
+    )
+    .expect("test proxy state should build");
+    let proxy_a = state.request_epoch.load().config.proxies[0].clone();
+    assert_eq!(
+        proxy_a.circuit_breaker.as_ref(),
+        Some(&stale_completion_config_a()),
+        "the fixture proxy must run breaker config A"
+    );
+    (state, proxy_a)
+}
+
+#[test]
+fn completion_lookup_never_replaces_or_creates_a_breaker() {
+    let cache = CircuitBreakerCache::new();
+    let cfg_a = stale_completion_config_a();
+    let cfg_b = stale_completion_config_b();
+    let tk = target_key("10.0.0.1", 8080);
+
+    // Absent key: no breaker is created for a completion.
+    assert!(
+        cache
+            .get_for_completion("ferrum", "proxy-x", Some(&tk), &cfg_a)
+            .is_none()
+    );
+    assert_eq!(cache.len(), 0, "a completion lookup must not insert");
+
+    // Matching config: the completion settles on the admitted breaker.
+    let (cb_a, _, _) = cache
+        .can_execute("ferrum", "proxy-x", Some(&tk), &cfg_a)
+        .expect("A admits");
+    let settled = cache
+        .get_for_completion("ferrum", "proxy-x", Some(&tk), &cfg_a)
+        .expect("A is still live");
+    assert!(Arc::ptr_eq(&settled, &cb_a));
+
+    // A reload's admission replaces the breaker (intended), and B opens.
+    let (cb_b, _, _) = cache
+        .can_execute("ferrum", "proxy-x", Some(&tk), &cfg_b)
+        .expect("fresh B admits");
+    assert!(!Arc::ptr_eq(&cb_a, &cb_b), "admission replaces on change");
+    cb_b.record_failure(500, false, false);
+    cb_b.record_failure(500, false, false);
+    assert_eq!(cb_b.state_name(), "open");
+
+    // A's completion is stale: no breaker, and the live B is untouched.
+    assert!(
+        cache
+            .get_for_completion("ferrum", "proxy-x", Some(&tk), &cfg_a)
+            .is_none(),
+        "a completion admitted under A must not resolve once B is live"
+    );
+    let live = cache
+        .peek("ferrum", "proxy-x", Some(&tk))
+        .expect("B stays cached");
+    assert!(Arc::ptr_eq(&live, &cb_b), "B's Arc must survive the lookup");
+    assert_eq!(live.config(), &cfg_b);
+    assert_eq!(live.state_name(), "open");
+    assert_eq!(cache.len(), 1);
+    assert!(
+        cache
+            .can_execute("ferrum", "proxy-x", Some(&tk), &cfg_b)
+            .is_err(),
+        "the next B admission must still be refused"
+    );
+
+    // B's own completions still resolve to B.
+    let settled_b = cache
+        .get_for_completion("ferrum", "proxy-x", Some(&tk), &cfg_b)
+        .expect("B completion settles on B");
+    assert!(Arc::ptr_eq(&settled_b, &cb_b));
+}
+
+#[tokio::test]
+async fn stale_ordinary_completion_cannot_reset_a_reloaded_breaker() {
+    let (state, proxy_a) = stale_completion_state();
+    let cfg_a = stale_completion_config_a();
+    let cfg_b = stale_completion_config_b();
+    let mut proxy_b = proxy_a.clone();
+    proxy_b.circuit_breaker = Some(cfg_b.clone());
+    let key = target_key("backend.local", 8080);
+    let cache = &state.circuit_breaker_cache;
+    let (namespace, proxy_id) = (proxy_a.namespace.as_str(), proxy_a.id.as_str());
+
+    // 1. A buffered request is admitted under A; its response is held.
+    let (cb_a, a_probe, _) = cache
+        .can_execute(namespace, proxy_id, Some(&key), &cfg_a)
+        .expect("A admits");
+    assert!(!a_probe);
+
+    // 2. Reload to B. The first B admission replaces the breaker and fails.
+    let (cb_b, b_probe, _) = cache
+        .can_execute(namespace, proxy_id, Some(&key), &cfg_b)
+        .expect("fresh B admits");
+    assert!(!Arc::ptr_eq(&cb_a, &cb_b));
+    ferrum_edge::_test_support::record_backend_completion_for_test(
+        &state,
+        &proxy_b,
+        Some(&key),
+        502,
+        false,
+        None,
+        b_probe,
+    );
+    assert_eq!(cb_b.failure_count(), 1);
+
+    // A stale A success between B failures must not reset B's streak.
+    ferrum_edge::_test_support::record_backend_completion_for_test(
+        &state,
+        &proxy_a,
+        Some(&key),
+        200,
+        false,
+        None,
+        a_probe,
+    );
+    let live = cache
+        .peek(namespace, proxy_id, Some(&key))
+        .expect("B stays cached");
+    assert!(Arc::ptr_eq(&live, &cb_b));
+    assert_eq!(
+        live.failure_count(),
+        1,
+        "an A completion must not touch B's accumulated failures"
+    );
+
+    // B's second failure opens it.
+    let (_, b_probe, _) = cache
+        .can_execute(namespace, proxy_id, Some(&key), &cfg_b)
+        .expect("B is still closed");
+    ferrum_edge::_test_support::record_backend_completion_for_test(
+        &state,
+        &proxy_b,
+        Some(&key),
+        502,
+        false,
+        None,
+        b_probe,
+    );
+    assert_eq!(cb_b.state_name(), "open");
+
+    // 3. The old A request completes successfully.
+    ferrum_edge::_test_support::record_backend_completion_for_test(
+        &state,
+        &proxy_a,
+        Some(&key),
+        200,
+        false,
+        None,
+        a_probe,
+    );
+
+    // B's Arc, config and open state survive the stale completion.
+    let live = cache
+        .peek(namespace, proxy_id, Some(&key))
+        .expect("B stays cached");
+    assert!(
+        Arc::ptr_eq(&live, &cb_b),
+        "a stale completion must not replace the live breaker"
+    );
+    assert_eq!(live.config(), &cfg_b);
+    assert_eq!(live.state_name(), "open");
+    assert_eq!(live.failure_count(), 2);
+    assert_eq!(cache.len(), 1);
+    assert_eq!(
+        cb_a.failure_count(),
+        0,
+        "the outcome is discarded, not written anywhere"
+    );
+
+    // 4. The next B admission is still refused.
+    assert!(
+        cache
+            .can_execute(namespace, proxy_id, Some(&key), &cfg_b)
+            .is_err(),
+        "B's open state must keep refusing admissions"
+    );
+
+    // A stale failure is dropped too, and a pruned key is never resurrected.
+    ferrum_edge::_test_support::record_backend_completion_for_test(
+        &state,
+        &proxy_a,
+        Some("retired.local:8080"),
+        502,
+        true,
+        None,
+        false,
+    );
+    assert!(
+        cache
+            .peek(namespace, proxy_id, Some("retired.local:8080"))
+            .is_none()
+    );
+    assert_eq!(cache.len(), 1);
+}
+
+#[tokio::test]
+async fn probe_guard_resolution_never_replaces_a_reloaded_breaker() {
+    let (state, proxy_a) = stale_completion_state();
+    let cfg_b = stale_completion_config_b();
+    let key = target_key("backend.local", 8080);
+    let cache = &state.circuit_breaker_cache;
+    let (namespace, proxy_id) = (proxy_a.namespace.as_str(), proxy_a.id.as_str());
+
+    // A reload installed B and B opened.
+    let cb_b = cache.get_or_create(namespace, proxy_id, Some(&key), &cfg_b);
+    cb_b.record_failure(500, false, false);
+    cb_b.record_failure(500, false, false);
+    assert_eq!(cb_b.state_name(), "open");
+
+    // A probe admitted under A re-resolves its breaker after the reload: the
+    // breaker that admitted it is gone, so the guard owns nothing and B stays.
+    let guard = HalfOpenProbeGuard::new(&state, &proxy_a, Some(&key), true, cb_b.open_epoch());
+    assert!(!guard.holds_slot());
+    drop(guard);
+    let live = cache
+        .peek(namespace, proxy_id, Some(&key))
+        .expect("B stays cached");
+    assert!(Arc::ptr_eq(&live, &cb_b));
+    assert_eq!(live.state_name(), "open");
+    assert!(
+        cache
+            .can_execute(namespace, proxy_id, Some(&key), &cfg_b)
+            .is_err()
+    );
+}
