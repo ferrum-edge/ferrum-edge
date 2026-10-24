@@ -483,6 +483,43 @@ fn connection_pool_entries_render_one_series_per_closed_set_pool() {
 }
 
 #[test]
+fn direct_h1_pool_families_render_idle_dials_reuse_and_each_eviction_reason() {
+    let stats = ferrum_edge::proxy::http2_pool::Http1PoolStats {
+        idle_connections: 37,
+        connections_opened: 120,
+        connections_reused: 9_880,
+        evicted_ceiling: 3,
+        evicted_expired: 41,
+        evicted_closed: 2,
+    };
+    let mut out = String::new();
+    data_path_metrics::render_direct_h1_pool(&mut out, &stats, NS_LABEL);
+
+    for line in [
+        "# TYPE ferrum_connection_pool_h1_idle_connections gauge",
+        "ferrum_connection_pool_h1_idle_connections{namespace=\"ferrum\"} 37",
+        "# TYPE ferrum_connection_pool_h1_connections_opened_total counter",
+        "ferrum_connection_pool_h1_connections_opened_total{namespace=\"ferrum\"} 120",
+        "# TYPE ferrum_connection_pool_h1_connections_reused_total counter",
+        "ferrum_connection_pool_h1_connections_reused_total{namespace=\"ferrum\"} 9880",
+        "# TYPE ferrum_connection_pool_h1_idle_evictions_total counter",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"ceiling\",namespace=\"ferrum\"} 3",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"expired\",namespace=\"ferrum\"} 41",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"closed\",namespace=\"ferrum\"} 2",
+    ] {
+        assert!(
+            out.lines().any(|candidate| candidate == line),
+            "missing `{line}`:\n{out}"
+        );
+    }
+    assert_eq!(
+        samples(&out, "ferrum_connection_pool_h1_idle_evictions_total").len(),
+        3,
+        "exactly one series per eviction reason"
+    );
+}
+
+#[test]
 fn process_families_render_both_tls_reason_buckets_and_the_retry_counter() {
     data_path_metrics::record_backend_retry_attempt();
     data_path_metrics::record_frontend_tls_handshake_failure(

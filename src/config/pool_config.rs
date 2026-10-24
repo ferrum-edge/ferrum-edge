@@ -20,6 +20,10 @@ pub const MIN_IDLE_PER_HOST: usize = 4;
 /// socket buffer) and file descriptors.  On most systems the practical ceiling
 /// is the per-process file-descriptor limit (`ulimit -n`), but values above
 /// 1024 rarely help because the backend itself becomes the bottleneck.
+///
+/// It is also the default. A ceiling reserves nothing: a lane only retains the
+/// connections its own concurrency opened, and each expires after the idle
+/// timeout.
 pub const MAX_IDLE_PER_HOST: usize = 1024;
 
 /// Global connection pool configuration from environment variables or ferrum.conf.
@@ -105,7 +109,12 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_idle_per_host: 64,
+            // The ceiling, not a target: a lane retains at most as many idle
+            // connections as its own concurrency opened, each for
+            // `idle_timeout_seconds`. A lower default dropped and redialed
+            // connections whenever more than that many were idle at once,
+            // which steady concurrency above it does continuously (issue #6793).
+            max_idle_per_host: MAX_IDLE_PER_HOST,
             idle_timeout_seconds: 90,
             enable_http_keep_alive: true,
             enable_http2: true,

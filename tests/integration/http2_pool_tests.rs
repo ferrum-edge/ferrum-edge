@@ -3077,6 +3077,142 @@ async fn test_grpc_pool_backoff_has_bounded_occupancy_and_constant_eviction_work
     assert_eq!(pool.pool_size(), 1);
 }
 
+/// A backend that accepts and holds connections; the HTTP/1.1 client
+/// handshake writes nothing, so no exchange is needed to pool them.
+async fn holding_backend() -> u16 {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+fn direct_h1_proxy(port: u16) -> Proxy {
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy
+}
+
+/// Check out a fresh direct-H1 connection and wait until its dispatcher is
+/// ready, so a later check-in pools it synchronously.
+async fn ready_checkout(
+    pool: &Http2ConnectionPool,
+    proxy: &Proxy,
+) -> ferrum_edge::proxy::http2_pool::Http1Checkout {
+    let mut checkout = pool
+        .checkout_h1(proxy, false, Duration::from_secs(2), false)
+        .await
+        .expect("checkout");
+    tokio::time::timeout(Duration::from_secs(5), checkout.sender.ready())
+        .await
+        .expect("dispatcher ready in time")
+        .expect("dispatcher ready");
+    checkout
+}
+
+/// The direct HTTP/1.1 idle set holds at most `max_idle_per_host`
+/// connections: check-ins beyond it drop the connection and count a ceiling
+/// eviction, and the kept ones are reused (issue #6793).
+#[tokio::test]
+async fn test_direct_h1_idle_set_holds_at_most_max_idle_per_host() {
+    let proxy = direct_h1_proxy(holding_backend().await);
+    let pool = Http2ConnectionPool::new(
+        PoolConfig {
+            max_idle_per_host: 4,
+            ..PoolConfig::default()
+        },
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+
+    let mut checkouts = Vec::new();
+    for _ in 0..6 {
+        let checkout = ready_checkout(&pool, &proxy).await;
+        assert!(!checkout.reused(), "nothing is idle while all six are held");
+        checkouts.push(checkout);
+    }
+    for checkout in checkouts {
+        checkout.checkin();
+    }
+    assert_eq!(
+        pool.h1_idle_connections(),
+        4,
+        "the idle set keeps exactly its ceiling"
+    );
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.connections_opened, 6);
+    assert_eq!(
+        stats.evicted_ceiling, 2,
+        "two check-ins found the lane full"
+    );
+
+    let mut reused = Vec::new();
+    for _ in 0..4 {
+        let checkout = pool
+            .checkout_h1(&proxy, false, Duration::from_secs(2), false)
+            .await
+            .expect("checkout");
+        assert!(checkout.reused(), "a kept connection is reused");
+        reused.push(checkout);
+    }
+    assert_eq!(pool.h1_idle_connections(), 0);
+    let fresh = pool
+        .checkout_h1(&proxy, false, Duration::from_secs(2), false)
+        .await
+        .expect("checkout");
+    assert!(!fresh.reused(), "an exhausted idle set dials");
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.connections_reused, 4);
+    assert_eq!(stats.connections_opened, 7);
+    assert_eq!(stats.idle_connections, 0);
+}
+
+/// Checkout reuses the most recently pooled connection (LIFO), so the
+/// connections a burst left behind age at the bottom of the idle set and
+/// expire instead of being kept warm by round-robin reuse (issue #6793).
+#[tokio::test]
+async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
+    let proxy = direct_h1_proxy(holding_backend().await);
+    let pool = create_default_pool();
+
+    let older = ready_checkout(&pool, &proxy).await;
+    let newer = ready_checkout(&pool, &proxy).await;
+    let older_socket = older.backend_socket();
+    let newer_socket = newer.backend_socket();
+    older.checkin();
+    newer.checkin();
+    assert_eq!(pool.h1_idle_connections(), 2);
+
+    let reused = pool
+        .checkout_h1(&proxy, false, Duration::from_secs(2), false)
+        .await
+        .expect("checkout");
+    assert!(reused.reused());
+    // Connection identity comes from the send-queue probe's socket handle,
+    // which platforms without the probe do not expose.
+    if let (Some(older), Some(newer), Some(got)) =
+        (older_socket, newer_socket, reused.backend_socket())
+    {
+        assert!(
+            Arc::ptr_eq(&got, &newer),
+            "the newest idle connection is reused"
+        );
+        assert!(!Arc::ptr_eq(&got, &older));
+    }
+    assert_eq!(pool.h1_idle_connections(), 1);
+}
+
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
 /// checked-out connection whose request bound elapsed before the handoff never
 /// carried the request, so the gate refuses it and returns it to the idle set

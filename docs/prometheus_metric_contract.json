@@ -1273,6 +1273,55 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_connection_pool_h1_connections_opened_total",
+    "type": "counter",
+    "help": "Connections the direct HTTP/1.1 backend pool dialed because no idle connection was available.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_h1_connections_reused_total",
+    "type": "counter",
+    "help": "Requests the direct HTTP/1.1 backend pool served on an idle connection.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_h1_idle_connections",
+    "type": "gauge",
+    "help": "Idle connections in the direct HTTP/1.1 backend pool across every backend, at scrape time.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_connection_pool_h1_idle_evictions_total",
+    "type": "counter",
+    "help": "Idle direct HTTP/1.1 backend connections the pool discarded: ceiling (dropped at check-in because the backend's idle set was full), expired (idle past the idle timeout), closed (closed by the backend while idle).",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "connection_pool",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_connection_pool_max_idle_per_host",
     "type": "gauge",
     "help": "Configured idle-connection ceiling per backend host for the HTTP/1.1 and HTTP/2 reqwest pool.",

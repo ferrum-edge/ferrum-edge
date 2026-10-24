@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Backend pools keep up to 1024 idle connections per host by default**
+  (issue #6793), up from 64. `FERRUM_POOL_MAX_IDLE_PER_HOST` is a ceiling, not
+  a reservation: a pool keeps only connections that concurrent requests opened,
+  each until `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`. At 64, a backend whose steady
+  concurrency exceeded it had connections dropped at check-in and redialed: on
+  the mesh runtime benchmark at 100 concurrent requests, about 6% of requests
+  opened a new backend connection. At 1024 there was none, server-sidecar CPU per
+  request fell about 1% at 10 KiB, and p99 latency dropped about 2% at 1 KiB. The
+  direct HTTP/1.1 pool now reuses the most recently returned connection first,
+  so connections a burst left behind close after the idle timeout instead of
+  being kept warm by round-robin reuse, and its idle set grows with use instead
+  of reserving the ceiling's slots up front. New `/metrics` families
+  `ferrum_connection_pool_h1_idle_connections`,
+  `ferrum_connection_pool_h1_connections_opened_total`,
+  `ferrum_connection_pool_h1_connections_reused_total` and
+  `ferrum_connection_pool_h1_idle_evictions_total{reason}` show idle
+  connections, dials, reuse and evictions. Set
+  `FERRUM_POOL_MAX_IDLE_PER_HOST=64` to keep the previous ceiling.
 - **Mesh workload labels travel as typed facts** (issue #6793).
   `workload_metrics` now resolves the local workload's labels once per plugin
   generation and a verified TLS peer's SPIFFE labels once per connection, and

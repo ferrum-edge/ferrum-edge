@@ -156,18 +156,21 @@ The connection pool maintains persistent connections to upstream backends, reduc
 
 | Pool setting | Default | Sizing impact |
 |--------------|---------|---------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | 64 | Max idle connections per upstream host |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | 1024 | Max idle connections per upstream host (a ceiling: the pool keeps only what concurrency opened) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | 90 | How long idle connections persist |
 | `FERRUM_POOL_ENABLE_HTTP2` | true | HTTP/2 multiplexing reduces connection count |
 
 **Connection pool memory estimate:**
 
 ```
-pool_memory ≈ num_upstream_hosts × max_idle_per_host × 20 KB
+pool_memory ≈ Σ over pool identities and upstream hosts of
+              max(warmup connections, min(max_idle_per_host, peak_concurrency)) × 20 KB
 ```
 
-| Upstream hosts | Max idle/host | Estimated pool memory |
-|----------------|---------------|----------------------|
+A pool identity is one distinct client configuration a host is reached through: each reqwest client key (TLS policy, per-proxy pool overrides, HTTP version preference), the direct HTTP/1.1 pool, and the Unix-socket or HBONE pools in mesh mode. Each identity keeps only the connections its own concurrent requests opened, at most `max_idle_per_host`, and closes them once idle for `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`. Startup warmup opens one probe connection per identity and backend even before any traffic. With one identity per host and steady load, the estimate reduces to `upstream_hosts × peak_concurrency × 20 KB`.
+
+| Upstream hosts | Peak concurrency/host (one identity) | Estimated pool memory |
+|----------------|-----------------------|----------------------|
 | 5 | 64 | ~6 MB |
 | 50 | 64 | ~64 MB |
 | 200 | 128 | ~512 MB |
@@ -176,8 +179,8 @@ pool_memory ≈ num_upstream_hosts × max_idle_per_host × 20 KB
 **Connection pool warmup:** When `FERRUM_POOL_WARMUP_ENABLED=true` (the default), the gateway pre-establishes connections to all HTTP-family backends at startup. This adds a small amount of time to startup (typically sub-second for most configs, depending on backend latency and `FERRUM_POOL_WARMUP_CONCURRENCY`) but eliminates first-request latency spikes. The warmed connections consume the same memory as connections created during normal traffic. For Kubernetes deployments, account for warmup time in your `startupProbe.initialDelaySeconds`. See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for configuration details.
 
 **Recommendations:**
-- With HTTP/2 enabled, a single connection can multiplex many requests — reduce `FERRUM_POOL_MAX_IDLE_PER_HOST` to 4–16 (it is global-only; there is no per-proxy override).
-- For backends with bursty traffic patterns, increase `FERRUM_POOL_MAX_IDLE_PER_HOST` to avoid connection churn.
+- With HTTP/2 backends a single connection multiplexes many requests, so few connections are ever idle and the ceiling rarely matters. Do not lower it for HTTP/2's sake: the setting is global-only, and HTTP/1.1 backends behind the same gateway would churn.
+- With many bursty backends and a tight `ulimit -n`, lower `FERRUM_POOL_MAX_IDLE_PER_HOST` to bound idle descriptors after bursts, but keep it at or above each backend's steady concurrency to avoid connection churn.
 - Lower `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` (or the per-proxy `pool_idle_timeout_seconds`) if your backends aggressively close idle connections.
 
 ## How Load Balancing Affects Resources
@@ -370,7 +373,7 @@ For a rough estimate of total memory:
 ```
 total_memory ≈ base (30 MB)
              + route_table (proxies × 5 KB)
-             + connection_pool (upstream_hosts × max_idle_per_host × 20 KB)
+             + connection_pool (Σ identities × hosts × min(max_idle_per_host, peak_concurrency) × 20 KB)
              + request_buffers (concurrent_requests × avg_request_payload)
              + response_buffers (concurrent_requests × avg_response_payload)  [buffered mode only]
              + load_balancer (upstreams × targets × algorithm_overhead)
