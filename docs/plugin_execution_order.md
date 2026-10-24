@@ -231,7 +231,9 @@ segments used by the backend URL builder, including regex/exact/prefix match
 length, the canonical policy path, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
-backend wire. The selected target remains pinned across deferred external hooks,
+backend wire. A `grpc`-enrolled `ai_transcript_audit` joins it too, so the
+proxy binds the backend-effective path its enrollment decision reads when no
+`grpc_full_method` was published. The selected target remains pinned across deferred external hooks,
 so routing-header mutations cannot steer the request onto a different method.
 The gateway enforces the selected path, including stateful per-method rate
 limits, exactly once before invoking those hooks or a terminal final-request-
@@ -518,6 +520,9 @@ is part of the question: a `monitor`-mode WAF, a rule set whose applicable body
 rules only log, or a body the operator opted out of scanning with
 `on_body_too_large: skip` all lose an observation when a body is unscannable,
 which is not a protection-mechanism failure and does not become a `400`.
+`ai_transcript_audit` claims candidate-shaped `POST`s only under a fail-closed
+sink policy (`sink.on_buffer_full: reject` or `sink.on_sink_error: reject`),
+because only then can it refuse a request it cannot audit.
 
 - **Nothing claims the request, or the finalized bytes are identity-coded.**
   Nothing changes. Ordinary compressed uploads keep flowing to backends that
