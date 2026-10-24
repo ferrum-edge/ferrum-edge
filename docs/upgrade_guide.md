@@ -144,6 +144,10 @@ answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
 
+### Backend idle connections: higher default ceiling (#6793)
+
+`FERRUM_POOL_MAX_IDLE_PER_HOST` now defaults to `1024` (was `64`). No configuration change is required. The ceiling reserves nothing: each backend keeps only the connections its own concurrent requests opened, and the direct HTTP/1.1 pool now reuses the most recently returned connection first, so connections left over from a burst close after `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`. A backend whose sustained concurrency exceeded 64 now keeps those connections instead of having them dropped and redialed. If a backend caps its own accepted connections, or the gateway runs under a tight `ulimit -n`, size that limit for the backend's peak concurrency, or set `FERRUM_POOL_MAX_IDLE_PER_HOST=64` to keep the previous behavior. The new `ferrum_connection_pool_h1_*` metrics show idle connections, dials, reuse, and evictions.
+
 ### Mesh workload labels in built-in-only chains (#6793)
 
 No action is required. `Plugin` gains `observes_mesh_label_metadata()`,

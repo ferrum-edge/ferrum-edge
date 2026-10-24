@@ -350,7 +350,7 @@
 //! reusable live-identity set: an H1 target whose keep-alive/reuse is off is
 //! omitted from the published live set so resident idle H1 carriers are
 //! retired synchronously before reconciliation returns — otherwise a full idle
-//! set (defaults: physical cap 64 and idle cap 64) would keep every physical
+//! set (the physical cap, default 64, binds well before the idle ceiling) would keep every physical
 //! slot occupied while new traffic must dial fresh and could receive
 //! `BackendConnectionLimit` until idle expiry. h2c is unaffected — HTTP/2 has
 //! no keep-alive negotiation and stream multiplexing is the transport's

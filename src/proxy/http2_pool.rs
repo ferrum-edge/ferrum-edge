@@ -1241,18 +1241,18 @@ impl IdleH1 {
     }
 }
 
-/// Idle connections for one lane key. Lock-free: many concurrent requests to
-/// one backend all check in and out of the same lane.
+/// Idle connections for one lane key.
 ///
-/// The idle set grows in small blocks as connections go idle instead of
-/// reserving `max_idle_per_host` slots up front, so a high ceiling costs a
-/// lane nothing until its own concurrency fills it.
+/// Oldest first: checkout takes the newest (LIFO), so the connections a burst
+/// left behind sit at the bottom unused and close once idle for the idle
+/// timeout, instead of being kept warm by round-robin reuse (issue #6793). The
+/// vector keeps its capacity across reuse, so a warm lane allocates nothing
+/// per request. The lock is held for exactly one push, pop or length read;
+/// connections are always dropped outside it.
 struct Http1Lane {
-    idle: crossbeam_queue::SegQueue<IdleH1>,
-    /// Entries in `idle`, reserved before each push so concurrent check-ins
-    /// cannot overshoot `max_idle`.
-    idle_len: AtomicUsize,
+    idle: std::sync::Mutex<Vec<IdleH1>>,
     max_idle: usize,
+    counters: Arc<Http1PoolCounters>,
     /// Bumped when a drain withdraws this lane. A checkout taken under an older
     /// generation is never checked back in, so an exchange that outlived the
     /// drain cannot repopulate the pool with a connection it meant to retire.
@@ -1262,36 +1262,107 @@ struct Http1Lane {
 }
 
 impl Http1Lane {
+    fn idle(&self) -> std::sync::MutexGuard<'_, Vec<IdleH1>> {
+        // Nothing that holds this lock can panic (a push, pop, length read or
+        // a partition of plain values), so a poisoned guard still protects a
+        // consistent vector.
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn retire(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        while self.pop_idle().is_some() {}
+        let retired = std::mem::take(&mut *self.idle());
+        drop(retired);
     }
 
     /// Pool `entry` unless the lane already holds its ceiling, in which case
     /// it is handed back and the caller drops the connection.
     fn push_idle(&self, entry: IdleH1) -> Result<(), IdleH1> {
-        if self.idle_len.fetch_add(1, Ordering::AcqRel) >= self.max_idle {
-            self.idle_len.fetch_sub(1, Ordering::AcqRel);
+        let mut idle = self.idle();
+        if idle.len() >= self.max_idle {
             return Err(entry);
         }
-        self.idle.push(entry);
+        idle.push(entry);
         Ok(())
     }
 
+    /// The most recently pooled connection.
     fn pop_idle(&self) -> Option<IdleH1> {
-        let entry = self.idle.pop()?;
-        self.idle_len.fetch_sub(1, Ordering::AcqRel);
-        Some(entry)
+        self.idle().pop()
     }
 
     fn idle_len(&self) -> usize {
-        self.idle.len()
+        self.idle().len()
     }
+
+    /// Remove closed and expired entries, keeping the rest in order, and hand
+    /// them back so they drop outside the lock.
+    fn take_stale(&self, now: std::time::Instant) -> Vec<IdleH1> {
+        let mut idle = self.idle();
+        if !idle
+            .iter()
+            .any(|entry| entry.sender.is_closed() || entry.expired(now))
+        {
+            return Vec::new();
+        }
+        let (stale, live): (Vec<_>, Vec<_>) = std::mem::take(&mut *idle)
+            .into_iter()
+            .partition(|entry| entry.sender.is_closed() || entry.expired(now));
+        *idle = live;
+        stale
+    }
+}
+
+/// Lifetime counters of one direct HTTP/1.1 pool, shared by its lanes
+/// (issue #6793).
+#[derive(Default)]
+pub(crate) struct Http1PoolCounters {
+    opened: AtomicU64,
+    reused: AtomicU64,
+    evicted_ceiling: AtomicU64,
+    evicted_expired: AtomicU64,
+    evicted_closed: AtomicU64,
+}
+
+impl Http1PoolCounters {
+    fn count(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count an idle connection the pool discards: closed by the backend (or
+    /// no longer ready), or idle past its timeout.
+    fn count_discarded(&self, idle: &IdleH1, now: std::time::Instant) {
+        if idle.sender.is_closed() || !idle.sender.is_ready() {
+            Self::count(&self.evicted_closed);
+        } else if idle.expired(now) {
+            Self::count(&self.evicted_expired);
+        }
+    }
+}
+
+/// One scrape of the direct HTTP/1.1 pool (issue #6793).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Http1PoolStats {
+    /// Idle connections across every lane at scrape time.
+    pub idle_connections: usize,
+    /// Connections dialed because no idle one was available.
+    pub connections_opened: u64,
+    /// Checkouts served from the idle set.
+    pub connections_reused: u64,
+    /// Connections dropped at check-in because their lane held its ceiling.
+    pub evicted_ceiling: u64,
+    /// Idle connections closed after `idle_timeout`.
+    pub evicted_expired: u64,
+    /// Idle connections discarded because the backend closed them.
+    pub evicted_closed: u64,
 }
 
 pub(crate) struct Http1Lanes {
     lanes: DashMap<String, Arc<Http1Lane>>,
     max_idle_per_host: usize,
+    counters: Arc<Http1PoolCounters>,
 }
 
 impl Http1Lanes {
@@ -1299,6 +1370,7 @@ impl Http1Lanes {
         Self {
             lanes: DashMap::with_shard_amount(shards),
             max_idle_per_host: max_idle_per_host.max(1),
+            counters: Arc::new(Http1PoolCounters::default()),
         }
     }
 
@@ -1308,9 +1380,9 @@ impl Http1Lanes {
         }
         Arc::clone(&self.lanes.entry(key.to_owned()).or_insert_with(|| {
             Arc::new(Http1Lane {
-                idle: crossbeam_queue::SegQueue::new(),
-                idle_len: AtomicUsize::new(0),
+                idle: std::sync::Mutex::new(Vec::new()),
                 max_idle: self.max_idle_per_host,
+                counters: Arc::clone(&self.counters),
                 generation: AtomicU64::new(0),
             })
         }))
@@ -1351,14 +1423,17 @@ impl Http1Lanes {
             idle_timeout,
             ..
         } = checkout;
-        // A full lane drops the connection (the oldest-wins tradeoff of a
-        // bounded idle set); `push_idle` hands the entry back and it drops here.
-        let _ = lane.push_idle(IdleH1 {
+        // A full lane drops the connection; `push_idle` hands the entry back
+        // and it drops here.
+        let pushed = lane.push_idle(IdleH1 {
             sender,
             socket,
             idle_since: std::time::Instant::now(),
             idle_timeout,
         });
+        if pushed.is_err() {
+            Http1PoolCounters::count(&lane.counters.evicted_ceiling);
+        }
     }
 
     fn clear(&self) {
@@ -1383,12 +1458,8 @@ impl Http1Lanes {
     fn sweep(&self) {
         let now = std::time::Instant::now();
         self.lanes.retain(|_, lane| {
-            for _ in 0..lane.idle_len() {
-                let Some(idle) = lane.pop_idle() else { break };
-                if idle.sender.is_closed() || idle.expired(now) {
-                    continue;
-                }
-                let _ = lane.push_idle(idle);
+            for stale in lane.take_stale(now) {
+                lane.counters.count_discarded(&stale, now);
             }
             lane.idle_len() > 0 || Arc::strong_count(lane) > 1
         });
@@ -1396,6 +1467,18 @@ impl Http1Lanes {
 
     fn idle_connections(&self) -> usize {
         self.lanes.iter().map(|lane| lane.idle_len()).sum()
+    }
+
+    fn stats(&self) -> Http1PoolStats {
+        let counters = &self.counters;
+        Http1PoolStats {
+            idle_connections: self.idle_connections(),
+            connections_opened: counters.opened.load(Ordering::Relaxed),
+            connections_reused: counters.reused.load(Ordering::Relaxed),
+            evicted_ceiling: counters.evicted_ceiling.load(Ordering::Relaxed),
+            evicted_expired: counters.evicted_expired.load(Ordering::Relaxed),
+            evicted_closed: counters.evicted_closed.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1791,8 +1874,10 @@ impl Http2ConnectionPool {
                 // or open is closing, and waiting on it would park this
                 // request behind a connection that will never serve it.
                 if idle.sender.is_closed() || !idle.sender.is_ready() || idle.expired(now) {
+                    lane.counters.count_discarded(&idle, now);
                     continue;
                 }
+                Http1PoolCounters::count(&lane.counters.reused);
                 crate::plugins::otel_tracing::note_backend_connection_reused();
                 return Ok(Http1Checkout {
                     lane,
@@ -1812,6 +1897,7 @@ impl Http2ConnectionPool {
             Box::pin(manager.create_h1_connection(proxy, tls, svid_generation, connect_timeout))
                 .await?;
         crate::plugins::otel_tracing::note_backend_connection_established_since(setup_started);
+        Http1PoolCounters::count(&lane.counters.opened);
         Ok(Http1Checkout {
             lane,
             sender,
@@ -1826,6 +1912,12 @@ impl Http2ConnectionPool {
     #[allow(dead_code)] // exercised from tests
     pub fn h1_idle_connections(&self) -> usize {
         self.h1.idle_connections()
+    }
+
+    /// Idle connections and lifetime dial, reuse and eviction counts of the
+    /// direct HTTP/1.1 pool (issue #6793).
+    pub fn h1_pool_stats(&self) -> Http1PoolStats {
+        self.h1.stats()
     }
 }
 

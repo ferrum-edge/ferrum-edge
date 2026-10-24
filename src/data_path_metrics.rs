@@ -184,6 +184,7 @@ pub fn render_prometheus(proxy_state: Option<&ProxyState>, ns_label: &str) -> St
             ("mesh_mtls", state.mesh_mtls_pool.pool_size()),
         ];
         render_connection_pools(&mut output, &pools, max_idle_per_host, ns_label);
+        render_direct_h1_pool(&mut output, &state.http2_pool.h1_pool_stats(), ns_label);
     }
     output
 }
@@ -572,6 +573,62 @@ pub fn render_connection_pools(
         ns_label,
         max_idle_per_host as u64,
     );
+}
+
+/// Append the direct HTTP/1.1 pool families (issue #6793): idle connections at
+/// scrape time, and the lifetime dial, reuse and eviction counts that show
+/// whether the idle ceiling is churning connections.
+pub fn render_direct_h1_pool(
+    output: &mut String,
+    stats: &crate::proxy::http2_pool::Http1PoolStats,
+    ns_label: &str,
+) {
+    output.push_str(
+        "# HELP ferrum_connection_pool_h1_idle_connections Idle connections in the direct HTTP/1.1 backend pool across every backend, at scrape time.\n",
+    );
+    output.push_str("# TYPE ferrum_connection_pool_h1_idle_connections gauge\n");
+    push_scalar(
+        output,
+        "ferrum_connection_pool_h1_idle_connections",
+        ns_label,
+        stats.idle_connections as u64,
+    );
+
+    output.push_str(
+        "# HELP ferrum_connection_pool_h1_connections_opened_total Connections the direct HTTP/1.1 backend pool dialed because no idle connection was available.\n",
+    );
+    output.push_str("# TYPE ferrum_connection_pool_h1_connections_opened_total counter\n");
+    push_scalar(
+        output,
+        "ferrum_connection_pool_h1_connections_opened_total",
+        ns_label,
+        stats.connections_opened,
+    );
+
+    output.push_str(
+        "# HELP ferrum_connection_pool_h1_connections_reused_total Requests the direct HTTP/1.1 backend pool served on an idle connection.\n",
+    );
+    output.push_str("# TYPE ferrum_connection_pool_h1_connections_reused_total counter\n");
+    push_scalar(
+        output,
+        "ferrum_connection_pool_h1_connections_reused_total",
+        ns_label,
+        stats.connections_reused,
+    );
+
+    output.push_str(
+        "# HELP ferrum_connection_pool_h1_idle_evictions_total Idle direct HTTP/1.1 backend connections the pool discarded: ceiling (dropped at check-in because the backend's idle set was full), expired (idle past the idle timeout), closed (closed by the backend while idle).\n",
+    );
+    output.push_str("# TYPE ferrum_connection_pool_h1_idle_evictions_total counter\n");
+    for (reason, count) in [
+        ("ceiling", stats.evicted_ceiling),
+        ("expired", stats.evicted_expired),
+        ("closed", stats.evicted_closed),
+    ] {
+        output.push_str(&format!(
+            "ferrum_connection_pool_h1_idle_evictions_total{{reason=\"{reason}\"{ns_label}}} {count}\n"
+        ));
+    }
 }
 
 /// Emit one unlabeled sample, adding the namespace label when published.
