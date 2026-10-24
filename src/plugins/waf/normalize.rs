@@ -380,6 +380,18 @@ pub(super) fn decode_wide_charset_body_views(
     views
 }
 
+/// Whether a body's UTF-16 / UTF-32 readings come from its own `charset`
+/// declaration or byte-order mark, rather than only from the BOM-less wide
+/// signature. Only then does a backend that honours the declaration read the
+/// body as wide text; without either, a backend defaults to UTF-8 and reads
+/// the raw bytes.
+pub(super) fn wide_charset_is_declared(body: &[u8], content_type: Option<&str>) -> bool {
+    charset_declares_utf16_family(content_type)
+        || charset_declares_utf32_family(content_type)
+        || utf32_bom(body).is_some()
+        || utf16_bom(body).is_some()
+}
+
 /// The wide width a BOM-less body's first four octets sign, if any: the
 /// NUL placement of two ASCII UTF-16 units or one ASCII UTF-32 unit. The
 /// NUL placement also implies an endianness (a leading NUL is big-endian).

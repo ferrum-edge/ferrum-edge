@@ -1747,6 +1747,87 @@ async fn body_json_path_rule_inspects_every_document_of_a_sequence() {
 }
 
 #[tokio::test]
+async fn body_json_path_recovery_keeps_a_container_the_refused_token_ran_into() {
+    // `serde_json` rejects `tru` only once it has consumed the `{` after it;
+    // a lenient sequence reader (Gson `JsonStreamParser`) reads the unquoted
+    // `tru` and then that object. Recovery must start the next document at
+    // the consumed `{`, not after it.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        b"tru{\"user\":{\"bio\":\"forbidden-canary\"}}".as_slice(),
+        b"nu{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"fals{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"NaN{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"1e400{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"null tru{\"user\":{\"bio\":\"forbidden-canary\"}}",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [
+        b"tru{\"user\":{\"bio\":\"ordinary\"}}".as_slice(),
+        b"NaN{\"user\":{\"bio\":\"ordinary\"}}",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    assert_json_path_verdicts(&plugin, "text/plain", &forbidden, &benign).await;
+    // Under a JSON declaration nothing here reads completely: fail closed.
+    assert_json_path_verdicts(&plugin, "application/json", &forbidden, &[]).await;
+    assert_json_path_verdicts(&plugin, "application/json", &benign, &[]).await;
+
+    // The same for an array, with the path into it.
+    let plugin = container_json_path_waf("0.user.bio", "contains", "forbidden-canary", &[]);
+    assert_json_path_verdicts(
+        &plugin,
+        "text/plain",
+        &[b"tru[{\"user\":{\"bio\":\"forbidden-canary\"}}]".to_vec()],
+        &[b"tru[{\"user\":{\"bio\":\"ordinary\"}}]".to_vec()],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes() {
+    // Without a declared wide charset or BOM, a backend defaults to UTF-8. A
+    // NUL-skipping one (Json.NET) then reads the raw bytes with their NULs
+    // skipped — here `[{"x":"", "user":{"bio":…},"y":""}]` — while the
+    // signature-sniffed UTF-16LE reading of the same bytes is a different,
+    // benign document whose string holds the ASCII middle as wide characters.
+    let plugin = container_json_path_waf("0.user.bio", "contains", "forbidden-canary", &[]);
+    let polyglot = |middle: &str| -> Vec<u8> {
+        assert_eq!(middle.len() % 2, 0);
+        let mut body = encode_utf16(r#"[{"x":""#, false);
+        body.extend_from_slice(middle.as_bytes());
+        body.extend(encode_utf16(r#""}]"#, false));
+        body
+    };
+    let forbidden = polyglot(r#"", "user":{"bio":"forbidden-canary"},"y":""#);
+    let benign = polyglot(r#"", "user":{"bio":"ordinary"},"y":""#);
+    for content_type in ["application/json", "text/plain"] {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &[forbidden.clone()],
+            &[benign.clone()],
+        )
+        .await;
+    }
+    // Declared UTF-16LE, the backend reads the wide document: benign. So is
+    // declared UTF-16 text with non-ASCII content.
+    assert_json_path_verdicts(
+        &plugin,
+        "application/json; charset=utf-16le",
+        &[],
+        &[
+            forbidden,
+            encode_utf16(r#"[{"user":{"bio":"łódź • ordinary"}}]"#, false),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn body_json_path_lenient_work_is_bounded_per_body_and_fails_closed() {
     // Every lenient reading of one body shares one work budget. A body whose
     // opening checks would rescan the same long comment at every token

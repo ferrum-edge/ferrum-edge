@@ -471,7 +471,8 @@ The lenient reading also accepts several documents separated by whitespace
 followed by another one). When a document cannot be read, it is judged by its
 opening (below) and reading resumes at the next whitespace-separated token or
 container after the error — as a sequence consumer that skips a bad value
-does, on the same line or the next. Every document it reads is inspected —
+does, on the same line or the next, including a container the bad token runs
+straight into (`tru{…}`, `NaN[…]`). Every document it reads is inspected —
 before or after a part it could not read, including a JSON object embedded in
 text — so a backend that reads only the first, only the last, or each of them
 is covered by the same verdict. Nothing is re-read inside a refused container:
@@ -524,7 +525,19 @@ a reading is refused by both the strict and the lenient parse and:
 
 "No reading was read completely" is what keeps an ordinary UTF-16 / UTF-32
 body open: its raw bytes are refused (a NUL follows every ASCII character)
-while its transcoded reading parses. A blank body (empty or JSON whitespace
+while its transcoded reading parses. That vouching comes only from a wide
+reading the body declares — a UTF-16 / UTF-32 `charset` or a byte-order mark
+— because only then does a backend read the body as wide text. A wide
+reading found only by the BOM-less signature is not what a backend that
+defaults to UTF-8 reads: when the raw bytes are refused in a way a
+NUL-skipping parser (Json.NET) reads past, the raw bytes with every NUL
+removed are read and inspected as well, and it is that reading that must be
+read completely. One body can be a benign UTF-16 document and a different
+UTF-8 document with NULs between its tokens; both are judged. Undeclared,
+BOM-less UTF-16 / UTF-32 JSON can therefore fail closed when a character's
+code unit holds a byte that breaks the NUL-removed reading — a control byte,
+`"` or `\` (for example most of U+0100–U+1FFF, or U+22xx): declare its
+`charset` or send a byte-order mark. A blank body (empty or JSON whitespace
 only) and a lone top-level scalar the parser accepts (which no non-empty path
 can select) are never judged.
 

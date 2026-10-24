@@ -207,9 +207,10 @@ pub(super) fn parse(bytes: &[u8], budget: &mut WorkBudget) -> JsonView {
 /// read and, when anything could not be read, the most JSON-like opening
 /// among the documents the reading stopped at.
 ///
-/// Linear: every attempt starts at or past the previous attempt's error, and
-/// an error is never before anything that attempt consumed, so no byte is
-/// parsed twice; nothing is re-read inside a refused container. The parse
+/// Linear: every attempt starts at or past the previous attempt's error (or
+/// one byte before it, at a container opening the failed token consumed),
+/// and an error is never before anything that attempt consumed, so no byte is
+/// parsed more than twice; nothing is re-read inside a refused container. The parse
 /// and opening-check work is charged to `budget`.
 fn parse_lenient_sequence(
     text: &str,
@@ -245,7 +246,14 @@ fn parse_lenient_sequence(
         .clamp(failed_at, bytes.len());
         budget.charge(error_at - start + 1);
         refused = refused.max(Some(JsonOpening::of(&bytes[failed_at..], budget)));
-        let next = resume_point(bytes, error_at);
+        // `serde_json` can report an error just past a byte it consumed while
+        // rejecting a token (`tru{` fails on the `{`). When that byte opens a
+        // container, the next document starts there; otherwise skip the token.
+        let next = if error_at > failed_at + 1 && matches!(bytes[error_at - 1], b'{' | b'[') {
+            error_at - 1
+        } else {
+            resume_point(bytes, error_at)
+        };
         start = if next > start {
             next
         } else {
