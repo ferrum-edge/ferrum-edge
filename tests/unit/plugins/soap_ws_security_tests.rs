@@ -1946,6 +1946,14 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         /// Sign with this `(PKCS#8 DER key, certificate PEM)` instead of the
         /// committed IdP fixture, e.g. an rcgen cert with a chosen validity.
         pub signer: Option<(Vec<u8>, String)>,
+        /// Raw condition elements appended inside `Conditions` (after the
+        /// AudienceRestriction / OneTimeUse the other fields emit), in both
+        /// the emitted and the signed view, so an unsupported or duplicated
+        /// condition still carries a fully valid IdP signature.
+        pub extra_conditions: Option<String>,
+        /// Replace the whole SubjectConfirmation fragment (in both views), for
+        /// assertions that carry several confirmations.
+        pub subject_confirmations: Option<String>,
     }
 
     impl<'a> AssertionBuilder<'a> {
@@ -1973,6 +1981,8 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 name_id_fragment: None,
                 reference_uri_override: None,
                 signer: None,
+                extra_conditions: None,
+                subject_confirmations: None,
             }
         }
 
@@ -1985,6 +1995,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 || self.not_on_or_after.is_some()
                 || self.audience.is_some()
                 || self.one_time_use
+                || self.extra_conditions.is_some()
             {
                 conditions.push_str("<saml:Conditions");
                 if let Some(nb) = self.not_before.as_deref() {
@@ -2003,6 +2014,9 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 if self.one_time_use {
                     inner.push_str("<saml:OneTimeUse/>");
                 }
+                if let Some(extra) = self.extra_conditions.as_deref() {
+                    inner.push_str(extra);
+                }
                 if inner.is_empty() {
                     conditions.push_str("/>");
                 } else {
@@ -2011,7 +2025,9 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
             }
 
             let mut confirmation = String::new();
-            if let Some(recipient) = self.recipient.as_deref() {
+            if let Some(fragment) = self.subject_confirmations.as_deref() {
+                confirmation.push_str(fragment);
+            } else if let Some(recipient) = self.recipient.as_deref() {
                 confirmation.push_str(&format!(
                     "<saml:SubjectConfirmation Method=\"{}\"><saml:SubjectConfirmationData Recipient=\"{}\"",
                     self.confirmation_method, recipient
@@ -4876,6 +4892,80 @@ mod x509_roundtrip {
             Ok(_) => panic!("missing cert file must fail load"),
         };
         assert!(err.contains("failed to load trusted cert"), "got: {err}");
+    }
+
+    // ── Signed SOAP header blocks (WS-Addressing) ───────────────────────
+
+    /// A WS-Addressing header block with a `wsu:Id`, as WCF/Metro/CXF
+    /// `SignedParts` policies sign beside Body and Timestamp.
+    const ADDRESSING_ACTION_XML: &str = r#"<wsa:Action xmlns:wsa="http://www.w3.org/2005/08/addressing" wsu:Id="Action-1">urn:example:GetPrice</wsa:Action>"#;
+
+    fn signed_header_reference(id: &str, digest_b64: &str) -> String {
+        format!(
+            r##"<Reference URI="#{id}"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{digest_b64}</DigestValue></Reference>"##
+        )
+    }
+
+    /// Body + Timestamp + a signed `wsa:Action` header block validates: the
+    /// Reference resolves inside a block of the namespace-correct SOAP
+    /// Header the backend consumes.
+    #[tokio::test]
+    async fn signed_ws_addressing_header_block_is_accepted() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let context = format!(
+            r#"<root xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsu="{WSU_NAMESPACE_URI_FOR_TESTS}">{ADDRESSING_ACTION_XML}</root>"#
+        );
+        let canonical = soap_exclusive_canonicalize_element_for_test(&context, "Action", "soap")
+            .expect("test Action header must canonicalize");
+        let digest =
+            B64.encode(ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes()).as_ref());
+        let reference = signed_header_reference("Action-1", &digest);
+        let envelope = build_signed_soap_envelope_with_signed_info(&cert, |signed_info| {
+            signed_info.replacen("</SignedInfo>", &format!("{reference}</SignedInfo>"), 1)
+        });
+        let envelope = envelope.replacen(
+            "<soap:Header>",
+            &format!("<soap:Header>{ADDRESSING_ACTION_XML}"),
+            1,
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&envelope);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "a signed WS-Addressing header block must be accepted: {result:?}"
+        );
+    }
+
+    /// The `Header` element itself is not a header block: a Reference to it
+    /// still resolves outside the governed set and is refused.
+    #[tokio::test]
+    async fn a_reference_to_the_header_element_itself_is_refused() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        // The location check precedes the digest comparison, so the digest is
+        // never computed for this Reference.
+        let reference = signed_header_reference("Hdr-1", "AAAA");
+        let envelope = build_signed_soap_envelope_with_signed_info(&cert, |signed_info| {
+            signed_info.replacen("</SignedInfo>", &format!("{reference}</SignedInfo>"), 1)
+        });
+        let envelope = envelope.replacen("<soap:Header>", r#"<soap:Header wsu:Id="Hdr-1">"#, 1);
+
+        let mut ctx = make_ctx_with_soap_body(&envelope);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            reject_body(&result).contains("outside the SOAP Header blocks and the SOAP Body"),
+            "got: {}",
+            reject_body(&result)
+        );
     }
 }
 
@@ -8040,6 +8130,61 @@ mod advisory_regressions {
         );
     }
 
+    /// A SOAP principal is an EXTERNAL identity (issue #6082). A same-namespace
+    /// Consumer whose username, id, and custom id all equal it is still not
+    /// bound, so Consumer ACL groups never apply, and the published docs no
+    /// longer promise that mapping.
+    #[tokio::test]
+    async fn soap_principal_is_never_mapped_to_a_same_named_consumer() {
+        use ferrum_edge::config::types::Consumer;
+        use ferrum_edge::plugins::access_control::AccessControl;
+
+        let plugin = SoapWsSecurity::new(&strict_username_token_config()).unwrap();
+        let consumer = Consumer {
+            labels: Default::default(),
+            id: "alice".to_string(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            username: "alice".to_string(),
+            custom_id: Some("alice".to_string()),
+            credentials: HashMap::new(),
+            acl_groups: vec!["finance".to_string()],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let consumer_index = ConsumerIndex::new(&[consumer]);
+
+        let mut ctx = ctx_with(&valid_username_token_body(), Some("text/xml"));
+        let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+        assert!(
+            ctx.identified_consumer.is_none(),
+            "a SOAP principal must not be mapped to a Consumer by name"
+        );
+
+        let acl = AccessControl::new(&json!({"allowed_groups": ["finance"]})).unwrap();
+        match acl.authorize(&mut ctx).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 403),
+            other => panic!("Consumer group policy must not admit a SOAP principal: {other:?}"),
+        }
+
+        let plugins_doc = include_str!("../../../docs/plugins.md");
+        let execution_order_doc = include_str!("../../../docs/plugin_execution_order.md");
+        let spec = include_str!("../../../openapi.yaml");
+        for (label, text) in [
+            ("docs/plugins.md", plugins_doc),
+            ("docs/plugin_execution_order.md", execution_order_doc),
+            ("openapi.yaml", spec),
+        ] {
+            assert!(
+                !text.contains("register that string as a Consumer username/id")
+                    && !text.contains("namespace-correct `identified_consumer`")
+                    && !text.contains("namespace-correct identified_consumer"),
+                "{label} must not promise a SOAP Consumer mapping"
+            );
+        }
+    }
+
     /// The timestamp-only policy establishes no principal, so it must stay out
     /// of the authentication chain (otherwise every request becomes
     /// "Authentication required") and keep validating in `before_proxy`.
@@ -10371,6 +10516,37 @@ fn openapi_soap_ws_security_component_matches_constructor_admission() {
             }),
         ),
         (
+            "require_mechanisms any across two mechanisms",
+            json!({
+                "require_mechanisms": "any",
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                },
+                "x509_signature": {"enabled": true, "trusted_certs": [cert]}
+            }),
+        ),
+        (
+            "require_mechanisms any with one mechanism",
+            json!({
+                "require_mechanisms": "any",
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                }
+            }),
+        ),
+        (
+            "require_mechanisms all",
+            json!({"require_mechanisms": "all", "timestamp": {"require": true}}),
+        ),
+        (
+            "require_mechanisms with an unknown value",
+            json!({"require_mechanisms": "some", "timestamp": {"require": true}}),
+        ),
+        (
             "credential removal alongside an explicit allow_mtom",
             json!({
                 "content_type": {"allow_mtom": true},
@@ -10544,4 +10720,835 @@ fn unknown_key_diagnostics_preserve_every_schema_path_and_credential_ordinal() {
             );
         }
     }
+}
+
+// ── Shared replay claims require a non-evicting backend ─────────────────────
+//
+// `SET NX EX` cannot tell an evicted claim from a credential nobody used, so a
+// shared replay backend that may evict live keys under `maxmemory` re-admits a
+// captured PasswordDigest token or SAML assertion. The shared client must prove
+// `maxmemory == 0` or `noeviction` before it carries a claim, and fail closed
+// otherwise.
+
+mod shared_replay_retention {
+    use super::*;
+    use std::collections::HashSet;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const NOEVICTION_MEMORY_INFO: &str =
+        "# Memory\r\nmaxmemory:1048576\r\nmaxmemory_policy:noeviction\r\n";
+    const EVICTING_MEMORY_INFO: &str =
+        "# Memory\r\nmaxmemory:1048576\r\nmaxmemory_policy:allkeys-lru\r\n";
+    const UNPROVEN_MEMORY_INFO: &str = "# Memory\r\nused_memory:123\r\n";
+    const CLUSTER_DISABLED_INFO: &str = "# Cluster\r\ncluster_enabled:0\r\n";
+    const ISSUER: &str = "https://idp.example.com/metadata";
+
+    /// A minimal standalone RESP endpoint with a real `SET NX` keyspace that
+    /// reports the configured `INFO MEMORY` payload.
+    struct FakeReplayRedis {
+        port: u16,
+        claims: Arc<AtomicUsize>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl FakeReplayRedis {
+        fn config(&self) -> Value {
+            shared_scope_config(&format!("redis://127.0.0.1:{}", self.port))
+        }
+
+        /// `SET` commands that reached the endpoint.
+        fn claims(&self) -> usize {
+            self.claims.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for FakeReplayRedis {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    fn bulk(text: &str) -> Vec<u8> {
+        format!("${}\r\n{text}\r\n", text.len()).into_bytes()
+    }
+
+    /// One complete RESP command array at the start of `buf`, and its length.
+    fn parse_command(buf: &[u8]) -> Option<(Vec<Vec<u8>>, usize)> {
+        fn line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+            let rest = buf.get(from..)?;
+            let end = rest.windows(2).position(|window| window == b"\r\n")?;
+            Some((&rest[..end], from + end + 2))
+        }
+        if *buf.first()? != b'*' {
+            return None;
+        }
+        let (count, mut cursor) = line(buf, 1)?;
+        let count: usize = std::str::from_utf8(count).ok()?.parse().ok()?;
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            if *buf.get(cursor)? != b'$' {
+                return None;
+            }
+            let (len, after) = line(buf, cursor + 1)?;
+            let len: usize = std::str::from_utf8(len).ok()?.parse().ok()?;
+            let end = after.checked_add(len)?;
+            args.push(buf.get(after..end)?.to_vec());
+            if buf.get(end..end + 2)? != b"\r\n" {
+                return None;
+            }
+            cursor = end + 2;
+        }
+        Some((args, cursor))
+    }
+
+    fn answer(
+        args: &[Vec<u8>],
+        memory_info: &str,
+        keys: &Mutex<HashSet<Vec<u8>>>,
+        claims: &AtomicUsize,
+    ) -> Vec<u8> {
+        let command = args
+            .first()
+            .map(|command| command.to_ascii_uppercase())
+            .unwrap_or_default();
+        match command.as_slice() {
+            b"PING" => b"+PONG\r\n".to_vec(),
+            b"INFO" => {
+                let memory = args
+                    .get(1)
+                    .is_some_and(|section| section.eq_ignore_ascii_case(b"MEMORY"));
+                bulk(if memory {
+                    memory_info
+                } else {
+                    CLUSTER_DISABLED_INFO
+                })
+            }
+            b"SET" => {
+                claims.fetch_add(1, Ordering::SeqCst);
+                let Some(key) = args.get(1) else {
+                    return b"-ERR wrong number of arguments\r\n".to_vec();
+                };
+                let nx = args
+                    .iter()
+                    .skip(3)
+                    .any(|option| option.eq_ignore_ascii_case(b"NX"));
+                let mut keys = keys.lock().expect("fake keyspace");
+                if nx && keys.contains(key) {
+                    b"$-1\r\n".to_vec()
+                } else {
+                    keys.insert(key.clone());
+                    b"+OK\r\n".to_vec()
+                }
+            }
+            // Connection setup (`CLIENT SETINFO`, ...) and anything else.
+            _ => b"+OK\r\n".to_vec(),
+        }
+    }
+
+    async fn spawn_fake_replay_redis(memory_info: &'static str) -> FakeReplayRedis {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake redis");
+        let port = listener.local_addr().expect("local addr").port();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let claims = Arc::new(AtomicUsize::new(0));
+        let keys: Arc<Mutex<HashSet<Vec<u8>>>> = Arc::new(Mutex::new(HashSet::new()));
+        let server_claims = Arc::clone(&claims);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { break };
+                        let claims = Arc::clone(&server_claims);
+                        let keys = Arc::clone(&keys);
+                        tokio::spawn(async move {
+                            let mut pending: Vec<u8> = Vec::new();
+                            let mut buf = vec![0u8; 16 * 1024];
+                            loop {
+                                let read = match stream.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(read) => read,
+                                };
+                                pending.extend_from_slice(&buf[..read]);
+                                let mut reply = Vec::new();
+                                while let Some((args, used)) = parse_command(&pending) {
+                                    reply.extend(answer(&args, memory_info, &keys, &claims));
+                                    pending = pending.split_off(used);
+                                }
+                                if !reply.is_empty() && stream.write_all(&reply).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        FakeReplayRedis {
+            port,
+            claims,
+            shutdown: Some(shutdown_tx),
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_replay_scope_requires_the_no_eviction_retention_screen() {
+        let shared = ferrum_edge::_test_support::soap_shared_replay_requires_no_eviction_for_test(
+            &shared_scope_config("redis://127.0.0.1:1"),
+        )
+        .expect("shared config constructs");
+        assert_eq!(
+            shared,
+            Some(true),
+            "a shared replay claim is the control itself, so its client must refuse an \
+             endpoint that can evict it"
+        );
+        let process = ferrum_edge::_test_support::soap_shared_replay_requires_no_eviction_for_test(
+            &username_token_digest_config(),
+        )
+        .expect("process config constructs");
+        assert_eq!(process, None, "process scope has no Redis client");
+    }
+
+    /// An evicting endpoint is refused before any claim reaches it, on the
+    /// PasswordDigest and the SAML path alike.
+    #[tokio::test]
+    async fn an_evicting_shared_backend_fails_closed_before_any_claim() {
+        let redis = spawn_fake_replay_redis(EVICTING_MEMORY_INFO).await;
+        let plugin = SoapWsSecurity::new(&redis.config()).unwrap();
+
+        let token = password_digest_token("alice", "secret123", b"evicting-redis-01");
+        let result = digest_outcome(&plugin, &token).await;
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            reject_body(&result).contains("replay protection backend is unavailable"),
+            "got: {}",
+            reject_body(&result)
+        );
+
+        let saml = ferrum_edge::_test_support::soap_claim_saml_assertion_for_test(
+            &plugin,
+            ISSUER,
+            "_evicting-assertion",
+        )
+        .await
+        .expect_err("an evicting backend must not accept an assertion claim");
+        assert!(saml.contains("backend is unavailable"), "{saml}");
+
+        assert_eq!(
+            redis.claims(),
+            0,
+            "no claim may be written to an endpoint that can evict it"
+        );
+    }
+
+    /// A memory policy that cannot be proven is an outage, not a pass.
+    #[tokio::test]
+    async fn an_unproven_memory_policy_fails_closed() {
+        let redis = spawn_fake_replay_redis(UNPROVEN_MEMORY_INFO).await;
+        let plugin = SoapWsSecurity::new(&redis.config()).unwrap();
+        let token = password_digest_token("alice", "secret123", b"unproven-redis-01");
+        let result = digest_outcome(&plugin, &token).await;
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            reject_body(&result).contains("replay protection backend is unavailable"),
+            "got: {}",
+            reject_body(&result)
+        );
+        assert_eq!(redis.claims(), 0);
+    }
+
+    /// A proven non-evicting endpoint still claims exactly once across
+    /// replicas (two independent instances sharing the keyspace).
+    #[tokio::test]
+    async fn a_non_evicting_shared_backend_claims_once_across_replicas() {
+        let redis = spawn_fake_replay_redis(NOEVICTION_MEMORY_INFO).await;
+        let replica_a = SoapWsSecurity::new(&redis.config()).unwrap();
+        let replica_b = SoapWsSecurity::new(&redis.config()).unwrap();
+
+        let token = password_digest_token("alice", "secret123", b"noeviction-redis1");
+        let first = digest_outcome(&replica_a, &token).await;
+        assert!(
+            matches!(first, PluginResult::Continue),
+            "first use must be accepted: {first:?}"
+        );
+        let replay = digest_outcome(&replica_b, &token).await;
+        assert_eq!(reject_status(&replay), 401);
+        assert!(
+            reject_body(&replay).contains("nonce replay"),
+            "got: {}",
+            reject_body(&replay)
+        );
+
+        ferrum_edge::_test_support::soap_claim_saml_assertion_for_test(
+            &replica_a,
+            ISSUER,
+            "_shared-assertion-1",
+        )
+        .await
+        .expect("first assertion claim");
+        let second = ferrum_edge::_test_support::soap_claim_saml_assertion_for_test(
+            &replica_b,
+            ISSUER,
+            "_shared-assertion-1",
+        )
+        .await
+        .expect_err("a second presentation must be refused");
+        assert!(second.contains("already been used"), "{second}");
+        assert_eq!(redis.claims(), 4);
+    }
+}
+
+// ── SAML Conditions are evaluated exhaustively (SAML Core §2.5.1.1) ─────────
+
+async fn saml_outcome(plugin: &SoapWsSecurity, assertion: &str) -> (PluginResult, RequestContext) {
+    let body = wrap_saml_assertion(assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(plugin, &mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+const SAML_ISSUER: &str = "https://idp.example.com/metadata";
+
+/// A signed restriction the gateway cannot evaluate makes the assertion
+/// indeterminate. It must be rejected, publish no identity, and consume no
+/// replay state.
+#[tokio::test]
+async fn saml_unsupported_signed_condition_is_rejected_without_consuming_the_assertion() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+    for (label, condition) in [
+        (
+            "xsi:type extension",
+            r#"<saml:Condition xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:corp="urn:example:corp" xsi:type="corp:ManagedDeviceCondition"/>"#,
+        ),
+        (
+            "foreign element",
+            r#"<corp:DeviceCheck xmlns:corp="urn:example:corp"/>"#,
+        ),
+    ] {
+        let mut builder = saml_fixtures::AssertionBuilder::new(
+            "_assertion-unsupported-condition",
+            SAML_ISSUER,
+            "alice@example.com",
+        );
+        builder.extra_conditions = Some(condition.to_string());
+        let (result, ctx) = saml_outcome(&plugin, &builder.build()).await;
+        assert_eq!(reject_status(&result), 401, "{label}");
+        assert!(
+            reject_body(&result).contains("unsupported condition"),
+            "{label}: got {}",
+            reject_body(&result)
+        );
+        assert!(
+            !reject_body(&result).contains("ManagedDeviceCondition")
+                && !reject_body(&result).contains("DeviceCheck"),
+            "{label}: the caller-controlled condition name must not be echoed"
+        );
+        assert!(ctx.authenticated_identity.is_none(), "{label}");
+    }
+
+    // The refused assertion id was never claimed: the same id carrying only
+    // conditions the gateway evaluates is still accepted, exactly once.
+    let builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-unsupported-condition",
+        SAML_ISSUER,
+        "alice@example.com",
+    );
+    let (result, ctx) = saml_outcome(&plugin, &builder.build()).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a rejected assertion must not burn its id: {result:?}"
+    );
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("alice@example.com")
+    );
+}
+
+/// `OneTimeUse` (enforced by the single-use claim) and `ProxyRestriction`
+/// (which binds only relying parties that issue derived assertions) are the
+/// standard conditions besides `AudienceRestriction`, and are accepted.
+#[tokio::test]
+async fn saml_standard_one_time_use_and_proxy_restriction_are_accepted() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-standard-conditions",
+        SAML_ISSUER,
+        "alice@example.com",
+    );
+    builder.one_time_use = true;
+    builder.extra_conditions = Some(r#"<saml:ProxyRestriction Count="0"/>"#.to_string());
+    let (result, _) = saml_outcome(&plugin, &builder.build()).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "standard conditions must be accepted: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn saml_duplicate_one_time_use_is_rejected() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-duplicate-one-time-use",
+        SAML_ISSUER,
+        "alice@example.com",
+    );
+    builder.one_time_use = true;
+    builder.extra_conditions = Some("<saml:OneTimeUse/>".to_string());
+    let (result, _) = saml_outcome(&plugin, &builder.build()).await;
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("more than one OneTimeUse"),
+        "got: {}",
+        reject_body(&result)
+    );
+}
+
+// ── SubjectConfirmation: at least one must qualify ─────────────────────────
+
+fn bearer_confirmation(recipient: &str, not_on_or_after: &str) -> String {
+    format!(
+        r#"<saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer"><saml:SubjectConfirmationData Recipient="{recipient}" NotOnOrAfter="{not_on_or_after}"/></saml:SubjectConfirmation>"#
+    )
+}
+
+async fn saml_confirmations_outcome(
+    assertion_id: &str,
+    confirmations: String,
+) -> (PluginResult, RequestContext) {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+    let mut builder =
+        saml_fixtures::AssertionBuilder::new(assertion_id, SAML_ISSUER, "alice@example.com");
+    builder.subject_confirmations = Some(confirmations);
+    saml_outcome(&plugin, &builder.build()).await
+}
+
+/// One assertion minted with a confirmation per endpoint: a first confirmation
+/// that does not qualify here (another recipient, or an expired one) must not
+/// hide a later one that does.
+#[tokio::test]
+async fn saml_a_later_qualifying_subject_confirmation_is_accepted() {
+    let valid_until = saml_fixtures::default_not_on_or_after();
+    let expired = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    for (label, first) in [
+        (
+            "other recipient",
+            bearer_confirmation("https://other.example.com/ws", &valid_until),
+        ),
+        (
+            "expired",
+            bearer_confirmation(saml_fixtures::TEST_RECIPIENT, &expired),
+        ),
+    ] {
+        let confirmations = format!(
+            "{first}{}",
+            bearer_confirmation(saml_fixtures::TEST_RECIPIENT, &valid_until)
+        );
+        let (result, ctx) =
+            saml_confirmations_outcome("_assertion-two-confirmations", confirmations).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label}: a qualifying second confirmation must be accepted: {result:?}"
+        );
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("alice@example.com"),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn saml_no_qualifying_subject_confirmation_keeps_the_precise_reason() {
+    let valid_until = saml_fixtures::default_not_on_or_after();
+    let confirmations = format!(
+        "{}{}",
+        bearer_confirmation("https://other-a.example.com/ws", &valid_until),
+        bearer_confirmation("https://other-b.example.com/ws", &valid_until)
+    );
+    let (result, ctx) = saml_confirmations_outcome("_assertion-no-qualifying", confirmations).await;
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("Recipient does not match this service"),
+        "got: {}",
+        reject_body(&result)
+    );
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+#[tokio::test]
+async fn saml_two_qualifying_subject_confirmations_are_ambiguous() {
+    let valid_until = saml_fixtures::default_not_on_or_after();
+    let confirmation = bearer_confirmation(saml_fixtures::TEST_RECIPIENT, &valid_until);
+    let (result, _) = saml_confirmations_outcome(
+        "_assertion-ambiguous",
+        format!("{confirmation}{confirmation}"),
+    )
+    .await;
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("multiple acceptable SubjectConfirmation"),
+        "got: {}",
+        reject_body(&result)
+    );
+}
+
+// ── Only a prolog declaration is a DTD ─────────────────────────────────────
+
+/// `<!DOCTYPE` / `<!ENTITY` characters inside CDATA or a comment are inert
+/// text; a message that carries an HTML/XML document as a string is not a DTD.
+#[tokio::test]
+async fn doctype_text_inside_cdata_or_a_comment_is_not_a_dtd() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    for (label, item) in [
+        (
+            "cdata",
+            "<Item><![CDATA[<!DOCTYPE html><html><body>hi</body></html>]]></Item>",
+        ),
+        ("comment", "<Item><!-- <!ENTITY note \"x\"> --></Item>"),
+        ("escaped text", "<Item>&lt;!DOCTYPE html&gt;</Item>"),
+    ] {
+        let body = wrap_soap(&fresh_timestamp()).replace("<Item>Widget</Item>", item);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{label}: inert declaration text must not be refused: {result:?}"
+        );
+    }
+}
+
+/// A real declaration still fails closed: in the prolog (any letter case,
+/// after an XML declaration or comment) with the forbidden-declaration
+/// diagnostic, and anywhere else as malformed XML.
+#[tokio::test]
+async fn a_real_markup_declaration_still_fails_closed() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let envelope = || wrap_soap(&fresh_timestamp());
+    for (label, body) in [
+        (
+            "lowercase prolog doctype",
+            format!("<!doctype soap:Envelope>\n{}", envelope()),
+        ),
+        (
+            "entity after a comment",
+            format!(
+                "<?xml version=\"1.0\"?>\n<!-- lead -->\n<!ENTITY x \"y\">\n{}",
+                envelope()
+            ),
+        ),
+    ] {
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), 400, "{label}");
+        assert!(
+            reject_body(&result).contains("forbidden XML declaration"),
+            "{label}: got {}",
+            reject_body(&result)
+        );
+    }
+    for (label, body) in [
+        (
+            "doctype in element content",
+            envelope().replace("<Item>Widget</Item>", "<Item><!DOCTYPE x></Item>"),
+        ),
+        (
+            "doctype after the root element",
+            format!("{}\n<!DOCTYPE x>", envelope()),
+        ),
+    ] {
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), 400, "{label}: {result:?}");
+    }
+}
+
+// ── MTOM boundary search ────────────────────────────────────────────────────
+
+/// A near-match payload (attacker boundary of dashes plus one byte, attachment
+/// octets all dashes) is the worst case for a naive window search. The linear
+/// substring search must still frame the package exactly as before.
+#[test]
+fn a_near_match_boundary_payload_still_frames_the_package() {
+    use ferrum_edge::_test_support::soap_extract_mtom_root_part_for_test as extract;
+
+    let boundary = format!("{}a", "-".repeat(69));
+    let attachment = "-".repeat(1 << 20);
+    let package = format!(
+        "--{boundary}\r\n\
+         Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+         Content-Transfer-Encoding: binary\r\n\
+         Content-ID: <root@example.com>\r\n\
+         \r\n\
+         <soap:Envelope/>\r\n\
+         --{boundary}\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-ID: <attachment@example.com>\r\n\
+         \r\n\
+         {attachment}\r\n\
+         --{boundary}--\r\n"
+    );
+    let (body, _) = extract(package.as_bytes(), &boundary, Some("root@example.com"))
+        .expect("a near-match payload is ordinary attachment data");
+    assert_eq!(body, b"<soap:Envelope/>");
+}
+
+// ── Namespace resolution is charged to the work budget ─────────────────────
+
+/// Inherited declarations are free in bytes but each element pays for all of
+/// them on every prefix lookup. A `SignedInfo`-sized subtree of tiny elements
+/// under a thousand-declaration ancestor, with a maximal unbound PrefixList,
+/// fits the byte budget easily and must still be refused by the
+/// namespace-resolution allowance, before the signature is ever checked.
+#[test]
+fn namespace_resolution_work_is_bounded_independently_of_bytes() {
+    let mut declarations = String::new();
+    for index in 0..500 {
+        declarations.push_str(&format!(" xmlns:p{index}=\"urn:p{index}\""));
+    }
+    let junk = "<a/>".repeat(2_000);
+    let xml = format!("<root{declarations}><SignedInfo>{junk}</SignedInfo></root>");
+    let prefix_list = (0..64)
+        .map(|index| format!("u{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let error = soap_exclusive_canonicalize_element_for_test(&xml, "SignedInfo", &prefix_list)
+        .expect_err("unbounded namespace-resolution work must be refused");
+    assert!(
+        error.contains("namespace-resolution work budget"),
+        "got: {error}"
+    );
+
+    // An ordinary namespaced subtree is unaffected.
+    let ordinary =
+        format!("<root{declarations}><SignedInfo><p1:a/><p2:b p3:c=\"v\"/></SignedInfo></root>");
+    let canonical = soap_exclusive_canonicalize_element_for_test(&ordinary, "SignedInfo", "")
+        .expect("ordinary canonicalization fits the allowance");
+    assert!(canonical.contains("xmlns:p1=\"urn:p1\""), "{canonical}");
+}
+
+// ── require_mechanisms: any ────────────────────────────────────────────────
+
+const PASSWORD_TEXT_ALICE_TOKEN: &str = r#"<wsse:UsernameToken><wsse:Username>alice</wsse:Username><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123</wsse:Password></wsse:UsernameToken>"#;
+
+fn username_token_or_saml_config(
+    bundle: &saml_fixtures::IdpBundle,
+    require: Option<&str>,
+) -> Value {
+    let mut config = saml_config(bundle, None);
+    config["username_token"] = json!({
+        "enabled": true,
+        "password_type": "PasswordText",
+        "credentials": [{"username": "alice", "password": "secret123"}]
+    });
+    if let Some(require) = require {
+        config["require_mechanisms"] = json!(require);
+    }
+    config
+}
+
+async fn security_outcome(
+    plugin: &SoapWsSecurity,
+    security: &str,
+) -> (PluginResult, RequestContext) {
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(security));
+    let mut headers = soap_headers();
+    let result = run_soap_request_policy(plugin, &mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+/// Two partner populations on one endpoint: either mechanism alone
+/// authenticates and publishes the principal that presented it.
+#[tokio::test]
+async fn require_any_accepts_each_presented_alternative() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&username_token_or_saml_config(&bundle, Some("any"))).unwrap();
+
+    let (result, ctx) = security_outcome(&plugin, PASSWORD_TEXT_ALICE_TOKEN).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+
+    let assertion =
+        saml_fixtures::AssertionBuilder::new("_assertion-any-saml", SAML_ISSUER, "bob@example.com")
+            .build();
+    let (result, ctx) = security_outcome(&plugin, &assertion).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("bob@example.com")
+    );
+}
+
+/// No presented token, or a presented token that fails, rejects — a valid
+/// alternative never excuses a forged one.
+#[tokio::test]
+async fn require_any_rejects_absent_or_failing_presented_tokens() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&username_token_or_saml_config(&bundle, Some("any"))).unwrap();
+
+    let (result, ctx) = security_outcome(&plugin, "").await;
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("none of the accepted security tokens"),
+        "got: {}",
+        reject_body(&result)
+    );
+    assert!(ctx.authenticated_identity.is_none());
+
+    let mut forged = saml_fixtures::AssertionBuilder::new(
+        "_assertion-any-forged",
+        SAML_ISSUER,
+        "mallory@example.com",
+    );
+    forged.corrupt_signature_value = true;
+    let (result, ctx) = security_outcome(
+        &plugin,
+        &format!("{PASSWORD_TEXT_ALICE_TOKEN}{}", forged.build()),
+    )
+    .await;
+    assert_eq!(
+        reject_status(&result),
+        401,
+        "a forged SAML alternative must reject"
+    );
+    assert!(ctx.authenticated_identity.is_none());
+
+    let wrong_password = PASSWORD_TEXT_ALICE_TOKEN.replace("secret123", "wrong-password");
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-any-with-bad-token",
+        SAML_ISSUER,
+        "bob@example.com",
+    )
+    .build();
+    let (result, ctx) = security_outcome(&plugin, &format!("{wrong_password}{assertion}")).await;
+    assert_eq!(
+        reject_status(&result),
+        401,
+        "a failing UsernameToken must reject even beside a valid assertion"
+    );
+    assert!(ctx.authenticated_identity.is_none());
+}
+
+/// The default stays conjunctive.
+#[tokio::test]
+async fn require_all_is_the_default_and_needs_every_mechanism() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&username_token_or_saml_config(&bundle, None)).unwrap();
+    let (result, _) = security_outcome(&plugin, PASSWORD_TEXT_ALICE_TOKEN).await;
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("missing SAML Assertion"),
+        "got: {}",
+        reject_body(&result)
+    );
+}
+
+#[test]
+fn require_mechanisms_admission_is_strict() {
+    let single = json!({
+        "require_mechanisms": "any",
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    let error = SoapWsSecurity::new(&single)
+        .err()
+        .expect("`any` over one mechanism is a contradiction");
+    assert!(error.contains("at least two"), "{error}");
+
+    let mut unknown = single.clone();
+    unknown["require_mechanisms"] = json!("some");
+    let error = SoapWsSecurity::new(&unknown)
+        .err()
+        .expect("unknown value must be rejected");
+    assert!(error.contains("must be one of: all, any"), "{error}");
+    assert!(
+        !error.contains("some"),
+        "the rejected value must not be echoed: {error}"
+    );
+}
+
+// ── UsernameToken passwords from FERRUM_PLUGIN_SECRET_* ────────────────────
+
+fn password_reference_config(password: &str) -> Value {
+    json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": password}]
+        }
+    })
+}
+
+#[tokio::test]
+async fn username_token_password_resolves_from_a_plugin_secret_reference() {
+    const SECRET_ENV: &str = "FERRUM_PLUGIN_SECRET_SOAP_WS_SECURITY_TEST_ALICE";
+    let mut plugin = None;
+    crate::unit::env_lock::with_env_vars(&[(SECRET_ENV, "secret123")], || {
+        plugin = Some(
+            SoapWsSecurity::new(&password_reference_config(&format!("${{{SECRET_ENV}}}")))
+                .expect("a set plugin-secret reference resolves at admission"),
+        );
+    });
+    let plugin = plugin.expect("constructed");
+
+    // Resolved once at admission: the request path never reads the environment.
+    let (result, ctx) = security_outcome(&plugin, PASSWORD_TEXT_ALICE_TOKEN).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+
+    let literal_reference =
+        PASSWORD_TEXT_ALICE_TOKEN.replace("secret123", &format!("${{{SECRET_ENV}}}"));
+    let (result, _) = security_outcome(&plugin, &literal_reference).await;
+    assert_eq!(
+        reject_status(&result),
+        401,
+        "the reference string itself is not the credential"
+    );
+}
+
+#[test]
+fn username_token_password_reference_outside_the_namespace_is_refused() {
+    crate::unit::env_lock::with_env_vars(
+        &[(
+            "FERRUM_ADMIN_JWT_SECRET",
+            "ADMIN_SECRET_VALUE_CANARY_0123456789",
+        )],
+        || {
+            let error =
+                SoapWsSecurity::new(&password_reference_config("${FERRUM_ADMIN_JWT_SECRET}"))
+                    .err()
+                    .expect("a non plugin-secret reference must be refused");
+            assert!(error.contains("FERRUM_PLUGIN_SECRET_<NAME>"), "{error}");
+            assert!(
+                !error.contains("ADMIN_JWT") && !error.contains("CANARY"),
+                "neither the referenced name nor its value may be echoed: {error}"
+            );
+        },
+    );
+
+    const UNSET_ENV: &str = "FERRUM_PLUGIN_SECRET_SOAP_WS_SECURITY_TEST_UNSET";
+    crate::unit::env_lock::without_env_vars(&[UNSET_ENV], || {
+        let error = SoapWsSecurity::new(&password_reference_config(&format!("${{{UNSET_ENV}}}")))
+            .err()
+            .expect("an unset reference must be refused");
+        assert!(error.contains("is not set"), "{error}");
+        assert!(error.contains("credentials[0].password"), "{error}");
+    });
 }

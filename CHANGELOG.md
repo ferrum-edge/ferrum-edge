@@ -329,6 +329,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`soap_ws_security` hardening.**
+  - **Shared replay claims refuse an evicting Redis.** `nonce.replay_scope:
+    shared` now uses the retention-authority Redis client, so every
+    connection must prove `maxmemory: 0` or `maxmemory_policy: noeviction`
+    (`INFO MEMORY`) before it carries a PasswordDigest nonce or SAML
+    assertion-id claim. `SET NX EX` cannot tell an evicted claim from an unused
+    credential, so an evicting endpoint used to re-admit a captured token. An
+    evicting policy is terminal for the generation and an unprovable one is a
+    recoverable outage; both fail closed (`401`). The ACL user needs `INFO`.
+  - **SAML `Conditions` are evaluated exhaustively** (SAML Core 2.0
+    §2.5.1.1). Besides `AudienceRestriction`, at most one `OneTimeUse` and one
+    `ProxyRestriction` are accepted; any other condition (a `saml:Condition`
+    extension or foreign element) rejects the assertion before its id is
+    claimed instead of being ignored.
+  - **Namespace resolution is charged to a per-message allowance** (16 ×
+    decoded body, floor 1 048 576 scanned entries), so inherited declarations
+    cannot multiply canonicalization CPU on `SignedInfo` before the signature
+    is checked.
+  - **Linear-time MTOM boundary search** (`memchr::memmem`) replaces a
+    window search that was O(body × boundary) on near-match payloads.
+- **`soap_ws_security` correctness and interop.**
+  - Only a markup declaration in the prolog is refused as a DTD; `<!DOCTYPE`
+    / `<!ENTITY` text inside CDATA, comments, or character data is accepted,
+    and a declaration after the prolog still fails as malformed XML.
+  - A `SubjectConfirmation` that does not qualify (another recipient, expired,
+    `InResponseTo`) is skipped, so a later qualifying one is accepted; none or
+    more than one qualifying is still rejected.
+  - X.509 References may resolve inside any SOAP Header block (for example
+    WS-Addressing `wsa:Action` / `wsa:To`), not only the Security header and
+    the Body.
+  - New `require_mechanisms: all | any` (default `all`). `any` makes the
+    enabled identity mechanisms alternatives: at least one must be presented
+    and every presented token must verify. It needs two enabled mechanisms.
+  - A UsernameToken `password` of exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is
+    resolved at admission from that environment variable. **BREAKING:** a
+    literal password of that `${...}` shape is now a reference, and a
+    reference outside the plugin-secret namespace is refused.
+  - Docs and OpenAPI no longer promise a Consumer mapping: a SOAP principal
+    is an external `authenticated_identity` only (issue #6082), so Consumer
+    ACL groups do not apply to it.
+
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

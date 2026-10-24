@@ -13,12 +13,17 @@
 //! Priority 1500 places this plugin in the AuthN band after HMAC auth. A
 //! configuration that establishes a principal — UsernameToken, X.509, or SAML —
 //! runs in the **`authenticate`** phase against a body buffered before
-//! authentication, and publishes `RequestContext::authenticated_identity` plus a
-//! namespace-correct `identified_consumer`. That is what lets `access_control`,
-//! consumer-scoped `rate_limiting`, logging, retries, and chargeback all see one
-//! authoritative SOAP identity; previously validation ran in `before_proxy`,
-//! after both central authentication *and* authorization had already decided,
-//! so ACL saw no consumer and consumer rate limits charged the source IP.
+//! authentication, and publishes the SOAP principal as an EXTERNAL identity:
+//! `RequestContext::authenticated_identity` (backend header
+//! `X-Authenticated-Identity`). It never sets `identified_consumer`. Matching an
+//! external principal to a gateway Consumer by username / id is exactly the
+//! implicit binding issue #6082 removed, so Consumer ACL groups and
+//! Consumer-specific policy do not apply to a SOAP principal; `access_control`
+//! admits one only through `allow_authenticated_identity`. Identity-keyed
+//! consumers (`rate_limiting` `limit_by: consumer`, logging, retries,
+//! chargeback) see the one authoritative SOAP identity, because validation
+//! runs before authorization rather than in `before_proxy`, where ACL and rate
+//! limits had already decided against the source IP.
 //!
 //! A timestamp-only policy proves freshness and nothing about the caller. It has
 //! no principal to publish, must not join the authentication chain, and keeps
@@ -351,6 +356,7 @@ use super::utils::auth_flow;
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::cert_hash::sha256_hex_lower;
 use super::utils::http_client::PluginHttpClient;
+use super::utils::plugin_secret_env::resolve_plugin_secret_env;
 use super::utils::redis_rate_limiter::{
     REDIS_PLUGIN_CONFIG_KEYS, RedisConfig, RedisRateLimitClient,
 };
@@ -421,6 +427,24 @@ const MIN_CANONICALIZATION_BUDGET_BYTES: usize = 65_536;
 /// can never drive more than a small constant multiple of its own body through
 /// canonicalization regardless of how its References are shaped.
 const CANONICALIZATION_BUDGET_MULTIPLIER: usize = 2;
+
+/// Namespace-resolution allowance multiplier, applied to the decoded envelope
+/// length (see [`WorkBudget::charge_namespace_scan`]).
+///
+/// Canonicalization resolves every visibly used and every `InclusiveNamespaces`
+/// prefix of every element with a linear scan of that element's in-scope
+/// namespace list. Declarations are inherited, so a caller can put a thousand
+/// of them on one ancestor and make each of tens of thousands of tiny elements
+/// pay for all of them — CPU the byte budget never sees, spent on `SignedInfo`
+/// before the signature is verified. The allowance charges one unit per
+/// in-scope entry scanned. A realistic message resolves a handful of prefixes
+/// against a few dozen in-scope namespaces per element, a small fraction of
+/// this multiple of its own size.
+const NAMESPACE_SCAN_BUDGET_MULTIPLIER: usize = 16;
+
+/// Floor for the namespace-resolution allowance, so small envelopes keep ample
+/// room.
+const MIN_NAMESPACE_SCAN_BUDGET: usize = 1_048_576;
 
 /// Bounds for MTOM/XOP (`multipart/related`) unpacking. The gateway only ever
 /// walks part *headers* looking for the SOAP root part; attachment payloads are
@@ -644,6 +668,7 @@ const MAX_PARSED_YEAR: i32 = 9999;
 
 const OWN_ROOT_CONFIG_KEYS: &[&str] = &[
     "reject_missing_security_header",
+    "require_mechanisms",
     "content_type",
     "timestamp",
     "username_token",
@@ -719,6 +744,18 @@ const NONCE_CONFIG_KEYS: &[&str] = &[
 /// incremental decoding instead.
 
 // ── Config types ────────────────────────────────────────────────────────────
+
+/// How the enabled identity mechanisms (`username_token`, `x509_signature`,
+/// `saml`) combine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MechanismRequirement {
+    /// Every enabled mechanism must be presented and must verify (default).
+    All,
+    /// WS-SecurityPolicy-style alternatives: at least one enabled mechanism must
+    /// be presented, and EVERY one that is presented must verify. A presented
+    /// token that fails is never ignored because another one passed.
+    Any,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PasswordType {
@@ -958,6 +995,36 @@ fn reject_unknown(
     reject_unknown_keys(map, path, allowed, &format!("soap_ws_security: `{path}`: "))
 }
 
+/// A configured UsernameToken password, resolving a whole-value
+/// `${FERRUM_PLUGIN_SECRET_<NAME>}` reference against the process environment
+/// so the secret need not live in plugin config.
+///
+/// Only the dedicated plugin-secret namespace is reachable: a `${...}`
+/// reference to any other variable — including every other `FERRUM_*` setting
+/// — is refused before anything is read (see `plugin_secret_env`). An unset,
+/// empty, non-UTF-8, or whitespace-only value is an admission error rather than
+/// a credential nobody can present. Diagnostics name only the field path,
+/// never the referenced variable or its value. Any other string is the literal
+/// password, matched byte for byte.
+fn resolve_credential_password(path: &str, configured: String) -> Result<String, String> {
+    let reference = configured
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(str::to_owned);
+    let Some(reference) = reference else {
+        return Ok(configured);
+    };
+    let label = format!("soap_ws_security: `{path}.password`");
+    let resolved = resolve_plugin_secret_env(&label, &reference)?;
+    if resolved.trim().is_empty() {
+        return Err(format!(
+            "{label} references a `FERRUM_PLUGIN_SECRET_<NAME>` env variable that holds only \
+             whitespace"
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Configured duration, converted once at admission so the request path never
 /// performs a fallible or panicking duration construction. The bounds above
 /// already guarantee success; the fallible conversion stays so a future bound
@@ -1018,8 +1085,8 @@ struct TrustedCert {
     ///
     /// Derived at admission from operator-supplied trust material, so it is
     /// bounded, allocation-free at request time, and carries no attacker-
-    /// controlled or personally identifying value. Operators map it to a
-    /// Consumer by registering that string as the Consumer's username/id.
+    /// controlled or personally identifying value. It is published as an
+    /// external identity only; it is never mapped to a gateway Consumer.
     principal: String,
     /// Certificate validity window (`notBefore`/`notAfter`), as Unix seconds.
     ///
@@ -1652,6 +1719,7 @@ pub struct SoapWsSecurity {
 
     // General
     reject_missing_security_header: bool,
+    require_mechanisms: MechanismRequirement,
 }
 
 impl SoapWsSecurity {
@@ -1818,6 +1886,7 @@ impl SoapWsSecurity {
                 let Some(password) = soap_string(entry_ref, &path, "password")? else {
                     return Err(required_error(&path, "password"));
                 };
+                let password = resolve_credential_password(&path, password)?;
                 // Duplicate usernames would make credential selection
                 // first-wins, so a later rotation entry would be inert.
                 if credentials.iter().any(|c| c.username == username) {
@@ -2376,7 +2445,16 @@ impl SoapWsSecurity {
                 let dns_cache = http_client.and_then(|client| client.dns_cache().cloned());
                 let tls_no_verify = http_client.is_some_and(|client| client.tls_no_verify());
                 let tls_ca_bundle_path = http_client.and_then(|c| c.tls_ca_bundle_path());
-                NonceReplayBackend::Shared(Arc::new(RedisRateLimitClient::new(
+                // A shared claim IS the replay control: `SET NX EX` cannot tell
+                // an evicted marker from a credential nobody has used, so an
+                // endpoint that may evict a live key under `maxmemory` silently
+                // re-admits a captured token or assertion. The retention
+                // authority proves `maxmemory == 0` or `noeviction` on every
+                // connection (first dial and recovery probe) before it may
+                // carry a claim; an evicting policy is terminal and an unproven
+                // one is a recoverable outage, and both fail this policy closed
+                // through the ordinary shared-backend-unavailable path.
+                NonceReplayBackend::Shared(Arc::new(RedisRateLimitClient::for_retention_authority(
                     redis_config,
                     dns_cache,
                     tls_no_verify,
@@ -2403,6 +2481,33 @@ impl SoapWsSecurity {
         // ── General ─────────────────────────────────────────────────────
         let reject_missing_security_header =
             soap_bool(root, "config", "reject_missing_security_header", true)?;
+        let require_mechanisms = match soap_string(root, "config", "require_mechanisms")?
+            .as_deref()
+            .unwrap_or("all")
+        {
+            "all" => MechanismRequirement::All,
+            "any" => MechanismRequirement::Any,
+            _ => {
+                return Err(
+                    "soap_ws_security: `config.require_mechanisms` must be one of: all, any"
+                        .to_string(),
+                );
+            }
+        };
+        // `any` only means something between alternatives. With one enabled
+        // mechanism it would read as optional authentication while behaving
+        // exactly like `all`, so the contradiction is refused instead.
+        let enabled_identity_mechanisms = [username_token_enabled, x509_enabled, saml_enabled]
+            .iter()
+            .filter(|enabled| **enabled)
+            .count();
+        if require_mechanisms == MechanismRequirement::Any && enabled_identity_mechanisms < 2 {
+            return Err(
+                "soap_ws_security: `config.require_mechanisms` = `any` requires at least two \
+                 enabled identity mechanisms among username_token, x509_signature, and saml"
+                    .to_string(),
+            );
+        }
 
         // ── Credential removal admission (GHSA-xg9v-wc29-fc29) ─────────
         //
@@ -2499,6 +2604,7 @@ impl SoapWsSecurity {
             max_nonce_encoded_length,
             max_nonce_cache_bytes,
             reject_missing_security_header,
+            require_mechanisms,
         })
     }
 
@@ -3510,6 +3616,19 @@ impl SoapWsSecurity {
         }
     }
 
+    /// Whether a `replay_scope: shared` instance's Redis client demands the
+    /// no-eviction retention proof, or `None` for process scope. The screen
+    /// itself needs a live server, so this pins what the constructor asked for.
+    #[allow(dead_code)]
+    pub(crate) fn shared_replay_requires_no_eviction_for_tests(&self) -> Option<bool> {
+        match &self.nonce_backend {
+            NonceReplayBackend::Shared(client) => {
+                Some(client.requires_no_eviction_screen_for_test())
+            }
+            NonceReplayBackend::Process(_) => None,
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn corrupt_nonce_age_index_for_tests(&self) -> Result<(), String> {
         let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
@@ -3839,15 +3958,27 @@ impl SoapWsSecurity {
             }
             let referenced_node = document.id_index.resolve_unique(ref_id)?;
 
-            // The referenced element must live inside the Security header or
-            // inside the backend-visible Body. Anything else is a subtree the
-            // gateway does not govern and a backend does not consume.
+            // The referenced element must live inside the selected Security
+            // header, inside another block of the namespace-correct SOAP
+            // Header, or inside the backend-visible Body. WS-SecurityPolicy
+            // `SignedParts` routinely covers WS-Addressing blocks (`wsa:To`,
+            // `wsa:Action`, `wsa:MessageID`, ...) alongside Body and Timestamp,
+            // and those are backend-visible header blocks the backend
+            // consumes. The Header element itself is not a header block, and
+            // anything outside Header and Body is a subtree the gateway does
+            // not govern and a backend does not consume. The structure checks
+            // already refuse a second Envelope/Header/Body anywhere, so "inside
+            // the Header" means inside the one the backend reads.
             let referenced_id = referenced_node.id();
             let in_security = node_is_within(referenced_node, security);
+            let in_header_block = document.structure.header.is_some_and(|header| {
+                referenced_id != header.id() && node_is_within(referenced_node, header)
+            });
             let in_body = node_is_within(referenced_node, document.structure.body);
-            if !in_security && !in_body {
+            if !in_security && !in_header_block && !in_body {
                 return Err(
-                    "WS-Security: Reference resolves outside the Security header and the SOAP Body"
+                    "WS-Security: Reference resolves outside the SOAP Header blocks and the SOAP \
+                     Body"
                         .to_string(),
                 );
             }
@@ -4116,10 +4247,51 @@ impl SoapWsSecurity {
             .ok_or_else(|| "WS-Security: SAML audience binding is not configured".to_string())?;
         let mut audience_matched = false;
         let mut audience_restrictions = 0usize;
-        for restriction in conditions
-            .children()
-            .filter(|node| node.has_tag_name((SAML2_ASSERTION_NS, "AudienceRestriction")))
-        {
+        let mut one_time_use_conditions = 0usize;
+        let mut proxy_restrictions = 0usize;
+        // SAML Core 2.0 §2.5.1.1: a condition the relying party does not
+        // understand or cannot evaluate makes the assertion's validity
+        // INDETERMINATE, and an indeterminate assertion must be rejected. The
+        // IdP signed the restriction, so skipping it would honour an assertion
+        // under conditions its issuer did not grant. Every element child of
+        // `Conditions` is therefore classified; nothing unrecognized passes.
+        for condition in conditions.children().filter(Node::is_element) {
+            if condition.has_tag_name((SAML2_ASSERTION_NS, "OneTimeUse")) {
+                // Satisfied by construction: every accepted assertion is claimed
+                // exactly once below. The schema admits at most one.
+                one_time_use_conditions += 1;
+                if one_time_use_conditions > 1 {
+                    return Err(
+                        "WS-Security: SAML Conditions carries more than one OneTimeUse".to_string(),
+                    );
+                }
+                continue;
+            }
+            if condition.has_tag_name((SAML2_ASSERTION_NS, "ProxyRestriction")) {
+                // Restricts relying parties that go on to ISSUE assertions of
+                // their own from this one (SAML Core §2.5.1.6). The gateway
+                // issues none — it forwards the message it verified — so the
+                // condition places no limit on accepting it here. The schema
+                // admits at most one.
+                proxy_restrictions += 1;
+                if proxy_restrictions > 1 {
+                    return Err(
+                        "WS-Security: SAML Conditions carries more than one ProxyRestriction"
+                            .to_string(),
+                    );
+                }
+                continue;
+            }
+            if !condition.has_tag_name((SAML2_ASSERTION_NS, "AudienceRestriction")) {
+                // A generic `saml:Condition` extension (`xsi:type`) or any other
+                // element. The name is never echoed: it is caller-controlled.
+                return Err(
+                    "WS-Security: SAML Conditions carries an unsupported condition — an \
+                     assertion whose conditions the gateway cannot evaluate is rejected"
+                        .to_string(),
+                );
+            }
+            let restriction = condition;
             audience_restrictions += 1;
             // Every AudienceRestriction is a conjunct: each one must admit this
             // service, so a second restriction naming only another relying
@@ -4197,13 +4369,22 @@ impl SoapWsSecurity {
 
     /// Enforce supported `SubjectConfirmation` semantics.
     ///
-    /// Exactly one confirmation must be acceptable: its `Method` must be in the
-    /// configured allow list (bearer only, today), and its
-    /// `SubjectConfirmationData` must name the configured `Recipient`, carry
-    /// its own bounded `NotOnOrAfter`, honour any `NotBefore`, and omit
-    /// `InResponseTo` — there is no SAML request in a WS-Security bearer flow
-    /// to correlate one against, so a value Ferrum cannot check must not be
-    /// silently ignored.
+    /// Exactly one confirmation must be acceptable. A confirmation qualifies
+    /// when its `Method` is in the configured allow list (bearer only, today)
+    /// and its `SubjectConfirmationData` names the configured `Recipient`,
+    /// carries its own bounded `NotOnOrAfter`, honours any `NotBefore`, and
+    /// omits `InResponseTo` — there is no SAML request in a WS-Security bearer
+    /// flow to correlate one against, so a confirmation carrying a value Ferrum
+    /// cannot check never qualifies.
+    ///
+    /// The SAML model requires *at least one* acceptable confirmation, not that
+    /// the first one listed be acceptable: an IdP may mint one assertion with a
+    /// confirmation per endpoint (or a legacy and a renewed recipient during a
+    /// migration). A confirmation that does not qualify for this service is
+    /// therefore skipped, never fatal by itself. Rejection still follows when
+    /// none qualifies (with the first non-qualifying reason, so a single
+    /// confirmation keeps its precise diagnostic) and when more than one does
+    /// (ambiguity).
     fn validate_saml_subject_confirmation(
         &self,
         subject: Node<'_, '_>,
@@ -4213,8 +4394,8 @@ impl SoapWsSecurity {
             .saml_recipient
             .as_deref()
             .ok_or_else(|| "WS-Security: SAML recipient binding is not configured".to_string())?;
-        let skew = self.saml_clock_skew;
         let mut accepted = false;
+        let mut first_rejection: Option<String> = None;
 
         for confirmation in subject
             .children()
@@ -4232,76 +4413,94 @@ impl SoapWsSecurity {
             {
                 continue;
             }
-            let data = unique_ns_child(
-                confirmation,
-                SAML2_ASSERTION_NS,
-                "SubjectConfirmationData",
-                "WS-Security: SAML",
-            )?
-            .ok_or_else(|| {
-                "WS-Security: SAML SubjectConfirmation missing SubjectConfirmationData".to_string()
-            })?;
-
-            if data.unqualified_attribute("InResponseTo").is_some() {
-                return Err(
-                    "WS-Security: SAML SubjectConfirmationData carries an InResponseTo value that \
-                     cannot be validated in a WS-Security bearer flow"
-                        .to_string(),
-                );
-            }
-            let recipient = data.unqualified_attribute("Recipient").ok_or_else(|| {
-                "WS-Security: SAML SubjectConfirmationData missing Recipient".to_string()
-            })?;
-            if recipient.trim() != expected_recipient {
-                return Err(
-                    "WS-Security: SAML SubjectConfirmationData Recipient does not match this \
-                     service"
-                        .to_string(),
-                );
-            }
-            let not_on_or_after = data
-                .unqualified_attribute("NotOnOrAfter")
-                .ok_or_else(|| {
-                    "WS-Security: SAML SubjectConfirmationData missing NotOnOrAfter".to_string()
-                })
-                .and_then(|raw| {
-                    parse_ws_datetime(raw).ok_or_else(|| {
-                        "WS-Security: invalid SAML SubjectConfirmationData NotOnOrAfter".to_string()
-                    })
-                })?;
-            let expiry_with_skew = not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
-                "WS-Security: SAML SubjectConfirmationData NotOnOrAfter is outside the supported \
-                 range"
-                    .to_string()
-            })?;
-            if now > expiry_with_skew {
-                return Err("WS-Security: SAML SubjectConfirmationData has expired".to_string());
-            }
-            if let Some(raw) = data.unqualified_attribute("NotBefore") {
-                let not_before = parse_ws_datetime(raw).ok_or_else(|| {
-                    "WS-Security: invalid SAML SubjectConfirmationData NotBefore".to_string()
-                })?;
-                if now + skew < not_before {
-                    return Err(
-                        "WS-Security: SAML SubjectConfirmationData is not yet valid".to_string()
-                    );
+            match self.saml_confirmation_qualifies(confirmation, expected_recipient, now) {
+                Ok(()) => {
+                    if accepted {
+                        return Err("WS-Security: SAML Subject carries multiple acceptable \
+                             SubjectConfirmation elements"
+                            .to_string());
+                    }
+                    accepted = true;
+                }
+                Err(reason) => {
+                    if first_rejection.is_none() {
+                        first_rejection = Some(reason);
+                    }
                 }
             }
-            if accepted {
-                return Err(
-                    "WS-Security: SAML Subject carries multiple acceptable SubjectConfirmation \
-                     elements"
-                        .to_string(),
-                );
-            }
-            accepted = true;
         }
 
-        if !accepted {
+        if accepted {
+            return Ok(());
+        }
+        Err(first_rejection.unwrap_or_else(|| {
+            "WS-Security: SAML Subject has no supported SubjectConfirmation for this service"
+                .to_string()
+        }))
+    }
+
+    /// Whether one allowed-method `SubjectConfirmation` is acceptable for this
+    /// service. `Err` carries the fixed reason it is not; it never echoes the
+    /// recipient, instants, or any other assertion value.
+    fn saml_confirmation_qualifies(
+        &self,
+        confirmation: Node<'_, '_>,
+        expected_recipient: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let skew = self.saml_clock_skew;
+        let data = unique_ns_child(
+            confirmation,
+            SAML2_ASSERTION_NS,
+            "SubjectConfirmationData",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| {
+            "WS-Security: SAML SubjectConfirmation missing SubjectConfirmationData".to_string()
+        })?;
+
+        if data.unqualified_attribute("InResponseTo").is_some() {
             return Err(
-                "WS-Security: SAML Subject has no supported SubjectConfirmation for this service"
+                "WS-Security: SAML SubjectConfirmationData carries an InResponseTo value that \
+                 cannot be validated in a WS-Security bearer flow"
                     .to_string(),
             );
+        }
+        let recipient = data.unqualified_attribute("Recipient").ok_or_else(|| {
+            "WS-Security: SAML SubjectConfirmationData missing Recipient".to_string()
+        })?;
+        if recipient.trim() != expected_recipient {
+            return Err(
+                "WS-Security: SAML SubjectConfirmationData Recipient does not match this service"
+                    .to_string(),
+            );
+        }
+        let not_on_or_after = data
+            .unqualified_attribute("NotOnOrAfter")
+            .ok_or_else(|| {
+                "WS-Security: SAML SubjectConfirmationData missing NotOnOrAfter".to_string()
+            })
+            .and_then(|raw| {
+                parse_ws_datetime(raw).ok_or_else(|| {
+                    "WS-Security: invalid SAML SubjectConfirmationData NotOnOrAfter".to_string()
+                })
+            })?;
+        let expiry_with_skew = not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
+            "WS-Security: SAML SubjectConfirmationData NotOnOrAfter is outside the supported range"
+                .to_string()
+        })?;
+        if now > expiry_with_skew {
+            return Err("WS-Security: SAML SubjectConfirmationData has expired".to_string());
+        }
+        if let Some(raw) = data.unqualified_attribute("NotBefore") {
+            let not_before = parse_ws_datetime(raw).ok_or_else(|| {
+                "WS-Security: invalid SAML SubjectConfirmationData NotBefore".to_string()
+            })?;
+            if now + skew < not_before {
+                return Err(
+                    "WS-Security: SAML SubjectConfirmationData is not yet valid".to_string()
+                );
+            }
         }
         Ok(())
     }
@@ -4917,8 +5116,8 @@ fn normalize_content_id(value: &str) -> String {
 
 /// A validated SOAP message's authoritative request principal.
 ///
-/// `principal` is what becomes `RequestContext::authenticated_identity` and, on
-/// a namespace-correct match, `identified_consumer`. `metadata` carries the
+/// `principal` is what becomes `RequestContext::authenticated_identity` — an
+/// external identity, never an `identified_consumer`. `metadata` carries the
 /// mechanism-specific values downstream logging has always seen.
 #[derive(Default)]
 struct SoapPrincipal {
@@ -4945,6 +5144,34 @@ const CREDENTIAL_STRIP_RANGE_KEY: &str = "soap_ws_security.credential_strip_rang
 const CREDENTIAL_REMOVAL_UNSUPPORTED_MESSAGE: &str =
     "WS-Security: this SOAP representation cannot have its UsernameToken removed";
 const CREDENTIAL_REMOVAL_UNSUPPORTED_CLASS: &str = "credential_removal_unsupported_representation";
+
+/// Whether the selected Security header presents a namespace-correct
+/// `wsse:UsernameToken` (`require_mechanisms: any` selection only; the
+/// mechanism itself enforces uniqueness and structure).
+fn presents_username_token(security: Node<'_, '_>) -> bool {
+    security
+        .children()
+        .any(|node| node.has_tag_name((WSSE_NAMESPACE_URI, "UsernameToken")))
+}
+
+/// Whether the selected Security header presents a message `ds:Signature` —
+/// the element the X.509 mechanism verifies.
+fn presents_x509_signature(security: Node<'_, '_>) -> bool {
+    security
+        .children()
+        .any(|node| node.has_tag_name((XMLDSIG_NAMESPACE_URI, "Signature")))
+}
+
+/// Whether the message carries a SAML 2.0 `Assertion` anywhere. Deliberately
+/// document-wide, matching the SAML mechanism's own search: an assertion placed
+/// outside the Security header is presented (and then refused by that
+/// mechanism), never silently skipped.
+fn presents_saml_assertion(security: Node<'_, '_>) -> bool {
+    security
+        .document()
+        .descendants()
+        .any(|node| node.has_tag_name((SAML2_ASSERTION_NS, "Assertion")))
+}
 
 fn credential_removal_unsupported() -> SoapRejection {
     SoapRejection::new(
@@ -5041,7 +5268,14 @@ impl SoapWsSecurity {
         };
 
         let envelope = body.trim();
-        if contains_forbidden_xml_declaration(envelope) {
+        // Only a declaration in the prolog is a DTD. The same characters inside
+        // CDATA, a comment, or character data are inert text and must not turn a
+        // legitimate message that carries an HTML/XML document as a string into
+        // a 400. A markup declaration anywhere else is not well-formed XML, and
+        // the parser below (`allow_dtd: false`, no entity resolver) refuses it
+        // as malformed, so the screen stays fail-closed without the false
+        // positives a whole-body substring search produced.
+        if prolog_contains_markup_declaration(envelope) {
             return Err(SoapRejection::new(
                 400,
                 "SOAP request contains forbidden XML declaration",
@@ -5106,8 +5340,19 @@ impl SoapWsSecurity {
             return Err(SoapRejection::new(401, &error, "timestamp"));
         }
 
+        // Under `require_mechanisms: any` an enabled mechanism runs only when its
+        // token is presented; under `all` (the default) every enabled mechanism
+        // runs and an absent token fails it. Either way a presented token that
+        // fails verification rejects the message — a valid alternative never
+        // excuses a forged one.
+        let any_mechanism = self.require_mechanisms == MechanismRequirement::Any;
+        let run_username_token =
+            self.username_token_enabled && (!any_mechanism || presents_username_token(security));
+        let run_x509 = self.x509_enabled && (!any_mechanism || presents_x509_signature(security));
+        let run_saml = self.saml_enabled && (!any_mechanism || presents_saml_assertion(security));
+
         // Validate UsernameToken
-        if self.username_token_enabled {
+        if run_username_token {
             match self.validate_username_token(security, now).await {
                 Ok(username) => {
                     debug!("soap_ws_security: UsernameToken validated");
@@ -5144,7 +5389,7 @@ impl SoapWsSecurity {
         // Validate X.509 signature. The id index is built once here — after the
         // structure is settled and before the first Reference is resolved —
         // instead of rescanning the whole envelope per Reference.
-        if self.x509_enabled {
+        if run_x509 {
             let id_index = DocumentIdIndex::build(&document);
             match self.validate_x509_signature(
                 &structure,
@@ -5170,7 +5415,7 @@ impl SoapWsSecurity {
         }
 
         // Validate SAML assertion
-        if self.saml_enabled {
+        if run_saml {
             match self
                 .validate_saml_assertion(security, envelope, now, &mut budget)
                 .await
@@ -5188,6 +5433,18 @@ impl SoapWsSecurity {
                     return Err(SoapRejection::new(401, &error, "saml"));
                 }
             }
+        }
+
+        if any_mechanism && principal.principal.is_none() {
+            warn_sampled!(
+                failure_class = "no_mechanism_presented",
+                "soap_ws_security: no enabled security mechanism was presented"
+            );
+            return Err(SoapRejection::new(
+                401,
+                "WS-Security: none of the accepted security tokens was presented",
+                "no_mechanism_presented",
+            ));
         }
 
         // Locate the verified credential to delete, while the borrowed document
@@ -5369,8 +5626,10 @@ impl SoapWsSecurity {
         let Some(identity) = principal.principal else {
             return PluginResult::Continue;
         };
-        // SOAP principals are not bound to Consumer credentials by the
-        // process-wide identity index.
+        // SOAP principals are external identities (issue #6082): they are not
+        // bound to gateway Consumers by matching a username or id in the
+        // process-wide identity index, so no `identified_consumer` is set and
+        // Consumer ACL groups never apply to them.
         let consumer = None;
 
         match auth_flow::commit_authentication_attempt(
@@ -6270,6 +6529,11 @@ fn xmldsig_key_info_certificate(
 /// References it declares or how they nest (GHSA-9g4v-h9hm-846r).
 struct WorkBudget {
     remaining: usize,
+    /// In-scope namespace entries canonicalization may still scan while it
+    /// resolves prefixes. Kept apart from `remaining`: it measures comparisons,
+    /// not bytes, and a large legitimate Body already spends most of the byte
+    /// budget on its own source and canonical output.
+    namespace_scan_remaining: usize,
 }
 
 impl WorkBudget {
@@ -6279,7 +6543,24 @@ impl WorkBudget {
                 .len()
                 .saturating_mul(CANONICALIZATION_BUDGET_MULTIPLIER)
                 .max(MIN_CANONICALIZATION_BUDGET_BYTES),
+            namespace_scan_remaining: envelope
+                .len()
+                .saturating_mul(NAMESPACE_SCAN_BUDGET_MULTIPLIER)
+                .max(MIN_NAMESPACE_SCAN_BUDGET),
         }
+    }
+
+    /// Charge one namespace lookup that scans `in_scope` entries, before it
+    /// runs.
+    fn charge_namespace_scan(&mut self, in_scope: usize) -> Result<(), String> {
+        self.namespace_scan_remaining = self
+            .namespace_scan_remaining
+            .checked_sub(in_scope.max(1))
+            .ok_or_else(|| {
+                "WS-Security: message exceeds the permitted XML namespace-resolution work budget"
+                    .to_string()
+            })?;
+        Ok(())
     }
 
     fn charge(&mut self, bytes: usize) -> Result<(), String> {
@@ -6317,6 +6598,11 @@ impl<'budget> BoundedCanonicalOutput<'budget> {
             output: String::with_capacity(capacity),
             budget,
         }
+    }
+
+    /// Charge namespace-resolution work to the shared budget before it runs.
+    fn charge_namespace_scan(&mut self, entries: usize) -> Result<(), String> {
+        self.budget.charge_namespace_scan(entries)
     }
 
     fn push_str(&mut self, text: &str) -> Result<(), String> {
@@ -6608,9 +6894,8 @@ pub(crate) fn exclusive_canonicalize_with_budget_for_test(
         let error = format!("WS-Security: test fixture missing {}", local_name);
         return (Err(error), budget_bytes);
     };
-    let mut budget = WorkBudget {
-        remaining: budget_bytes,
-    };
+    let mut budget = WorkBudget::for_envelope(xml);
+    budget.remaining = budget_bytes;
     let canonical = exclusive_canonicalize(xml, root, &[], None, &mut budget);
     let outcome = canonical.and_then(|bytes| {
         String::from_utf8(bytes).map_err(|_| "WS-Security: canonical XML was not UTF-8".to_string())
@@ -6709,6 +6994,11 @@ fn canonicalize_node(
         .split_once(':')
         .map(|(prefix, _)| prefix)
         .unwrap_or("");
+    // Every de-duplicating insert scans the list built so far and every prefix
+    // resolution scans the element's whole in-scope namespace list. Neither
+    // emits a byte, so both are charged to the namespace-resolution allowance
+    // before they run (see `NAMESPACE_SCAN_BUDGET_MULTIPLIER`).
+    output.charge_namespace_scan(required_prefixes.len())?;
     add_required_prefix(&mut required_prefixes, element_prefix, true);
 
     let mut attributes = Vec::new();
@@ -6718,6 +7008,7 @@ fn canonicalize_node(
             "WS-Security: XML parser returned an invalid attribute range".to_string()
         })?;
         if let Some((prefix, _)) = attribute_qname.split_once(':') {
+            output.charge_namespace_scan(required_prefixes.len())?;
             add_required_prefix(&mut required_prefixes, prefix, true);
         }
         attributes.push((
@@ -6728,11 +7019,13 @@ fn canonicalize_node(
         ));
     }
 
+    let in_scope_namespaces = node.namespaces().len();
     let mut namespace_declarations = Vec::new();
     for (prefix, required) in required_prefixes {
         if prefix == "xml" {
             continue;
         }
+        output.charge_namespace_scan(in_scope_namespaces)?;
         let namespace_uri = if prefix.is_empty() {
             node.lookup_namespace_uri(None).unwrap_or("")
         } else if let Some(uri) = node.lookup_namespace_uri(Some(prefix)) {
@@ -7279,9 +7572,52 @@ fn parse_trusted_certificate_source(raw: &str) -> CertSource {
     }
 }
 
-fn contains_forbidden_xml_declaration(xml: &str) -> bool {
-    contains_ascii_case_insensitive(xml, "<!doctype")
-        || contains_ascii_case_insensitive(xml, "<!entity")
+/// Whether the document prolog — everything before the root element's start
+/// tag — carries a markup declaration (`<!DOCTYPE`, or a stray `<!ENTITY`,
+/// `<!ELEMENT`, `<!ATTLIST`, in any letter case).
+///
+/// The prolog may hold only the XML declaration, processing instructions,
+/// comments, and whitespace besides a document type declaration, so any other
+/// `<!` construct found there is refused. Scanning stops at the first byte that
+/// is none of those (the root element, or text the parser will refuse): past
+/// that point a `<!` that is not a comment or CDATA section is not well-formed
+/// and fails the parse, while one inside CDATA, a comment, or character data is
+/// inert. An unterminated comment or processing instruction is likewise left to
+/// the parser, which refuses it.
+fn prolog_contains_markup_declaration(xml: &str) -> bool {
+    let bytes = xml.as_bytes();
+    // The parser skips a leading UTF-8 byte-order mark; so does the screen.
+    let mut position = if xml.starts_with('\u{FEFF}') {
+        '\u{FEFF}'.len_utf8()
+    } else {
+        0
+    };
+    loop {
+        while bytes
+            .get(position)
+            .is_some_and(|&byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            position += 1;
+        }
+        let Some(rest) = bytes.get(position..) else {
+            return false;
+        };
+        if rest.starts_with(b"<!--") {
+            let Some(end) = rest.get(4..).and_then(|tail| find_subslice(tail, b"-->")) else {
+                return false;
+            };
+            position += 4 + end + 3;
+            continue;
+        }
+        if rest.starts_with(b"<?") {
+            let Some(end) = rest.get(2..).and_then(|tail| find_subslice(tail, b"?>")) else {
+                return false;
+            };
+            position += 2 + end + 2;
+            continue;
+        }
+        return rest.starts_with(b"<!");
+    }
 }
 
 /// Encoding rejection at the SOAP hostile-input boundary.
@@ -7824,13 +8160,19 @@ pub(crate) fn extract_mtom_root_part_for_test(
         .map_err(SoapBodyDecodeError::class)
 }
 
+/// First offset of `needle` in `haystack`, or `None` for an empty needle.
+///
+/// The MTOM scanner runs this over every byte of an unauthenticated package
+/// against an attacker-chosen boundary of up to 70 bytes. A naive
+/// `windows().position()` search is O(body × boundary) on a near-match payload
+/// (a boundary of dashes plus one byte, attachment octets all dashes);
+/// `memchr::memmem` is a linear-time substring search, so the scan stays
+/// proportional to the package size whatever the payload holds.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
+    if needle.is_empty() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    memchr::memmem::find(haystack, needle)
 }
 
 /// Decode a buffered SOAP body into UTF-8 text for XML validation.
@@ -8265,14 +8607,6 @@ pub(crate) fn decode_soap_xml_body_for_test(
         .map_err(|err| err.message().to_string())
 }
 
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    let needle = needle.as_bytes();
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
-}
-
 /// Parse WS-Security datetime formats (ISO 8601 variants with an explicit
 /// `Z` or `±hh:mm` zone designator).
 fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
@@ -8531,9 +8865,8 @@ mod tests {
         let document = parse_bounded_xml(xml, "test fixture").expect("fixture parses");
         let root = document.root_element();
         let source_len = root.range().len();
-        let mut budget = WorkBudget {
-            remaining: source_len.saturating_mul(2).saturating_sub(1),
-        };
+        let mut budget = WorkBudget::for_envelope(xml);
+        budget.remaining = source_len.saturating_mul(2).saturating_sub(1);
         let error = exclusive_canonicalize(xml, root, &[], None, &mut budget)
             .expect_err("source plus full canonical output must exceed the budget");
         assert!(

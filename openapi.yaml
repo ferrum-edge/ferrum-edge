@@ -27533,9 +27533,54 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Malformed XML returns HTTP 400 with a fixed parser category; document names, positions, and raw parser details are never returned or logged. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Every evaluated xsd:dateTime (Timestamp Created/Expires, PasswordDigest Created, SAML Conditions and SubjectConfirmationData bounds) must carry a Z or ±hh:mm zone designator; a zoneless value is rejected rather than read as UTC. Both signature paths settle TRUST FIRST: certificate fingerprint match (plus the matched certificate's notBefore/notAfter window) and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed. Every element value the gateway acts on is read once and returned UNCHANGED: only xsd:dateTime instants and xsd:base64Binary payloads are whitespace-collapsed, so a NameID, Issuer, Audience, Username, or PasswordText value with significant leading/trailing spaces is matched byte for byte against the bytes the signature covered and against configuration. Canonicalization charges the per-message work budget BEFORE each emitted run, so a refused canonical form is never fully allocated. username_token.remove_credential (default false) deletes the verified UsernameToken — or the whole wsse:Security header when it holds only the credential — from the backend-visible message; it is admitted only for an enabled PasswordText policy with no enabled x509_signature or saml and no explicit content_type.allow_mtom=true, its final-body proof binds the sanitized representation, and a signed envelope (400) or an unspliceable UTF-16/MTOM representation (415) is refused rather than forwarded with the credential intact. The schema's conditionals mirror those admission rules, so a configuration this component accepts is one the constructor accepts."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Malformed XML returns HTTP 400 with a fixed parser category; document names, positions, and raw parser details are never returned or logged. A document type (or any other markup) declaration in the prolog is refused with 400; the same characters inside CDATA, comments, or character data are ordinary text, and a declaration after the prolog is malformed XML. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). MTOM package framing is strict and line-anchored: delimiter lines only at body start or immediately after CRLF with exact CRLF framing, exactly one close-delimiter with a boundary-free epilogue, strict US-ASCII unfolded part headers with unique Content-Type/Content-ID/Content-Transfer-Encoding, package-unique nonblank Content-IDs, exactly one part matching `start`, and root selection only after the whole package is framed — every other shape fails closed under bounded part/header/candidate ceilings. Because Ferrum implements no WS-Security attachment-signature transform, an enabled x509_signature refuses both MTOM multipart/related and bare application/xop+xml with 415 (and an explicit content_type.allow_mtom=true alongside it is refused at admission); username_token and saml keep accepting MTOM/XOP because they authenticate identity and never claimed attachment integrity. Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes the SOAP principal as an EXTERNAL authenticated_identity (backend header X-Authenticated-Identity). It never sets identified_consumer: a same-named Consumer is not bound (issue #6082), so Consumer ACL groups and Consumer-specific policy do not apply and access_control admits a SOAP principal only through allow_authenticated_identity; identity-keyed rate limiting, logging, retries, and chargeback observe the one SOAP identity. require_mechanisms (default 'all') selects whether every enabled identity mechanism must be presented and verify, or ('any', at least two enabled) whether they are alternatives of which at least one must be presented and every presented one must verify. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission requires an identity-establishing instance to be the proxy's sole authentication mechanism in either auth mode, rejects it alongside compression decompress_request, and rejects an explicit content_type.allow_mtom=true alongside an enabled x509_signature; for that identity-establishing form on_final_request_body refuses to dispatch a message whose bytes changed after validation (a timestamp-only policy authenticates nobody, claims no integrity over the Body, and therefore does not bind the representation). Because an identity-establishing instance is the proxy's sole authentication mechanism, a request the SOAP policy passes through — a non-SOAP media type under mixed_route, or a governed envelope with no wsse:Security header under reject_missing_security_header=false — reaches the authentication chain with no identity and is answered 401 rather than forwarded anonymously; pair those options with a timestamp-only instance or separate the proxies. At least one security feature must be enabled. Every evaluated xsd:dateTime (Timestamp Created/Expires, PasswordDigest Created, SAML Conditions and SubjectConfirmationData bounds) must carry a Z or ±hh:mm zone designator; a zoneless value is rejected rather than read as UTC. Both signature paths settle TRUST FIRST: certificate fingerprint match (plus the matched certificate's notBefore/notAfter window) and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget plus a separate namespace-resolution allowance (16 x decoded body length, floor 1048576 scanned in-scope entries) so inherited namespace declarations cannot multiply pre-verification CPU. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body; References may resolve inside any block of the namespace-correct SOAP Header (the Security header or, e.g., WS-Addressing blocks) or the Body, never the Header element itself or anything outside them; and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, no Conditions child other than AudienceRestriction and at most one each of OneTimeUse and ProxyRestriction (an unsupported condition makes the assertion indeterminate and is rejected, SAML Core 2.0 section 2.5.1.1), exactly one qualifying SubjectConfirmation (a confirmation that does not name the configured recipient with its own bounded NotOnOrAfter and no InResponseTo is skipped, not fatal), exactly one namespace-correct nonblank Subject NameID resolved BEFORE the single-use claim (so an assertion that authenticates nobody fails closed with 401 without consuming replay state), and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). On a governed representation, malformed XML, unsupported/ambiguous envelope structure, and XML parsing-budget failures reject with 400 regardless of reject_missing_security_header, which governs an absent header only. Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed, and every shared-replay connection must prove a non-evicting Redis memory policy (maxmemory 0 or maxmemory_policy noeviction) before it carries a claim. Every element value the gateway acts on is read once and returned UNCHANGED: only xsd:dateTime instants and xsd:base64Binary payloads are whitespace-collapsed, so a NameID, Issuer, Audience, Username, or PasswordText value with significant leading/trailing spaces is matched byte for byte against the bytes the signature covered and against configuration. Canonicalization charges the per-message work budget BEFORE each emitted run, so a refused canonical form is never fully allocated. username_token.remove_credential (default false) deletes the verified UsernameToken — or the whole wsse:Security header when it holds only the credential — from the backend-visible message; it is admitted only for an enabled PasswordText policy with no enabled x509_signature or saml and no explicit content_type.allow_mtom=true, its final-body proof binds the sanitized representation, and a signed envelope (400) or an unspliceable UTF-16/MTOM representation (415) is refused rather than forwarded with the credential intact. The schema's conditionals mirror those admission rules, so a configuration this component accepts is one the constructor accepts."
       additionalProperties: false
       allOf:
+        # require_mechanisms=any needs at least two enabled identity
+        # mechanisms; with one it would read as optional authentication.
+        - if:
+            properties:
+              require_mechanisms:
+                const: any
+            required: [require_mechanisms]
+          then:
+            anyOf:
+              - required: [username_token, x509_signature]
+                properties:
+                  username_token:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  x509_signature:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+              - required: [username_token, saml]
+                properties:
+                  username_token:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  saml:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+              - required: [x509_signature, saml]
+                properties:
+                  x509_signature:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  saml:
+                    properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
         # At least one security feature must be enabled. timestamp.require
         # defaults to true, so this only bites when it is explicitly false and
         # no mechanism is enabled.
@@ -27768,6 +27813,23 @@ components:
                     const: shared
                 required: [replay_scope]
       properties:
+        require_mechanisms:
+          type: string
+          enum: [all, any]
+          default: all
+          description: |
+            How the enabled identity mechanisms (username_token,
+            x509_signature, saml) combine. 'all' (default): every enabled
+            mechanism must be presented and must verify. 'any':
+            WS-SecurityPolicy-style alternatives — a mechanism runs only when
+            its token is presented (a wsse:UsernameToken or message ds:Signature
+            as a direct child of the selected Security header, or a SAML
+            Assertion anywhere in the message); at least one enabled mechanism
+            must be presented (otherwise 401), and EVERY presented token must
+            verify, so a failing token rejects the message even beside a valid
+            one. 'any' requires at least two enabled identity mechanisms and is
+            refused at admission otherwise. The published principal is the first
+            verified mechanism in the order UsernameToken, X.509, SAML.
         reject_missing_security_header:
           type: boolean
           default: true
@@ -27960,7 +28022,7 @@ components:
                     type: string
                     minLength: 1
                     pattern: '\S'
-              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with a username and password that each contain at least one non-whitespace character; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins. Values are matched EXACTLY, including any leading or trailing spaces — the gateway compares the credential the client sent byte for byte and never trims it. Required and non-empty when `enabled` is true.
+              description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with a username and password that each contain at least one non-whitespace character; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins. Values are matched EXACTLY, including any leading or trailing spaces — the gateway compares the credential the client sent byte for byte and never trims it. A `password` of exactly `${FERRUM_PLUGIN_SECRET_<NAME>}` is resolved once at admission from that process environment variable (populated directly or through the _FILE/_VAULT/_AWS/_AZURE/_GCP secret suffixes); a `${...}` reference to any other variable, or an unset, empty, or whitespace-only value, is refused at admission without echoing the name or value, and the variable must be set on every node that constructs the plugin. Required and non-empty when `enabled` is true.
             created_max_age_seconds:
               type: integer
               format: uint64
@@ -27995,7 +28057,7 @@ components:
                 from the message the BACKEND receives, so a reusable PasswordText
                 secret is not handed to every system behind the gateway. The
                 authenticated identity is still published normally
-                (`authenticated_identity`, `identified_consumer`,
+                (`authenticated_identity`,
                 `ctx.metadata["soap_ws_username"]`).
 
                 Off by default, because a backend may legitimately read the
@@ -28090,8 +28152,14 @@ components:
               6. Validate Issuer (must match `trusted_issuers`), the MANDATORY bounded
                  Conditions window (both NotBefore and NotOnOrAfter required, span capped
                  by `max_assertion_lifetime_seconds`, `clock_skew_seconds` tolerance), the
-                 service `audience` on every AudienceRestriction, and one supported
-                 SubjectConfirmation naming `recipient`.
+                 service `audience` on every AudienceRestriction, and every other
+                 Conditions child: at most one OneTimeUse and at most one
+                 ProxyRestriction are accepted, and any other condition (a
+                 `saml:Condition` extension or foreign element) makes the assertion
+                 indeterminate and is rejected (SAML Core 2.0 section 2.5.1.1) before
+                 its id is claimed. Exactly one SubjectConfirmation must qualify by
+                 naming `recipient`; a non-qualifying confirmation is skipped, and
+                 none or more than one qualifying is rejected.
               7. Resolve exactly one namespace-correct, nonblank Subject NameID.
                  This happens before replay state is consumed, so an otherwise
                  valid assertion that authenticates nobody fails with 401
@@ -28105,7 +28173,7 @@ components:
                  is a single-replica declaration and makes NO cross-replica claim;
                  multi-replica SAML deployments must use 'shared'.
               9. Publish the Subject NameID as the request principal
-                 (authenticated_identity plus a namespace-correct identified_consumer) and
+                 (an external authenticated_identity, never mapped to a Consumer) and
                  mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
             On any failure the request is rejected with HTTP 401. Rejections never echo
             the issuer, audience, recipient, subject, or assertion id. Unsupported
@@ -28318,10 +28386,16 @@ components:
                 redis_health_check_interval_seconds without a reload (a
                 literal-IP egress-policy denial is the exception and is a
                 configuration fix; hostname denials re-screen because DNS
-                answers can change). Claim durability is Redis's own: run the
-                replay keyspace
-                with maxmemory-policy noeviction and consistent failover, since
-                a lost claim key makes its nonce claimable again. Admission
+                answers can change). Because SET NX cannot tell an evicted claim
+                from an unused nonce or assertion, every shared-replay
+                connection (first dial and recovery probe) runs INFO MEMORY and
+                must prove maxmemory 0 or maxmemory_policy noeviction before it
+                carries a claim: a proven evicting policy is terminal for the
+                plugin generation, an unprovable answer is a recoverable outage,
+                and both fail closed like any other shared-backend outage.
+                Durability across failover is Redis's own: run the replay
+                keyspace with consistent failover, since a lost claim key makes
+                its nonce claimable again. Admission
                 enforces the pairing in both directions: shared without
                 sync_mode=redis is rejected, and sync_mode=redis without shared
                 is rejected.
