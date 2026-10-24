@@ -53,6 +53,9 @@ pub(super) struct JsonView {
     /// the part that could not be read opens: the most JSON-like of the view's
     /// opening and every document the lenient reading stopped at.
     refused: Option<JsonOpening>,
+    /// The lenient reading ran out of its work budget before the end of the
+    /// view, so part of it was never examined at all.
+    exhausted: bool,
 }
 
 enum Documents {
@@ -81,9 +84,15 @@ pub(super) enum JsonOpening {
 /// How far past a refused document the per-document opening check looks.
 /// The view's own opening is judged without a bound (once per view); a
 /// document the lenient reading stopped at part-way through the view is
-/// judged within this window, so a body of many short refused lines costs
-/// `O(lines × SNIFF_WINDOW)`, never `O(lines × bytes)`.
+/// judged within this window, so the checks cost `O(stops × SNIFF_WINDOW)`.
 const SNIFF_WINDOW: usize = 64;
+
+/// The lenient reading's work budget: bytes parsed across all of its
+/// attempts, as a multiple of the view's length plus a constant. Re-reading
+/// inside a refused container repeats work, and this bounds it; a view that
+/// exhausts the budget fails closed rather than going partly unexamined.
+const LENIENT_WORK_FACTOR: usize = 4;
+const LENIENT_WORK_ALLOWANCE: usize = 64 * 1024;
 
 impl JsonOpening {
     fn of(bytes: &[u8]) -> Self {
@@ -103,7 +112,7 @@ impl JsonOpening {
 
 impl JsonView {
     /// Every document read from the view, in source order — including the
-    /// ones read before (or after) a part that could not be read.
+    /// ones read before, after, or inside a part that could not be read.
     pub(super) fn documents(&self) -> &[JsonNode] {
         match &self.documents {
             Documents::Empty => &[],
@@ -117,6 +126,11 @@ impl JsonView {
     pub(super) fn refused(&self) -> Option<JsonOpening> {
         self.refused
     }
+
+    /// The lenient reading gave up before examining the whole view.
+    pub(super) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
 }
 
 /// Parse one inspection view. A leading byte-order mark is skipped.
@@ -125,69 +139,89 @@ impl JsonView {
 /// further work. A refused view is re-read the way lenient parsers read it:
 /// invalid UTF-8 decodes to `U+FFFD`, every `\u` escape naming an unpaired
 /// surrogate (`\uD800`–`\uDFFF` not forming a high-then-low pair) becomes
-/// `\uFFFD`, every document of a whitespace-separated sequence is read, and a
-/// document that still cannot be read is skipped up to the end of its line,
-/// where reading resumes (as a line-by-line NDJSON consumer does). Every
-/// document read is returned for inspection, whatever failed around it. Only
-/// this failure path copies the view, and only when there is something to
-/// repair. The view is refused when anything in it could not be read — for
-/// example a number beyond the `f64` range, nesting deeper than
-/// `serde_json`'s 128 levels, `NaN`, a comment, a trailing comma, a leading
-/// form feed, or an unquoted member name.
+/// `\uFFFD`, and every document of a whitespace-separated sequence is read.
+/// When a document cannot be read, reading resumes inside it if it is an
+/// object or array (so the containers it holds are still read), and
+/// otherwise at the next whitespace-separated token or container after the
+/// error — as a sequence consumer that skips a bad value does. Every document
+/// read is returned for inspection, whatever failed around it. Only this
+/// failure path copies the view, and only when there is something to repair.
+/// The view is refused when anything in it could not be read — for example a
+/// number beyond the `f64` range, nesting deeper than `serde_json`'s 128
+/// levels, `NaN`, a comment, a trailing comma, a leading form feed, or an
+/// unquoted member name.
 pub(super) fn parse(bytes: &[u8]) -> JsonView {
     let bytes = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
     if let Ok(document) = serde_json::from_slice(bytes) {
         return JsonView {
             documents: Documents::One(document),
             refused: None,
+            exhausted: false,
         };
     }
     if bytes.iter().all(|byte| is_json_whitespace(*byte)) {
         return JsonView {
             documents: Documents::Empty,
             refused: None,
+            exhausted: false,
         };
     }
     let text = String::from_utf8_lossy(bytes);
     let repaired = replace_unpaired_surrogate_escapes(&text);
-    let (documents, stopped_at) = parse_lenient_sequence(&repaired);
-    let refused = match stopped_at {
-        // Every document parsed: the view was read completely.
-        None => None,
-        Some(stopped_at) => Some(stopped_at.max(JsonOpening::of(bytes))),
-    };
+    let reading = parse_lenient_sequence(&repaired);
+    let refused = reading
+        .stopped_at
+        .map(|stopped_at| stopped_at.max(JsonOpening::of(bytes)));
     JsonView {
-        documents: if documents.is_empty() {
+        documents: if reading.documents.is_empty() {
             Documents::Empty
         } else {
-            Documents::Many(documents)
+            Documents::Many(reading.documents)
         },
         refused,
+        exhausted: reading.exhausted,
     }
 }
 
+struct LenientReading {
+    documents: Vec<JsonNode>,
+    /// `None` when every document parsed; otherwise the most JSON-like
+    /// opening among the documents the reading stopped at.
+    stopped_at: Option<JsonOpening>,
+    exhausted: bool,
+}
+
 /// Read every document of a whitespace-separated sequence, resuming after
-/// the line that holds an error. Returns the documents read and, when
-/// anything could not be read, the most JSON-like opening among the
-/// documents the reading stopped at (judged within [`SNIFF_WINDOW`]).
+/// each document that cannot be read (see [`parse`]).
 ///
-/// Linear in the view: each attempt starts after the line holding the
-/// previous attempt's error, and an error is never before anything that
-/// attempt consumed, so no byte is parsed twice.
-fn parse_lenient_sequence(text: &str) -> (Vec<JsonNode>, Option<JsonOpening>) {
+/// Bounded and linear: a resumption after a scalar or token starts at or
+/// past the error, which is never before anything that attempt consumed, so
+/// those bytes are parsed once; a resumption inside a refused container
+/// re-reads its contents, and the total is capped by the work budget.
+fn parse_lenient_sequence(text: &str) -> LenientReading {
     let bytes = text.as_bytes();
-    let mut documents = Vec::new();
-    let mut stopped_at: Option<JsonOpening> = None;
+    let budget = bytes
+        .len()
+        .saturating_mul(LENIENT_WORK_FACTOR)
+        .saturating_add(LENIENT_WORK_ALLOWANCE);
+    let mut reading = LenientReading {
+        documents: Vec::new(),
+        stopped_at: None,
+        exhausted: false,
+    };
+    let mut work = 0usize;
     let mut start = 0;
     while start < bytes.len() {
-        // `text[start..]`: `start` is 0 or follows an ASCII `\n`.
+        // `start` is always a character boundary: 0, the byte after an ASCII
+        // `{` / `[`, an ASCII stop byte from `resume_point`, or the next
+        // character boundary.
         let segment = &text[start..];
         let mut stream = serde_json::Deserializer::from_str(segment).into_iter::<JsonNode>();
         // Not a `for` loop: the stream is read again on failure.
         let failure = loop {
             match stream.next() {
                 None => break None,
-                Some(Ok(document)) => documents.push(document),
+                Some(Ok(document)) => reading.documents.push(document),
                 Some(Err(error)) => break Some((stream.byte_offset(), error)),
             }
         };
@@ -195,16 +229,44 @@ fn parse_lenient_sequence(text: &str) -> (Vec<JsonNode>, Option<JsonOpening>) {
             break;
         };
         let failed_at = start + failed_at.min(segment.len());
-        stopped_at = stopped_at.max(Some(JsonOpening::of_window(&bytes[failed_at..])));
+        reading.stopped_at = reading
+            .stopped_at
+            .max(Some(JsonOpening::of_window(&bytes[failed_at..])));
         let error_at = (start
             + offset_of_position(segment.as_bytes(), error.line(), error.column()))
-        .max(failed_at);
-        match memchr::memchr(b'\n', &bytes[error_at..]) {
-            Some(newline) => start = error_at + newline + 1,
-            None => break,
+        .clamp(failed_at, bytes.len());
+        work = work.saturating_add(error_at - start).saturating_add(1);
+        if work > budget {
+            reading.exhausted = true;
+            break;
         }
+        let next = if matches!(bytes[failed_at..].first(), Some(b'{' | b'[')) {
+            // Read what the refused container holds.
+            failed_at + 1
+        } else {
+            resume_point(bytes, error_at)
+        };
+        start = if next > start {
+            next
+        } else {
+            start + segment.chars().next().map_or(1, char::len_utf8)
+        };
     }
-    (documents, stopped_at)
+    reading
+}
+
+/// The first byte at or after `from` where a new document can start once the
+/// failed token is skipped: a container opening, or whitespace that ends the
+/// token (`serde_json` skips the whitespace itself). Always an ASCII byte or
+/// the end of `bytes`, so a character boundary.
+fn resume_point(bytes: &[u8], from: usize) -> usize {
+    bytes
+        .get(from..)
+        .and_then(|rest| {
+            rest.iter()
+                .position(|byte| matches!(byte, b'{' | b'[') || is_json_whitespace(*byte))
+        })
+        .map_or(bytes.len(), |offset| from + offset)
 }
 
 /// The byte offset of a 1-based `line` and byte `column` reported by
@@ -217,6 +279,13 @@ fn offset_of_position(bytes: &[u8], line: usize, column: usize) -> usize {
             .map_or(bytes.len(), |newline| newline + 1),
     };
     line_start.saturating_add(column).min(bytes.len())
+}
+
+/// `bytes` with every U+0000 removed: the reading of a NUL-separated body by a
+/// parser that skips NULs between tokens (Json.NET). A NUL inside a string is
+/// removed too, which only changes values that hold one.
+pub(super) fn without_nul_bytes(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().copied().filter(|byte| *byte != 0).collect()
 }
 
 fn is_json_whitespace(byte: u8) -> bool {
@@ -389,8 +458,8 @@ fn opens_with_literal(rest: &[u8], nul_is_whitespace: bool) -> bool {
 /// Whether a `Content-Type` declares a JSON document: base type `*/json` or
 /// an RFC 6839 `+json` suffix, as the inspection gate maps them. Framed JSON
 /// codecs (`application/grpc+json`, `application/connect+json`, …) match as
-/// well; [`framed_json_messages`] takes a body that really is framed out of
-/// this question before it is asked. Allocation-free.
+/// well; a body that really is a framed stream is read as its messages
+/// ([`FramedStream`]) as well as judged as an ordinary body. Allocation-free.
 pub(super) fn media_type_declares_json(content_type: Option<&str>) -> bool {
     let Some(subtype) = media_essence(content_type)
         .and_then(|essence| essence.split_once('/'))
@@ -425,59 +494,98 @@ fn is_connect_streaming_essence(essence: &str) -> bool {
         && essence.len() > PREFIX.len()
 }
 
-/// A body that genuinely is a framed RPC stream, identified by its exact
-/// media type AND validated framing: the gRPC (`application/grpc[+codec]`),
-/// gRPC-Web binary (`application/grpc-web[+codec]`) and Connect streaming
-/// (`application/connect+codec`) envelopes of a flags byte and a 4-byte
-/// big-endian length, covering the body exactly; or a gRPC-Web text body
-/// (`application/grpc-web-text[+codec]`) that is entirely base64.
+/// A body that genuinely parses as a framed RPC stream: an exact gRPC
+/// (`application/grpc[+codec]`), gRPC-Web binary (`application/grpc-web[+codec]`)
+/// or Connect streaming (`application/connect+codec`) media type with
+/// envelopes of a flags byte and a 4-byte big-endian length covering the body
+/// exactly, or a gRPC-Web text body (`application/grpc-web-text[+codec]`)
+/// whose base64 decodes to such envelopes.
 ///
-/// Returns the messages to inspect as JSON documents in place of the raw
-/// body: each uncompressed message of a `+json` codec. A non-JSON codec,
-/// a compressed message, or a gRPC-Web text body contributes none (those
-/// bytes are not a JSON document under any reading). `None` when the body is
-/// not such a stream — a look-alike media type, or framing that does not
-/// validate — so it is judged as an ordinary body.
-pub(super) fn framed_json_messages<'a>(
-    content_type: Option<&str>,
-    body: &'a [u8],
-) -> Option<Vec<&'a [u8]>> {
-    let content_type = content_type?;
-    let essence = media_essence(Some(content_type))?;
-    if crate::plugins::grpc_web::is_grpc_web_text(content_type) {
-        let base64 = body
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"+/=\r\n".contains(byte));
-        return base64.then(Vec::new);
-    }
-    let connect = is_connect_streaming_essence(essence);
-    let framed = connect
-        || crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
-        || crate::plugins::grpc_web::is_grpc_web_content_type(content_type);
-    if !framed {
-        return None;
-    }
-    // gRPC and gRPC-Web request frames: bit 0 is the compression flag.
-    // Connect adds bit 1, end-of-stream.
-    let allowed_flags: u8 = if connect { 0x03 } else { 0x01 };
-    let json_codec = ends_with_ignore_ascii_case(essence.as_bytes(), b"+json");
-    let mut messages = Vec::new();
-    let mut rest = body;
-    while !rest.is_empty() {
-        let [flags, a, b, c, d, tail @ ..] = rest else {
+/// The media type and the framing are both client-controlled, so this only
+/// says how an RPC backend reads the body — never that the backend IS one. The
+/// caller still judges the raw bytes as the JSON a NUL-skipping parser reads.
+pub(super) struct FramedStream<'a> {
+    envelopes: Cow<'a, [u8]>,
+    frames: Vec<(u8, std::ops::Range<usize>)>,
+    json_codec: bool,
+    text: bool,
+}
+
+/// One message of a [`FramedStream`].
+pub(super) enum FramedMessage<'a> {
+    /// An uncompressed message: the JSON document itself.
+    Json(&'a [u8]),
+    /// A compressed message, which the WAF does not decompress.
+    Compressed,
+}
+
+impl<'a> FramedStream<'a> {
+    pub(super) fn parse(content_type: Option<&str>, body: &'a [u8]) -> Option<Self> {
+        let content_type = content_type?;
+        let essence = media_essence(Some(content_type))?;
+        let json_codec = ends_with_ignore_ascii_case(essence.as_bytes(), b"+json");
+        let text = crate::plugins::grpc_web::is_grpc_web_text(content_type);
+        let connect = is_connect_streaming_essence(essence);
+        let framed = text
+            || connect
+            || crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+            || crate::plugins::grpc_web::is_grpc_web_content_type(content_type);
+        if !framed {
             return None;
+        }
+        let envelopes = if text {
+            Cow::Owned(crate::plugins::grpc_web::decode_grpc_web_text_body(body)?)
+        } else {
+            Cow::Borrowed(body)
         };
-        if flags & !allowed_flags != 0 {
-            return None;
+        // gRPC and gRPC-Web request frames: bit 0 is the compression flag.
+        // Connect adds bit 1, end-of-stream.
+        let allowed_flags: u8 = if connect { 0x03 } else { 0x01 };
+        let mut frames = Vec::new();
+        let mut at = 0usize;
+        while at < envelopes.len() {
+            let &[flags, a, b, c, d, ..] = &envelopes[at..] else {
+                return None;
+            };
+            if flags & !allowed_flags != 0 {
+                return None;
+            }
+            let length = usize::try_from(u32::from_be_bytes([a, b, c, d])).ok()?;
+            let message_start = at + 5;
+            let message_end = message_start.checked_add(length)?;
+            if message_end > envelopes.len() {
+                return None;
+            }
+            frames.push((flags, message_start..message_end));
+            at = message_end;
         }
-        let length = usize::try_from(u32::from_be_bytes([*a, *b, *c, *d])).ok()?;
-        let message = tail.get(..length)?;
-        if json_codec && flags & 0x01 == 0 {
-            messages.push(message);
-        }
-        rest = &tail[length..];
+        Some(Self {
+            envelopes,
+            frames,
+            json_codec,
+            text,
+        })
     }
-    Some(messages)
+
+    /// The codec is `+json`, so each message is a JSON document.
+    pub(super) fn is_json_codec(&self) -> bool {
+        self.json_codec
+    }
+
+    /// The body is gRPC-Web text: base64, which no parser reads as JSON.
+    pub(super) fn is_text(&self) -> bool {
+        self.text
+    }
+
+    pub(super) fn messages(&self) -> impl Iterator<Item = FramedMessage<'_>> {
+        self.frames.iter().map(|(flags, range)| {
+            if flags & 0x01 == 0 {
+                FramedMessage::Json(&self.envelopes[range.clone()])
+            } else {
+                FramedMessage::Compressed
+            }
+        })
+    }
 }
 
 /// Rewrite every `\u` escape that names an unpaired UTF-16 surrogate to

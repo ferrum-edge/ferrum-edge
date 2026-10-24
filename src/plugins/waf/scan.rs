@@ -54,24 +54,42 @@ enum ReadingKind {
     /// The raw bytes or a UTF-16 / UTF-32 transcoding of an ordinary body:
     /// several such readings coexist and at most one is the real document.
     Alternative,
-    /// One message of a validated framed RPC stream: the document itself,
-    /// with no alternative reading, so any refusal fails closed.
+    /// The raw bytes of a body that parses as a framed RPC stream, or those
+    /// bytes with their NULs removed: what a NUL-skipping parser reads. Only a
+    /// NUL-skipping parser reads anything there, so a refusal weighs at most
+    /// [`json_doc::JsonOpening::SkippingNul`]; a legitimate stream's envelopes
+    /// are refused this way, and its messages are what parse.
+    NulSkipping,
+    /// One message of a framed RPC stream: the document itself, with no
+    /// alternative reading, so any refusal fails closed.
     FramedMessage,
 }
 
 impl JsonReadings {
     fn record(&mut self, view: &json_doc::JsonView, kind: ReadingKind) {
-        match view.refused() {
-            None => self.complete = true,
-            Some(opening) => {
-                self.refused = true;
-                let opening = match kind {
-                    ReadingKind::Alternative => opening,
-                    ReadingKind::FramedMessage => json_doc::JsonOpening::Yes,
-                };
-                self.refused_opening = self.refused_opening.max(opening);
+        let Some(opening) = view.refused() else {
+            self.complete = true;
+            return;
+        };
+        let opening = if view.exhausted() {
+            // Part of the reading was never examined: nothing vouches for it.
+            json_doc::JsonOpening::Yes
+        } else {
+            match kind {
+                ReadingKind::Alternative => opening,
+                ReadingKind::NulSkipping => opening.min(json_doc::JsonOpening::SkippingNul),
+                ReadingKind::FramedMessage => json_doc::JsonOpening::Yes,
             }
-        }
+        };
+        self.refused = true;
+        self.refused_opening = self.refused_opening.max(opening);
+    }
+
+    /// A message of a framed RPC stream the WAF cannot read (compressed): the
+    /// backend decodes it, so it fails closed like any unreadable message.
+    fn record_unreadable(&mut self) {
+        self.refused = true;
+        self.refused_opening = json_doc::JsonOpening::Yes;
     }
 
     /// Whether the body is JSON the rules could not read, so the rules fail
@@ -80,8 +98,9 @@ impl JsonReadings {
     /// - a part that could not be read opens like a JSON object or array
     ///   (in the reading's opening, or at any document the lenient reading
     ///   stopped at), whatever the declared type and whatever the other
-    ///   readings did; or a message of a validated framed stream could not
-    ///   be read;
+    ///   readings did; a message of a framed stream could not be read
+    ///   (including a compressed one); or a reading exhausted its work
+    ///   budget;
     /// - no reading was read completely, and an unread part opens like a
     ///   JSON container once U+0000 is skipped between tokens (Json.NET);
     /// - no reading was read completely and the `Content-Type` declares JSON.
@@ -427,17 +446,41 @@ impl Waf {
             // each UTF-16 / UTF-32 view — since a backend may accept any of
             // them as JSON.
             let mut readings = JsonReadings::default();
-            // A validated gRPC / gRPC-Web / Connect stream is read as its
-            // messages, not as raw bytes: its envelope is NULs and lengths,
-            // never a JSON document.
-            match json_doc::framed_json_messages(content_type, body) {
-                Some(messages) => {
-                    for message in messages {
+            // A body that parses as a gRPC / gRPC-Web / Connect stream is read
+            // as its messages, as an RPC backend reads it — and, because the
+            // media type and framing are client-controlled and say nothing
+            // about the backend, its raw bytes are still read as the JSON a
+            // NUL-skipping parser (Json.NET) takes from them.
+            match json_doc::FramedStream::parse(content_type, body) {
+                // A non-JSON codec: no reading of the body is a JSON document.
+                Some(stream) if !stream.is_json_codec() => {}
+                Some(stream) => {
+                    for message in stream.messages() {
+                        match message {
+                            json_doc::FramedMessage::Json(message) => self.scan_json_path_rules(
+                                &mut outcome,
+                                message,
+                                subject,
+                                ReadingKind::FramedMessage,
+                                &mut readings,
+                            ),
+                            json_doc::FramedMessage::Compressed => readings.record_unreadable(),
+                        }
+                    }
+                    if !stream.is_text() {
                         self.scan_json_path_rules(
                             &mut outcome,
-                            message,
+                            body,
                             subject,
-                            ReadingKind::FramedMessage,
+                            ReadingKind::NulSkipping,
+                            &mut readings,
+                        );
+                        let without_nuls = json_doc::without_nul_bytes(body);
+                        self.scan_json_path_rules(
+                            &mut outcome,
+                            &without_nuls,
+                            subject,
+                            ReadingKind::NulSkipping,
                             &mut readings,
                         );
                     }

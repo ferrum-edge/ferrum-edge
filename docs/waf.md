@@ -468,11 +468,16 @@ body the strict parser accepts is read in place.
 
 The lenient reading also accepts several documents separated by whitespace
 (NDJSON, a leading scalar such as `null` followed by an object, or a document
-followed by another one), and when a document cannot be read it skips to the
-end of that line and resumes, as a line-by-line consumer does. Every document
-it reads is inspected — the ones before a part it could not read as well as
-the ones after — so a backend that reads only the first, only the last, or
-each of them is covered by the same verdict.
+followed by another one). When a document cannot be read, reading resumes
+inside it if it is an object or array, so the containers it holds are still
+read, and otherwise at the next whitespace-separated token or container after
+the error — as a sequence consumer that skips a bad value does, on the same
+line or the next. Every document it reads is inspected — before, after, or
+inside a part it could not read, including a JSON object embedded in text —
+so a backend that reads only the first, only the last, or each of them is
+covered by the same verdict. Re-reading inside refused containers is bounded
+by a work budget of four times the reading's length plus 64 KiB; a reading
+that exhausts it fails closed.
 
 A body that `body_json_path` rules cannot read **fails closed**: every
 applicable `body_json_path` rule records a hit, and that rule's own action,
@@ -517,28 +522,36 @@ while its transcoded reading parses. A blank body (empty or JSON whitespace
 only) and a lone top-level scalar the parser accepts (which no non-empty path
 can select) are never judged.
 
-A framed RPC stream is read as its messages instead of its raw bytes, but only
-when it really is one: an exact gRPC (`application/grpc[+codec]`), gRPC-Web
-(`application/grpc-web[+codec]`) or Connect streaming
-(`application/connect+codec`) media type, AND envelopes (a flags byte and a
-4-byte length) that cover the body exactly. Each uncompressed message of a
-`+json` codec is then a document of its own, and any message that cannot be
-read fails closed. Compressed messages and `application/grpc-web-text` bodies
-(accepted only when they are entirely base64) are not JSON under any reading
-and are not inspected by `body_json_path` rules. A look-alike media type, or a
-body whose framing does not validate, is judged as an ordinary body.
+A body that parses as a framed RPC stream — an exact gRPC
+(`application/grpc[+codec]`), gRPC-Web (`application/grpc-web[+codec]`) or
+Connect streaming (`application/connect+codec`) media type with envelopes (a
+flags byte and a 4-byte length) that cover the body exactly, or a gRPC-Web
+text body (`application/grpc-web-text[+codec]`) whose base64 decodes to such
+envelopes — is read as its messages: each uncompressed message of a `+json`
+codec is a document of its own, and any message that cannot be read fails
+closed. A compressed message is decoded by an RPC backend but not by the WAF,
+so it fails closed too: scope `body_json_path` rules away from compressed
+JSON-codec RPC traffic with `conditions` if that traffic must pass. Because
+the media type and the framing are both client-controlled and say nothing
+about the backend, a binary stream's raw bytes are judged as well, as the
+document a NUL-skipping parser (Json.NET) reads from them: the bytes as sent
+and the bytes with every NUL removed are both read and inspected. Their
+refusal alone weighs at most like a NUL-skipping opening, since a legitimate
+stream's envelopes are refused that way while its messages parse. A
+non-JSON codec (`+proto`, a bare gRPC type) has no JSON reading and is not
+inspected by `body_json_path` rules. A look-alike media type, or a body whose
+framing does not validate, is judged as an ordinary body.
 
 A body scanned only up to `max_scan_bytes` (`on_body_too_large:
 scan_truncated`, or a prefix scan in a configuration that cannot block) is cut
 short by construction and is not judged. WebSocket messages carry no
 `Content-Type`, so only the opening rules apply to them.
 
-What remains outside `body_json_path` inspection is a body that is not
-declared JSON, of which nothing could be read as a JSON document, and no part
-of which opens like a JSON container as described above — for example a
-leading scalar followed by text (`1 item`), a container behind more than 64
-bytes of comments or Unicode whitespace part-way through a body, or an opening
-only a parser option beyond those listed accepts. `body_text` rules, byte
+What remains outside `body_json_path` inspection is a part of a body that is
+not declared JSON, that could not be read as a JSON document, and that does
+not open like a JSON container as described above — for example a container
+behind more than 64 bytes of comments or Unicode whitespace part-way through
+a body, or an opening only a parser option beyond those listed accepts. `body_text` rules, byte
 rules and the body-scoped specials scan every body either way; pair a
 `body_json_path` rule with a `body_text` rule, or declare and validate JSON
 before it reaches the backend, when such a backend must be protected.

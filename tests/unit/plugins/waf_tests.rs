@@ -1462,7 +1462,7 @@ fn bodies_that_do_not_open_like_json() -> Vec<Vec<u8>> {
     [
         b"user.bio=forbidden-canary".as_slice(),
         b"[INFO] forbidden-canary",
-        b"[Note] {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"[Note] see {\"user\":{\"bio\":\"ordinary\"}}",
         b"[true-story] hello",
         b"[nullify it] hello",
         b"{{user.bio}} forbidden-canary",
@@ -1538,12 +1538,11 @@ fn rpc_frame(flags: u8, message: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn body_json_path_reads_framed_rpc_streams_as_their_messages() {
-    // A validated gRPC / gRPC-Web / Connect stream is read as its messages:
-    // the envelope is NULs and lengths, never a JSON document, so it neither
-    // fails closed on its own nor hides the messages from the rules. The
-    // benign message is 32 bytes, an ASCII space as the length's low byte:
-    // skipping the envelope's NULs would otherwise land on whitespace and
-    // then on `{"`.
+    // A body that parses as a gRPC / gRPC-Web / Connect stream is read as its
+    // messages, as an RPC backend reads it. The benign message is 32 bytes,
+    // an ASCII space as the length's low byte, so the envelopes' NUL-skipping
+    // reading is ` {...}`: it must not by itself fail a legitimate stream
+    // closed, and it must not hide a message from the rules.
     let plugin = enforcing_json_path_waf(false);
     let benign = br#"{"user":{"bio":"ordinary-1234"}}"#;
     assert_eq!(benign.len(), 32);
@@ -1556,30 +1555,70 @@ async fn body_json_path_reads_framed_rpc_streams_as_their_messages() {
         let mut clean = rpc_frame(0x00, benign);
         clean.extend(rpc_frame(0x00, benign));
         clean.extend(rpc_frame(end_flags, b"{}"));
-        // A compressed message cannot be read as JSON under any reading.
-        clean.extend(rpc_frame(0x01, b"\x1f\x8b compressed"));
         let mut hidden = rpc_frame(0x00, benign);
         hidden.extend(rpc_frame(0x00, forbidden));
         let refused = rpc_frame(0x00, br#"{"user":{"bio":"ordinary"},"n":1e400}"#);
         let mut after_empty = rpc_frame(0x00, b"");
         after_empty.extend(rpc_frame(0x00, b"[\0{\"user\":{\"bio\":\"ordinary\"}}]"));
+        // A compressed message is decoded by the backend but not by the WAF,
+        // so it fails closed rather than passing unread.
+        let mut compressed = rpc_frame(0x00, benign);
+        compressed.extend(rpc_frame(0x01, b"\x1f\x8b\x08\x00compressed"));
         assert_json_path_verdicts(
             &plugin,
             content_type,
-            &[hidden, refused, after_empty],
+            &[hidden, refused, after_empty, compressed],
             &[clean, Vec::new()],
         )
         .await;
     }
 
-    // gRPC-Web text bodies are base64: no reading of them is a document.
+    // gRPC-Web text is base64 of the same envelopes, one or more padded
+    // flushes: its messages are read the same way.
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    let text = |frames: &[Vec<u8>]| -> Vec<u8> {
+        frames
+            .iter()
+            .map(|frame| BASE64.encode(frame))
+            .collect::<String>()
+            .into_bytes()
+    };
     assert_json_path_verdicts(
         &plugin,
         "application/grpc-web-text+json",
-        &[],
-        &[b"AAAAACB7InVzZXIiOnsiYmlvIjoib3JkaW5hcnkifX0=".to_vec()],
+        &[
+            text(&[rpc_frame(0x00, benign), rpc_frame(0x00, forbidden)]),
+            text(&[rpc_frame(0x01, b"\x1f\x8b\x08\x00compressed")]),
+        ],
+        &[text(&[rpc_frame(0x00, benign), rpc_frame(0x00, benign)])],
     )
     .await;
+
+    // The media type and the framing are client-controlled and say nothing
+    // about the backend. These two valid envelopes are also, once their
+    // NULs are skipped as Json.NET does, the array
+    // `[{"user":{"bio":"forbidden-canary"}} ... ]`: a REST backend behind an
+    // `application/*+json` formatter reads `0.user.bio`.
+    let plugin_at_index =
+        container_json_path_waf("0.user.bio", "contains", "forbidden-canary", &[]);
+    let mut first = forbidden.to_vec();
+    first.resize(91, b' ');
+    let mut smuggled = rpc_frame(0x00, &first);
+    smuggled.extend(rpc_frame(0x00, &[b' '; 93]));
+    assert_eq!(smuggled[4], b'[');
+    assert_eq!(smuggled[5 + 91 + 4], b']');
+    let mut genuine = rpc_frame(0x00, benign);
+    genuine.extend(rpc_frame(0x00, benign));
+    for content_type in ["application/connect+json", "application/grpc+json"] {
+        assert_json_path_verdicts(
+            &plugin_at_index,
+            content_type,
+            &[smuggled.clone()],
+            &[genuine.clone()],
+        )
+        .await;
+    }
 
     // A look-alike media type, or an exact one whose body is not a valid
     // stream, is an ordinary body: Json.NET behind an `application/*+json`
@@ -1641,6 +1680,20 @@ async fn body_json_path_rule_inspects_every_document_of_a_sequence() {
         b"NaN\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
         b"garbage\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
         b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"n\":1e400}\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // Reading resumes at the next token or container after a refused
+        // value, not at the next line: whitespace (any of it) separates
+        // documents, and a string that swallowed a line break does not hide
+        // the line after it.
+        b"null NaN {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"NaN {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"1e400 {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"null\rNaN\r{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"\"a\nb\" {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // A container embedded in text, and one inside a refused container,
+        // are read too.
+        b"[INFO] {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"note: {\"user\":{\"bio\":\"forbidden-canary\"}} end",
+        b"null [NaN, {\"user\":{\"bio\":\"forbidden-canary\"}}]",
     ]
     .iter()
     .map(|body| body.to_vec())
