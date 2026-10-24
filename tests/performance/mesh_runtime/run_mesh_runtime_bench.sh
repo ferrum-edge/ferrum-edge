@@ -131,7 +131,9 @@ AGENT_NAME="meshbench-${MESH}-${RUN_ID}-agent"
 PROBE_NAME="meshbench-${MESH}-${RUN_ID}-probe"
 LOADGEN_NAME="meshbench-${MESH}-${RUN_ID}-loadgen"
 # This grants access only through the explicitly mounted, disposable fixture
-# directories. Container users stay nonroot and private keys stay mode 0640.
+# directories. Container users stay nonroot and private keys stay mode 0640
+# (0660 only for Linkerd's per-proxy runtime copy, whose identity init must
+# write beside it).
 CERT_GID="$(id -g)"
 
 mkdir -p "$OUTPUT_DIR"
@@ -166,7 +168,7 @@ cleanup() {
         "$PROBE_NAME" "$LOADGEN_NAME" >/dev/null 2>&1 || true
     # Single-run private keys never outlive the run (certificates and
     # public bundles remain as provenance under runtime/).
-    rm -f "$CERT_DIR"/*/svid.key "$CERT_DIR"/*/key.p8 \
+    rm -f "$CERT_DIR"/*/svid.key "$CERT_DIR"/*/key.p8 "$RUNTIME_DIR"/linkerd/*/key.p8 \
         "$CERT_DIR/ca/root.key" "$CERT_DIR/rogue/root.key" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -540,16 +542,18 @@ start_linkerd() {
     # the Destination check that classifies this arm. Each proxy therefore
     # gets a disposable, group-writable copy under the runtime directory,
     # and the shared certificate fixture stays read-only.
-    local identity="$RUNTIME_DIR/linkerd"
+    local identity="${RUNTIME_DIR:?}/linkerd"
+    # Start each cell from a clean copy: no CSR or key left by an earlier run.
+    rm -rf "$identity"
     mkdir -p "$identity/svc" "$identity/client"
     cp "$CERT_DIR/svc/svid.crt" "$identity/svc/crt.pem"
     cp "$CERT_DIR/svc/svid.key" "$identity/svc/key.p8"
     cp "$CERT_DIR/client/svid.crt" "$identity/client/crt.pem"
     cp "$CERT_DIR/client/svid.key" "$identity/client/key.p8"
-    chgrp "$CERT_GID" "$identity/svc" "$identity/client" "$identity"/*/key.p8 "$identity"/*/crt.pem
+    chgrp "$CERT_GID" "$identity/svc" "$identity/client" "$identity"/*/key.p8
     chmod 770 "$identity/svc" "$identity/client"
     chmod 660 "$identity"/*/key.p8
-    chmod 664 "$identity"/*/crt.pem
+    chmod 644 "$identity"/*/crt.pem
     docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
         -v "$identity/svc:/var/run/linkerd/identity/end-entity" \
         -e LINKERD2_PROXY_LOG=info \

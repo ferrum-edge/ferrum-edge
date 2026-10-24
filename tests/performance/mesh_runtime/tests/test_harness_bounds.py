@@ -112,10 +112,12 @@ with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) +
                 self.assertEqual((identity / "crt.pem").read_text(), f"{role}-svid.crt")
                 self.assertEqual(stat.S_IMODE(identity.stat().st_mode), 0o770)
                 self.assertEqual(stat.S_IMODE((identity / "key.p8").stat().st_mode), 0o660)
-                self.assertEqual(stat.S_IMODE((identity / "crt.pem").stat().st_mode), 0o664)
+                self.assertEqual(stat.S_IMODE((identity / "crt.pem").stat().st_mode), 0o644)
                 self.assertEqual((identity / "key.p8").stat().st_gid, os.getgid())
-            # The shared fixture gains no Linkerd copies.
+            # The shared fixture gains no Linkerd copies, and the run's
+            # cleanup removes the copied private keys with the fixture's.
             self.assertEqual(sorted(path.name for path in certs.iterdir()), ["client", "svc"])
+            self.assertIn('"$RUNTIME_DIR"/linkerd/*/key.p8', functions("cleanup"))
 
     @unittest.skipUnless(shutil.which("timeout"), "GNU timeout required by the Linux harness")
     def test_readiness_detects_dead_container_before_probing(self):
