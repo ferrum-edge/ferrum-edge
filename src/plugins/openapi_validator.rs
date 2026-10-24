@@ -51,7 +51,7 @@ use super::utils::validation_diagnostics::{
     MAX_DIAGNOSTIC_CHARS, SafeFieldNames, bound_detail, safe_keyword, safe_location,
     schema_violation_detail, xml_error_category,
 };
-use super::utils::xml_bounds::xml_nesting_depth_within_limit;
+use super::utils::xml_bounds::{UnqualifiedAttribute, xml_nesting_depth_within_limit};
 use super::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext};
 
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -101,10 +101,10 @@ const XML_DEPTH_DETAIL: &str = "XML document nesting exceeds the supported depth
 /// sufficient:
 ///
 /// * `XML_MAX_DEPTH` is screened over the raw bytes *before* `roxmltree` sees
-///   them. `roxmltree`'s own tokenizer is recursive per nesting level
-///   (`parse_element` -> `parse_content` -> `parse_element`), so a node limit
-///   alone still lets a deeply nested document overflow the worker stack
-///   inside the parser.
+///   them, so a deeply nested document is refused before any tree is
+///   allocated and before this file's recursive walkers run. (`roxmltree`
+///   before 0.21.2 also recursed once per nesting level inside the parser;
+///   see `xml_bounds`.)
 /// * `XML_MAX_NODES` bounds the parser's arena allocation (same value
 ///   `body_validator` uses).
 /// * `XML_MAX_DEPTH` is re-applied as an explicit budget threaded through this
@@ -2690,9 +2690,9 @@ fn xml_body_to_value(
     schema: &Value,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
-    // Bound nesting over the raw bytes first: `roxmltree`'s tokenizer recurses
-    // once per open element, so an unbounded document overflows the worker
-    // stack inside `parse` before any node limit or walk budget is reached.
+    // Bound nesting over the raw bytes first, before any tree is allocated or
+    // walked recursively below (see `xml_bounds` for why this stays a
+    // pre-parse screen).
     if !xml_nesting_depth_within_limit(body, XML_MAX_DEPTH) {
         return Err(XML_DEPTH_DETAIL.to_string());
     }
@@ -2704,6 +2704,8 @@ fn xml_body_to_value(
         roxmltree::ParsingOptions {
             allow_dtd: false,
             nodes_limit: XML_MAX_NODES,
+            // No resolver: an external entity is never fetched or inlined.
+            entity_resolver: None,
         },
     )
     .map_err(|error| format!("Invalid XML body: {}", xml_error_category(&error)))?;
@@ -5775,7 +5777,7 @@ fn xml_attribute_value<'a>(
     match namespace {
         Some(namespace) => node.attribute((namespace, local)),
         // Attributes do not inherit default namespaces; omit => unqualified only.
-        None => node.attribute(local),
+        None => node.unqualified_attribute(local),
     }
 }
 

@@ -690,11 +690,11 @@ impl BodyValidator {
     /// configured `<!ENTITY` declaration cap / nested-entity rejection, outright
     /// rejection of external (`SYSTEM`/`PUBLIC`) identifiers on both the DOCTYPE
     /// and entity declarations, and the shared
-    /// [`xml_nesting_depth_within_limit`] screen — `roxmltree`'s tokenizer
-    /// recurses per nesting level, so a node budget alone cannot keep a deeply
-    /// nested document from overflowing the worker stack inside the parser. The
-    /// parser is then given a node budget so a pathologically wide document
-    /// cannot allocate without bound.
+    /// [`xml_nesting_depth_within_limit`] screen, a fixed nesting ceiling applied
+    /// before any tree is allocated (`roxmltree` before 0.21.2 recursed once
+    /// per nesting level inside the parser; see `xml_bounds`). The parser is
+    /// then given a node budget so a pathologically wide document cannot
+    /// allocate without bound.
     fn validate_xml_body(
         body: &str,
         required_xml_elements: &[RequiredXmlElement],
@@ -710,11 +710,10 @@ impl BodyValidator {
         check_xml_entity_expansion(body, max_entities, reject_nested)?;
 
         // Bound element nesting over the raw bytes before `roxmltree` sees
-        // them: its tokenizer recurses once per open element
-        // (`parse_element` -> `parse_content` -> `parse_element`), so the node
-        // budget below cannot stop a deeply nested document from overflowing
-        // the worker stack *inside* the parser. Under `panic = "abort"` that
-        // would be a process kill on the request path.
+        // them. `roxmltree` 0.21.2+ parses element content iteratively, but
+        // the screen stays the fixed depth ceiling for this path, so a parser
+        // that recursed per level again could not overflow the worker stack
+        // (a process kill under `panic = "abort"`). See `xml_bounds`.
         if !xml_nesting_depth_within_limit(body, XML_MAX_NESTING_DEPTH) {
             return Err(XML_DEPTH_DETAIL.to_string());
         }
@@ -729,6 +728,8 @@ impl BodyValidator {
                 // external entity.
                 allow_dtd: true,
                 nodes_limit: XML_MAX_NODES,
+                // No resolver: an external entity is never fetched or inlined.
+                entity_resolver: None,
             },
         )
         .map_err(|e| format!("Invalid XML: {}", xml_error_category(&e)))?;
