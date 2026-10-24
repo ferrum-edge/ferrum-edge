@@ -37,6 +37,24 @@ pub(super) struct ScanOutcome {
     pub timed_out: bool,
 }
 
+/// Whether a scanned body is the whole representation or only its first
+/// `max_scan_bytes`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum BodyExtent {
+    Complete,
+    Prefix,
+}
+
+impl BodyExtent {
+    pub(super) fn of(truncated: bool) -> Self {
+        if truncated {
+            BodyExtent::Prefix
+        } else {
+            BodyExtent::Complete
+        }
+    }
+}
+
 impl ScanOutcome {
     pub fn push(&mut self, hit: RuleHit) {
         if !self
@@ -285,8 +303,9 @@ impl Waf {
         ctx: &RequestContext,
         body: &[u8],
         content_type: Option<&str>,
+        extent: BodyExtent,
     ) -> ScanOutcome {
-        self.scan_request_body_rules(ScanSubject::Http(ctx), body, content_type)
+        self.scan_request_body_rules(ScanSubject::Http(ctx), body, content_type, extent)
     }
 
     /// Request-side body rule engine, shared by the HTTP final-request-body
@@ -296,8 +315,9 @@ impl Waf {
         subject: ScanSubject<'_>,
         body: &[u8],
         content_type: Option<&str>,
+        extent: BodyExtent,
     ) -> ScanOutcome {
-        self.scan_body_rules(subject, body, content_type, BodyDirection::Request)
+        self.scan_body_rules(subject, body, content_type, BodyDirection::Request, extent)
     }
 
     /// One bounded view policy for both HTTP directions and WS messages.
@@ -308,6 +328,7 @@ impl Waf {
         body: &[u8],
         content_type: Option<&str>,
         direction: BodyDirection,
+        extent: BodyExtent,
     ) -> ScanOutcome {
         let (bytes, text_rules_active) = match direction {
             BodyDirection::Request => (
@@ -338,9 +359,9 @@ impl Waf {
             // They parse every admitted reading of the body — the raw bytes and
             // each UTF-16 / UTF-32 view — since a backend may accept any of
             // them as JSON.
-            self.scan_json_path_rules(&mut outcome, body, subject);
+            self.scan_json_path_rules(&mut outcome, body, subject, extent);
             for decoded in transcoded_views.iter() {
-                self.scan_json_path_rules(&mut outcome, decoded.as_bytes(), subject);
+                self.scan_json_path_rules(&mut outcome, decoded.as_bytes(), subject, extent);
             }
         }
         let text = String::from_utf8_lossy(body);
@@ -443,7 +464,14 @@ impl Waf {
         body: &[u8],
         content_type: Option<&str>,
     ) -> ScanOutcome {
-        self.scan_body_rules(subject, body, content_type, BodyDirection::Response)
+        // `body_json_path` rules are request-only, so the extent is unused.
+        self.scan_body_rules(
+            subject,
+            body,
+            content_type,
+            BodyDirection::Response,
+            BodyExtent::Complete,
+        )
     }
 
     fn scan_text_set(
@@ -512,15 +540,19 @@ impl Waf {
         outcome: &mut ScanOutcome,
         body: &[u8],
         subject: ScanSubject<'_>,
+        extent: BodyExtent,
     ) {
         if self.compiled.body_json_paths.is_empty() {
             return;
         }
         // Duplicate-preserving parse: every occurrence of a repeated member
         // is inspected, so the verdict holds whichever one the backend reads.
-        let Some(json) = json_doc::parse(body) else {
+        let view = json_doc::parse(body);
+        if matches!(view, json_doc::JsonView::Unparsed) {
+            self.push_unparsed_json_hits(outcome, subject, extent);
             return;
-        };
+        }
+        let documents = view.documents();
         for path_rule in &self.compiled.body_json_paths {
             // One hit per rule is all the outcome records. Stop at it, and skip
             // a rule an earlier view already hit, so duplicated members cannot
@@ -532,7 +564,10 @@ impl Waf {
             {
                 continue;
             }
-            'occurrences: for value in json_doc::select(&json, &path_rule.path) {
+            let selected = documents
+                .iter()
+                .flat_map(|document| json_doc::select(document, &path_rule.path));
+            'occurrences: for value in selected {
                 for text in json_doc::scan_texts(value) {
                     let text = text.as_ref();
                     if self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject) {
@@ -548,6 +583,38 @@ impl Waf {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// A view that opens like a JSON object or array but that neither the
+    /// strict nor the lenient reading parses. Backend parsers accept grammar
+    /// `serde_json` refuses — a number beyond the `f64` range, nesting deeper
+    /// than 128 levels, `NaN` / `Infinity`, comments, a trailing comma, text
+    /// after the document — so treating such a view as "nothing selected"
+    /// would let one such token switch every JSON-path rule off. No path can
+    /// be evaluated, so every applicable `body_json_path` rule records a hit
+    /// and its own action, scoring, and paranoia band decide, exactly as for a
+    /// match.
+    ///
+    /// A prefix scan (`on_body_too_large: scan_truncated`, or a non-blocking
+    /// configuration's prefix observation) cuts the document short, so its
+    /// view is unparsed by construction and is not judged here.
+    fn push_unparsed_json_hits(
+        &self,
+        outcome: &mut ScanOutcome,
+        subject: ScanSubject<'_>,
+        extent: BodyExtent,
+    ) {
+        if extent == BodyExtent::Prefix {
+            return;
+        }
+        for path_rule in &self.compiled.body_json_paths {
+            if self.rule_applies(subject, path_rule.rule_index) {
+                outcome.push(RuleHit {
+                    rule_index: path_rule.rule_index,
+                    target_name: path_rule.target_name,
+                });
             }
         }
     }

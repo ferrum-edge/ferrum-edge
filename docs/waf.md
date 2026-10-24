@@ -466,13 +466,32 @@ changed). One such string therefore cannot hide the rest of the
 document from `body_json_path` rules. Only that fallback copies the body; a
 body the strict parser accepts is read in place.
 
-A reading that still does not parse as JSON is not inspected by
-`body_json_path` rules; `body_text` rules, byte rules and the body-scoped
-specials still scan it. That includes grammar some lenient backends accept
-but the WAF's parser refuses, for example numbers beyond the `f64` range,
-nesting deeper than 128 levels, comments, trailing commas, or `NaN`. Pair a
-`body_json_path` rule with a `body_text` rule, or validate the body against a
-schema before it reaches the backend, when such a backend must be protected.
+The lenient reading also accepts several documents separated by whitespace
+(NDJSON, or a document followed by another one): every document is inspected,
+so a backend that reads only the first, only the last, or each of them is
+covered by the same verdict.
+
+A reading that opens like a JSON object or array — after whitespace, `{`
+followed by a quoted member name, `}` or a comment, or `[` followed by a
+value (including `NaN` and `Infinity`), `]` or a comment — but that neither
+reading parses **fails closed**: every applicable `body_json_path` rule
+records a hit, and that rule's own action, paranoia band and anomaly-score
+contribution decide, exactly as for a match: in `mode: monitor`, or for a
+`monitor` rule without anomaly scoring, it is only observed. The rule's
+`conditions` and request-wide exemptions still apply; value filters
+(`fp_filters`, global value exemptions) are not consulted because no value
+was selected. Backend parsers accept grammar the WAF's parser refuses —
+numbers beyond the `f64` range, nesting deeper than 128 levels, `NaN` /
+`Infinity`, comments, trailing commas, text after the document — so treating
+such a body as having nothing to select would let one such token switch every
+JSON-path rule off. The rule is judged per reading, so the raw bytes of a
+UTF-16 / UTF-32 document (a NUL follows the bracket) and text that merely
+starts with a bracket (`[INFO] …`) are not taken for a document. A body
+scanned only up to `max_scan_bytes` (`on_body_too_large: scan_truncated`, or a
+prefix scan in a configuration that cannot block) is cut short by
+construction and is not judged this way. A body that does not open like a
+JSON object or array is not inspected by `body_json_path` rules; `body_text`
+rules, byte rules and the body-scoped specials scan every body either way.
 
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).

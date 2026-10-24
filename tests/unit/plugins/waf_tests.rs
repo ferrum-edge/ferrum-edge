@@ -1292,6 +1292,248 @@ async fn body_json_path_rule_inspects_bodies_with_invalid_utf8_strings() {
     assert_json_path_verdicts(&plugin, "application/json", &forbidden, &benign).await;
 }
 
+/// JSON documents `serde_json` refuses even on the lenient reading, while
+/// common backend parsers accept them (`json.loads` takes `NaN`, `Infinity`
+/// and `1e400`; Jackson stops after the first document and allows a nesting
+/// depth far past 128; JSON5-style readers take comments and trailing commas).
+/// Every one carries only the benign `ordinary` value at `user.bio`.
+fn json_documents_the_parser_refuses() -> Vec<String> {
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    vec![
+        r#"{"user":{"bio":"ordinary"},"n":1e400}"#.to_string(),
+        r#"{"user":{"bio":"ordinary"},"n":-1e999}"#.to_string(),
+        format!(r#"{{"user":{{"bio":"ordinary"}},"pad":{deep}}}"#),
+        format!(r#"{{"pad":{deep},"user":{{"bio":"ordinary"}}}}"#),
+        r#"{"user":{"bio":"ordinary"},"n":NaN}"#.to_string(),
+        r#"[NaN,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        r#"[Infinity,{"user":{"bio":"ordinary"}}]"#.to_string(),
+        r#"{"user":{"bio":"ordinary"},}"#.to_string(),
+        r#"{/* c */"user":{"bio":"ordinary"}}"#.to_string(),
+        r#"[// c
+{"user":{"bio":"ordinary"}}]"#
+            .to_string(),
+        r#"{"user":{"bio":"ordinary"}} trailing"#.to_string(),
+        r#"{'user':{'bio':'ordinary'}}"#.to_string(),
+        "  \r\n\t{\"user\":{\"bio\":\"ordinary\"},\"n\":1e400}".to_string(),
+        // An unpaired surrogate (repaired by the lenient reading) does not
+        // rescue a document that is refused for another reason.
+        r#"{"pad":"\ud800","user":{"bio":"ordinary"},"n":1e400}"#.to_string(),
+    ]
+}
+
+#[tokio::test]
+async fn body_json_path_rule_fails_closed_on_json_the_parser_refuses() {
+    // No path can be evaluated on these readings, so leaving them uninspected
+    // would let one such token switch every JSON-path rule off while the
+    // backend reads `user.bio`. The applicable rule records a hit instead.
+    let plugin = enforcing_json_path_waf(false);
+    let refused = json_documents_the_parser_refuses();
+    let as_bytes: Vec<Vec<u8>> = refused
+        .iter()
+        .map(|body| body.as_bytes().to_vec())
+        .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &as_bytes, &[]).await;
+    // The declared content type plays no part: a backend that parses the raw
+    // body regardless of its label reads these too.
+    assert_json_path_verdicts(&plugin, "text/plain", &as_bytes, &[]).await;
+    let with_utf8_bom: Vec<Vec<u8>> = as_bytes
+        .iter()
+        .map(|body| with_bom(&[0xEF, 0xBB, 0xBF], body))
+        .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &with_utf8_bom, &[]).await;
+
+    // Each UTF-16 / UTF-32 reading is judged the same way.
+    let wide: [(&str, BodyEncoder); 6] = [
+        ("application/json; charset=utf-16le", |t| {
+            encode_utf16(t, false)
+        }),
+        ("application/json; charset=utf-16be", |t| {
+            encode_utf16(t, true)
+        }),
+        ("application/json", |t| {
+            with_bom(UTF16_LE_BOM, &encode_utf16(t, false))
+        }),
+        ("application/json", |t| encode_utf16(t, true)),
+        ("application/json; charset=utf-32be", |t| {
+            encode_utf32(t, true)
+        }),
+        ("application/json", |t| {
+            with_bom(UTF32_LE_BOM, &encode_utf32(t, false))
+        }),
+    ];
+    for (content_type, encode) in wide {
+        let encoded: Vec<Vec<u8>> = refused.iter().map(|body| encode(body)).collect();
+        assert_json_path_verdicts(&plugin, content_type, &encoded, &[]).await;
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_refused_json_is_decided_like_a_rule_match() {
+    // A refused reading is a hit on the rule, so a monitoring instance only
+    // observes it and the request continues.
+    let plugin = waf(json!({
+        "mode": "monitor",
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    for body in json_documents_the_parser_refuses() {
+        let (result, ctx) =
+            scan_body_with_content_type(&plugin, "application/json", body.as_bytes()).await;
+        assert!(matches!(result, PluginResult::Continue), "{body:?}");
+        assert_eq!(
+            ctx.metadata.get("waf.rule_hits").map(String::as_str),
+            Some("CUSTOM-JSON-CANARY"),
+            "{body:?} must be observed"
+        );
+    }
+
+    // `conditions` still scope the rule: out of scope, nothing is recorded.
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce",
+            "conditions": { "paths": ["/admin"] }
+        }]
+    }))
+    .unwrap();
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"ordinary"},"n":1e400}"#,
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+}
+
+#[tokio::test]
+async fn body_json_path_rule_ignores_bodies_that_do_not_open_like_json() {
+    // Only a reading that opens like a JSON object or array is judged; other
+    // bodies have nothing for a JSON-path rule to select and pass as before.
+    let plugin = enforcing_json_path_waf(false);
+    let benign: Vec<Vec<u8>> = [
+        b"user.bio=forbidden-canary".as_slice(),
+        b"[INFO] forbidden-canary",
+        b"[Note] {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"{{user.bio}} forbidden-canary",
+        b"{not json",
+        b"<user><bio>forbidden-canary</bio></user>",
+        b"forbidden-canary",
+        b"[",
+        b"{",
+        b"   ",
+        b"",
+        b"42",
+        b"\"forbidden-canary\"",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    for content_type in ["application/json", "text/plain"] {
+        assert_json_path_verdicts(&plugin, content_type, &[], &benign).await;
+    }
+}
+
+#[tokio::test]
+async fn body_json_path_rule_inspects_every_document_of_a_sequence() {
+    // Whitespace-separated documents (NDJSON, or a document followed by
+    // another that a first-value reader stops before) are all inspected.
+    let plugin = enforcing_json_path_waf(false);
+    let forbidden: Vec<Vec<u8>> = [
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"user\":{\"bio\":\"forbidden-canary\"}}\n"
+            .as_slice(),
+        b"{\"user\":{\"bio\":\"forbidden-canary\"}}\n{\"user\":{\"bio\":\"ordinary\"}}",
+        b"{\"user\":{\"bio\":\"forbidden-canary\"}}{\"user\":{\"bio\":\"ordinary\"}}",
+        b"[1] {\"user\":{\"bio\":\"forbidden-canary\"}}",
+        b"{\"pad\":\"\\ud800\"}\r\n{\"user\":{\"bio\":\"forbidden-canary\"}}",
+        // One refused document makes the whole sequence refused.
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"n\":1e400}",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    let benign: Vec<Vec<u8>> = [
+        b"{\"user\":{\"bio\":\"ordinary\"}}\n{\"user\":{\"bio\":\"fine\"}}\n".as_slice(),
+        b"{\"user\":{\"bio\":\"ordinary\"}}{\"other\":1}",
+        b"{\"user\":{\"bio\":\"ordinary\"}}  \n  ",
+    ]
+    .iter()
+    .map(|body| body.to_vec())
+    .collect();
+    assert_json_path_verdicts(&plugin, "application/json", &forbidden, &benign).await;
+    let encoded = |bodies: &[Vec<u8>]| -> Vec<Vec<u8>> {
+        bodies
+            .iter()
+            .map(|body| encode_utf16(std::str::from_utf8(body).unwrap(), false))
+            .collect()
+    };
+    assert_json_path_verdicts(
+        &plugin,
+        "application/json; charset=utf-16le",
+        &encoded(&forbidden[..]),
+        &encoded(&benign[..]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn body_json_path_prefix_scan_does_not_judge_the_cut_document() {
+    // A prefix scan cuts a valid document short by construction, so the
+    // documented `scan_truncated` opt-out keeps forwarding it rather than
+    // treating the cut as a refused document.
+    let plugin = waf(json!({
+        "include_default_rules": false,
+        "max_scan_bytes": 1024,
+        "on_body_too_large": "scan_truncated",
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let body = format!(
+        r#"{{"user":{{"bio":"ordinary"}},"pad":"{}"}}"#,
+        "x".repeat(4096)
+    );
+    let (result, ctx) =
+        scan_body_with_content_type(&plugin, "application/json", body.as_bytes()).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!ctx.metadata.contains_key("waf.rule_hits"));
+    assert_eq!(
+        ctx.metadata.get("waf.scan_truncated").map(String::as_str),
+        Some("true")
+    );
+
+    // The whole body fits: the same refused grammar is judged.
+    let (result, ctx) = scan_body_with_content_type(
+        &plugin,
+        "application/json",
+        br#"{"user":{"bio":"ordinary"},"n":1e400}"#,
+    )
+    .await;
+    assert!(json_path_rule_hit(&result, &ctx));
+}
+
 #[tokio::test]
 async fn body_luhn_and_cidr_rules_scan_decoded_variants() {
     let plugin = waf(json!({

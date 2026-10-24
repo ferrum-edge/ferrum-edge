@@ -40,7 +40,7 @@ use self::rules::{
     CompiledRule, CompiledRules, ParanoiaLevels, RuleAction, RuleHit, RuleTarget, Severity,
     WafRule, compile_rules, parse_custom_rule, parse_rule_action, parse_rule_overrides,
 };
-use self::scan::ScanOutcome;
+use self::scan::{BodyExtent, ScanOutcome};
 use self::stream::{
     StreamWafConfig, TLS_CLIENT_HELLO_MIN_PREFIX, looks_like_tls_client_hello, parse_stream_config,
 };
@@ -2022,7 +2022,9 @@ impl Plugin for Waf {
         };
         let content_type = headers.get("content-type").map(String::as_str);
         let mut outcome = self
-            .run_body_scan_with_budget(|| self.run_request_body_scan(ctx, body, content_type))
+            .run_body_scan_with_budget(|| {
+                self.run_request_body_scan(ctx, body, content_type, BodyExtent::of(truncated))
+            })
             .await;
         outcome.truncated = truncated;
         // Read only by `on_scan_timeout: fail_closed`, and evaluated only on the

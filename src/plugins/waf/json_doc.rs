@@ -18,6 +18,10 @@
 //! for invalid UTF-8.
 //! A view refused for only those reasons is re-read leniently (see [`parse`]),
 //! so one such string cannot hide the rest of the document from inspection.
+//! A view holding several whitespace-separated documents is read as all of
+//! them, and a view that opens like a JSON object or array but still cannot
+//! be read is reported as [`JsonView::Unparsed`] so the caller can fail closed
+//! instead of treating it as having nothing to inspect.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -42,27 +46,115 @@ pub(super) enum JsonNode {
     Object(Vec<(String, JsonNode)>),
 }
 
+/// How one inspection view reads as JSON.
+pub(super) enum JsonView {
+    /// One document: the strict parse accepted the view.
+    Document(JsonNode),
+    /// Every document of a view the strict parse refused but the lenient
+    /// reading accepts: one, or several separated by whitespace (NDJSON, or a
+    /// document followed by another that a first-value reader such as Jackson
+    /// stops before).
+    Documents(Vec<JsonNode>),
+    /// The view opens like a JSON object or array (see
+    /// [`opens_like_json_container`]) but no reading of it parses.
+    Unparsed,
+    /// The view does not open like a JSON object or array.
+    NotJson,
+}
+
+impl JsonView {
+    /// The parsed documents, in source order; empty unless the view parsed.
+    pub(super) fn documents(&self) -> &[JsonNode] {
+        match self {
+            JsonView::Document(document) => std::slice::from_ref(document),
+            JsonView::Documents(documents) => documents,
+            JsonView::Unparsed | JsonView::NotJson => &[],
+        }
+    }
+}
+
 /// Parse one inspection view. A leading byte-order mark is skipped.
 ///
-/// A view the strict parse accepts is parsed in place, with no copy. When it
-/// is refused, the view is re-read the way lenient parsers read it: invalid
-/// UTF-8 decodes to `U+FFFD`, and every `\u` escape naming an unpaired
-/// surrogate (`\uD800`–`\uDFFF` not forming a high-then-low pair) becomes
-/// `\uFFFD`. Only that failure path allocates, and only when there is
-/// something to repair; a view that is still refused, or that needed no
-/// repair, yields `None`.
-pub(super) fn parse(bytes: &[u8]) -> Option<JsonNode> {
+/// A view the strict parse accepts is parsed in place, with no copy and no
+/// further work. When it is refused, a view that does not open like a JSON
+/// object or array is [`JsonView::NotJson`] without any further pass. One
+/// that does is re-read the way lenient parsers read it: invalid UTF-8
+/// decodes to `U+FFFD`, every `\u` escape naming an unpaired surrogate
+/// (`\uD800`–`\uDFFF` not forming a high-then-low pair) becomes `�`, and
+/// every document of a whitespace-separated sequence is read. Only that
+/// failure path copies the view, and only when there is something to repair.
+/// A view that is still refused — for example a number beyond the `f64`
+/// range, nesting deeper than `serde_json`'s 128 levels, `NaN`, a comment, a
+/// trailing comma, or trailing text after a document — is
+/// [`JsonView::Unparsed`].
+pub(super) fn parse(bytes: &[u8]) -> JsonView {
     let bytes = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
     if let Ok(document) = serde_json::from_slice(bytes) {
-        return Some(document);
+        return JsonView::Document(document);
+    }
+    if !opens_like_json_container(bytes) {
+        return JsonView::NotJson;
     }
     let text = String::from_utf8_lossy(bytes);
     let repaired = replace_unpaired_surrogate_escapes(&text);
-    if matches!((&text, &repaired), (Cow::Borrowed(_), Cow::Borrowed(_))) {
-        // Nothing lenient parsers read differently: the refusal stands.
-        return None;
+    match parse_document_sequence(&repaired) {
+        Some(documents) => JsonView::Documents(documents),
+        None => JsonView::Unparsed,
     }
-    serde_json::from_str(&repaired).ok()
+}
+
+/// Every document of a whitespace-separated sequence, or `None` when any of
+/// them fails to parse or there is none. Each document is parsed once, so the
+/// cost stays linear in the view.
+fn parse_document_sequence(text: &str) -> Option<Vec<JsonNode>> {
+    let mut documents = Vec::new();
+    for document in serde_json::Deserializer::from_str(text).into_iter::<JsonNode>() {
+        documents.push(document.ok()?);
+    }
+    (!documents.is_empty()).then_some(documents)
+}
+
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Whether a view opens like a JSON object or array as a parser — strict or
+/// lenient — reads one: after JSON whitespace, `{` followed by a member name
+/// (double- or single-quoted), `}` or a comment, or `[` followed by a value
+/// (including `NaN` and `Infinity`), `]` or a comment.
+///
+/// This decides whether a view the WAF cannot parse is a document it failed
+/// to inspect or simply not JSON. The second token is required so that text
+/// which merely starts with a bracket (`[INFO] …`), and the raw bytes of a
+/// UTF-16 / UTF-32 document (a NUL follows the bracket), are not taken for a
+/// JSON document; their transcoded views are judged on their own.
+fn opens_like_json_container(bytes: &[u8]) -> bool {
+    let mut tokens = bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| !is_json_whitespace(**byte));
+    let (Some((_, &open)), Some((at, &next))) = (tokens.next(), tokens.next()) else {
+        return false;
+    };
+    let rest = &bytes[at..];
+    let comment = rest.starts_with(b"/*") || rest.starts_with(b"//");
+    match open {
+        b'{' => matches!(next, b'"' | b'\'' | b'}') || comment,
+        b'[' => {
+            matches!(next, b'{' | b'[' | b']' | b'"' | b'\'' | b'-' | b'0'..=b'9')
+                || [
+                    b"true".as_slice(),
+                    b"false".as_slice(),
+                    b"null".as_slice(),
+                    b"NaN".as_slice(),
+                    b"Infinity".as_slice(),
+                ]
+                .iter()
+                .any(|literal| rest.starts_with(literal))
+                || comment
+        }
+        _ => false,
+    }
 }
 
 /// Rewrite every `\u` escape that names an unpaired UTF-16 surrogate to
@@ -350,8 +442,11 @@ mod tests {
     use super::*;
 
     fn texts(body: &[u8], path: &[JsonPathSegment]) -> Vec<Vec<String>> {
-        let doc = parse(body).expect("valid JSON");
-        select(&doc, path)
+        let view = parse(body);
+        let [doc] = view.documents() else {
+            panic!("expected exactly one JSON document");
+        };
+        select(doc, path)
             .into_iter()
             .map(|node| scan_texts(node).into_iter().map(Cow::into_owned).collect())
             .collect()
@@ -419,7 +514,8 @@ mod tests {
     #[test]
     fn byte_order_mark_is_skipped_and_malformed_input_is_rejected() {
         assert_eq!(texts(b"\xEF\xBB\xBF{\"k\":\"v\"}", &[key("k")]), [["v"]]);
-        assert!(parse(b"{\"k\":").is_none());
-        assert!(parse(b"{\"k\":1} trailing").is_none());
+        assert!(matches!(parse(b"{\"k\":"), JsonView::Unparsed));
+        assert!(matches!(parse(b"{\"k\":1} trailing"), JsonView::Unparsed));
+        assert!(matches!(parse(b"k=v"), JsonView::NotJson));
     }
 }
