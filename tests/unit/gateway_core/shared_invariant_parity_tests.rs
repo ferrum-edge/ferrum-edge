@@ -340,13 +340,13 @@ const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str, &str)] = &[
         "explicit gateway-side refusal",
         "    pub fn release_neutral(&self) {",
         "\n    }\n",
-        "record_neutral_for_admission(true, self.admission_generation)",
+        "record_neutral_for_admission(true, admission_generation)",
     ),
     (
         "dropped future (client disconnect)",
         "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
-        "record_neutral_for_admission(true, self.admission_generation)",
+        "record_neutral_for_admission(true, admission_generation)",
     ),
     (
         "gRPC streaming recorder handoff",
@@ -486,6 +486,201 @@ fn taking_the_probe_slot_is_what_disarms_the_guard() {
         "the guard's `Drop` must claim the slot with the same atomic swap so it \
          cannot race an explicit release"
     );
+}
+
+/// Issue #6799: only admission (`CircuitBreakerCache::can_execute`, inside
+/// `src/circuit_breaker.rs`) may resolve — and, on a config change, replace — a
+/// cached breaker. Every completion settles on the breaker instance its
+/// admission returned (`HalfOpenProbeGuard`), checked for identity with
+/// `CircuitBreakerCache::is_current`, so a request's captured config can never
+/// replace live state or settle on an instance it never ran against.
+///
+/// Receiver-agnostic: ANY `.get_or_create(` / `::get_or_create(` call outside
+/// `src/circuit_breaker.rs` fails, whatever the receiver is called and however
+/// rustfmt breaks the line. Identifiers that merely start with the name
+/// (`get_or_create_sender(`) do not match.
+#[test]
+fn no_breaker_completion_path_uses_the_replacing_lookup() {
+    for (path, text) in production_sources() {
+        if path == "src/circuit_breaker.rs" {
+            continue;
+        }
+        let production: String = without_inline_test_module(&text)
+            .split_whitespace()
+            .collect();
+        for replacing in [".get_or_create(", "::get_or_create("] {
+            assert!(
+                !production.contains(replacing),
+                "{path} calls `{replacing}`; completions must settle on the breaker their \
+                 admission returned (`HalfOpenProbeGuard::current_breaker` / `settle`), and \
+                 only admissions (`can_execute`) may resolve a breaker"
+            );
+        }
+    }
+    let shared_recorder = source("src/proxy/backend_dispatch.rs");
+    let recorder: String = item_body(
+        &shared_recorder,
+        "fn record_backend_outcome_inner(",
+        "\n}\n",
+    )
+    .split_whitespace()
+    .collect();
+    assert!(
+        recorder.contains("cb_settlement.breaker")
+            && recorder.contains("circuit_breaker_cache.is_current("),
+        "the shared ordinary-completion recorder must settle on the admitting breaker, \
+         checked for identity with `is_current`"
+    );
+}
+
+/// Issue #6799 (sibling): every HTTP/3 native and cross-protocol retry loop
+/// admits each retry attempt through the breaker of the target it will dial,
+/// in the H1/H2 retry loops' order: AFTER the backoff sleep (so no probe slot is
+/// held across it and a cooldown that ends during it admits the retry as a
+/// recovery probe) and after the rotated target's policy/transport screens,
+/// immediately before the attempt is handed on. Without it a rotated target that
+/// was never admitted has no cached breaker, so its failures never open it.
+///
+/// `(file, function, admissions, screens that must precede each admission
+/// since its backoff, what must follow it before the next backoff)`.
+type RetryAdmissionSite = (
+    &'static str,
+    &'static str,
+    usize,
+    &'static [&'static str],
+    &'static str,
+);
+const RETRY_ADMISSION_SITES: &[RetryAdmissionSite] = &[
+    // Native H3 buffered retry loop.
+    (
+        "src/http3/server.rs",
+        "async fn handle_h3_request(",
+        1,
+        &[
+            "denied_literal_backend_or_dns_override(",
+            "h3_bridge_transport_refusal(",
+        ],
+        "run_h3_backend_admission_or_send_reject(",
+    ),
+    // H3 -> HTTP plain bridge: mesh arm plus the reqwest success / error arms.
+    // Each arm keeps the attempt it is about to replace until the admission,
+    // so a refusal can serve it; the next attempt starts at `continue`.
+    (
+        "src/http3/cross_protocol.rs",
+        "async fn dispatch_plain<S>(",
+        3,
+        &[],
+        "continue;",
+    ),
+    // H3 -> gRPC bridge buffered retry loop.
+    (
+        "src/http3/cross_protocol.rs",
+        "async fn dispatch_grpc<S>(",
+        1,
+        &["resolve_h3_grpc_transport("],
+        "run_cross_protocol_backend_admission_or_reject(",
+    ),
+];
+
+#[test]
+fn every_http3_retry_loop_admits_each_attempt_through_the_circuit_breaker() {
+    let call = "crate::proxy::admit_retry_attempt(";
+    let backoff = "tokio::time::sleep(delay)";
+    for &(file, signature, expected, screens, handoff) in RETRY_ADMISSION_SITES {
+        let text = source(file);
+        let body: String = item_body(&text, signature, "\n}\n")
+            .split_whitespace()
+            .collect();
+        let admissions: Vec<usize> = body.match_indices(call).map(|(at, _)| at).collect();
+        assert_eq!(
+            admissions.len(),
+            expected,
+            "{file} `{signature}` must admit every retry attempt through the breaker"
+        );
+        for at in admissions {
+            let args = body[at + call.len()..]
+                .split_once("cb_probe")
+                .map(|(args, _)| args);
+            assert!(
+                args.is_some_and(|args| args.len() < 80),
+                "{file} `{signature}`: each retry admission must re-point the request's \
+                 probe guard (`cb_probe`)"
+            );
+            let slept = body[..at]
+                .rfind(backoff)
+                .unwrap_or_else(|| panic!("{file} `{signature}`: admission precedes any backoff"));
+            let since_backoff = &body[slept..at];
+            assert!(
+                !since_backoff.contains("continue;") && !since_backoff.contains("retry_delay("),
+                "{file} `{signature}`: the admission must follow THIS attempt's backoff"
+            );
+            for screen in screens {
+                assert!(
+                    since_backoff.contains(screen),
+                    "{file} `{signature}`: `{screen}` must screen the rotated target \
+                     before the breaker admits it"
+                );
+            }
+            let after = &body[at..];
+            let next_backoff = after.find(backoff).unwrap_or(after.len());
+            assert!(
+                after[..next_backoff].contains(handoff),
+                "{file} `{signature}`: `{handoff}` must follow the admission before the \
+                 next backoff"
+            );
+        }
+    }
+    let admission = source("src/proxy/mod.rs");
+    let helper = item_body(&admission, "pub(crate) fn admit_retry_attempt(", "\n}\n");
+    assert!(helper.contains("circuit_breaker_cache.can_execute("));
+    assert!(helper.contains("cb_probe.rearm(&cb, is_half_open_probe, admission_generation)"));
+    assert!(helper.contains("cb_probe.retire()"));
+}
+
+/// Issue #6799 (sibling): the synchronous fallbacks that record a deferred
+/// streaming outcome whose body an `after_proxy` reject replaced must record it
+/// on the admitting breaker, through the one shared helper. An empty
+/// `BreakerSettlement` there silently drops the only breaker record the
+/// attempt gets. Every production recorder call that passes an empty
+/// settlement must also skip the breaker outright.
+#[test]
+fn replaced_streaming_outcomes_record_on_the_admitting_breaker() {
+    let proxy = source("src/proxy/mod.rs");
+    let production = without_inline_test_module(&proxy);
+    assert_eq!(
+        production
+            .matches("backend_dispatch::record_replaced_streaming_outcome(")
+            .count(),
+        2,
+        "the H1/H2 streaming and the buffered-request gRPC after_proxy fallbacks"
+    );
+    let helper_source = source("src/proxy/backend_dispatch.rs");
+    let helper = item_body(
+        &helper_source,
+        "pub(crate) fn record_replaced_streaming_outcome(",
+        "\n}\n",
+    );
+    assert!(helper.contains("cb_probe.settlement_without_slot()"));
+
+    for (path, text) in production_sources() {
+        let production: String = without_inline_test_module(&text)
+            .split_whitespace()
+            .collect();
+        for call in production
+            .split("record_backend_outcome_no_conn_end(")
+            .skip(1)
+        {
+            // The call's own arguments end at its closing `);`.
+            let args = call.split(");").next().unwrap_or_default();
+            if let Some((_, after_empty)) = args.split_once("BreakerSettlement::none(),") {
+                assert!(
+                    after_empty.starts_with("true,"),
+                    "{path}: a recorder call with an empty settlement must skip the breaker \
+                     (`true`); pass the attempt guard's settlement instead"
+                );
+            }
+        }
+    }
 }
 
 fn probe_breaker_config() -> CircuitBreakerConfig {

@@ -1080,6 +1080,10 @@ fn xml_error_category_maps_representative_variants_to_fixed_text() {
             "document ended before markup was complete",
             XmlError::UnexpectedEndOfStream,
         ),
+        (
+            "external entity could not be resolved",
+            XmlError::EntityResolver(pos, CANARY.to_string()),
+        ),
     ];
     for (expected, error) in cases {
         let category = xml_error_category(error);

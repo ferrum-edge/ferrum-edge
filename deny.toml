@@ -62,21 +62,15 @@ ignore = [
     # private-key operations. There is still no fixed release: RustSec lists
     # `patched = []`; rsa 0.9.10 is the latest stable and 0.10.0-rc.18 (the
     # latest pre-release, already required by sqlx 0.9.0) is still affected
-    # (checked 2026-09-24). Two parents reach it:
+    # (checked 2026-09-24). One parent reaches it:
     #   - sqlx-mysql 0.8.6 uses only `RsaPublicKey` OAEP *encryption* of the
     #     password for MySQL `sha256_password` / `caching_sha2_password` over a
     #     non-TLS link. That is a public-key operation, so the timing leak is not
     #     reachable there, and FERRUM_DB_TLS_MODE avoids the exchange entirely.
-    #   - jsonwebtoken 10's `rust_crypto` backend, selected by the default
-    #     `crypto-ring` profile (`fips` selects `aws_lc_rs` instead). RS*/PS*
-    #     verification is a public-key operation, but RSA *signing* of outbound
-    #     client assertions (`private_key_jwt` in oidc_relying_party and
-    #     oauth2_introspection, ai_federation service-account JWTs) runs on the
-    #     non-constant-time implementation. For oidc_relying_party and
-    #     oauth2_introspection, EC/EdDSA assertion keys or the `fips` profile
-    #     avoid it. ai_federation always signs RS256 (GCP service-account keys
-    #     are RSA), so only the `fips` profile avoids it there.
-    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no fixed release (patched = [], 0.9.10 latest stable, 0.10.0-rc.18 still affected, checked 2026-09-24). sqlx-mysql does public-key encryption only; jsonwebtoken rust_crypto (crypto-ring profile) signs RSA client assertions (avoided with EC/EdDSA keys or the fips profile for oidc_relying_party/oauth2_introspection; ai_federation always signs RS256, so only fips avoids it there). Re-evaluate on an rsa fix. [expires:2026-12-31]" },
+    # jsonwebtoken no longer reaches it: its backend is `aws_lc_rs` on both
+    # profiles (Cargo.toml, 2026-10-24), so RSA signing of outbound client
+    # assertions and ai_federation service-account JWTs runs on AWS-LC.
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 Marvin timing side-channel; no fixed release (patched = [], 0.9.10 latest stable, 0.10.0-rc.18 still affected, checked 2026-09-24). Only sqlx-mysql reaches it, for public-key OAEP encryption of the MySQL password (no private-key operation). jsonwebtoken uses aws_lc_rs on both profiles, so no RSA signing runs on this crate. Re-evaluate on an rsa fix. [expires:2026-12-31]" },
 
     # ── paste 1.0.15 — RUSTSEC-2024-0436, unmaintained (repository archived).
     # A proc-macro only: it runs at compile time and has no runtime or network

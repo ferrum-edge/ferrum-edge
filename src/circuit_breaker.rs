@@ -812,7 +812,11 @@ impl CircuitBreakerCache {
     /// `target_key` should be `Some("host:port")` when the request resolved to
     /// a concrete upstream target or direct backend override, and `None` when a
     /// direct backend proxy should use one breaker for the proxy.
-    /// If the config has changed, replaces the breaker with a fresh one.
+    /// If the config has changed, replaces the breaker with a fresh one. That
+    /// replacement belongs to ADMISSION only: a request completion settles on
+    /// the breaker instance its admission returned, checked with
+    /// [`is_current`](Self::is_current), and never resolves a breaker again
+    /// from its captured (possibly older) config.
     ///
     /// Concurrent callers for the same key/config generation receive the same
     /// `Arc`. New distinct keys are admitted only while under `max_entries`;
@@ -926,6 +930,37 @@ impl CircuitBreakerCache {
             self.breakers
                 .get(key.as_str())
                 .map(|entry| entry.value().clone())
+        })
+    }
+
+    /// Whether `admitted` — the breaker instance that admitted a request — is
+    /// still the one cached for this proxy (+target), compared by identity.
+    ///
+    /// Admission ([`can_execute`](Self::can_execute)) replaces a cached breaker
+    /// whose config differs, so a configuration change starts a fresh breaker
+    /// at the next admission. A completion must settle on the exact breaker
+    /// that admitted it: resolving it again by its captured config would either
+    /// replace the live (possibly OPEN) breaker with a fresh CLOSED one (#6799)
+    /// or, after an A→B→A reload or a prune that recreated the key with the same
+    /// config, settle on a NEW instance it never ran against. A completion whose
+    /// admitting breaker is no longer cached is stale: its outcome is discarded
+    /// and any probe slot it holds is released on the admitting breaker itself.
+    ///
+    /// This is a shard read with the thread-local key buffer, like a
+    /// `get_or_create` hit: no allocation and no write lock.
+    pub fn is_current(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+        target_key: Option<&str>,
+        admitted: &Arc<CircuitBreaker>,
+    ) -> bool {
+        CB_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_circuit_breaker_key(&mut key, namespace, proxy_id, target_key);
+            self.breakers
+                .get(key.as_str())
+                .is_some_and(|entry| Arc::ptr_eq(entry.value(), admitted))
         })
     }
 

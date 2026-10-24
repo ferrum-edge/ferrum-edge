@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
+  element content iteratively instead of recursing once per nesting level, so
+  the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
+  stack on a 199-level document the `openapi_validator` depth screen admits).
+  The 256-level pre-parse nesting screen in `body_validator`,
+  `soap_ws_security` and `openapi_validator` is unchanged. 0.21 also makes
+  `Node::attribute("ID")` return the first attribute with that local name in
+  any namespace, so `soap_ws_security` (WS-Security, SAML and XML-Signature
+  `ID`, `URI`, `Algorithm`, `Type`, validity and confirmation attributes) and
+  `openapi_validator` (attributes without `xml.namespace`) now read only the
+  unqualified attribute: a prefixed look-alike such as `x:ID` or `x:Type`
+  placed first cannot stand in for it. The XML parsers pass no
+  external-entity resolver.
+- **JWT signing and verification run on AWS-LC in the default build.**
+  `jsonwebtoken` now selects its `aws_lc_rs` backend inline on both profiles
+  instead of `rust_crypto` on the default `crypto-ring` profile; a `fips` build
+  still routes it onto the validated module. This removes the RustCrypto
+  `p256`/`p384` 0.13 → `crypto-bigint` 0.5.5 signers (RUSTSEC-2026-0387) that
+  minted ES256 JWT-SVIDs and ES256/ES384 `private_key_jwt` client assertions,
+  and the RustCrypto `rsa` signer (RUSTSEC-2023-0071) used for RS* assertions
+  and `ai_federation` service-account JWTs. RSA keys must now be 2048–8192
+  bits for **verification as well as signing**:
+  - `oidc_relying_party` and `oauth2_introspection` trial-sign their
+    assertion key at config load, so a shorter key is refused there.
+  - `jwks_auth`, OIDC and mesh `RequestAuthentication` JWKS keys and JWT-SVID
+    authorities already enforced 2048–8192 bits.
+  - CP/DP trust-bundle (`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`) RSA public keys
+    outside the range are now refused at load and reload, with the size named.
+    A refused reload keeps the previous verifier.
+  - A DPoP proof whose RSA `jwk` is outside the range is refused as
+    `invalid_dpop_proof` ("DPoP RSA key must be 2048-8192 bits") before its
+    signature is checked.
+  - An `ai_federation` service-account key outside the range would fail on
+    first token exchange. GCP issues 2048-bit keys.
+  ECDSA signatures are randomized rather than RFC 6979 deterministic; both are
+  valid ES256/ES384.
 - **Backend pools keep up to 256 idle connections per host by default**
   (issue #6793), up from 64. `FERRUM_POOL_MAX_IDLE_PER_HOST` is a ceiling, not
   a reservation: a pool keeps only connections that concurrent requests opened,
@@ -135,6 +171,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source-scope behaviour. A body-inspecting CUSTOM rule carried only by that
   inventory buffers (and size-limits) only requests whose scope its policy
   selects.
+- **Stale request completions no longer reset a reloaded circuit breaker**
+  (issue #6799). A request completes with the breaker config it was admitted
+  under. When that config had since been reloaded, every completion recorder
+  (H1/H2 buffered and retry paths, WebSocket, gRPC, HTTP/3, HBONE, TCP, UDP
+  and DTLS) treated the older config as a change. It replaced the live
+  breaker, possibly OPEN, with a fresh CLOSED one, and the next admission
+  replaced it again. The new breaker's failures and open state were lost and
+  traffic was re-admitted. Each attempt now keeps the breaker instance its
+  admission returned, CLOSED admissions included, and settles its outcome and
+  probe slot on that instance only while it is still the cached breaker
+  (`CircuitBreakerCache::is_current`). A completion whose breaker was replaced
+  is dropped, including after an A→B→A reload or a prune that recreated the
+  key with the same config. Any probe slot it holds is returned on the
+  breaker that admitted it. Admission still replaces a breaker whose config
+  changed. HTTP/3 native and cross-protocol (HTTP and gRPC bridge) retries now
+  admit every attempt through the target's breaker, as the HTTP/1.1 and
+  HTTP/2 retry loops do: after the backoff, just before dispatch. A breaker
+  still OPEN at that point refuses the retry, and a rotated target that was
+  never admitted before now has its failures recorded.
 - **A direct HTTP/1.1 check-in racing a drain no longer lands in the drained
   pool** (issue #6793). A drain now marks the backend's lane retired under the
   lane lock, and check-in reads that mark under the same lock. A connection
@@ -144,6 +199,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drain, or a checkout that found the lane just before it was withdrawn, could
   leave the connection in the withdrawn lane, uncounted, until the last
   in-flight request on that lane finished.
+- **Checkout credential verifier reads nested step values** (issue #6688).
+  `verify_workflow_permissions.py` checked only the top-level keys of an
+  `actions/checkout` step for a value left open across lines, so an
+  unterminated quoted value under the step's `env:` could swallow later lines
+  that only looked like `with: persist-credentials: false`, or like a new
+  `- ` step that hid the real step's start. The verifier now decides on a
+  real YAML parse (PyYAML, required). It walks `jobs.<job>.steps` and
+  `runs.steps` and requires each checkout's parsed `with` to hold exactly one
+  `persist-credentials` with the text `false`. It refuses anchors, aliases,
+  tags, merge and duplicate keys, case variants of the input, an `env:` that
+  presets `INPUT_PERSIST-CREDENTIALS`, and line-break characters that YAML 1.1
+  and 1.2 readers split differently. A repository `uses` must be spelled
+  canonically (`owner/repo[/path]@ref`, single `/`), so separator variants
+  such as `actions//checkout` or `actions\checkout`, which the runner still
+  resolves to actions/checkout, cannot skip the check. The line-based reader remains as
+  additional spelling policy.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

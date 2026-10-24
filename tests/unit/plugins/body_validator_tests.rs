@@ -5960,12 +5960,12 @@ async fn advisory_2vmr_multiple_instances_remain_isolated() {
 
 // ─── Pre-parse XML nesting depth (issue #4565) ─────────────────────────────
 //
-// `roxmltree`'s tokenizer recurses once per open element
-// (`parse_element` -> `parse_content` -> `parse_element`), so `XML_MAX_NODES`
-// alone cannot stop a deeply nested body from overflowing the worker stack
-// *inside* `Document::parse_with_options`. Element nesting is therefore
+// `roxmltree` before 0.21.2 recursed once per open element inside
+// `Document::parse_with_options`, so `XML_MAX_NODES` alone could not stop a
+// deeply nested body from overflowing the worker stack. Element nesting is
 // screened over the raw bytes first, bounded by the shared
-// `XML_MAX_NESTING_DEPTH` (256).
+// `XML_MAX_NESTING_DEPTH` (256); the screen stays the fixed ceiling now that
+// the parser is iterative (issue #6590).
 
 /// A `<root>`-wrapped chain nested `levels` deep below the root element, so the
 /// document's maximum depth is `levels + 1`.

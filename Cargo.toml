@@ -150,7 +150,7 @@ serde_yaml = "0.9"
 # materialization (issue #3307 and PR #3843).
 unsafe-libyaml = "0.2.11"
 jsonschema = { version = "0.49.9", default-features = false }
-roxmltree = "0.20"
+roxmltree = "0.21.2"
 memchr = "2"
 
 # Database
@@ -175,12 +175,20 @@ tower = { version = "0.5", features = ["util"] }
 
 # JWT and auth
 #
-# The signing/verification backend (`rust_crypto` vs `aws_lc_rs`) comes from
-# `crypto-ring` / `fips`. jsonwebtoken 10 prefers `aws_lc_rs` when both are
-# compiled, but leaving `rust_crypto` on in a FIPS build would still link a
-# second, non-validated implementation of the same primitives, so the arms are
-# exclusive here too.
-jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
+# jsonwebtoken's signing/verification backend is `aws_lc_rs` on BOTH profiles,
+# selected inline here rather than through the `crypto-ring` / `fips` pair.
+# jsonwebtoken 11 picks its provider automatically only when exactly one of
+# `rust_crypto` / `aws_lc_rs` is compiled (both, or neither, panics at first
+# use), so a single inline selection keeps that true for every feature
+# combination. On a `fips` build, `aws-lc-rs/fips` unifies onto this same
+# `aws-lc-rs`, so JWT signing and verification run in the validated module; on
+# the ordinary profile they run on AWS-LC, which dimpl, rcgen and x509-parser
+# already compile in. `rust_crypto` is never enabled: it pulls in the
+# RustCrypto `rsa` (RUSTSEC-2023-0071) and `p256`/`p384` 0.13 on
+# `crypto-bigint` 0.5 (RUSTSEC-2026-0387), and would sign ES256/ES384/RS*
+# outbound assertions and JWT-SVIDs on those implementations.
+# `.github/scripts/check_fips_feature_policy.py` enforces both.
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 # NOTE: `argon2` was declared here and referenced by nothing in `src/` or
 # `custom_plugins/`. Argon2 is not an SP 800-132 approved KDF, so an unused
 # declaration was a non-approved primitive sitting in the dependency graph for
@@ -416,8 +424,10 @@ bench-udp-profile = []
 # feature graph so a transitive edge cannot quietly put ring back in control of
 # a nominal FIPS build.
 #
-# `crypto-ring` (default) reproduces the historical, non-FIPS build exactly.
-# Ordinary deployments are behaviourally unchanged by the existence of the
+# `crypto-ring` (default) reproduces the historical, non-FIPS build, with one
+# deliberate exception: jsonwebtoken signs and verifies on AWS-LC on both
+# profiles (its backend is selected inline above, not by this pair). Ordinary
+# deployments are otherwise behaviourally unchanged by the existence of the
 # FIPS profile.
 crypto-ring = [
     "dep:ring",
@@ -429,7 +439,6 @@ crypto-ring = [
     "ldap3/tls-rustls-ring",
     "rcgen/ring",
     "x509-parser/verify",
-    "jsonwebtoken/rust_crypto",
     "reqwest/__rustls-ring",
     "hyper-rustls?/ring",
     "instant-acme?/ring",
@@ -469,7 +478,6 @@ fips = [
     "ldap3/tls-rustls-aws-lc-rs",
     "rcgen/fips",
     "x509-parser/verify-aws",
-    "jsonwebtoken/aws_lc_rs",
     "reqwest/__rustls-aws-lc-rs",
     "hyper-rustls?/fips",
     "instant-acme?/fips",

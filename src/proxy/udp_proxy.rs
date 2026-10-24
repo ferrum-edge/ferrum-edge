@@ -7670,13 +7670,12 @@ async fn handle_dtls_client_inner(
             // NEUTRALLY (no count) rather than leaking it — otherwise
             // `half_open_in_flight` stays consumed and the breaker can never
             // recover. Genuine DNS/transport failures still record a failure.
-            if let Some(ref cb_config) = proxy.circuit_breaker {
-                let cb = circuit_breaker_cache.get_or_create(
-                    &proxy.namespace,
-                    proxy_id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                );
+            if let Some(cb) = cb_probe.current_breaker(
+                circuit_breaker_cache,
+                &proxy.namespace,
+                proxy_id,
+                cb_target_key.as_deref(),
+            ) {
                 if crate::dns::is_egress_policy_denial(&e) {
                     cb.record_neutral(cb_probe.take_slot());
                 } else {
@@ -7721,13 +7720,12 @@ async fn handle_dtls_client_inner(
     {
         Ok(connected) => connected,
         Err(error) => {
-            if let Some(ref cb_config) = proxy.circuit_breaker {
-                let cb = circuit_breaker_cache.get_or_create(
-                    &proxy.namespace,
-                    proxy_id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                );
+            if let Some(cb) = cb_probe.current_breaker(
+                circuit_breaker_cache,
+                &proxy.namespace,
+                proxy_id,
+                cb_target_key.as_deref(),
+            ) {
                 cb.record_failure(502, true, cb_probe.take_slot());
             }
             return Err(error);
@@ -7766,13 +7764,12 @@ async fn handle_dtls_client_inner(
     }
 
     // Record circuit breaker success — backend connection established.
-    if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            proxy_id,
-            cb_target_key.as_deref(),
-            cb_config,
-        );
+    if let Some(cb) = cb_probe.current_breaker(
+        circuit_breaker_cache,
+        &proxy.namespace,
+        proxy_id,
+        cb_target_key.as_deref(),
+    ) {
         cb.record_success(cb_probe.take_slot());
     }
 
@@ -8596,13 +8593,12 @@ async fn create_session(
             // NEUTRALLY (no count) rather than leaking it — otherwise
             // `half_open_in_flight` stays consumed and the breaker can never
             // recover. Genuine DNS/transport failures still record a failure.
-            if let Some(ref cb_config) = proxy.circuit_breaker {
-                let cb = circuit_breaker_cache.get_or_create(
-                    &proxy.namespace,
-                    proxy_id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                );
+            if let Some(cb) = cb_probe.current_breaker(
+                circuit_breaker_cache,
+                &proxy.namespace,
+                proxy_id,
+                cb_target_key.as_deref(),
+            ) {
                 if crate::dns::is_egress_policy_denial(&e) {
                     cb.record_neutral(cb_probe.take_slot());
                 } else {
@@ -8616,13 +8612,12 @@ async fn create_session(
         Some(destination) => {
             let filtered = candidates.matching_family(destination);
             if filtered.is_empty() {
-                if let Some(ref cb_config) = proxy.circuit_breaker {
-                    let cb = circuit_breaker_cache.get_or_create(
-                        &proxy.namespace,
-                        proxy_id,
-                        cb_target_key.as_deref(),
-                        cb_config,
-                    );
+                if let Some(cb) = cb_probe.current_breaker(
+                    circuit_breaker_cache,
+                    &proxy.namespace,
+                    proxy_id,
+                    cb_target_key.as_deref(),
+                ) {
                     cb.record_failure(502, true, cb_probe.take_slot());
                 }
                 return Err(StreamSetupError::new(
@@ -8675,13 +8670,12 @@ async fn create_session(
     {
         Ok(connected) => connected,
         Err(error) => {
-            if let Some(ref cb_config) = proxy.circuit_breaker {
-                let cb = circuit_breaker_cache.get_or_create(
-                    &proxy.namespace,
-                    proxy_id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                );
+            if let Some(cb) = cb_probe.current_breaker(
+                circuit_breaker_cache,
+                &proxy.namespace,
+                proxy_id,
+                cb_target_key.as_deref(),
+            ) {
                 cb.record_failure(502, true, cb_probe.take_slot());
             }
             return Err(error);
@@ -8716,13 +8710,12 @@ async fn create_session(
     }
 
     // Record circuit breaker success — backend socket established.
-    if let Some(ref cb_config) = proxy.circuit_breaker {
-        let cb = circuit_breaker_cache.get_or_create(
-            &proxy.namespace,
-            proxy_id,
-            cb_target_key.as_deref(),
-            cb_config,
-        );
+    if let Some(cb) = cb_probe.current_breaker(
+        circuit_breaker_cache,
+        &proxy.namespace,
+        proxy_id,
+        cb_target_key.as_deref(),
+    ) {
         cb.record_success(cb_probe.take_slot());
     }
 

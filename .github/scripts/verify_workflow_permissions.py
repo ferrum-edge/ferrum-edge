@@ -17,7 +17,9 @@ status-check rulesets trust). So every workflow must state its own default:
 * every `actions/checkout` step, in a workflow or a local composite action,
   states `persist-credentials: false`, so the token is not persisted for later
   steps. `true` is admitted only in a workflow started solely by `schedule`
-  or `workflow_dispatch` (#6581).
+  or `workflow_dispatch` (#6581). The decision is made on a real YAML parse
+  (PyYAML's composed node graph); a line-based reader runs alongside it as
+  extra spelling policy, and both must accept (#6688).
 
 Executed by verify_required_ci.py inside the `Tests` aggregate, so a pull
 request that adds or edits a workflow without explicit permissions fails CI.
@@ -29,6 +31,11 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+
+try:
+    import yaml
+except ImportError:  # the parsed checkout check fails closed without it
+    yaml = None
 
 WORKFLOW_DIR = Path(".github/workflows")
 ACTIONS_DIR = Path(".github/actions")
@@ -275,6 +282,10 @@ def _single_line_input(line: str, mapping_keys: frozenset[str] = frozenset()) ->
         return "'" not in value and '"' not in value and _strip_comment(value).endswith(closing)
     if value.startswith(("&", "*", "!")):
         return False  # anchors, aliases, and tags are not read here
+    plain = re.split(r"[ \t]#", value, maxsplit=1)[0].strip()
+    if plain.endswith(("'", '"')) and plain.count(plain[-1]) % 2:
+        # An unbalanced closing quote ends a value opened on an earlier line.
+        return False
     return True
 
 
@@ -306,6 +317,206 @@ def _is_content(line: str) -> bool:
     return bool(line.strip()) and not line.lstrip().startswith("#")
 
 
+BLOCK_SCALAR_VALUE = re.compile(r"^[|>][1-9+-]{0,2} *(?:#.*)?$")
+# The first plain-key separator or comment on a line, whichever comes first.
+PLAIN_KEY_OR_COMMENT = re.compile(r":(?=[ \t]|$)|[ \t]#")
+
+
+def _scan_quoted(text: str, pos: int, quote: str) -> int | None:
+    """Index just past the quote closing a scalar whose body starts at `pos`."""
+
+    while pos < len(text):
+        char = text[pos]
+        if quote == '"' and char == "\\":
+            pos += 2
+            continue
+        if char == quote:
+            if quote == "'" and text.startswith("''", pos):
+                pos += 2
+                continue
+            return pos + 1
+        pos += 1
+    return None
+
+
+def _scan_flow(text: str, pos: int, depth: int, quote: str | None) -> tuple[int, str | None]:
+    """Advance a flow collection; return its remaining depth and any open quote.
+
+    A quote opens a quoted scalar only where a flow node can start: after `[`,
+    `{`, `,`, or a `:` separator (whitespace in between is allowed), or at the
+    start of a continuation line. Inside a plain scalar such as `don't` or
+    `a"b` it is an ordinary character, as YAML readers treat it.
+    """
+
+    node_start = True
+    while pos < len(text):
+        if quote is not None:
+            closed = _scan_quoted(text, pos, quote)
+            if closed is None:
+                return depth, quote
+            pos, quote, node_start = closed, None, False
+            continue
+        char = text[pos]
+        if char in "[{":
+            depth += 1
+            node_start = True
+        elif char in "]}":
+            depth -= 1
+            node_start = False
+            if depth <= 0:
+                return 0, None
+        elif char == ",":
+            node_start = True
+        elif char == ":" and (pos + 1 == len(text) or text[pos + 1] in " \t,[]{}"):
+            node_start = True
+        elif char in " \t":
+            pass  # whitespace keeps whatever position came before it
+        elif char in "'\"" and node_start:
+            quote = char
+        elif char == "#" and (pos == 0 or text[pos - 1] in " \t"):
+            break
+        else:
+            node_start = False
+        pos += 1
+    return depth, quote
+
+
+def _lex_node(text: str, pos: int, column: int) -> tuple[str, object] | None:
+    """Lex the node(s) from `pos` to the end of the line.
+
+    Returns the construct the line leaves open: ("quote", q), ("flow",
+    (depth, q)), or ("block", parent column); None when nothing stays open.
+    """
+
+    while True:
+        while pos < len(text) and text[pos] in " \t":
+            pos += 1
+        if pos >= len(text) or text[pos] == "#":
+            return None
+        char = text[pos]
+        follows_space = pos + 1 == len(text) or text[pos + 1] in " \t"
+        if char in "-?:" and follows_space:
+            column = pos  # sequence entry or explicit key / value indicator
+            pos += 1
+            continue
+        if char in "'\"":
+            closed = _scan_quoted(text, pos + 1, char)
+            if closed is None:
+                return ("quote", char)
+            rest = text[closed:].lstrip(" \t")
+            if not rest.startswith(":"):
+                return None
+            pos = text.index(":", closed) + 1  # a quoted key; lex its value
+            continue
+        if char in "[{":
+            depth, quote = _scan_flow(text, pos, 0, None)
+            return ("flow", (depth, quote)) if depth else None
+        if char in "|>":
+            return ("block", column)
+        if char in "&!":
+            while pos < len(text) and text[pos] not in " \t":
+                pos += 1
+            continue
+        match = PLAIN_KEY_OR_COMMENT.search(text, pos)
+        if match is None or match.group().endswith("#"):
+            return None  # a plain scalar
+        column = pos
+        pos = match.end()
+
+
+def _open_scalar_lines(lines: list[str]) -> set[int]:
+    """Indices of lines that start inside a quoted scalar or flow collection.
+
+    A forward lexer over the whole file: a quote or bracket that opens a
+    value and does not close on its line makes every following line, up to and
+    including the one that closes it, scalar text rather than YAML structure.
+    Such text can look like a `- ` step, a `with:` key, or a job key, so step
+    boundaries and inputs are never read from these lines (#6688). Block
+    scalar bodies (`|` / `>`) are skipped from each header's parent column.
+    """
+
+    opaque: set[int] = set()
+    state: tuple[str, object] | None = None
+    for number, line in enumerate(lines):
+        if state is not None and state[0] == "block":
+            if not line.strip() or _indent(line) > int(state[1]):
+                continue
+            state = None
+        if state is None:
+            if line.strip():
+                state = _lex_node(line, _indent(line), _indent(line))
+            continue
+        opaque.add(number)
+        kind, data = state
+        if kind == "quote":
+            closed = _scan_quoted(line, 0, str(data))
+            if closed is None:
+                continue
+            rest = line[closed:].lstrip(" \t")
+            state = _lex_node(line, line.index(":", closed) + 1, closed) if rest.startswith(":") else None
+        else:
+            depth, quote = data
+            depth, quote = _scan_flow(line, 0, depth, quote)
+            state = ("flow", (depth, quote)) if depth else None
+    return opaque
+
+
+def _checkout_step_readable(lines: list[str], start: int, end: int, key_indent: int) -> bool:
+    """Whether every line of a checkout step has the one shape this reader follows.
+
+    A step line is a complete `key: value` step key at `key_indent`, a complete
+    `key: value` direct child of an empty `with:` / `env:` key, or the body of a
+    block scalar (`|` / `>`) opened by one of those lines. Anything else,
+    including a quoted or flow value left open at any depth, a plain scalar
+    continued onto a deeper line, or a child nested below another child, is
+    refused: it would carry later lines that only look like `with:` and
+    `persist-credentials` into a scalar (#6688).
+
+    Block scalar bodies are tracked here from each header's own key column,
+    not from the file-wide pass, because a header on a `- key: |` line ends at
+    the step key column, not at the dash.
+    """
+
+    mapping_open = False
+    child_indent: int | None = None
+    block_indent: int | None = None
+    for number in range(start, end):
+        line = lines[number]
+        if not line.strip():
+            continue
+        if number == start and line.lstrip().startswith("- "):
+            line = " " * key_indent + line.lstrip()[2:].lstrip()
+        indent = _indent(line)
+        if block_indent is not None:
+            if indent > block_indent:
+                continue  # block scalar body, including lines that look like comments
+            block_indent = None
+        if line.lstrip().startswith("#"):
+            continue
+        if indent == key_indent:
+            if not _single_line_input(line, STEP_MAPPING_KEYS):
+                return False
+            match = CHILD_INPUT.match(line)
+            value = _strip_comment(match.group("value") or "") if match else ""
+            mapping_open = (
+                match is not None and not value and match.group("key") in STEP_MAPPING_KEYS
+            )
+            child_indent = None
+            if BLOCK_SCALAR_VALUE.match(value):
+                block_indent = key_indent
+            continue
+        if indent < key_indent or not mapping_open:
+            return False
+        if child_indent is None:
+            child_indent = indent
+        if indent != child_indent or not _single_line_input(line):
+            return False
+        match = CHILD_INPUT.match(line)
+        if match is not None and BLOCK_SCALAR_VALUE.match((match.group("value") or "").strip()):
+            block_indent = child_indent
+    return True
+
+
 def checkout_credential_errors(text: str, source: str, *, composite: bool = False) -> list[str]:
     """Every `actions/checkout` step states `persist-credentials` explicitly.
 
@@ -332,6 +543,7 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
     )
     errors: list[str] = []
     block_bodies = _block_scalar_body_lines(lines)
+    open_scalar = _open_scalar_lines(lines)
     for index, line in enumerate(lines):
         if line.lstrip().startswith("#"):
             continue
@@ -375,6 +587,8 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
         if "-" not in match.group("lead"):
             start = -1
             for back in range(index - 1, -1, -1):
+                if back in open_scalar:
+                    continue  # scalar text, never a step boundary
                 if _is_content(lines[back]) and _indent(lines[back]) < key_indent:
                     start = back
                     break
@@ -389,24 +603,12 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
             _is_content(lines[end]) and _indent(lines[end]) < key_indent
         ):
             end += 1
-        # Every step key must be one complete line. A quoted or flow value left
-        # open (`name: 'x`) would swallow later lines that only look like a
-        # `with:` mapping.
-        step_keys_readable = True
-        for number in range(start, end):
-            step_line = lines[number]
-            if not _is_content(step_line):
-                continue
-            if number == start and step_line.lstrip().startswith("- "):
-                step_line = " " * key_indent + step_line.lstrip()[2:].lstrip()
-            if _indent(step_line) == key_indent and not _single_line_input(
-                step_line, STEP_MAPPING_KEYS
-            ):
-                step_keys_readable = False
-                break
-        if not step_keys_readable:
+        if any(number in open_scalar for number in range(start, end)) or not (
+            _checkout_step_readable(lines, start, end, key_indent)
+        ):
             errors.append(
-                f"{located} checkout step keys must each be one complete `key: value` "
+                f"{located} checkout step keys, and the direct children of its "
+                "`with:` / `env:` mappings, must each be one complete `key: value` "
                 "line; a value left open across lines is refused"
             )
             continue
@@ -458,6 +660,9 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
         elif not values:
             job = None
             for back in range(index - 1, -1, -1):
+                if back in open_scalar:
+                    job = None  # crossed unread scalar text: no exemption
+                    break
                 job_match = JOB_KEY.match(lines[back])
                 if job_match is not None:
                     job = job_match.group("job")
@@ -482,6 +687,281 @@ def checkout_credential_errors(text: str, source: str, *, composite: bool = Fals
                 f"{located} checkout persist-credentials must be `false` "
                 f"(found {values[0]!r})"
             )
+    errors.extend(
+        parsed_checkout_errors(text, source, composite=composite, line_triggers=triggers)
+    )
+    return errors
+
+
+# Characters PyYAML (YAML 1.1) reads as line breaks or strips, where a YAML 1.2
+# reader (the Actions runner's) sees ordinary content. Either side could then
+# see keys the other does not.
+LINE_BREAK_DIVERGENCE = ("\r", "\x85", "\u2028", "\u2029", "\ufeff")
+PINNED_CHECKOUT = re.compile(r"(?i:actions/checkout)@[0-9a-f]{40}")
+# The runner passes `with:` inputs as INPUT_<NAME> with spaces as underscores,
+# upper-cased, so names that differ only in case or spacing are one input.
+def _input_name(name: str) -> str:
+    return name.replace(" ", "_").upper()
+
+
+# A repository action reference in its one canonical spelling: single `/`
+# separators, no empty, `.` or `..` path segments, no backslash or whitespace,
+# exactly one `@`.
+CANONICAL_REPOSITORY_USES = re.compile(
+    r"(?P<name>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)@[A-Za-z0-9_./-]+"
+)
+
+
+def _action_repository(uses: str) -> str | None:
+    """The lower-cased `owner/repo` a step's `uses` runs, as the runner resolves it.
+
+    The runner treats `./` and `.\\` values as local actions and `docker://`
+    values as images (None here). Anything else is a repository reference,
+    which it splits on both `/` and `\\` and drops empty segments, so
+    `actions//checkout@x` and `actions\\checkout@x` both run actions/checkout.
+    Only the canonical spelling is classified; every other spelling returns ""
+    and is refused, so no separator trick can hide a checkout (#6688).
+    """
+
+    if uses.startswith(("./", ".\\", "docker://")):
+        return None
+    match = CANONICAL_REPOSITORY_USES.fullmatch(uses)
+    if match is None:
+        return ""
+    segments = match.group("name").split("/")
+    if any(segment in {".", ".."} for segment in segments):
+        return ""
+    return "/".join(segments[:2]).lower()
+
+
+def _lookup(node: "yaml.MappingNode", key: str, located: str, errors: list[str]) -> "yaml.Node | None":
+    """The value of `key` in a mapping; any other spelling of it fails closed."""
+
+    found = None
+    for key_node, value in node.value:
+        name = key_node.value if isinstance(key_node, yaml.ScalarNode) else ""
+        if name.lower() != key:
+            continue
+        if name != key or found is not None:
+            errors.append(f"{located} `{key}` must be spelled once, in lower case")
+            return None
+        found = value
+    return found
+
+
+def _line(node: "yaml.Node") -> int:
+    return node.start_mark.line + 1
+
+
+def _mapping_policy_errors(node: "yaml.Node", source: str) -> list[str]:
+    """Duplicate keys, merge keys, and non-scalar keys anywhere in the document."""
+
+    errors: list[str] = []
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, yaml.SequenceNode):
+            pending.extend(current.value)
+            continue
+        if not isinstance(current, yaml.MappingNode):
+            continue
+        seen: set[str] = set()
+        for key_node, value in current.value:
+            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag.endswith(":merge"):
+                errors.append(f"{source}:{_line(key_node)} mapping keys must be plain scalars")
+            elif key_node.value in seen:
+                errors.append(
+                    f"{source}:{_line(key_node)} duplicate key {key_node.value!r}; "
+                    "YAML readers disagree on which one wins"
+                )
+            else:
+                seen.add(key_node.value)
+            pending.append(value)
+    return errors
+
+
+def _parsed_triggers(root: "yaml.MappingNode") -> set[str] | None:
+    """Trigger names from the parsed `on:` value, or None when unreadable."""
+
+    entries = [
+        value for key, value in root.value if isinstance(key, yaml.ScalarNode) and key.value == "on"
+    ]
+    if len(entries) != 1:
+        return None
+    value = entries[0]
+    if isinstance(value, yaml.ScalarNode):
+        names = [value]
+    elif isinstance(value, yaml.SequenceNode):
+        names = value.value
+    elif isinstance(value, yaml.MappingNode):
+        names = [key for key, _ in value.value]
+    else:
+        return None
+    if not names or not all(isinstance(name, yaml.ScalarNode) for name in names):
+        return None
+    return {name.value for name in names}
+
+
+def _input_env_errors(env: "yaml.Node | None", located: str, errors: list[str]) -> None:
+    """An `env:` that could preset the action's persist-credentials input is refused.
+
+    The action reads INPUT_PERSIST-CREDENTIALS from its environment; the
+    comparison ignores case so no spelling of it is left to a reader's rules.
+    """
+
+    if env is None:
+        return
+    if not isinstance(env, yaml.MappingNode):
+        errors.append(f"{located} `env:` must be a mapping so checkout inputs can be verified")
+        return
+    for key, _ in env.value:
+        if isinstance(key, yaml.ScalarNode) and key.value.upper() == "INPUT_PERSIST-CREDENTIALS":
+            errors.append(f"{located} `env:` must not set the checkout input {key.value}")
+
+
+def parsed_checkout_errors(
+    text: str,
+    source: str,
+    *,
+    composite: bool = False,
+    line_triggers: set[str] | None = None,
+) -> list[str]:
+    """Check every checkout step on the parsed YAML structure (#6688).
+
+    Steps are found as `jobs.<job>.steps[*]` (workflow) or `runs.steps[*]`
+    (composite action), never by line position, so text inside any scalar
+    cannot pose as a step, a `with:` key, or an input. The document must be
+    plain: one document, no anchors, aliases, tags, directives, merge keys, or
+    duplicate keys, and no characters that YAML 1.1 and 1.2 readers split into
+    lines differently. A checkout's `with` must be a block mapping holding one
+    `persist-credentials` whose scalar text is exactly `false` (plain or quoted,
+    which the action reads as the string "false"); `true` only where the line
+    reader also admits it.
+    """
+
+    if yaml is None:
+        return [f"{source} cannot be verified: PyYAML is not installed"]
+    for char in LINE_BREAK_DIVERGENCE:
+        if char in text:
+            return [f"{source} contains U+{ord(char):04X}; YAML readers split its lines differently"]
+    try:
+        for token in yaml.scan(text, Loader=yaml.SafeLoader):
+            if isinstance(token, (yaml.AnchorToken, yaml.AliasToken, yaml.TagToken, yaml.DirectiveToken)):
+                return [
+                    f"{source}:{token.start_mark.line + 1} uses a YAML anchor, alias, tag, or "
+                    "directive; write plain YAML so checkout steps can be verified"
+                ]
+        documents = list(yaml.compose_all(text, Loader=yaml.SafeLoader))
+    except yaml.YAMLError as error:
+        return [f"{source} could not be parsed as YAML: {error}"]
+    if len(documents) != 1 or not isinstance(documents[0], yaml.MappingNode):
+        return [f"{source} must be a single YAML mapping document"]
+    root = documents[0]
+    errors = _mapping_policy_errors(root, source)
+    if errors:
+        return errors
+
+    parsed_triggers = _parsed_triggers(root)
+    true_admitted = (
+        not composite
+        and line_triggers is not None
+        and parsed_triggers is not None
+        and line_triggers <= PERSIST_TRUE_TRIGGERS
+        and parsed_triggers <= PERSIST_TRUE_TRIGGERS
+    )
+    # Both step locations are read in every file, so a misfiled or mislabelled
+    # document is still checked rather than silently matching neither shape.
+    step_lists: list[tuple[str | None, "yaml.Node", list["yaml.Node | None"]]] = []
+    runs = _lookup(root, "runs", source, errors)
+    if isinstance(runs, yaml.MappingNode):
+        steps = _lookup(runs, "steps", f"{source}:{_line(runs)}", errors)
+        if steps is not None:
+            step_lists.append((None, steps, []))
+    workflow_env = _lookup(root, "env", source, errors)
+    jobs = _lookup(root, "jobs", source, errors)
+    if jobs is not None and not isinstance(jobs, yaml.MappingNode):
+        errors.append(f"{source}:{_line(jobs)} `jobs:` must be a mapping")
+    elif jobs is not None:
+        for job_key, job in jobs.value:
+            if not isinstance(job, yaml.MappingNode):
+                continue
+            located = f"{source}:{_line(job_key)}"
+            steps = _lookup(job, "steps", located, errors)
+            if steps is not None:
+                job_env = _lookup(job, "env", located, errors)
+                step_lists.append((job_key.value, steps, [workflow_env, job_env]))
+    for job, steps, inherited_env in step_lists:
+        if not isinstance(steps, yaml.SequenceNode):
+            errors.append(f"{source}:{_line(steps)} `steps:` must be a sequence")
+            continue
+        for step in steps.value:
+            located = f"{source}:{_line(step)}"
+            if not isinstance(step, yaml.MappingNode):
+                errors.append(f"{located} each step must be a mapping")
+                continue
+            uses = _lookup(step, "uses", located, errors)
+            if uses is None:
+                continue
+            if not isinstance(uses, yaml.ScalarNode):
+                errors.append(f"{located} `uses` must be a scalar")
+                continue
+            repository = _action_repository(uses.value)
+            if repository is None:
+                continue  # a local `./` action or a `docker://` image
+            if repository == "":
+                errors.append(
+                    f"{located} `uses` must be a canonical `owner/repo[/path]@ref` with "
+                    f"single `/` separators (found {uses.value!r})"
+                )
+                continue
+            if repository != "actions/checkout":
+                continue
+            if PINNED_CHECKOUT.fullmatch(uses.value) is None:
+                errors.append(
+                    f"{located} checkout must be `actions/checkout@<40-hex SHA>` "
+                    f"(found {uses.value!r})"
+                )
+                continue
+            for env in [*inherited_env, _lookup(step, "env", located, errors)]:
+                _input_env_errors(env, located, errors)
+            inputs = _lookup(step, "with", located, errors)
+            values: list["yaml.Node"] = []
+            if inputs is not None:
+                if not isinstance(inputs, yaml.MappingNode) or inputs.flow_style:
+                    errors.append(f"{located} checkout `with:` must be a block mapping")
+                    continue
+                for key, value in inputs.value:
+                    name = key.value if isinstance(key, yaml.ScalarNode) else ""
+                    if _input_name(name) != "PERSIST-CREDENTIALS":
+                        continue
+                    if name != "persist-credentials":
+                        errors.append(f"{located} spell the input `persist-credentials`")
+                    values.append(value)
+            if len(values) > 1:
+                errors.append(f"{located} checkout sets persist-credentials more than once")
+                continue
+            if not values:
+                if (Path(source).name, job) in POLICY_FROZEN_CHECKOUT_JOBS:
+                    continue
+                errors.append(
+                    f"{located} checkout must set `persist-credentials: false` (parsed "
+                    "`with` has no such input) so the job token is not persisted"
+                )
+                continue
+            value = values[0]
+            text_value = value.value if isinstance(value, yaml.ScalarNode) else None
+            if not isinstance(value, yaml.ScalarNode) or value.style not in (None, "'", '"'):
+                errors.append(f"{located} checkout persist-credentials must be a one-line scalar")
+            elif text_value == "true":
+                if not true_admitted:
+                    errors.append(
+                        f"{located} checkout persists credentials outside a workflow "
+                        "started only by schedule or workflow_dispatch"
+                    )
+            elif text_value != "false":
+                errors.append(
+                    f"{located} checkout persist-credentials must be `false` (found {text_value!r})"
+                )
     return errors
 
 
@@ -645,6 +1125,63 @@ def run_self_test() -> list[str]:
         "          path: \"src\"\n          persist-credentials: false\n" + tail
     if checkout_credential_errors(quoted_ok, "self-test checkout quoted single-line inputs"):
         failures.append("checkout credential self-test: single-line quoted inputs were rejected")
+    # Controls for the nested-scalar pass (#6688): complete `env:` children,
+    # block scalars at the step, `env:`, and `with:` depth, and a block scalar
+    # opened on the `- ` line must all still be accepted.
+    for label, text in (
+        (
+            "env children",
+            pr + f"      - name: Checkout\n        env:\n          A: plain\n"
+            "          B: 'single'  # note\n          C: \"double\"\n          D: ${{ github.sha }}\n"
+            f"        uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "env block scalar",
+            pr + f"      - uses: {pin}\n        env:\n          NOTE: |\n            \"open\n"
+            "            with:\n          OTHER: x\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "dash block scalar",
+            pr + "      - name: >-\n          Checkout 'the\n        uses: " + pin + "\n"
+            "        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "with block scalar and comments",
+            pr + f"      - uses: {pin}\n        # comment\n        with:\n          # inputs\n"
+            "          ssh-known-hosts: |\n            # host keys\n            'x\n"
+            "          persist-credentials: false\n" + tail,
+        ),
+        (
+            "balanced quoted expressions",
+            pr + f"      - uses: {pin}\n        if: needs.plan.outputs.mode != 'skip'\n"
+            "        with:\n          persist-credentials: false\n          ref: x\n" + tail,
+        ),
+        (
+            "multi-line scalar in another step",
+            pr + "      - run: \"echo one\n          - name: two\"\n"
+            f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "flow plain scalar with apostrophe before checkout",
+            pr + "      - run: echo ready\n        env: {NOTE: don't}\n"
+            f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "composite flow plain scalar with quotes before checkout",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - run: echo ready\n      shell: bash\n      env: {NOTE: a\"b, OTHER: don't}\n"
+            f"    - uses: {pin}\n      with:\n        persist-credentials: false\n",
+        ),
+        (
+            "composite env children",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      env:\n        A: \"x\"\n      with:\n"
+            "        persist-credentials: false\n    - run: true\n      shell: bash\n",
+        ),
+    ):
+        errors = checkout_credential_errors(text, f"self-test checkout {label}")
+        if errors:
+            failures.append(f"checkout credential self-test {label!r} rejected: {errors}")
     for label, text in (
         ("mixed-case missing", pr + f"      - uses: {mixed}\n" + tail),
         ("mixed-case true", pr + f"      - uses: {mixed}\n" + persist_true + tail),
@@ -756,6 +1293,196 @@ def run_self_test() -> list[str]:
             pr + f"      - uses: {pin}\n        with:\n          persist-credentials: !!str false\n" + tail,
         ),
         (
+            "env double-quoted scalar hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X: \"ignored\n        with:\n"
+            "          persist-credentials: false\n            \"\n" + tail,
+        ),
+        (
+            "env single-quoted scalar hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X: 'ignored\n        with:\n"
+            "          persist-credentials: false\n            '\n" + tail,
+        ),
+        (
+            "env scalar before uses hides with",
+            pr + "      - env:\n          X: \"ignored\n        with:\n"
+            f"          persist-credentials: false\n            \"\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "env flow scalar hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X: [\"ignored\n        with:\n"
+            "          persist-credentials: false\n            \"]\n" + tail,
+        ),
+        (
+            "env empty value hides with",
+            pr + f"      - uses: {pin}\n        env:\n          X:\n            \"ignored\n"
+            "        with:\n          persist-credentials: false\n            \"\n" + tail,
+        ),
+        (
+            "plain scalar continuation",
+            pr + f"      - uses: {pin}\n        name: one\n          two\n        with:\n"
+            "          persist-credentials: false\n" + tail,
+        ),
+        (
+            "env nested below child",
+            pr + f"      - uses: {pin}\n        env:\n          X: a\n            Y: \"ignored\n"
+            "        with:\n          persist-credentials: false\n            \"\n" + tail,
+        ),
+        (
+            "dash block scalar does not cover env scalar",
+            pr + "      - name: |\n          x\n        uses: " + pin + "\n        env:\n"
+            "          X: \"ignored\n        with:\n          persist-credentials: false\n"
+            "            \"\n" + tail,
+        ),
+        (
+            "composite env scalar hides with",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: {pin}\n      env:\n        X: \"ignored\n      with:\n"
+            "        persist-credentials: false\n          \"\n    - run: true\n      shell: bash\n",
+        ),
+        (
+            "fabricated step start inside env scalar",
+            pr + "      - env:\n          X: 'ignored\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: ignored'\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "composite fabricated step start inside env scalar",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - env:\n        X: 'ignored\n    - name: decoy\n      with:\n"
+            f"        persist-credentials: false\n        CLOSE: ignored'\n      uses: {pin}\n",
+        ),
+        (
+            "fabricated step start with escaped closing quote",
+            pr + "      - env:\n          X: \"ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: a\\\"b\"\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
+            "fabricated step start closed on its own line",
+            pr + "      - env:\n          X: \"ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: x\n            \"\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
+            "fabricated step start inside tab-separated scalar",
+            pr + "      - env:\n          X:\t'ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: x\n            '\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
+            "fabricated step start inside flow value",
+            pr + "      - env:\n          X: [ignored\n      - name: decoy\n        with:\n"
+            "          persist-credentials: false\n          CLOSE: x\n            ]\n"
+            f"        uses: {pin}\n" + tail,
+        ),
+        (
+            "composite quoted block key hides env scalar",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - \"name\": |\n        Checkout\n      env:\n        X: 'ignored\n"
+            "    - name: decoy\n      with:\n        persist-credentials: false\n"
+            f"        CLOSE: ignored#'\n      uses: {pin}\n",
+        ),
+        (
+            "quoted block key hides env scalar",
+            pr + "      - \"name\": >-\n          Checkout\n        env:\n          X: 'ignored\n"
+            "      - name: decoy\n        with:\n          persist-credentials: false\n"
+            f"          CLOSE: ignored#'\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "composite flow apostrophe hides env scalar",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            "    - env: { X: foo'bar, Y: 'ignored }\n    - name: decoy\n      with:\n"
+            f"        persist-credentials: false\n        CLOSE: ignored#'}}\n      uses: {pin}\n",
+        ),
+        (
+            "flow double quote hides env scalar",
+            pr + "      - env: { X: foo\"bar, Y: \"ignored }\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: ignored#\"}}\n        uses: {pin}\n"
+            + tail,
+        ),
+        (
+            "duplicate with mapping",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "        with:\n          fetch-depth: 0\n" + tail,
+        ),
+        (
+            "input spelled in another case",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+            "          Persist-Credentials: true\n" + tail,
+        ),
+        (
+            "job env presets the input",
+            pr.replace("  build:\n", "  build:\n    env:\n      INPUT_PERSIST-CREDENTIALS: 'true'\n")
+            + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "YAML 1.1 boolean spelling",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: off\n" + tail,
+        ),
+        (
+            "upper-case step key",
+            pr + f"      - Uses: {pin}\n        with:\n          fetch-depth: 0\n" + tail,
+        ),
+        (
+            "anchor elsewhere in the file",
+            pr.replace("permissions:\n", "env:\n  A: &a x\npermissions:\n")
+            + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n" + tail,
+        ),
+        (
+            "line separator splits lines differently",
+            pr + f"      - uses: {pin}\n        env:\n          X: ignored         with: "
+            "          persist-credentials: false\n" + tail,
+        ),
+        (
+            "flow sequence key hides env scalar",
+            pr + "      - env:\n          [X]: \"ignored\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: x#y\"\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "comment-bearing closer after single-quoted opener",
+            pr + "      - env:\n          X: 'ignored\n      - name: decoy\n        with:\n"
+            f"          persist-credentials: false\n          CLOSE: x#y'\n        uses: {pin}\n" + tail,
+        ),
+        (
+            "comment-like suffix on the value",
+            pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false#x\n" + tail,
+        ),
+        (
+            "composite doubled separator checkout",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: actions//checkout@{sha}\n",
+        ),
+        (
+            "doubled separator checkout",
+            pr + f"      - uses: actions//checkout@{sha}\n" + tail,
+        ),
+        (
+            "doubled separator checkout true",
+            scheduled.replace("schedule:\n    - cron: '0 0 * * *'", "pull_request:")
+            + f"      - uses: actions//checkout@{sha}\n" + persist_true + tail,
+        ),
+        (
+            "composite backslash separator checkout",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: actions\\checkout@{sha}\n",
+        ),
+        (
+            "backslash separator checkout",
+            pr + f"      - uses: 'actions\\checkout@{sha}'\n" + tail,
+        ),
+        (
+            "leading separator checkout",
+            pr + f"      - uses: /actions/checkout@{sha}\n" + tail,
+        ),
+        (
+            "dot segment checkout",
+            pr + f"      - uses: actions/./checkout@{sha}\n" + tail,
+        ),
+        (
+            "checkout subpath",
+            pr + f"      - uses: actions/checkout/sub@{sha}\n        with:\n"
+            "          persist-credentials: false\n" + tail,
+        ),
+        (
             "composite block scalar impersonation",
             "name: a\nruns:\n  using: composite\n  steps:\n"
             f"    - uses: {pin}\n      with:\n        ssh-known-hosts: |\n"
@@ -764,6 +1491,17 @@ def run_self_test() -> list[str]:
     ):
         if not checkout_credential_errors(text, f"self-test checkout {label}"):
             failures.append(f"checkout credential self-test {label!r} was accepted")
+
+    # Without PyYAML the parsed check cannot run, and the verifier must say so.
+    global yaml
+    parser = yaml
+    try:
+        yaml = None
+        compliant = pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false\n"
+        if not checkout_credential_errors(compliant, "self-test checkout without PyYAML"):
+            failures.append("checkout credential self-test: accepted a checkout without PyYAML")
+    finally:
+        yaml = parser
 
     # Repository level: a compliant workflow cannot hide a credential-persisting
     # checkout inside a local composite action.
@@ -800,6 +1538,24 @@ def run_self_test() -> list[str]:
         failures.append("checkout credential self-test: policy-frozen release job was rejected")
     if not checkout_credential_errors(frozen, ".github/workflows/ci.yml"):
         failures.append("checkout credential self-test: frozen-job exemption leaked to another file")
+    decoy_job = pr.replace(
+        "  build:\n    steps:\n",
+        "  build:\n    env:\n      X: 'ignored\n  docker:\n      '\n    steps:\n",
+    ) + f"      - uses: {pin}\n" + tail
+    if not checkout_credential_errors(decoy_job, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: frozen job key inside a scalar was admitted")
+    # A flow plain scalar holding a quote must not hide a real job key from the
+    # frozen-job exemption: the checkout below belongs to `victim`, not `docker`.
+    hidden_job = (
+        pr.replace("  build:\n", "  docker:\n")
+        + "      - run: true\n"
+        + '  "probe":\n    runs-on: ubuntu-latest\n    env: {X: a"b}\n    steps:\n'
+        "      - run: true\n  victim:\n    runs-on: ubuntu-latest\n    steps:\n"
+        '      - run: echo "}"\n'
+        f"      - uses: {pin}\n"
+    )
+    if not checkout_credential_errors(hidden_job, ".github/workflows/release.yml"):
+        failures.append("checkout credential self-test: frozen exemption reached a hidden job")
     frozen_true = frozen.replace(tail, "        with:\n          persist-credentials: true\n" + tail)
     if not checkout_credential_errors(frozen_true, ".github/workflows/release.yml"):
         failures.append("checkout credential self-test: policy-frozen job admitted true")
