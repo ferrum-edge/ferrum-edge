@@ -12,7 +12,7 @@ use hyper::client::conn::{http1, http2};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -1254,15 +1254,16 @@ struct Http1Lane {
     idle: std::sync::Mutex<Vec<IdleH1>>,
     max_idle: usize,
     counters: Arc<Http1PoolCounters>,
-    /// Bumped when a drain withdraws this lane. A checkout taken under an older
-    /// generation is never checked back in, so an exchange that outlived the
-    /// drain cannot repopulate the pool with a connection it meant to retire.
-    /// `push_idle` reads it under the lane lock, which `retire` takes after
-    /// bumping it, so a check-in racing a drain either lands before the drain
-    /// takes the idle set (and is retired with it) or is refused.
-    /// Per lane, so a reload or SVID rotation that withdraws one backend does
-    /// not discard every other backend's in-flight connections.
-    generation: AtomicU64,
+    /// Set, under the lane lock, when a drain withdraws this lane, which it
+    /// also removes from the map: a retired lane is never used again. A
+    /// check-in reads it under the same lock, so a connection checked in
+    /// during or after a drain either lands before the drain takes the idle
+    /// set (and is retired with it) or is refused, however long ago its
+    /// checkout found the lane. An exchange that outlived the drain therefore
+    /// cannot repopulate the pool with a connection it meant to retire. Per
+    /// lane, so a reload or SVID rotation that withdraws one backend does not
+    /// discard every other backend's in-flight connections.
+    retired: AtomicBool,
 }
 
 impl Http1Lane {
@@ -1276,20 +1277,22 @@ impl Http1Lane {
     }
 
     fn retire(&self) {
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        let retired = std::mem::take(&mut *self.idle());
+        let retired = {
+            let mut idle = self.idle();
+            self.retired.store(true, Ordering::Release);
+            std::mem::take(&mut *idle)
+        };
         self.counters
             .evicted_retired
             .fetch_add(retired.len() as u64, Ordering::Relaxed);
         drop(retired);
     }
 
-    /// Pool `entry`, checked out under `generation`, unless the lane was
-    /// retired since or already holds its ceiling; a refused entry is handed
-    /// back and the caller drops the connection.
-    fn push_idle(&self, entry: IdleH1, generation: u64) -> Result<(), (IdleH1, Refused)> {
+    /// Pool `entry` unless the lane is retired or already holds its ceiling;
+    /// a refused entry is handed back and the caller drops the connection.
+    fn push_idle(&self, entry: IdleH1) -> Result<(), (IdleH1, Refused)> {
         let mut idle = self.idle();
-        if self.generation.load(Ordering::Acquire) != generation {
+        if self.retired.load(Ordering::Acquire) {
             return Err((entry, Refused::Retired));
         }
         if idle.len() >= self.max_idle {
@@ -1320,7 +1323,7 @@ impl Http1Lane {
 
 /// Why a lane refused a check-in.
 enum Refused {
-    /// A drain retired the lane after the connection was checked out.
+    /// A drain retired the lane while the connection was checked out.
     Retired,
     /// The lane already holds `max_idle` connections.
     Full,
@@ -1399,7 +1402,7 @@ impl Http1Lanes {
                 idle: std::sync::Mutex::new(Vec::new()),
                 max_idle: self.max_idle_per_host,
                 counters: Arc::clone(&self.counters),
-                generation: AtomicU64::new(0),
+                retired: AtomicBool::new(false),
             })
         }))
     }
@@ -1421,7 +1424,7 @@ impl Http1Lanes {
         }
         // No point waiting for a lane a drain already retired; `push_idle`
         // checks again under the lane lock once the wait ends.
-        if checkout.lane.generation.load(Ordering::Acquire) != checkout.generation {
+        if checkout.lane.retired.load(Ordering::Acquire) {
             return;
         }
         let mut checkout = checkout;
@@ -1437,22 +1440,18 @@ impl Http1Lanes {
             lane,
             sender,
             socket,
-            generation,
             idle_timeout,
             ..
         } = checkout;
         // A refused entry is handed back and drops here, outside the lane
         // lock. A retired lane's refusal is not an idle eviction: the
         // connection was never idle in it.
-        let pushed = lane.push_idle(
-            IdleH1 {
-                sender,
-                socket,
-                idle_since: std::time::Instant::now(),
-                idle_timeout,
-            },
-            generation,
-        );
+        let pushed = lane.push_idle(IdleH1 {
+            sender,
+            socket,
+            idle_since: std::time::Instant::now(),
+            idle_timeout,
+        });
         if let Err((_, Refused::Full)) = pushed {
             Http1PoolCounters::count(&lane.counters.evicted_ceiling);
         }
@@ -1511,7 +1510,6 @@ pub struct Http1Checkout {
     pub sender: Http1Sender,
     socket: BackendSocket,
     reused: bool,
-    generation: u64,
     idle_timeout: Duration,
 }
 
@@ -1889,7 +1887,6 @@ impl Http2ConnectionPool {
             );
             self.h1.lane_for_key(&buf)
         });
-        let generation = lane.generation.load(Ordering::Acquire);
         if !fresh {
             let now = std::time::Instant::now();
             while let Some(idle) = lane.pop_idle() {
@@ -1907,7 +1904,6 @@ impl Http2ConnectionPool {
                     sender: idle.sender,
                     socket: idle.socket,
                     reused: true,
-                    generation,
                     idle_timeout,
                 });
             }
@@ -1926,7 +1922,6 @@ impl Http2ConnectionPool {
             sender,
             socket,
             reused: false,
-            generation,
             idle_timeout,
         })
     }

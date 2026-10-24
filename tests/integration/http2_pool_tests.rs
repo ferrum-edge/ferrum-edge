@@ -3179,17 +3179,21 @@ async fn test_direct_h1_idle_set_holds_at_most_max_idle_per_host() {
 }
 
 /// A backend that numbers its connections in accept order and answers every
-/// request with the number of the connection it arrived on.
-async fn numbering_backend() -> u16 {
+/// request with the number of the connection it arrived on. The counter
+/// returned with its port counts connections the client closed.
+async fn numbering_backend() -> (u16, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind backend");
     let port = listener.local_addr().expect("backend addr").port();
+    let closed = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&closed);
     tokio::spawn(async move {
         let mut accepted = 0usize;
         while let Ok((stream, _)) = listener.accept().await {
             let number = accepted;
             accepted += 1;
+            let counted = Arc::clone(&counted);
             tokio::spawn(async move {
                 let service = service_fn(move |_: Request<Incoming>| async move {
                     Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
@@ -3199,10 +3203,11 @@ async fn numbering_backend() -> u16 {
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
                     .await;
+                counted.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
-    port
+    (port, closed)
 }
 
 /// Ask a numbering backend which connection `checkout` holds, then wait until
@@ -3242,7 +3247,8 @@ async fn connection_number(checkout: &mut ferrum_edge::proxy::http2_pool::Http1C
 /// is not pooled again (issue #6793).
 #[tokio::test]
 async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
-    let proxy = direct_h1_proxy(numbering_backend().await);
+    let (port, _) = numbering_backend().await;
+    let proxy = direct_h1_proxy(port);
     let pool = create_default_pool();
 
     let mut older = ready_checkout(&pool, &proxy).await;
@@ -3269,7 +3275,8 @@ async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
     pool.force_drain_all();
     assert_eq!(pool.h1_idle_connections(), 0);
     // The connection is ready, so check-in goes straight to the lane, which
-    // refuses it under its lock because the drain bumped the generation.
+    // refuses it under its lock because the drain retired it.
+    assert!(reused.sender.is_ready());
     reused.checkin();
     assert_eq!(
         pool.h1_idle_connections(),
@@ -3287,6 +3294,38 @@ async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
     );
     assert_eq!(stats.connections_opened, 2);
     assert_eq!(stats.connections_reused, 1);
+}
+
+/// A connection checked in after a drain closes at once, even while another
+/// checkout still holds the withdrawn lane: it never parks there, uncounted
+/// and unreachable, until the last checkout on that lane finishes (issue
+/// #6793).
+#[tokio::test]
+async fn test_direct_h1_checkin_after_a_drain_closes_the_connection() {
+    let (port, closed) = numbering_backend().await;
+    let proxy = direct_h1_proxy(port);
+    let pool = create_default_pool();
+
+    let held = ready_checkout(&pool, &proxy).await;
+    let late = ready_checkout(&pool, &proxy).await;
+    pool.force_drain_all();
+    assert!(late.sender.is_ready());
+    late.checkin();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while closed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        closed.load(Ordering::SeqCst),
+        1,
+        "the late check-in's connection closes while the lane is still held"
+    );
+    assert_eq!(pool.h1_idle_connections(), 0);
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.evicted_retired, 0, "nothing was idle at the drain");
+    assert_eq!(stats.evicted_ceiling, 0);
+    drop(held);
 }
 
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
