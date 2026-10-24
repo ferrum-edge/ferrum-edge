@@ -4046,43 +4046,6 @@ impl Plugin for MeshAuthz {
             || self.capture_custom_rules_may_apply_to_request(ctx, &rule_may_apply)
     }
 
-    /// Whether a capture-ONLY body-inspecting CUSTOM rule could be checked for
-    /// this request. A policy contributes only when a scope `authorize` could
-    /// judge this request under selects it: the destination scope for the
-    /// matched proxy (the capture-destination scope on the synthesized inbound
-    /// relay, the ordinary index otherwise) or the request's source pod scope;
-    /// with neither, only a mesh-wide policy can apply. This is the same
-    /// applicability `authorize` uses, taken as a superset (either scope), so
-    /// it never skips a buffer a selected policy needs, while a foreign
-    /// destination's provider can no longer buffer or `413` a request to a
-    /// workload it does not select.
-    fn capture_custom_rules_may_apply_to_request(
-        &self,
-        ctx: &RequestContext,
-        rule_may_apply: &dyn Fn(&crate::modes::mesh::config::MeshRule) -> bool,
-    ) -> bool {
-        if self.capture_body_inspecting_custom_policies.is_empty() {
-            return false;
-        }
-        let destination = ctx
-            .matched_proxy
-            .as_ref()
-            .and_then(|proxy| self.node_waypoint_destination_scope_match(proxy));
-        let source = ctx.node_waypoint_policy_scope.as_deref();
-        let waypoint = self.waypoint_attachment();
-        self.capture_body_inspecting_custom_policies
-            .iter()
-            .any(|policy| {
-                let selected = destination.as_ref().is_some_and(|matched| {
-                    matched
-                        .scopes
-                        .iter()
-                        .any(|scope| scope.policy_applies_for_destination(policy, waypoint))
-                }) || Self::policy_applies_to_pod(policy, source);
-                selected && policy.rules.iter().any(rule_may_apply)
-            })
-    }
-
     /// Bound the buffer at the largest `maxRequestBytes` any provider declared,
     /// so a body-inspecting policy cannot make the gateway retain more than the
     /// operator asked a provider to see.
@@ -4270,6 +4233,43 @@ impl Plugin for MeshAuthz {
 }
 
 impl MeshAuthz {
+    /// Whether a capture-ONLY body-inspecting CUSTOM rule could be checked for
+    /// this request. A policy contributes only when a scope `authorize` could
+    /// judge this request under selects it: the destination scope for the
+    /// matched proxy (the capture-destination scope on the synthesized inbound
+    /// relay, the ordinary index otherwise) or the request's source pod scope;
+    /// with neither, only a mesh-wide policy can apply. This is the same
+    /// applicability `authorize` uses, taken as a superset (either scope), so
+    /// it never skips a buffer a selected policy needs, while a foreign
+    /// destination's provider can no longer buffer or `413` a request to a
+    /// workload it does not select.
+    fn capture_custom_rules_may_apply_to_request(
+        &self,
+        ctx: &RequestContext,
+        rule_may_apply: &dyn Fn(&crate::modes::mesh::config::MeshRule) -> bool,
+    ) -> bool {
+        if self.capture_body_inspecting_custom_policies.is_empty() {
+            return false;
+        }
+        let destination = ctx
+            .matched_proxy
+            .as_ref()
+            .and_then(|proxy| self.node_waypoint_destination_scope_match(proxy));
+        let source = ctx.node_waypoint_policy_scope.as_deref();
+        let waypoint = self.waypoint_attachment();
+        self.capture_body_inspecting_custom_policies
+            .iter()
+            .any(|policy| {
+                let selected = destination.as_ref().is_some_and(|matched| {
+                    matched
+                        .scopes
+                        .iter()
+                        .any(|scope| scope.policy_applies_for_destination(policy, waypoint))
+                }) || Self::policy_applies_to_pod(policy, source);
+                selected && policy.rules.iter().any(rule_may_apply)
+            })
+    }
+
     fn ambient_udp_source_scope(
         &self,
         ctx: &RequestContext,
