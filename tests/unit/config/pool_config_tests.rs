@@ -91,7 +91,7 @@ fn create_test_proxy() -> Proxy {
 #[test]
 fn test_default_config() {
     let config = PoolConfig::default();
-    assert_eq!(config.max_idle_per_host, 1024);
+    assert_eq!(config.max_idle_per_host, 256);
     assert_eq!(config.idle_timeout_seconds, 90);
     assert_eq!(config.tcp_keepalive_seconds, 60);
     assert_eq!(config.http2_keep_alive_interval_seconds, 30);
@@ -214,7 +214,7 @@ fn test_proxy_overrides() {
     proxy.pool_http2_keep_alive_timeout_seconds = Some(45);
 
     let config = global.for_proxy(&proxy);
-    assert_eq!(config.max_idle_per_host, 1024); // unchanged (global-only)
+    assert_eq!(config.max_idle_per_host, 256); // unchanged (global-only)
     assert_eq!(config.idle_timeout_seconds, 90); // unchanged
     assert_eq!(config.tcp_keepalive_seconds, 30); // overridden
     assert_eq!(config.http2_keep_alive_interval_seconds, 15); // overridden
@@ -581,7 +581,7 @@ fn test_from_env_explicit_defaults_match_today() {
     // default is host-dependent (CPU cores clamped to 2-8).
     with_env_vars(
         &[
-            ("FERRUM_POOL_MAX_IDLE_PER_HOST", "1024"),
+            ("FERRUM_POOL_MAX_IDLE_PER_HOST", "256"),
             ("FERRUM_POOL_IDLE_TIMEOUT_SECONDS", "90"),
             ("FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE", "true"),
             ("FERRUM_POOL_ENABLE_HTTP2", "true"),

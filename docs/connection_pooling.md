@@ -10,7 +10,7 @@ Connection pooling uses a **hybrid configuration** with global defaults and per-
 
 ```bash
 # Set global defaults (optional - shown with defaults)
-FERRUM_POOL_MAX_IDLE_PER_HOST=1024
+FERRUM_POOL_MAX_IDLE_PER_HOST=256
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=90
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
 FERRUM_POOL_ENABLE_HTTP2=true
@@ -54,7 +54,7 @@ The adaptive setting controls the hyper/reqwest backend HTTP/2 pools. HBONE uses
 
 | Setting | Global Default | Description |
 |---------|----------------|-------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `1024` | Maximum idle connections per backend host. Must be between 4 and 1024 |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `256` | Maximum idle connections per backend host. Must be between 4 and 1024 |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed. Any `u64`, including `0` |
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse. Accepted: `true`/`false`/`1`/`0` |
 | `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported. Accepted: `true`/`false`/`1`/`0` |
@@ -73,7 +73,7 @@ The adaptive setting controls the hyper/reqwest backend HTTP/2 pools. HBONE uses
 
 ## Sizing `FERRUM_POOL_MAX_IDLE_PER_HOST`
 
-This setting controls how many idle backend connections are kept alive per host. The default, **1024**, is also the maximum.
+This setting controls how many idle backend connections are kept alive per host. The default is **256**.
 
 **Safety bounds:** Minimum **4**, maximum **1024**. Values outside this range refuse to start (`ferrum-edge validate` and `run` both fail).
 
@@ -81,7 +81,7 @@ This setting controls how many idle backend connections are kept alive per host.
 
 **After a burst the pool shrinks by itself.** Checkout reuses the most recently returned connection, as hyper's own pool does. The connections a burst left behind therefore sit unused at the bottom of the idle set and close once idle for the timeout, while steady traffic keeps reusing the same few. The ceiling is not what returns a pool to its working size; the idle timeout is.
 
-**A ceiling below a backend's steady concurrency causes churn.** Under steady load most connections sit idle between requests. When more of them are idle at once than the ceiling allows, every check-in beyond it closes a connection, and a later request dials a new one. On the mesh runtime benchmark at 100 concurrent requests, the former default of 64 made about 6% of requests open a new backend connection. At 1024 there was none (issue #6793).
+**A ceiling below a backend's sustained concurrency causes churn.** Under steady load most connections sit idle between requests. When more of them are idle at once than the ceiling allows, every check-in beyond it closes a connection, and a later request dials a new one. On the mesh runtime benchmark (issue #6793), churn cost about 2.5% of throughput and server CPU wherever it happened: a ceiling of 64 at 100 concurrent requests made about 4% of requests dial, and 256 at 500 about 1%. Where the ceiling stayed above concurrency (128 and 256 at 100 concurrent requests, 256 at 250) results matched a ceiling of 1024 exactly, with the same connections, CPU, latency and memory. The default, 256, is the smallest ceiling that matched 1024 through 250 concurrent requests per backend.
 
 ### Watching it
 
@@ -90,6 +90,10 @@ The direct HTTP/1.1 pool exports four families on `/metrics` (see [prometheus_me
 - `ferrum_connection_pool_h1_idle_connections`: idle connections at scrape time.
 - `ferrum_connection_pool_h1_connections_opened_total` and `ferrum_connection_pool_h1_connections_reused_total`: under steady load almost every request should reuse.
 - `ferrum_connection_pool_h1_idle_evictions_total{reason}`: `expired` is the normal shrink after a burst, and `closed` counts connections the backend closed while idle. A steady `ceiling` rate means a backend's concurrency exceeds the ceiling and connections are being redialed, so raise it.
+
+### When to raise it
+
+Raise the ceiling, up to the maximum of **1024**, for a backend that sustains more concurrent requests per gateway or sidecar instance than the ceiling: a steady `ferrum_connection_pool_h1_idle_evictions_total{reason="ceiling"}` rate is the signal. The pool still keeps only the connections that concurrency opened.
 
 ### When to lower it
 

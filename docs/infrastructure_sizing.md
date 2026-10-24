@@ -156,7 +156,7 @@ The connection pool maintains persistent connections to upstream backends, reduc
 
 | Pool setting | Default | Sizing impact |
 |--------------|---------|---------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | 1024 | Max idle connections per upstream host (a ceiling: the pool keeps only what concurrency opened) |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | 256 | Max idle connections per upstream host (a ceiling: the pool keeps only what concurrency opened) |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | 90 | How long idle connections persist |
 | `FERRUM_POOL_ENABLE_HTTP2` | true | HTTP/2 multiplexing reduces connection count |
 

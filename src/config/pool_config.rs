@@ -20,11 +20,21 @@ pub const MIN_IDLE_PER_HOST: usize = 4;
 /// socket buffer) and file descriptors.  On most systems the practical ceiling
 /// is the per-process file-descriptor limit (`ulimit -n`), but values above
 /// 1024 rarely help because the backend itself becomes the bottleneck.
-///
-/// It is also the default. A ceiling reserves nothing: a lane only retains the
-/// connections its own concurrency opened, and each expires after the idle
-/// timeout.
 pub const MAX_IDLE_PER_HOST: usize = 1024;
+
+/// Default `max_idle_per_host` (issue #6793).
+///
+/// A ceiling reserves nothing: a pool keeps only the connections its own
+/// concurrency opened, and each expires after the idle timeout. It costs only
+/// when a backend's sustained concurrency exceeds it, and then every check-in
+/// beyond it drops a connection that is redialed. On the mesh runtime
+/// benchmark that cost about 2.5% of throughput and server CPU (64 at 100
+/// concurrent requests, 256 at 500), while 128 and 256 matched 1024 exactly at
+/// 100 and 256 matched it at 250. 256 is the smallest ceiling that matched
+/// 1024 through 250 concurrent requests per backend; set
+/// `FERRUM_POOL_MAX_IDLE_PER_HOST` up to 1024 for higher sustained
+/// concurrency.
+pub const DEFAULT_IDLE_PER_HOST: usize = 256;
 
 /// Global connection pool configuration from environment variables or ferrum.conf.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,12 +119,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            // The ceiling, not a target: a lane retains at most as many idle
-            // connections as its own concurrency opened, each for
-            // `idle_timeout_seconds`. A lower default dropped and redialed
-            // connections whenever more than that many were idle at once,
-            // which steady concurrency above it does continuously (issue #6793).
-            max_idle_per_host: MAX_IDLE_PER_HOST,
+            max_idle_per_host: DEFAULT_IDLE_PER_HOST,
             idle_timeout_seconds: 90,
             enable_http_keep_alive: true,
             enable_http2: true,
