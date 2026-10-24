@@ -302,13 +302,14 @@ date.
 
 | Advisory | Crate | Disposition | Evidence / tracking |
 |---|---|---|---|
-| RUSTSEC-2023-0071 | `rsa` 0.9.10 (Marvin timing side-channel) | **Re-affirmed** until 2026-12-31 | No fixed release: RustSec `patched = []`; 0.9.10 is the latest stable and 0.10.0-rc.18 (required by sqlx 0.9.0) is still affected. Reached via `sqlx-mysql` (public-key OAEP encryption of the MySQL password only, no private-key operation) and via jsonwebtoken's `rust_crypto` backend in the default `crypto-ring` profile, where RSA *signing* of outbound client assertions (`private_key_jwt` in `oidc_relying_party` / `oauth2_introspection`, `ai_federation` service-account JWTs) runs on the non-constant-time code. For `oidc_relying_party` / `oauth2_introspection`, EC/EdDSA assertion keys or the `fips` profile (`aws_lc_rs`) avoid it. `ai_federation` always signs RS256 (GCP service-account keys are RSA), so only the `fips` profile avoids it there. Retire when `rsa` ships a fix. |
+| RUSTSEC-2023-0071 | `rsa` 0.9.10 (Marvin timing side-channel) | **Re-affirmed** until 2026-12-31 | No fixed release: RustSec `patched = []`; 0.9.10 is the latest stable and 0.10.0-rc.18 (required by sqlx 0.9.0) is still affected. Reached only via `sqlx-mysql` (public-key OAEP encryption of the MySQL password, no private-key operation). Since 2026-10-24 `jsonwebtoken` uses its `aws_lc_rs` backend on both profiles, so RSA signing of outbound client assertions (`private_key_jwt` in `oidc_relying_party` / `oauth2_introspection`) and `ai_federation` service-account JWTs runs on AWS-LC instead of this crate. Retire when `rsa` ships a fix. |
 | RUSTSEC-2024-0436 | `paste` 1.0.15 (unmaintained) | **Re-affirmed** until 2026-12-31 | Proc-macro only; no runtime surface. `tikv-jemalloc-ctl` still depends on `paste ^1` in its latest 0.7.0, and the test matrix macro (`tests/scaffolding/matrix.rs`) uses it as a dev-dependency. Retire when `tikv-jemalloc-ctl` drops it. |
 | RUSTSEC-2024-0449 | `unsafe-libyaml` 0.2.11 (unmaintained) | **Added** 2026-10-12, until 2026-12-31 | Informational, not a known vulnerability: the repository was archived on 2024-03-25, RustSec lists `patched = []`, and 0.2.11 is the last release. Reached via `serde_yaml` 0.9.34+deprecated (file-mode and mesh file config loaders, config migration, API-spec YAML export) and via the direct pin that drives the libyaml event parser in `src/admin/api_specs/bounded_yaml.rs` and `src/config/yaml_alias_budget.rs` to bound alias expansion (#3307, PR #3843). Present in the root and `fuzz/` lockfiles, not in `ebpf/`. Inputs are operator-controlled (config files, the Kubernetes MeshConfig ConfigMap) or authenticated Admin API spec bodies parsed under size, node, depth, alias, and work budgets; no unauthenticated network input reaches libyaml. Forks such as `serde_yaml_ng` still depend on `unsafe-libyaml`, so retire by migrating `serde_yaml` and both event parsers to a safe-Rust YAML parser (`saphyr` / `serde-saphyr`). |
 | RUSTSEC-2026-0118, RUSTSEC-2026-0119 | `hickory-proto` 0.25.2 | **Retired** | Only `mongodb` < 3.7 pulled hickory 0.25. `mongodb` 3.7.0 moved to hickory 0.26. `Cargo.toml` now requires `3.9.1` (the lockfile resolves 3.9.1, also the fix for CVE-2026-88024), so the hickory 0.25 line cannot return. |
 | RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104 | `rustls-webpki` 0.101.7 | **Retired** | Came only from rustls 0.21 in the AWS SDK's legacy `rustls` connector (`aws-smithy-runtime/tls-rustls`). `aws-sdk-secretsmanager` is now built with `default-features = false` and `default-https-client` + `rt-tokio`, the hyper 1.x / rustls 0.23 client that `aws_config::load_defaults` already selected. |
 | RUSTSEC-2026-0258 | `h2` 0.3.27 | **Retired** | Same legacy AWS connector (hyper 0.14). The gateway's own h2 0.4.x stays on the patched release. |
 | RUSTSEC-2025-0134 | `rustls-pemfile` 2.2.0 (unmaintained) | **Retired** | PEM parsing uses the `rustls-pki-types` `PemObject` API (`CertificateDer::pem_slice_iter`, `PrivateKeyDer::from_pem_slice`, `CertificateRevocationListDer::pem_slice_iter`), the code `rustls-pemfile` 2.2 already wrapped. `crate::tls::first_pem_private_key` keeps the old `Result<Option<_>>` contract where callers distinguish "no key" from "malformed". The standalone `tests/performance/**` harnesses were migrated the same way and their lockfiles refreshed. |
+| RUSTSEC-2026-0387 | `crypto-bigint` 0.5.5 (constant-time timing issues) | **Not needed** (2026-10-24) | Only `jsonwebtoken`'s `rust_crypto` backend pulled in `p256` / `p384` 0.13 → `elliptic-curve` 0.13 → `crypto-bigint` 0.5.5, and that backend signed ES256 JWT-SVIDs and ES256/ES384 `private_key_jwt` assertions on it. `jsonwebtoken` now selects `aws_lc_rs` inline on both profiles, so the root, `fuzz/` and `tests/performance/mesh/` lockfiles no longer contain those crates, and no ignore was added. |
 
 ### 3. License allowlist and exceptions
 
@@ -1153,8 +1154,20 @@ Rules:
 
 - **The backend is never selected inline on a dependency.** `rustls`,
   `tokio-rustls`, `reqwest`, `sqlx`, `ldap3`, `quinn`, `rcgen`, `x509-parser`,
-  `jsonwebtoken`, `hyper-rustls`, and `instant-acme` all take their crypto arm
-  from the feature pair. An inline selection would win on both profiles.
+  `hyper-rustls`, and `instant-acme` all take their crypto arm from the
+  feature pair. An inline selection would win on both profiles.
+- **`jsonwebtoken` is the one deliberate exception.** It selects `aws_lc_rs`
+  inline, identically on both profiles, and `rust_crypto` is never enabled.
+  jsonwebtoken 11 picks its provider automatically only when exactly one
+  backend is compiled, so one inline selection keeps that true for every
+  feature combination. On a `fips` build, `aws-lc-rs/fips` unifies onto the
+  same `aws-lc-rs`, so JWTs are signed and verified in the validated module.
+  `rust_crypto` would pull in the RustCrypto `rsa` (RUSTSEC-2023-0071) and
+  `p256`/`p384` 0.13 on `crypto-bigint` 0.5 (RUSTSEC-2026-0387) signers.
+  `check_fips_feature_policy.py` (`REQUIRED_INLINE_DECLARATIONS`) requires the
+  inline selection, rejects any `jsonwebtoken/...` edge in either profile
+  list, and requires `jsonwebtoken/aws_lc_rs` with no `rust_crypto` in both
+  resolved graphs.
   `rustls`, `tokio-rustls`, `quinn`, and `rcgen` carry
   `default-features = false`, because their default sets select a provider;
   reqwest uses `rustls-no-provider` plus vendored `__rustls-ring` /

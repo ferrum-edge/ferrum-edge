@@ -98,6 +98,9 @@ const TOKEN_BINDING_MISSING: &str = "DPoP token binding missing";
 /// [`verify`] failure: the access token is bound to a different key than the
 /// proof's `jwk`.
 const TOKEN_BINDING_MISMATCH: &str = "DPoP binding mismatch";
+/// [`verify`] failure: the proof's RSA `jwk` is outside the 2048-8192-bit
+/// window the JWT backend verifies with.
+pub const DPOP_RSA_KEY_SIZE: &str = "DPoP RSA key must be 2048-8192 bits";
 
 /// Whether a [`verify`] failure faults the access token's key binding rather
 /// than the proof itself. RFC 9449 §7.1 answers the former with
@@ -124,6 +127,18 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
         return Err(TOKEN_BINDING_MISMATCH);
     }
 
+    // The JWT backend verifies RS256 only with 2048-8192-bit RSA keys; name
+    // that instead of reporting a signature failure for a well-formed proof.
+    if let AlgorithmParameters::RSA(rsa) = &jwk.algorithm {
+        let modulus = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(rsa.n.trim_end_matches('=').as_bytes())
+            .map_err(|_| "Invalid DPoP jwk")?;
+        if crate::fips::keys::check_jwt_rsa_verification_modulus(&modulus, "DPoP proof key")
+            .is_err()
+        {
+            return Err(DPOP_RSA_KEY_SIZE);
+        }
+    }
     let key = DecodingKey::from_jwk(jwk).map_err(|_| "Invalid DPoP jwk")?;
     let mut validation = Validation::new(header.alg);
     validation.validate_exp = true;

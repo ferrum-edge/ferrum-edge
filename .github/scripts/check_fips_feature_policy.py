@@ -55,7 +55,6 @@ REQUIRED_FEATURE_PAIRS = (
     ("ldap3/tls-rustls-ring", "ldap3/tls-rustls-aws-lc-rs"),
     ("rcgen/ring", "rcgen/fips"),
     ("x509-parser/verify", "x509-parser/verify-aws"),
-    ("jsonwebtoken/rust_crypto", "jsonwebtoken/aws_lc_rs"),
     ("reqwest/__rustls-ring", "reqwest/__rustls-aws-lc-rs"),
     ("hyper-rustls?/ring", "hyper-rustls?/fips"),
     ("instant-acme?/ring", "instant-acme?/fips"),
@@ -75,7 +74,9 @@ REQUIRED_RING_ONLY = ("dep:ring",)
 
 # Neither profile may name the other's backend crate at all, in any spelling.
 # The pair table above catches a known counterpart edge; this catches a *new*
-# edge onto the wrong crate that nobody thought to pair.
+# edge onto the wrong crate that nobody thought to pair. jsonwebtoken's inline
+# `aws_lc_rs` (REQUIRED_INLINE_DECLARATIONS) is outside both lists by design:
+# it is the same AWS-LC selection on both profiles, not a profile arm.
 BACKEND_CRATE_PREFIXES = {
     "crypto-ring": ("aws-lc-rs", "aws_lc_rs", "aws-lc-fips-sys", "aws-lc-sys"),
     "fips": ("ring",),
@@ -127,8 +128,23 @@ FORBIDDEN_INLINE_DECLARATIONS = {
     "kube": ("ring", "aws-lc-rs"),
     "mongodb": ("rustls-tls", "rustls-tls-aws-lc"),
     "x509-parser": ("verify", "verify-aws"),
-    "jsonwebtoken": ("rust_crypto", "aws_lc_rs"),
+    # jsonwebtoken is the one deliberate inline selection: see
+    # REQUIRED_INLINE_DECLARATIONS below. `rust_crypto` is never admissible.
+    "jsonwebtoken": ("rust_crypto",),
     "reqwest": ("rustls",),
+}
+
+# Dependencies whose crypto backend is selected inline, identically on both
+# profiles, instead of through the feature pair. jsonwebtoken 11 chooses its
+# provider automatically only when exactly one of `rust_crypto` / `aws_lc_rs`
+# is compiled, and a `fips` build already routes `aws-lc-rs` onto the
+# validated module through `aws-lc-rs/fips`. Selecting `aws_lc_rs` inline keeps
+# exactly one backend in every feature combination, and keeps the RustCrypto
+# `rsa` / `p256` / `p384` signers (RUSTSEC-2023-0071, RUSTSEC-2026-0387) out of
+# the ordinary build. Neither profile list may name these dependencies'
+# backend features.
+REQUIRED_INLINE_DECLARATIONS = {
+    "jsonwebtoken": ("aws_lc_rs",),
 }
 
 # Dependencies that must be declared with `default-features = false`, because
@@ -179,6 +195,7 @@ FORBIDDEN_RESOLVED_FIPS = {
 # Feature selections that must be present in a resolved `fips` graph.
 REQUIRED_RESOLVED_FIPS = {
     ("aws-lc-rs", "fips"),
+    ("jsonwebtoken", "aws_lc_rs"),
     ("kube", "aws-lc-rs"),
     ("mongodb", "rustls-tls-aws-lc"),
     ("reqwest", "__rustls-aws-lc-rs"),
@@ -188,6 +205,7 @@ REQUIRED_RESOLVED_FIPS = {
 # The ordinary profile's contract, so a change that quietly moves the default
 # build onto a different backend is caught too.
 REQUIRED_RESOLVED_RING = {
+    ("jsonwebtoken", "aws_lc_rs"),
     ("kube", "ring"),
     ("mongodb", "rustls-tls"),
     ("reqwest", "__rustls-ring"),
@@ -195,6 +213,7 @@ REQUIRED_RESOLVED_RING = {
 }
 FORBIDDEN_RESOLVED_RING = {
     ("aws-lc-rs", "fips"),
+    ("jsonwebtoken", "rust_crypto"),
     ("rustls", "fips"),
 }
 
@@ -318,6 +337,26 @@ def check_manifest() -> list[str]:
                     f"dependency {dep!r} must not select the crypto-backend feature "
                     f"{feature!r} inline; it belongs to the `crypto-ring` / `fips` pair"
                 )
+
+    for dep, required in REQUIRED_INLINE_DECLARATIONS.items():
+        line = dependency_line(manifest, dep)
+        if line is None:
+            failures.append(f"dependency {dep!r} is not declared on its own line in Cargo.toml")
+            continue
+        inline = set(re.findall(r'"([^"]+)"', line))
+        for feature in required:
+            if feature not in inline:
+                failures.append(
+                    f"dependency {dep!r} must select the crypto-backend feature {feature!r} "
+                    "inline so exactly one backend is compiled on every profile"
+                )
+        for profile, entries in (("crypto-ring", ring_features), ("fips", fips_features)):
+            for entry in entries:
+                if entry.split("/", 1)[0].rstrip("?") == dep:
+                    failures.append(
+                        f"`{profile}` must not select {entry!r}: the {dep!r} backend is "
+                        "selected inline, identically on both profiles"
+                    )
 
     for dep in REQUIRE_DEFAULT_FEATURES_OFF:
         line = dependency_line(manifest, dep)

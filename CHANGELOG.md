@@ -21,6 +21,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unqualified attribute: a prefixed look-alike such as `x:ID` or `x:Type`
   placed first cannot stand in for it. The XML parsers pass no
   external-entity resolver.
+- **JWT signing and verification run on AWS-LC in the default build.**
+  `jsonwebtoken` now selects its `aws_lc_rs` backend inline on both profiles
+  instead of `rust_crypto` on the default `crypto-ring` profile; a `fips` build
+  still routes it onto the validated module. This removes the RustCrypto
+  `p256`/`p384` 0.13 → `crypto-bigint` 0.5.5 signers (RUSTSEC-2026-0387) that
+  minted ES256 JWT-SVIDs and ES256/ES384 `private_key_jwt` client assertions,
+  and the RustCrypto `rsa` signer (RUSTSEC-2023-0071) used for RS* assertions
+  and `ai_federation` service-account JWTs. RSA keys must now be 2048–8192
+  bits for **verification as well as signing**:
+  - `oidc_relying_party` and `oauth2_introspection` trial-sign their
+    assertion key at config load, so a shorter key is refused there.
+  - `jwks_auth`, OIDC and mesh `RequestAuthentication` JWKS keys and JWT-SVID
+    authorities already enforced 2048–8192 bits.
+  - CP/DP trust-bundle (`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`) RSA public keys
+    outside the range are now refused at load and reload, with the size named.
+    A refused reload keeps the previous verifier.
+  - A DPoP proof whose RSA `jwk` is outside the range is refused as
+    `invalid_dpop_proof` ("DPoP RSA key must be 2048-8192 bits") before its
+    signature is checked.
+  - An `ai_federation` service-account key outside the range would fail on
+    first token exchange. GCP issues 2048-bit keys.
+  ECDSA signatures are randomized rather than RFC 6979 deterministic; both are
+  valid ES256/ES384.
+- **Backend pools keep up to 256 idle connections per host by default**
+  (issue #6793), up from 64. `FERRUM_POOL_MAX_IDLE_PER_HOST` is a ceiling, not
+  a reservation: a pool keeps only connections that concurrent requests opened,
+  each until `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`. A backend whose sustained
+  concurrency exceeded the old 64 had connections dropped at check-in and
+  redialed: on the mesh runtime benchmark at 100 concurrent requests about 4% of
+  requests dialed, costing about 2.5% of throughput and server CPU. In a paired
+  sweep, 128 and 256 dialed nothing extra and were indistinguishable from a
+  ceiling of 1024 at 100 concurrent requests, as was 256 at 250; at 500, 256 churned again and cost the
+  same 2.5%, so raise the ceiling (up to 1024) for that much sustained
+  concurrency per backend. The direct HTTP/1.1 pool now reuses the most
+  recently returned connection first, so connections a burst left behind close
+  after the idle timeout instead of being kept warm by round-robin reuse, and
+  its idle set keeps its capacity rather than reserving the ceiling's slots up
+  front. New `/metrics` families `ferrum_connection_pool_h1_idle_connections`,
+  `ferrum_connection_pool_h1_connections_opened_total`,
+  `ferrum_connection_pool_h1_connections_reused_total` and
+  `ferrum_connection_pool_h1_idle_evictions_total{reason}` show idle
+  connections, dials, reuse and evictions (ceiling, expired, closed,
+  retired); a steady `reason="ceiling"` rate means the ceiling is too low. Set
+  `FERRUM_POOL_MAX_IDLE_PER_HOST=64` to keep the previous ceiling.
 - **Mesh workload labels travel as typed facts** (issue #6793).
   `workload_metrics` now resolves the local workload's labels once per plugin
   generation and a verified TLS peer's SPIFFE labels once per connection, and
@@ -95,6 +139,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **A direct HTTP/1.1 check-in racing a drain no longer lands in the drained
+  pool** (issue #6793). A drain now marks the backend's lane retired under the
+  lane lock, and check-in reads that mark under the same lock. A connection
+  checked in while a reload, certificate rotation or pool clear withdrew its
+  backend is therefore either retired with the rest (and counted as
+  `reason="retired"`) or closed at once. Before, a check-in that raced the
+  drain, or a checkout that found the lane just before it was withdrawn, could
+  leave the connection in the withdrawn lane, uncounted, until the last
+  in-flight request on that lane finished.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now
