@@ -131,7 +131,9 @@ AGENT_NAME="meshbench-${MESH}-${RUN_ID}-agent"
 PROBE_NAME="meshbench-${MESH}-${RUN_ID}-probe"
 LOADGEN_NAME="meshbench-${MESH}-${RUN_ID}-loadgen"
 # This grants access only through the explicitly mounted, disposable fixture
-# directories. Container users stay nonroot and private keys stay mode 0640.
+# directories. Container users stay nonroot and private keys stay mode 0640
+# (0660 only for Linkerd's per-proxy runtime copy, whose identity init must
+# write beside it).
 CERT_GID="$(id -g)"
 
 mkdir -p "$OUTPUT_DIR"
@@ -166,7 +168,7 @@ cleanup() {
         "$PROBE_NAME" "$LOADGEN_NAME" >/dev/null 2>&1 || true
     # Single-run private keys never outlive the run (certificates and
     # public bundles remain as provenance under runtime/).
-    rm -f "$CERT_DIR"/*/svid.key "$CERT_DIR"/*/key.p8 \
+    rm -f "$CERT_DIR"/*/svid.key "$CERT_DIR"/*/key.p8 "$RUNTIME_DIR"/linkerd/*/key.p8 \
         "$CERT_DIR/ca/root.key" "$CERT_DIR/rogue/root.key" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -534,17 +536,26 @@ start_linkerd() {
     # "forward" posture is not a supported mode. This arm exists to prove
     # or refute standalone operation with evidence: if the echo probe
     # fails, the arm is recorded unsupported-standalone with logs.
-    mkdir -p "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client"
-    cp "$CERT_DIR/svc/svid.crt" "$CERT_DIR/linkerd-svc/crt.pem"
-    cp "$CERT_DIR/svc/svid.key" "$CERT_DIR/linkerd-svc/key.p8"
-    cp "$CERT_DIR/client/svid.crt" "$CERT_DIR/linkerd-client/crt.pem"
-    cp "$CERT_DIR/client/svid.key" "$CERT_DIR/linkerd-client/key.p8"
-    chgrp "$CERT_GID" "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client" "$CERT_DIR"/linkerd-*/key.p8
-    chmod 750 "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client"
-    chmod 640 "$CERT_DIR"/linkerd-*/key.p8
-    chmod 644 "$CERT_DIR"/linkerd-*/crt.pem
+    #
+    # linkerd2-proxy's identity init opens key.p8 for writing and writes its
+    # CSR into the identity directory; on a read-only mount it exits before
+    # the Destination check that classifies this arm. Each proxy therefore
+    # gets a disposable, group-writable copy under the runtime directory,
+    # and the shared certificate fixture stays read-only.
+    local identity="${RUNTIME_DIR:?}/linkerd"
+    # Start each cell from a clean copy: no CSR or key left by an earlier run.
+    rm -rf "$identity"
+    mkdir -p "$identity/svc" "$identity/client"
+    cp "$CERT_DIR/svc/svid.crt" "$identity/svc/crt.pem"
+    cp "$CERT_DIR/svc/svid.key" "$identity/svc/key.p8"
+    cp "$CERT_DIR/client/svid.crt" "$identity/client/crt.pem"
+    cp "$CERT_DIR/client/svid.key" "$identity/client/key.p8"
+    chgrp "$CERT_GID" "$identity/svc" "$identity/client" "$identity"/*/key.p8
+    chmod 770 "$identity/svc" "$identity/client"
+    chmod 660 "$identity"/*/key.p8
+    chmod 644 "$identity"/*/crt.pem
     docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
-        -v "$CERT_DIR/linkerd-svc:/var/run/linkerd/identity/end-entity:ro" \
+        -v "$identity/svc:/var/run/linkerd/identity/end-entity" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_INBOUND_LISTEN_ADDR=127.0.0.1:4143 \
         -e LINKERD2_PROXY_INBOUND_PORTS=18080 \
@@ -555,7 +566,7 @@ start_linkerd() {
         -e LINKERD2_PROXY_IDENTITY_LOCAL_NAME=svc.ferrum.serviceaccount.identity.linkerd.cluster.local \
         "$LINKERD_IMAGE" >/dev/null 2>&1 || true
     docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
-        -v "$CERT_DIR/linkerd-client:/var/run/linkerd/identity/end-entity:ro" \
+        -v "$identity/client:/var/run/linkerd/identity/end-entity" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_OUTBOUND_LISTEN_ADDR=127.0.0.1:4140 \
         -e LINKERD2_PROXY_DESTINATION_CONTEXT="ns:ferrum" \
