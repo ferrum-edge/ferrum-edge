@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`waf` records the matched field names.** `waf.matched_fields` lists the
+  `query:` / `header:` / `cookie:` / `response_header:` NAMES that rule hits
+  came from (percent-encoded, at most 16 per scan, each cut at 128 bytes) so a
+  false positive can be tuned with `rule_overrides.<id>.exclude` without
+  reproducing the request. Values are never recorded. JSON-path-only policies
+  no longer normalize the entire raw body when no whole-body text rule or
+  encoding special consumes it.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -329,6 +336,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`waf` inspects gRPC bodies message by message.** A framed gRPC or
+  gRPC-Web body the WAF scans (the `+json` codecs by default) was scanned as
+  one stream, so every `body_json_path` rule saw invalid JSON and passed an
+  ordinary `application/grpc+json` call, and a `grpc-encoding`-compressed
+  message reached the backend as octets no rule could read. Bodies are now
+  split into their length-prefixed messages (gRPC-Web text is base64-decoded
+  first) and every rule runs per message, in both directions; the wire bytes
+  are unchanged. A compressed message, or more than 1024 messages, is refused
+  when an enforcing body policy applies
+  (`waf.block_reason=grpc_message_uninspectable`) and recorded as
+  `waf.body_uninspected=grpc_compressed` / `grpc_message_count` otherwise.
+- **`waf` judges a bounded response relabeled `text/event-stream`.** The final
+  response-body phase skipped every `text/event-stream` body, so a finite
+  `text/plain` response wrapped by the `sse` plugin's `wrap_non_sse_responses`
+  (or relabeled by a response transformer) escaped both the response-body
+  rules and `on_unlisted_response_content_type`. Only a pristine origin event
+  stream is skipped now; a relabeled body is judged by the scan scope of the
+  origin media type.
+- **`waf` governs request bodies on every method.** Bodies were buffered and
+  scanned only for `body_methods`, so a payload an enforcing rule refused on
+  `POST` reached a body-parsing backend unscanned as `GET`/`SEARCH`/`PROPFIND`.
+  A request on any method is now governed once it declares a body
+  (`Content-Length` > 0, `Transfer-Encoding`, or `Content-Type`), and any
+  non-empty finalized body is decided; `body_methods` now names methods that
+  are always buffered even without such a declaration. `body_methods: []` no
+  longer stops `on_unlisted_content_type: block` from being an admission
+  enforcement path.
+- **`waf` `global_exemptions.header_present` also suppresses the strict
+  `block` dispositions** of `on_body_too_large`, `on_unlisted_content_type`,
+  and `on_unlisted_response_content_type` (HTTP and WebSocket), matching the
+  rule hits and `fail_closed` decisions it already suppressed.
+- **`waf` rejects non-canonical `global_exemptions.paths`** exact and `prefix*`
+  entries at construction, as `conditions.paths` already did; such an entry
+  could never match the canonical request path and silently exempted nothing.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

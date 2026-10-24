@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use super::BodyDirection;
 use super::Waf;
 use super::decode;
+use super::grpc::GrpcMessages;
 use super::json_doc;
 use super::normalize;
 use super::rules::{
@@ -30,15 +31,30 @@ pub(super) enum ScanSubject<'a> {
     WebSocketSession(&'a WsSessionPolicy),
 }
 
+/// Most distinct field names one scan records in `matched_fields`.
+const MAX_MATCHED_FIELDS: usize = 16;
+
+/// Longest encoded field name recorded; a longer one ends in a bare `*`.
+const MAX_MATCHED_FIELD_NAME_BYTES: usize = 128;
+
 #[derive(Debug, Default)]
 pub(super) struct ScanOutcome {
     pub hits: Vec<RuleHit>,
     pub truncated: bool,
     pub timed_out: bool,
+    /// `<kind>:<name>` labels of the request/response fields accepted hits came
+    /// from (`query`, `header`, `cookie`, `response_header`). Names only — a
+    /// field VALUE is never recorded. Bounded by [`MAX_MATCHED_FIELDS`] and
+    /// [`MAX_MATCHED_FIELD_NAME_BYTES`]; see [`matched_field_label`].
+    pub matched_fields: Vec<String>,
+    /// Every accepted hit, including a repeat of an already-recorded rule, so
+    /// a scan can tell whether one field produced any hit at all.
+    pub(super) accepted_hits: usize,
 }
 
 impl ScanOutcome {
     pub fn push(&mut self, hit: RuleHit) {
+        self.accepted_hits = self.accepted_hits.saturating_add(1);
         if !self
             .hits
             .iter()
@@ -47,6 +63,79 @@ impl ScanOutcome {
             self.hits.push(hit);
         }
     }
+
+    /// Record the NAME of the field an accepted hit came from. Cold path: it
+    /// runs only after a rule matched.
+    fn record_field(&mut self, kind: &str, name: &str) {
+        if self.matched_fields.len() >= MAX_MATCHED_FIELDS {
+            return;
+        }
+        let label = matched_field_label(kind, name);
+        if !self.matched_fields.contains(&label) {
+            self.matched_fields.push(label);
+        }
+    }
+
+    /// [`Self::record_field`] for a per-field surface. Query parameters are
+    /// recorded by `scan_query_pair`, which knows the name as the application
+    /// reads it; whole-surface matches (path, method, URL, bodies) have no
+    /// field name to report.
+    fn record_field_of(&mut self, field: Field<'_>) {
+        let (kind, name) = match field {
+            Field::Header(name) => ("header", name),
+            Field::ResponseHeader(name) => ("response_header", name),
+            Field::Cookie(name) => ("cookie", name),
+            Field::QueryParam(_) | Field::Whole | Field::Url { .. } => return,
+        };
+        self.record_field(kind, name);
+    }
+
+    /// Fold one message's outcome into a whole-body outcome.
+    fn absorb(&mut self, other: ScanOutcome) {
+        for hit in other.hits {
+            self.push(hit);
+        }
+        for label in other.matched_fields {
+            if self.matched_fields.len() < MAX_MATCHED_FIELDS
+                && !self.matched_fields.contains(&label)
+            {
+                self.matched_fields.push(label);
+            }
+        }
+        self.truncated |= other.truncated;
+        self.timed_out |= other.timed_out;
+    }
+}
+
+/// `<kind>:<name>` with every byte of `name` outside the RFC 3986 unreserved
+/// set (`A-Z a-z 0-9 - . _ ~`) percent-encoded, so an attacker-chosen name can
+/// neither inject a delimiter (`,`), a control character, nor a log-format
+/// escape into transaction metadata, while an ordinary name reads verbatim.
+/// A name whose encoding exceeds [`MAX_MATCHED_FIELD_NAME_BYTES`] is cut and
+/// ends in a bare `*` (a literal `*` is always encoded as `%2A`).
+fn matched_field_label(kind: &str, name: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut label =
+        String::with_capacity(kind.len() + 1 + name.len().min(MAX_MATCHED_FIELD_NAME_BYTES) + 1);
+    label.push_str(kind);
+    label.push(':');
+    let start = label.len();
+    for byte in name.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~');
+        let encoded_len = if unreserved { 1 } else { 3 };
+        if label.len() - start + encoded_len > MAX_MATCHED_FIELD_NAME_BYTES {
+            label.push('*');
+            return label;
+        }
+        if unreserved {
+            label.push(char::from(byte));
+        } else {
+            label.push('%');
+            label.push(char::from(HEX[usize::from(byte >> 4)]));
+            label.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    label
 }
 
 impl Waf {
@@ -191,7 +280,7 @@ impl Waf {
                 } else {
                     Cow::Borrowed(raw_k)
                 };
-                self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, subject);
+                self.scan_query_pair(&mut outcome, raw_k, raw_v, &name, false, subject);
                 // A backend that also splits on `;` reads each `;` sub-pair as
                 // a parameter of its own (issue #6579), so `?html=ok;q=<x>`
                 // must not hide `q` behind an excluded `html`. Split on the
@@ -207,7 +296,7 @@ impl Waf {
                         } else {
                             Cow::Borrowed(sub_k)
                         };
-                        self.scan_query_pair(&mut outcome, sub_k, sub_v, &sub_name, subject);
+                        self.scan_query_pair(&mut outcome, sub_k, sub_v, &sub_name, false, subject);
                     }
                 }
             }
@@ -218,7 +307,7 @@ impl Waf {
             // that the whole-URL re-check, which compares these keys as they
             // are, does not honour.
             for (key, value) in &ctx.query_params {
-                self.scan_query_pair(&mut outcome, key, value, key, subject);
+                self.scan_query_pair(&mut outcome, key, value, key, true, subject);
             }
         }
 
@@ -280,13 +369,22 @@ impl Waf {
         outcome
     }
 
+    /// `grpc` is the message split of a framed gRPC body (see
+    /// [`super::grpc::split_messages`]); `None` scans `body` as one document.
     pub(super) fn run_request_body_scan(
         &self,
         ctx: &RequestContext,
         body: &[u8],
         content_type: Option<&str>,
+        grpc: Option<&GrpcMessages<'_>>,
     ) -> ScanOutcome {
-        self.scan_request_body_rules(ScanSubject::Http(ctx), body, content_type)
+        let subject = ScanSubject::Http(ctx);
+        match grpc {
+            Some(messages) => {
+                self.scan_grpc_messages(subject, messages, content_type, BodyDirection::Request)
+            }
+            None => self.scan_request_body_rules(subject, body, content_type),
+        }
     }
 
     /// Request-side body rule engine, shared by the HTTP final-request-body
@@ -343,6 +441,13 @@ impl Waf {
                 self.scan_json_path_rules(&mut outcome, decoded.as_bytes(), subject);
             }
         }
+        // Nothing below has a consumer unless a whole-body text rule (body
+        // text, Luhn, CIDR) or a body-scoped encoding special is active: a
+        // JSON-path-only policy normalizes its selected scalars above and must
+        // not pay for decoding and copying the entire document as well.
+        if !text_views_active {
+            return outcome;
+        }
         let text = String::from_utf8_lossy(body);
         if transcoded_views.uninspectable_charset()
             && let Some(rule_index) = self.specials.encoding
@@ -352,11 +457,29 @@ impl Waf {
         // A declared charset adds coverage; it must not remove matches from
         // raw text or its transformations (including mixed representations).
         self.scan_body_text_view(&mut outcome, text.as_ref(), subject, direction);
-        if text_views_active {
-            for decoded in transcoded_views.iter() {
-                self.scan_bytes_set(&mut outcome, bytes, decoded.as_bytes(), subject);
-                self.scan_body_text_view(&mut outcome, decoded, subject, direction);
-            }
+        for decoded in transcoded_views.iter() {
+            self.scan_bytes_set(&mut outcome, bytes, decoded.as_bytes(), subject);
+            self.scan_body_text_view(&mut outcome, decoded, subject, direction);
+        }
+        outcome
+    }
+
+    /// Body-rule scan of a framed gRPC / gRPC-Web body, ONE MESSAGE AT A TIME:
+    /// each payload is the document (or opaque message) the backend decodes,
+    /// so JSON-path rules parse each `+json` message and text/byte rules read
+    /// each payload rather than a stream interleaved with 5-byte frame
+    /// headers. Messages the caller already refused or recorded as
+    /// uninspectable (compressed, over the count cap) are not in `messages`.
+    pub(super) fn scan_grpc_messages(
+        &self,
+        subject: ScanSubject<'_>,
+        messages: &GrpcMessages<'_>,
+        content_type: Option<&str>,
+        direction: BodyDirection,
+    ) -> ScanOutcome {
+        let mut outcome = ScanOutcome::default();
+        for payload in messages.payloads() {
+            outcome.absorb(self.scan_body_rules(subject, payload, content_type, direction));
         }
         outcome
     }
@@ -427,13 +550,21 @@ impl Waf {
         outcome
     }
 
+    /// Response-side counterpart of [`Self::run_request_body_scan`].
     pub(super) fn run_response_body_scan(
         &self,
         ctx: &RequestContext,
         body: &[u8],
         content_type: Option<&str>,
+        grpc: Option<&GrpcMessages<'_>>,
     ) -> ScanOutcome {
-        self.scan_response_body_rules(ScanSubject::Http(ctx), body, content_type)
+        let subject = ScanSubject::Http(ctx);
+        match grpc {
+            Some(messages) => {
+                self.scan_grpc_messages(subject, messages, content_type, BodyDirection::Response)
+            }
+            None => self.scan_response_body_rules(subject, body, content_type),
+        }
     }
 
     /// Response-side engine for HTTP bodies and backend→client WS messages.
@@ -656,14 +787,19 @@ impl Waf {
         );
     }
 
+    /// `key_is_decoded` is true for a materialized query map, whose keys are
+    /// already the names the application reads; a raw pair's key is decoded
+    /// once (only when it produced a hit) for the `matched_fields` record.
     fn scan_query_pair(
         &self,
         outcome: &mut ScanOutcome,
         raw_key: &str,
         raw_value: &str,
         name: &str,
+        key_is_decoded: bool,
         subject: ScanSubject<'_>,
     ) {
+        let accepted_before = outcome.accepted_hits;
         // One shared decode: split components are already isolated, then
         // `canonical_query_component_views` percent-decodes `%2f` and produces
         // the bounded layered variants. PATHTRAV/LFI (canonical_query_values)
@@ -698,6 +834,14 @@ impl Waf {
                 subject,
                 field,
             );
+        }
+        if outcome.accepted_hits != accepted_before {
+            let label_name = if key_is_decoded {
+                Cow::Borrowed(raw_key)
+            } else {
+                normalize::query_component_name(raw_key)
+            };
+            outcome.record_field("query", &label_name);
         }
     }
 
@@ -798,6 +942,7 @@ impl Waf {
                     rule_index,
                     target_name: rule.target.log_target(),
                 });
+                outcome.record_field_of(field);
             }
         }
     }
@@ -1067,6 +1212,7 @@ impl Waf {
                 rule_index: rule_ref.rule_index,
                 target_name: rule_ref.target_name,
             });
+            outcome.record_field_of(field);
         }
     }
 }

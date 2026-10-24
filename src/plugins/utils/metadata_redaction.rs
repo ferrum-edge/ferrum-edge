@@ -506,6 +506,7 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "waf.detection_rule_hits",
     "waf.first_blocking_rule",
     "waf.instance_scores",
+    "waf.matched_fields",
     "waf.paranoia",
     "waf.response_stream_uninspectable",
     "waf.rule_hits",

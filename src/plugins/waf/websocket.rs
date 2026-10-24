@@ -141,11 +141,12 @@ impl WsSessionPolicy {
             inspect_client_to_backend && waf.has_enforcing_body_policy(BodyDirection::Request, ctx);
         let enforcing_backend_to_client = inspect_backend_to_client
             && waf.has_enforcing_body_policy(BodyDirection::Response, ctx);
-        // The `(mode == enforce && on_body_too_large == block)` term both HTTP
-        // body predicates OR in: a strict size cap is a blocking body
-        // disposition on its own, independent of per-rule `action`.
-        let strict_size_cap = waf.config.mode == GlobalMode::Enforce
-            && waf.config.on_body_too_large == TooLargeAction::Block;
+        // The `(on_body_too_large == block && strict_block_applies)` term both
+        // HTTP body predicates OR in: a strict size cap is a blocking body
+        // disposition on its own, independent of per-rule `action`, unless a
+        // `header_present` secret exempted the upgrade request.
+        let strict_size_cap =
+            waf.config.on_body_too_large == TooLargeAction::Block && waf.strict_block_applies(ctx);
         Self {
             suppressed_by_request: waf.exemptions.suppresses_rule_for_request(ctx),
             rule_conditions: waf
@@ -279,7 +280,11 @@ impl WafWsSession {
             TooLargeAction::Skip => return Err(None),
             TooLargeAction::ScanTruncated => false,
             TooLargeAction::FailClosed => self.policy.enforces(governed),
-            TooLargeAction::Block => self.waf.config.mode == GlobalMode::Enforce,
+            // A `header_present` secret on the upgrade request exempts the
+            // session from the strict cap too, as `Waf::clamp_body` does.
+            TooLargeAction::Block => {
+                self.waf.config.mode == GlobalMode::Enforce && !self.policy.suppressed_by_request
+            }
         };
         // A block is terminal for the session and always recorded. The
         // non-blocking prefix-scan arm is a lost-coverage signal that can

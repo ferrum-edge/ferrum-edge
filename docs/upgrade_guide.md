@@ -328,6 +328,29 @@ These plugin fields are now refused at admission above a hard ceiling:
 
 An omitted `body_validator` value inherited from a larger `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` is clamped to the ceiling instead of refused. Lower any configured value above its ceiling before upgrading; otherwise the plugin config is rejected (`400` on the Admin API, startup failure in file mode).
 
+### `waf` governs bodies on every method and inspects gRPC per message
+
+- Request bodies are no longer gated by `body_methods`: a request on any
+  method is buffered and scanned once it declares a body (`Content-Length` >
+  0, `Transfer-Encoding`, or `Content-Type`), and any non-empty finalized body
+  is decided. A `GET` / `SEARCH` / `PROPFIND` body that an enforcing rule (or
+  `on_unlisted_content_type`) would refuse on `POST` is now refused too.
+- Framed gRPC / gRPC-Web bodies the WAF scans (`application/grpc+json`,
+  `application/grpc-web+json`, or every gRPC type with `inspect_binary_body`)
+  are inspected per message. Under an enforcing body policy a
+  `grpc-encoding`-compressed message is refused (`403` /
+  `PERMISSION_DENIED`); have clients of those routes send uncompressed
+  messages, or exempt the route.
+- A response relabeled `text/event-stream` by the `sse` plugin's
+  `wrap_non_sse_responses` (or a response transformer) is now scanned by the
+  response-body rules instead of skipped.
+- `global_exemptions.header_present` now also suppresses the `block` values of
+  `on_body_too_large`, `on_unlisted_content_type`, and
+  `on_unlisted_response_content_type`.
+- Non-canonical exact or `prefix*` `global_exemptions.paths` entries (a percent
+  escape, `\`, a dot segment, or `//`) are refused at load. They never matched;
+  replace them with the canonical path.
+
 ### `waf` exemption and unlisted-content-type defaults are stricter (PR #6646)
 
 - `global_exemptions.header_present` values must be shared secrets of at

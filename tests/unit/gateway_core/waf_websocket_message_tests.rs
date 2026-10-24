@@ -540,6 +540,48 @@ async fn oversize_message_block_action_closes_without_enforcing_rule() {
     assert_policy_close(&outgoing);
 }
 
+/// A `global_exemptions.header_present` secret on the upgrade request exempts
+/// the session from the strict `on_body_too_large: block` cap too, exactly as
+/// it already suppressed every rule and every `fail_closed` decision.
+#[tokio::test]
+async fn header_present_exemption_also_suppresses_the_strict_size_cap() {
+    let plugins = vec![waf(json!({
+        "include_default_rules": false,
+        "max_scan_bytes": 16,
+        "on_body_too_large": "block",
+        "global_exemptions": {
+            "header_present": { "x-skip-waf": "trusted-hop-shared-secret" }
+        },
+        "custom_rules": [
+            {
+                "id": "CUSTOM-WS-MONITOR",
+                "name": "monitored token",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": PROHIBITED,
+                "action": "monitor"
+            }
+        ]
+    }))];
+    let original = oversize_message();
+
+    let mut exempt_ctx = upgrade_ctx("/ws");
+    exempt_ctx.headers.insert(
+        "x-skip-waf".to_string(),
+        "trusted-hop-shared-secret".to_string(),
+    );
+    let exempt = relay_to_backend(&plugins, &exempt_ctx, original.clone()).await;
+    assert_eq!(
+        exempt, original,
+        "a header-exempt session must not be closed by the strict size cap"
+    );
+
+    let governed_ctx = upgrade_ctx("/ws");
+    let governed = relay_to_backend(&plugins, &governed_ctx, original).await;
+    assert_policy_close(&governed);
+}
+
 #[tokio::test]
 async fn a_message_at_the_scan_ceiling_is_still_fully_inspected() {
     let mut config = enforcing_request_rule();
