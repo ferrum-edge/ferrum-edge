@@ -1832,18 +1832,52 @@ async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes()
         )
         .await;
     }
-    // A `charset` that only a parser splitting at every `;` sees — inside
-    // another parameter's quoted value — or a conflicting / malformed
-    // parameter list declares nothing: the NUL-skipping reading is read.
+    // Only the exact canonical `type/subtype; charset=<wide label>` declares
+    // a wide reading. Anything else — an empty or extra parameter (ASP.NET
+    // Core stops reading parameters at an empty one and defaults to UTF-8),
+    // a `charset` inside another parameter's quoted value, a duplicate, an
+    // alias label, malformed quoting — declares nothing, so the NUL-skipping
+    // reading is read and the hidden value hits.
     for content_type in [
+        "application/json;;charset=utf-16le",
+        "application/json; ;charset=utf-16le",
+        "application/json;\t; charset=\"UTF-16LE\"",
+        "application/json; charset=utf-16le; x=1",
+        "application/json; x=1; charset=utf-16le",
         "application/json; profile=\";charset=utf-16le\"",
         "application/json; charset=utf-16le; profile=\";charset=utf-8\"",
         "application/json; charset=utf-16le; charset=utf-16le",
         "application/json; charset=utf-16le; broken",
         "application/json; charset=\"utf-16le",
+        "application/json; charset=\"utf\\-16le\"",
+        "application/json; charset=unicode",
     ] {
         assert_json_path_verdicts(&plugin, content_type, &[forbidden.clone()], &[]).await;
     }
+    // Two `Content-Type` field lines are folded into one comma-separated
+    // value, which is not canonical either (admitted here through
+    // `inspect_binary_body`).
+    let binary_plugin = waf(json!({
+        "include_default_rules": false,
+        "inspect_binary_body": true,
+        "custom_rules": [{
+            "id": "CUSTOM-JSON-CANARY",
+            "category": "custom",
+            "severity": "high",
+            "target": { "type": "body_json_path", "path": "0.user.bio" },
+            "match_kind": "contains",
+            "pattern": "forbidden-canary",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    assert_json_path_verdicts(
+        &binary_plugin,
+        "application/json, application/json; charset=utf-16le",
+        &[forbidden.clone()],
+        &[],
+    )
+    .await;
 }
 
 #[tokio::test]

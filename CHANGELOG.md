@@ -412,11 +412,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed) are judged like any other reading, so a genuine stream whose
   envelope bytes assemble a refused JSON container (for example a 91-byte
   message, whose length byte is `[`) fails closed and needs `conditions`
-  scoping. A UTF-16 / UTF-32 reading found only by the BOM-less signature no
-  longer vouches for the raw bytes: the NUL-skipping reading a UTF-8 backend
-  takes is read as well, so undeclared, BOM-less wide JSON whose code units
+  scoping. A UTF-16 / UTF-32 reading vouches for the raw bytes only when the
+  body starts with a byte-order mark or the whole `Content-Type` is exactly
+  `type/subtype; charset=<utf-16|utf-16le|utf-16be|utf-32|utf-32le|utf-32be>`;
+  otherwise (including a BOM-less signature, an extra or empty parameter, or
+  an alias label) the NUL-skipping reading a UTF-8 backend takes is read as
+  well, so undeclared, BOM-less wide JSON whose code units
   hold a control byte, `"` or `\` (for example most of U+0100–U+1FFF) needs a
-  `charset` or byte-order mark. A body scanned only up to
+  canonical `charset` or a byte-order mark. A body scanned only up to
   `max_scan_bytes` is not judged this way, a declared or BOM-marked UTF-16 /
   UTF-32 body is unaffected, and valid JSON bodies take the same single parse
   as before.

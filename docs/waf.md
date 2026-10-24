@@ -527,12 +527,19 @@ a reading is refused by both the strict and the lenient parse and:
 body open: its raw bytes are refused (a NUL follows every ASCII character)
 while its transcoded reading parses. That vouching comes only from a wide
 reading the body declares — a UTF-16 / UTF-32 `charset` or a byte-order mark
-— because only then does a backend read the body as wide text. The `charset`
-must be unambiguous: the parameter an RFC 9110 parser reads (quoted values
-unquoted, a `;` inside another parameter's quoted value left alone) and the
-one a parser that splits at every `;` reads must both exist and agree, so
-`profile=";charset=utf-16le"`, two `charset` parameters, or a malformed
-parameter list declare nothing. A wide
+— because only then does a backend certainly read the body as wide text.
+The test is an allow-list: the body starts with a UTF-16 / UTF-32
+byte-order mark, or the whole `Content-Type` value is exactly
+`type/subtype; charset=<label>` with one of the labels `utf-16`, `utf-16le`,
+`utf-16be`, `utf-32`, `utf-32le` or `utf-32be` (any case, optionally
+double-quoted, optional whitespace around `;` and `=`), and nothing else.
+Media-type parsers disagree about empty parameters, extra parameters, quoted
+values and repeated headers — ASP.NET Core, for one, stops reading
+parameters at an empty one and then defaults to UTF-8 — so any other form
+(`application/json;;charset=utf-16le`, a second parameter, an alias such as
+`unicode`, two `Content-Type` lines) declares nothing, even though the WAF
+still decodes and inspects its wide reading. A client sending wide JSON with
+any other `Content-Type` form should start the body with a byte-order mark. A wide
 reading found only by the BOM-less signature is not what a backend that
 defaults to UTF-8 reads: when the raw bytes are refused in a way a
 NUL-skipping parser (Json.NET) reads past, the raw bytes with every NUL

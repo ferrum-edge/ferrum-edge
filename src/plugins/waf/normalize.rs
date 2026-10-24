@@ -380,32 +380,65 @@ pub(super) fn decode_wide_charset_body_views(
     views
 }
 
-/// Whether a body's UTF-16 / UTF-32 readings come from its own `charset`
-/// declaration or byte-order mark, rather than only from the BOM-less wide
-/// signature. Only then does a backend that honours the declaration read the
-/// body as wide text; without either, a backend defaults to UTF-8 and reads
-/// the raw bytes.
+/// Whether a body's UTF-16 / UTF-32 reading is one a backend certainly
+/// takes, rather than one only the BOM-less signature (or a loosely written
+/// header) suggests: the body starts with a UTF-16 / UTF-32 byte-order mark,
+/// or the whole `Content-Type` value is the canonical
+/// `type/subtype; charset=<utf-16|utf-16le|utf-16be|utf-32|utf-32le|utf-32be>`
+/// (see [`content_type_is_canonical_wide_declaration`]).
 ///
-/// The declaration counts only when it is unambiguous: the `charset` an RFC
-/// 9110 parser reads ([`declared_charset`]) and the one a backend that splits
-/// at every `;` reads ([`charset_value`]) must both exist and agree. A
-/// `;charset=…` hidden in another parameter's quoted value, a malformed
-/// parameter list, or two `charset` parameters therefore declare nothing.
+/// The test is an allow-list on purpose. Media-type parsers disagree about
+/// empty parameters, quoted values, repeated headers and parameter order —
+/// ASP.NET Core stops reading parameters at an empty one and then defaults to
+/// UTF-8 — so any header that is not exactly canonical declares nothing, and
+/// the raw bytes are judged as the UTF-8 document a backend may read instead.
+/// Which readings are DECODED is unchanged ([`charset_value`]); this only
+/// decides whether a decoded wide reading may vouch for the raw bytes.
 pub(super) fn wide_charset_is_declared(body: &[u8], content_type: Option<&str>) -> bool {
     utf32_bom(body).is_some()
         || utf16_bom(body).is_some()
-        || charset_is_unambiguously_wide(content_type)
+        || content_type.is_some_and(content_type_is_canonical_wide_declaration)
 }
 
-fn charset_is_unambiguously_wide(content_type: Option<&str>) -> bool {
-    let (Some(strict), Some(lenient)) =
-        (declared_charset(content_type), charset_value(content_type))
-    else {
+/// `OWS type "/" subtype OWS ";" OWS "charset" OWS "=" OWS ( label / DQUOTE
+/// label DQUOTE ) OWS`, nothing more: one `Content-Type` value with exactly
+/// one parameter, a wide charset label (ASCII case-insensitive), no escapes.
+/// A comma-folded repeated header, a second or empty parameter, or anything
+/// after the label fails.
+fn content_type_is_canonical_wide_declaration(value: &str) -> bool {
+    const LABELS: [&str; 6] = [
+        "utf-16", "utf-16le", "utf-16be", "utf-32", "utf-32le", "utf-32be",
+    ];
+    fn trim(text: &str) -> &str {
+        text.trim_matches(|c: char| c == ' ' || c == '\t')
+    }
+    let Some((essence, parameter)) = value.split_once(';') else {
         return false;
     };
-    strict.eq_ignore_ascii_case(lenient)
-        && (utf16_label_endian(&strict, Some(Utf16Endian::Little)).is_some()
-            || utf32_label_endian(&strict, Some(Utf32Endian::Little)).is_some())
+    let Some((kind, subtype)) = trim(essence).split_once('/') else {
+        return false;
+    };
+    let is_token = |text: &str| !text.is_empty() && text.bytes().all(is_token_byte);
+    if !is_token(kind) || !is_token(subtype) {
+        return false;
+    }
+    let Some((name, label)) = parameter.split_once('=') else {
+        return false;
+    };
+    if !trim(name).eq_ignore_ascii_case("charset") {
+        return false;
+    }
+    let label = trim(label);
+    let label = label
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .unwrap_or(label);
+    LABELS.iter().any(|known| label.eq_ignore_ascii_case(known))
+}
+
+/// RFC 9110 `tchar`.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 /// The wide width a BOM-less body's first four octets sign, if any: the
@@ -614,7 +647,7 @@ fn resolve_utf32_body(body: &[u8], content_type: Option<&str>) -> WideEndian<Utf
 /// `charset=` parameters are treated as unspecified (return `None`) so a
 /// conflicting pair cannot pick an endianness. This decides which wide
 /// readings are decoded (coverage), not whether one is authoritative; see
-/// [`declared_charset`].
+/// [`wide_charset_is_declared`].
 fn charset_value(content_type: Option<&str>) -> Option<&str> {
     let content_type = content_type?;
     let mut declared = None;
@@ -631,131 +664,6 @@ fn charset_value(content_type: Option<&str>) -> Option<&str> {
         declared = Some(raw_value.trim().trim_matches('"'));
     }
     declared
-}
-
-/// The `charset` parameter of a Content-Type, parsed per RFC 9110 §8.3.1:
-/// `type/subtype *( OWS ";" OWS [ token "=" ( token / quoted-string ) ] )`.
-/// A quoted value is unquoted (and its `\` quoted-pairs resolved), so
-/// `charset="utf-16le"` is `utf-16le`, while a `;` or `charset=` inside
-/// another parameter's quoted value (`profile=";charset=utf-16le"`) is only
-/// that value's text.
-///
-/// Anything that does not parse is ambiguous — a backend may read it either
-/// way — and returns `None`, as do duplicate `charset` parameters, so a
-/// malformed or conflicting header can neither pick an endianness nor make a
-/// wide reading count as declared. Borrows unless the value holds a
-/// quoted-pair.
-fn declared_charset(content_type: Option<&str>) -> Option<Cow<'_, str>> {
-    let content_type = content_type?;
-    let bytes = content_type.as_bytes();
-    let mut at = memchr::memchr(b';', bytes)?;
-    if bytes[..at].contains(&b'"') {
-        return None;
-    }
-    let skip_ows = |mut at: usize| {
-        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
-            at += 1;
-        }
-        at
-    };
-    let mut declared: Option<Cow<'_, str>> = None;
-    // `at` is at a `;`.
-    while at < bytes.len() {
-        at = skip_ows(at + 1);
-        match bytes.get(at) {
-            None => break,
-            // An empty parameter: `;;` or `; ;`.
-            Some(b';') => continue,
-            Some(_) => {}
-        }
-        let name_start = at;
-        while bytes.get(at).copied().is_some_and(is_token_byte) {
-            at += 1;
-        }
-        let name = &content_type[name_start..at];
-        if name.is_empty() || bytes.get(at) != Some(&b'=') {
-            return None;
-        }
-        at += 1;
-        let value = if bytes.get(at) == Some(&b'"') {
-            let (value, end) = quoted_string(content_type, at)?;
-            at = end;
-            value
-        } else {
-            let value_start = at;
-            while bytes.get(at).copied().is_some_and(is_token_byte) {
-                at += 1;
-            }
-            if at == value_start {
-                return None;
-            }
-            Cow::Borrowed(&content_type[value_start..at])
-        };
-        at = skip_ows(at);
-        if !matches!(bytes.get(at), None | Some(b';')) {
-            return None;
-        }
-        if name.eq_ignore_ascii_case("charset") {
-            if declared.is_some() {
-                return None;
-            }
-            declared = Some(value);
-        }
-    }
-    declared
-}
-
-/// RFC 9110 `tchar`.
-fn is_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-}
-
-/// The quoted-string starting at `bytes[open]` (a `"`): its value with
-/// quoted-pairs resolved, and the index just past its closing quote. `None`
-/// when it is unterminated or holds a control character.
-fn quoted_string(text: &str, open: usize) -> Option<(Cow<'_, str>, usize)> {
-    let bytes = text.as_bytes();
-    let start = open + 1;
-    let mut at = start;
-    let mut unescaped: Option<String> = None;
-    loop {
-        match *bytes.get(at)? {
-            b'"' => {
-                let value = match unescaped {
-                    Some(value) => Cow::Owned(value),
-                    None => Cow::Borrowed(&text[start..at]),
-                };
-                return Some((value, at + 1));
-            }
-            b'\\' => {
-                let escaped = *bytes.get(at + 1)?;
-                if escaped.is_ascii_control() && escaped != b'\t' {
-                    return None;
-                }
-                let value = unescaped.get_or_insert_with(|| text[start..at].to_string());
-                // Only ASCII is meaningful in a charset name; a non-ASCII
-                // quoted-pair makes the value ambiguous.
-                if !escaped.is_ascii() {
-                    return None;
-                }
-                value.push(char::from(escaped));
-                at += 2;
-            }
-            byte if byte.is_ascii_control() && byte != b'\t' => return None,
-            _ => {
-                if let Some(value) = unescaped.as_mut() {
-                    // `at` is a character boundary: every byte consumed so far
-                    // in this branch or the escape branch is ASCII or a whole
-                    // character.
-                    let ch = text[at..].chars().next()?;
-                    value.push(ch);
-                    at += ch.len_utf8();
-                } else {
-                    at += 1;
-                }
-            }
-        }
-    }
 }
 
 fn charset_is_unspecified_utf16(content_type: Option<&str>) -> bool {
