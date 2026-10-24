@@ -1614,6 +1614,31 @@ fn spawn_http1_lane_sweeper(lanes: &Arc<Http1Lanes>, interval: Duration) {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
+    // EXPERIMENT (not for merge): print the direct-H1 pool stats every 5 s
+    // while they change, for the idle-cap sweep.
+    {
+        let weak = Arc::downgrade(lanes);
+        handle.spawn(async move {
+            let mut last = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let Some(lanes) = weak.upgrade() else { break };
+                let stats = lanes.stats();
+                if last != Some(stats) {
+                    eprintln!(
+                        "[h1-pool] idle={} opened={} reused={} evicted_ceiling={} evicted_expired={} evicted_closed={}",
+                        stats.idle_connections,
+                        stats.connections_opened,
+                        stats.connections_reused,
+                        stats.evicted_ceiling,
+                        stats.evicted_expired,
+                        stats.evicted_closed
+                    );
+                    last = Some(stats);
+                }
+            }
+        });
+    }
     let weak = Arc::downgrade(lanes);
     handle.spawn(async move {
         let mut ticker = tokio::time::interval(interval);
