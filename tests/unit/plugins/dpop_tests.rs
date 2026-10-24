@@ -513,3 +513,72 @@ fn parse_asn1_length(data: &[u8]) -> (usize, usize) {
         (length, 1 + num_bytes)
     }
 }
+
+// ── RSA proof keys must fit the JWT backend's 2048-8192-bit window ──────────
+
+/// An RS256 DPoP proof whose `jwk` carries a synthetic modulus of `bits` bits.
+/// The size check runs before the signature is verified, so the proof does
+/// not need a real signature or a real key.
+fn unsigned_rsa_proof(bits: usize) -> (String, Value) {
+    let jwk: Jwk = serde_json::from_value(json!({
+        "kty": "RSA",
+        "n": URL_SAFE_NO_PAD.encode(vec![0xff_u8; bits / 8]),
+        "e": "AQAB",
+    }))
+    .expect("rsa jwk should parse");
+    let jkt = jwk_thumbprint_sha256(&jwk).expect("thumbprint");
+    let header = json!({ "typ": "dpop+jwt", "alg": "RS256", "jwk": jwk });
+    let proof = format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(base_proof_claims().to_string()),
+        URL_SAFE_NO_PAD.encode([0u8; 16]),
+    );
+    (proof, token_claims_for(&jkt))
+}
+
+#[test]
+fn rsa_proof_keys_outside_the_jwt_backend_window_are_refused_by_size() {
+    let domain = ReplayDomain::new(
+        DPOP_REPLAY_PROFILE,
+        "ferrum",
+        "jwks_auth",
+        "dpop-tests",
+        "0",
+    );
+    for bits in [1024, 16384] {
+        let (proof, token_claims) = unsigned_rsa_proof(bits);
+        let result = dpop::verify(DpopVerifyInput {
+            proof: &proof,
+            access_token: "token",
+            access_token_claims: &token_claims,
+            token_principal: &[b"issuer".as_slice(), b"user".as_slice()],
+            method: "GET",
+            htu: "https://api.example.com/resource",
+            clock_skew: Duration::from_secs(30),
+            domain: &domain,
+        });
+        assert_eq!(
+            result.map(|marker| marker.digest()),
+            Err(dpop::DPOP_RSA_KEY_SIZE),
+            "{bits}-bit RSA proof key"
+        );
+    }
+    // A 2048-bit synthetic key passes the size check and then fails only on
+    // its (absent) signature.
+    let (proof, token_claims) = unsigned_rsa_proof(2048);
+    let result = dpop::verify(DpopVerifyInput {
+        proof: &proof,
+        access_token: "token",
+        access_token_claims: &token_claims,
+        token_principal: &[b"issuer".as_slice(), b"user".as_slice()],
+        method: "GET",
+        htu: "https://api.example.com/resource",
+        clock_skew: Duration::from_secs(30),
+        domain: &domain,
+    });
+    assert!(
+        matches!(result, Err(reason) if reason != dpop::DPOP_RSA_KEY_SIZE),
+        "a 2048-bit key must not be refused for its size"
+    );
+}

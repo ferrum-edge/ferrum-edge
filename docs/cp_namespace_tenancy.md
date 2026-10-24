@@ -265,6 +265,11 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
   (`RS256`/`RS384`/`RS512`/`PS256`/`PS384`/`PS512`/`ES256`/`ES384`/`EdDSA`) are
   strongly preferred: the CP then holds only public material, and **no data
   plane is a signing authority at all**.
+- RSA public keys (`RS*`/`PS*`) must be 2048–8192 bits, as SPKI `PUBLIC KEY`
+  or PKCS#1 `RSA PUBLIC KEY` PEM. JWT signatures are verified with AWS-LC,
+  which accepts only that range, so a key outside it is refused when the
+  bundle loads or reloads, with its size named. A refused reload keeps the
+  previous verifier.
 - The symmetric (`HS*`) path remains supported for migration, but only because
   each secret is per-credential and bound CP-side. It requires at least 32
   bytes. Do not reuse one `HS*` secret across tenants — that reintroduces the
