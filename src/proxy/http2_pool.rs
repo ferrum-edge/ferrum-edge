@@ -1257,6 +1257,9 @@ struct Http1Lane {
     /// Bumped when a drain withdraws this lane. A checkout taken under an older
     /// generation is never checked back in, so an exchange that outlived the
     /// drain cannot repopulate the pool with a connection it meant to retire.
+    /// `push_idle` reads it under the lane lock, which `retire` takes after
+    /// bumping it, so a check-in racing a drain either lands before the drain
+    /// takes the idle set (and is retired with it) or is refused.
     /// Per lane, so a reload or SVID rotation that withdraws one backend does
     /// not discard every other backend's in-flight connections.
     generation: AtomicU64,
@@ -1281,12 +1284,16 @@ impl Http1Lane {
         drop(retired);
     }
 
-    /// Pool `entry` unless the lane already holds its ceiling, in which case
-    /// it is handed back and the caller drops the connection.
-    fn push_idle(&self, entry: IdleH1) -> Result<(), IdleH1> {
+    /// Pool `entry`, checked out under `generation`, unless the lane was
+    /// retired since or already holds its ceiling; a refused entry is handed
+    /// back and the caller drops the connection.
+    fn push_idle(&self, entry: IdleH1, generation: u64) -> Result<(), (IdleH1, Refused)> {
         let mut idle = self.idle();
+        if self.generation.load(Ordering::Acquire) != generation {
+            return Err((entry, Refused::Retired));
+        }
         if idle.len() >= self.max_idle {
-            return Err(entry);
+            return Err((entry, Refused::Full));
         }
         idle.push(entry);
         Ok(())
@@ -1309,6 +1316,14 @@ impl Http1Lane {
             .extract_if(.., |entry| entry.sender.is_closed() || entry.expired(now))
             .collect()
     }
+}
+
+/// Why a lane refused a check-in.
+enum Refused {
+    /// A drain retired the lane after the connection was checked out.
+    Retired,
+    /// The lane already holds `max_idle` connections.
+    Full,
 }
 
 /// Lifetime counters of one direct HTTP/1.1 pool, shared by its lanes
@@ -1397,20 +1412,21 @@ impl Http1Lanes {
     /// hyper reports it idle — the same rule as the Unix-socket pool's
     /// `checkin_h1_when_idle`.
     fn checkin(checkout: Http1Checkout) {
-        if checkout.sender.is_closed()
-            || checkout.lane.generation.load(Ordering::Acquire) != checkout.generation
-        {
+        if checkout.sender.is_closed() {
             return;
         }
         if checkout.sender.is_ready() {
             Self::push_idle(checkout);
             return;
         }
+        // No point waiting for a lane a drain already retired; `push_idle`
+        // checks again under the lane lock once the wait ends.
+        if checkout.lane.generation.load(Ordering::Acquire) != checkout.generation {
+            return;
+        }
         let mut checkout = checkout;
         tokio::spawn(async move {
-            if checkout.sender.ready().await.is_ok()
-                && checkout.lane.generation.load(Ordering::Acquire) == checkout.generation
-            {
+            if checkout.sender.ready().await.is_ok() {
                 Self::push_idle(checkout);
             }
         });
@@ -1421,18 +1437,23 @@ impl Http1Lanes {
             lane,
             sender,
             socket,
+            generation,
             idle_timeout,
             ..
         } = checkout;
-        // A full lane drops the connection; `push_idle` hands the entry back
-        // and it drops here.
-        let pushed = lane.push_idle(IdleH1 {
-            sender,
-            socket,
-            idle_since: std::time::Instant::now(),
-            idle_timeout,
-        });
-        if pushed.is_err() {
+        // A refused entry is handed back and drops here, outside the lane
+        // lock. A retired lane's refusal is not an idle eviction: the
+        // connection was never idle in it.
+        let pushed = lane.push_idle(
+            IdleH1 {
+                sender,
+                socket,
+                idle_since: std::time::Instant::now(),
+                idle_timeout,
+            },
+            generation,
+        );
+        if let Err((_, Refused::Full)) = pushed {
             Http1PoolCounters::count(&lane.counters.evicted_ceiling);
         }
     }

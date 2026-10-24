@@ -3268,6 +3268,8 @@ async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
 
     pool.force_drain_all();
     assert_eq!(pool.h1_idle_connections(), 0);
+    // The connection is ready, so check-in goes straight to the lane, which
+    // refuses it under its lock because the drain bumped the generation.
     reused.checkin();
     assert_eq!(
         pool.h1_idle_connections(),
@@ -3278,6 +3280,10 @@ async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
     assert_eq!(
         stats.evicted_retired, 1,
         "the drain closed one idle connection"
+    );
+    assert_eq!(
+        stats.evicted_ceiling, 0,
+        "a refused post-drain check-in is not a ceiling eviction"
     );
     assert_eq!(stats.connections_opened, 2);
     assert_eq!(stats.connections_reused, 1);
