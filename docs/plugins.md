@@ -2352,7 +2352,15 @@ acknowledgement (HTTP 200/204 alone is insufficient); `wait_for_async_insert=0`
 needs explicit `clickhouse.allow_lossy_async_insert=true`, and omitted
 `wait_for_async_insert` pins `wait_for_async_insert=1` on every durable
 request so ClickHouse user/profile defaults cannot enable fire-and-forget async
-inserts. It
+inserts. A ClickHouse exception reported under HTTP 200/204 is classified by its
+numeric code: known transient server conditions (for example 159
+`TIMEOUT_EXCEEDED`, 241 `MEMORY_LIMIT_EXCEEDED`, 252 `TOO_MANY_PARTS`) stay
+retryable in the spool, and every other exception is dead-lettered as a
+permanent row defect. A nonempty `clickhouse.password_ref` requires a non-blank
+`clickhouse.username`; `insert_query_params` may not name the reserved
+`database` / `query` parameters; `clickhouse.database` / `clickhouse.table` must
+be identifiers whose dot-separated parts are nonempty and do not start with a
+digit; and an enabled spool's `spool.max_bytes` is at least 1048576. It
 supports per-event mode for transaction-level provenance, snapshot mode for
 lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
 ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generation
@@ -2440,7 +2448,11 @@ instance, plugin generation, or Ferrum process sharing the namespace can obtain
 a second one. **The bound therefore does not grow with the number of concurrent
 handoffs.** Ordinary spool writes never carry a credit, and releasing it is
 closing a descriptor, so a crash, panic, abort, or dropped claim frees it
-immediately. Without this reservation a source larger than roughly half
+immediately. A replay cancelled mid-delivery (a reload retiring
+its generation aborts the replay worker) releases its claim back to the
+replayable namespace through the descriptor-bound release before the
+descriptor is dropped, so the replacement generation delivers the unchanged
+rows instead of leaving an inert `.inflight` claim. Without this reservation a source larger than roughly half
 `spool.max_bytes` could never complete a handoff and would permanently block
 its namespace's replay. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) →

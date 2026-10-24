@@ -139,6 +139,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`api_chargeback_sink` delivery and admission hardening.** A replay
+  cancelled mid-delivery (a reload retiring its generation aborts the replay
+  worker) now releases its spool claim through the descriptor-bound release,
+  so the replacement generation delivers the unchanged rows instead of
+  stranding an inert `.inflight` claim. ClickHouse exceptions reported under
+  HTTP 200/204 are classified by their numeric code: known transient codes
+  (3, 159, 202, 209, 210, 241, 242, 252, 319, 394, 425, 999) stay retryable
+  in the spool instead of being dead-lettered; other codes stay permanent.
+  Admission (constructor and OpenAPI) now rejects a nonempty
+  `clickhouse.password_ref` without a non-blank `clickhouse.username` (the
+  password was silently never sent), a blank `username`, the reserved
+  `insert_query_params` names `database` / `query`, `clickhouse.database` /
+  `clickhouse.table` values that are not dot-separated identifiers (parts
+  nonempty, not starting with a digit), and an enabled `spool.max_bytes`
+  below 1048576. Snapshot identities are now charged for every retained copy
+  (map key, entry metadata, last-emitted baseline key), so
+  `snapshot.max_retained_bytes` and the process ceiling admit fewer, honestly
+  accounted identities. The same-identity snapshot fast path no longer clones
+  its key, and per-event status-cache invalidation skips the store while the
+  cache is already empty. The reference DDL's 13-month raw-charge TTL is now
+  documented.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder

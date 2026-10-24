@@ -562,6 +562,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
             "database": "ferrum",
             "table": "charges_raw",
             "timeout_ms": 1000,
+            "username": "ferrum_ingest",
             "password_ref": "FERRUM_PLUGIN_SECRET_CHARGEBACK_MISSING"
         },
         "batch": {"size": 2, "flush_interval_ms": 60000, "buffer_capacity": 10},
