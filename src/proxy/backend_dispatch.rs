@@ -1173,6 +1173,58 @@ pub(crate) fn deferred_circuit_breaker_is_stale(
     }
 }
 
+/// Synchronous replacement for a deferred streaming dispatch outcome whose
+/// response body an `after_proxy` reject replaced with a buffered one: the body
+/// will never carry the deferred record, so record it now — the BACKEND's
+/// captured status/error (never the plugin reject's), as a non-probe (the probe
+/// slot was released at header time), on the breaker that admitted the attempt
+/// (`cb_probe`, issue #6799). The breaker record is skipped when
+/// `skip_circuit_breaker_record` is set or when the breaker opened a new cycle
+/// since `admission_open_epoch` (#1649 R5); passive health and least-latency
+/// still record.
+///
+/// Shared by the H1/H2 `StreamingH2` / `StreamingH3` reject path and the
+/// buffered-request native-gRPC streaming reject path, so neither can drop the
+/// outcome it exists to record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_replaced_streaming_outcome(
+    state: &ProxyState,
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    selected_balancer: Option<&Arc<LoadBalancer>>,
+    upstream_target: Option<&UpstreamTarget>,
+    final_cb_target_key: Option<&str>,
+    response_status: u16,
+    connection_error: bool,
+    error_class: Option<ErrorClass>,
+    cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    skip_circuit_breaker_record: bool,
+    admission_open_epoch: u64,
+    backend_elapsed: Duration,
+) {
+    let cb_stale = !skip_circuit_breaker_record
+        && deferred_circuit_breaker_is_stale(
+            state,
+            proxy,
+            final_cb_target_key,
+            admission_open_epoch,
+        );
+    record_backend_outcome_no_conn_end(
+        state,
+        proxy,
+        lb_snapshot,
+        selected_balancer,
+        upstream_target,
+        final_cb_target_key,
+        response_status,
+        connection_error,
+        error_class,
+        cb_probe.settlement_without_slot(),
+        skip_circuit_breaker_record || cb_stale,
+        backend_elapsed,
+    );
+}
+
 /// A post-wire backend failure: the request reached the backend's application
 /// layer (response headers already arrived) and then the response stalled, the
 /// transport broke, or the backend over-sent before the body/trailers completed.

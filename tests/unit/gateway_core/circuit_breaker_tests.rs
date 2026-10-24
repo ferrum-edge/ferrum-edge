@@ -3644,3 +3644,179 @@ async fn refused_retry_admission_retires_the_guard_so_the_outcome_settles_once()
     assert_eq!(cb.failure_count(), failures);
     assert_eq!(cb.state_name(), "open");
 }
+
+/// Drive the production synchronous record for a deferred streaming outcome
+/// whose response body an `after_proxy` reject replaced.
+fn record_replaced(
+    state: &ProxyState,
+    proxy: &ferrum_edge::config::types::Proxy,
+    key: &str,
+    status: u16,
+    guard: &HalfOpenProbeGuard,
+    skip: bool,
+    admission_epoch: u64,
+) {
+    ferrum_edge::_test_support::record_replaced_streaming_outcome_for_test(
+        state,
+        proxy,
+        Some(key),
+        status,
+        guard,
+        skip,
+        admission_epoch,
+    );
+}
+
+/// A breaker that trips on one failure and stays OPEN for the test.
+fn trips_on_one_failure() -> CircuitBreakerConfig {
+    CircuitBreakerConfig {
+        failure_threshold: 1,
+        ..stale_completion_config_a()
+    }
+}
+
+#[tokio::test]
+async fn replaced_streaming_response_heals_the_admitting_half_open_breaker() {
+    let (state, proxy) = stale_completion_state();
+    let proxy = with_breaker(&proxy, &probe_slot_breaker_config());
+    let key = target_key("backend.local", 8080);
+
+    let (cb, _) = admit(&state, &proxy, &key);
+    cb.record_failure(500, false, false);
+    let (same, cb_probe) = admit(&state, &proxy, &key);
+    assert!(Arc::ptr_eq(&cb, &same));
+    assert!(cb_probe.holds_slot());
+    let admission_epoch = cb.open_epoch();
+
+    // Header time: the deferred streaming path releases the probe slot
+    // without a health outcome and defers the record to body completion.
+    cb_probe.release_neutral();
+    assert_eq!(cb.state_name(), "half_open");
+    assert_eq!(cb.half_open_in_flight(), 0);
+
+    // An after_proxy reject replaced the streaming body, so the synchronous
+    // record is the attempt's only breaker record: the backend's success heals.
+    record_replaced(&state, &proxy, &key, 200, &cb_probe, false, admission_epoch);
+    assert_eq!(
+        cb.state_name(),
+        "closed",
+        "the replaced-body record must settle the backend success on the admitting breaker"
+    );
+}
+
+#[tokio::test]
+async fn replaced_streaming_response_counts_a_backend_failure_once() {
+    let (state, proxy) = stale_completion_state();
+    let config = trips_on_one_failure();
+    let proxy = with_breaker(&proxy, &config);
+    let key = target_key("backend.local", 8080);
+
+    let (cb, cb_probe) = admit(&state, &proxy, &key);
+    let admission_epoch = cb.open_epoch();
+    record_replaced(&state, &proxy, &key, 502, &cb_probe, false, admission_epoch);
+    assert_eq!(cb.state_name(), "open");
+    assert_eq!(cb.failure_count(), 1);
+    assert!(
+        state
+            .circuit_breaker_cache
+            .can_execute(&proxy.namespace, &proxy.id, Some(&key), &config)
+            .is_err(),
+        "the recorded failure must refuse the next admission"
+    );
+}
+
+#[tokio::test]
+async fn replaced_streaming_response_record_honours_skip_staleness_and_identity() {
+    let (state, proxy) = stale_completion_state();
+    let config = trips_on_one_failure();
+    let proxy = with_breaker(&proxy, &config);
+    let proxy_b = with_breaker(&proxy, &stale_completion_config_b());
+    let key = target_key("backend.local", 8080);
+
+    // An explicit skip (already recorded elsewhere) records nothing.
+    let (cb, cb_probe) = admit(&state, &proxy, &key);
+    let admission_epoch = cb.open_epoch();
+    record_replaced(&state, &proxy, &key, 502, &cb_probe, true, admission_epoch);
+    assert_eq!(cb.failure_count(), 0);
+    assert_eq!(cb.state_name(), "closed");
+
+    // The breaker opened a new cycle since admission: the outcome is stale.
+    cb.record_failure(502, false, false);
+    assert_eq!(cb.state_name(), "open");
+    record_replaced(&state, &proxy, &key, 200, &cb_probe, false, admission_epoch);
+    assert_eq!(
+        cb.state_name(),
+        "open",
+        "a stale success must not heal a later cycle"
+    );
+
+    // A reload replaced the admitting breaker: nothing reaches the new one.
+    let (cb_a, guard_a) = admit(
+        &state,
+        &with_breaker(&proxy, &stale_completion_config_a()),
+        &key,
+    );
+    let epoch_a = cb_a.open_epoch();
+    let (cb_b, _) = admit(&state, &proxy_b, &key);
+    record_replaced(
+        &state,
+        &with_breaker(&proxy, &stale_completion_config_a()),
+        &key,
+        502,
+        &guard_a,
+        false,
+        epoch_a,
+    );
+    assert_eq!(cb_b.failure_count(), 0);
+    assert_eq!(cb_a.failure_count(), 0);
+    assert!(Arc::ptr_eq(&live(&state, &proxy, &key), &cb_b));
+}
+
+#[tokio::test]
+async fn retry_admitted_after_the_backoff_probes_a_breaker_whose_cooldown_ended() {
+    // The HTTP/3 retry loops admit the next attempt AFTER the backoff, like
+    // H1/H2: a breaker that opened on the failed attempt and whose cooldown
+    // elapses during the backoff admits the retry as its recovery probe, and no
+    // probe slot is held while the loop sleeps.
+    let (state, proxy) = stale_completion_state();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        success_threshold: 1,
+        timeout_seconds: 1,
+        failure_status_codes: vec![502],
+        half_open_max_requests: 1,
+        trip_on_connection_errors: true,
+    };
+    let proxy = with_breaker(&proxy, &config);
+    let key = target_key("backend.local", 8080);
+
+    let (cb, cb_probe) = admit(&state, &proxy, &key);
+    complete(&state, &proxy, &key, 502, &cb_probe);
+    assert_eq!(cb.state_name(), "open");
+    assert!(
+        !cb_probe.holds_slot(),
+        "nothing is held while the loop backs off"
+    );
+    // Admitting before the backoff would have been refused here.
+    assert!(
+        state
+            .circuit_breaker_cache
+            .can_execute(&proxy.namespace, &proxy.id, Some(&key), &config)
+            .is_err()
+    );
+
+    // The backoff outlasts the breaker's cooldown.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    assert!(ferrum_edge::_test_support::admit_retry_attempt_for_test(
+        &state,
+        &proxy,
+        Some(&key),
+        &cb_probe,
+    ));
+    assert!(cb_probe.holds_slot(), "the retry is the recovery probe");
+    assert_eq!(cb.state_name(), "half_open");
+    complete(&state, &proxy, &key, 200, &cb_probe);
+    assert_eq!(cb.state_name(), "closed");
+    assert_eq!(cb.half_open_in_flight(), 0);
+}

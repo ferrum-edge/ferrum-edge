@@ -535,45 +535,98 @@ fn no_breaker_completion_path_uses_the_replacing_lookup() {
 
 /// Issue #6799 (sibling): every HTTP/3 native and cross-protocol retry loop
 /// admits each retry attempt through the breaker of the target it will dial,
-/// exactly as the H1/H2 HTTP, gRPC and WebSocket retry loops do. Without it a
-/// rotated target that was never admitted has no cached breaker, so its
-/// outcome could not settle anywhere and its failures would never open it.
-const RETRY_ADMISSION_SITES: &[(&str, &str, usize)] = &[
+/// in the H1/H2 retry loops' order: AFTER the backoff sleep (so no probe slot is
+/// held across it and a cooldown that ends during it admits the retry as a
+/// recovery probe) and after the rotated target's policy/transport screens,
+/// immediately before the attempt is handed on. Without it a rotated target that
+/// was never admitted has no cached breaker, so its failures never open it.
+///
+/// `(file, function, admissions, screens that must precede each admission
+/// since its backoff, what must follow it before the next backoff)`.
+type RetryAdmissionSite = (
+    &'static str,
+    &'static str,
+    usize,
+    &'static [&'static str],
+    &'static str,
+);
+const RETRY_ADMISSION_SITES: &[RetryAdmissionSite] = &[
     // Native H3 buffered retry loop.
-    ("src/http3/server.rs", "async fn handle_h3_request(", 1),
+    (
+        "src/http3/server.rs",
+        "async fn handle_h3_request(",
+        1,
+        &[
+            "denied_literal_backend_or_dns_override(",
+            "h3_bridge_transport_refusal(",
+        ],
+        "run_h3_backend_admission_or_send_reject(",
+    ),
     // H3 -> HTTP plain bridge: mesh arm plus the reqwest success / error arms.
+    // Each arm keeps the attempt it is about to replace until the admission,
+    // so a refusal can serve it; the next attempt starts at `continue`.
     (
         "src/http3/cross_protocol.rs",
         "async fn dispatch_plain<S>(",
         3,
+        &[],
+        "continue;",
     ),
     // H3 -> gRPC bridge buffered retry loop.
     (
         "src/http3/cross_protocol.rs",
         "async fn dispatch_grpc<S>(",
         1,
+        &["resolve_h3_grpc_transport("],
+        "run_cross_protocol_backend_admission_or_reject(",
     ),
 ];
 
 #[test]
 fn every_http3_retry_loop_admits_each_attempt_through_the_circuit_breaker() {
-    for &(file, signature, expected) in RETRY_ADMISSION_SITES {
+    let call = "crate::proxy::admit_retry_attempt(";
+    let backoff = "tokio::time::sleep(delay)";
+    for &(file, signature, expected, screens, handoff) in RETRY_ADMISSION_SITES {
         let text = source(file);
         let body: String = item_body(&text, signature, "\n}\n")
             .split_whitespace()
             .collect();
-        let call = "crate::proxy::admit_retry_attempt(";
+        let admissions: Vec<usize> = body.match_indices(call).map(|(at, _)| at).collect();
         assert_eq!(
-            body.matches(call).count(),
+            admissions.len(),
             expected,
             "{file} `{signature}` must admit every retry attempt through the breaker"
         );
-        for admission in body.split(call).skip(1) {
-            let args = admission.split_once("cb_probe").map(|(args, _)| args);
+        for at in admissions {
+            let args = body[at + call.len()..]
+                .split_once("cb_probe")
+                .map(|(args, _)| args);
             assert!(
                 args.is_some_and(|args| args.len() < 80),
                 "{file} `{signature}`: each retry admission must re-point the request's \
                  probe guard (`cb_probe`)"
+            );
+            let slept = body[..at]
+                .rfind(backoff)
+                .unwrap_or_else(|| panic!("{file} `{signature}`: admission precedes any backoff"));
+            let since_backoff = &body[slept..at];
+            assert!(
+                !since_backoff.contains("continue;") && !since_backoff.contains("retry_delay("),
+                "{file} `{signature}`: the admission must follow THIS attempt's backoff"
+            );
+            for screen in screens {
+                assert!(
+                    since_backoff.contains(screen),
+                    "{file} `{signature}`: `{screen}` must screen the rotated target \
+                     before the breaker admits it"
+                );
+            }
+            let after = &body[at..];
+            let next_backoff = after.find(backoff).unwrap_or(after.len());
+            assert!(
+                after[..next_backoff].contains(handoff),
+                "{file} `{signature}`: `{handoff}` must follow the admission before the \
+                 next backoff"
             );
         }
     }
@@ -582,6 +635,52 @@ fn every_http3_retry_loop_admits_each_attempt_through_the_circuit_breaker() {
     assert!(helper.contains("circuit_breaker_cache.can_execute("));
     assert!(helper.contains("cb_probe.rearm(&cb, is_half_open_probe, admission_generation)"));
     assert!(helper.contains("cb_probe.retire()"));
+}
+
+/// Issue #6799 (sibling): the synchronous fallbacks that record a deferred
+/// streaming outcome whose body an `after_proxy` reject replaced must record it
+/// on the admitting breaker, through the one shared helper. An empty
+/// `BreakerSettlement` there silently drops the only breaker record the
+/// attempt gets. Every production recorder call that passes an empty
+/// settlement must also skip the breaker outright.
+#[test]
+fn replaced_streaming_outcomes_record_on_the_admitting_breaker() {
+    let proxy = source("src/proxy/mod.rs");
+    let production = without_inline_test_module(&proxy);
+    assert_eq!(
+        production
+            .matches("backend_dispatch::record_replaced_streaming_outcome(")
+            .count(),
+        2,
+        "the H1/H2 streaming and the buffered-request gRPC after_proxy fallbacks"
+    );
+    let helper_source = source("src/proxy/backend_dispatch.rs");
+    let helper = item_body(
+        &helper_source,
+        "pub(crate) fn record_replaced_streaming_outcome(",
+        "\n}\n",
+    );
+    assert!(helper.contains("cb_probe.settlement_without_slot()"));
+
+    for (path, text) in production_sources() {
+        let production: String = without_inline_test_module(&text)
+            .split_whitespace()
+            .collect();
+        for call in production
+            .split("record_backend_outcome_no_conn_end(")
+            .skip(1)
+        {
+            // The call's own arguments end at its closing `);`.
+            let args = call.split(");").next().unwrap_or_default();
+            if let Some((_, after_empty)) = args.split_once("BreakerSettlement::none(),") {
+                assert!(
+                    after_empty.starts_with("true,"),
+                    "{path}: a recorder call with an empty settlement must skip the breaker \
+                     (`true`); pass the attempt guard's settlement instead"
+                );
+            }
+        }
+    }
 }
 
 fn probe_breaker_config() -> CircuitBreakerConfig {

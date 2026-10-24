@@ -40324,18 +40324,12 @@ async fn handle_proxy_request_inner(
                         let reject_skip_cb =
                             grpc_streaming_probe_recorder.is_some() || grpc_cb_recorded_eagerly;
                         // #1649 R5 finding 1 (parity): the buffered-request path
-                        // records the CB here directly; skip it if the breaker opened
-                        // a new cycle since admission (the recorder path is already
-                        // epoch-checked inside `on_response_terminal`). Passive-health
-                        // + least-latency still record below.
-                        let reject_cb_stale = !reject_skip_cb
-                            && backend_dispatch::deferred_circuit_breaker_is_stale(
-                                &state,
-                                &proxy,
-                                grpc_final_cb_key.as_deref(),
-                                cb_admission_open_epoch,
-                            );
-                        backend_dispatch::record_backend_outcome_no_conn_end(
+                        // records the CB here directly on the admitting breaker;
+                        // the helper skips it if the breaker opened a new cycle
+                        // since admission (the recorder path is already
+                        // epoch-checked inside `on_response_terminal`).
+                        // Passive-health + least-latency still record.
+                        backend_dispatch::record_replaced_streaming_outcome(
                             &state,
                             &proxy,
                             &epoch.load_balancer,
@@ -40345,8 +40339,9 @@ async fn handle_proxy_request_inner(
                             grpc_backend_dispatch_status,
                             false,
                             None,
-                            crate::proxy::BreakerSettlement::none(),
-                            reject_skip_cb || reject_cb_stale,
+                            &cb_probe,
+                            reject_skip_cb,
+                            cb_admission_open_epoch,
                             grpc_backend_admission_elapsed,
                         );
                         if let Some(recorder) = &grpc_streaming_probe_recorder {
@@ -44100,17 +44095,12 @@ async fn handle_proxy_request_inner(
         || (defer_streaming_h3_dispatch && matches!(&response_body, ResponseBody::StreamingH3(_)));
     if defer_streaming_dispatch && !deferred_streaming_body_still_streaming {
         // #1649 R5 finding 3: the after_proxy hook may have run long enough for the
-        // breaker to open a new cycle. Skip the CB record if this header-time
-        // outcome is stale for the current generation (parity with the
-        // body-deferred path's `cb_stale` check), while still recording
-        // passive-health + least-latency below.
-        let cb_stale = backend_dispatch::deferred_circuit_breaker_is_stale(
-            &state,
-            &proxy,
-            final_cb_target_key.as_deref(),
-            cb_admission_open_epoch,
-        );
-        backend_dispatch::record_backend_outcome_no_conn_end(
+        // breaker to open a new cycle. The helper skips the CB record if this
+        // header-time outcome is stale for the current generation (parity with
+        // the body-deferred path's `cb_stale` check), and otherwise records it
+        // on the admitting breaker (issue #6799), while still recording
+        // passive-health + least-latency.
+        backend_dispatch::record_replaced_streaming_outcome(
             &state,
             &proxy,
             &epoch.load_balancer,
@@ -44120,8 +44110,9 @@ async fn handle_proxy_request_inner(
             backend_admission_response_status,
             backend_admission_connection_error,
             backend_admission_error_class,
-            crate::proxy::BreakerSettlement::none(),
-            skip_final_cb_record || cb_stale,
+            &cb_probe,
+            skip_final_cb_record,
+            cb_admission_open_epoch,
             final_backend_dispatch_elapsed,
         );
     }

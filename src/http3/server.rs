@@ -10692,25 +10692,6 @@ async fn handle_h3_request(
                     Some(result.status),
                 );
                 last_attempt_recorded = true;
-                // Admit the next attempt through the breaker of the target it
-                // will dial — the rotated candidate, or this one again — as the
-                // H1/H2 retry loop does (issue #6799). An OPEN breaker ends the
-                // retries: the attempt just recorded stays the outcome, and the
-                // retired guard keeps the post-loop record from settling it
-                // twice. On admission the guard owns the new attempt, so its
-                // outcome and any probe slot settle on that breaker.
-                let next_cb_target_key = next_retry_target
-                    .as_ref()
-                    .map(|(next, _)| crate::circuit_breaker::target_key(&next.host, next.port))
-                    .or_else(|| current_cb_target_key.clone());
-                if !crate::proxy::admit_retry_attempt(
-                    &state,
-                    &proxy,
-                    next_cb_target_key.as_deref(),
-                    &cb_probe,
-                ) {
-                    break;
-                }
                 // Backoff spends the route's total budget too; its expiry here
                 // is the health-neutral route timeout (#5646).
                 let delay = crate::retry::retry_delay(retry_config, attempt);
@@ -10727,6 +10708,10 @@ async fn handle_h3_request(
                 }
                 attempt += 1;
 
+                // Kept so a breaker refusal below can restore the target that
+                // produced the result being served.
+                let pre_rotation_target = current_target.clone();
+                let pre_rotation_cb_target_key = current_cb_target_key.clone();
                 if let Some((next, next_url)) = next_retry_target {
                     let target_changed = current_target.as_ref().is_some_and(|prev_target| {
                         next.host != prev_target.host || next.port != prev_target.port
@@ -10814,6 +10799,24 @@ async fn handle_h3_request(
                         request_on_wire: false,
                     };
                     sticky_dispatch_refused = true;
+                    break;
+                }
+
+                // Admit this attempt through the breaker of the target it will
+                // dial (issue #6799) after the backoff and the rotated target's
+                // egress/transport screens, immediately before backend
+                // admission — the H1/H2 retry loop's order. An OPEN breaker ends
+                // the retries: the previous attempt, already recorded, is served
+                // against the target that produced it, and the retired guard
+                // keeps the post-loop record from settling it twice.
+                if !crate::proxy::admit_retry_attempt(
+                    &state,
+                    &proxy,
+                    current_cb_target_key.as_deref(),
+                    &cb_probe,
+                ) {
+                    current_target = pre_rotation_target;
+                    current_cb_target_key = pre_rotation_cb_target_key;
                     break;
                 }
 

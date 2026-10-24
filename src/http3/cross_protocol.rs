@@ -4056,11 +4056,67 @@ where
                                     attempt_result.connection_error,
                                     cb_probe,
                                 );
-                                // Admit the next attempt through the breaker of the target it
-                                // will dial (issue #6799), as the H1/H2 retry loop does. An
-                                // OPEN breaker ends the retries: this attempt, already recorded,
-                                // is served, and the retired guard keeps the terminal record
-                                // from settling it twice.
+                                // A gRPC-Web route attempt budget (#5646) ends with the failed
+                                // attempt, so backoff is bounded by the total deadline alone.
+                                (grpc_web_deadline_at, plain_write_bound, plain_local_bound) =
+                                    end_plain_route_attempt(
+                                        ctx,
+                                        policy_flavor,
+                                        plain_auth_deadline_plan,
+                                        route,
+                                    );
+                                let delay = crate::retry::retry_delay(retry_config, attempt);
+                                if crate::plugins::await_deadline_first(
+                                    plain_local_bound.deadline(),
+                                    tokio::time::sleep(delay),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    // This attempt's admission + backend outcome
+                                    // were ALREADY settled just above, and the
+                                    // retry-failure record already released this
+                                    // iteration's least-connections count.
+                                    // Recording a client deadline or
+                                    // authorization expiry here too would settle
+                                    // that outcome a SECOND time, so settle only
+                                    // the client-facing write — same as the
+                                    // reqwest retry arms below.
+                                    if let Some(termination) =
+                                        plain_local_bound.expired_authorization()
+                                    {
+                                        ctx.record_authorization_termination_once(
+                                            termination,
+                                            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                        );
+                                        return write_plain_authorization_expired_terminal(
+                                            stream,
+                                            ctx,
+                                            backend_start,
+                                            bytes_sent,
+                                        )
+                                        .await;
+                                    }
+                                    // Backoff is gateway-local: a route total expiry here is
+                                    // health-neutral and logged under `retry_backoff`.
+                                    mark_plain_route_backoff_expiry(ctx);
+                                    return write_plain_grpc_web_client_deadline(
+                                        stream,
+                                        plugins,
+                                        ctx,
+                                        response_committed_plugins,
+                                        initial_response_header_policy_plugins,
+                                        backend_start,
+                                        bytes_sent,
+                                        &current_url,
+                                    )
+                                    .await;
+                                }
+                                // Admit the next attempt after the backoff, through the breaker
+                                // of the target it will dial (issue #6799), as the H1/H2 retry
+                                // loops do. An OPEN breaker ends the retries: this attempt,
+                                // already recorded, is served below, and the retired guard keeps
+                                // the terminal record from settling it twice.
                                 let next_cb_target_key = match &retry_target {
                                     CrossProtocolRetryTarget::Selected(
                                         _,
@@ -4075,62 +4131,6 @@ where
                                     next_cb_target_key,
                                     cb_probe,
                                 ) {
-                                    // A gRPC-Web route attempt budget (#5646) ends with the failed
-                                    // attempt, so backoff is bounded by the total deadline alone.
-                                    (grpc_web_deadline_at, plain_write_bound, plain_local_bound) =
-                                        end_plain_route_attempt(
-                                            ctx,
-                                            policy_flavor,
-                                            plain_auth_deadline_plan,
-                                            route,
-                                        );
-                                    let delay = crate::retry::retry_delay(retry_config, attempt);
-                                    if crate::plugins::await_deadline_first(
-                                        plain_local_bound.deadline(),
-                                        tokio::time::sleep(delay),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        // This attempt's admission + backend outcome
-                                        // were ALREADY settled just above, and the
-                                        // retry-failure record already released this
-                                        // iteration's least-connections count.
-                                        // Recording a client deadline or
-                                        // authorization expiry here too would settle
-                                        // that outcome a SECOND time, so settle only
-                                        // the client-facing write — same as the
-                                        // reqwest retry arms below.
-                                        if let Some(termination) =
-                                            plain_local_bound.expired_authorization()
-                                        {
-                                            ctx.record_authorization_termination_once(
-                                            termination,
-                                            crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-                                        );
-                                            return write_plain_authorization_expired_terminal(
-                                                stream,
-                                                ctx,
-                                                backend_start,
-                                                bytes_sent,
-                                            )
-                                            .await;
-                                        }
-                                        // Backoff is gateway-local: a route total expiry here is
-                                        // health-neutral and logged under `retry_backoff`.
-                                        mark_plain_route_backoff_expiry(ctx);
-                                        return write_plain_grpc_web_client_deadline(
-                                            stream,
-                                            plugins,
-                                            ctx,
-                                            response_committed_plugins,
-                                            initial_response_header_policy_plugins,
-                                            backend_start,
-                                            bytes_sent,
-                                            &current_url,
-                                        )
-                                        .await;
-                                    }
                                     attempt += 1;
                                     if let CrossProtocolRetryTarget::Selected(
                                         next_target,
@@ -4756,11 +4756,58 @@ where
                                         attempt_result.connection_error,
                                         cb_probe,
                                     );
-                                    // Admit the next attempt through the breaker of the target it
-                                    // will dial (issue #6799), as the H1/H2 retry loop does. An
-                                    // OPEN breaker ends the retries: this attempt, already recorded,
-                                    // is served, and the retired guard keeps the terminal record
-                                    // from settling it twice.
+                                    // A gRPC-Web route attempt budget (#5646) ends with the failed
+                                    // attempt, so backoff is bounded by the total deadline alone.
+                                    (grpc_web_deadline_at, plain_write_bound, plain_local_bound) =
+                                        end_plain_route_attempt(
+                                            ctx,
+                                            policy_flavor,
+                                            plain_auth_deadline_plan,
+                                            route,
+                                        );
+                                    let delay = crate::retry::retry_delay(retry_config, attempt);
+                                    if crate::plugins::await_deadline_first(
+                                        plain_local_bound.deadline(),
+                                        tokio::time::sleep(delay),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        if let Some(termination) =
+                                            plain_local_bound.expired_authorization()
+                                        {
+                                            ctx.record_authorization_termination_once(
+                                                termination,
+                                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                            );
+                                            return write_plain_authorization_expired_terminal(
+                                                stream,
+                                                ctx,
+                                                backend_start,
+                                                bytes_sent,
+                                            )
+                                            .await;
+                                        }
+                                        // Backoff is gateway-local: a route total expiry here is
+                                        // health-neutral and logged under `retry_backoff`.
+                                        mark_plain_route_backoff_expiry(ctx);
+                                        return write_plain_grpc_web_client_deadline(
+                                            stream,
+                                            plugins,
+                                            ctx,
+                                            response_committed_plugins,
+                                            initial_response_header_policy_plugins,
+                                            backend_start,
+                                            bytes_sent,
+                                            &current_url,
+                                        )
+                                        .await;
+                                    }
+                                    // Admit the next attempt after the backoff, through the breaker
+                                    // of the target it will dial (issue #6799), as the H1/H2 retry
+                                    // loops do. An OPEN breaker ends the retries: this attempt,
+                                    // already recorded, is served below, and the retired guard keeps
+                                    // the terminal record from settling it twice.
                                     let next_cb_target_key = match &retry_target {
                                         CrossProtocolRetryTarget::Selected(
                                             _,
@@ -4775,57 +4822,6 @@ where
                                         next_cb_target_key,
                                         cb_probe,
                                     ) {
-                                        // A gRPC-Web route attempt budget (#5646) ends with the failed
-                                        // attempt, so backoff is bounded by the total deadline alone.
-                                        (
-                                            grpc_web_deadline_at,
-                                            plain_write_bound,
-                                            plain_local_bound,
-                                        ) = end_plain_route_attempt(
-                                            ctx,
-                                            policy_flavor,
-                                            plain_auth_deadline_plan,
-                                            route,
-                                        );
-                                        let delay =
-                                            crate::retry::retry_delay(retry_config, attempt);
-                                        if crate::plugins::await_deadline_first(
-                                            plain_local_bound.deadline(),
-                                            tokio::time::sleep(delay),
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            if let Some(termination) =
-                                                plain_local_bound.expired_authorization()
-                                            {
-                                                ctx.record_authorization_termination_once(
-                                                termination,
-                                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-                                            );
-                                                return write_plain_authorization_expired_terminal(
-                                                    stream,
-                                                    ctx,
-                                                    backend_start,
-                                                    bytes_sent,
-                                                )
-                                                .await;
-                                            }
-                                            // Backoff is gateway-local: a route total expiry here is
-                                            // health-neutral and logged under `retry_backoff`.
-                                            mark_plain_route_backoff_expiry(ctx);
-                                            return write_plain_grpc_web_client_deadline(
-                                                stream,
-                                                plugins,
-                                                ctx,
-                                                response_committed_plugins,
-                                                initial_response_header_policy_plugins,
-                                                backend_start,
-                                                bytes_sent,
-                                                &current_url,
-                                            )
-                                            .await;
-                                        }
                                         attempt += 1;
                                         if let CrossProtocolRetryTarget::Selected(
                                             next_target,
@@ -4912,11 +4908,58 @@ where
                                         attempt_result.connection_error,
                                         cb_probe,
                                     );
-                                    // Admit the next attempt through the breaker of the target it
-                                    // will dial (issue #6799), as the H1/H2 retry loop does. An
-                                    // OPEN breaker ends the retries: this attempt, already recorded,
-                                    // is served, and the retired guard keeps the terminal record
-                                    // from settling it twice.
+                                    // A gRPC-Web route attempt budget (#5646) ends with the failed
+                                    // attempt, so backoff is bounded by the total deadline alone.
+                                    (grpc_web_deadline_at, plain_write_bound, plain_local_bound) =
+                                        end_plain_route_attempt(
+                                            ctx,
+                                            policy_flavor,
+                                            plain_auth_deadline_plan,
+                                            route,
+                                        );
+                                    let delay = crate::retry::retry_delay(retry_config, attempt);
+                                    if crate::plugins::await_deadline_first(
+                                        plain_local_bound.deadline(),
+                                        tokio::time::sleep(delay),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        if let Some(termination) =
+                                            plain_local_bound.expired_authorization()
+                                        {
+                                            ctx.record_authorization_termination_once(
+                                                termination,
+                                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
+                                            );
+                                            return write_plain_authorization_expired_terminal(
+                                                stream,
+                                                ctx,
+                                                backend_start,
+                                                bytes_sent,
+                                            )
+                                            .await;
+                                        }
+                                        // Backoff is gateway-local: a route total expiry here is
+                                        // health-neutral and logged under `retry_backoff`.
+                                        mark_plain_route_backoff_expiry(ctx);
+                                        return write_plain_grpc_web_client_deadline(
+                                            stream,
+                                            plugins,
+                                            ctx,
+                                            response_committed_plugins,
+                                            initial_response_header_policy_plugins,
+                                            backend_start,
+                                            bytes_sent,
+                                            &current_url,
+                                        )
+                                        .await;
+                                    }
+                                    // Admit the next attempt after the backoff, through the breaker
+                                    // of the target it will dial (issue #6799), as the H1/H2 retry
+                                    // loops do. An OPEN breaker ends the retries: this attempt,
+                                    // already recorded, is served below, and the retired guard keeps
+                                    // the terminal record from settling it twice.
                                     let next_cb_target_key = match &retry_target {
                                         CrossProtocolRetryTarget::Selected(
                                             _,
@@ -4931,57 +4974,6 @@ where
                                         next_cb_target_key,
                                         cb_probe,
                                     ) {
-                                        // A gRPC-Web route attempt budget (#5646) ends with the failed
-                                        // attempt, so backoff is bounded by the total deadline alone.
-                                        (
-                                            grpc_web_deadline_at,
-                                            plain_write_bound,
-                                            plain_local_bound,
-                                        ) = end_plain_route_attempt(
-                                            ctx,
-                                            policy_flavor,
-                                            plain_auth_deadline_plan,
-                                            route,
-                                        );
-                                        let delay =
-                                            crate::retry::retry_delay(retry_config, attempt);
-                                        if crate::plugins::await_deadline_first(
-                                            plain_local_bound.deadline(),
-                                            tokio::time::sleep(delay),
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            if let Some(termination) =
-                                                plain_local_bound.expired_authorization()
-                                            {
-                                                ctx.record_authorization_termination_once(
-                                                termination,
-                                                crate::proxy::auth_lifetime::StreamAuthProtocolFamily::Http,
-                                            );
-                                                return write_plain_authorization_expired_terminal(
-                                                    stream,
-                                                    ctx,
-                                                    backend_start,
-                                                    bytes_sent,
-                                                )
-                                                .await;
-                                            }
-                                            // Backoff is gateway-local: a route total expiry here is
-                                            // health-neutral and logged under `retry_backoff`.
-                                            mark_plain_route_backoff_expiry(ctx);
-                                            return write_plain_grpc_web_client_deadline(
-                                                stream,
-                                                plugins,
-                                                ctx,
-                                                response_committed_plugins,
-                                                initial_response_header_policy_plugins,
-                                                backend_start,
-                                                bytes_sent,
-                                                &current_url,
-                                            )
-                                            .await;
-                                        }
                                         attempt += 1;
                                         if let CrossProtocolRetryTarget::Selected(
                                             next_target,
@@ -9028,21 +9020,6 @@ where
             );
             last_attempt_recorded = true;
 
-            // Admit the next attempt through the breaker of the target it will
-            // dial (issue #6799), as the H1/H2 gRPC retry loop does. An OPEN
-            // breaker ends the retries: the attempt just recorded stays the
-            // outcome, and the retired guard keeps the terminal record from
-            // settling it twice.
-            let next_cb_target_key = match &retry_target {
-                CrossProtocolRetryTarget::Selected(_, next_cb_target_key, _) => {
-                    Some(next_cb_target_key.as_str())
-                }
-                _ => current_cb_target_key.as_deref(),
-            };
-            if !crate::proxy::admit_retry_attempt(state, proxy, next_cb_target_key, cb_probe) {
-                break;
-            }
-
             // The failed attempt's route budget ends here: backoff is bounded
             // by the RPC's total deadline alone (H1/H2 parity, #5646).
             ctx.end_grpc_route_attempt();
@@ -9062,6 +9039,11 @@ where
             }
             attempt += 1;
 
+            // Kept so a breaker refusal below can restore the target that
+            // produced the result being served.
+            let pre_rotation_target = current_target.clone();
+            let pre_rotation_cb_target_key = current_cb_target_key.clone();
+            let pre_rotation_url = current_url.clone();
             if let CrossProtocolRetryTarget::Selected(next_target, next_cb_target_key, next_url) =
                 retry_target
             {
@@ -9114,6 +9096,25 @@ where
                     .await;
                 }
             };
+
+            // Admit this attempt through the breaker of the target it will dial
+            // (issue #6799) after the backoff and the rotated target's transport
+            // screen, immediately before backend admission — the H1/H2 gRPC
+            // retry loop's order. An OPEN breaker ends the retries: the previous
+            // attempt, already recorded, is served against the target that
+            // produced it, and the retired guard keeps the terminal record from
+            // settling it twice.
+            if !crate::proxy::admit_retry_attempt(
+                state,
+                proxy,
+                current_cb_target_key.as_deref(),
+                cb_probe,
+            ) {
+                current_target = pre_rotation_target;
+                current_cb_target_key = pre_rotation_cb_target_key;
+                current_url = pre_rotation_url;
+                break;
+            }
 
             warn!(
                 proxy_id = %proxy.id,

@@ -4898,6 +4898,37 @@ pub mod _test_support {
         );
     }
 
+    /// Drive the production synchronous record for a deferred streaming
+    /// outcome whose body an `after_proxy` reject replaced (H1/H2
+    /// `StreamingH2`/`StreamingH3` and buffered-request native gRPC), for an
+    /// attempt owned by `cb_probe` and admitted at `admission_open_epoch`.
+    pub fn record_replaced_streaming_outcome_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        final_cb_target_key: Option<&str>,
+        response_status: u16,
+        cb_probe: &crate::proxy::HalfOpenProbeGuard,
+        skip_circuit_breaker_record: bool,
+        admission_open_epoch: u64,
+    ) {
+        let epoch = state.request_epoch.load();
+        crate::proxy::backend_dispatch::record_replaced_streaming_outcome(
+            state,
+            proxy,
+            &epoch.load_balancer,
+            None,
+            None,
+            final_cb_target_key,
+            response_status,
+            false,
+            None,
+            cb_probe,
+            skip_circuit_breaker_record,
+            admission_open_epoch,
+            std::time::Duration::ZERO,
+        );
+    }
+
     /// Drive the production retry-attempt circuit-breaker admission every
     /// HTTP/3 native and cross-protocol retry loop runs before dialing the next
     /// (possibly rotated, possibly not yet cached) target (issue #6799).
