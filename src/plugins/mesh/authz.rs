@@ -110,6 +110,11 @@ pub struct MeshAuthz {
     /// Empty whenever no provider inspects bodies, so an ordinary mesh pays
     /// nothing.
     body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule>,
+    /// Body-inspecting CUSTOM rules that ONLY the NodeWaypoint capture
+    /// inventory carries, each kept inside its policy (scope + those rules).
+    /// Unlike `body_inspecting_custom_rules`, these request a prebuffer only
+    /// when the request's destination or source scope selects the policy.
+    capture_body_inspecting_custom_policies: Vec<MeshPolicy>,
     /// Unfiltered policy superset used for Ambient UDP CONNECTs carrying
     /// validated per-pod evidence and for ServiceWaypoint inbound relays whose
     /// destination workload differs from the waypoint identity. Ordinary
@@ -1963,9 +1968,18 @@ impl MeshAuthz {
             per_pod_policy_scoping && policies_enforce_scoped_rules(&slice.mesh_policies);
         let has_scoped_capture_destination_policies = per_pod_policy_scoping
             && policies_enforce_scoped_rules(&slice.node_waypoint_capture_mesh_policies);
-        if per_pod_policy_scoping {
+        // The merge APPENDS capture-only policies and never reorders; later
+        // normalization is in place, and the construction-time `retain` (which
+        // can shrink the list) only runs without per-pod scoping, i.e. when
+        // nothing was appended. So the last `capture_only_policy_count` entries
+        // are exactly the capture-only policies.
+        let capture_only_policy_count = if per_pod_policy_scoping {
+            let before = slice.mesh_policies.len();
             merge_node_waypoint_capture_mesh_policies(&mut slice);
-        }
+            slice.mesh_policies.len() - before
+        } else {
+            0
+        };
 
         validate_policy_ip_inputs(&slice.mesh_policies)?;
         validate_waypoint_target_ref_evidence(&slice)?;
@@ -2137,10 +2151,20 @@ impl MeshAuthz {
         // here so the per-request buffering predicate is a bounded scan of the
         // (usually empty) body-inspecting subset rather than a scan of every
         // policy.
+        //
+        // Capture-ONLY policies are kept apart, WITH their policy scope: the
+        // prebuffer (and its `maxRequestBytes` 413) runs before `authorize`, so
+        // a foreign destination's CUSTOM rule must not buffer or cap a request
+        // to a workload it cannot select. See
+        // `capture_custom_rules_may_apply_to_request`.
+        let ordinary_policy_count = slice
+            .mesh_policies
+            .len()
+            .saturating_sub(capture_only_policy_count);
         let body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule> =
             match ext_authz.as_ref() {
-                Some(executor) if executor.requires_request_body() => slice
-                    .mesh_policies
+                Some(executor) if executor.requires_request_body() => slice.mesh_policies
+                    [..ordinary_policy_count]
                     .iter()
                     .chain(relay_policy_superset.iter())
                     .flat_map(|policy| policy.rules.iter())
@@ -2153,11 +2177,35 @@ impl MeshAuthz {
                     .collect(),
                 _ => Vec::new(),
             };
+        let capture_body_inspecting_custom_policies: Vec<MeshPolicy> = match ext_authz.as_ref() {
+            Some(executor) if executor.requires_request_body() => slice.mesh_policies
+                [ordinary_policy_count..]
+                .iter()
+                .filter_map(|policy| {
+                    let rules: Vec<_> = policy
+                        .rules
+                        .iter()
+                        .filter(|rule| {
+                            rule.action.custom_provider().is_some_and(|provider| {
+                                executor.provider_requires_request_body(provider)
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    (!rules.is_empty()).then(|| MeshPolicy {
+                        rules,
+                        ..policy.clone()
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
 
         Ok(Self {
             slice,
             ext_authz,
             body_inspecting_custom_rules,
+            capture_body_inspecting_custom_policies,
             relay_policy_superset,
             ambient_udp_source_scopes,
             ambient_udp_source_scoping,
@@ -3955,7 +4003,9 @@ impl Plugin for MeshAuthz {
         if mesh_authz_skips_outbound_capture_leg(self.per_pod_policy_scoping, ctx.mesh_direction) {
             return false;
         }
-        if self.body_inspecting_custom_rules.is_empty() {
+        if self.body_inspecting_custom_rules.is_empty()
+            && self.capture_body_inspecting_custom_policies.is_empty()
+        {
             return false;
         }
         let host = ctx
@@ -3980,7 +4030,7 @@ impl Plugin for MeshAuthz {
         let stripped = crate::policy_path::strip_path_parameters(path);
         let stripped_spelling = (stripped != path).then_some(&*stripped);
         let spellings = std::iter::once(path).chain(stripped_spelling);
-        self.body_inspecting_custom_rules.iter().any(|rule| {
+        let rule_may_apply = |rule: &crate::modes::mesh::config::MeshRule| {
             spellings.clone().any(|spelling| {
                 crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
                     rule,
@@ -3989,7 +4039,48 @@ impl Plugin for MeshAuthz {
                     host.as_deref(),
                 )
             })
-        })
+        };
+        self.body_inspecting_custom_rules
+            .iter()
+            .any(&rule_may_apply)
+            || self.capture_custom_rules_may_apply_to_request(ctx, &rule_may_apply)
+    }
+
+    /// Whether a capture-ONLY body-inspecting CUSTOM rule could be checked for
+    /// this request. A policy contributes only when a scope `authorize` could
+    /// judge this request under selects it: the destination scope for the
+    /// matched proxy (the capture-destination scope on the synthesized inbound
+    /// relay, the ordinary index otherwise) or the request's source pod scope;
+    /// with neither, only a mesh-wide policy can apply. This is the same
+    /// applicability `authorize` uses, taken as a superset (either scope), so
+    /// it never skips a buffer a selected policy needs, while a foreign
+    /// destination's provider can no longer buffer or `413` a request to a
+    /// workload it does not select.
+    fn capture_custom_rules_may_apply_to_request(
+        &self,
+        ctx: &RequestContext,
+        rule_may_apply: &dyn Fn(&crate::modes::mesh::config::MeshRule) -> bool,
+    ) -> bool {
+        if self.capture_body_inspecting_custom_policies.is_empty() {
+            return false;
+        }
+        let destination = ctx
+            .matched_proxy
+            .as_ref()
+            .and_then(|proxy| self.node_waypoint_destination_scope_match(proxy));
+        let source = ctx.node_waypoint_policy_scope.as_deref();
+        let waypoint = self.waypoint_attachment();
+        self.capture_body_inspecting_custom_policies
+            .iter()
+            .any(|policy| {
+                let selected = destination.as_ref().is_some_and(|matched| {
+                    matched
+                        .scopes
+                        .iter()
+                        .any(|scope| scope.policy_applies_for_destination(policy, waypoint))
+                }) || Self::policy_applies_to_pod(policy, source);
+                selected && policy.rules.iter().any(rule_may_apply)
+            })
     }
 
     /// Bound the buffer at the largest `maxRequestBytes` any provider declared,

@@ -9027,6 +9027,108 @@ fn mesh_authz_node_waypoint_still_buffers_on_its_source_side_leg() {
     );
 }
 
+/// A body-inspecting CUSTOM policy that only the NodeWaypoint capture
+/// inventory carries must not prebuffer (or `413` at its `maxRequestBytes`) a
+/// request to a workload it cannot select: the prebuffer runs before
+/// `authorize`, so it applies the same destination/source scope selection.
+/// A request to the captured destination still gets the buffer and ceiling.
+#[test]
+fn mesh_authz_capture_only_custom_body_rule_buffers_only_selected_requests() {
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    let delegate: MeshPolicy = serde_json::from_value(json!({
+        "name": "payments-delegate",
+        "namespace": "payments",
+        "scope": {"kind": "namespace", "namespace": "payments"},
+        "rules": [{"action": {"custom": {"provider": "payments-authz"}}}]
+    }))
+    .expect("policy");
+    let provider = serde_json::from_value(json!({
+        "name": "payments-authz",
+        "service": "127.0.0.1",
+        "port": 9000,
+        "timeout_ms": 500,
+        "status_on_error": 403,
+        "include_request_body_in_check": {"max_request_bytes": 1024}
+    }))
+    .expect("provider");
+    let plugin = MeshAuthz::new_with_http_client(
+        &json!({
+            "mesh_slice": MeshSlice {
+                node_id: "node-a".to_string(),
+                namespace: "ferrum".to_string(),
+                version: "test".to_string(),
+                ext_authz_providers: vec![provider],
+                node_waypoint_capture_destinations: vec![capture_destination(
+                    "payments",
+                    "ledger",
+                    "10.244.1.7",
+                    &[8080],
+                )],
+                node_waypoint_capture_mesh_policies: vec![delegate],
+                node_waypoint_capture_mesh_policies_resolved: true,
+                ..MeshSlice::default()
+            },
+            "per_pod_policy_scoping": true,
+            "trusted_hbone_assertors": [{
+                "assertor": CAPTURE_RELAY_PEER,
+                "asserts": [CAPTURE_FRONTEND],
+            }],
+        }),
+        Some(PluginHttpClient::default()),
+    )
+    .expect("body-inspecting mesh_authz generation builds");
+    let ferrum_pod = || {
+        Some(Arc::new(PolicyScopeCache::new(
+            SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/client").expect("spiffe"),
+            "ferrum",
+            HashMap::from([("app".to_string(), "client".to_string())]),
+        )))
+    };
+
+    // An enrolled `ferrum` pod uploading to an unrelated `ferrum` Service.
+    let mut unrelated = admin_request_context(Some(MeshTrafficDirection::Outbound));
+    unrelated.node_waypoint_policy_scope = ferrum_pod();
+    unrelated.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "upload",
+            "namespace": "ferrum",
+            "hosts": ["upload.ferrum"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.244.1.50",
+            "backend_port": 8080
+        }))
+        .expect("proxy"),
+    ));
+    assert!(
+        !plugin.should_buffer_request_body(&unrelated),
+        "a foreign capture-only CUSTOM rule must not buffer an unrelated workload's request"
+    );
+
+    // No scope evidence at all: only a mesh-wide policy could apply.
+    let unscoped = admin_request_context(Some(MeshTrafficDirection::Inbound));
+    assert!(!plugin.should_buffer_request_body(&unscoped));
+
+    // The captured destination, reached through the synthesized inbound relay,
+    // still requests the buffer and the provider's ceiling.
+    let relayed = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    assert!(
+        plugin.should_buffer_request_body(&relayed),
+        "a request the capture policy selects must still be prebuffered"
+    );
+    assert_eq!(plugin.request_body_buffer_limit(), Some(1024));
+
+    // A source pod the policy selects (namespace `payments`) also buffers.
+    let mut payments_source = admin_request_context(Some(MeshTrafficDirection::Outbound));
+    payments_source.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger").expect("spiffe"),
+        "payments",
+        HashMap::from([("app".to_string(), "ledger".to_string())]),
+    )));
+    assert!(plugin.should_buffer_request_body(&payments_source));
+}
+
 #[tokio::test]
 async fn mesh_authz_authorize_skips_the_outbound_capture_leg_and_still_enforces_inbound() {
     let plugin = MeshAuthz::new(&json!({

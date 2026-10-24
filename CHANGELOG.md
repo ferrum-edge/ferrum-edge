@@ -132,7 +132,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slice is never rebuilt from a narrowed or Sidecar-widened routing view. Those
   destination policies make a missing scope fail closed only for connections to
   the captured destinations; unattributed UDP/DTLS sessions keep the previous
-  source-scope behaviour.
+  source-scope behaviour. A body-inspecting CUSTOM rule carried only by that
+  inventory buffers (and size-limits) only requests whose scope its policy
+  selects.
 - **A direct HTTP/1.1 check-in racing a drain no longer lands in the drained
   pool** (issue #6793). A drain now marks the backend's lane retired under the
   lane lock, and check-in reads that mark under the same lock. A connection
