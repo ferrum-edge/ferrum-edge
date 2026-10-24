@@ -118,7 +118,11 @@ ignore = [
     # 0.13.8 -> crypto-bigint 0.5.5. jsonwebtoken 11.1.0 (latest) still requires
     # p256 ^0.13.2 / p384 ^0.13; p256/p384 0.14 (elliptic-curve 0.14.2 ->
     # crypto-bigint ^0.7.7) exist, but nothing we depend on uses them yet.
-    # Same graph in fuzz/ and tests/performance/mesh/.
+    # Same graph in fuzz/ and tests/performance/mesh/. The vendored dimpl's
+    # standalone regression lockfile (vendor/dimpl-0.6.1-ferrum-patched/
+    # Cargo.lock) also lists 0.5.5, through dimpl's own optional `rust-crypto`
+    # feature. Ferrum builds dimpl on aws-lc-rs, so that copy is never compiled
+    # into Ferrum, and cargo-deny does not scan that lockfile.
     # Reachability (source review of the registry crates):
     #   - SECRET-DEPENDENT USE IS REACHABLE. jsonwebtoken `rust_crypto` signs
     #     ES256/ES384 with p256/p384 `SigningKey`. Ferrum signs ES256 in
@@ -128,9 +132,14 @@ ignore = [
     #   - p256 0.13 does its *scalar* arithmetic on crypto-bigint `U256`
     #     (`add_mod`, `sub_mod`, `mul_wide`, `sbb`, `ct_lt`/`ct_gt`, with its
     #     own Barrett reduction). ECDSA signing runs that code on the private
-    #     key and the nonce (k^-1, r*d, s, low-S check). Its field arithmetic
-    #     and p384's field and scalar arithmetic are its own code or fiat-crypto,
-    #     and use crypto-bigint only for encoding and range checks.
+    #     key and the nonce (k^-1, r*d, s, low-S check). p256's field
+    #     arithmetic is its own code. p384 0.13 does field and scalar
+    #     arithmetic in fiat-crypto, but still calls crypto-bigint 0.5.5 for
+    #     `U384` encoding, the `ct_lt` range check when the private key or
+    #     nonce is loaded (`from_repr`), `Reduce` (`sbb` + `conditional_select`)
+    #     on the hash and R.x, and the `ct_gt` low-S check on s. So on ES384
+    #     the secret key and nonce reach only the 0.5.5 subtraction/borrow in
+    #     those range checks.
     #   - The code the 0.7.6 fix changed does not exist in 0.5.5 in that form.
     #     The `borrowing_sub` branch came from a 0.7-only workaround. 0.5.5
     #     subtracts with u128 arithmetic. Zero counting, division and
@@ -144,9 +153,23 @@ ignore = [
     # p256/p384. EdDSA assertion keys avoid it for oidc_relying_party and
     # oauth2_introspection. JWT-SVID minting is always ES256, so only `fips`
     # avoids it there.
+    # Alternative, for the owner to choose instead (PR #6811, "Option B"):
+    # select jsonwebtoken's `aws_lc_rs` backend on BOTH profiles. That drops
+    # p256/p384 0.13 and crypto-bigint 0.5.5 from every lockfile, needs no
+    # ignore, and also takes jsonwebtoken off the RustCrypto rsa. The cost: it
+    # redesigns the two-profile boundary (`crypto-ring` stops being the
+    # historical build for JWTs; check_fips_feature_policy.py's
+    # REQUIRED_FEATURE_PAIRS / BACKEND_CRATE_PREFIXES contract changes),
+    # requires RSA signing keys of 2048-8192 bits, and makes ECDSA signatures
+    # randomized rather than RFC 6979 deterministic. AWS-LC is already compiled
+    # into the default build through dimpl/rcgen/x509-parser.
     # Exit: retire when jsonwebtoken moves to p256/p384 0.14 (elliptic-curve
-    # 0.14 / crypto-bigint >= 0.7.6) and the lockfile drops crypto-bigint 0.5.5.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 constant-time timing issues; fixed only in >=0.7.6, no patched 0.5.x. Reached via jsonwebtoken 11.1.0 rust_crypto (default crypto-ring) -> p256 0.13.2/p384 0.13.1 -> elliptic-curve 0.13.8; jsonwebtoken latest still pins p256 ^0.13. SECRET-DEPENDENT USE IS REACHABLE: ES256 JWT-SVID minting and ES256/ES384 private_key_jwt assertions sign through p256 0.13, whose scalar arithmetic (add_mod/sub_mod/mul_wide/sbb/ct_lt) runs on crypto-bigint 0.5.5 with the private key and nonce. The specific branches fixed in 0.7.6 are not present in 0.5.5 (0.7-only borrowing_sub workaround; zero counting/division/Montgomery not on this path; no UintRef/BoxedMontyForm), but 0.5.5 has never had a cargo checkct check. The fips profile avoids p256/p384. Time-boxed, pending owner acceptance. Exit: jsonwebtoken on p256/p384 0.14 (crypto-bigint >=0.7.6). [expires:2026-11-30]" },
+    # 0.14 / crypto-bigint >= 0.7.6) and the lockfile drops crypto-bigint 0.5.5,
+    # or when Option B lands. Upstream: jsonwebtoken master still requires
+    # p256 0.13 (checked 2026-10-24), so do not expect an upstream release by
+    # 2026-11-30. If none exists by then, the re-review should choose Option B
+    # (or an explicit re-acceptance), not quietly extend this entry.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 constant-time timing issues; fixed only in >=0.7.6, no patched 0.5.x. Reached via jsonwebtoken 11.1.0 rust_crypto (default crypto-ring) -> p256 0.13.2/p384 0.13.1 -> elliptic-curve 0.13.8; jsonwebtoken latest still pins p256 ^0.13. SECRET-DEPENDENT USE IS REACHABLE: ES256 JWT-SVID minting and ES256/ES384 private_key_jwt assertions sign through p256 0.13, whose scalar arithmetic (add_mod/sub_mod/mul_wide/sbb/ct_lt) runs on crypto-bigint 0.5.5 with the private key and nonce. The specific branches fixed in 0.7.6 are not present in 0.5.5 (0.7-only borrowing_sub workaround; zero counting/division/Montgomery not on this path; no UintRef/BoxedMontyForm), but 0.5.5 has never had a cargo checkct check. The fips profile avoids p256/p384. Alternative: jsonwebtoken aws_lc_rs on both profiles (PR #6811) removes the crate but redesigns the crypto-ring/fips boundary. Time-boxed, pending owner acceptance. Exit: jsonwebtoken on p256/p384 0.14 (crypto-bigint >=0.7.6) or PR #6811. [expires:2026-11-30]" },
 ]
 
 [bans]
