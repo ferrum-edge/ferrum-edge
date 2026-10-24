@@ -3605,7 +3605,7 @@ Bounds: the idle set per identity is capped by the global `max_idle_per_host`, e
 
 **Per-target physical-connection bound.** Pooling is not a way to open unbounded connections into the local application. `FERRUM_MESH_UNIX_INGRESS_MAX_CONNECTIONS` (default `64`; `0` disables it) caps the concurrently open **physical** connections one admitted target identity may hold. It is deliberately **not** an Istio `DestinationRule` `connectionPool.tcp.maxConnections`: a `DestinationRule` is **outbound**, client-side policy about a destination service this workload calls, while sidecar ingress is traffic the mesh has already accepted being handed to the co-located app over a socket with no network authority, no dial host, and no service port to resolve a rule against — and the materialized ingress upstream's placeholder `127.0.0.1:<listener_port>` target under a synthetic `__mesh-ingress-unix-*` id would in practice match no rule at all. The bound's lane is the pool's **complete structured identity** — namespace, proxy id, effective upstream id, configured and canonical socket path, the admitted `(dev, ino, owner_uid)`, and the wire protocol — so sibling ingress listeners on one workload, an `http` ⇄ `http2` flip, and a replaced socket object each get their own lane and can neither steal nor accidentally share one. A slot is taken at the one point a **new physical connection** is about to be constructed — never on a pool hit and never per multiplexed h2c stream. A dedicated WebSocket is a new physical connection and therefore holds one slot for its complete session relay; a target pinned at `1` still serves an unbounded number of sequential HTTP/1.1 requests and concurrent RPCs over one pooled carrier, but cannot open a second dedicated WebSocket beside it. Pooled-carrier guards are owned by their connection-driver futures; a WebSocket's equivalent lease is owned beside the session relay. Both forms hold the slot for exactly the socket's lifetime — idle residence included — and release it on handshake failure, close, relay termination, eviction, withdrawal, drain, shutdown, cancellation, and a driver panic alike. An over-bound refusal is decided **before `connect(2)`**: no socket is opened and no application byte is written, and it surfaces as a typed `503` with `ErrorClass::BackendConnectionLimit` — pre-wire, health-neutral (an application at its configured transport capacity is not an unhealthy one), and retryable onto another target with its own lane.
 
-**Keep-alive.** `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` (and the per-proxy `pool_enable_http_keep_alive` override) is honored literally for HTTP/1.1 on this transport: with it off, a carrier is neither taken from nor returned to the idle set, so every request gets its own freshly admitted connection. Publication also treats the effective setting as part of the reusable live-identity set: an H1 target whose keep-alive/reuse is off is omitted from the published live set so resident idle H1 carriers are retired synchronously before reconciliation returns — otherwise a full idle set at the default physical and idle caps (both 64) could keep every physical slot occupied while new traffic must dial fresh and receive `BackendConnectionLimit` until idle expiry. h2c is unaffected — HTTP/2 has no keep-alive negotiation, and stream multiplexing is the transport's defining behavior rather than a keep-alive optimization.
+**Keep-alive.** `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` (and the per-proxy `pool_enable_http_keep_alive` override) is honored literally for HTTP/1.1 on this transport: with it off, a carrier is neither taken from nor returned to the idle set, so every request gets its own freshly admitted connection. Publication also treats the effective setting as part of the reusable live-identity set: an H1 target whose keep-alive/reuse is off is omitted from the published live set so resident idle H1 carriers are retired synchronously before reconciliation returns — otherwise a full idle set (the physical cap, default `64`, binds well before the `256` idle ceiling) could keep every physical slot occupied while new traffic must dial fresh and receive `BackendConnectionLimit` until idle expiry. h2c is unaffected — HTTP/2 has no keep-alive negotiation, and stream multiplexing is the transport's defining behavior rather than a keep-alive optimization.
 
 **Metrics.** The pool exports physical connects, hits, misses, identity retirements, setup failures, gateway-side checkout refusals (path admission, per-target connection-bound refusals, and the shutdown latch), and gauges for idle HTTP/1.1 carriers, shared h2c carriers, and open physical connections. They appear on the JWT-authenticated runtime metrics endpoint under `connections.unix_backend_pool` (`GET /metrics/runtime`). Cardinality is fixed: one object for the whole pool, never a per-target label. Every field is one atomic read — the gauges are maintained at each insert/removal and at each connection-driver spawn/completion, so producing the snapshot never scans a map and the request path never pays for it.
 
@@ -4030,9 +4030,21 @@ label another plugin rewrote is reported as the metadata says. When every
 plugin in the chain is an audited non-observer (`spiffe_identity`,
 `mesh_authz`, and a `workload_metrics` instance without span exporters — the
 default sidecar chain with access logging disabled), the label keys are left
-out of both metadata maps, since nothing could read them. Every other `mesh.*`
-key (`mesh.request_protocol`, `mesh.connection_security_policy`,
-`mesh.direction`, trace and tag keys) is always written.
+out of both metadata maps, since nothing could read them. Label deferral
+touches only the label keys: every other key the plugin stamps keeps its
+existing stamping conditions. `mesh.request_protocol` and
+`mesh.connection_security_policy` are always written; `mesh.direction` is
+written only when the request or stream has an established mesh direction;
+the trace identity and propagation keys (`trace_id`, `span_id`,
+`parent_span_id`, `traceparent`, `tracestate`) only when trace context is
+enabled and the traffic is sampled or, for HTTP, carries a valid W3C
+`traceparent` or B3 context; the `trace_sampled` decision key follows the
+configured or inherited sampling decision and can be present (including as
+`false`) without them; and tag keys only as configured
+(custom and header-backed tags, metric tag overrides), with the derived CEL
+attribute keys stamped only when an active per-family override plan needs
+them. Optional keys can therefore be absent even on mesh traffic whose labels
+were projected eagerly.
 
 ### Service Graph
 
