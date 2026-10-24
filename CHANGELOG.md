@@ -467,8 +467,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escapes read as `\uFFFD` (escaped backslashes are left literal), and the
   JSON-path rules run on that reading with duplicate members preserved. Bodies
   the strict parse accepts are still read in place without a copy. A reading
-  that still does not parse remains outside `body_json_path` inspection; see
-  `docs/waf.md`.
+  that still does not parse now fails closed (next entry).
+- **WAF `body_json_path` rules fail closed on JSON they cannot parse.** A
+  body that neither the strict nor the lenient parse accepts — a number
+  beyond the `f64` range, nesting deeper than 128 levels, `NaN` / `Infinity`,
+  a comment, a trailing comma, an unquoted name or value, a leading form feed
+  or NBSP, the `)]}'` prefix, or text after the document, all of which some
+  backend parsers accept — used to switch every JSON-path rule off for that
+  request while the bytes were forwarded. Every applicable `body_json_path`
+  rule now records a hit, and its own action and anomaly score decide
+  exactly as for a match, when a part that cannot be read opens like a JSON
+  object or array (after the whitespace, comments and prefix lenient parsers
+  skip), or when no reading can be read completely and the `Content-Type`
+  declares JSON (`*/json`, `+json`) or the part opens like JSON once NULs
+  are skipped. Whitespace-separated documents (NDJSON, a leading scalar
+  followed by an object, a document followed by another) are now all
+  inspected; after a document that cannot be read, reading resumes at the
+  next token or container, and every document read around such a part is
+  inspected. All lenient readings of one body share a work budget of four
+  times its length plus 64 KiB, and a body that exhausts it fails closed. A
+  body that parses as a gRPC / gRPC-Web (binary or base64 text) / Connect
+  stream is read as its uncompressed `+json` messages, a compressed `+json`
+  message fails closed, and a binary stream's raw bytes (as sent and with NULs
+  removed) are judged like any other reading, so a genuine stream whose
+  envelope bytes assemble a refused JSON container (for example a 91-byte
+  message, whose length byte is `[`) fails closed and needs `conditions`
+  scoping. A UTF-16 / UTF-32 reading vouches for the raw bytes only when the
+  body starts with a byte-order mark or the whole `Content-Type` is exactly
+  `type/subtype; charset=<utf-16|utf-16le|utf-16be|utf-32|utf-32le|utf-32be>`;
+  otherwise (including a BOM-less signature, an extra or empty parameter, or
+  an alias label) the NUL-skipping reading a UTF-8 backend takes is read as
+  well, so undeclared, BOM-less wide JSON whose code units
+  hold a control byte, `"` or `\` (for example most of U+0100–U+1FFF) needs a
+  canonical `charset` or a byte-order mark. A body scanned only up to
+  `max_scan_bytes` is not judged this way, a declared or BOM-marked UTF-16 /
+  UTF-32 body is unaffected, and valid JSON bodies take the same single parse
+  as before.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,
