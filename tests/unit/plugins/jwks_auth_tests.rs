@@ -1464,9 +1464,26 @@ fn test_jwks_auth_skips_below_floor_rsa_key() {
     );
 }
 
+/// An RS256 token signed offline with `tests/fixtures/test_rsa_1024_private.pem`.
+///
+/// jsonwebtoken's `aws_lc_rs` backend (the only one compiled) refuses to sign
+/// with an RSA key below 2048 bits, so this token cannot be minted at test
+/// time. Header `{"typ":"JWT","alg":"RS256","kid":"test-key-1"}`, claims
+/// `{"sub":"idp-user","exp":4102444800}` (2100-01-01, so expiry is never the
+/// reason it is rejected). Regenerate with:
+///
+/// ```text
+/// b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+/// H=$(printf '{"typ":"JWT","alg":"RS256","kid":"test-key-1"}' | b64)
+/// P=$(printf '{"sub":"idp-user","exp":4102444800}' | b64)
+/// S=$(printf '%s.%s' "$H" "$P" | openssl dgst -sha256 \
+///     -sign tests/fixtures/test_rsa_1024_private.pem -binary | b64)
+/// echo "$H.$P.$S"
+/// ```
+const BELOW_FLOOR_RSA_1024_RS256_TOKEN: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6InRlc3Qta2V5LTEifQ.eyJzdWIiOiJpZHAtdXNlciIsImV4cCI6NDEwMjQ0NDgwMH0.BiW0G1rvS9I2Rt3-OWdh17UbdckwIpFF5Yj372NUA482F378MVP-nPPuVi060kOgVuogn_puVDsZAcYFP1CUFcp15od9BfmF-fOKfPbkdULAKMExPENx_wM4JWUP550iHX6uZKA5Qh_TuwhhYKUT5Ek4t_a0tDZBzRaU7ESPNNw";
+
 #[tokio::test]
 async fn test_jwks_auth_rejects_token_signed_with_below_floor_rsa_key() {
-    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_1024_public.pem");
 
     let (_server, jwks_uri) = start_jwks_server(public_key_pem).await;
@@ -1474,7 +1491,7 @@ async fn test_jwks_auth_rejects_token_signed_with_below_floor_rsa_key() {
     plugin.warmup_jwks().await;
 
     let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
-    let token = create_rs256_token(&json!({"sub": "idp-user"}), private_key_pem);
+    let token = BELOW_FLOOR_RSA_1024_RS256_TOKEN;
 
     let mut ctx = make_ctx();
     ctx.headers

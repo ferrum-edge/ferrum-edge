@@ -350,7 +350,7 @@
 //! reusable live-identity set: an H1 target whose keep-alive/reuse is off is
 //! omitted from the published live set so resident idle H1 carriers are
 //! retired synchronously before reconciliation returns — otherwise a full idle
-//! set (defaults: physical cap 64 and idle cap 64) would keep every physical
+//! set (the physical cap, default 64, binds well before the idle ceiling) would keep every physical
 //! slot occupied while new traffic must dial fresh and could receive
 //! `BackendConnectionLimit` until idle expiry. h2c is unaffected — HTTP/2 has
 //! no keep-alive negotiation and stream multiplexing is the transport's
@@ -371,9 +371,9 @@
 /// open PHYSICAL connections the Unix backend manager holds per admitted
 /// ingress target, including dedicated WebSockets.
 ///
-/// Matches the pool's own `max_idle_per_host` default, so the bound and the
-/// idle ceiling agree: every admitted carrier can be pooled, and a target
-/// cannot accumulate more physical connections than the idle set could hold.
+/// At or below the pool's `max_idle_per_host` default, so every admitted
+/// carrier can be pooled and this bound, not the idle ceiling, is what limits
+/// a target's physical connections.
 /// The bound is enforced by default rather than opt-in — an unbounded local
 /// transport is exactly the regression issue #3731 asks to prevent — and `0`
 /// is the explicit operator opt-out.
