@@ -527,7 +527,12 @@ a reading is refused by both the strict and the lenient parse and:
 body open: its raw bytes are refused (a NUL follows every ASCII character)
 while its transcoded reading parses. That vouching comes only from a wide
 reading the body declares — a UTF-16 / UTF-32 `charset` or a byte-order mark
-— because only then does a backend read the body as wide text. A wide
+— because only then does a backend read the body as wide text. The `charset`
+must be unambiguous: the parameter an RFC 9110 parser reads (quoted values
+unquoted, a `;` inside another parameter's quoted value left alone) and the
+one a parser that splits at every `;` reads must both exist and agree, so
+`profile=";charset=utf-16le"`, two `charset` parameters, or a malformed
+parameter list declare nothing. A wide
 reading found only by the BOM-less signature is not what a backend that
 defaults to UTF-8 reads: when the raw bytes are refused in a way a
 NUL-skipping parser (Json.NET) reads past, the raw bytes with every NUL

@@ -385,11 +385,27 @@ pub(super) fn decode_wide_charset_body_views(
 /// signature. Only then does a backend that honours the declaration read the
 /// body as wide text; without either, a backend defaults to UTF-8 and reads
 /// the raw bytes.
+///
+/// The declaration counts only when it is unambiguous: the `charset` an RFC
+/// 9110 parser reads ([`declared_charset`]) and the one a backend that splits
+/// at every `;` reads ([`charset_value`]) must both exist and agree. A
+/// `;charset=…` hidden in another parameter's quoted value, a malformed
+/// parameter list, or two `charset` parameters therefore declare nothing.
 pub(super) fn wide_charset_is_declared(body: &[u8], content_type: Option<&str>) -> bool {
-    charset_declares_utf16_family(content_type)
-        || charset_declares_utf32_family(content_type)
-        || utf32_bom(body).is_some()
+    utf32_bom(body).is_some()
         || utf16_bom(body).is_some()
+        || charset_is_unambiguously_wide(content_type)
+}
+
+fn charset_is_unambiguously_wide(content_type: Option<&str>) -> bool {
+    let (Some(strict), Some(lenient)) =
+        (declared_charset(content_type), charset_value(content_type))
+    else {
+        return false;
+    };
+    strict.eq_ignore_ascii_case(lenient)
+        && (utf16_label_endian(&strict, Some(Utf16Endian::Little)).is_some()
+            || utf32_label_endian(&strict, Some(Utf32Endian::Little)).is_some())
 }
 
 /// The wide width a BOM-less body's first four octets sign, if any: the
@@ -593,9 +609,12 @@ fn resolve_utf32_body(body: &[u8], content_type: Option<&str>) -> WideEndian<Utf
     }
 }
 
-/// First `charset` parameter of a Content-Type. Duplicate `charset=`
-/// parameters are treated as unspecified (return `None`) so a conflicting
-/// pair cannot pick an endianness.
+/// First `charset` parameter of a Content-Type, read the lenient way many
+/// backends read it: split at every `;`, quotes trimmed. Duplicate
+/// `charset=` parameters are treated as unspecified (return `None`) so a
+/// conflicting pair cannot pick an endianness. This decides which wide
+/// readings are decoded (coverage), not whether one is authoritative; see
+/// [`declared_charset`].
 fn charset_value(content_type: Option<&str>) -> Option<&str> {
     let content_type = content_type?;
     let mut declared = None;
@@ -614,6 +633,131 @@ fn charset_value(content_type: Option<&str>) -> Option<&str> {
     declared
 }
 
+/// The `charset` parameter of a Content-Type, parsed per RFC 9110 §8.3.1:
+/// `type/subtype *( OWS ";" OWS [ token "=" ( token / quoted-string ) ] )`.
+/// A quoted value is unquoted (and its `\` quoted-pairs resolved), so
+/// `charset="utf-16le"` is `utf-16le`, while a `;` or `charset=` inside
+/// another parameter's quoted value (`profile=";charset=utf-16le"`) is only
+/// that value's text.
+///
+/// Anything that does not parse is ambiguous — a backend may read it either
+/// way — and returns `None`, as do duplicate `charset` parameters, so a
+/// malformed or conflicting header can neither pick an endianness nor make a
+/// wide reading count as declared. Borrows unless the value holds a
+/// quoted-pair.
+fn declared_charset(content_type: Option<&str>) -> Option<Cow<'_, str>> {
+    let content_type = content_type?;
+    let bytes = content_type.as_bytes();
+    let mut at = memchr::memchr(b';', bytes)?;
+    if bytes[..at].contains(&b'"') {
+        return None;
+    }
+    let skip_ows = |mut at: usize| {
+        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        at
+    };
+    let mut declared: Option<Cow<'_, str>> = None;
+    // `at` is at a `;`.
+    while at < bytes.len() {
+        at = skip_ows(at + 1);
+        match bytes.get(at) {
+            None => break,
+            // An empty parameter: `;;` or `; ;`.
+            Some(b';') => continue,
+            Some(_) => {}
+        }
+        let name_start = at;
+        while bytes.get(at).copied().is_some_and(is_token_byte) {
+            at += 1;
+        }
+        let name = &content_type[name_start..at];
+        if name.is_empty() || bytes.get(at) != Some(&b'=') {
+            return None;
+        }
+        at += 1;
+        let value = if bytes.get(at) == Some(&b'"') {
+            let (value, end) = quoted_string(content_type, at)?;
+            at = end;
+            value
+        } else {
+            let value_start = at;
+            while bytes.get(at).copied().is_some_and(is_token_byte) {
+                at += 1;
+            }
+            if at == value_start {
+                return None;
+            }
+            Cow::Borrowed(&content_type[value_start..at])
+        };
+        at = skip_ows(at);
+        if !matches!(bytes.get(at), None | Some(b';')) {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("charset") {
+            if declared.is_some() {
+                return None;
+            }
+            declared = Some(value);
+        }
+    }
+    declared
+}
+
+/// RFC 9110 `tchar`.
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+/// The quoted-string starting at `bytes[open]` (a `"`): its value with
+/// quoted-pairs resolved, and the index just past its closing quote. `None`
+/// when it is unterminated or holds a control character.
+fn quoted_string(text: &str, open: usize) -> Option<(Cow<'_, str>, usize)> {
+    let bytes = text.as_bytes();
+    let start = open + 1;
+    let mut at = start;
+    let mut unescaped: Option<String> = None;
+    loop {
+        match *bytes.get(at)? {
+            b'"' => {
+                let value = match unescaped {
+                    Some(value) => Cow::Owned(value),
+                    None => Cow::Borrowed(&text[start..at]),
+                };
+                return Some((value, at + 1));
+            }
+            b'\\' => {
+                let escaped = *bytes.get(at + 1)?;
+                if escaped.is_ascii_control() && escaped != b'\t' {
+                    return None;
+                }
+                let value = unescaped.get_or_insert_with(|| text[start..at].to_string());
+                // Only ASCII is meaningful in a charset name; a non-ASCII
+                // quoted-pair makes the value ambiguous.
+                if !escaped.is_ascii() {
+                    return None;
+                }
+                value.push(char::from(escaped));
+                at += 2;
+            }
+            byte if byte.is_ascii_control() && byte != b'\t' => return None,
+            _ => {
+                if let Some(value) = unescaped.as_mut() {
+                    // `at` is a character boundary: every byte consumed so far
+                    // in this branch or the escape branch is ASCII or a whole
+                    // character.
+                    let ch = text[at..].chars().next()?;
+                    value.push(ch);
+                    at += ch.len_utf8();
+                } else {
+                    at += 1;
+                }
+            }
+        }
+    }
+}
+
 fn charset_is_unspecified_utf16(content_type: Option<&str>) -> bool {
     charset_value(content_type).is_some_and(|value| {
         value.eq_ignore_ascii_case("utf-16") || value.eq_ignore_ascii_case("utf16")
@@ -630,7 +774,12 @@ fn declared_utf16_endian(
     content_type: Option<&str>,
     bom_endian: Option<Utf16Endian>,
 ) -> Option<Utf16Endian> {
-    let value = charset_value(content_type)?;
+    utf16_label_endian(charset_value(content_type)?, bom_endian)
+}
+
+/// The UTF-16 endianness a charset label names; `bom_endian` for the bare,
+/// endian-unspecified `utf-16`; `None` for a label outside the family.
+fn utf16_label_endian(value: &str, bom_endian: Option<Utf16Endian>) -> Option<Utf16Endian> {
     // WHATWG encoding index: every UTF-16LE label, so `charset=unicode` or
     // `charset=ucs-2` cannot slip past the transcoder that `utf-16le` hits.
     if value.eq_ignore_ascii_case("utf-16le")
@@ -676,7 +825,11 @@ fn declared_utf32_endian(
     content_type: Option<&str>,
     bom_endian: Option<Utf32Endian>,
 ) -> Option<Utf32Endian> {
-    let value = charset_value(content_type)?;
+    utf32_label_endian(charset_value(content_type)?, bom_endian)
+}
+
+/// UTF-32 counterpart of [`utf16_label_endian`].
+fn utf32_label_endian(value: &str, bom_endian: Option<Utf32Endian>) -> Option<Utf32Endian> {
     if value.eq_ignore_ascii_case("utf-32le") || value.eq_ignore_ascii_case("utf32le") {
         Some(Utf32Endian::Little)
     } else if value.eq_ignore_ascii_case("utf-32be") || value.eq_ignore_ascii_case("utf32be") {

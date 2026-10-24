@@ -1814,17 +1814,36 @@ async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes()
         .await;
     }
     // Declared UTF-16LE, the backend reads the wide document: benign. So is
-    // declared UTF-16 text with non-ASCII content.
-    assert_json_path_verdicts(
-        &plugin,
+    // declared UTF-16 text with non-ASCII content. A quoted charset value is
+    // the same declaration.
+    for content_type in [
         "application/json; charset=utf-16le",
-        &[],
-        &[
-            forbidden,
-            encode_utf16(r#"[{"user":{"bio":"łódź • ordinary"}}]"#, false),
-        ],
-    )
-    .await;
+        "application/json; charset=\"utf-16le\"",
+        "application/json;charset=UTF-16LE",
+    ] {
+        assert_json_path_verdicts(
+            &plugin,
+            content_type,
+            &[],
+            &[
+                forbidden.clone(),
+                encode_utf16(r#"[{"user":{"bio":"łódź • ordinary"}}]"#, false),
+            ],
+        )
+        .await;
+    }
+    // A `charset` that only a parser splitting at every `;` sees — inside
+    // another parameter's quoted value — or a conflicting / malformed
+    // parameter list declares nothing: the NUL-skipping reading is read.
+    for content_type in [
+        "application/json; profile=\";charset=utf-16le\"",
+        "application/json; charset=utf-16le; profile=\";charset=utf-8\"",
+        "application/json; charset=utf-16le; charset=utf-16le",
+        "application/json; charset=utf-16le; broken",
+        "application/json; charset=\"utf-16le",
+    ] {
+        assert_json_path_verdicts(&plugin, content_type, &[forbidden.clone()], &[]).await;
+    }
 }
 
 #[tokio::test]
