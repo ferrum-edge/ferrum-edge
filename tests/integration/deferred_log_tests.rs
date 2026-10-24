@@ -342,11 +342,13 @@ async fn detached_terminal_delivery_matches_inline_delivery() {
     async fn deliver(detached: bool) -> (Vec<TransactionSummary>, Vec<Option<MeshRequestKey>>) {
         let (capturing, captured) = CapturingPlugin::new();
         let keys = Arc::new(Mutex::new(Vec::new()));
+        // Key capture runs first: each summary's plugins run in order, so a
+        // captured summary implies its key was already recorded.
         let plugins: Vec<Arc<dyn Plugin>> = vec![
-            Arc::new(capturing),
             Arc::new(MeshKeyCapture {
                 keys: Arc::clone(&keys),
             }),
+            Arc::new(capturing),
         ];
         let mut ctx = make_ctx();
         ctx.method = "HEAD".to_string();
@@ -395,6 +397,8 @@ async fn detached_terminal_delivery_matches_inline_delivery() {
     let (detached, detached_keys) = deliver(true).await;
     assert_eq!(inline.len(), 2, "inline: primary and mirror summaries");
     assert_eq!(detached.len(), 2, "detached: primary and mirror summaries");
+    assert_eq!(inline_keys.len(), 2, "inline: primary and mirror keys");
+    assert_eq!(detached_keys.len(), 2, "detached: primary and mirror keys");
     // The fixture really exercises each context-derived stamp.
     let primary = &inline[0];
     assert_eq!(
