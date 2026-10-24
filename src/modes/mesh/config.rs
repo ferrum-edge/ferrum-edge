@@ -4795,6 +4795,17 @@ pub enum NodeWaypointCaptureInventoryState {
     NotResolved,
 }
 
+impl NodeWaypointCaptureInventoryState {
+    /// Stable label (fingerprints, diagnostics).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unfiltered => "unfiltered",
+            Self::Resolved => "resolved",
+            Self::NotResolved => "not_resolved",
+        }
+    }
+}
+
 /// All mesh-specific configuration, kept in a single container so the
 /// core `GatewayConfig` struct stays lean for non-mesh deployments.
 /// Stored as `Option<Box<MeshConfig>>` on `GatewayConfig` — `None` when

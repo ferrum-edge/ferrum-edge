@@ -3154,15 +3154,11 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
         return crate::util::deserialization::from_json_value::<
             crate::util::json_object::JsonObject<MeshSlice>,
         >(value.clone())
-        // The per-pod evaluator unions the NodeWaypoint capture-destination
-        // AuthorizationPolicy inventory into its candidate set, so the scoped
-        // policy census must see it too.
-        .map(|object| {
-            let mut slice = object.0;
-            let mut policies = std::mem::take(&mut slice.mesh_policies);
-            policies.append(&mut slice.node_waypoint_capture_mesh_policies);
-            policies
-        })
+        // Ordinary policies only: like `mesh_authz`'s source-scope census, the
+        // NodeWaypoint capture-destination inventory governs connections TO
+        // its destinations, not the source-attributed UDP/DTLS sessions this
+        // census decides about.
+        .map(|object| object.0.mesh_policies)
         .unwrap_or_else(|_| {
             warn!(
                 field = "mesh_slice",

@@ -665,6 +665,43 @@ impl XdsAdsServer {
         identity_changed || waypoint_changed || scoping_changed
     }
 
+    /// Reconcile a request's `Node.metadata` and, when it changed OR this is
+    /// the stream's first node-identified request, rebuild the stream config
+    /// from the authoritative shared config under the node's scoping.
+    ///
+    /// Every stream starts from a placeholder filtered with default scoping
+    /// (the node is unknown before its first request). That placeholder is
+    /// narrowed without a NodeWaypoint capture inventory, and a narrowed config
+    /// can never yield one later. Another stream for the same node (a reconnect
+    /// racing the predecessor's teardown, or SotW beside Delta) finds the
+    /// node's metadata already recorded, so "metadata changed" alone would
+    /// leave this stream on the placeholder and serve an empty inventory until
+    /// the next full config update. Binding on the first identified request
+    /// closes that.
+    fn bind_stream_config_to_node(
+        &self,
+        stream_config: &mut XdsStreamConfig,
+        namespace: &str,
+        state_key: &str,
+        node: Option<&super::proto::Node>,
+        first_identified_request: bool,
+    ) {
+        let metadata_changed = node.is_some_and(|node| {
+            self.reconcile_node_metadata(
+                state_key,
+                crate::xds::carrier::decode_node_metadata(&node.metadata),
+            )
+        });
+        if metadata_changed || first_identified_request {
+            self.refresh_stream_config_from_current(
+                stream_config,
+                namespace,
+                self.waypoint_name_for_state_key(state_key),
+                self.node_scoping_for_state_key(state_key),
+            );
+        }
+    }
+
     fn reconcile_optional_string_state(
         values: &DashMap<String, String>,
         key: &str,
@@ -1625,6 +1662,9 @@ fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
                 &mesh.node_waypoint_capture_destinations,
                 &mesh.node_waypoint_capture_peer_authentications,
                 &mesh.node_waypoint_capture_mesh_policies,
+                // Provenance too: a narrowed placeholder and a resolved-empty
+                // inventory have identical vectors but build different slices.
+                mesh.node_waypoint_capture_inventory_state.as_str(),
             ))
         })
         .transpose()
@@ -1852,6 +1892,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &current_node_id,
                             )
                         });
+                        let first_identified_request = node_id.is_none();
                         if node_id.is_none() {
                             if let Err(rejection) =
                                 stream_guard.set_node_state_key(&current_state_key)
@@ -1876,19 +1917,13 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         // fingerprint) only, so any identity CHANGE must drop the
                         // cached slice. ACKs carry `node: None` and don't reach
                         // here, preserving the identity mid-stream.
-                        if let Some(node) = request.node.as_ref()
-                            && server.reconcile_node_metadata(
-                                &current_state_key,
-                                crate::xds::carrier::decode_node_metadata(&node.metadata),
-                            )
-                        {
-                            server.refresh_stream_config_from_current(
-                                &mut stream_config,
-                                &stream_namespace,
-                                server.waypoint_name_for_state_key(&current_state_key),
-                                server.node_scoping_for_state_key(&current_state_key),
-                            );
-                        }
+                        server.bind_stream_config_to_node(
+                            &mut stream_config,
+                            &stream_namespace,
+                            &current_state_key,
+                            request.node.as_ref(),
+                            first_identified_request,
+                        );
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
                             warn_xds_request_rejected(
@@ -2238,6 +2273,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                 &current_node_id,
                             )
                         });
+                        let first_identified_request = node_id.is_none();
                         if node_id.is_none() {
                             if let Err(rejection) =
                                 stream_guard.set_node_state_key(&current_state_key)
@@ -2262,19 +2298,13 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                         // fingerprint) only, so any identity CHANGE must drop the
                         // cached slice. ACKs carry `node: None` and don't reach
                         // here, preserving the identity mid-stream.
-                        if let Some(node) = request.node.as_ref()
-                            && server.reconcile_node_metadata(
-                                &current_state_key,
-                                crate::xds::carrier::decode_node_metadata(&node.metadata),
-                            )
-                        {
-                            server.refresh_stream_config_from_current(
-                                &mut stream_config,
-                                &stream_namespace,
-                                server.waypoint_name_for_state_key(&current_state_key),
-                                server.node_scoping_for_state_key(&current_state_key),
-                            );
-                        }
+                        server.bind_stream_config_to_node(
+                            &mut stream_config,
+                            &stream_namespace,
+                            &current_state_key,
+                            request.node.as_ref(),
+                            first_identified_request,
+                        );
 
                         if let Err(status) = ensure_supported_type_url(&request.type_url) {
                             warn_xds_request_rejected(
@@ -3365,6 +3395,132 @@ mod tests {
                 .iter()
                 .any(|policy| policy.name == "payments-deny"),
             "the authorized destination keeps its own DENY through the ADS prefilter"
+        );
+    }
+
+    /// A second stream for a node whose metadata is already recorded (a
+    /// reconnect racing the predecessor's teardown, or SotW beside Delta) must
+    /// still leave the default-scoping placeholder: its first identified
+    /// request rebuilds the stream config from the authoritative config under
+    /// the node's capture scoping, so the inventory is `Resolved`.
+    #[test]
+    fn a_stream_for_an_already_known_node_resolves_its_capture_inventory() {
+        use crate::modes::mesh::config::{NodeWaypointCaptureInventoryState, NodeWaypointEndpoint};
+
+        let this_waypoint = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-a";
+        let ledger = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger")
+                .expect("spiffe"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                namespace: Some("payments".to_string()),
+            },
+            service_name: "ledger".to_string(),
+            service_namespace: None,
+            addresses: vec!["10.244.1.7".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "payments".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("ledger".to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(this_waypoint).expect("spiffe"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![ledger],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let server = test_server(config.clone()).with_scope(CpScope::All);
+        let node = super::super::proto::Node {
+            id: "node-a".to_string(),
+            cluster: "ferrum".to_string(),
+            metadata: crate::xds::carrier::encode_node_metadata_with_scoping(
+                Some(this_waypoint),
+                None,
+                XdsNodeScoping {
+                    ambient_udp_source_scoping: false,
+                    node_waypoint_capture_scoping: true,
+                },
+            ),
+        };
+        let placeholder = || {
+            XdsStreamConfig::new(server.filter_config_for_xds_request(
+                &config,
+                "ferrum",
+                None,
+                XdsNodeScoping::default(),
+            ))
+        };
+        let state = |stream: &XdsStreamConfig| {
+            let mesh = stream.config.mesh.as_deref().expect("mesh");
+            (
+                mesh.node_waypoint_capture_inventory_state,
+                mesh.node_waypoint_capture_destinations.len(),
+            )
+        };
+
+        // First stream: metadata is new.
+        let mut first = placeholder();
+        assert_eq!(
+            state(&first).0,
+            NodeWaypointCaptureInventoryState::NotResolved,
+            "precondition: the placeholder is narrowed without an inventory"
+        );
+        server.bind_stream_config_to_node(&mut first, "ferrum", "node-a", Some(&node), true);
+        assert_eq!(
+            state(&first),
+            (NodeWaypointCaptureInventoryState::Resolved, 1)
+        );
+
+        // Second stream: identical metadata is already recorded, so nothing
+        // "changed" — the first identified request must still bind.
+        let mut second = placeholder();
+        server.bind_stream_config_to_node(&mut second, "ferrum", "node-a", Some(&node), true);
+        assert_eq!(
+            state(&second),
+            (NodeWaypointCaptureInventoryState::Resolved, 1)
+        );
+
+        // A later request with unchanged metadata does not refilter.
+        let fingerprint = second.fingerprint.clone();
+        server.bind_stream_config_to_node(&mut second, "ferrum", "node-a", Some(&node), false);
+        assert_eq!(second.fingerprint, fingerprint);
+    }
+
+    #[test]
+    fn xds_config_fingerprint_distinguishes_capture_inventory_provenance() {
+        use crate::modes::mesh::config::NodeWaypointCaptureInventoryState;
+
+        let mut placeholder = gateway_config_with_service(true, 0);
+        placeholder
+            .mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_capture_inventory_state = NodeWaypointCaptureInventoryState::NotResolved;
+        let mut resolved = placeholder.clone();
+        resolved
+            .mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_capture_inventory_state = NodeWaypointCaptureInventoryState::Resolved;
+        assert_ne!(
+            config_fingerprint(&placeholder),
+            config_fingerprint(&resolved)
         );
     }
 

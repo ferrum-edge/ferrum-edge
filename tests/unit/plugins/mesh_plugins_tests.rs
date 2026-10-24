@@ -7171,39 +7171,91 @@ async fn mesh_authz_node_waypoint_enforces_capture_destination_allow_floor() {
 }
 
 #[tokio::test]
-async fn mesh_authz_node_waypoint_capture_policies_count_toward_scope_missing() {
-    // A scoped destination policy reachable only through the capture inventory
-    // still makes the policy set scoped, so a connection with no per-pod scope
-    // fails closed instead of evaluating mesh-wide-only.
-    let plugin = MeshAuthz::new(&json!({
+async fn mesh_authz_node_waypoint_source_scope_census_ignores_capture_destination_policies() {
+    // A stream without a per-pod scope is SOURCE-attributed (UDP/DTLS sessions,
+    // outbound capture): the transparent capture relay always stamps its
+    // destination scope. Capture-inventory policies select capture
+    // DESTINATIONS, so they must not turn an unattributed UDP/DTLS session into
+    // a `scope_missing` refusal no supplied scope could satisfy — the session
+    // is judged mesh-wide-only exactly as before the inventory existed. An
+    // ordinary scoped policy keeps the fail-closed refusal.
+    let capture_only = MeshAuthz::new(&json!({
         "mesh_slice": MeshSlice {
             namespace: "ferrum".to_string(),
             node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let with_ordinary_scoped = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            mesh_policies: vec![policy_with_scope(
+                "ferrum-deny",
+                PolicyScope::Namespace {
+                    namespace: "ferrum".to_string(),
+                },
+                PolicyAction::Deny,
+            )],
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            node_waypoint_capture_mesh_policies_resolved: true,
             ..MeshSlice::default()
         },
         "per_pod_policy_scoping": true,
     }))
     .expect("plugin config");
 
-    let mut ctx = stream_context();
-    let result = plugin.on_stream_connect(&mut ctx).await;
-    assert!(
-        matches!(
-            result,
-            PluginResult::Reject {
-                status_code: 403,
-                ..
-            }
-        ),
-        "missing scope with a capture-inventory scoped policy must fail closed, got {result:?}"
-    );
-    assert_eq!(
-        ctx.metadata
-            .as_ref()
-            .and_then(|m| m.get("mesh_authz.deny_policy"))
-            .map(String::as_str),
-        Some("scope_missing")
-    );
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls, BackendScheme::Tcp] {
+        let session = || {
+            StreamConnectionContext::new(
+                "10.244.1.7".to_string(),
+                "10.244.1.7".to_string(),
+                "__mesh-nw-udp-echo".to_string(),
+                None,
+                5353,
+                scheme,
+                Arc::new(ConsumerIndex::new(&[])),
+            )
+        };
+
+        let mut ctx = session();
+        let result = capture_only.on_stream_connect(&mut ctx).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{scheme:?}: capture-inventory policies must not refuse an unattributed session, \
+             got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .as_ref()
+                .and_then(|m| m.get("mesh_authz.scope_missing"))
+                .map(String::as_str),
+            Some("true"),
+            "{scheme:?}: the missing scope is still recorded"
+        );
+
+        let mut ctx = session();
+        let result = with_ordinary_scoped.on_stream_connect(&mut ctx).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "{scheme:?}: an ordinary scoped policy keeps the fail-closed refusal, got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .as_ref()
+                .and_then(|m| m.get("mesh_authz.deny_policy"))
+                .map(String::as_str),
+            Some("scope_missing")
+        );
+    }
 }
 
 #[tokio::test]
@@ -7434,13 +7486,19 @@ async fn mesh_authz_node_waypoint_inbound_relay_capture_scope_fails_closed() {
     let result = plugin.authorize(&mut ctx).await;
     refuse(result, &ctx, "unhonored source assertion");
 
-    // Only the synthesized inbound relay may use the capture inventory.
+    // Only the synthesized inbound relay uses the capture inventory: any other
+    // proxy keeps the ordinary index and the ordinary census, so the capture
+    // destination's scope is never stamped for it.
     let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
     let mut proxy = (**ctx.matched_proxy.as_ref().expect("relay proxy")).clone();
     proxy.id = "some-operator-route".to_string();
     ctx.matched_proxy = Some(Arc::new(proxy));
-    let result = plugin.authorize(&mut ctx).await;
-    refuse(result, &ctx, "non-relay proxy");
+    let _ = plugin.authorize(&mut ctx).await;
+    assert!(
+        !ctx.metadata
+            .contains_key("mesh_authz.node_waypoint_authorized_backend"),
+        "a non-relay proxy must not be bound to a capture destination's scope"
+    );
 
     // Two records claiming the address with divergent scopes are ambiguous.
     let ambiguous = capture_relay_plugin(
