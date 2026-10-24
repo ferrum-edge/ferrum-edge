@@ -687,6 +687,36 @@ def _input_name(name: str) -> str:
     return name.replace(" ", "_").upper()
 
 
+# A repository action reference in its one canonical spelling: single `/`
+# separators, no empty, `.` or `..` path segments, no backslash or whitespace,
+# exactly one `@`.
+CANONICAL_REPOSITORY_USES = re.compile(
+    r"(?P<name>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)@[A-Za-z0-9_./-]+"
+)
+
+
+def _action_repository(uses: str) -> str | None:
+    """The lower-cased `owner/repo` a step's `uses` runs, as the runner resolves it.
+
+    The runner treats `./` and `.\\` values as local actions and `docker://`
+    values as images (None here). Anything else is a repository reference,
+    which it splits on both `/` and `\\` and drops empty segments, so
+    `actions//checkout@x` and `actions\\checkout@x` both run actions/checkout.
+    Only the canonical spelling is classified; every other spelling returns ""
+    and is refused, so no separator trick can hide a checkout (#6688).
+    """
+
+    if uses.startswith(("./", ".\\", "docker://")):
+        return None
+    match = CANONICAL_REPOSITORY_USES.fullmatch(uses)
+    if match is None:
+        return ""
+    segments = match.group("name").split("/")
+    if any(segment in {".", ".."} for segment in segments):
+        return ""
+    return "/".join(segments[:2]).lower()
+
+
 def _lookup(node: "yaml.MappingNode", key: str, located: str, errors: list[str]) -> "yaml.Node | None":
     """The value of `key` in a mapping; any other spelling of it fails closed."""
 
@@ -853,9 +883,21 @@ def parsed_checkout_errors(
                 errors.append(f"{located} each step must be a mapping")
                 continue
             uses = _lookup(step, "uses", located, errors)
-            if not isinstance(uses, yaml.ScalarNode) or "actions/checkout" not in uses.value.lower():
-                if uses is not None and not isinstance(uses, yaml.ScalarNode):
-                    errors.append(f"{located} `uses` must be a scalar")
+            if uses is None:
+                continue
+            if not isinstance(uses, yaml.ScalarNode):
+                errors.append(f"{located} `uses` must be a scalar")
+                continue
+            repository = _action_repository(uses.value)
+            if repository is None:
+                continue  # a local `./` action or a `docker://` image
+            if repository == "":
+                errors.append(
+                    f"{located} `uses` must be a canonical `owner/repo[/path]@ref` with "
+                    f"single `/` separators (found {uses.value!r})"
+                )
+                continue
+            if repository != "actions/checkout":
                 continue
             if PINNED_CHECKOUT.fullmatch(uses.value) is None:
                 errors.append(
@@ -1375,6 +1417,42 @@ def run_self_test() -> list[str]:
         (
             "comment-like suffix on the value",
             pr + f"      - uses: {pin}\n        with:\n          persist-credentials: false#x\n" + tail,
+        ),
+        (
+            "composite doubled separator checkout",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: actions//checkout@{sha}\n",
+        ),
+        (
+            "doubled separator checkout",
+            pr + f"      - uses: actions//checkout@{sha}\n" + tail,
+        ),
+        (
+            "doubled separator checkout true",
+            scheduled.replace("schedule:\n    - cron: '0 0 * * *'", "pull_request:")
+            + f"      - uses: actions//checkout@{sha}\n" + persist_true + tail,
+        ),
+        (
+            "composite backslash separator checkout",
+            "name: a\nruns:\n  using: composite\n  steps:\n"
+            f"    - uses: actions\\checkout@{sha}\n",
+        ),
+        (
+            "backslash separator checkout",
+            pr + f"      - uses: 'actions\\checkout@{sha}'\n" + tail,
+        ),
+        (
+            "leading separator checkout",
+            pr + f"      - uses: /actions/checkout@{sha}\n" + tail,
+        ),
+        (
+            "dot segment checkout",
+            pr + f"      - uses: actions/./checkout@{sha}\n" + tail,
+        ),
+        (
+            "checkout subpath",
+            pr + f"      - uses: actions/checkout/sub@{sha}\n        with:\n"
+            "          persist-credentials: false\n" + tail,
         ),
         (
             "composite block scalar impersonation",

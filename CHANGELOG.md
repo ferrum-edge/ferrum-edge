@@ -93,7 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `persist-credentials` with the text `false`. It refuses anchors, aliases,
   tags, merge and duplicate keys, case variants of the input, an `env:` that
   presets `INPUT_PERSIST-CREDENTIALS`, and line-break characters that YAML 1.1
-  and 1.2 readers split differently. The line-based reader remains as
+  and 1.2 readers split differently. A repository `uses` must be spelled
+  canonically (`owner/repo[/path]@ref`, single `/`), so separator variants
+  such as `actions//checkout` or `actions\checkout`, which the runner still
+  resolves to actions/checkout, cannot skip the check. The line-based reader remains as
   additional spelling policy.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
