@@ -1710,6 +1710,12 @@ fn prepare_normalized_gateway_config_for_mesh(
         mesh.node_waypoint_capture_peer_authentications = mesh_slice
             .node_waypoint_capture_peer_authentications
             .clone();
+        // The destination AuthorizationPolicy inventory rides along under the
+        // same unconditional-assignment rule, so a withdrawn destination's
+        // policies leave with it. `mesh_authz` reads the slice copy; this
+        // back-projection keeps the prepared config's capture view complete.
+        mesh.node_waypoint_capture_mesh_policies =
+            mesh_slice.node_waypoint_capture_mesh_policies.clone();
         // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
         // SEPARATE from the egress-narrowed `services` — never folded in, per
         // the egress-scope security rule) so the router's inbound per-port
@@ -3130,7 +3136,15 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
         return crate::util::deserialization::from_json_value::<
             crate::util::json_object::JsonObject<MeshSlice>,
         >(value.clone())
-        .map(|object| object.0.mesh_policies)
+        // The per-pod evaluator unions the NodeWaypoint capture-destination
+        // AuthorizationPolicy inventory into its candidate set, so the scoped
+        // policy census must see it too.
+        .map(|object| {
+            let mut slice = object.0;
+            let mut policies = std::mem::take(&mut slice.mesh_policies);
+            policies.append(&mut slice.node_waypoint_capture_mesh_policies);
+            policies
+        })
         .unwrap_or_else(|_| {
             warn!(
                 field = "mesh_slice",
@@ -30863,6 +30877,7 @@ mod tests {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,

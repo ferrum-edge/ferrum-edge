@@ -164,10 +164,11 @@ message MeshSubscribeRequest {
   // least-privilege capture inventory — the workloads whose trusted
   // `Workload.node_waypoint.spiffe_id` names THIS NodeWaypoint (subject to CP
   // scope and the bearer `ns` claim) plus the PeerAuthentication candidates
-  // applicable to them — onto the slice's
+  // and AuthorizationPolicy entries applicable to them — onto the slice's
   // `node_waypoint_capture_destinations` / `node_waypoint_capture_peer_
-  // authentications` fields. It does NOT widen `workloads` / `services` /
-  // `peer_authentications`. Deliberately separate from
+  // authentications` / `node_waypoint_capture_mesh_policies` fields. It does
+  // NOT widen `workloads` / `services` / `peer_authentications` /
+  // `mesh_policies`. Deliberately separate from
   // `ambient_udp_source_scoping`: NodeWaypoint UDP stays mesh-wide-only.
   // Absent/false means the subscriber receives no inventory and its capture
   // path resolves nothing (fail closed).

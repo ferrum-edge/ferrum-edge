@@ -4887,6 +4887,15 @@ pub struct MeshConfig {
     /// reason.
     #[serde(skip)]
     pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
+    /// Runtime-only AuthorizationPolicy (`MeshPolicy`) entries applicable to
+    /// [`Self::node_waypoint_capture_destinations`]. CP-side it is resolved
+    /// alongside that inventory, BEFORE `mesh_policies` is narrowed to the
+    /// subscription namespace, so a captured pod's own-namespace policy still
+    /// reaches its NodeWaypoint; DP-side it is back-projected from
+    /// `MeshSlice.node_waypoint_capture_mesh_policies`. Never folded into
+    /// `mesh_policies`. `serde(skip)` for the same reason as the fields above.
+    #[serde(skip)]
+    pub node_waypoint_capture_mesh_policies: Vec<MeshPolicy>,
     /// Runtime-only back-projection of the slice's narrowed **local-inbound**
     /// service view (`MeshSlice.local_inbound_services`), set by mesh
     /// preparation. `Some` exactly when Sidecar narrowing resolved the local
@@ -6334,6 +6343,7 @@ impl Default for MeshConfig {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
             sidecar_ingress_declared: false,

@@ -79,8 +79,8 @@ use crate::config::gateway_trust::GatewayTrustPublication;
 use crate::config::types::{GatewayConfig, default_namespace};
 use crate::k8s_controller::CpPublicationGate;
 use crate::modes::mesh::config::{
-    MeshConfig, MeshSidecar, MeshSidecarEgress, NodeWaypointAssertor, PeerAuthentication,
-    PolicyScope, SidecarHostPattern, Workload, WorkloadSelector,
+    MeshConfig, MeshPolicy, MeshSidecar, MeshSidecarEgress, NodeWaypointAssertor,
+    PeerAuthentication, PolicyScope, SidecarHostPattern, Workload, WorkloadSelector,
     service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::config_consumer::common::MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE;
@@ -1207,6 +1207,26 @@ impl CpGrpcServer {
                     );
                 mesh.node_waypoint_capture_peer_authentications = capture_peer_authentications;
             }
+            // Destination AuthorizationPolicy inventory, resolved for the same
+            // reason and at the same point: the `mesh_policies` retain below
+            // keeps only policies applicable to the SUBSCRIPTION namespace, so
+            // a captured `payments` pod's own DENY/ALLOW would be gone, and the
+            // capture relay — which stamps that pod's exact policy scope —
+            // would authorize against an incomplete set. Owner-namespace
+            // bound: only policies owned by a captured destination's namespace
+            // (already CP-scope/bearer authorized above) or by the root
+            // namespace can ride, so no unauthorized namespace's policy leaks.
+            // The slice builder then narrows it to the exact per-destination
+            // set the scoped evaluator applies.
+            if mesh.node_waypoint_capture_mesh_policies.is_empty() {
+                let capture_mesh_policies =
+                    Self::node_waypoint_capture_mesh_policies_for_destinations(
+                        &mesh.mesh_policies,
+                        &mesh.node_waypoint_capture_destinations,
+                        &istio_root_namespace,
+                    );
+                mesh.node_waypoint_capture_mesh_policies = capture_mesh_policies;
+            }
         }
         mesh.workloads.retain(|workload| {
             visible_namespaces.contains(&workload.namespace)
@@ -1590,6 +1610,42 @@ impl CpGrpcServer {
             .filter(|policy| {
                 destination_namespaces.iter().any(|namespace| {
                     Self::peer_auth_can_apply_to_namespace(policy, namespace, root_namespace)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// AuthorizationPolicy candidates the CP may hand a NodeWaypoint for its
+    /// capture destinations.
+    ///
+    /// Namespace-level applicability with the owner-namespace bound of
+    /// [`Self::policy_scope_can_apply_to_namespace`] (owner = destination
+    /// namespace or the root namespace), mirroring the PeerAuthentication
+    /// candidate hop above. The exact per-workload narrowing happens in the
+    /// slice builder, before anything leaves the CP.
+    fn node_waypoint_capture_mesh_policies_for_destinations(
+        mesh_policies: &[MeshPolicy],
+        destinations: &[Workload],
+        root_namespace: &str,
+    ) -> Vec<MeshPolicy> {
+        if destinations.is_empty() {
+            return Vec::new();
+        }
+        let destination_namespaces: BTreeSet<&str> = destinations
+            .iter()
+            .map(|workload| workload.namespace.as_str())
+            .collect();
+        mesh_policies
+            .iter()
+            .filter(|policy| {
+                destination_namespaces.iter().any(|namespace| {
+                    Self::policy_scope_can_apply_to_namespace(
+                        &policy.namespace,
+                        &policy.scope,
+                        namespace,
+                        root_namespace,
+                    )
                 })
             })
             .cloned()
@@ -4511,6 +4567,211 @@ mod tests {
                     .node_waypoint_capture_peer_authentications
                     .is_empty(),
             "a non-NodeWaypoint subscription must not receive the capture inventory"
+        );
+    }
+
+    /// The CP must hand a NodeWaypoint the AuthorizationPolicy of every
+    /// destination it captures for — resolved BEFORE `mesh_policies` is
+    /// narrowed to the subscription namespace — on the dedicated capture field
+    /// only, bounded by the same CP scope / bearer authorization as the
+    /// destinations themselves, and narrowed by the slice builder to exactly the
+    /// policies that select a captured destination.
+    #[test]
+    fn mesh_request_filter_carries_capture_destination_authorization_policies() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            MeshPolicy, MeshRule, NodeWaypointEndpoint, PolicyAction, Workload,
+        };
+        use crate::modes::mesh::slice::MeshSlice;
+
+        let this_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-a";
+        let other_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-b";
+        let workload = |namespace: &str, name: &str, waypoint: &str, address: &str| Workload {
+            spiffe_id: SpiffeId::new(format!("spiffe://test.local/ns/{namespace}/sa/{name}"))
+                .expect("fixture SPIFFE ID should be valid"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), name.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+            service_name: name.to_string(),
+            service_namespace: None,
+            addresses: vec![address.to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("test.local")
+                .expect("fixture trust domain should be valid"),
+            namespace: namespace.to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some(name.to_string()),
+            pod_uid: None,
+            node_waypoint: Some(NodeWaypointEndpoint {
+                address: "10.0.0.1".to_string(),
+                hbone_port: 15008,
+                spiffe_id: SpiffeId::new(waypoint)
+                    .expect("fixture waypoint SPIFFE ID should be valid"),
+                node_name: None,
+                node_uid: None,
+                network: None,
+                cluster: None,
+            }),
+            remote_provenance: false,
+        };
+        let policy = |namespace: &str, name: &str, scope: PolicyScope| MeshPolicy {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            scope,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: Vec::new(),
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action: PolicyAction::Deny,
+            }],
+        };
+        let namespace_scope = |namespace: &str| PolicyScope::Namespace {
+            namespace: namespace.to_string(),
+        };
+        let app_scope = |namespace: &str, app: &str| PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), app.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                workloads: vec![
+                    // Enrolled on THIS NodeWaypoint, in another namespace.
+                    workload("payments", "ledger", this_waypoint, "10.244.1.7"),
+                    // Enrolled on ANOTHER node's NodeWaypoint.
+                    workload("payments", "reports", other_waypoint, "10.244.1.8"),
+                    // Enrolled on THIS NodeWaypoint, outside the bearer claim.
+                    workload("secrets", "vault", this_waypoint, "10.244.1.9"),
+                ],
+                mesh_policies: vec![
+                    policy("payments", "payments-deny", namespace_scope("payments")),
+                    policy("payments", "ledger-deny", app_scope("payments", "ledger")),
+                    policy("payments", "reports-deny", app_scope("payments", "reports")),
+                    policy("secrets", "secrets-deny", namespace_scope("secrets")),
+                    policy("inventory", "inventory-deny", namespace_scope("inventory")),
+                    // A non-root owner cannot reach another namespace even with
+                    // a mesh-wide scope.
+                    policy("inventory", "inventory-mesh-wide", PolicyScope::MeshWide),
+                    policy("istio-system", "root-deny", PolicyScope::MeshWide),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let request = MeshSliceRequest {
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: Some(this_waypoint.to_string()),
+            node_waypoint_capture_scoping: true,
+            ..MeshSliceRequest::default()
+        };
+        let names = |policies: &[MeshPolicy]| {
+            let mut names: Vec<String> =
+                policies.iter().map(|policy| policy.name.clone()).collect();
+            names.sort_unstable();
+            names
+        };
+
+        let filtered =
+            CpGrpcServer::filter_config_to_mesh_request_for_scope(&config, &request, &CpScope::All);
+        let mesh = filtered.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(
+            names(mesh.mesh_policies.as_slice()),
+            vec!["root-deny".to_string()],
+            "the ordinary AuthorizationPolicy view must stay narrowed to `ferrum` + root"
+        );
+        assert_eq!(
+            names(mesh.node_waypoint_capture_mesh_policies.as_slice()),
+            vec![
+                "ledger-deny".to_string(),
+                "payments-deny".to_string(),
+                "reports-deny".to_string(),
+                "root-deny".to_string(),
+                "secrets-deny".to_string(),
+            ],
+            "the CP hop is namespace-level: owner = a captured destination's namespace or root"
+        );
+
+        let slice = MeshSlice::from_gateway_config(&filtered, request.clone());
+        assert_eq!(
+            names(slice.node_waypoint_capture_mesh_policies.as_slice()),
+            vec![
+                "ledger-deny".to_string(),
+                "payments-deny".to_string(),
+                "root-deny".to_string(),
+                "secrets-deny".to_string(),
+            ],
+            "the slice carries exactly the policies that select a captured destination; a \
+             selector for a pod on another node never leaves the CP"
+        );
+        assert!(
+            slice
+                .mesh_policies
+                .iter()
+                .all(|policy| policy.namespace != "payments" && policy.namespace != "secrets"),
+            "the capture inventory must not widen the slice's own AuthorizationPolicy view"
+        );
+
+        // `Single`-scope CP: no cross-namespace destination, so no foreign
+        // policy either.
+        let single = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &request,
+            &CpScope::Single("ferrum".to_string()),
+        );
+        let single_mesh = single.mesh.as_ref().expect("mesh should remain");
+        assert!(single_mesh.node_waypoint_capture_mesh_policies.is_empty());
+
+        // Explicit bearer `ns` claim: `secrets` is not authorized, so neither
+        // its destination nor its policy rides.
+        let bearer = CpGrpcServer::filter_config_to_mesh_request_for_scope_and_bearer(
+            &config,
+            &request,
+            &CpScope::Set(HashSet::from([
+                "ferrum".to_string(),
+                "payments".to_string(),
+                "secrets".to_string(),
+            ])),
+            Some(&HashSet::from(["payments".to_string()])),
+        );
+        let bearer_mesh = bearer.mesh.as_ref().expect("mesh should remain");
+        assert!(
+            bearer_mesh
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .all(|policy| policy.namespace != "secrets"),
+            "an unauthorized namespace's policy must not ride the capture inventory"
+        );
+        assert!(
+            bearer_mesh
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "payments-deny")
+        );
+
+        // Without the flag the CP resolves no inventory at all.
+        let mut unflagged_request = request;
+        unflagged_request.node_waypoint_capture_scoping = false;
+        let unflagged = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &config,
+            &unflagged_request,
+            &CpScope::All,
+        );
+        assert!(
+            unflagged
+                .mesh
+                .as_ref()
+                .expect("mesh should remain")
+                .node_waypoint_capture_mesh_policies
+                .is_empty()
         );
     }
 

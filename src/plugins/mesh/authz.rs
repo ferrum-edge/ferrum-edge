@@ -1804,10 +1804,24 @@ impl MeshAuthz {
             slice.labels_ambiguous = false;
         }
 
+        let per_pod_policy_scoping = parse_scoping_flag(config, "per_pod_policy_scoping")?;
+        // NodeWaypoint: a captured connection is authorized against the
+        // DESTINATION pod's exact policy scope, and that pod may live in a
+        // namespace other than this waypoint's subscription namespace. Its own
+        // AuthorizationPolicy therefore cannot be in the namespace-narrowed
+        // `mesh_policies`; the slice carries it on the dedicated capture
+        // inventory instead. Union the two BEFORE any validation, census, or
+        // index below is computed, so the capture policies are validated, count
+        // toward `has_scoped_policies` (a missing scope then fails closed), and
+        // contribute their `when:` keys and CUSTOM providers. The per-request
+        // `policy_applies_to_pod` filter keeps each one confined to the scopes
+        // it actually selects. Outside per-pod scoping the inventory is unused.
+        if per_pod_policy_scoping {
+            merge_node_waypoint_capture_mesh_policies(&mut slice);
+        }
+
         validate_policy_ip_inputs(&slice.mesh_policies)?;
         validate_waypoint_target_ref_evidence(&slice)?;
-
-        let per_pod_policy_scoping = parse_scoping_flag(config, "per_pod_policy_scoping")?;
         let ambient_udp_source_scoping = parse_scoping_flag(config, "ambient_udp_source_scoping")?;
         let mut relay_policy_superset = if ambient_udp_source_scoping {
             slice.mesh_policies.clone()
@@ -2613,6 +2627,25 @@ impl MeshAuthz {
 /// — an unscopable audit-only selector policy is skipped, not rejected.
 fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
     policy.rules.iter().any(|rule| rule.action.is_enforcing())
+}
+
+/// Union the NodeWaypoint capture-destination AuthorizationPolicy inventory
+/// into the per-pod candidate set (cold path, once per plugin generation).
+///
+/// The inventory already holds only policies applicable to a captured
+/// destination, and per-pod evaluation re-checks every candidate against the
+/// connection's own scope, so a union is exactly the destination's complete
+/// policy set without letting a foreign policy reach any other pod. A policy
+/// already present in `mesh_policies` (typically a root-namespace mesh-wide
+/// one, or a same-namespace destination's) is not duplicated. The inventory
+/// field is drained so nothing downstream evaluates it a second time.
+fn merge_node_waypoint_capture_mesh_policies(slice: &mut MeshSlice) {
+    let capture_policies = std::mem::take(&mut slice.node_waypoint_capture_mesh_policies);
+    for policy in capture_policies {
+        if !slice.mesh_policies.contains(&policy) {
+            slice.mesh_policies.push(policy);
+        }
+    }
 }
 
 /// Refuse a waypoint slice that carries an ENFORCING GatewayClass-targeted

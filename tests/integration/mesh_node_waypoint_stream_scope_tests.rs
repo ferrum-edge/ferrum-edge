@@ -435,8 +435,8 @@ mod node_waypoint_capture_inventory {
     use ferrum_edge::identity::SpiffeId;
     use ferrum_edge::identity::spiffe::TrustDomain;
     use ferrum_edge::modes::mesh::config::{
-        AppProtocol, MeshConfig, MtlsMode, NodeWaypointEndpoint, PeerAuthentication, PolicyScope,
-        Workload, WorkloadPort, WorkloadSelector,
+        AppProtocol, MeshConfig, MeshPolicy, MeshRule, MtlsMode, NodeWaypointEndpoint,
+        PeerAuthentication, PolicyAction, PolicyScope, Workload, WorkloadPort, WorkloadSelector,
     };
     use ferrum_edge::modes::mesh::slice::{
         MeshSlice, MeshSliceRequest, node_waypoint_destination_peer_authentications,
@@ -512,10 +512,105 @@ mod node_waypoint_capture_inventory {
                     namespace_peer_auth("payments", MtlsMode::Strict),
                     namespace_peer_auth("ferrum", MtlsMode::Permissive),
                 ],
+                mesh_policies: capture_fixture_policies(),
                 ..MeshConfig::default()
             })),
             ..GatewayConfig::default()
         }
+    }
+
+    fn policy(namespace: &str, name: &str, scope: PolicyScope, action: PolicyAction) -> MeshPolicy {
+        MeshPolicy {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            scope,
+            rules: vec![MeshRule {
+                from: Vec::new(),
+                to: Vec::new(),
+                when: Vec::new(),
+                request_principals: Vec::new(),
+                not_request_principals: Vec::new(),
+                source_negation: Default::default(),
+                never_matches: false,
+                action,
+            }],
+        }
+    }
+
+    fn app_selector(namespace: &str, app: &str) -> PolicyScope {
+        PolicyScope::WorkloadSelector {
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), app.to_string())]),
+                namespace: Some(namespace.to_string()),
+            },
+        }
+    }
+
+    /// AuthorizationPolicy fixture for the capture inventory:
+    ///
+    /// * `payments-deny-all` — namespace-wide DENY in the captured pod's own
+    ///   namespace: must ride the inventory.
+    /// * `ledger-deny` — selector DENY matching the captured `ledger` pod: must
+    ///   ride.
+    /// * `reports-deny` — selector DENY matching only `reports`, which is
+    ///   enrolled on ANOTHER node's NodeWaypoint: must NOT ride.
+    /// * `inventory-deny` — a namespace with no captured destination at all:
+    ///   must NOT ride.
+    /// * `mesh-wide-audit` — root-namespace mesh-wide policy: applies to every
+    ///   destination, so it rides (and is also in the waypoint's own view).
+    /// * `ferrum-deny` — the waypoint's own namespace: stays in the ordinary
+    ///   view and is not applicable to any captured destination.
+    fn capture_fixture_policies() -> Vec<MeshPolicy> {
+        vec![
+            policy(
+                "payments",
+                "payments-deny-all",
+                PolicyScope::Namespace {
+                    namespace: "payments".to_string(),
+                },
+                PolicyAction::Deny,
+            ),
+            policy(
+                "payments",
+                "ledger-deny",
+                app_selector("payments", "ledger"),
+                PolicyAction::Deny,
+            ),
+            policy(
+                "payments",
+                "reports-deny",
+                app_selector("payments", "reports"),
+                PolicyAction::Deny,
+            ),
+            policy(
+                "inventory",
+                "inventory-deny",
+                PolicyScope::Namespace {
+                    namespace: "inventory".to_string(),
+                },
+                PolicyAction::Deny,
+            ),
+            policy(
+                "istio-system",
+                "mesh-wide-audit",
+                PolicyScope::MeshWide,
+                PolicyAction::Audit,
+            ),
+            policy(
+                "ferrum",
+                "ferrum-deny",
+                PolicyScope::Namespace {
+                    namespace: "ferrum".to_string(),
+                },
+                PolicyAction::Deny,
+            ),
+        ]
+    }
+
+    fn policy_names(policies: &[MeshPolicy]) -> Vec<&str> {
+        let mut names: Vec<&str> = policies.iter().map(|policy| policy.name.as_str()).collect();
+        names.sort_unstable();
+        names
     }
 
     fn node_waypoint_request() -> MeshSliceRequest {
@@ -682,6 +777,7 @@ mod node_waypoint_capture_inventory {
         let mut rebuilt = MeshSlice::default();
         let mut saw_destinations = false;
         let mut saw_peer_authentications = false;
+        let mut saw_mesh_policies = false;
         for resource in &resources {
             // The ECDS resource body is an encoded `TypedExtensionConfig`; the
             // Ferrum carrier is its inner `Any`, exactly as the DP recovers it.
@@ -706,6 +802,10 @@ mod node_waypoint_capture_inventory {
                 carrier,
                 MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_)
             );
+            saw_mesh_policies |= matches!(
+                carrier,
+                MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(_)
+            );
             ferrum_edge::xds::carrier::apply_carrier(&mut rebuilt, carrier);
         }
 
@@ -720,6 +820,19 @@ mod node_waypoint_capture_inventory {
         assert_eq!(
             rebuilt.node_waypoint_capture_peer_authentications,
             slice.node_waypoint_capture_peer_authentications
+        );
+        assert!(
+            saw_mesh_policies,
+            "the capture AuthorizationPolicy carrier must be emitted when the inventory is \
+             non-empty"
+        );
+        assert!(
+            !slice.node_waypoint_capture_mesh_policies.is_empty(),
+            "the fixture must exercise a non-empty destination policy inventory"
+        );
+        assert_eq!(
+            rebuilt.node_waypoint_capture_mesh_policies,
+            slice.node_waypoint_capture_mesh_policies
         );
     }
 
@@ -752,6 +865,171 @@ mod node_waypoint_capture_inventory {
         assert!(
             !strict.content_eq(&dropped),
             "a captured destination leaving the inventory must not be deduped away"
+        );
+    }
+
+    /// File/local slicing carries the captured destination's own
+    /// AuthorizationPolicy set — namespace-wide, selector, and root mesh-wide —
+    /// on the dedicated capture field, and nothing else: a selector for a pod on
+    /// another node, a namespace with no captured destination, and the waypoint's
+    /// own namespace policy are all absent. The ordinary `mesh_policies` view is
+    /// not widened.
+    #[test]
+    fn local_slicing_carries_only_the_capture_destinations_authorization_policies() {
+        let slice =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+
+        assert_eq!(
+            policy_names(&slice.node_waypoint_capture_mesh_policies),
+            vec!["ledger-deny", "mesh-wide-audit", "payments-deny-all"],
+            "exactly the policies the scoped evaluator applies to the captured `ledger` pod"
+        );
+        assert!(
+            slice
+                .mesh_policies
+                .iter()
+                .all(|policy| policy.namespace != "payments" && policy.namespace != "inventory"),
+            "the capture inventory must not widen the waypoint's own AuthorizationPolicy view"
+        );
+    }
+
+    /// A non-NodeWaypoint subscriber and an identity-less NodeWaypoint receive no
+    /// destination AuthorizationPolicy inventory (no destination, no policy).
+    #[test]
+    fn capture_authorization_inventory_is_absent_without_capture_scoping_or_identity() {
+        let mut unflagged = node_waypoint_request();
+        unflagged.node_waypoint_capture_scoping = false;
+        let slice = MeshSlice::from_gateway_config(&config_with_workloads(), unflagged);
+        assert!(slice.node_waypoint_capture_mesh_policies.is_empty());
+
+        let mut identity_less = node_waypoint_request();
+        identity_less.workload_spiffe_id = None;
+        let slice = MeshSlice::from_gateway_config(&config_with_workloads(), identity_less);
+        assert!(slice.node_waypoint_capture_mesh_policies.is_empty());
+    }
+
+    /// A DENY added in the captured pod's namespace changes only the capture
+    /// inventory, so slice dedupe must observe it.
+    #[test]
+    fn content_eq_observes_the_capture_authorization_inventory() {
+        let mut without_deny_config = config_with_workloads();
+        without_deny_config
+            .mesh
+            .as_deref_mut()
+            .expect("mesh")
+            .mesh_policies
+            .retain(|policy| policy.namespace != "payments");
+        let without_deny =
+            MeshSlice::from_gateway_config(&without_deny_config, node_waypoint_request());
+        let with_deny =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+
+        assert_eq!(
+            without_deny.mesh_policies, with_deny.mesh_policies,
+            "the waypoint's own view is identical in both slices"
+        );
+        assert!(
+            !with_deny.content_eq(&without_deny),
+            "a captured destination gaining a DENY must not be deduped away"
+        );
+    }
+
+    /// End to end over the local slice: the plugin config the mesh runtime
+    /// injects (`mesh_slice` + `per_pod_policy_scoping`) must refuse a captured
+    /// connection to `ledger` because its own namespace DENYs it — the stream
+    /// context carries exactly the destination scope the capture relay stamps.
+    /// A connection scoped to a waypoint-namespace pod is judged by its own
+    /// namespace's policy, not by the foreign one.
+    #[tokio::test]
+    async fn the_scoped_evaluator_enforces_the_captured_destinations_deny() {
+        use std::sync::Arc;
+
+        use ferrum_edge::ConsumerIndex;
+        use ferrum_edge::config::types::BackendScheme;
+        use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+        use ferrum_edge::plugins::mesh::authz::MeshAuthz;
+        use ferrum_edge::plugins::{Plugin, PluginResult, StreamConnectionContext};
+
+        let mut config = config_with_workloads();
+        // Keep only the destination's DENY plus the root audit so the waypoint
+        // namespace carries nothing that could refuse on its own.
+        config
+            .mesh
+            .as_deref_mut()
+            .expect("mesh")
+            .mesh_policies
+            .retain(|policy| {
+                matches!(
+                    policy.name.as_str(),
+                    "payments-deny-all" | "mesh-wide-audit"
+                )
+            });
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+        let ledger = slice
+            .node_waypoint_capture_destinations
+            .iter()
+            .find(|workload| workload.service_name == "ledger")
+            .cloned()
+            .expect("ledger is a capture destination");
+        assert!(
+            slice
+                .mesh_policies
+                .iter()
+                .all(|policy| policy.name != "payments-deny-all"),
+            "precondition: the destination DENY is absent from the ordinary view"
+        );
+
+        let plugin = MeshAuthz::new(&serde_json::json!({
+            "mesh_slice": slice,
+            "per_pod_policy_scoping": true,
+        }))
+        .expect("mesh_authz builds from the NodeWaypoint slice");
+
+        let stream_context = || {
+            StreamConnectionContext::new(
+                "10.244.9.9".to_string(),
+                "10.244.9.9".to_string(),
+                "__mesh-nw-capture".to_string(),
+                None,
+                15006,
+                BackendScheme::Tcp,
+                Arc::new(ConsumerIndex::new(&[])),
+            )
+        };
+
+        let mut captured = stream_context();
+        captured.node_waypoint_policy_scope =
+            Some(Arc::new(PolicyScopeCache::from_workload(&ledger)));
+        let result = plugin.on_stream_connect(&mut captured).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "the captured destination's own namespace DENY must refuse the connection, got \
+             {result:?}"
+        );
+        assert_eq!(
+            captured
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("mesh_authz.deny_policy"))
+                .map(String::as_str),
+            Some("payments-deny-all")
+        );
+
+        let waypoint_pod = workload("ferrum", "local-app", THIS_WAYPOINT, "10.244.1.20");
+        let mut local = stream_context();
+        local.node_waypoint_policy_scope =
+            Some(Arc::new(PolicyScopeCache::from_workload(&waypoint_pod)));
+        let result = plugin.on_stream_connect(&mut local).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "a foreign destination's policy must not reach a pod it does not select, got \
+             {result:?}"
         );
     }
 }

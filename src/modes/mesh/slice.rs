@@ -387,6 +387,26 @@ pub struct MeshSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
+    /// AuthorizationPolicy (`MeshPolicy`) entries applicable to
+    /// [`Self::node_waypoint_capture_destinations`].
+    ///
+    /// `mesh_policies` is narrowed to the subscription namespace (and this
+    /// proxy's own identity), so a policy declared in a CAPTURED pod's own
+    /// namespace never reaches a NodeWaypoint deployed elsewhere. The capture
+    /// relay stamps that destination's exact policy scope, and the per-pod
+    /// evaluator can only filter the policies it was given — so without this
+    /// inventory a destination DENY (or a destination ALLOW's implicit-deny
+    /// floor) was silently absent and the connection was admitted.
+    ///
+    /// Carries exactly the policies the evaluator would apply to one of those
+    /// destinations (mesh-wide/root-namespace, namespace-scoped, and
+    /// selector-scoped entries matching a destination's own namespace and
+    /// labels) and nothing else. `mesh_authz` unions it into its per-pod
+    /// candidate set under NodeWaypoint per-pod scoping; it is never folded into
+    /// `mesh_policies` on the wire or in the slice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
+    pub node_waypoint_capture_mesh_policies: Vec<MeshPolicy>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object_vec")]
     pub services: Vec<MeshService>,
@@ -778,6 +798,43 @@ pub(crate) fn node_waypoint_capture_peer_authentications_for_destinations<'a>(
         .collect()
 }
 
+/// AuthorizationPolicy (`MeshPolicy`) entries applicable to `destinations`.
+///
+/// Uses the canonical [`policy_scope_applies_to_workload`] predicate — the one
+/// `PolicyScopeCache::policy_applies` evaluates per connection — against each
+/// destination workload's OWN namespace and labels, so mesh-wide/root-namespace,
+/// namespace-scoped, and selector-scoped policies are kept exactly when the
+/// scoped evaluator would apply them to that destination. Everything else is
+/// dropped: a policy in a namespace with no captured destination, or a
+/// selector that matches no captured destination, never rides this inventory.
+/// `targetRefs` policies are never kept: Istio attaches them at waypoint
+/// proxies only, and the per-pod evaluator never applies them on a
+/// NodeWaypoint.
+///
+/// Returns an empty vec for an empty destination set: with no destination there
+/// is nothing to authorize and carrying policy would only leak it.
+pub(crate) fn node_waypoint_capture_mesh_policies_for_destinations<'a>(
+    mesh_policies: impl IntoIterator<Item = &'a MeshPolicy>,
+    destinations: &[Workload],
+) -> Vec<MeshPolicy> {
+    if destinations.is_empty() {
+        return Vec::new();
+    }
+    mesh_policies
+        .into_iter()
+        .filter(|policy| {
+            destinations.iter().any(|workload| {
+                policy_scope_applies_to_workload(
+                    policy,
+                    &workload.namespace,
+                    &workload.selector.labels,
+                )
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// PeerAuthentication set that governs a generated NodeWaypoint DTLS listener.
 ///
 /// The NodeWaypoint's own inbound view (`peer_authentications`) is filtered to
@@ -860,6 +917,13 @@ impl MeshSlice {
             && self.node_waypoint_capture_destinations == other.node_waypoint_capture_destinations
             && self.node_waypoint_capture_peer_authentications
                 == other.node_waypoint_capture_peer_authentications
+            // A captured destination's AuthorizationPolicy moves independently
+            // of `mesh_policies` (it lives in ANOTHER namespace). Omitting it
+            // would let dedupe keep serving the old destination policy set —
+            // e.g. still admitting a connection after the operator added a
+            // DENY in the captured pod's namespace.
+            && self.node_waypoint_capture_mesh_policies
+                == other.node_waypoint_capture_mesh_policies
             && self.services == other.services
             && self.local_inbound_services == other.local_inbound_services
             && self.local_inbound_workloads == other.local_inbound_workloads
@@ -1251,30 +1315,52 @@ impl MeshSlice {
         // authorization), that authoritative value wins; the `is_empty` fallback
         // covers the file/local source and any CP that resolved nothing, and can
         // only ever yield a SUBSET of the authorized inventory — never a widening.
-        let (node_waypoint_capture_destinations, node_waypoint_capture_peer_authentications) =
-            if request.node_waypoint_capture_scoping {
-                let destinations = if mesh.node_waypoint_capture_destinations.is_empty() {
-                    node_waypoint_capture_destinations_from_workloads(
-                        mesh.workloads.iter(),
-                        request.workload_spiffe_id.as_deref(),
-                    )
-                } else {
-                    mesh.node_waypoint_capture_destinations.clone()
-                };
-                let candidates = if mesh.node_waypoint_capture_peer_authentications.is_empty() {
-                    &mesh.peer_authentications
-                } else {
-                    &mesh.node_waypoint_capture_peer_authentications
-                };
-                let peer_authentications =
-                    node_waypoint_capture_peer_authentications_for_destinations(
-                        candidates.iter(),
-                        &destinations,
-                    );
-                (destinations, peer_authentications)
+        let (
+            node_waypoint_capture_destinations,
+            node_waypoint_capture_peer_authentications,
+            node_waypoint_capture_mesh_policies,
+        ) = if request.node_waypoint_capture_scoping {
+            let destinations = if mesh.node_waypoint_capture_destinations.is_empty() {
+                node_waypoint_capture_destinations_from_workloads(
+                    mesh.workloads.iter(),
+                    request.workload_spiffe_id.as_deref(),
+                )
             } else {
-                (Vec::new(), Vec::new())
+                mesh.node_waypoint_capture_destinations.clone()
             };
+            let candidates = if mesh.node_waypoint_capture_peer_authentications.is_empty() {
+                &mesh.peer_authentications
+            } else {
+                &mesh.node_waypoint_capture_peer_authentications
+            };
+            let peer_authentications = node_waypoint_capture_peer_authentications_for_destinations(
+                candidates.iter(),
+                &destinations,
+            );
+            // Destination AuthorizationPolicy inventory. Same provenance
+            // rule as the PeerAuthentication candidates above: the
+            // CP-resolved value (scope/bearer-authorized, derived BEFORE
+            // `mesh_policies` was narrowed to the subscription namespace)
+            // wins; the fallback reads `mesh.mesh_policies`, which on the
+            // file/local source is the whole document and on a CP is the
+            // already-narrowed view, so it can only ever be a SUBSET of the
+            // authorized set. Either way the result is re-narrowed here to
+            // exactly the policies the scoped evaluator would apply to one
+            // of THESE destinations, so an unrelated foreign-namespace
+            // policy never rides it.
+            let policy_candidates = if mesh.node_waypoint_capture_mesh_policies.is_empty() {
+                &mesh.mesh_policies
+            } else {
+                &mesh.node_waypoint_capture_mesh_policies
+            };
+            let capture_mesh_policies = node_waypoint_capture_mesh_policies_for_destinations(
+                policy_candidates.iter(),
+                &destinations,
+            );
+            (destinations, peer_authentications, capture_mesh_policies)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
         let workloads: Vec<Workload> = mesh
             .workloads
             .iter()
@@ -1946,8 +2032,11 @@ impl MeshSlice {
         // narrowing is a projection of what the policy set already named, so
         // it can never remove a provider a retained policy needs.
         let ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider> = {
+            // The NodeWaypoint capture-destination inventory is evaluated beside
+            // `mesh_policies`, so a provider only it references must ride too.
             let referenced: BTreeSet<&str> = mesh_policies
                 .iter()
+                .chain(node_waypoint_capture_mesh_policies.iter())
                 .flat_map(|policy| policy.rules.iter())
                 .filter_map(|rule| rule.action.custom_provider())
                 .collect();
@@ -1999,6 +2088,7 @@ impl MeshSlice {
             node_waypoint_assertors,
             node_waypoint_capture_destinations,
             node_waypoint_capture_peer_authentications,
+            node_waypoint_capture_mesh_policies,
             services,
             local_inbound_services,
             local_inbound_workloads,
@@ -5003,6 +5093,7 @@ mod tests {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,

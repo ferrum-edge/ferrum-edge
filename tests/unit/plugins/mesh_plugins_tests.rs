@@ -7063,6 +7063,165 @@ async fn mesh_authz_on_stream_connect_scope_missing_metadata_stamped() {
     );
 }
 
+// NodeWaypoint capture-destination AuthorizationPolicy inventory.
+//
+// A captured connection is stamped with the DESTINATION pod's exact scope, and
+// that pod can live outside the waypoint's subscription namespace, so its own
+// policies ride `MeshSlice.node_waypoint_capture_mesh_policies` rather than the
+// namespace-narrowed `mesh_policies`. `mesh_authz` must evaluate them under
+// per-pod scoping, and only against the scopes they select.
+
+fn payments_frontend_only_allow() -> MeshPolicy {
+    MeshPolicy {
+        name: "ledger-frontend-only".to_string(),
+        namespace: "payments".to_string(),
+        scope: PolicyScope::Namespace {
+            namespace: "payments".to_string(),
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(
+                    "spiffe://cluster.local/ns/payments/sa/frontend".to_string(),
+                ),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
+fn captured_payments_stream(scope_namespace: &str) -> StreamConnectionContext {
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    let mut ctx = stream_context();
+    ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new(format!(
+            "spiffe://cluster.local/ns/{scope_namespace}/sa/ledger"
+        ))
+        .expect("spiffe"),
+        scope_namespace,
+        HashMap::from([("app".to_string(), "ledger".to_string())]),
+    )));
+    ctx
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_enforces_capture_destination_allow_floor() {
+    // The destination's own ALLOW admits only `payments/frontend`; an
+    // unauthenticated captured peer matches no ALLOW and is implicitly denied.
+    let with_inventory = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut captured = captured_payments_stream("payments");
+    let result = with_inventory.on_stream_connect(&mut captured).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "the captured destination's ALLOW floor must refuse a non-matching peer, got {result:?}"
+    );
+
+    // The same policy must not leak onto a pod it does not select.
+    let mut unrelated = captured_payments_stream("ferrum");
+    assert!(
+        matches!(
+            with_inventory.on_stream_connect(&mut unrelated).await,
+            PluginResult::Continue
+        ),
+        "a foreign destination policy must not apply to a pod in another namespace"
+    );
+
+    // Control: without the inventory (the pre-fix slice shape) the evaluator
+    // has no applicable policy and admits — which is exactly the gap.
+    let without_inventory = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut captured = captured_payments_stream("payments");
+    assert!(matches!(
+        without_inventory.on_stream_connect(&mut captured).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_capture_policies_count_toward_scope_missing() {
+    // A scoped destination policy reachable only through the capture inventory
+    // still makes the policy set scoped, so a connection with no per-pod scope
+    // fails closed instead of evaluating mesh-wide-only.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut ctx = stream_context();
+    let result = plugin.on_stream_connect(&mut ctx).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "missing scope with a capture-inventory scoped policy must fail closed, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata
+            .as_ref()
+            .and_then(|m| m.get("mesh_authz.deny_policy"))
+            .map(String::as_str),
+        Some("scope_missing")
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_capture_inventory_is_inert_without_per_pod_scoping() {
+    // Outside NodeWaypoint per-pod scoping the inventory is never evaluated; the
+    // construction-time filter keeps judging the proxy's own identity.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "payments".to_string(),
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            ..MeshSlice::default()
+        },
+    }))
+    .expect("plugin config");
+    let mut ctx = stream_context();
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+}
+
 #[tokio::test]
 async fn workload_metrics_inbound_listener_stamps_mesh_direction_inbound() {
     // GAP-3F: the mesh inbound listener stamps `ctx.mesh_direction = Inbound`

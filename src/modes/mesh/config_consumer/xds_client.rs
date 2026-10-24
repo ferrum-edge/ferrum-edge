@@ -1874,6 +1874,11 @@ fn reverse_translate(
         node_waypoint_capture_destinations: recovered.node_waypoint_capture_destinations,
         node_waypoint_capture_peer_authentications: recovered
             .node_waypoint_capture_peer_authentications,
+        // The capture destinations' AuthorizationPolicy inventory rides its own
+        // carrier too. Empty when the CP emitted none — the scoped evaluator
+        // then sees only `mesh_policies`, exactly like a native slice built by
+        // a CP that resolved no foreign destination policy.
+        node_waypoint_capture_mesh_policies: recovered.node_waypoint_capture_mesh_policies,
         services,
         // Inbound-only un-narrowed local services recovered from the dedicated
         // carrier (kept separate from `services` so egress scope / the outbound
@@ -1991,7 +1996,13 @@ fn validate_recovered_ext_authz_binding(
 ) -> Result<(), String> {
     use crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic;
 
-    for policy in &slice.mesh_policies {
+    // The NodeWaypoint capture-destination inventory is evaluated beside
+    // `mesh_policies`, so its CUSTOM rules must bind a recovered provider too.
+    for policy in slice
+        .mesh_policies
+        .iter()
+        .chain(slice.node_waypoint_capture_mesh_policies.iter())
+    {
         for rule in &policy.rules {
             let Some(provider) = rule.action.custom_provider() else {
                 continue;
@@ -2107,6 +2118,7 @@ struct RecoveredSliceCarriers {
     node_waypoint_assertors: Vec<crate::modes::mesh::config::NodeWaypointAssertor>,
     node_waypoint_capture_destinations: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_capture_peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
+    node_waypoint_capture_mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
     ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider>,
     virtual_service_cors_policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
@@ -2581,6 +2593,9 @@ fn apply_recovered_carrier(
         }
         MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => {
             recovered.node_waypoint_capture_peer_authentications = value
+        }
+        MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value) => {
+            recovered.node_waypoint_capture_mesh_policies = value
         }
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,

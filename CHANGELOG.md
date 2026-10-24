@@ -82,6 +82,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **NodeWaypoint capture relays evaluate the destination pod's own
+  AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
+  for an enrolled pod in another namespace stamped that pod's exact policy
+  scope but received only its own namespace's `AuthorizationPolicy` set, so a
+  `DENY` (or an `ALLOW`'s implicit deny) declared in the destination's
+  namespace was not enforced. The slice now carries a dedicated
+  `node_waypoint_capture_mesh_policies` inventory — exactly the policies that
+  apply to a captured destination, authorized by the same CP scope / bearer
+  `ns` bounds as the destinations — over native MeshSubscribe, the file source,
+  and a new `NodeWaypointCaptureMeshPoliciesCarrier` ECDS carrier, and
+  `mesh_authz` evaluates it under per-pod scoping. The ordinary `mesh_policies`
+  view is unchanged. Scoped destination policies also count toward the
+  missing-scope fail-closed rule.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

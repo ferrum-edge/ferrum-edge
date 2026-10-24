@@ -1448,6 +1448,7 @@ fn mesh_config_fields_are_accounted_for_in_overlay_ownership() {
         node_waypoint_assertors: _,
         node_waypoint_capture_destinations: _,
         node_waypoint_capture_peer_authentications: _,
+        node_waypoint_capture_mesh_policies: _,
         local_inbound_services: _,
         local_ingress_listeners: _,
         sidecar_ingress_declared: _,

@@ -123,6 +123,14 @@ pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL: &str =
 /// resolver would default PERMISSIVE.
 pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointCapturePeerAuthenticationsCarrier";
+/// Inner `type_url` for the AuthorizationPolicy (`MeshPolicy`) entries
+/// applicable to the NodeWaypoint capture destinations. Carried SEPARATELY from
+/// `MeshPoliciesCarrier`, which is the subscription-namespace view; without this
+/// carrier a captured pod's cross-namespace DENY/ALLOW never reaches an xDS DP
+/// and the scoped evaluator would judge the connection against an incomplete
+/// policy set.
+pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL: &str =
+    "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointCaptureMeshPoliciesCarrier";
 /// Inner `type_url` for the effective workload-label context carrier.
 pub const FERRUM_ECDS_LABELS_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.WorkloadLabelsCarrier";
@@ -270,6 +278,9 @@ pub enum MeshSliceCarrier {
     /// PeerAuthentication candidates for those destinations (issue #3287); see
     /// [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL`].
     NodeWaypointCapturePeerAuthentications(Vec<PeerAuthentication>),
+    /// AuthorizationPolicy entries for those destinations; see
+    /// [`FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL`].
+    NodeWaypointCaptureMeshPolicies(Vec<MeshPolicy>),
     WorkloadLabels(BTreeMap<String, String>),
     /// Marker: `WorkloadLabels` is an ambiguous shared-SPIFFE intersection, not
     /// the workload's authoritative labels. Always `true` when emitted (the CP
@@ -345,6 +356,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_) => {
                 FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL
             }
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(_) => {
+                FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL
+            }
             MeshSliceCarrier::WorkloadLabels(_) => FERRUM_ECDS_LABELS_TYPE_URL,
             MeshSliceCarrier::LabelsAmbiguous(_) => FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL,
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => FERRUM_ECDS_VS_L4_PROXIES_TYPE_URL,
@@ -395,6 +409,9 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(_) => {
                 "node-waypoint-capture-peer-authentications"
             }
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(_) => {
+                "node-waypoint-capture-mesh-policies"
+            }
             MeshSliceCarrier::WorkloadLabels(_) => "workload-labels",
             MeshSliceCarrier::LabelsAmbiguous(_) => "workload-labels-ambiguous",
             MeshSliceCarrier::VirtualServiceL4Proxies(_) => "virtual-service-l4-proxies",
@@ -434,6 +451,7 @@ impl MeshSliceCarrier {
             MeshSliceCarrier::NodeWaypointAssertors(value) => encode(value),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(value) => encode(value),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => encode(value),
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value) => encode(value),
             MeshSliceCarrier::WorkloadLabels(value) => encode(value),
             MeshSliceCarrier::LabelsAmbiguous(value) => encode(value),
             MeshSliceCarrier::VirtualServiceL4Proxies(value) => encode(value),
@@ -511,6 +529,9 @@ impl MeshSliceCarrier {
             }
             FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL => {
                 MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(decode_json(value)?)
+            }
+            FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL => {
+                MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(decode_json(value)?)
             }
             FERRUM_ECDS_LABELS_TYPE_URL => MeshSliceCarrier::WorkloadLabels(decode_json(value)?),
             FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
@@ -634,6 +655,9 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         }
         FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL => {
             Some("ferrum-mesh-carrier/node-waypoint-capture-peer-authentications")
+        }
+        FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL => {
+            Some("ferrum-mesh-carrier/node-waypoint-capture-mesh-policies")
         }
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
         FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
@@ -849,6 +873,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.node_waypoint_capture_peer_authentications.clone(),
         ));
     }
+    if !slice.node_waypoint_capture_mesh_policies.is_empty() {
+        carriers.push(MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(
+            slice.node_waypoint_capture_mesh_policies.clone(),
+        ));
+    }
     // Emitted UNCONDITIONALLY (unlike the other field groups, which are gated
     // on non-empty), even when `slice.labels` is empty. This push is
     // load-bearing: it is what makes `recovered.slice_carrier_seen` reliably
@@ -1002,6 +1031,9 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
         }
         MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => {
             slice.node_waypoint_capture_peer_authentications = value
+        }
+        MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value) => {
+            slice.node_waypoint_capture_mesh_policies = value
         }
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,
@@ -1210,6 +1242,7 @@ mod tests {
             }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
                 "api".to_string(),
@@ -1321,6 +1354,7 @@ mod tests {
             }]),
             MeshSliceCarrier::NodeWaypointCaptureDestinations(Vec::new()),
             MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(Vec::new()),
+            MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(Vec::new()),
             MeshSliceCarrier::WorkloadLabels(BTreeMap::from([(
                 "app".to_string(),
                 "api".to_string(),

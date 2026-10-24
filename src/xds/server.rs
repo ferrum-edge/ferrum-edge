@@ -1610,11 +1610,23 @@ fn config_fingerprint(config: &GatewayConfig) -> XdsConfigFingerprint {
     // never rides raw ConfigSync `GatewayConfig` JSON, but xDS CP filtering
     // stores it in the in-process filtered config before snapshot translation.
     // Include it here so off-visible source-waypoint inventory changes still
-    // invalidate the stream/snapshot cache.
+    // invalidate the stream/snapshot cache. The NodeWaypoint capture
+    // inventory (destinations, their PeerAuthentication, and their
+    // AuthorizationPolicy) is the same kind of runtime-only, cross-namespace
+    // field: a DENY added in a captured pod's namespace changes nothing else in
+    // the filtered config, so it must be fingerprinted too or the stream would
+    // keep serving the snapshot without it.
     let assertor_bytes = match config
         .mesh
         .as_ref()
-        .map(|mesh| serde_json::to_vec(&mesh.node_waypoint_assertors))
+        .map(|mesh| {
+            serde_json::to_vec(&(
+                &mesh.node_waypoint_assertors,
+                &mesh.node_waypoint_capture_destinations,
+                &mesh.node_waypoint_capture_peer_authentications,
+                &mesh.node_waypoint_capture_mesh_policies,
+            ))
+        })
         .transpose()
     {
         Ok(Some(bytes)) => bytes,
