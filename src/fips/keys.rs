@@ -294,9 +294,8 @@ pub fn check_jwt_rsa_verification_modulus(
 pub fn check_jwt_rsa_verification_pkcs1_der(der: &[u8], surface_label: &str) -> Result<(), String> {
     let parsed = x509_parser::public_key::RSAPublicKey::from_der(der);
     match parsed {
-        Ok((remaining, key)) if remaining.is_empty() => {
-            check_jwt_rsa_verification_modulus(key.modulus, surface_label)
-        }
+        // `[]`: trailing bytes after the DER structure are refused.
+        Ok(([], key)) => check_jwt_rsa_verification_modulus(key.modulus, surface_label),
         _ => Err(format!(
             "{}: the RSA public key could not be parsed, so its size cannot be checked.",
             bounded_label(surface_label)
