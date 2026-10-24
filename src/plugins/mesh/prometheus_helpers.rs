@@ -58,6 +58,13 @@ static MESH_CONFIG_UPDATE_REJECTIONS: LazyLock<DashMap<MeshConfigUpdateRejectKey
     LazyLock::new(DashMap::new);
 static MESH_CONFIG_REVISION_REJECTIONS: LazyLock<DashMap<&'static str, AtomicU64>> =
     LazyLock::new(DashMap::new);
+/// `ferrum_mesh_tracing_spans_dropped_total{provider,reason}`, indexed by
+/// `provider.index() * MeshTracingSpanDropReason::ALL.len() + reason.index()`.
+/// Both labels are closed enums, so the series set is fixed at compile time.
+static MESH_TRACING_SPANS_DROPPED: [AtomicU64; MESH_TRACING_SPAN_DROP_SERIES] =
+    [const { AtomicU64::new(0) }; MESH_TRACING_SPAN_DROP_SERIES];
+const MESH_TRACING_SPAN_DROP_SERIES: usize =
+    MeshTracingProvider::ALL.len() * MeshTracingSpanDropReason::ALL.len();
 static MESH_CONFIG_STREAM_ATTEMPTS: LazyLock<DashMap<MeshConfigStreamAttemptKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
 static MESH_CONFIG_REVISION_ADOPTIONS: AtomicU64 = AtomicU64::new(0);
@@ -127,14 +134,71 @@ pub struct MeshRequestKey {
     pub destination_app: Arc<str>,
     pub destination_service: Arc<str>,
     pub request_protocol: Arc<str>,
+    /// Numeric HTTP status. A response-code label override whose value is the
+    /// canonical decimal spelling of a status is stored here too (with no
+    /// override), so equal rendered labels are always equal registry keys.
     pub response_code: u16,
     response_code_override: Option<Arc<str>>,
+    /// Istio `grpc_response_status`: the finalized numeric gRPC status (`0`
+    /// to `16`, out-of-range or malformed statuses as UNKNOWN `2`) for gRPC
+    /// requests, and the empty value for every other request. The value set
+    /// is fixed, so the label adds no unbounded cardinality.
+    pub grpc_response_status: Arc<str>,
     pub response_flags: Arc<str>,
     pub connection_security_policy: Arc<str>,
     /// Bitset of labels removed by a Telemetry metric tag override. The
     /// underlying values stay populated so ordered rename operations can copy a
     /// value before removing its source label.
     removed_labels: u16,
+}
+
+/// Fixed `grpc_response_status` label values: index `n` (0..=16) is the
+/// numeric gRPC status `n`; index 17 is the empty value carried by requests
+/// with no gRPC status.
+static GRPC_RESPONSE_STATUS_LABELS: LazyLock<[Arc<str>; 18]> = LazyLock::new(|| {
+    std::array::from_fn(|index| {
+        if index <= GRPC_STATUS_MAX_CODE {
+            Arc::from(index.to_string())
+        } else {
+            Arc::from("")
+        }
+    })
+});
+const GRPC_STATUS_MAX_CODE: usize = 16;
+const GRPC_STATUS_UNKNOWN_CODE: usize = 2;
+const GRPC_STATUS_ABSENT_LABEL_INDEX: usize = 17;
+
+/// The bounded `grpc_response_status` label for a finalized gRPC status.
+/// `None` (not a gRPC request, or a status the gateway could not read) is the
+/// empty value. A status outside the defined 0–16 range — including the
+/// malformed-status sentinel — is UNKNOWN (`2`), the value a gRPC client
+/// reports for it, so hostile trailers cannot mint new label values.
+fn grpc_response_status_label(status: Option<u32>) -> Arc<str> {
+    let index = match status {
+        None => GRPC_STATUS_ABSENT_LABEL_INDEX,
+        Some(code) => usize::try_from(code)
+            .ok()
+            .filter(|code| *code <= GRPC_STATUS_MAX_CODE)
+            .unwrap_or(GRPC_STATUS_UNKNOWN_CODE),
+    };
+    GRPC_RESPONSE_STATUS_LABELS
+        .get(index)
+        .map(Arc::clone)
+        .unwrap_or_else(|| Arc::from(""))
+}
+
+/// The status a response-code label value is the canonical decimal spelling
+/// of (`"200"`, but not `"0200"`, `"+200"`, or `"200 "`), so storing it as
+/// the numeric code renders exactly the same label.
+fn canonical_response_code(value: &str) -> Option<u16> {
+    let bytes = value.as_bytes();
+    let canonical = !bytes.is_empty()
+        && bytes.iter().all(u8::is_ascii_digit)
+        && (bytes.len() == 1 || bytes.first() != Some(&b'0'));
+    if !canonical {
+        return None;
+    }
+    value.parse::<u16>().ok()
 }
 
 pub(crate) const MESH_METRICS_DISABLED_METADATA: &str = "mesh.metrics.disabled";
@@ -538,9 +602,13 @@ pub(crate) enum MeshMetricLabel {
     ResponseFlags = 11,
     ConnectionSecurityPolicy = 12,
     ResponseCode = 13,
+    GrpcResponseStatus = 14,
 }
 
 impl MeshMetricLabel {
+    /// The highest label index; every label's bit fits the `u16` removal set.
+    const LAST: Self = Self::GrpcResponseStatus;
+
     pub(crate) fn from_config_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "mesh.source.workload" | "source_workload" => Some(Self::SourceWorkload),
@@ -569,6 +637,7 @@ impl MeshMetricLabel {
                 Some(Self::ConnectionSecurityPolicy)
             }
             "mesh.response_code" | "response_code" => Some(Self::ResponseCode),
+            "mesh.grpc_response_status" | "grpc_response_status" => Some(Self::GrpcResponseStatus),
             _ => None,
         }
     }
@@ -593,6 +662,7 @@ impl MeshMetricLabel {
             11 => Some(Self::ResponseFlags),
             12 => Some(Self::ConnectionSecurityPolicy),
             13 => Some(Self::ResponseCode),
+            14 => Some(Self::GrpcResponseStatus),
             _ => None,
         }
     }
@@ -969,6 +1039,135 @@ pub fn increment_mesh_config_update_rejection(consumer: &'static str, reason: &'
         .entry(MeshConfigUpdateRejectKey { consumer, reason })
         .or_insert_with(|| AtomicU64::new(0))
         .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Tracing backend a mesh span exporter delivers to. The `provider` label of
+/// `ferrum_mesh_tracing_spans_dropped_total`; never an endpoint or host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshTracingProvider {
+    OpenTelemetry,
+    Zipkin,
+    Datadog,
+    Lightstep,
+    /// An exporter outside the built-in provider set.
+    Other,
+}
+
+impl MeshTracingProvider {
+    pub const ALL: [Self; 5] = [
+        Self::OpenTelemetry,
+        Self::Zipkin,
+        Self::Datadog,
+        Self::Lightstep,
+        Self::Other,
+    ];
+
+    /// Map a trace exporter's provider name (`OTLP`, `Zipkin`, `Datadog`,
+    /// `Lightstep`) onto the closed label set.
+    pub fn from_exporter_name(name: &str) -> Self {
+        match name {
+            "OTLP" => Self::OpenTelemetry,
+            "Zipkin" => Self::Zipkin,
+            "Datadog" => Self::Datadog,
+            "Lightstep" => Self::Lightstep,
+            _ => Self::Other,
+        }
+    }
+
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::OpenTelemetry => "opentelemetry",
+            Self::Zipkin => "zipkin",
+            Self::Datadog => "datadog",
+            Self::Lightstep => "lightstep",
+            Self::Other => "other",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::OpenTelemetry => 0,
+            Self::Zipkin => 1,
+            Self::Datadog => 2,
+            Self::Lightstep => 3,
+            Self::Other => 4,
+        }
+    }
+}
+
+/// Why a mesh span exporter refused a finished span. The `reason` label of
+/// `ferrum_mesh_tracing_spans_dropped_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshTracingSpanDropReason {
+    /// The exporter's bounded span queue (`buffer_capacity`) was full.
+    QueueFull,
+    /// The exporter's queued-byte budget (`buffer_max_bytes`) was exhausted.
+    ByteBudget,
+    /// The process-wide observability retained-byte ceiling was exhausted.
+    ProcessCeiling,
+    /// The exporter was closing for reload or shutdown.
+    ShuttingDown,
+    /// The exporter could not accept spans at all (no flush worker, for
+    /// example outside a Tokio runtime).
+    Unavailable,
+}
+
+impl MeshTracingSpanDropReason {
+    pub const ALL: [Self; 5] = [
+        Self::QueueFull,
+        Self::ByteBudget,
+        Self::ProcessCeiling,
+        Self::ShuttingDown,
+        Self::Unavailable,
+    ];
+
+    pub const fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::ByteBudget => "byte_budget",
+            Self::ProcessCeiling => "process_ceiling",
+            Self::ShuttingDown => "shutting_down",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::QueueFull => 0,
+            Self::ByteBudget => 1,
+            Self::ProcessCeiling => 2,
+            Self::ShuttingDown => 3,
+            Self::Unavailable => 4,
+        }
+    }
+}
+
+fn mesh_tracing_span_drop_slot(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+) -> Option<&'static AtomicU64> {
+    MESH_TRACING_SPANS_DROPPED
+        .get(provider.index() * MeshTracingSpanDropReason::ALL.len() + reason.index())
+}
+
+/// Count one span a mesh tracing exporter dropped. Lock-free: a fixed atomic
+/// slot per `(provider, reason)` pair, so a collector outage that drops spans
+/// at line rate costs one relaxed increment each.
+pub fn increment_mesh_tracing_span_dropped(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+) {
+    if let Some(slot) = mesh_tracing_span_drop_slot(provider, reason) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Current `ferrum_mesh_tracing_spans_dropped_total` value for one series.
+pub fn mesh_tracing_spans_dropped_count(
+    provider: MeshTracingProvider,
+    reason: MeshTracingSpanDropReason,
+) -> u64 {
+    mesh_tracing_span_drop_slot(provider, reason).map_or(0, |slot| slot.load(Ordering::Relaxed))
 }
 
 /// Count a mesh freshness admission or apply-token rejection. A missing apply
@@ -1472,6 +1671,34 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
                 gateway_ns_label,
                 backend_tls_refusal_count(surface)
             ));
+        }
+    }
+
+    // Mesh tracing span drops. Both labels are closed enums, so no endpoint,
+    // host, or exporter error text can become a label; only series that have
+    // dropped at least one span are rendered.
+    if MESH_TRACING_SPANS_DROPPED
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) > 0)
+    {
+        output.push_str(
+            "# HELP ferrum_mesh_tracing_spans_dropped_total Finished mesh telemetry spans a workload_metrics exporter refused before delivery, by provider and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_tracing_spans_dropped_total counter\n");
+        for provider in MeshTracingProvider::ALL {
+            for reason in MeshTracingSpanDropReason::ALL {
+                let count = mesh_tracing_spans_dropped_count(provider, reason);
+                if count == 0 {
+                    continue;
+                }
+                output.push_str(&format!(
+                    "ferrum_mesh_tracing_spans_dropped_total{{provider=\"{}\",reason=\"{}\"{}}} {}\n",
+                    provider.as_metric_label(),
+                    reason.as_metric_label(),
+                    gateway_ns_label,
+                    count
+                ));
+            }
         }
     }
 
@@ -2057,6 +2284,7 @@ pub fn mesh_request_key(summary: &TransactionSummary) -> Option<MeshRequestKey> 
         request_protocol,
         response_code: summary.response_status_code,
         response_code_override: None,
+        grpc_response_status: grpc_response_status_label(summary.grpc_status()),
         response_flags,
         connection_security_policy,
         removed_labels: 0,
@@ -2135,6 +2363,7 @@ fn mesh_request_key_from_shadow(
         ),
         response_code: summary.response_status_code,
         response_code_override: None,
+        grpc_response_status: grpc_response_status_label(summary.grpc_status()),
         response_flags: shared_label(
             summary
                 .metadata
@@ -2202,7 +2431,7 @@ fn normalize_removed_labels(key: &mut MeshRequestKey) {
         return;
     }
     static REMOVED_LABEL_SENTINEL: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
-    for index in 0u8..=MeshMetricLabel::ResponseCode.index() {
+    for index in 0u8..=MeshMetricLabel::LAST.index() {
         if key.removed_labels & (1u16 << index) == 0 {
             continue;
         }
@@ -2588,6 +2817,7 @@ fn metric_label_value(key: &MeshRequestKey, label: MeshMetricLabel) -> Arc<str> 
             .response_code_override
             .as_ref()
             .map_or_else(|| intern_label(&key.response_code.to_string()), Arc::clone),
+        MeshMetricLabel::GrpcResponseStatus => Arc::clone(&key.grpc_response_status),
     }
 }
 
@@ -2606,10 +2836,21 @@ fn set_metric_label_value(key: &mut MeshRequestKey, label: MeshMetricLabel, valu
         MeshMetricLabel::RequestProtocol => key.request_protocol = value,
         MeshMetricLabel::ResponseFlags => key.response_flags = value,
         MeshMetricLabel::ConnectionSecurityPolicy => key.connection_security_policy = value,
-        MeshMetricLabel::ResponseCode => {
-            key.response_code = 0;
-            key.response_code_override = Some(value);
-        }
+        // A value that renders exactly like a numeric status (an override
+        // `set` to `"200"`, or `string(response.code)`) is stored as that
+        // status, so it shares the registry key of the same response recorded
+        // without an override instead of splitting one rendered series in two.
+        MeshMetricLabel::ResponseCode => match canonical_response_code(&value) {
+            Some(code) => {
+                key.response_code = code;
+                key.response_code_override = None;
+            }
+            None => {
+                key.response_code = 0;
+                key.response_code_override = Some(value);
+            }
+        },
+        MeshMetricLabel::GrpcResponseStatus => key.grpc_response_status = value,
     }
 }
 
@@ -2725,9 +2966,15 @@ pub fn render_mesh_histogram_named(
     );
 }
 
+/// Labels TCP families never render (Istio parity): the HTTP `response_code`
+/// and the gRPC `grpc_response_status`.
+const TCP_FAMILY_REMOVED_LABELS: u16 = (1u16 << MeshMetricLabel::ResponseCode.index())
+    | (1u16 << MeshMetricLabel::GrpcResponseStatus.index());
+
 /// Build a mesh identity key from stream metadata (TCP/UDP connect or disconnect).
 ///
-/// TCP families omit `response_code` from the rendered label set (Istio parity).
+/// TCP families omit `response_code` and `grpc_response_status` from the
+/// rendered label set (Istio parity).
 pub fn mesh_stream_key_from_metadata<MS: std::hash::BuildHasher>(
     metadata: &HashMap<String, String, MS>,
     proxy_id: &str,
@@ -2772,9 +3019,10 @@ pub fn mesh_stream_key_from_metadata<MS: std::hash::BuildHasher>(
         request_protocol,
         response_code: 0,
         response_code_override: None,
+        grpc_response_status: grpc_response_status_label(None),
         response_flags,
         connection_security_policy,
-        removed_labels: 1u16 << MeshMetricLabel::ResponseCode.index(),
+        removed_labels: TCP_FAMILY_REMOVED_LABELS,
     };
     normalize_removed_labels(&mut key);
     Some(key)
@@ -2809,11 +3057,12 @@ pub(crate) fn mesh_request_key_for_family_from_metadata<MS: std::hash::BuildHash
         destination_port: metadata_destination_port(metadata),
     };
     apply_metric_override_plan(&mut key, base, plan, extras);
-    // TCP families never carry an HTTP response-code dimension. Preserve that
-    // fixed schema even when an ALL_METRICS plan contains a response-code
-    // UPSERT/rename intended for the HTTP/gRPC families.
+    // TCP families never carry an HTTP response-code or gRPC-status
+    // dimension. Preserve that fixed schema even when an ALL_METRICS plan
+    // contains a response-code / gRPC-status UPSERT or rename intended for the
+    // HTTP/gRPC families.
     if family.is_tcp() {
-        key.removed_labels |= 1u16 << MeshMetricLabel::ResponseCode.index();
+        key.removed_labels |= TCP_FAMILY_REMOVED_LABELS;
     }
     normalize_removed_labels(&mut key);
     key
@@ -3032,6 +3281,13 @@ fn mesh_label_base_fragment(key: &MeshRequestKey) -> String {
     write_optional_mesh_label(
         &mut labels,
         key,
+        MeshMetricLabel::GrpcResponseStatus,
+        "grpc_response_status",
+        &key.grpc_response_status,
+    );
+    write_optional_mesh_label(
+        &mut labels,
+        key,
         MeshMetricLabel::ResponseFlags,
         "response_flags",
         &key.response_flags,
@@ -3112,6 +3368,7 @@ mod tests {
             request_protocol: Arc::from("http"),
             response_code: 200,
             response_code_override: None,
+            grpc_response_status: Arc::from(""),
             response_flags: Arc::from("-"),
             connection_security_policy: Arc::from("mutual_tls"),
             removed_labels: 0,

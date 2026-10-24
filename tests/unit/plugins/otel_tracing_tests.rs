@@ -2838,3 +2838,60 @@ async fn test_otel_tracing_cleartext_endpoint_needs_opt_in_off_loopback() {
         assert!(build(config.clone()).is_ok(), "{config} must be admitted");
     }
 }
+
+/// workload_metrics-MUSE-5: a span a workload_metrics exporter refuses is
+/// counted on `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` with
+/// fixed labels only, never the endpoint or the exporter error text.
+#[tokio::test]
+async fn workload_metrics_counts_refused_spans_by_provider_and_reason() {
+    use ferrum_edge::plugins::mesh::prometheus_helpers::{
+        self, MeshTracingProvider, MeshTracingSpanDropReason,
+    };
+
+    // One-slot queue and a flush interval far beyond the test: on this
+    // current-thread runtime the flush worker never runs between the two
+    // `log` calls, so the second span finds the queue full.
+    let plugin = WorkloadMetrics::new(&json!({
+        "service_name": "reviews",
+        "batch_size": 10_000,
+        "flush_interval_ms": 600_000,
+        "buffer_capacity": 1,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {"url": "http://127.0.0.1:9/api/v2/spans"}
+        }]
+    }))
+    .expect("workload metrics with zipkin provider");
+    let before = prometheus_helpers::mesh_tracing_spans_dropped_count(
+        MeshTracingProvider::Zipkin,
+        MeshTracingSpanDropReason::QueueFull,
+    );
+
+    plugin.log(&make_summary(make_trace_metadata())).await;
+    plugin.log(&make_summary(make_trace_metadata())).await;
+
+    let after = prometheus_helpers::mesh_tracing_spans_dropped_count(
+        MeshTracingProvider::Zipkin,
+        MeshTracingSpanDropReason::QueueFull,
+    );
+    assert!(
+        after > before,
+        "queue-full drop must be counted ({before} -> {after})"
+    );
+
+    let mut output = String::new();
+    prometheus_helpers::render_mesh_observability_metrics(&mut output);
+    assert!(
+        output.contains("# TYPE ferrum_mesh_tracing_spans_dropped_total counter"),
+        "{output}"
+    );
+    let series = output
+        .lines()
+        .find(|line| {
+            line.starts_with(
+                "ferrum_mesh_tracing_spans_dropped_total{provider=\"zipkin\",reason=\"queue_full\"}",
+            )
+        })
+        .expect("zipkin queue_full series");
+    assert!(!series.contains("127.0.0.1"), "{series}");
+}

@@ -13803,7 +13803,7 @@ fn inject_mesh_global_plugins(
     // trigger makes request applicability unknowable, so requiring that gate
     // is the fail-closed direction. Direct/user-created workload_metrics
     // without this internal field keep their own single-gate config.
-    let effective_authz_gates: Vec<serde_json::Value> = config
+    let mut effective_authz_gates: Vec<serde_json::Value> = config
         .plugin_configs
         .iter()
         .filter(|plugin| {
@@ -13813,13 +13813,26 @@ fn inject_mesh_global_plugins(
         })
         .map(|plugin| mesh_authz_baggage_gate_config(&plugin.config))
         .collect();
+    // A proxy- or proxy-group-scoped mesh_authz REPLACES the global instance
+    // on its routes (PluginCache `remove_shadowed_globals`), so on those
+    // routes it is the gate authorization actually runs. This global
+    // telemetry instance cannot vary per proxy, so every enabled scoped gate
+    // joins the conjunction too: requiring it everywhere is the fail-closed
+    // direction, exactly like a triggered global gate.
+    let scoped_authz_gates: Vec<serde_json::Value> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.scope != PluginScope::Global
+                && plugin.plugin_name == "mesh_authz"
+        })
+        .map(|plugin| mesh_authz_baggage_gate_config(&plugin.config))
+        .collect();
     if !effective_authz_gates.is_empty() {
         if let [single_gate] = effective_authz_gates.as_slice() {
             mirror_mesh_authz_baggage_gate_fields(&mut workload_metrics_config, single_gate);
         }
-        let gates_key =
-            crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY;
-        workload_metrics_config[gates_key] = serde_json::Value::Array(effective_authz_gates);
     } else {
         // No enabled global mesh_authz. Do not copy a disabled operator
         // config. Thread the mesh-managed list only when no operator global
@@ -13835,6 +13848,31 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["trusted_hbone_assertors"] =
                 serde_json::Value::Array(assertors.clone());
         }
+    }
+    if !scoped_authz_gates.is_empty() {
+        if effective_authz_gates.is_empty() {
+            // Routes without a scoped mesh_authz keep the gate this instance
+            // would otherwise apply on its own (defaults, or the mesh-managed
+            // list threaded above).
+            effective_authz_gates.push(mesh_authz_baggage_gate_config(&workload_metrics_config));
+        }
+        for gate in scoped_authz_gates {
+            if !effective_authz_gates.contains(&gate) {
+                effective_authz_gates.push(gate);
+            }
+        }
+        // More distinct gates than the conjunction admits: honor no baggage
+        // at all rather than fail construction and lose workload telemetry.
+        if effective_authz_gates.len()
+            > crate::plugins::mesh::workload_metrics::MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES
+        {
+            effective_authz_gates = vec![serde_json::json!({ "trusted_hbone_assertors": [] })];
+        }
+    }
+    if !effective_authz_gates.is_empty() {
+        let gates_key =
+            crate::plugins::mesh::workload_metrics::EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES_KEY;
+        workload_metrics_config[gates_key] = serde_json::Value::Array(effective_authz_gates);
     }
     // Apply ProxyConfig sampling as a baseline. The more granular Telemetry
     // resource below may override on the `sampling_percentage` key.
@@ -32318,6 +32356,97 @@ mod tests {
             gates[1].get("trusted_hbone_assertors"),
             Some(&serde_json::json!([]))
         );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_conjoins_scoped_authz_gates_into_workload_metrics() {
+        // A proxy-scoped mesh_authz lockdown replaces the global instance on
+        // its route, so the global telemetry instance must refuse what it
+        // refuses (it cannot vary per proxy).
+        let mut scoped = global_mesh_authz_plugin(
+            "proxy-mesh-authz",
+            serde_json::json!({ "trusted_hbone_assertors": [] }),
+        );
+        scoped.scope = PluginScope::Proxy;
+        scoped.proxy_id = Some("payments".to_string());
+        let mut disabled_group = global_mesh_authz_plugin(
+            "group-mesh-authz",
+            serde_json::json!({ "trusted_hbone_assertors": ["waypoint"] }),
+        );
+        disabled_group.scope = PluginScope::ProxyGroup;
+        disabled_group.enabled = false;
+        let mut config = GatewayConfig {
+            plugin_configs: vec![scoped, disabled_group],
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(
+            gates.len(),
+            2,
+            "managed global gate plus the enabled scoped gate: {gates:?}"
+        );
+        assert!(
+            gates[0].get("trusted_hbone_assertors").is_none(),
+            "the managed global gate stays first with shared defaults"
+        );
+        assert_eq!(
+            gates[1].get("trusted_hbone_assertors"),
+            Some(&serde_json::json!([])),
+            "the scoped lockdown joins the conjunction"
+        );
+        assert!(
+            !gates.iter().any(|gate| gate.get("trusted_hbone_assertors")
+                == Some(&serde_json::json!(["waypoint"]))),
+            "a disabled scoped row never constrains the set"
+        );
+        crate::plugins::mesh::workload_metrics::WorkloadMetrics::new(
+            injected_workload_metrics_config(&config),
+        )
+        .expect("injected scoped conjunction constructs");
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_scoped_authz_gates_over_bound_lock_baggage() {
+        let plugin_configs = (0
+            ..crate::plugins::mesh::workload_metrics::MAX_EFFECTIVE_MESH_AUTHZ_BAGGAGE_GATES + 1)
+            .map(|index| {
+                let mut scoped = global_mesh_authz_plugin(
+                    &format!("proxy-mesh-authz-{index}"),
+                    serde_json::json!({
+                        "trusted_hbone_assertors": [
+                            format!("spiffe://cluster.local/ns/istio-system/sa/assertor-{index}")
+                        ]
+                    }),
+                );
+                scoped.scope = PluginScope::Proxy;
+                scoped.proxy_id = Some(format!("proxy-{index}"));
+                scoped
+            })
+            .collect();
+        let mut config = GatewayConfig {
+            plugin_configs,
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(
+            &mut config,
+            &test_mesh_runtime_config(),
+            &MeshSlice::default(),
+        );
+        let gates = injected_effective_authz_gates(&config);
+        assert_eq!(
+            gates,
+            [serde_json::json!({ "trusted_hbone_assertors": [] })],
+            "an over-bound conjunction must lock baggage, not fail construction"
+        );
+        crate::plugins::mesh::workload_metrics::WorkloadMetrics::new(
+            injected_workload_metrics_config(&config),
+        )
+        .expect("locked-down injected config constructs");
     }
 
     #[test]

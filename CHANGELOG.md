@@ -139,6 +139,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`workload_metrics` (mesh telemetry) review hardening.**
+  - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
+    request/response size, gRPC message families) gain Istio's
+    `grpc_response_status` label: the finalized gRPC status `0`–`16`
+    (out-of-range, malformed, or missing statuses as UNKNOWN `2`), empty for
+    non-gRPC requests, and never on TCP families. It is also a tag-override
+    name. Failing RPCs behind HTTP 200 no longer merge into the success series.
+  - A `response_code` tag override whose value is a status's canonical
+    decimal spelling (`set` to `"200"`, `string(response.code)`) now shares
+    that status's series instead of exposing a duplicate series with the same
+    labels.
+  - B3 propagation: with a Zipkin provider, and whenever the backend request
+    still carries B3, the active span is injected as `x-b3-*` (and `b3` when
+    the request used the single-header form) beside W3C; stale incoming B3 is
+    replaced.
+  - New `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` counts
+    spans an exporter refused (`queue_full`, `byte_budget`,
+    `process_ceiling`, `shutting_down`, `unavailable`).
+  - HBONE baggage attribution reads the same input as `mesh_authz` (wire
+    field-lines plus the folded map); a `baggage` header added by a request
+    transform after authorization is no longer honored.
+  - Mesh injection mirrors enabled proxy-/proxy-group-scoped `mesh_authz`
+    baggage gates into the auto-injected instance's conjunction (over 16
+    distinct gates locks baggage instead of failing construction).
+  - `custom_env_tags`, `custom_header_tags`, and `safe_tag_sources` reject a
+    `PAT` segment (`GITHUB_PAT`, `x-pat`) and a terminal `AUTH` segment
+    (`BASIC_AUTH`, `x-basic-auth`).
+  - No span is built when export is inactive, and the disabled-metrics marker
+    and tag-override plans are no longer re-copied on every stamp.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder

@@ -1373,7 +1373,7 @@ impl BufferedTraceExporter {
     fn try_reserve_queued_bytes(&self, bytes: usize) -> Result<ProcessByteReservation, String> {
         let process = self.ceiling.try_acquire(bytes).ok_or_else(|| {
             format!(
-                "process-wide observability retained-byte ceiling exceeded (+{bytes} > {})",
+                "{TRACE_EXPORT_PROCESS_CEILING_PREFIX} (+{bytes} > {})",
                 self.ceiling.max()
             )
         })?;
@@ -1386,7 +1386,7 @@ impl BufferedTraceExporter {
             .map(|_| process)
             .map_err(|current| {
                 format!(
-                    "queued byte budget exceeded ({current}+{bytes} > {})",
+                    "{TRACE_EXPORT_BYTE_BUDGET_PREFIX} ({current}+{bytes} > {})",
                     self.buffer_max_bytes
                 )
             })
@@ -1419,7 +1419,7 @@ impl TraceExporter for BufferedTraceExporter {
             .get()
             .ok_or_else(|| "trace exporter worker is unavailable".to_string())?;
         let Some(_admission) = worker.try_admit() else {
-            return Err("trace exporter is shutting down".to_string());
+            return Err(TRACE_EXPORT_SHUTTING_DOWN.to_string());
         };
         self.queued_spans.fetch_add(1, Ordering::Relaxed);
         let bytes = span.approx_queued_bytes();
@@ -1441,9 +1441,46 @@ impl TraceExporter for BufferedTraceExporter {
                 // releases it on drop; only the per-instance charge is manual.
                 self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                 decrement_queued_spans(&self.queued_spans, 1);
-                Err(error.to_string())
+                Err(match error {
+                    mpsc::error::TrySendError::Full(_) => TRACE_EXPORT_QUEUE_FULL,
+                    mpsc::error::TrySendError::Closed(_) => TRACE_EXPORT_QUEUE_CLOSED,
+                }
+                .to_string())
             }
         }
+    }
+}
+
+/// `try_export` refusal when the bounded span queue (`buffer_capacity`) is full.
+const TRACE_EXPORT_QUEUE_FULL: &str = "trace exporter queue is full";
+/// `try_export` refusal when the flush worker's receiver is gone.
+const TRACE_EXPORT_QUEUE_CLOSED: &str = "trace exporter queue is closed";
+/// `try_export` refusal once admission is closed for reload or shutdown.
+const TRACE_EXPORT_SHUTTING_DOWN: &str = "trace exporter is shutting down";
+/// Prefix of the `try_export` refusal for an exhausted process-wide ceiling.
+const TRACE_EXPORT_PROCESS_CEILING_PREFIX: &str =
+    "process-wide observability retained-byte ceiling exceeded";
+/// Prefix of the `try_export` refusal for an exhausted per-exporter byte budget.
+const TRACE_EXPORT_BYTE_BUDGET_PREFIX: &str = "queued byte budget exceeded";
+
+/// Classify a [`TraceExporter::try_export`] refusal into the closed drop-reason
+/// set the mesh span-drop counter reports. The messages are produced only by
+/// [`BufferedTraceExporter::try_export`] from the constants above; anything
+/// else (no flush worker, a poisoned startup lock) is `Unavailable`.
+pub(crate) fn trace_export_drop_reason(
+    error: &str,
+) -> crate::plugins::mesh::prometheus_helpers::MeshTracingSpanDropReason {
+    use crate::plugins::mesh::prometheus_helpers::MeshTracingSpanDropReason;
+    if error == TRACE_EXPORT_QUEUE_FULL {
+        MeshTracingSpanDropReason::QueueFull
+    } else if error.starts_with(TRACE_EXPORT_BYTE_BUDGET_PREFIX) {
+        MeshTracingSpanDropReason::ByteBudget
+    } else if error.starts_with(TRACE_EXPORT_PROCESS_CEILING_PREFIX) {
+        MeshTracingSpanDropReason::ProcessCeiling
+    } else if error == TRACE_EXPORT_SHUTTING_DOWN || error == TRACE_EXPORT_QUEUE_CLOSED {
+        MeshTracingSpanDropReason::ShuttingDown
+    } else {
+        MeshTracingSpanDropReason::Unavailable
     }
 }
 

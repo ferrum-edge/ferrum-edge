@@ -24,20 +24,21 @@ use crate::modes::mesh::metric_tag_cel::{
 use crate::plugins::mesh::CUSTOM_TRACE_ATTRIBUTES_METADATA;
 use crate::plugins::mesh::authz::{
     HboneBaggageHonor, IGNORED_UDP_SOURCE_SCOPE_METADATA, TrustedAssertorIndex,
-    hbone_baggage_honor, merge_hbone_baggage_honor, mesh_authz_destination_port,
-    mesh_stream_authz_destination_port, parse_trust_domain_aliases, parse_trusted_hbone_assertors,
+    hbone_baggage_honor, hbone_baggage_identity, merge_hbone_baggage_honor,
+    mesh_authz_destination_port, mesh_stream_authz_destination_port, parse_trust_domain_aliases,
+    parse_trusted_hbone_assertors,
 };
 use crate::plugins::mesh::prometheus_helpers::{
     MESH_METRICS_DISABLED_METADATA, MESH_WORKLOAD_METRICS_OBSERVED_METADATA, MeshMetricFamily,
-    MeshMetricLabel,
+    MeshMetricLabel, MeshTracingProvider, increment_mesh_tracing_span_dropped,
 };
 use crate::plugins::mesh::telemetry_facts::{
     LocalWorkloadFacts, MeshLabel, MeshLabelShadow, RemoteSourceFacts, SpiffeLabels,
 };
 use crate::plugins::otel_tracing::{
     OtelTracing, SpanData, SpanKind, TraceExporter, build_traceparent, ensure_trace_metadata,
-    trace_exporters_from_providers, trace_is_sampled, validate_trace_provider_endpoints,
-    validate_trace_provider_secret_refs,
+    trace_export_drop_reason, trace_exporters_from_providers, trace_is_sampled,
+    validate_trace_provider_endpoints, validate_trace_provider_secret_refs,
 };
 use crate::plugins::utils::PluginHttpClient;
 use crate::plugins::utils::metadata_redaction::{
@@ -402,6 +403,11 @@ pub struct WorkloadMetrics {
     /// via the mesh slice. These also enable trace-context propagation when
     /// span reporting is disabled.
     tracing_providers: Vec<TracingProvider>,
+    /// Inject the active span as B3 headers toward the backend for every
+    /// traced request, not only for requests that arrived with B3 context.
+    /// True when a Zipkin provider is configured (B3 is Zipkin's native
+    /// propagation format), including while span reporting is disabled.
+    b3_propagation: bool,
     trace_exporters: Vec<Arc<dyn TraceExporter>>,
     export_drop_log_limiter: Mutex<crate::util::accept_backoff::LogRateLimiter>,
     span_reporting_disabled: bool,
@@ -432,6 +438,7 @@ impl Default for WorkloadMetrics {
             disabled_metrics_marker: None,
             custom_trace_attributes_marker: None,
             tracing_providers: Vec::new(),
+            b3_propagation: false,
             trace_exporters: Vec::new(),
             export_drop_log_limiter: Mutex::default(),
             span_reporting_disabled: false,
@@ -628,6 +635,9 @@ impl WorkloadMetrics {
                 .map_err(|error| format!("workload_metrics: {error}"))?
         };
         let direction_emit = parse_direction_emit(config)?;
+        let b3_propagation = tracing_providers
+            .iter()
+            .any(|provider| matches!(provider, TracingProvider::Zipkin { .. }));
 
         Ok(Self {
             node_id: string_config(config, "node_id"),
@@ -644,6 +654,7 @@ impl WorkloadMetrics {
             disabled_metrics_marker,
             custom_trace_attributes_marker,
             tracing_providers,
+            b3_propagation,
             trace_exporters,
             export_drop_log_limiter: Mutex::new(crate::util::accept_backoff::LogRateLimiter::new()),
             span_reporting_disabled,
@@ -673,21 +684,46 @@ impl WorkloadMetrics {
             || !self.tracing_providers.is_empty()
     }
 
+    /// Stamp from `headers`, the request's own header map (`ctx.headers`):
+    /// its folded `baggage` value is the one `mesh_authz` evaluates.
     fn annotate_http_context(&self, ctx: &mut RequestContext, headers: &HashMap<String, String>) {
         let probe = TraceHeaderProbe::scan(headers);
-        self.annotate_http_context_with_probe(ctx, headers, &probe);
+        let folded_baggage = headers.get(BAGGAGE_HEADER).map(String::as_str);
+        self.annotate_http_context_with_probe(ctx, headers, &probe, folded_baggage);
+    }
+
+    /// Stamp from the `before_proxy` backend-visible map. Request transforms
+    /// have already run, after authorization, so its `baggage` is NOT what
+    /// `mesh_authz` evaluated: a transformer-added assertion must not be
+    /// honored, and one a transformer stripped before forwarding must not be
+    /// lost. While the pristine wire block is held it alone supplies the HBONE
+    /// baggage identity; without one the map's value is the only evidence.
+    fn annotate_backend_http_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+    ) {
+        let probe = TraceHeaderProbe::scan(headers);
+        let folded_baggage = if ctx.has_raw_headers() {
+            None
+        } else {
+            headers.get(BAGGAGE_HEADER).map(String::as_str)
+        };
+        self.annotate_http_context_with_probe(ctx, headers, &probe, folded_baggage);
     }
 
     /// Stamp the request's mesh telemetry metadata and labels.
     ///
     /// The label keys are written through [`Self::stamp_http_labels`]; every
     /// other key is written to `ctx.metadata` exactly as before. `probe` must
-    /// describe `headers`.
+    /// describe `headers`. `folded_baggage` is the folded `baggage` value read
+    /// beside the pristine wire field-lines (see [`hbone_baggage_identity`]).
     fn annotate_http_context_with_probe(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         probe: &TraceHeaderProbe<'_>,
+        folded_baggage: Option<&str>,
     ) {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata_with_probe(&mut ctx.metadata, headers, probe);
@@ -702,7 +738,7 @@ impl WorkloadMetrics {
                     .insert(TRACESTATE_HEADER.to_string(), tracestate.to_string());
             }
         }
-        let hbone_identity = hbone_identity_from_headers(ctx, headers);
+        let hbone_identity = hbone_identity_for_request(ctx, folded_baggage);
         let resolved_source = self.resolve_peer_source_identity(ctx, hbone_identity.as_ref());
         insert_metadata_if_changed(
             &mut ctx.metadata,
@@ -1095,11 +1131,14 @@ impl WorkloadMetrics {
                 }
             }
         }
+        // Instance-immutable values: the repeat stamp (request-received, then
+        // before-proxy) is one borrowed comparison, not a fresh key and up to
+        // 16 KiB of plan bytes copied again per family.
         if let Some(marker) = self.disabled_metrics_marker.as_ref() {
-            metadata.insert(MESH_METRICS_DISABLED_METADATA.to_string(), marker.clone());
+            insert_metadata_if_changed(metadata, MESH_METRICS_DISABLED_METADATA, marker);
         }
         for (family, plan) in &self.tag_override_plans {
-            metadata.insert(family.override_metadata_key().to_string(), plan.clone());
+            insert_metadata_if_changed(metadata, family.override_metadata_key(), plan);
         }
     }
 
@@ -1184,8 +1223,16 @@ impl WorkloadMetrics {
         insert_metadata_if_changed(metadata, "mesh.destination.service", destination);
     }
 
+    /// Whether a finished span can reach any exporter. Callers check this
+    /// BEFORE building a [`SpanData`]: propagation-only instances (span
+    /// reporting disabled, or no provider) would otherwise build every sampled
+    /// span's owned IDs and projected attributes only to drop them.
+    fn span_export_active(&self) -> bool {
+        !self.span_reporting_disabled && !self.trace_exporters.is_empty()
+    }
+
     fn export_span(&self, span: Option<SpanData>) {
-        if self.span_reporting_disabled || self.trace_exporters.is_empty() {
+        if !self.span_export_active() {
             return;
         }
         let Some(span) = span else {
@@ -1196,15 +1243,22 @@ impl WorkloadMetrics {
         };
         for exporter in earlier_exporters {
             if let Err(error) = exporter.try_export(span.clone()) {
-                self.warn_export_drop(exporter.provider_name(), &error);
+                self.record_export_drop(exporter.provider_name(), &error);
             }
         }
         if let Err(error) = last_exporter.try_export(span) {
-            self.warn_export_drop(last_exporter.provider_name(), &error);
+            self.record_export_drop(last_exporter.provider_name(), &error);
         }
     }
 
-    fn warn_export_drop(&self, provider: &'static str, error: &str) {
+    /// Count a refused span on `ferrum_mesh_tracing_spans_dropped_total` (fixed
+    /// provider/reason labels, never the endpoint or error text) and emit the
+    /// rate-limited diagnostic.
+    fn record_export_drop(&self, provider: &'static str, error: &str) {
+        increment_mesh_tracing_span_dropped(
+            MeshTracingProvider::from_exporter_name(provider),
+            trace_export_drop_reason(error),
+        );
         let now_ms = crate::socket_opts::monotonic_now_ms();
         let suppressed = match self.export_drop_log_limiter.lock() {
             Ok(mut limiter) => limiter.on_event(now_ms),
@@ -1221,7 +1275,7 @@ impl WorkloadMetrics {
     }
 
     async fn log_span(&self, summary: &TransactionSummary) {
-        if summary.mirror {
+        if summary.mirror || !self.span_export_active() {
             return;
         }
         if !self.should_export_metadata(&summary.metadata) {
@@ -1360,7 +1414,7 @@ impl Plugin for WorkloadMetrics {
     /// attributes). An instance that can export no span leaves them to the
     /// typed label projection (issue #6793).
     fn observes_mesh_label_metadata(&self) -> bool {
-        !self.span_reporting_disabled && !self.trace_exporters.is_empty()
+        self.span_export_active()
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -1373,7 +1427,12 @@ impl Plugin for WorkloadMetrics {
         let captured_traceparent = probe.has_valid_traceparent();
         let captured_b3 = probe.has_b3_trace_context() || probe.b3_sampling_decision().is_some();
         let captured_tracestate = probe.tracestate.is_some();
-        self.annotate_http_context_with_probe(ctx, &headers, &probe);
+        self.annotate_http_context_with_probe(
+            ctx,
+            &headers,
+            &probe,
+            headers.get(BAGGAGE_HEADER).map(String::as_str),
+        );
         if captured_traceparent && ctx.metadata.contains_key(TRACEPARENT_HEADER) {
             ctx.metadata.insert(
                 CAPTURED_TRACEPARENT_METADATA.to_string(),
@@ -1398,7 +1457,7 @@ impl Plugin for WorkloadMetrics {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         let suppress_local_trace = self.reconcile_captured_trace_headers(ctx, headers);
-        self.annotate_http_context(ctx, headers);
+        self.annotate_backend_http_context(ctx, headers);
         if suppress_local_trace {
             clear_http_trace_metadata(&mut ctx.metadata);
         }
@@ -1407,6 +1466,17 @@ impl Plugin for WorkloadMetrics {
         }
         if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
             set_header_case_insensitive(headers, TRACESTATE_HEADER, tracestate);
+        }
+        // B3 rides beside W3C: always for a Zipkin provider, and whenever the
+        // backend request still carries B3 context, whose stale copy (the
+        // caller's span) would otherwise make a B3-only backend continue from
+        // the parent instead of this gateway span. Metrics-only instances own
+        // no trace context and leave the headers alone.
+        if self.trace_context_enabled() {
+            let b3 = backend_b3_headers(headers);
+            if self.b3_propagation || b3.any {
+                inject_b3_trace_headers(&ctx.metadata, headers, b3.single);
+            }
         }
         PluginResult::Continue
     }
@@ -1614,7 +1684,7 @@ impl Plugin for WorkloadMetrics {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if !self.should_export_metadata(&summary.metadata) {
+        if !self.span_export_active() || !self.should_export_metadata(&summary.metadata) {
             return;
         }
         let direction = summary
@@ -2226,7 +2296,10 @@ fn validate_custom_tags(
             })?;
         // Judge the configured spelling as well as the normalized one:
         // normalization lowercases away camelCase boundaries (`x-projectPin`).
-        if is_sensitive_header_name(&header) || is_sensitive_header_name(header_name.as_str()) {
+        if is_sensitive_header_name(&header)
+            || is_sensitive_header_name(header_name.as_str())
+            || names_short_form_credential(&header)
+        {
             return Err(format!(
                 "workload_metrics: custom tag {name:?} cannot copy sensitive header {header:?}"
             ));
@@ -2385,6 +2458,9 @@ fn is_sensitive_environment_variable_name(name: &str) -> bool {
         .split('_')
         .filter(|segment| !segment.is_empty())
         .collect();
+    if segments_name_short_form_credential(&segments) {
+        return true;
+    }
 
     let mut has_database_source = false;
     let mut has_location = false;
@@ -2419,6 +2495,28 @@ fn is_sensitive_environment_variable_name(name: &str) -> bool {
     }
 
     (has_database_source && has_location) || (has_client && has_id)
+}
+
+/// Short credential spellings the shared classifiers do not name: a `pat`
+/// segment (personal access token: `GITHUB_PAT`, `AZURE_DEVOPS_PAT`, `x-pat`)
+/// and a TERMINAL `auth` segment, which holds the credential itself
+/// (`BASIC_AUTH`, `DOCKER_AUTH`, `NPM_AUTH`, `x-basic-auth`). Segment
+/// equality keeps `path` / `pattern` / `patch` and a non-terminal `auth`
+/// (`AUTH_TYPE`, `AUTH_MODE`) out of the rule.
+fn segments_name_short_form_credential(segments: &[&str]) -> bool {
+    segments.contains(&"pat") || segments.last() == Some(&"auth")
+}
+
+/// [`segments_name_short_form_credential`] over a raw header or environment
+/// name, segmented exactly like the environment classifier (delimiters and
+/// camelCase boundaries split, so `x-basicAuth` is `x_basic_auth`).
+fn names_short_form_credential(name: &str) -> bool {
+    let fingerprint = environment_name_fingerprint(name);
+    let segments: Vec<&str> = fingerprint
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    segments_name_short_form_credential(&segments)
 }
 
 fn is_credential_token(segment: &str) -> bool {
@@ -2708,10 +2806,9 @@ fn remote_source_facts(
         .unwrap_or_else(|| Arc::new(RemoteSourceFacts::new(Some(identity))))
 }
 
-fn hbone_identity_from_headers(
-    ctx: &RequestContext,
-    headers: &HashMap<String, String>,
-) -> Option<HboneIdentity> {
+/// The HBONE baggage identity of an HBONE request, read exactly as
+/// `mesh_authz` reads it: every pristine wire field-line plus `folded`.
+fn hbone_identity_for_request(ctx: &RequestContext, folded: Option<&str>) -> Option<HboneIdentity> {
     if ctx
         .metadata
         .get("request_protocol")
@@ -2720,10 +2817,79 @@ fn hbone_identity_from_headers(
         return None;
     }
 
-    headers
-        .get(BAGGAGE_HEADER)
-        .map(String::as_str)
-        .map(HboneIdentity::from_baggage_header)
+    Some(hbone_baggage_identity(ctx, folded))
+}
+
+/// Which B3 spellings the backend request carries.
+#[derive(Debug, Clone, Copy, Default)]
+struct BackendB3Headers {
+    /// Any B3 header, single or multi.
+    any: bool,
+    /// The single-header `b3` form.
+    single: bool,
+}
+
+fn backend_b3_headers(headers: &HashMap<String, String>) -> BackendB3Headers {
+    let mut found = BackendB3Headers::default();
+    for name in headers.keys() {
+        if B3_TRACE_HEADERS
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
+        {
+            found.any = true;
+            found.single |= name.eq_ignore_ascii_case("b3");
+        }
+    }
+    found
+}
+
+/// Replace every B3 header on the backend request with the active span from
+/// `metadata` (the same trace ID, span ID, parent and sampling decision the
+/// injected `traceparent` carries): multi-header `x-b3-traceid` /
+/// `x-b3-spanid` / `x-b3-parentspanid` / `x-b3-sampled`, plus the
+/// single-header `b3` form when the request used it. Without an active span
+/// the headers are left untouched.
+fn inject_b3_trace_headers<MS: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, MS>,
+    headers: &mut HashMap<String, String>,
+    single_header: bool,
+) {
+    let Some(active) = metadata
+        .get(TRACEPARENT_HEADER)
+        .and_then(|value| OtelTracing::parse_traceparent(value))
+    else {
+        return;
+    };
+    let sampled = if u8::from_str_radix(active.flags, 16).is_ok_and(|flags| flags & 0x01 == 0x01) {
+        "1"
+    } else {
+        "0"
+    };
+    let parent_span_id = metadata
+        .get("parent_span_id")
+        .and_then(|value| normalize_b3_span_id(value));
+    // `parse_traceparent` names the traceparent span field from the
+    // receiver's point of view; for the injected value it is this span.
+    let span_id = active.parent_span_id;
+    headers.retain(|name, _| {
+        !B3_TRACE_HEADERS
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
+    });
+    headers.insert("x-b3-traceid".to_string(), active.trace_id.to_string());
+    headers.insert("x-b3-spanid".to_string(), span_id.to_string());
+    headers.insert("x-b3-sampled".to_string(), sampled.to_string());
+    if let Some(parent_span_id) = parent_span_id.as_deref() {
+        headers.insert("x-b3-parentspanid".to_string(), parent_span_id.to_string());
+    }
+    if single_header {
+        let mut value = format!("{}-{span_id}-{sampled}", active.trace_id);
+        if let Some(parent_span_id) = parent_span_id.as_deref() {
+            value.push('-');
+            value.push_str(parent_span_id);
+        }
+        headers.insert("b3".to_string(), value);
+    }
 }
 
 thread_local! {

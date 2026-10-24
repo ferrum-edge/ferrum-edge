@@ -805,6 +805,93 @@ async fn mesh_authz_reads_materialized_hbone_baggage_source_identity() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
+fn hbone_wire_context(wire_baggage: Option<&str>) -> RequestContext {
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/ztunnel"));
+    ctx.metadata
+        .insert("request_protocol".to_string(), "hbone".to_string());
+    let mut wire = http::HeaderMap::new();
+    wire.insert("x-request-id", "hbone-wire".parse().expect("header value"));
+    if let Some(baggage) = wire_baggage {
+        wire.insert("baggage", baggage.parse().expect("header value"));
+    }
+    ctx.set_raw_headers(wire);
+    ctx
+}
+
+fn stamped_source_principal(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("mesh.source.principal")
+        .map(String::as_str)
+}
+
+/// workload_metrics-MUSE-1: telemetry reads HBONE baggage exactly as
+/// `mesh_authz` does (every wire field-line plus the folded map), so a wire
+/// assertion whose folded copy is absent is still the attributed source, and
+/// a transformer that strips the forwarded `baggage` does not undo it.
+#[tokio::test]
+async fn workload_metrics_attributes_wire_hbone_baggage_like_mesh_authz() {
+    let metrics = WorkloadMetrics::new(&json!({})).expect("metrics config");
+    let authz = MeshAuthz::new(&json!({
+        "mesh_policies": [allow_client_policy(PolicyAction::Allow)]
+    }))
+    .expect("authz config");
+    // Wire baggage only: the folded `ctx.headers` copy is absent.
+    let mut ctx = hbone_wire_context(Some(
+        "source.principal=spiffe://cluster.local/ns/default/sa/client",
+    ));
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        stamped_source_principal(&ctx),
+        Some("spiffe://cluster.local/ns/default/sa/client")
+    );
+    // Authorization honors the same wire assertion.
+    let result = authz.authorize(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    // The backend-visible map no longer carries baggage (stripped before
+    // forwarding); attribution still matches the authorized identity.
+    let mut headers = HashMap::new();
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        stamped_source_principal(&ctx),
+        Some("spiffe://cluster.local/ns/default/sa/client")
+    );
+}
+
+/// workload_metrics-MUSE-1: a `baggage` header added to the backend request
+/// after authorization (for example by `request_transformer`) was never
+/// evaluated by `mesh_authz`, so telemetry must not newly honor it.
+#[tokio::test]
+async fn workload_metrics_ignores_baggage_added_after_authorization() {
+    let metrics = WorkloadMetrics::new(&json!({})).expect("metrics config");
+    let mut ctx = hbone_wire_context(None);
+    ctx.materialize_headers();
+
+    let result = metrics.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        stamped_source_principal(&ctx),
+        Some("spiffe://cluster.local/ns/default/sa/ztunnel")
+    );
+
+    let mut headers = ctx.headers.clone();
+    headers.insert(
+        "baggage".to_string(),
+        "source.principal=spiffe://cluster.local/ns/default/sa/victim".to_string(),
+    );
+    let result = metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        stamped_source_principal(&ctx),
+        Some("spiffe://cluster.local/ns/default/sa/ztunnel"),
+        "post-authorization baggage must not rewrite the source"
+    );
+    assert!(!ctx.metadata.contains_key("mesh.ignored_baggage"));
+}
+
 #[tokio::test]
 async fn mesh_authz_ignores_hbone_baggage_from_untrusted_assertor() {
     let plugin = MeshAuthz::new(&json!({
