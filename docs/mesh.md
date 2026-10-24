@@ -4029,9 +4029,17 @@ label another plugin rewrote is reported as the metadata says. When every
 plugin in the chain is an audited non-observer (`spiffe_identity`,
 `mesh_authz`, and a `workload_metrics` instance without span exporters — the
 default sidecar chain with access logging disabled), the label keys are left
-out of both metadata maps, since nothing could read them. Every other `mesh.*`
-key (`mesh.request_protocol`, `mesh.connection_security_policy`,
-`mesh.direction`, trace and tag keys) is always written.
+out of both metadata maps, since nothing could read them. Label deferral
+touches only the label keys: every other key the plugin stamps keeps its
+existing stamping conditions. `mesh.request_protocol` and
+`mesh.connection_security_policy` are always written; `mesh.direction` is
+written only when the request or stream has an established mesh direction;
+trace keys only when trace context is enabled and the traffic is sampled (or,
+for HTTP, carries incoming trace headers); and tag keys only as configured
+(custom and header-backed tags, metric tag overrides), with the derived CEL
+attribute keys stamped only when an active per-family override plan needs
+them. Optional keys can therefore be absent even on mesh traffic whose labels
+were projected eagerly.
 
 ### Service Graph
 
