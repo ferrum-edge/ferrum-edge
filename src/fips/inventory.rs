@@ -175,11 +175,12 @@ pub const INVENTORY: &[CryptoOperation] = &[
     CryptoOperation {
         operation: "CP/DP gRPC bearer-token HS256 signing and verification",
         location: "src/grpc/auth.rs",
-        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        implementation: "jsonwebtoken (aws_lc_rs backend; the validated module on a fips build)",
         disposition: Disposition::ModuleRoutable,
-        rationale: "the `fips` cargo feature selects jsonwebtoken/aws_lc_rs and excludes \
-                    jsonwebtoken/rust_crypto, so HS256 runs in the module. Key length is floored \
-                    by fips::policy::check_env_config",
+        rationale: "jsonwebtoken selects aws_lc_rs inline on both profiles and rust_crypto is \
+                    never compiled; the `fips` feature routes that aws-lc-rs onto the module \
+                    (aws-lc-rs/fips), so HS256 runs in the module. Key length is floored by \
+                    fips::policy::check_env_config",
     },
     // ── DTLS ────────────────────────────────────────────────────────────
     CryptoOperation {
@@ -232,17 +233,19 @@ pub const INVENTORY: &[CryptoOperation] = &[
     CryptoOperation {
         operation: "Admin API JWT verification",
         location: "src/admin/jwt_auth.rs",
-        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        implementation: "jsonwebtoken (aws_lc_rs backend; the validated module on a fips build)",
         disposition: Disposition::ModuleRoutable,
-        rationale: "the `fips` cargo feature selects jsonwebtoken/aws_lc_rs",
+        rationale: "jsonwebtoken selects aws_lc_rs inline on both profiles and the `fips` \
+                    feature routes it onto the module (aws-lc-rs/fips)",
     },
     CryptoOperation {
         operation: "Request-path and CP/DP trust-bundle JWT/JWKS verification",
         location: "src/plugins/jwt_auth.rs, src/plugins/jwks_auth.rs, src/grpc/cp_trust.rs",
-        implementation: "jsonwebtoken (aws_lc_rs backend on a fips build)",
+        implementation: "jsonwebtoken (aws_lc_rs backend; the validated module on a fips build)",
         disposition: Disposition::ModuleRoutable,
         rationale: "algorithms are screened against fips::policy::APPROVED_JWT_ALGORITHMS at \
-                    config admission and the implementation is selected by the `fips` feature",
+                    config admission, and the `fips` feature routes jsonwebtoken's inline \
+                    aws_lc_rs backend onto the module",
     },
     CryptoOperation {
         operation: "JWT-SVID authority EC public-key point validation (P-256 / P-384)",

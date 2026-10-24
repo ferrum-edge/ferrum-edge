@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **JWT signing and verification run on AWS-LC in the default build.**
+  `jsonwebtoken` now selects its `aws_lc_rs` backend inline on both profiles
+  instead of `rust_crypto` on the default `crypto-ring` profile; a `fips` build
+  still routes it onto the validated module. This removes the RustCrypto
+  `p256`/`p384` 0.13 → `crypto-bigint` 0.5.5 signers (RUSTSEC-2026-0387) that
+  minted ES256 JWT-SVIDs and ES256/ES384 `private_key_jwt` client assertions,
+  and the RustCrypto `rsa` signer (RUSTSEC-2023-0071) used for RS* assertions
+  and `ai_federation` service-account JWTs. RSA keys must now be 2048–8192
+  bits for **verification as well as signing**:
+  - `oidc_relying_party` and `oauth2_introspection` trial-sign their
+    assertion key at config load, so a shorter key is refused there.
+  - `jwks_auth`, OIDC and mesh `RequestAuthentication` JWKS keys and JWT-SVID
+    authorities already enforced 2048–8192 bits.
+  - CP/DP trust-bundle (`FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH`) RSA public keys
+    outside the range are now refused at load and reload, with the size named.
+    A refused reload keeps the previous verifier.
+  - A DPoP proof whose RSA `jwk` is outside the range is refused as
+    `invalid_dpop_proof` ("DPoP RSA key must be 2048-8192 bits") before its
+    signature is checked.
+  - An `ai_federation` service-account key outside the range would fail on
+    first token exchange. GCP issues 2048-bit keys.
+  ECDSA signatures are randomized rather than RFC 6979 deterministic; both are
+  valid ES256/ES384.
 - **Backend pools keep up to 256 idle connections per host by default**
   (issue #6793), up from 64. `FERRUM_POOL_MAX_IDLE_PER_HOST` is a ceiling, not
   a reservation: a pool keeps only connections that concurrent requests opened,

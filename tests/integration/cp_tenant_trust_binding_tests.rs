@@ -3648,3 +3648,109 @@ async fn stale_trust_ends_the_shared_authorization_lease() {
     let reason = waiter.await.expect("lease waiter must not panic");
     assert_eq!(reason.label(), "trust_stale");
 }
+
+/// DER length octets.
+fn der_length(len: usize) -> Vec<u8> {
+    if len < 0x80 {
+        return vec![len as u8];
+    }
+    let bytes: Vec<u8> = len
+        .to_be_bytes()
+        .into_iter()
+        .skip_while(|b| *b == 0)
+        .collect();
+    let mut out = vec![0x80 | bytes.len() as u8];
+    out.extend(bytes);
+    out
+}
+
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(der_length(content.len()));
+    out.extend_from_slice(content);
+    out
+}
+
+/// A syntactically valid RSA public key of exactly `bits` modulus bits.
+///
+/// Admission measures only the modulus, so the value need not be a product of
+/// primes; that keeps a 16384-bit case cheap. Returns (SPKI PEM, PKCS#1 PEM).
+fn synthetic_rsa_public_key_pems(bits: usize) -> (String, String) {
+    use base64::Engine as _;
+    let mut modulus = vec![0xff_u8; bits / 8];
+    // Leading 0x00 keeps the DER INTEGER positive; the top bit stays set so the
+    // significant bit length is exactly `bits`.
+    modulus.insert(0, 0x00);
+    let mut pkcs1 = der_tlv(0x02, &modulus);
+    pkcs1.extend(der_tlv(0x02, &[0x01, 0x00, 0x01]));
+    let pkcs1 = der_tlv(0x30, &pkcs1);
+    let mut algorithm = der_tlv(
+        0x06,
+        &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
+    );
+    algorithm.extend([0x05, 0x00]);
+    let mut spki = der_tlv(0x30, &algorithm);
+    let mut bit_string = vec![0x00];
+    bit_string.extend(&pkcs1);
+    spki.extend(der_tlv(0x03, &bit_string));
+    let spki = der_tlv(0x30, &spki);
+    let pem = |label: &str, der: &[u8]| {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        let body: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
+            .collect();
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            body.join("\n")
+        )
+    };
+    (pem("PUBLIC KEY", &spki), pem("RSA PUBLIC KEY", &pkcs1))
+}
+
+/// jsonwebtoken's AWS-LC backend verifies RS*/PS* only with 2048-8192-bit RSA
+/// keys, on every build profile. A trust bundle naming a key outside that
+/// window is refused at load (and so at reload, which keeps the previous
+/// verifier), with the size named, instead of admitting a key every token
+/// would then fail against.
+#[test]
+fn trust_bundle_admits_rsa_public_keys_only_inside_the_jwt_backend_window() {
+    let document = |algorithm: &str, pem: &str| {
+        json!({ "version": 1, "keys": [{ "kid": "rsa", "algorithm": algorithm,
+                "public_key_pem": pem, "namespaces": [TENANT_A] }] })
+        .to_string()
+    };
+    for bits in [2048, 4096] {
+        let (spki, pkcs1) = synthetic_rsa_public_key_pems(bits);
+        for (form, pem) in [("SPKI", &spki), ("PKCS#1", &pkcs1)] {
+            for algorithm in ["RS256", "PS512"] {
+                let bundle = CpDpTrustBundle::from_document_str(
+                    &document(algorithm, pem),
+                    "rsa-window",
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("{bits}-bit {form} {algorithm} key must load: {e}"));
+                assert_eq!(bundle.key_count(), 1);
+            }
+        }
+    }
+    for bits in [1024, 16384] {
+        let (spki, pkcs1) = synthetic_rsa_public_key_pems(bits);
+        for (form, pem) in [("SPKI", &spki), ("PKCS#1", &pkcs1)] {
+            for algorithm in ["RS256", "PS256"] {
+                let error = CpDpTrustBundle::from_document_str(
+                    &document(algorithm, pem),
+                    "rsa-window",
+                    None,
+                )
+                .expect_err("an out-of-window RSA key must be refused at admission");
+                assert!(
+                    error.contains(&format!("RSA public key is {bits} bits"))
+                        && error.contains("2048-8192"),
+                    "{bits}-bit {form} {algorithm}: unexpected error: {error}"
+                );
+            }
+        }
+    }
+}
