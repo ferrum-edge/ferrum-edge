@@ -340,13 +340,13 @@ const PROBE_GUARD_SETTLE_PATHS: &[(&str, &str, &str, &str)] = &[
         "explicit gateway-side refusal",
         "    pub fn release_neutral(&self) {",
         "\n    }\n",
-        "record_neutral_for_admission(true, self.admission_generation)",
+        "record_neutral_for_admission(true, admission_generation)",
     ),
     (
         "dropped future (client disconnect)",
         "impl Drop for HalfOpenProbeGuard {",
         "\n}\n",
-        "record_neutral_for_admission(true, self.admission_generation)",
+        "record_neutral_for_admission(true, admission_generation)",
     ),
     (
         "gRPC streaming recorder handoff",
@@ -489,39 +489,99 @@ fn taking_the_probe_slot_is_what_disarms_the_guard() {
 }
 
 /// Issue #6799: only admission (`CircuitBreakerCache::can_execute`, inside
-/// `src/circuit_breaker.rs`) may replace a cached breaker whose config changed.
-/// Every completion, probe-guard and recorder site resolves its breaker through
-/// the read-only `get_for_completion`, so a request's captured (possibly older)
-/// config can never swap a live — possibly OPEN — breaker for a fresh one.
+/// `src/circuit_breaker.rs`) may resolve — and, on a config change, replace — a
+/// cached breaker. Every completion settles on the breaker instance its
+/// admission returned (`HalfOpenProbeGuard`), checked for identity with
+/// `CircuitBreakerCache::is_current`, so a request's captured config can never
+/// replace live state or settle on an instance it never ran against.
+///
+/// Receiver-agnostic: ANY `.get_or_create(` / `::get_or_create(` call outside
+/// `src/circuit_breaker.rs` fails, whatever the receiver is called and however
+/// rustfmt breaks the line. Identifiers that merely start with the name
+/// (`get_or_create_sender(`) do not match.
 #[test]
 fn no_breaker_completion_path_uses_the_replacing_lookup() {
     for (path, text) in production_sources() {
         if path == "src/circuit_breaker.rs" {
             continue;
         }
-        let production = without_inline_test_module(&text);
-        for replacing in [
-            "circuit_breaker_cache.get_or_create(",
-            "cb_cache.get_or_create(",
-        ] {
+        let production: String = without_inline_test_module(&text)
+            .split_whitespace()
+            .collect();
+        for replacing in [".get_or_create(", "::get_or_create("] {
             assert!(
                 !production.contains(replacing),
-                "{path} resolves a circuit breaker with `{replacing}`; completions must use \
-                 `get_for_completion` (read-only, config-matched) and admissions \
-                 `can_execute`, so a stale config cannot replace live breaker state"
+                "{path} calls `{replacing}`; completions must settle on the breaker their \
+                 admission returned (`HalfOpenProbeGuard::current_breaker` / `settle`), and \
+                 only admissions (`can_execute`) may resolve a breaker"
             );
         }
     }
     let shared_recorder = source("src/proxy/backend_dispatch.rs");
-    let recorder = item_body(
+    let recorder: String = item_body(
         &shared_recorder,
         "fn record_backend_outcome_inner(",
         "\n}\n",
-    );
+    )
+    .split_whitespace()
+    .collect();
     assert!(
-        recorder.contains("circuit_breaker_cache.get_for_completion("),
-        "the shared ordinary-completion recorder must settle through `get_for_completion`"
+        recorder.contains("cb_settlement.breaker")
+            && recorder.contains("circuit_breaker_cache.is_current("),
+        "the shared ordinary-completion recorder must settle on the admitting breaker, \
+         checked for identity with `is_current`"
     );
+}
+
+/// Issue #6799 (sibling): every HTTP/3 native and cross-protocol retry loop
+/// admits each retry attempt through the breaker of the target it will dial,
+/// exactly as the H1/H2 HTTP, gRPC and WebSocket retry loops do. Without it a
+/// rotated target that was never admitted has no cached breaker, so its
+/// outcome could not settle anywhere and its failures would never open it.
+const RETRY_ADMISSION_SITES: &[(&str, &str, usize)] = &[
+    // Native H3 buffered retry loop.
+    ("src/http3/server.rs", "async fn handle_h3_request(", 1),
+    // H3 -> HTTP plain bridge: mesh arm plus the reqwest success / error arms.
+    (
+        "src/http3/cross_protocol.rs",
+        "async fn dispatch_plain<S>(",
+        3,
+    ),
+    // H3 -> gRPC bridge buffered retry loop.
+    (
+        "src/http3/cross_protocol.rs",
+        "async fn dispatch_grpc<S>(",
+        1,
+    ),
+];
+
+#[test]
+fn every_http3_retry_loop_admits_each_attempt_through_the_circuit_breaker() {
+    for &(file, signature, expected) in RETRY_ADMISSION_SITES {
+        let text = source(file);
+        let body: String = item_body(&text, signature, "\n}\n")
+            .split_whitespace()
+            .collect();
+        let call = "crate::proxy::admit_retry_attempt(";
+        assert_eq!(
+            body.matches(call).count(),
+            expected,
+            "{file} `{signature}` must admit every retry attempt through the breaker"
+        );
+        for admission in body.split(call).skip(1) {
+            let args = admission.split_once("cb_probe").map(|(args, _)| args);
+            assert!(
+                args.is_some_and(|args| args.len() < 80),
+                "{file} `{signature}`: each retry admission must re-point the request's \
+                 probe guard (`cb_probe`)"
+            );
+        }
+    }
+    let admission = source("src/proxy/mod.rs");
+    let helper = item_body(&admission, "pub(crate) fn admit_retry_attempt(", "\n}\n");
+    assert!(helper.contains("circuit_breaker_cache.can_execute("));
+    assert!(helper.contains("cb_probe.rearm(&cb, is_half_open_probe, admission_generation)"));
+    assert!(helper.contains("cb_probe.retire()"));
 }
 
 fn probe_breaker_config() -> CircuitBreakerConfig {

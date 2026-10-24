@@ -89,11 +89,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and DTLS) treated the older config as a change. It replaced the live
   breaker, possibly OPEN, with a fresh CLOSED one, and the next admission
   replaced it again. The new breaker's failures and open state were lost and
-  traffic was re-admitted. Completions now settle through a read-only
-  `CircuitBreakerCache::get_for_completion` lookup. It returns the cached
-  breaker only while that breaker still runs the captured config, so an
-  outcome for a replaced or pruned breaker is discarded. Admission still
-  replaces a breaker whose config changed.
+  traffic was re-admitted. Each attempt now keeps the breaker instance its
+  admission returned, CLOSED admissions included, and settles its outcome and
+  probe slot on that instance only while it is still the cached breaker
+  (`CircuitBreakerCache::is_current`). A completion whose breaker was replaced
+  is dropped, including after an A→B→A reload or a prune that recreated the
+  key with the same config. Any probe slot it holds is returned on the
+  breaker that admitted it. Admission still replaces a breaker whose config
+  changed. HTTP/3 native and cross-protocol (HTTP and gRPC bridge) retries now
+  admit every attempt through the target's breaker, as the HTTP/1.1 and
+  HTTP/2 retry loops do. An OPEN breaker refuses the retry, and a rotated
+  target that was never admitted before now has its failures recorded.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

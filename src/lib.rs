@@ -4867,10 +4867,11 @@ pub mod _test_support {
     }
 
     /// Drive the shared ordinary-completion recorder
-    /// (`record_backend_outcome_no_conn_end`) for a request admitted under
+    /// (`record_backend_outcome_no_conn_end`) for an attempt admitted under
     /// `proxy` — the request's captured snapshot, whose breaker config may be
-    /// older than the live one (issue #6799). No balancer or upstream target is
-    /// attributed, so only the circuit-breaker arm runs.
+    /// older than the live one — and owned by `cb_probe` (issue #6799). No
+    /// balancer or upstream target is attributed, so only the circuit-breaker
+    /// arm runs.
     pub fn record_backend_completion_for_test(
         state: &crate::proxy::ProxyState,
         proxy: &crate::config::types::Proxy,
@@ -4878,7 +4879,7 @@ pub mod _test_support {
         response_status: u16,
         connection_error: bool,
         error_class: Option<crate::retry::ErrorClass>,
-        is_half_open_probe: bool,
+        cb_probe: &crate::proxy::HalfOpenProbeGuard,
     ) {
         let epoch = state.request_epoch.load();
         crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
@@ -4891,10 +4892,22 @@ pub mod _test_support {
             response_status,
             connection_error,
             error_class,
-            is_half_open_probe,
+            cb_probe.settle(),
             false,
             std::time::Duration::ZERO,
         );
+    }
+
+    /// Drive the production retry-attempt circuit-breaker admission every
+    /// HTTP/3 native and cross-protocol retry loop runs before dialing the next
+    /// (possibly rotated, possibly not yet cached) target (issue #6799).
+    pub fn admit_retry_attempt_for_test(
+        state: &crate::proxy::ProxyState,
+        proxy: &crate::config::types::Proxy,
+        target_key: Option<&str>,
+        cb_probe: &crate::proxy::HalfOpenProbeGuard,
+    ) -> bool {
+        crate::proxy::admit_retry_attempt(state, proxy, target_key, cb_probe)
     }
 
     /// Drive the production UDP setup-failure ownership + emit path.

@@ -250,6 +250,7 @@ When both `retry` and `circuit_breaker` are configured on the same proxy, they w
 1. Each failed retry attempt is recorded as a failure against the target's circuit breaker **before** the next retry.
 2. If the circuit breaker opens for a target during retries, subsequent retry attempts route to different targets (via load balancing).
 3. The circuit breaker uses per-target tracking when an upstream is configured — a single target's breaker opening does not affect other targets.
+4. Every retry attempt is admitted by the breaker of the target it will dial, on every frontend (HTTP/1.1, HTTP/2, HTTP/3 native and cross-protocol, gRPC, WebSocket, TCP). An OPEN breaker refuses the retry, and the previous attempt's already-recorded result is served. An attempt's outcome settles on the breaker instance that admitted it. If a configuration reload or a target prune has since replaced that breaker, the outcome is dropped as stale and never applied to the new breaker.
 
 ```yaml
 retry:

@@ -1245,7 +1245,7 @@ pub(super) async fn handle_hbone_request(
     // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
     // responses are excluded from the deferred-dispatch path, #1649); the
     // admission generation only binds the probe guard's neutral release (#6177).
-    let (cb_target_key, cb_is_half_open_probe, cb_admission_generation) =
+    let (cb_target_key, cb_admitted, cb_is_half_open_probe, cb_admission_generation) =
         match backend_dispatch::check_circuit_breaker(proxy, state, upstream_target.as_deref()) {
             Ok(result) => result,
             Err(()) => {
@@ -1283,9 +1283,7 @@ pub(super) async fn handle_hbone_request(
     // that window drops this future without running either settle site. Dropping
     // the guard releases the slot NEUTRALLY instead of wedging the breaker.
     let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
-        state,
-        proxy,
-        cb_target_key.as_deref(),
+        cb_admitted.as_ref(),
         cb_is_half_open_probe,
         cb_admission_generation,
     );
@@ -1401,14 +1399,12 @@ pub(super) async fn handle_hbone_request(
                     (err.status, err.body, err.phase, err.class, false)
                 }
             };
-            if let Some(cb_config) = &proxy.circuit_breaker
-                && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
-                    &proxy.namespace,
-                    &proxy.id,
-                    cb_target_key.as_deref(),
-                    cb_config,
-                )
-            {
+            if let Some(cb) = cb_probe.current_breaker(
+                &state.circuit_breaker_cache,
+                &proxy.namespace,
+                &proxy.id,
+                cb_target_key.as_deref(),
+            ) {
                 settle_hbone_backend_connect_circuit_breaker_outcome(
                     &cb,
                     status,
@@ -1442,14 +1438,12 @@ pub(super) async fn handle_hbone_request(
     };
     let backend_elapsed = backend_start.elapsed();
 
-    if let Some(cb_config) = &proxy.circuit_breaker
-        && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
-            &proxy.namespace,
-            &proxy.id,
-            cb_target_key.as_deref(),
-            cb_config,
-        )
-    {
+    if let Some(cb) = cb_probe.current_breaker(
+        &state.circuit_breaker_cache,
+        &proxy.namespace,
+        &proxy.id,
+        cb_target_key.as_deref(),
+    ) {
         cb.record_success(cb_probe.take_slot());
     }
     if let (Some(upstream_id), Some(target)) = (&proxy.upstream_id, upstream_target.as_deref())

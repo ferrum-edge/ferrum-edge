@@ -821,16 +821,17 @@ pub(crate) fn concretize_wildcard_target_for_request(
 
 /// Check whether the circuit breaker allows this request to proceed.
 ///
-/// Returns `Ok((cb_target_key, is_half_open_probe))` when the request is allowed,
-/// or `Err(())` when the circuit is open and the request should be rejected with 503.
-/// The `is_half_open_probe` flag MUST be threaded into every subsequent
-/// `record_success` / `record_failure` call so the half-open in-flight counter
-/// is only decremented for requests that actually hold a probe slot.
+/// Returns `Ok((cb_target_key, admitted_breaker, is_half_open_probe,
+/// admission_generation))` when the request is allowed, or `Err(())` when the
+/// circuit is open and the request should be rejected with 503. The caller
+/// hands the admission to a `HalfOpenProbeGuard`, which settles the attempt's
+/// outcome and probe slot on exactly `admitted_breaker` (issue #6799) and only
+/// decrements the half-open in-flight counter for a request that holds a slot.
 pub(crate) fn check_circuit_breaker(
     proxy: &Proxy,
     state: &ProxyState,
     upstream_target: Option<&UpstreamTarget>,
-) -> Result<(Option<String>, bool, u64), ()> {
+) -> Result<CircuitBreakerAdmission, ()> {
     let cb_target_key = circuit_breaker_target_key(proxy, upstream_target);
 
     if let Some(cb_config) = &proxy.circuit_breaker {
@@ -849,8 +850,16 @@ pub(crate) fn check_circuit_breaker(
                 cb_target_key.as_deref(),
                 cb_config,
             ) {
-            Ok((_cb, is_half_open_probe, admission_open_epoch)) => {
-                return Ok((cb_target_key, is_half_open_probe, admission_open_epoch));
+            // Keep the admitting breaker: the attempt's outcome and probe slot
+            // settle on exactly this instance (issue #6799), never on one
+            // re-resolved later from the request's captured config.
+            Ok((cb, is_half_open_probe, admission_open_epoch)) => {
+                return Ok((
+                    cb_target_key,
+                    Some(cb),
+                    is_half_open_probe,
+                    admission_open_epoch,
+                ));
             }
             Err(_) => {
                 warn!(proxy_id = %proxy.id, "Request rejected: circuit breaker open");
@@ -859,8 +868,18 @@ pub(crate) fn check_circuit_breaker(
         }
     }
 
-    Ok((cb_target_key, false, 0))
+    Ok((cb_target_key, None, false, 0))
 }
+
+/// What [`check_circuit_breaker`] admitted: the breaker key, the admitting
+/// breaker instance (`None` when the proxy configures none), whether it admitted
+/// a HALF_OPEN probe, and the open generation the admission was decided in.
+pub(crate) type CircuitBreakerAdmission = (
+    Option<String>,
+    Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
+    bool,
+    u64,
+);
 
 fn circuit_breaker_target_key(
     proxy: &Proxy,
@@ -1044,7 +1063,7 @@ pub(crate) fn record_backend_outcome_no_conn_end(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    cb_settlement: crate::proxy::BreakerSettlement,
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
 ) {
@@ -1058,7 +1077,7 @@ pub(crate) fn record_backend_outcome_no_conn_end(
         response_status,
         connection_error,
         error_class,
-        is_half_open_probe,
+        cb_settlement,
         skip_circuit_breaker_record,
         backend_elapsed,
     );
@@ -1278,7 +1297,7 @@ fn record_backend_outcome_inner(
     response_status: u16,
     connection_error: bool,
     error_class: Option<ErrorClass>,
-    is_half_open_probe: bool,
+    cb_settlement: crate::proxy::BreakerSettlement,
     skip_circuit_breaker_record: bool,
     backend_elapsed: Duration,
 ) {
@@ -1326,27 +1345,34 @@ fn record_backend_outcome_inner(
     // For retries, intermediate failures were already recorded per-target inside
     // the retry loop, so this only records the final attempt's outcome.
     //
-    // `proxy` is the request's captured snapshot, so its breaker config may be
-    // older than the live one. Settle on the breaker that is still running that
-    // config, or drop the outcome as stale: a replacing lookup here would swap a
-    // live (possibly OPEN) breaker for a fresh CLOSED one built from the old
-    // config (issue #6799).
-    if !skip_circuit_breaker_record
-        && let Some(cb_config) = &proxy.circuit_breaker
-        && let Some(cb) = state.circuit_breaker_cache.get_for_completion(
+    // The outcome settles on the breaker instance that ADMITTED this attempt
+    // (`cb_settlement`), and only while that instance is still the cached
+    // breaker for the final key. A breaker that has since been replaced by a
+    // reload (A→B, or A→B→A) or reclaimed and recreated is a different
+    // instance: the outcome is stale and is dropped, and any probe slot is
+    // returned on the admitting breaker. Resolving the breaker again from the
+    // request's captured config would instead overwrite live, possibly OPEN,
+    // state (issue #6799).
+    if !skip_circuit_breaker_record && let Some(cb) = cb_settlement.breaker.as_ref() {
+        if state.circuit_breaker_cache.is_current(
             &proxy.namespace,
             &proxy.id,
             final_cb_target_key,
-            cb_config,
-        )
-    {
-        apply_circuit_breaker_outcome(
-            &cb,
-            response_status,
-            connection_error,
-            error_class,
-            is_half_open_probe,
-        );
+            cb,
+        ) {
+            apply_circuit_breaker_outcome(
+                cb,
+                response_status,
+                connection_error,
+                error_class,
+                cb_settlement.is_half_open_probe,
+            );
+        } else {
+            cb.record_neutral_for_admission(
+                cb_settlement.is_half_open_probe,
+                cb_settlement.admission_generation,
+            );
+        }
     }
 
     // Passive health check reporting (O(1) upstream lookup via index).
@@ -2556,7 +2582,7 @@ mod tests {
             200,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             std::time::Duration::ZERO,
         );
@@ -2624,8 +2650,13 @@ mod tests {
         cb.record_failure(500, false, false);
         assert_eq!(cb.state_name(), "open");
 
-        let (final_cb_target_key, is_half_open_probe, _admission_open_epoch) =
+        let (final_cb_target_key, admitted, is_half_open_probe, admission_open_epoch) =
             check_circuit_breaker(proxy, &state, None).expect("timeout=0 admits a probe");
+        let cb_probe = crate::proxy::HalfOpenProbeGuard::new(
+            admitted.as_ref(),
+            is_half_open_probe,
+            admission_open_epoch,
+        );
         assert!(
             is_half_open_probe,
             "the request must own a HALF_OPEN probe slot"
@@ -2643,7 +2674,7 @@ mod tests {
             413,
             false,
             Some(ErrorClass::RequestBodyTooLarge),
-            is_half_open_probe,
+            cb_probe.settle(),
             false,
             std::time::Duration::ZERO,
         );
@@ -2743,7 +2774,7 @@ mod tests {
             502,
             false,
             Some(ErrorClass::ClientDisconnect),
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             std::time::Duration::ZERO,
         );
@@ -2765,7 +2796,7 @@ mod tests {
             502,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             std::time::Duration::ZERO,
         );
@@ -2851,7 +2882,7 @@ mod tests {
             200,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             Duration::from_micros(2500),
         );
@@ -2893,7 +2924,7 @@ mod tests {
             200,
             false,
             None,
-            false,
+            crate::proxy::BreakerSettlement::none(),
             true,
             Duration::from_micros(2500),
         );
