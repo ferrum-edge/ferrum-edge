@@ -1247,8 +1247,9 @@ impl IdleH1 {
 /// left behind sit at the bottom unused and close once idle for the idle
 /// timeout, instead of being kept warm by round-robin reuse (issue #6793). The
 /// vector keeps its capacity across reuse, so a warm lane allocates nothing
-/// per request. The lock is held for exactly one push, pop or length read;
-/// connections are always dropped outside it.
+/// per request. Checkout and check-in hold the lock for one push or pop; the
+/// sweep holds it for one in-place scan of at most `max_idle` entries and
+/// retirement for one take. Connections are always dropped outside it.
 struct Http1Lane {
     idle: std::sync::Mutex<Vec<IdleH1>>,
     max_idle: usize,
@@ -1263,9 +1264,9 @@ struct Http1Lane {
 
 impl Http1Lane {
     fn idle(&self) -> std::sync::MutexGuard<'_, Vec<IdleH1>> {
-        // Nothing that holds this lock can panic (a push, pop, length read or
-        // a partition of plain values), so a poisoned guard still protects a
-        // consistent vector.
+        // Nothing that holds this lock can panic (a push, pop, length read,
+        // take or in-place extraction of plain values), so a poisoned guard
+        // still protects a consistent vector.
         self.idle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1274,6 +1275,9 @@ impl Http1Lane {
     fn retire(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         let retired = std::mem::take(&mut *self.idle());
+        self.counters
+            .evicted_retired
+            .fetch_add(retired.len() as u64, Ordering::Relaxed);
         drop(retired);
     }
 
@@ -1297,21 +1301,13 @@ impl Http1Lane {
         self.idle().len()
     }
 
-    /// Remove closed and expired entries, keeping the rest in order, and hand
-    /// them back so they drop outside the lock.
+    /// Remove closed and expired entries in place, keeping the rest in order
+    /// and the vector's capacity, and hand them back so they drop outside the
+    /// lock.
     fn take_stale(&self, now: std::time::Instant) -> Vec<IdleH1> {
-        let mut idle = self.idle();
-        if !idle
-            .iter()
-            .any(|entry| entry.sender.is_closed() || entry.expired(now))
-        {
-            return Vec::new();
-        }
-        let (stale, live): (Vec<_>, Vec<_>) = std::mem::take(&mut *idle)
-            .into_iter()
-            .partition(|entry| entry.sender.is_closed() || entry.expired(now));
-        *idle = live;
-        stale
+        self.idle()
+            .extract_if(.., |entry| entry.sender.is_closed() || entry.expired(now))
+            .collect()
     }
 }
 
@@ -1324,6 +1320,7 @@ pub(crate) struct Http1PoolCounters {
     evicted_ceiling: AtomicU64,
     evicted_expired: AtomicU64,
     evicted_closed: AtomicU64,
+    evicted_retired: AtomicU64,
 }
 
 impl Http1PoolCounters {
@@ -1347,9 +1344,10 @@ impl Http1PoolCounters {
 pub struct Http1PoolStats {
     /// Idle connections across every lane at scrape time.
     pub idle_connections: usize,
-    /// Connections dialed because no idle one was available.
+    /// Connections dialed: on an empty idle set, or fresh to replay an idle
+    /// keep-alive race.
     pub connections_opened: u64,
-    /// Checkouts served from the idle set.
+    /// Checkouts served from the idle set, counted before the request is sent.
     pub connections_reused: u64,
     /// Connections dropped at check-in because their lane held its ceiling.
     pub evicted_ceiling: u64,
@@ -1357,6 +1355,9 @@ pub struct Http1PoolStats {
     pub evicted_expired: u64,
     /// Idle connections discarded because the backend closed them.
     pub evicted_closed: u64,
+    /// Idle connections closed because a reload, certificate rotation or pool
+    /// clear withdrew their backend.
+    pub evicted_retired: u64,
 }
 
 pub(crate) struct Http1Lanes {
@@ -1478,6 +1479,7 @@ impl Http1Lanes {
             evicted_ceiling: counters.evicted_ceiling.load(Ordering::Relaxed),
             evicted_expired: counters.evicted_expired.load(Ordering::Relaxed),
             evicted_closed: counters.evicted_closed.load(Ordering::Relaxed),
+            evicted_retired: counters.evicted_retired.load(Ordering::Relaxed),
         }
     }
 }

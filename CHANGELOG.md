@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concurrency exceeded the old 64 had connections dropped at check-in and
   redialed: on the mesh runtime benchmark at 100 concurrent requests about 4% of
   requests dialed, costing about 2.5% of throughput and server CPU. In a paired
-  sweep, 128 and 256 matched a ceiling of 1024 exactly at 100 concurrent
-  requests and 256 matched it at 250; at 500, 256 churned again and cost the
+  sweep, 128 and 256 dialed nothing extra and were indistinguishable from a
+  ceiling of 1024 at 100 concurrent requests, as was 256 at 250; at 500, 256 churned again and cost the
   same 2.5%, so raise the ceiling (up to 1024) for that much sustained
   concurrency per backend. The direct HTTP/1.1 pool now reuses the most
   recently returned connection first, so connections a burst left behind close
@@ -26,9 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ferrum_connection_pool_h1_connections_opened_total`,
   `ferrum_connection_pool_h1_connections_reused_total` and
   `ferrum_connection_pool_h1_idle_evictions_total{reason}` show idle
-  connections, dials, reuse and evictions; a steady `reason="ceiling"` rate
-  means the ceiling is too low. Set `FERRUM_POOL_MAX_IDLE_PER_HOST=64` to keep
-  the previous ceiling.
+  connections, dials, reuse and evictions (ceiling, expired, closed,
+  retired); a steady `reason="ceiling"` rate means the ceiling is too low. Set
+  `FERRUM_POOL_MAX_IDLE_PER_HOST=64` to keep the previous ceiling.
 - **Mesh workload labels travel as typed facts** (issue #6793).
   `workload_metrics` now resolves the local workload's labels once per plugin
   generation and a verified TLS peer's SPIFFE labels once per connection, and

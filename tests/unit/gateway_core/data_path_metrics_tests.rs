@@ -491,6 +491,7 @@ fn direct_h1_pool_families_render_idle_dials_reuse_and_each_eviction_reason() {
         evicted_ceiling: 3,
         evicted_expired: 41,
         evicted_closed: 2,
+        evicted_retired: 5,
     };
     let mut out = String::new();
     data_path_metrics::render_direct_h1_pool(&mut out, &stats, NS_LABEL);
@@ -506,6 +507,7 @@ fn direct_h1_pool_families_render_idle_dials_reuse_and_each_eviction_reason() {
         "ferrum_connection_pool_h1_idle_evictions_total{reason=\"ceiling\",namespace=\"ferrum\"} 3",
         "ferrum_connection_pool_h1_idle_evictions_total{reason=\"expired\",namespace=\"ferrum\"} 41",
         "ferrum_connection_pool_h1_idle_evictions_total{reason=\"closed\",namespace=\"ferrum\"} 2",
+        "ferrum_connection_pool_h1_idle_evictions_total{reason=\"retired\",namespace=\"ferrum\"} 5",
     ] {
         assert!(
             out.lines().any(|candidate| candidate == line),
@@ -514,7 +516,7 @@ fn direct_h1_pool_families_render_idle_dials_reuse_and_each_eviction_reason() {
     }
     assert_eq!(
         samples(&out, "ferrum_connection_pool_h1_idle_evictions_total").len(),
-        3,
+        4,
         "exactly one series per eviction reason"
     );
 }

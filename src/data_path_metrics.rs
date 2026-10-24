@@ -595,7 +595,7 @@ pub fn render_direct_h1_pool(
     );
 
     output.push_str(
-        "# HELP ferrum_connection_pool_h1_connections_opened_total Connections the direct HTTP/1.1 backend pool dialed because no idle connection was available.\n",
+        "# HELP ferrum_connection_pool_h1_connections_opened_total Connections the direct HTTP/1.1 backend pool dialed, on an empty idle set or fresh to replay an idle keep-alive race.\n",
     );
     output.push_str("# TYPE ferrum_connection_pool_h1_connections_opened_total counter\n");
     push_scalar(
@@ -606,7 +606,7 @@ pub fn render_direct_h1_pool(
     );
 
     output.push_str(
-        "# HELP ferrum_connection_pool_h1_connections_reused_total Requests the direct HTTP/1.1 backend pool served on an idle connection.\n",
+        "# HELP ferrum_connection_pool_h1_connections_reused_total Checkouts the direct HTTP/1.1 backend pool served from its idle set, counted before the request is sent.\n",
     );
     output.push_str("# TYPE ferrum_connection_pool_h1_connections_reused_total counter\n");
     push_scalar(
@@ -617,13 +617,14 @@ pub fn render_direct_h1_pool(
     );
 
     output.push_str(
-        "# HELP ferrum_connection_pool_h1_idle_evictions_total Idle direct HTTP/1.1 backend connections the pool discarded: ceiling (dropped at check-in because the backend's idle set was full), expired (idle past the idle timeout), closed (closed by the backend while idle).\n",
+        "# HELP ferrum_connection_pool_h1_idle_evictions_total Idle direct HTTP/1.1 backend connections the pool discarded: ceiling (dropped at check-in because the backend's idle set was full), expired (idle past the idle timeout), closed (closed by the backend while idle), retired (closed because a reload, certificate rotation or pool clear withdrew the backend).\n",
     );
     output.push_str("# TYPE ferrum_connection_pool_h1_idle_evictions_total counter\n");
     for (reason, count) in [
         ("ceiling", stats.evicted_ceiling),
         ("expired", stats.evicted_expired),
         ("closed", stats.evicted_closed),
+        ("retired", stats.evicted_retired),
     ] {
         output.push_str(&format!(
             "ferrum_connection_pool_h1_idle_evictions_total{{reason=\"{reason}\"{ns_label}}} {count}\n"

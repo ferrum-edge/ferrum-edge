@@ -1275,7 +1275,7 @@
   {
     "name": "ferrum_connection_pool_h1_connections_opened_total",
     "type": "counter",
-    "help": "Connections the direct HTTP/1.1 backend pool dialed because no idle connection was available.",
+    "help": "Connections the direct HTTP/1.1 backend pool dialed, on an empty idle set or fresh to replay an idle keep-alive race.",
     "labels": [
       "namespace"
     ],
@@ -1287,7 +1287,7 @@
   {
     "name": "ferrum_connection_pool_h1_connections_reused_total",
     "type": "counter",
-    "help": "Requests the direct HTTP/1.1 backend pool served on an idle connection.",
+    "help": "Checkouts the direct HTTP/1.1 backend pool served from its idle set, counted before the request is sent.",
     "labels": [
       "namespace"
     ],
@@ -1311,7 +1311,7 @@
   {
     "name": "ferrum_connection_pool_h1_idle_evictions_total",
     "type": "counter",
-    "help": "Idle direct HTTP/1.1 backend connections the pool discarded: ceiling (dropped at check-in because the backend's idle set was full), expired (idle past the idle timeout), closed (closed by the backend while idle).",
+    "help": "Idle direct HTTP/1.1 backend connections the pool discarded: ceiling (dropped at check-in because the backend's idle set was full), expired (idle past the idle timeout), closed (closed by the backend while idle), retired (closed because a reload, certificate rotation or pool clear withdrew the backend).",
     "labels": [
       "reason",
       "namespace"

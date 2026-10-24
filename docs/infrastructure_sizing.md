@@ -164,10 +164,10 @@ The connection pool maintains persistent connections to upstream backends, reduc
 
 ```
 pool_memory ≈ Σ over pool identities and upstream hosts of
-              max(warmup connections, min(max_idle_per_host, peak_concurrency)) × 20 KB
+              max(warmup, min(max_idle_per_host, peak_concurrency)) × 20 KB
 ```
 
-A pool identity is one distinct client configuration a host is reached through: each reqwest client key (TLS policy, per-proxy pool overrides, HTTP version preference), the direct HTTP/1.1 pool, and the Unix-socket or HBONE pools in mesh mode. Each identity keeps only the connections its own concurrent requests opened, at most `max_idle_per_host`, and closes them once idle for `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`. Startup warmup opens one probe connection per identity and backend even before any traffic. With one identity per host and steady load, the estimate reduces to `upstream_hosts × peak_concurrency × 20 KB`.
+A pool identity is one distinct client configuration a host is reached through: each reqwest client key (TLS policy, per-proxy pool overrides, HTTP version preference), the direct HTTP/1.1 pool, and the Unix-socket or HBONE pools in mesh mode. Each identity keeps only the connections its own concurrent requests opened, at most `max_idle_per_host`, and closes them once idle for `FERRUM_POOL_IDLE_TIMEOUT_SECONDS`. `warmup` is the floor startup warmup sets before any traffic: 1 where it probed that backend through that reqwest client identity (`FERRUM_POOL_WARMUP_ENABLED=true`, the default), otherwise 0; it does not warm the direct HTTP/1.1, Unix-socket or HBONE pools. With one identity per host and a steady peak concurrency between that floor and the ceiling, the estimate reduces to `upstream_hosts × peak_concurrency × 20 KB`.
 
 | Upstream hosts | Peak concurrency/host (one identity) | Estimated pool memory |
 |----------------|-----------------------|----------------------|
@@ -373,7 +373,7 @@ For a rough estimate of total memory:
 ```
 total_memory ≈ base (30 MB)
              + route_table (proxies × 5 KB)
-             + connection_pool (Σ identities × hosts × min(max_idle_per_host, peak_concurrency) × 20 KB)
+             + connection_pool (Σ identities × hosts × max(warmup, min(max_idle_per_host, peak_concurrency)) × 20 KB)
              + request_buffers (concurrent_requests × avg_request_payload)
              + response_buffers (concurrent_requests × avg_response_payload)  [buffered mode only]
              + load_balancer (upstreams × targets × algorithm_overhead)

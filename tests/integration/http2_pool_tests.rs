@@ -3178,39 +3178,109 @@ async fn test_direct_h1_idle_set_holds_at_most_max_idle_per_host() {
     assert_eq!(stats.idle_connections, 0);
 }
 
+/// A backend that numbers its connections in accept order and answers every
+/// request with the number of the connection it arrived on.
+async fn numbering_backend() -> u16 {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    tokio::spawn(async move {
+        let mut accepted = 0usize;
+        while let Ok((stream, _)) = listener.accept().await {
+            let number = accepted;
+            accepted += 1;
+            tokio::spawn(async move {
+                let service = service_fn(move |_: Request<Incoming>| async move {
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
+                        number.to_string(),
+                    ))))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    port
+}
+
+/// Ask a numbering backend which connection `checkout` holds, then wait until
+/// the connection is ready for another request so a check-in pools it.
+async fn connection_number(checkout: &mut ferrum_edge::proxy::http2_pool::Http1Checkout) -> usize {
+    let request = Request::get("/")
+        .header("host", "127.0.0.1")
+        .body(ferrum_edge::proxy::body::DirectH1RequestBody::Empty)
+        .expect("request");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        checkout.sender.send_request(request),
+    )
+    .await
+    .expect("response in time")
+    .expect("response");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    tokio::time::timeout(Duration::from_secs(5), checkout.sender.ready())
+        .await
+        .expect("dispatcher ready in time")
+        .expect("dispatcher ready");
+    std::str::from_utf8(&body)
+        .expect("utf-8 body")
+        .parse()
+        .expect("connection number")
+}
+
 /// Checkout reuses the most recently pooled connection (LIFO), so the
 /// connections a burst left behind age at the bottom of the idle set and
-/// expire instead of being kept warm by round-robin reuse (issue #6793).
+/// expire instead of being kept warm by round-robin reuse. A drain counts the
+/// idle connection it closes as retired, and a checkout taken before the drain
+/// is not pooled again (issue #6793).
 #[tokio::test]
 async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
-    let proxy = direct_h1_proxy(holding_backend().await);
+    let proxy = direct_h1_proxy(numbering_backend().await);
     let pool = create_default_pool();
 
-    let older = ready_checkout(&pool, &proxy).await;
-    let newer = ready_checkout(&pool, &proxy).await;
-    let older_socket = older.backend_socket();
-    let newer_socket = newer.backend_socket();
+    let mut older = ready_checkout(&pool, &proxy).await;
+    let mut newer = ready_checkout(&pool, &proxy).await;
+    let older_number = connection_number(&mut older).await;
+    let newer_number = connection_number(&mut newer).await;
+    assert_ne!(older_number, newer_number);
     older.checkin();
     newer.checkin();
     assert_eq!(pool.h1_idle_connections(), 2);
 
-    let reused = pool
+    let mut reused = pool
         .checkout_h1(&proxy, false, Duration::from_secs(2), false)
         .await
         .expect("checkout");
     assert!(reused.reused());
-    // Connection identity comes from the send-queue probe's socket handle,
-    // which platforms without the probe do not expose.
-    if let (Some(older), Some(newer), Some(got)) =
-        (older_socket, newer_socket, reused.backend_socket())
-    {
-        assert!(
-            Arc::ptr_eq(&got, &newer),
-            "the newest idle connection is reused"
-        );
-        assert!(!Arc::ptr_eq(&got, &older));
-    }
+    assert_eq!(
+        connection_number(&mut reused).await,
+        newer_number,
+        "the newest idle connection is reused"
+    );
     assert_eq!(pool.h1_idle_connections(), 1);
+
+    pool.force_drain_all();
+    assert_eq!(pool.h1_idle_connections(), 0);
+    reused.checkin();
+    assert_eq!(
+        pool.h1_idle_connections(),
+        0,
+        "a checkout from before the drain is not pooled again"
+    );
+    let stats = pool.h1_pool_stats();
+    assert_eq!(
+        stats.evicted_retired, 1,
+        "the drain closed one idle connection"
+    );
+    assert_eq!(stats.connections_opened, 2);
+    assert_eq!(stats.connections_reused, 1);
 }
 
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A

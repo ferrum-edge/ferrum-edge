@@ -29,8 +29,8 @@ pub const MAX_IDLE_PER_HOST: usize = 1024;
 /// when a backend's sustained concurrency exceeds it, and then every check-in
 /// beyond it drops a connection that is redialed. On the mesh runtime
 /// benchmark that cost about 2.5% of throughput and server CPU (64 at 100
-/// concurrent requests, 256 at 500), while 128 and 256 matched 1024 exactly at
-/// 100 and 256 matched it at 250. 256 is the smallest ceiling that matched
+/// concurrent requests, 256 at 500), while 128 and 256 were indistinguishable
+/// from 1024 at 100, as was 256 at 250. 256 is the smallest ceiling that matched
 /// 1024 through 250 concurrent requests per backend; set
 /// `FERRUM_POOL_MAX_IDLE_PER_HOST` up to 1024 for higher sustained
 /// concurrency.

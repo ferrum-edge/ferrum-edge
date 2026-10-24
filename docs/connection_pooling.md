@@ -81,15 +81,15 @@ This setting controls how many idle backend connections are kept alive per host.
 
 **After a burst the pool shrinks by itself.** Checkout reuses the most recently returned connection, as hyper's own pool does. The connections a burst left behind therefore sit unused at the bottom of the idle set and close once idle for the timeout, while steady traffic keeps reusing the same few. The ceiling is not what returns a pool to its working size; the idle timeout is.
 
-**A ceiling below a backend's sustained concurrency causes churn.** Under steady load most connections sit idle between requests. When more of them are idle at once than the ceiling allows, every check-in beyond it closes a connection, and a later request dials a new one. On the mesh runtime benchmark (issue #6793), churn cost about 2.5% of throughput and server CPU wherever it happened: a ceiling of 64 at 100 concurrent requests made about 4% of requests dial, and 256 at 500 about 1%. Where the ceiling stayed above concurrency (128 and 256 at 100 concurrent requests, 256 at 250) results matched a ceiling of 1024 exactly, with the same connections, CPU, latency and memory. The default, 256, is the smallest ceiling that matched 1024 through 250 concurrent requests per backend.
+**A ceiling below a backend's sustained concurrency causes churn.** Under steady load most connections sit idle between requests. When more of them are idle at once than the ceiling allows, every check-in beyond it closes a connection, and a later request dials a new one. On the mesh runtime benchmark (issue #6793), churn cost about 2.5% of throughput and server CPU wherever it happened: a ceiling of 64 at 100 concurrent requests made about 4% of requests dial, and 256 at 500 about 1%. Where the ceiling stayed above concurrency (128 and 256 at 100 concurrent requests, 256 at 250) the pool dialed nothing beyond its initial connections, and throughput and server CPU were indistinguishable from a ceiling of 1024. The default, 256, is the smallest ceiling that matched 1024 through 250 concurrent requests per backend.
 
 ### Watching it
 
 The direct HTTP/1.1 pool exports four families on `/metrics` (see [prometheus_metrics.md](prometheus_metrics.md)):
 
 - `ferrum_connection_pool_h1_idle_connections`: idle connections at scrape time.
-- `ferrum_connection_pool_h1_connections_opened_total` and `ferrum_connection_pool_h1_connections_reused_total`: under steady load almost every request should reuse.
-- `ferrum_connection_pool_h1_idle_evictions_total{reason}`: `expired` is the normal shrink after a burst, and `closed` counts connections the backend closed while idle. A steady `ceiling` rate means a backend's concurrency exceeds the ceiling and connections are being redialed, so raise it.
+- `ferrum_connection_pool_h1_connections_opened_total` and `ferrum_connection_pool_h1_connections_reused_total`: dials and checkouts served from the idle set. Under steady load almost every checkout should reuse; dials also include fresh connections that replay an idle keep-alive race.
+- `ferrum_connection_pool_h1_idle_evictions_total{reason}`: `expired` is the normal shrink after a burst, `closed` counts connections the backend closed while idle, and `retired` counts idle connections closed when a reload, certificate rotation or pool clear withdrew their backend. A steady `ceiling` rate means a backend's concurrency exceeds the ceiling and connections are being redialed, so raise it.
 
 ### When to raise it
 
