@@ -3361,14 +3361,23 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
     //
     // A workload that declares ports admits only those ports; one that declares
     // none does not constrain its address (the same rule the HBONE open-relay
-    // guard applies).
+    // guard applies). Addresses compare CANONICALLY (`IpAddr::to_canonical` on
+    // both sides), exactly as the relay ownership guard and `mesh_authz`'s
+    // capture-destination scope index do, so an alternate spelling of one
+    // address (an IPv4-mapped IPv6 original destination, a zero-padded IPv6
+    // record) can never resolve on one inbound surface and not the other.
+    // Parsing borrows; nothing is allocated per connection.
+    let captured_address = orig_dst.ip().to_canonical();
     let owns_destination = |workload: &crate::modes::mesh::config::Workload| {
-        workload.addresses.iter().any(|addr| addr == &host)
-            && (workload.ports.is_empty()
-                || workload
-                    .ports
-                    .iter()
-                    .any(|workload_port| workload_port.port == orig_dst.port()))
+        workload.addresses.iter().any(|addr| {
+            addr.trim()
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|addr| addr.to_canonical() == captured_address)
+        }) && (workload.ports.is_empty()
+            || workload
+                .ports
+                .iter()
+                .any(|workload_port| workload_port.port == orig_dst.port()))
     };
     // Exactly one workload identity may own the captured address. Duplicate
     // records for one pod (several services backed by the same workload) are

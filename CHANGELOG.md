@@ -122,8 +122,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   generation; reload keeps the previous one), so a control plane that predates
   this inventory cannot serve captured destinations without their policies.
   Authenticated inbound HBONE relays to those destinations now resolve the
-  destination's scope from the same inventory, so their policies are evaluated
-  instead of the relay being refused for a missing scope.
+  destination's scope from the same inventory, which takes precedence over any
+  ordinary record for the same address, so their policies are evaluated instead
+  of the relay being refused for a missing scope. The transparent capture
+  resolver now compares destination addresses canonically, matching the relay
+  guard.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

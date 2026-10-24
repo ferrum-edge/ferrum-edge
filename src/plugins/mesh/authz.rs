@@ -396,12 +396,17 @@ enum NodeWaypointAuthorizedDestination {
 /// all. It is a SEPARATE view: it never feeds routing, known destinations, or
 /// the ordinary service-derived index.
 ///
-/// Resolution mirrors the transparent capture resolver: the address is matched
-/// canonically, a workload that declares ports admits only those ports (one
-/// that declares none does not constrain its address), and two matching records
-/// with divergent scopes resolve to NOTHING (fail closed) rather than picking
-/// whose policy applies. Built once per plugin generation; lookup is one parse
-/// plus one hash probe over a tiny per-address list.
+/// Resolution: the address is matched canonically (parsed and
+/// `IpAddr::to_canonical`, the same rule the inbound relay ownership guard and
+/// the transparent capture resolver apply), a workload that declares ports
+/// admits only those ports (one that declares none does not constrain its
+/// address), and two matching records with divergent scopes resolve to NOTHING
+/// (fail closed) rather than picking whose policy applies. For the relay, an
+/// address this inventory names is AUTHORITATIVE: an undeclared port or an
+/// ambiguity refuses the scope instead of falling back to the ordinary
+/// service-derived index, whose record for the same address need not belong to
+/// the destination the relay guard admitted. Built once per plugin generation;
+/// lookup is one parse plus one hash probe over a tiny per-address list.
 #[derive(Default)]
 struct NodeWaypointCaptureDestinationScopes {
     by_address: HashMap<std::net::IpAddr, Vec<NodeWaypointCaptureDestinationScope>>,
@@ -437,28 +442,46 @@ impl NodeWaypointCaptureDestinationScopes {
         Self { by_address }
     }
 
-    fn resolve(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> Option<&crate::modes::mesh::runtime::PolicyScopeCache> {
+    fn lookup(&self, host: &str, port: u16) -> NodeWaypointCaptureScopeLookup<'_> {
+        let Ok(address) = host.trim().parse::<std::net::IpAddr>() else {
+            return NodeWaypointCaptureScopeLookup::NotCaptured;
+        };
+        let Some(entries) = self.by_address.get(&address.to_canonical()) else {
+            return NodeWaypointCaptureScopeLookup::NotCaptured;
+        };
         if port == 0 {
-            return None;
+            return NodeWaypointCaptureScopeLookup::Refused;
         }
-        let address = host.trim().parse::<std::net::IpAddr>().ok()?.to_canonical();
         let mut resolved: Option<&crate::modes::mesh::runtime::PolicyScopeCache> = None;
-        for entry in self.by_address.get(&address)? {
+        for entry in entries {
             if !entry.ports.is_empty() && !entry.ports.contains(&port) {
                 continue;
             }
             match resolved {
-                Some(existing) if existing != &entry.scope => return None,
+                Some(existing) if existing != &entry.scope => {
+                    return NodeWaypointCaptureScopeLookup::Refused;
+                }
                 Some(_) => {}
                 None => resolved = Some(&entry.scope),
             }
         }
-        resolved
+        match resolved {
+            Some(scope) => NodeWaypointCaptureScopeLookup::Resolved(scope),
+            None => NodeWaypointCaptureScopeLookup::Refused,
+        }
     }
+}
+
+/// Outcome of a capture-destination scope lookup.
+enum NodeWaypointCaptureScopeLookup<'a> {
+    /// The inventory does not name this address (or it is not an IP); the
+    /// ordinary destination index decides.
+    NotCaptured,
+    /// The inventory names this address and resolves exactly one scope.
+    Resolved(&'a crate::modes::mesh::runtime::PolicyScopeCache),
+    /// The inventory names this address but cannot resolve one scope for it
+    /// (undeclared port, divergent records): no scope, never a fallback.
+    Refused,
 }
 
 struct DestinationScopeMatch<'a> {
@@ -2503,32 +2526,48 @@ impl MeshAuthz {
             })
     }
 
-    /// Destination scope for the synthesized inbound HBONE relay from the
-    /// NodeWaypoint capture-destination inventory. `None` for any other proxy,
-    /// an unknown/non-IP destination, an undeclared port, or ambiguous records.
-    /// The authorized-destination stamp names the exact relayed backend, so
-    /// route dispatch stays bound to the destination whose policies were
-    /// evaluated.
-    fn capture_destination_scope_match_for_inbound_relay(
+    /// NodeWaypoint per-pod destination scope for the matched proxy.
+    ///
+    /// For the exact synthesized inbound HBONE relay, the capture-destination
+    /// inventory is AUTHORITATIVE whenever it names the relayed address: the
+    /// relay guard admitted that destination FROM this inventory, so its scope
+    /// is the one whose policies must be evaluated. An ordinary
+    /// service-derived record for the same address (a stale or reused address
+    /// in the subscription-namespace view) never preempts it, and an
+    /// unresolvable capture lookup (undeclared port, divergent records) yields
+    /// no scope rather than falling back to that record. Every other proxy,
+    /// and a relayed address the inventory does not name, keeps the ordinary
+    /// index. The authorized-destination stamp names the exact relayed
+    /// backend, so route dispatch stays bound to the destination whose policies
+    /// were evaluated.
+    fn node_waypoint_destination_scope_match(
         &self,
         proxy: &Proxy,
     ) -> Option<DestinationScopeMatch<'_>> {
         if proxy.id != crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID
             || proxy.upstream_id.is_some()
         {
-            return None;
+            return self.destination_scope_match_for_proxy(proxy);
         }
-        let scope = self
+        match self
             .node_waypoint_capture_destination_scopes
-            .resolve(&proxy.backend_host, proxy.backend_port)?;
-        let key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
-        Some(DestinationScopeMatch {
-            authorized_destination: NodeWaypointAuthorizedDestination::Backend {
-                aliases: vec![key.clone()],
-                key,
-            },
-            scopes: std::slice::from_ref(scope),
-        })
+            .lookup(&proxy.backend_host, proxy.backend_port)
+        {
+            NodeWaypointCaptureScopeLookup::NotCaptured => {
+                self.destination_scope_match_for_proxy(proxy)
+            }
+            NodeWaypointCaptureScopeLookup::Refused => None,
+            NodeWaypointCaptureScopeLookup::Resolved(scope) => {
+                let key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
+                Some(DestinationScopeMatch {
+                    authorized_destination: NodeWaypointAuthorizedDestination::Backend {
+                        aliases: vec![key.clone()],
+                        key,
+                    },
+                    scopes: std::slice::from_ref(scope),
+                })
+            }
+        }
     }
 
     fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
@@ -3499,16 +3538,15 @@ impl Plugin for MeshAuthz {
                     "true".to_string(),
                 );
             }
-            // The capture-destination scopes are consulted only for the exact
-            // synthesized inbound HBONE relay, and only when the ordinary
-            // service-derived index has no entry: an enrolled pod in another
-            // namespace is absent from that namespace-narrowed index but is a
-            // destination the relay guard terminates for. The source-assertion
+            // For the exact synthesized inbound HBONE relay the capture
+            // destination inventory is authoritative for any address it names
+            // (see `node_waypoint_destination_scope_match`); every other proxy
+            // keeps the ordinary service-derived index. The source-assertion
             // gate below is unchanged.
-            let destination_scope_match = ctx.matched_proxy.as_ref().and_then(|proxy| {
-                self.destination_scope_match_for_proxy(proxy)
-                    .or_else(|| self.capture_destination_scope_match_for_inbound_relay(proxy))
-            });
+            let destination_scope_match = ctx
+                .matched_proxy
+                .as_ref()
+                .and_then(|proxy| self.node_waypoint_destination_scope_match(proxy));
             let can_use_destination_scope = ctx.node_waypoint_policy_scope.is_some()
                 || can_use_inbound_relay_destination_scope_without_source_scope(
                     ctx,
