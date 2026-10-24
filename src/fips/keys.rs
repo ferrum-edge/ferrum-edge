@@ -264,6 +264,46 @@ pub fn check_rsa_modulus_bits(bits: usize, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Admit an RSA modulus for JWT signature verification, on every profile.
+///
+/// jsonwebtoken's `aws_lc_rs` backend (the only one Ferrum compiles) verifies
+/// RS*/PS* only with RSA keys of [`MIN_RSA_MODULUS_BITS`]–[`MAX_RSA_MODULUS_BITS`]
+/// bits. A key outside that window still decodes, but every token signed with
+/// it would then fail verification as if it were forged. Admission points call
+/// this so such a key is refused up front, with its size named. Not gated on
+/// FIPS mode: the limit is the backend's, so it applies to both profiles.
+pub fn check_jwt_rsa_verification_modulus(
+    modulus: &[u8],
+    surface_label: &str,
+) -> Result<(), String> {
+    let bits = unsigned_be_bit_length(modulus);
+    if (MIN_RSA_MODULUS_BITS..=MAX_RSA_MODULUS_BITS).contains(&bits) {
+        return Ok(());
+    }
+    let label = bounded_label(surface_label);
+    Err(format!(
+        "{label}: the RSA public key is {bits} bits. JWT signatures are verified with AWS-LC, \
+         which accepts only RSA keys of {MIN_RSA_MODULUS_BITS}-{MAX_RSA_MODULUS_BITS} bits, so \
+         every token signed with this key would fail verification."
+    ))
+}
+
+/// [`check_jwt_rsa_verification_modulus`] over a PKCS#1 `RSAPublicKey` DER,
+/// the form jsonwebtoken stores for an RSA PEM public key (it unwraps an SPKI
+/// `PUBLIC KEY` to this).
+pub fn check_jwt_rsa_verification_pkcs1_der(der: &[u8], surface_label: &str) -> Result<(), String> {
+    let parsed = x509_parser::public_key::RSAPublicKey::from_der(der);
+    match parsed {
+        Ok((remaining, key)) if remaining.is_empty() => {
+            check_jwt_rsa_verification_modulus(key.modulus, surface_label)
+        }
+        _ => Err(format!(
+            "{}: the RSA public key could not be parsed, so its size cannot be checked.",
+            bounded_label(surface_label)
+        )),
+    }
+}
+
 /// Admit a JWK RSA modulus, when FIPS mode is enforced.
 ///
 /// `modulus` is the decoded, unsigned big-endian `n` member of an RFC 7518 RSA

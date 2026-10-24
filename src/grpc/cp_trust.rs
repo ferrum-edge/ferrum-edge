@@ -2179,6 +2179,29 @@ impl TrustBundleKeyDocument {
                      \"{algorithm:?}\""
                 )
             })?;
+            // The JWT backend verifies RS*/PS* only with 2048-8192-bit RSA
+            // keys. Refuse an out-of-range key here, so a startup load or a
+            // reload fails with the size named (and a reload keeps the
+            // previous verifier) instead of admitting a key every token would
+            // then fail against.
+            if matches!(
+                algorithm,
+                Algorithm::RS256
+                    | Algorithm::RS384
+                    | Algorithm::RS512
+                    | Algorithm::PS256
+                    | Algorithm::PS384
+                    | Algorithm::PS512
+            ) {
+                let der = decoding_key.try_get_as_bytes().map_err(|_| {
+                    format!(
+                        "CP/DP trust bundle {origin:?}: key {kid:?} public key is not valid PEM \
+                         for \"{algorithm:?}\""
+                    )
+                })?;
+                crate::fips::keys::check_jwt_rsa_verification_pkcs1_der(der, "RSA public key")
+                    .map_err(|e| format!("CP/DP trust bundle {origin:?}: key {kid:?}: {e}"))?;
+            }
             let identity_material = canonical_public_key_identity_material(bytes);
             let identity = credential_identity(Some(&kid), algorithm, &identity_material);
             (decoding_key, identity)
