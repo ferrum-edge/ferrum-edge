@@ -4155,6 +4155,7 @@ fn request_deduplication_schema_matches_runtime_validation() {
         "ttl_seconds",
         "inflight_ttl_seconds",
         "max_entries",
+        "max_inflight_entries",
         "max_entry_size_bytes",
         "max_total_size_bytes",
     ] {
@@ -4256,6 +4257,10 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!({"anonymous_caller_scope": "caller_address"}),
         json!({"anonymous_caller_scope": "caller-address"}),
         json!({"anonymous_caller_scope": "shared"}),
+        json!({"caller_partition": "credential"}),
+        json!({"caller_partition": "authenticated_identity"}),
+        json!({"max_inflight_entries": 1}),
+        json!({"max_entries": 10, "max_inflight_entries": 500}),
     ];
     for config in &accepted {
         assert!(
@@ -4327,6 +4332,11 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!({"max_entries": 0}),
         json!({"max_entry_size_bytes": 0}),
         json!({"max_total_size_bytes": 0}),
+        json!({"max_inflight_entries": 0}),
+        json!({"max_inflight_entries": "100"}),
+        json!({"caller_partition": "identity"}),
+        json!({"caller_partition": "AUTHENTICATED_IDENTITY"}),
+        json!({"caller_partition": null}),
     ];
     for config in &rejected {
         assert!(

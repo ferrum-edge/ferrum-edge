@@ -149,11 +149,17 @@ const CLEANUP_INTERVAL_SECS: u64 = 30;
 const CLEANUP_NEVER: u64 = u64::MAX;
 
 /// Bumped to `v6` when lookup moved after routing/request-transformer shaping
-/// and the fingerprint began preferring the published outbound query. Entries
-/// keyed under an earlier lifecycle contract can never be reached again, which
-/// is the intended fail-closed outcome: no pre-contract retained result may be
-/// replayed or converted into a false conflict.
-const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v6";
+/// and the fingerprint began preferring the published outbound query, and to
+/// `v7` when the matched route's response-header policy moved out of the
+/// logical key (it names presentation, not the executed operation) and into
+/// the request fingerprint, and when the opt-in principal-scoped caller
+/// partition was added. Entries keyed under an earlier lifecycle contract can
+/// never be reached again, which is the intended fail-closed outcome: no
+/// pre-contract retained result may be replayed or converted into a false
+/// conflict.
+const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v7";
+/// Printable prefix of every logical key; tracks [`DEDUP_LOGICAL_KEY_VERSION`].
+const DEDUP_LOGICAL_KEY_PREFIX: &str = "v7:";
 /// Bumped to `v4` when query fingerprinting moved from the raw inbound query to
 /// the request-transformer-published outbound query when present.
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v4";
@@ -172,6 +178,20 @@ const REDIS_UNAVAILABLE_BODY: &str = r#"{"error":"Idempotency coordination store
 /// operations fail-closed without allocating attacker-amplified per-key state.
 const EXECUTION_BARRIER_CAPACITY_BODY: &str =
     r#"{"error":"Idempotency execution-barrier capacity is saturated"}"#;
+/// Deterministic refusal of a NEW idempotency key while the hard live
+/// in-flight budget (`max_inflight_entries`) is saturated. Keys that are
+/// already tracked still replay or conflict; live ownership is never evicted to
+/// admit new work.
+const INFLIGHT_CAPACITY_BODY: &str = r#"{"error":"Idempotency in-flight capacity is saturated"}"#;
+/// Deterministic refusal when the request carries case-variant spellings of the
+/// idempotency header with different values. Selecting one would depend on map
+/// iteration order, so a retry could key on the other value and re-execute.
+const AMBIGUOUS_IDEMPOTENCY_HEADER_BODY: &str =
+    r#"{"error":"Conflicting values for the idempotency header"}"#;
+/// Deterministic refusal when a framing/authority header the fingerprint reads
+/// is present under case-variant spellings with different values.
+const AMBIGUOUS_FINGERPRINT_HEADER_BODY: &str =
+    r#"{"error":"Request carries conflicting case-variant header fields"}"#;
 /// Deterministic refusal when no complete, stable replay partition can be
 /// derived for this caller and `enforce_required` demands the guarantee. Never
 /// echoes the caller context that could not be resolved.
@@ -206,6 +226,16 @@ const DEFAULT_MAX_ENTRY_SIZE_BYTES: usize = 1024 * 1024;
 const REDIS_RECORD_ENVELOPE_BYTES: usize = 4 * 1024;
 const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 100 * 1024 * 1024;
 const MAX_CANONICAL_DECODED_BODY_BYTES: usize = 1024 * 1024;
+/// Header fields the fingerprint reads by name (authority, framing, coding)
+/// rather than through the sorted header list. Each must resolve to one value.
+const FINGERPRINT_LOOKUP_HEADER_COUNT: usize = 5;
+const FINGERPRINT_LOOKUP_HEADERS: [&str; FINGERPRINT_LOOKUP_HEADER_COUNT] = [
+    ":authority",
+    "host",
+    "content-encoding",
+    "content-length",
+    "transfer-encoding",
+];
 const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "connection",
     "content-encoding",
@@ -224,11 +254,13 @@ pub const REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS: &[&str] = &[
     "ttl_seconds",
     "inflight_ttl_seconds",
     "max_entries",
+    "max_inflight_entries",
     "max_entry_size_bytes",
     "max_total_size_bytes",
     "applicable_methods",
     "scope_by_consumer",
     "anonymous_caller_scope",
+    "caller_partition",
     "enforce_required",
     "on_redis_unavailable",
 ];
@@ -244,11 +276,13 @@ pub const REQUEST_DEDUPLICATION_CONFIG_KEYS: &[&str] = &[
     "ttl_seconds",
     "inflight_ttl_seconds",
     "max_entries",
+    "max_inflight_entries",
     "max_entry_size_bytes",
     "max_total_size_bytes",
     "applicable_methods",
     "scope_by_consumer",
     "anonymous_caller_scope",
+    "caller_partition",
     "enforce_required",
     "on_redis_unavailable",
     // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
@@ -645,6 +679,9 @@ enum LocalDeduplicationAction {
     Fresh,
     Replay(CachedResponse),
     Conflict(DeduplicationConflict),
+    /// A new key could not reserve a live in-flight slot: the hard
+    /// `max_inflight_entries` budget is saturated. Nothing was inserted.
+    CapacityExhausted,
 }
 
 enum DeduplicationConflict {
@@ -731,6 +768,27 @@ impl RedisOwnership {
         })
     }
 }
+
+/// How the caller dimension of the logical key is bound.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallerPartition {
+    /// Default. The shared fail-closed caller-authorization partition
+    /// (`replay_partition::append_caller_partition`): mechanism, identity,
+    /// consumer, peer SPIFFE identity, digests of every presented credential,
+    /// and the canonical peer address. A rotated token or a new peer address is
+    /// a different caller.
+    Credential,
+    /// Operator opt-in (`caller_partition: authenticated_identity`). When the
+    /// gateway verified a principal (`replay_partition::has_verified_principal`)
+    /// the key binds that principal only, and the fingerprint binds the
+    /// presence but not the bytes of credential headers, so a token refresh,
+    /// per-request signature, or address change keeps one operation. Requests
+    /// without a verified principal fall back to [`Self::Credential`].
+    AuthenticatedIdentity,
+}
+
+/// A header was present under case-variant spellings with different values.
+struct AmbiguousHeader;
 
 /// How Redis mode behaves when the centralized store cannot be consulted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1052,6 +1110,12 @@ pub struct RequestDeduplication {
     inflight_ttl: Duration,
     /// Maximum number of cached entries (local mode).
     max_entries: usize,
+    /// Hard ceiling on live local in-flight markers: requests currently
+    /// executing plus interrupted/ambiguous requests whose markers are
+    /// retained until `inflight_ttl_seconds`. A new key that cannot reserve a
+    /// slot is refused with 503; live ownership is never evicted to make room.
+    /// Execution barriers are bounded separately by `max_entries`.
+    max_inflight_entries: usize,
     /// Maximum retained size of one completed response entry.
     max_entry_size_bytes: usize,
     /// Maximum retained size across completed response entries.
@@ -1067,6 +1131,8 @@ pub struct RequestDeduplication {
     scope_by_consumer: bool,
     /// How anonymous callers are partitioned (see [`AnonymousCallerScope`]).
     anonymous_caller_scope: AnonymousCallerScope,
+    /// How the caller dimension of the logical key is bound.
+    caller_partition: CallerPartition,
     /// Whether to require the idempotency header (reject if missing).
     enforce_required: bool,
     /// Behavior when `sync_mode: "redis"` is configured but Redis cannot be
@@ -1192,6 +1258,8 @@ impl RequestDeduplication {
         let inflight_ttl = Duration::from_secs(inflight_ttl_seconds);
 
         let max_entries = optional_positive_usize(config, "max_entries")?.unwrap_or(10_000);
+        let max_inflight_entries =
+            optional_positive_usize(config, "max_inflight_entries")?.unwrap_or(max_entries);
         let max_entry_size_bytes = optional_positive_usize(config, "max_entry_size_bytes")?
             .unwrap_or(DEFAULT_MAX_ENTRY_SIZE_BYTES);
         let max_total_size_bytes = optional_positive_usize(config, "max_total_size_bytes")?
@@ -1202,6 +1270,19 @@ impl RequestDeduplication {
         let anonymous_caller_scope = match optional_string(config, "anonymous_caller_scope")? {
             None => AnonymousCallerScope::default(),
             Some(value) => AnonymousCallerScope::parse("request_deduplication", value)?,
+        };
+        // Bound into the logical key (the principal partition frames its own
+        // mode), so a change produces different keys rather than reusing
+        // retained state; it is deliberately outside the compatibility set.
+        let caller_partition = match optional_string(config, "caller_partition")? {
+            None | Some("credential") => CallerPartition::Credential,
+            Some("authenticated_identity") => CallerPartition::AuthenticatedIdentity,
+            Some(_) => {
+                // Value-redacted, like `on_redis_unavailable`.
+                return Err("request_deduplication: `caller_partition` must be exactly \
+                     `credential` or `authenticated_identity`"
+                    .to_string());
+            }
         };
         let enforce_required = optional_bool(config, "enforce_required")?.unwrap_or(false);
         let on_redis_unavailable = match optional_string(config, "on_redis_unavailable")? {
@@ -1275,11 +1356,13 @@ impl RequestDeduplication {
             ttl,
             inflight_ttl,
             max_entries,
+            max_inflight_entries,
             max_entry_size_bytes,
             max_total_size_bytes,
             applicable_methods,
             scope_by_consumer,
             anonymous_caller_scope,
+            caller_partition,
             enforce_required,
             on_redis_unavailable,
             redis_client,
@@ -1318,6 +1401,43 @@ impl RequestDeduplication {
 
     fn release_execution_barrier(&self) {
         decrement_atomic(&self.local.execution_barrier_count);
+    }
+
+    /// Reserve one live in-flight slot for a key that is not yet counted.
+    ///
+    /// `inflight_count` covers live markers and execution barriers alike;
+    /// barriers have their own `max_entries` cap, so only the live share is
+    /// held to `max_inflight_entries`. The compare-and-swap is the admission
+    /// point, taken before the entry is inserted, so concurrent new keys can
+    /// never overshoot the ceiling between check and insert. Without it an
+    /// interrupted streamed response leaves its marker until
+    /// `inflight_ttl_seconds`, and a client resetting fresh-key requests could
+    /// grow retained markers far beyond any live-connection count.
+    fn try_reserve_inflight_slot(&self) -> bool {
+        let barriers = self.local.execution_barrier_count.load(Ordering::Relaxed);
+        let limit = self.max_inflight_entries.saturating_add(barriers);
+        self.local
+            .inflight_count
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < limit).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    /// Whether an expired execution barrier, which is already counted in
+    /// `inflight_count`, may turn into a live in-flight marker without the live
+    /// share exceeding `max_inflight_entries`.
+    fn converted_inflight_slot_within_capacity(&self) -> bool {
+        let current = self.local.inflight_count.load(Ordering::Relaxed);
+        let barriers = self.local.execution_barrier_count.load(Ordering::Relaxed);
+        current.saturating_sub(barriers) < self.max_inflight_entries
+    }
+
+    /// Whether this request's caller dimension is the verified principal
+    /// rather than the presented credential bytes.
+    fn principal_partition_applies(&self, ctx: &RequestContext) -> bool {
+        self.caller_partition == CallerPartition::AuthenticatedIdentity
+            && replay_partition::has_verified_principal(ctx)
     }
 
     /// Extend the one bounded overflow barrier to cover this completion's
@@ -1570,13 +1690,28 @@ impl RequestDeduplication {
         // prefix, so equal resource IDs in separate namespaces cannot claim or
         // replay one another's operation. `append_destination_partition` frames
         // the namespace, proxy, route rewrite, and effective upstream/backend.
-        replay_partition::append_destination_partition(&mut hasher, ctx);
-        replay_partition::append_caller_partition(
-            &mut hasher,
-            ctx,
-            request_headers,
-            self.anonymous_caller_scope,
-        )?;
+        //
+        // The execution variant omits the matched route's response-header
+        // policy: it changes how a result is presented, not which operation an
+        // identical retry would execute, so binding it here let a
+        // response-header-only route reload address a fresh key and execute the
+        // operation a second time. The fingerprint binds that policy instead,
+        // so a changed policy is a 409 conflict rather than a replay of headers
+        // finalized under the old rule or a re-execution.
+        replay_partition::append_execution_destination_partition(&mut hasher, ctx);
+        // `caller_partition: authenticated_identity` binds only the verified
+        // principal when there is one; otherwise, and by default, the full
+        // credential-and-address caller partition applies.
+        let principal_bound = self.caller_partition == CallerPartition::AuthenticatedIdentity
+            && replay_partition::append_verified_principal_partition(&mut hasher, ctx);
+        if !principal_bound {
+            replay_partition::append_caller_partition(
+                &mut hasher,
+                ctx,
+                request_headers,
+                self.anonymous_caller_scope,
+            )?;
+        }
         // Retained for operators who additionally want the display identity in
         // the partition; the caller partition above already isolates callers.
         hasher.bool_value("scope_by_consumer", self.scope_by_consumer);
@@ -1586,7 +1721,7 @@ impl RequestDeduplication {
         hasher.text("idempotency_key", idempotency_value);
 
         let mut key = String::with_capacity(67);
-        key.push_str("v6:");
+        key.push_str(DEDUP_LOGICAL_KEY_PREFIX);
         key.push_str(&hasher.hex());
         Ok(key)
     }
@@ -1646,6 +1781,17 @@ impl RequestDeduplication {
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
     ) -> Result<String, PluginResult> {
+        // The authority, framing, and coding headers are read by name below.
+        // Case-variant spellings with different values would make that read
+        // depend on map iteration order, so refuse them deterministically.
+        if !fingerprint_lookup_headers_unambiguous(headers) {
+            return Err(PluginResult::Reject {
+                status_code: 400,
+                body: AMBIGUOUS_FINGERPRINT_HEADER_BODY.to_string(),
+                headers: HashMap::new(),
+            });
+        }
+        let principal_scoped = self.principal_partition_applies(ctx);
         let mut hasher = PartitionHasher::new(DEDUP_FINGERPRINT_VERSION);
         hasher.text("method", &ctx.method.to_ascii_uppercase());
         hasher.text("authority", &canonical_authority(headers));
@@ -1673,15 +1819,24 @@ impl RequestDeduplication {
         // observable. `request_headers_for_fingerprint` still drops hop-by-hop
         // and per-request trace headers, which describe the transport rather
         // than the operation.
+        //
+        // Under the opt-in principal partition the credential bytes are the
+        // one thing a same-principal retry is expected to change (a refreshed
+        // token, a per-request signature), so only their presence is bound;
+        // the verified principal itself is already in the logical key.
         let mut fields = request_headers_for_fingerprint(headers, &self.header_name);
         hasher.count("headers", fields.len());
         for (header_name, value) in fields.drain(..) {
             hasher.text("header_name", &header_name);
             if replay_partition::is_request_credential_context_header(ctx, &header_name) {
-                hasher.nested(
-                    "header_value_digest",
-                    &replay_partition::value_digest(value),
-                );
+                if principal_scoped {
+                    hasher.bool_value("header_value_principal_scoped", true);
+                } else {
+                    hasher.nested(
+                        "header_value_digest",
+                        &replay_partition::value_digest(value),
+                    );
+                }
             } else {
                 hasher.text("header_value", value);
             }
@@ -1704,13 +1859,16 @@ impl RequestDeduplication {
     ) -> LocalDeduplicationAction {
         match self.local.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
+                // Reserve before inserting, while the shard entry is held.
+                if !self.try_reserve_inflight_slot() {
+                    return LocalDeduplicationAction::CapacityExhausted;
+                }
                 entry.insert(DeduplicationEntry::InFlight {
                     started_at: now,
                     retention: self.inflight_ttl,
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
-                self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => {
@@ -1827,13 +1985,15 @@ impl RequestDeduplication {
         let _guard = self.accounting_guard();
         match self.local.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
+                if !self.try_reserve_inflight_slot() {
+                    return LocalDeduplicationAction::CapacityExhausted;
+                }
                 entry.insert(DeduplicationEntry::InFlight {
                     started_at: now,
                     retention: self.inflight_ttl,
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
-                self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => match entry.get() {
@@ -1854,12 +2014,15 @@ impl RequestDeduplication {
                         } else {
                             LocalDeduplicationAction::Replay(cached.clone())
                         }
+                    } else if !self.try_reserve_inflight_slot() {
+                        // The expired completion stays for the cleanup scan;
+                        // nothing is admitted without a live slot.
+                        LocalDeduplicationAction::CapacityExhausted
                     } else {
                         let retained_size = cached.retained_size();
                         self.mark_completed_sequence_pruned(*sequence);
                         self.sub_completed_size_locked(retained_size);
                         decrement_atomic(&self.local.completed_count);
-                        self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
                             retention: self.inflight_ttl,
@@ -1883,6 +2046,10 @@ impl RequestDeduplication {
                                 DeduplicationConflict::FingerprintMismatch,
                             )
                         }
+                    } else if !self.converted_inflight_slot_within_capacity() {
+                        // Already counted, but as a barrier: turning it into a
+                        // live marker must still fit the live budget.
+                        LocalDeduplicationAction::CapacityExhausted
                     } else {
                         // A barrier is accounted with the in-flight/fixed-state
                         // counter. Replacing it in place preserves cardinality.
@@ -2522,6 +2689,17 @@ impl RequestDeduplication {
             response_policy,
         } = candidate;
         let entry_size = cached_response_retained_size(body.len(), &headers);
+        // Materialize the retained body before taking the shared accounting
+        // lock: the copy can be up to `max_entry_size_bytes` and every
+        // completion, expired-entry replacement, and cleanup scan for this
+        // policy identity contends on that lock. Only the ownership check,
+        // insertion, and counters need it. An entry that cannot be retained
+        // never copies.
+        let body = if entry_size <= self.max_entry_size_bytes {
+            Bytes::copy_from_slice(body)
+        } else {
+            Bytes::new()
+        };
         // A size-admission failure replaces the in-flight owner with a
         // non-replayable execution barrier. Never let that replacement expire
         // before the lease it supersedes, even when the replayable response
@@ -2592,7 +2770,7 @@ impl RequestDeduplication {
                 Some(CachedResponse {
                     status_code,
                     headers,
-                    body: Bytes::copy_from_slice(body),
+                    body,
                     inserted_at: Instant::now(),
                     retention,
                     response_policy,
@@ -2625,7 +2803,7 @@ impl RequestDeduplication {
         let cached = CachedResponse {
             status_code,
             headers,
-            body: Bytes::copy_from_slice(body),
+            body,
             inserted_at: Instant::now(),
             retention,
             response_policy,
@@ -2840,7 +3018,9 @@ impl RequestDeduplication {
         // InFlight markers are dropped by the throttled expiry scan. This
         // means max_entries can be temporarily exceeded if the cache is
         // saturated with active in-flight work; correctness is strictly
-        // preferred over hitting the memory cap.
+        // preferred over hitting the entry target. The live share is still
+        // hard-bounded: admission refuses a new key once
+        // `max_inflight_entries` live markers exist.
         let mut to_remove = completed_hint
             .saturating_add(inflight_hint)
             .saturating_sub(self.max_entries)
@@ -3262,6 +3442,54 @@ fn header_value_case_insensitive<'a>(
     headers
         .iter()
         .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.as_str()))
+}
+
+/// Case-insensitive lookup that is independent of map iteration order.
+///
+/// Wire header names are lowercased, but a plugin earlier in the chain can
+/// insert a differently cased spelling next to the client's. Zero matches is
+/// absent; any number of matches carrying one distinct value is that value;
+/// two distinct values are ambiguous and must be refused rather than resolved
+/// by whichever entry the `HashMap` happens to yield first.
+fn unambiguous_header_value<'a>(
+    headers: &'a HashMap<String, String>,
+    name: &str,
+) -> Result<Option<&'a str>, AmbiguousHeader> {
+    let mut found: Option<&'a str> = None;
+    for (key, value) in headers {
+        if !key.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let previous: Option<&'a str> = found;
+        match previous {
+            None => found = Some(value.as_str()),
+            Some(existing) if existing == value.as_str() => {}
+            Some(_) => return Err(AmbiguousHeader),
+        }
+    }
+    Ok(found)
+}
+
+/// Whether every [`FINGERPRINT_LOOKUP_HEADERS`] name resolves to at most one
+/// distinct value, in a single pass over the header map.
+fn fingerprint_lookup_headers_unambiguous(headers: &HashMap<String, String>) -> bool {
+    let mut seen: [Option<&str>; FINGERPRINT_LOOKUP_HEADER_COUNT] =
+        [None; FINGERPRINT_LOOKUP_HEADER_COUNT];
+    for (key, value) in headers {
+        for (name, slot) in FINGERPRINT_LOOKUP_HEADERS.iter().zip(seen.iter_mut()) {
+            if !key.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            let current: Option<&str> = *slot;
+            match current {
+                None => *slot = Some(value.as_str()),
+                Some(previous) if previous == value.as_str() => {}
+                Some(_) => return false,
+            }
+            break;
+        }
+    }
+    true
 }
 
 fn canonical_authority(headers: &HashMap<String, String>) -> String {
@@ -3689,10 +3917,19 @@ impl Plugin for RequestDeduplication {
         let (key, fingerprint) = {
             // Get idempotency key from headers. Keep the borrow scoped so no
             // header-map borrow survives across Redis/cache awaits below.
-            let idempotency_value = match header_value_case_insensitive(headers, &self.header_name)
-            {
-                Some(value) if !value.is_empty() => value,
-                _ => {
+            let idempotency_value = match unambiguous_header_value(headers, &self.header_name) {
+                Err(AmbiguousHeader) => {
+                    // Fail closed regardless of `enforce_required`: picking
+                    // either spelling could key a retry on the other value and
+                    // re-execute the operation.
+                    return PluginResult::Reject {
+                        status_code: 400,
+                        body: AMBIGUOUS_IDEMPOTENCY_HEADER_BODY.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                Ok(Some(value)) if !value.is_empty() => value,
+                Ok(_) => {
                     if self.enforce_required {
                         return PluginResult::Reject {
                             status_code: 400,
@@ -3936,6 +4173,24 @@ impl Plugin for RequestDeduplication {
                     status_code: 409,
                     body: r#"{"error":"Idempotency key was reused for a different request"}"#
                         .to_string(),
+                    headers: HashMap::new(),
+                };
+            }
+            LocalDeduplicationAction::CapacityExhausted => {
+                // Never evict live ownership to admit new work. Roll back the
+                // distributed ownership this request just acquired so peers
+                // are not blocked by an operation that never ran.
+                if let Some(ownership) = redis_lock_token.as_ref() {
+                    self.redis_release_inflight(&key, ownership).await;
+                }
+                debug!(
+                    max_inflight_entries = self.max_inflight_entries,
+                    "request_deduplication: live in-flight capacity is saturated; refusing a new \
+                     idempotency key"
+                );
+                return PluginResult::Reject {
+                    status_code: 503,
+                    body: INFLIGHT_CAPACITY_BODY.to_string(),
                     headers: HashMap::new(),
                 };
             }

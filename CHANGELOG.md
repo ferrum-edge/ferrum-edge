@@ -139,6 +139,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`request_deduplication` hardening from the production-launch review.**
+  - A route response-header policy (a `mesh_route_dispatch`
+    `response_transform`) is no longer part of the logical key. Reloading only
+    that policy used to address a fresh key, so an identical retry of a
+    completed payment executed again within its TTL. The policy is now bound
+    into the request fingerprint: an unchanged policy replays, a changed one
+    returns `409`. Logical keys move to `v7:` (`ferrum-dedup-logical-v7`);
+    entries keyed under `v6` are not reachable.
+  - New `max_inflight_entries` (default `max_entries`) hard-caps live local
+    in-flight markers. Interrupted streamed responses keep their marker until
+    `inflight_ttl_seconds`, so a client resetting fresh-key requests could grow
+    retained markers without bound. A new key past the cap now gets `503`
+    (any Redis ownership it acquired is released); tracked keys still replay
+    or conflict, and live ownership is never evicted.
+  - New opt-in `caller_partition: authenticated_identity`. When the gateway
+    verified a principal (a Consumer, a peer SPIFFE identity, or an external
+    identity committed with its realm), the key binds that principal instead
+    of credential digests and the peer address, and the fingerprint binds
+    credential-header presence rather than values. A retry after a token
+    refresh, a per-request signature, or an address change then replays. The
+    default `credential` partition is unchanged.
+  - Case-variant spellings of the idempotency header with different values,
+    or of the authority/framing/coding headers the fingerprint reads, are
+    refused with `400` instead of being resolved by map iteration order.
+  - The retained response body is copied before the shared accounting lock
+    is taken rather than while it is held.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder
