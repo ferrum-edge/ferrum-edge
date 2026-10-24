@@ -30,9 +30,24 @@ Selecting both, or neither, is a `compile_error!`.
 | Ordinary (default) | `cargo build --release` | `ring` + `rustls/ring` | `false` |
 | FIPS | `cargo build --release --no-default-features --features fips` | `aws-lc-fips-sys` via `aws-lc-rs/fips` + `rustls/fips` | `true` |
 
-The ordinary profile retains Ferrum's existing Ring-backed behavior; the
-existence of the FIPS profile does not opt an ordinary deployment into a new
-provider. `FERRUM_FIPS_MODE=enforce` on an ordinary build refuses to start, with
+The ordinary profile retains Ferrum's existing Ring-backed behavior for TLS,
+QUIC, and every other provider-selected path; the existence of the FIPS profile
+does not opt an ordinary deployment into a new TLS provider. JWT signing and
+verification are the one exception: `jsonwebtoken` selects its `aws_lc_rs`
+backend inline on **both** profiles. On a `fips` build that `aws-lc-rs` is the
+validated module (through `aws-lc-rs/fips`). On the ordinary build it is
+AWS-LC, which dimpl, rcgen, and x509-parser already compile in. The RustCrypto
+`rust_crypto` backend is never compiled: it signed ES256 JWT-SVIDs and
+ES256/ES384/RS* `private_key_jwt` assertions on `p256`/`p384` 0.13
+(`crypto-bigint` 0.5, RUSTSEC-2026-0387) and the RustCrypto `rsa`
+(RUSTSEC-2023-0071). jsonwebtoken 11 needs exactly one backend compiled to
+choose its provider, and one inline selection keeps that true for every
+feature combination. AWS-LC accepts RSA keys of 2048–8192 bits only, for
+verification as well as signing. The JWKS paths (`jwks_auth`, OIDC, mesh
+`RequestAuthentication`) and JWT-SVID authorities already enforced that range.
+CP/DP trust-bundle RSA public keys and DPoP proof keys now check it too
+(`fips::keys::check_jwt_rsa_verification_modulus`), so an out-of-range key is
+refused by size instead of failing every signature. `FERRUM_FIPS_MODE=enforce` on an ordinary build refuses to start, with
 a diagnostic that names the missing module. It never downgrades to `ring`.
 
 Exclusivity is not stylistic. `sqlx-core`, `quinn-proto`, `tonic`, `ldap3`, and

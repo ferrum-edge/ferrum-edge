@@ -3077,6 +3077,257 @@ async fn test_grpc_pool_backoff_has_bounded_occupancy_and_constant_eviction_work
     assert_eq!(pool.pool_size(), 1);
 }
 
+/// A backend that accepts and holds connections; the HTTP/1.1 client
+/// handshake writes nothing, so no exchange is needed to pool them.
+async fn holding_backend() -> u16 {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    port
+}
+
+fn direct_h1_proxy(port: u16) -> Proxy {
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    proxy
+}
+
+/// Check out a fresh direct-H1 connection and wait until its dispatcher is
+/// ready, so a later check-in pools it synchronously.
+async fn ready_checkout(
+    pool: &Http2ConnectionPool,
+    proxy: &Proxy,
+) -> ferrum_edge::proxy::http2_pool::Http1Checkout {
+    let mut checkout = pool
+        .checkout_h1(proxy, false, Duration::from_secs(2), false)
+        .await
+        .expect("checkout");
+    tokio::time::timeout(Duration::from_secs(5), checkout.sender.ready())
+        .await
+        .expect("dispatcher ready in time")
+        .expect("dispatcher ready");
+    checkout
+}
+
+/// The direct HTTP/1.1 idle set holds at most `max_idle_per_host`
+/// connections: check-ins beyond it drop the connection and count a ceiling
+/// eviction, and the kept ones are reused (issue #6793).
+#[tokio::test]
+async fn test_direct_h1_idle_set_holds_at_most_max_idle_per_host() {
+    let proxy = direct_h1_proxy(holding_backend().await);
+    let pool = Http2ConnectionPool::new(
+        PoolConfig {
+            max_idle_per_host: 4,
+            ..PoolConfig::default()
+        },
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+
+    let mut checkouts = Vec::new();
+    for _ in 0..6 {
+        let checkout = ready_checkout(&pool, &proxy).await;
+        assert!(!checkout.reused(), "nothing is idle while all six are held");
+        checkouts.push(checkout);
+    }
+    for checkout in checkouts {
+        checkout.checkin();
+    }
+    assert_eq!(
+        pool.h1_idle_connections(),
+        4,
+        "the idle set keeps exactly its ceiling"
+    );
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.connections_opened, 6);
+    assert_eq!(
+        stats.evicted_ceiling, 2,
+        "two check-ins found the lane full"
+    );
+
+    let mut reused = Vec::new();
+    for _ in 0..4 {
+        let checkout = pool
+            .checkout_h1(&proxy, false, Duration::from_secs(2), false)
+            .await
+            .expect("checkout");
+        assert!(checkout.reused(), "a kept connection is reused");
+        reused.push(checkout);
+    }
+    assert_eq!(pool.h1_idle_connections(), 0);
+    let fresh = pool
+        .checkout_h1(&proxy, false, Duration::from_secs(2), false)
+        .await
+        .expect("checkout");
+    assert!(!fresh.reused(), "an exhausted idle set dials");
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.connections_reused, 4);
+    assert_eq!(stats.connections_opened, 7);
+    assert_eq!(stats.idle_connections, 0);
+}
+
+/// A backend that numbers its connections in accept order and answers every
+/// request with the number of the connection it arrived on. The counter
+/// returned with its port counts connections the client closed.
+async fn numbering_backend() -> (u16, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let closed = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&closed);
+    tokio::spawn(async move {
+        let mut accepted = 0usize;
+        while let Ok((stream, _)) = listener.accept().await {
+            let number = accepted;
+            accepted += 1;
+            let counted = Arc::clone(&counted);
+            tokio::spawn(async move {
+                let service = service_fn(move |_: Request<Incoming>| async move {
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
+                        number.to_string(),
+                    ))))
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+    });
+    (port, closed)
+}
+
+/// Ask a numbering backend which connection `checkout` holds, then wait until
+/// the connection is ready for another request so a check-in pools it.
+async fn connection_number(checkout: &mut ferrum_edge::proxy::http2_pool::Http1Checkout) -> usize {
+    let request = Request::get("/")
+        .header("host", "127.0.0.1")
+        .body(ferrum_edge::proxy::body::DirectH1RequestBody::Empty)
+        .expect("request");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        checkout.sender.send_request(request),
+    )
+    .await
+    .expect("response in time")
+    .expect("response");
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    tokio::time::timeout(Duration::from_secs(5), checkout.sender.ready())
+        .await
+        .expect("dispatcher ready in time")
+        .expect("dispatcher ready");
+    std::str::from_utf8(&body)
+        .expect("utf-8 body")
+        .parse()
+        .expect("connection number")
+}
+
+/// Checkout reuses the most recently pooled connection (LIFO), so the
+/// connections a burst left behind age at the bottom of the idle set and
+/// expire instead of being kept warm by round-robin reuse. A drain counts the
+/// idle connection it closes as retired, and a checkout taken before the drain
+/// is not pooled again (issue #6793).
+#[tokio::test]
+async fn test_direct_h1_checkout_reuses_the_newest_idle_connection() {
+    let (port, _) = numbering_backend().await;
+    let proxy = direct_h1_proxy(port);
+    let pool = create_default_pool();
+
+    let mut older = ready_checkout(&pool, &proxy).await;
+    let mut newer = ready_checkout(&pool, &proxy).await;
+    let older_number = connection_number(&mut older).await;
+    let newer_number = connection_number(&mut newer).await;
+    assert_ne!(older_number, newer_number);
+    older.checkin();
+    newer.checkin();
+    assert_eq!(pool.h1_idle_connections(), 2);
+
+    let mut reused = pool
+        .checkout_h1(&proxy, false, Duration::from_secs(2), false)
+        .await
+        .expect("checkout");
+    assert!(reused.reused());
+    assert_eq!(
+        connection_number(&mut reused).await,
+        newer_number,
+        "the newest idle connection is reused"
+    );
+    assert_eq!(pool.h1_idle_connections(), 1);
+
+    pool.force_drain_all();
+    assert_eq!(pool.h1_idle_connections(), 0);
+    // The connection is ready, so check-in goes straight to the lane, which
+    // refuses it under its lock because the drain retired it.
+    assert!(reused.sender.is_ready());
+    reused.checkin();
+    assert_eq!(
+        pool.h1_idle_connections(),
+        0,
+        "a checkout from before the drain is not pooled again"
+    );
+    let stats = pool.h1_pool_stats();
+    assert_eq!(
+        stats.evicted_retired, 1,
+        "the drain closed one idle connection"
+    );
+    assert_eq!(
+        stats.evicted_ceiling, 0,
+        "a refused post-drain check-in is not a ceiling eviction"
+    );
+    assert_eq!(stats.connections_opened, 2);
+    assert_eq!(stats.connections_reused, 1);
+}
+
+/// A connection checked in after a drain closes at once, even while another
+/// checkout still holds the withdrawn lane: it never parks there, uncounted
+/// and unreachable, until the last checkout on that lane finishes (issue
+/// #6793).
+#[tokio::test]
+async fn test_direct_h1_checkin_after_a_drain_closes_the_connection() {
+    let (port, closed) = numbering_backend().await;
+    let proxy = direct_h1_proxy(port);
+    let pool = create_default_pool();
+
+    let held = ready_checkout(&pool, &proxy).await;
+    let late = ready_checkout(&pool, &proxy).await;
+    pool.force_drain_all();
+    assert!(late.sender.is_ready());
+    late.checkin();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while closed.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        closed.load(Ordering::SeqCst),
+        1,
+        "the late check-in's connection closes while the lane is still held"
+    );
+    assert_eq!(pool.h1_idle_connections(), 0);
+    let stats = pool.h1_pool_stats();
+    assert_eq!(stats.evicted_retired, 0, "nothing was idle at the drain");
+    assert_eq!(stats.evicted_ceiling, 0);
+    drop(held);
+}
+
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
 /// checked-out connection whose request bound elapsed before the handoff never
 /// carried the request, so the gate refuses it and returns it to the idle set
