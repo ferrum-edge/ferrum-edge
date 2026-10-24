@@ -534,17 +534,24 @@ start_linkerd() {
     # "forward" posture is not a supported mode. This arm exists to prove
     # or refute standalone operation with evidence: if the echo probe
     # fails, the arm is recorded unsupported-standalone with logs.
-    mkdir -p "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client"
-    cp "$CERT_DIR/svc/svid.crt" "$CERT_DIR/linkerd-svc/crt.pem"
-    cp "$CERT_DIR/svc/svid.key" "$CERT_DIR/linkerd-svc/key.p8"
-    cp "$CERT_DIR/client/svid.crt" "$CERT_DIR/linkerd-client/crt.pem"
-    cp "$CERT_DIR/client/svid.key" "$CERT_DIR/linkerd-client/key.p8"
-    chgrp "$CERT_GID" "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client" "$CERT_DIR"/linkerd-*/key.p8
-    chmod 750 "$CERT_DIR/linkerd-svc" "$CERT_DIR/linkerd-client"
-    chmod 640 "$CERT_DIR"/linkerd-*/key.p8
-    chmod 644 "$CERT_DIR"/linkerd-*/crt.pem
+    #
+    # linkerd2-proxy's identity init opens key.p8 for writing and writes its
+    # CSR into the identity directory; on a read-only mount it exits before
+    # the Destination check that classifies this arm. Each proxy therefore
+    # gets a disposable, group-writable copy under the runtime directory,
+    # and the shared certificate fixture stays read-only.
+    local identity="$RUNTIME_DIR/linkerd"
+    mkdir -p "$identity/svc" "$identity/client"
+    cp "$CERT_DIR/svc/svid.crt" "$identity/svc/crt.pem"
+    cp "$CERT_DIR/svc/svid.key" "$identity/svc/key.p8"
+    cp "$CERT_DIR/client/svid.crt" "$identity/client/crt.pem"
+    cp "$CERT_DIR/client/svid.key" "$identity/client/key.p8"
+    chgrp "$CERT_GID" "$identity/svc" "$identity/client" "$identity"/*/key.p8 "$identity"/*/crt.pem
+    chmod 770 "$identity/svc" "$identity/client"
+    chmod 660 "$identity"/*/key.p8
+    chmod 664 "$identity"/*/crt.pem
     docker run -d --network host --name "$SERVER_NAME" --group-add "$CERT_GID" \
-        -v "$CERT_DIR/linkerd-svc:/var/run/linkerd/identity/end-entity:ro" \
+        -v "$identity/svc:/var/run/linkerd/identity/end-entity" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_INBOUND_LISTEN_ADDR=127.0.0.1:4143 \
         -e LINKERD2_PROXY_INBOUND_PORTS=18080 \
@@ -555,7 +562,7 @@ start_linkerd() {
         -e LINKERD2_PROXY_IDENTITY_LOCAL_NAME=svc.ferrum.serviceaccount.identity.linkerd.cluster.local \
         "$LINKERD_IMAGE" >/dev/null 2>&1 || true
     docker run -d --network host --name "$CLIENT_NAME" --group-add "$CERT_GID" \
-        -v "$CERT_DIR/linkerd-client:/var/run/linkerd/identity/end-entity:ro" \
+        -v "$identity/client:/var/run/linkerd/identity/end-entity" \
         -e LINKERD2_PROXY_LOG=info \
         -e LINKERD2_PROXY_OUTBOUND_LISTEN_ADDR=127.0.0.1:4140 \
         -e LINKERD2_PROXY_DESTINATION_CONTEXT="ns:ferrum" \

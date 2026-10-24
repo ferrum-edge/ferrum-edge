@@ -78,6 +78,45 @@ with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) +
                 mounts = [call[index + 1] for index, value in enumerate(call) if value == "-v"]
                 self.assertTrue(all(mount.endswith(":ro") for mount in mounts))
 
+    def test_linkerd_identity_is_a_writable_runtime_copy_of_the_readonly_fixture(self):
+        # linkerd2-proxy's identity init opens key.p8 for writing and writes a
+        # CSR beside it; on a read-only mount it exits before the Destination
+        # check that classifies the arm unsupported-standalone.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable(root / "docker", '''import json, os, sys
+with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) + "\\n")
+''')
+            certs = root / "certs"
+            for name in ("svc", "client"):
+                (certs / name).mkdir(parents=True)
+                for leaf in ("svid.crt", "svid.key", "bundle.pem"):
+                    (certs / name / leaf).write_text(f"{name}-{leaf}")
+            runtime = root / "runtime"
+            subprocess.run(["bash", "-ec", functions("start_linkerd") + '\nstart_linkerd'],
+                check=True, timeout=5, env={**os.environ,
+                    "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                    "CALLS": str(root / "calls"), "RUNTIME_DIR": str(runtime),
+                    "CERT_DIR": str(certs), "CERT_GID": str(os.getgid()),
+                    "SERVER_NAME": "fixture-server", "CLIENT_NAME": "fixture-client",
+                    "LINKERD_IMAGE": "ghcr.io/linkerd/proxy:edge-25.11.1"})
+            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+            self.assertEqual(len(calls), 2)
+            for call, name, role in zip(calls, ("fixture-server", "fixture-client"), ("svc", "client")):
+                self.assertEqual(call[call.index("--name") + 1], name)
+                self.assertEqual(call[call.index("--group-add") + 1], str(os.getgid()))
+                mounts = [call[index + 1] for index, value in enumerate(call) if value == "-v"]
+                identity = runtime / "linkerd" / role
+                self.assertEqual(mounts, [f"{identity}:/var/run/linkerd/identity/end-entity"])
+                self.assertEqual((identity / "key.p8").read_text(), f"{role}-svid.key")
+                self.assertEqual((identity / "crt.pem").read_text(), f"{role}-svid.crt")
+                self.assertEqual(stat.S_IMODE(identity.stat().st_mode), 0o770)
+                self.assertEqual(stat.S_IMODE((identity / "key.p8").stat().st_mode), 0o660)
+                self.assertEqual(stat.S_IMODE((identity / "crt.pem").stat().st_mode), 0o664)
+                self.assertEqual((identity / "key.p8").stat().st_gid, os.getgid())
+            # The shared fixture gains no Linkerd copies.
+            self.assertEqual(sorted(path.name for path in certs.iterdir()), ["client", "svc"])
+
     @unittest.skipUnless(shutil.which("timeout"), "GNU timeout required by the Linux harness")
     def test_readiness_detects_dead_container_before_probing(self):
         self.check_readiness("dead", expected_run=False)
