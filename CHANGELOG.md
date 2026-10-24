@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **JWT signing and verification run on AWS-LC in the default build.**
+  `jsonwebtoken` now selects its `aws_lc_rs` backend inline on both profiles
+  instead of `rust_crypto` on the default `crypto-ring` profile; a `fips` build
+  still routes it onto the validated module. This removes the RustCrypto
+  `p256`/`p384` 0.13 → `crypto-bigint` 0.5.5 signers (RUSTSEC-2026-0387) that
+  minted ES256 JWT-SVIDs and ES256/ES384 `private_key_jwt` client assertions,
+  and the RustCrypto `rsa` signer (RUSTSEC-2023-0071) used for RS* assertions
+  and `ai_federation` service-account JWTs. RSA signing keys must now be
+  2048–8192 bits: `oidc_relying_party` already trial-signs its assertion key
+  at config load, so a shorter key is refused there. ECDSA signatures are
+  randomized rather than RFC 6979 deterministic; both are valid ES256/ES384.
 - **Backend pools keep up to 256 idle connections per host by default**
   (issue #6793), up from 64. `FERRUM_POOL_MAX_IDLE_PER_HOST` is a ceiling, not
   a reservation: a pool keeps only connections that concurrent requests opened,
