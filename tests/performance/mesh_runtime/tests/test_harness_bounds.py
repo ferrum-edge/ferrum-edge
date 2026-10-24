@@ -93,13 +93,24 @@ with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) +
                 for leaf in ("svid.crt", "svid.key", "bundle.pem"):
                     (certs / name / leaf).write_text(f"{name}-{leaf}")
             runtime = root / "runtime"
+            # Leftovers from an earlier run into the same output directory:
+            # a proxy-written CSR and a key under a role that no longer exists.
+            (runtime / "linkerd/svc").mkdir(parents=True)
+            (runtime / "linkerd/svc/csr.der").write_text("stale")
+            (runtime / "linkerd/oldrole").mkdir()
+            (runtime / "linkerd/oldrole/key.p8").write_text("stale")
+            env = {**os.environ,
+                "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                "CALLS": str(root / "calls"), "RUNTIME_DIR": str(runtime),
+                "CERT_DIR": str(certs), "CERT_GID": str(os.getgid()),
+                "SERVER_NAME": "fixture-server", "CLIENT_NAME": "fixture-client",
+                "LINKERD_IMAGE": "ghcr.io/linkerd/proxy:edge-25.11.1"}
             subprocess.run(["bash", "-ec", functions("start_linkerd") + '\nstart_linkerd'],
-                check=True, timeout=5, env={**os.environ,
-                    "PATH": str(root) + os.pathsep + os.environ["PATH"],
-                    "CALLS": str(root / "calls"), "RUNTIME_DIR": str(runtime),
-                    "CERT_DIR": str(certs), "CERT_GID": str(os.getgid()),
-                    "SERVER_NAME": "fixture-server", "CLIENT_NAME": "fixture-client",
-                    "LINKERD_IMAGE": "ghcr.io/linkerd/proxy:edge-25.11.1"})
+                check=True, timeout=5, env=env)
+            self.assertEqual(
+                sorted(str(path.relative_to(runtime / "linkerd"))
+                       for path in (runtime / "linkerd").rglob("*") if path.is_file()),
+                ["client/crt.pem", "client/key.p8", "svc/crt.pem", "svc/key.p8"])
             calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()]
             self.assertEqual(len(calls), 2)
             for call, name, role in zip(calls, ("fixture-server", "fixture-client"), ("svc", "client")):
@@ -114,10 +125,16 @@ with open(os.environ["CALLS"], "a") as out: out.write(json.dumps(sys.argv[1:]) +
                 self.assertEqual(stat.S_IMODE((identity / "key.p8").stat().st_mode), 0o660)
                 self.assertEqual(stat.S_IMODE((identity / "crt.pem").stat().st_mode), 0o644)
                 self.assertEqual((identity / "key.p8").stat().st_gid, os.getgid())
-            # The shared fixture gains no Linkerd copies, and the run's
-            # cleanup removes the copied private keys with the fixture's.
+            # The shared fixture gains no Linkerd copies.
             self.assertEqual(sorted(path.name for path in certs.iterdir()), ["client", "svc"])
-            self.assertIn('"$RUNTIME_DIR"/linkerd/*/key.p8', functions("cleanup"))
+            # The run's cleanup removes the copied private keys with the
+            # fixture's and keeps the public certificates as provenance.
+            subprocess.run(["bash", "-c", functions("cleanup") + '\ncleanup'],
+                check=True, timeout=10, env={**env, "MESH": ""})
+            self.assertEqual(sorted((runtime / "linkerd").rglob("key.p8")), [])
+            self.assertEqual(sorted(certs.rglob("svid.key")), [])
+            for role in ("svc", "client"):
+                self.assertTrue((runtime / "linkerd" / role / "crt.pem").exists())
 
     @unittest.skipUnless(shutil.which("timeout"), "GNU timeout required by the Linux harness")
     def test_readiness_detects_dead_container_before_probing(self):
