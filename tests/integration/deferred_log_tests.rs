@@ -34,6 +34,7 @@ use ferrum_edge::_test_support::{
     proxy_body_into_grpc_web_passthrough_streaming_with_headers_for_test,
     proxy_body_streaming_for_test, proxy_body_with_grpc_admission_outcome_for_test,
 };
+use ferrum_edge::plugins::mesh::prometheus_helpers::MeshRequestKey;
 use ferrum_edge::plugins::prometheus_metrics::{ClientDisconnectKey, MetricsRegistry};
 use ferrum_edge::plugins::{
     MirrorResponseMeta, Plugin, RequestContext, ResponseDelivery, ResponseStreamAction,
@@ -308,22 +309,67 @@ async fn direct_terminal_dispatch_reaches_log_sinks() {
     assert_eq!(delivered[0].response_status_code, 200);
 }
 
+/// Records the mesh key terminal delivery precomputes. Named like the built-in
+/// so `log_with_mirror` computes the key for it.
+struct MeshKeyCapture {
+    keys: Arc<Mutex<Vec<Option<MeshRequestKey>>>>,
+}
+
+#[async_trait]
+impl Plugin for MeshKeyCapture {
+    fn name(&self) -> &str {
+        "workload_metrics"
+    }
+
+    async fn log_with_mesh_key(
+        &self,
+        _summary: &TransactionSummary,
+        mesh_key: Option<&MeshRequestKey>,
+    ) {
+        self.keys.lock().unwrap().push(mesh_key.cloned());
+    }
+}
+
 /// Detached terminal delivery hands its task a slim copy of the request
 /// context instead of a deep clone (issue #6793). The sinks must still receive
-/// exactly what an inline delivery of the same summary gives them: the `HEAD`
-/// delivered-byte rule and the mirror summary both read the context.
+/// exactly what an inline delivery of the same summary gives them, with every
+/// context field that delivery reads set to a non-default value: the `HEAD`
+/// delivered-byte rule, the WebSocket flavor, a trigger decision, a response
+/// size refusal, the deferred typed mesh labels behind the metric key, and the
+/// mirror summary.
 #[tokio::test(flavor = "multi_thread")]
 async fn detached_terminal_delivery_matches_inline_delivery() {
-    async fn deliver(detached: bool) -> Vec<TransactionSummary> {
+    async fn deliver(detached: bool) -> (Vec<TransactionSummary>, Vec<Option<MeshRequestKey>>) {
         let (capturing, captured) = CapturingPlugin::new();
-        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(capturing)];
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(capturing),
+            Arc::new(MeshKeyCapture {
+                keys: Arc::clone(&keys),
+            }),
+        ];
         let mut ctx = make_ctx();
         ctx.method = "HEAD".to_string();
+        ferrum_edge::_test_support::populate_terminal_delivery_state_for_test(&mut ctx);
+        ferrum_edge::_test_support::defer_mesh_label_projection_for_test(&mut ctx);
+        ferrum_edge::_test_support::annotate_gateway_mesh_dispatch_for_test(
+            &mut ctx,
+            HashMap::from([
+                (
+                    "mesh.spiffe_id".to_string(),
+                    "spiffe://cluster.local/ns/shop/sa/orders".to_string(),
+                ),
+                ("mesh.namespace".to_string(), "shop".to_string()),
+            ]),
+        );
         let (mirror_tx, mirror_rx) = tokio::sync::watch::channel(None);
         ctx.mirror_result_rxs.push(mirror_rx);
         let mut summary = make_summary_with_status(200);
         summary.http_method = "HEAD".to_string();
         summary.bytes_received = 512;
+        summary
+            .metadata
+            .insert("mesh.request_protocol".to_string(), "http".to_string());
         if detached {
             spawn_bounded_terminal_summary_log(&plugins, summary, &ctx);
         } else {
@@ -341,16 +387,42 @@ async fn detached_terminal_delivery_matches_inline_delivery() {
         }));
         let mut delivered = wait_for_captures(&captured, 2).await;
         delivered.sort_by_key(|summary| summary.mirror);
-        delivered
+        let keys = keys.lock().unwrap().clone();
+        (delivered, keys)
     }
 
-    let inline = deliver(false).await;
-    let detached = deliver(true).await;
+    let (inline, inline_keys) = deliver(false).await;
+    let (detached, detached_keys) = deliver(true).await;
     assert_eq!(inline.len(), 2, "inline: primary and mirror summaries");
     assert_eq!(detached.len(), 2, "detached: primary and mirror summaries");
+    // The fixture really exercises each context-derived stamp.
+    let primary = &inline[0];
     assert_eq!(
-        inline[0].bytes_received, 0,
+        primary.bytes_received, 0,
         "a HEAD response delivers no body"
+    );
+    assert_eq!(
+        primary.metadata.get("request_protocol").map(String::as_str),
+        Some("ws")
+    );
+    assert_eq!(
+        primary.error_class,
+        Some(ErrorClass::DispatchPolicyRejected)
+    );
+    assert_ne!(
+        format!("{:?}", primary.plugin_trigger_decisions),
+        format!(
+            "{:?}",
+            TransactionSummary::default().plugin_trigger_decisions
+        )
+    );
+    let primary_key = inline_keys
+        .first()
+        .and_then(Option::as_ref)
+        .expect("a mesh key from the typed labels");
+    assert_eq!(
+        &*primary_key.destination_principal,
+        "spiffe://cluster.local/ns/shop/sa/orders"
     );
     for (inline, detached) in inline.iter().zip(&detached) {
         assert_eq!(inline.mirror, detached.mirror);
@@ -359,7 +431,15 @@ async fn detached_terminal_delivery_matches_inline_delivery() {
         assert_eq!(inline.backend_target, detached.backend_target);
         assert_eq!(inline.error_class, detached.error_class);
         assert_eq!(inline.metadata, detached.metadata);
+        assert_eq!(
+            format!("{:?}", inline.plugin_trigger_decisions),
+            format!("{:?}", detached.plugin_trigger_decisions)
+        );
     }
+    assert_eq!(
+        inline_keys, detached_keys,
+        "the same mesh keys, primary and mirror"
+    );
 }
 
 /// Every context read on the detached terminal-delivery path is one the slim
@@ -439,7 +519,11 @@ fn detached_terminal_delivery_reads_only_what_its_slim_context_carries() {
         uncarried.is_empty(),
         "detached terminal delivery reads context state its slim copy does not carry: {uncarried:?}"
     );
-    let slim = item(plugins, "pub(crate) fn clone_for_detached_terminal_log(");
+    let slim = {
+        let start = "pub(crate) fn clone_for_detached_terminal_log(";
+        let rest = &plugins[plugins.find(start).expect("slim detached context")..];
+        &rest[..rest.find("\n    }\n").expect("end of the method")]
+    };
     assert!(slim.contains("Self::new(String::new(), self.method.clone(), String::new())"));
     for field in [
         "plugin_trigger_decisions",
