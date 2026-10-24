@@ -334,22 +334,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escapes read as `\uFFFD` (escaped backslashes are left literal), and the
   JSON-path rules run on that reading with duplicate members preserved. Bodies
   the strict parse accepts are still read in place without a copy. A reading
-  that still does not parse remains outside `body_json_path` inspection; see
-  `docs/waf.md`.
+  that still does not parse now fails closed (next entry).
 - **WAF `body_json_path` rules fail closed on JSON they cannot parse.** A
-  reading that opens like a JSON object or array but that neither the strict
-  nor the lenient parse accepts — a number beyond the `f64` range, nesting
-  deeper than 128 levels, `NaN` / `Infinity`, a comment, a trailing comma, or
-  text after the document, all of which some backend parsers accept — used to
-  switch every JSON-path rule off for that request while the bytes were
-  forwarded. Every applicable `body_json_path` rule now records a hit on such
-  a reading, and its own action and anomaly score decide exactly as for a
-  match. Whitespace-separated documents (NDJSON, or a document followed by
-  another) are now all inspected instead of being refused. A body scanned only
-  up to `max_scan_bytes` is not judged this way, and a body that does not open
-  like a JSON container (form, XML, plain text, the raw bytes of a UTF-16 /
-  UTF-32 document) is unaffected. Valid JSON bodies take the same single parse
-  as before.
+  body that neither the strict nor the lenient parse accepts — a number
+  beyond the `f64` range, nesting deeper than 128 levels, `NaN` / `Infinity`,
+  a comment, a trailing comma, an unquoted member name, a leading form feed
+  or NBSP, the `)]}'` prefix, or text after the document, all of which some
+  backend parsers accept — used to switch every JSON-path rule off for that
+  request while the bytes were forwarded. Every applicable `body_json_path`
+  rule now records a hit, and its own action and anomaly score decide
+  exactly as for a match, when a refused reading opens like a JSON object or
+  array (after the whitespace, comments and prefix lenient parsers skip), or
+  when no reading parsed and the `Content-Type` declares JSON (`*/json`,
+  `+json`; not the gRPC JSON codecs) or a reading opens like JSON once NULs
+  are skipped. Whitespace-separated documents (NDJSON, a leading scalar
+  followed by an object, a document followed by another) are now all
+  inspected instead of being refused. A body scanned only up to
+  `max_scan_bytes` is not judged this way, an ordinary UTF-16 / UTF-32 body is
+  unaffected, and valid JSON bodies take the same single parse as before.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,

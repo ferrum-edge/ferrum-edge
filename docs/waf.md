@@ -467,31 +467,60 @@ document from `body_json_path` rules. Only that fallback copies the body; a
 body the strict parser accepts is read in place.
 
 The lenient reading also accepts several documents separated by whitespace
-(NDJSON, or a document followed by another one): every document is inspected,
-so a backend that reads only the first, only the last, or each of them is
-covered by the same verdict.
+(NDJSON, a leading scalar such as `null` followed by an object, or a document
+followed by another one): every document is inspected, so a backend that
+reads only the first, only the last, or each of them is covered by the same
+verdict.
 
-A reading that opens like a JSON object or array — after whitespace, `{`
-followed by a quoted member name, `}` or a comment, or `[` followed by a
-value (including `NaN` and `Infinity`), `]` or a comment — but that neither
-reading parses **fails closed**: every applicable `body_json_path` rule
-records a hit, and that rule's own action, paranoia band and anomaly-score
-contribution decide, exactly as for a match: in `mode: monitor`, or for a
-`monitor` rule without anomaly scoring, it is only observed. The rule's
-`conditions` and request-wide exemptions still apply; value filters
-(`fp_filters`, global value exemptions) are not consulted because no value
-was selected. Backend parsers accept grammar the WAF's parser refuses —
-numbers beyond the `f64` range, nesting deeper than 128 levels, `NaN` /
-`Infinity`, comments, trailing commas, text after the document — so treating
-such a body as having nothing to select would let one such token switch every
-JSON-path rule off. The rule is judged per reading, so the raw bytes of a
-UTF-16 / UTF-32 document (a NUL follows the bracket) and text that merely
-starts with a bracket (`[INFO] …`) are not taken for a document. A body
-scanned only up to `max_scan_bytes` (`on_body_too_large: scan_truncated`, or a
-prefix scan in a configuration that cannot block) is cut short by
-construction and is not judged this way. A body that does not open like a
-JSON object or array is not inspected by `body_json_path` rules; `body_text`
-rules, byte rules and the body-scoped specials scan every body either way.
+A body that `body_json_path` rules cannot read **fails closed**: every
+applicable `body_json_path` rule records a hit, and that rule's own action,
+paranoia band and anomaly-score contribution decide, exactly as for a match —
+in `mode: monitor`, or for a `monitor` rule without anomaly scoring, it is
+only observed. The rule's `conditions` and request-wide exemptions still
+apply; value filters (`fp_filters`, global value exemptions) are not
+consulted because no value was selected. Backend parsers accept grammar the
+WAF's parser refuses — numbers beyond the `f64` range, nesting deeper than
+128 levels, `NaN` / `Infinity`, comments, trailing commas, unquoted member
+names, JavaScript whitespace, text after the document — so treating such a
+body as having nothing to select would let one such token switch every
+JSON-path rule off. A body cannot be read when a reading is refused by both
+the strict and the lenient parse and:
+
+- the reading, or the document the lenient reading stopped at, **opens like a
+  JSON object or array** — whatever the `Content-Type` says and whatever the
+  other readings did. After an optional `)]}'` (or `)]}',`) anti-XSSI prefix
+  and anything lenient parsers skip between tokens (JSON whitespace, vertical
+  tab, form feed, U+00A0, U+FEFF, U+2028 / U+2029 and the other Unicode space
+  separators, `//` and `/* */` comments), it holds `{` followed by a quoted
+  member name, `}`, or an unquoted identifier and `:`, or `[` followed by `]`,
+  `{`, `[`, a quote, `-`, `+`, `.`, a digit, or `true` / `false` / `null` /
+  `NaN` / `Infinity` ending at a delimiter. Text that merely starts with a
+  bracket (`[INFO] …`, `[true-story] …`, `{{template}}`) does not; or
+- **no reading parsed** and either the `Content-Type` declares JSON
+  (`*/json` or a `+json` suffix, except the gRPC JSON codecs, whose bodies are
+  length-prefixed frames), or a reading opens like a JSON container once
+  U+0000 is skipped between tokens as Json.NET does (again except gRPC
+  framings). Under a JSON declaration no sniff is needed: any non-blank body
+  none of whose readings parse — including plain text or a form sent as
+  `application/json` — fails closed.
+
+"No reading parsed" is what keeps an ordinary UTF-16 / UTF-32 body open: its
+raw bytes are refused (a NUL follows every ASCII character) while its
+transcoded reading parses. An empty or whitespace-only body, and a lone
+top-level scalar (which no non-empty path can select), are never judged. A
+body scanned only up to `max_scan_bytes` (`on_body_too_large:
+scan_truncated`, or a prefix scan in a configuration that cannot block) is cut
+short by construction and is not judged either. WebSocket messages carry no
+`Content-Type`, so only the opening rules apply to them.
+
+What remains outside `body_json_path` inspection is a body that is not
+declared JSON, whose readings all fail to parse, and that does not open like
+a JSON container as described above — for example a leading scalar followed
+by text (`1 item`), or an opening only a non-default parser option accepts
+beyond those listed. `body_text` rules, byte rules and the body-scoped
+specials scan every body either way; pair a `body_json_path` rule with a
+`body_text` rule, or declare and validate JSON before it reaches the backend,
+when such a backend must be protected.
 
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).
