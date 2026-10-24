@@ -22,6 +22,20 @@ pub const MIN_IDLE_PER_HOST: usize = 4;
 /// 1024 rarely help because the backend itself becomes the bottleneck.
 pub const MAX_IDLE_PER_HOST: usize = 1024;
 
+/// Default `max_idle_per_host` (issue #6793).
+///
+/// A ceiling reserves nothing: a pool keeps only the connections its own
+/// concurrency opened, and each expires after the idle timeout. It costs only
+/// when a backend's sustained concurrency exceeds it, and then every check-in
+/// beyond it drops a connection that is redialed. On the mesh runtime
+/// benchmark that cost about 2.5% of throughput and server CPU (64 at 100
+/// concurrent requests, 256 at 500), while 128 and 256 were indistinguishable
+/// from 1024 at 100, as was 256 at 250. 256 is the smallest ceiling that matched
+/// 1024 through 250 concurrent requests per backend; set
+/// `FERRUM_POOL_MAX_IDLE_PER_HOST` up to 1024 for higher sustained
+/// concurrency.
+pub const DEFAULT_IDLE_PER_HOST: usize = 256;
+
 /// Global connection pool configuration from environment variables or ferrum.conf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolConfig {
@@ -105,7 +119,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            max_idle_per_host: 64,
+            max_idle_per_host: DEFAULT_IDLE_PER_HOST,
             idle_timeout_seconds: 90,
             enable_http_keep_alive: true,
             enable_http2: true,

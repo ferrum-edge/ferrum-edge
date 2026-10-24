@@ -67,9 +67,10 @@ so destination metadata is not stripped solely because one node's proxy is
 briefly not Ready. Another node's trusted pod cannot retain a withdrawn node.
 Removing a node's trusted waypoint object, or removing every trusted waypoint
 pod, clears that node's inventory and withdraws its metadata. The proxy Pod
-must live in `FERRUM_K8S_CONTROLLER_NAMESPACE`, carry
-`app.kubernetes.io/name=ferrum-mesh-ambient`, use service account
-`ferrum-mesh`, and advertise `FERRUM_MESH_TOPOLOGY=node_waypoint`; scoped
+must live in `FERRUM_K8S_CONTROLLER_NAMESPACE`, run with `hostNetwork: true`,
+carry `app.kubernetes.io/name=ferrum-mesh-ambient`, use service account
+`ferrum-mesh-ambient` (the chart binds that account only to the ambient
+DaemonSet), and advertise `FERRUM_MESH_TOPOLOGY=node_waypoint`; scoped
 workload watches include that namespace for Pod discovery. Helm sets this to
 the release namespace by default and refuses `node_waypoint` renders that
 disable the ambient admin health listener, so Kubernetes Pod Ready is backed by
