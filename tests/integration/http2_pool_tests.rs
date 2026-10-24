@@ -3077,6 +3077,81 @@ async fn test_grpc_pool_backoff_has_bounded_occupancy_and_constant_eviction_work
     assert_eq!(pool.pool_size(), 1);
 }
 
+/// The direct HTTP/1.1 idle set grows with use instead of preallocating its
+/// ceiling, but still holds at most `max_idle_per_host` connections: check-ins
+/// beyond it drop the connection, and the kept ones are reused (issue #6793).
+#[tokio::test]
+async fn test_direct_h1_idle_set_holds_at_most_max_idle_per_host() {
+    let listener = tokio::net::TcpListener::bind_test("127.0.0.1:0")
+        .await
+        .expect("bind backend");
+    let port = listener.local_addr().expect("backend addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&accepts);
+    let _backend = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            held.push(stream);
+        }
+    });
+
+    let pool = Http2ConnectionPool::new(
+        PoolConfig {
+            max_idle_per_host: 4,
+            ..PoolConfig::default()
+        },
+        ferrum_edge::config::EnvConfig::default(),
+        create_dns_cache(),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Http);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
+    proxy.backend_host = "127.0.0.1".to_string();
+    proxy.backend_port = port;
+    let connect_timeout = Duration::from_secs(2);
+
+    let mut checkouts = Vec::new();
+    for _ in 0..6 {
+        let checkout = pool
+            .checkout_h1(&proxy, false, connect_timeout, false)
+            .await
+            .expect("checkout dials the backend");
+        assert!(!checkout.reused(), "nothing is idle while all six are held");
+        checkouts.push(checkout);
+    }
+    for checkout in checkouts {
+        checkout.checkin();
+    }
+    // Check-in may wait for each fresh connection's dispatcher to report ready.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pool.h1_idle_connections() < 4 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        pool.h1_idle_connections(),
+        4,
+        "the idle set keeps exactly its ceiling"
+    );
+
+    for _ in 0..4 {
+        let checkout = pool
+            .checkout_h1(&proxy, false, connect_timeout, false)
+            .await
+            .expect("checkout");
+        assert!(checkout.reused(), "a kept connection is reused");
+    }
+    assert_eq!(pool.h1_idle_connections(), 0);
+    let fresh = pool
+        .checkout_h1(&proxy, false, connect_timeout, false)
+        .await
+        .expect("checkout");
+    assert!(!fresh.reused(), "an empty idle set dials");
+}
+
 /// The production direct HTTP/1.1 handoff gate (GHSA-xcg4-wj3x-gjj2). A
 /// checked-out connection whose request bound elapsed before the handoff never
 /// carried the request, so the gate refuses it and returns it to the idle set
