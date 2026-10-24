@@ -1632,7 +1632,7 @@ async fn body_json_path_reads_framed_rpc_streams_as_their_messages() {
             &plugin_at_index,
             content_type,
             &[smuggled.clone(), trailing_comma.clone()],
-            &[genuine.clone()],
+            std::slice::from_ref(&genuine),
         )
         .await;
     }
@@ -1796,7 +1796,7 @@ async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes()
     // benign document whose string holds the ASCII middle as wide characters.
     let plugin = container_json_path_waf("0.user.bio", "contains", "forbidden-canary", &[]);
     let polyglot = |middle: &str| -> Vec<u8> {
-        assert_eq!(middle.len() % 2, 0);
+        assert!(middle.len().is_multiple_of(2));
         let mut body = encode_utf16(r#"[{"x":""#, false);
         body.extend_from_slice(middle.as_bytes());
         body.extend(encode_utf16(r#""}]"#, false));
@@ -1808,8 +1808,8 @@ async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes()
         assert_json_path_verdicts(
             &plugin,
             content_type,
-            &[forbidden.clone()],
-            &[benign.clone()],
+            std::slice::from_ref(&forbidden),
+            std::slice::from_ref(&benign),
         )
         .await;
     }
@@ -1852,7 +1852,8 @@ async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes()
         "application/json; charset=\"utf\\-16le\"",
         "application/json; charset=unicode",
     ] {
-        assert_json_path_verdicts(&plugin, content_type, &[forbidden.clone()], &[]).await;
+        assert_json_path_verdicts(&plugin, content_type, std::slice::from_ref(&forbidden), &[])
+            .await;
     }
     // Two `Content-Type` field lines are folded into one comma-separated
     // value, which is not canonical either (admitted here through
@@ -1874,7 +1875,7 @@ async fn body_json_path_sniffed_utf16_reading_does_not_vouch_for_the_raw_bytes()
     assert_json_path_verdicts(
         &binary_plugin,
         "application/json, application/json; charset=utf-16le",
-        &[forbidden.clone()],
+        std::slice::from_ref(&forbidden),
         &[],
     )
     .await;
