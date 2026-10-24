@@ -225,11 +225,12 @@ const SLICE: &str = "node_id namespace istio_root_namespace workload_spiffe_id w
     waypoint_gateway_class service_waypoint_bound_services labels labels_ambiguous \
     virtual_service_l4_proxies virtual_service_l4_upstreams version revision workloads \
     ambient_udp_source_workloads node_waypoint_assertors node_waypoint_capture_destinations \
-    node_waypoint_capture_peer_authentications node_waypoint_capture_mesh_policies services \
-    local_inbound_services local_inbound_workloads local_ingress_listeners \
-    sidecar_ingress_declared declared_ingress_http_ports mesh_policies ext_authz_providers \
-    peer_authentications service_entries request_authentications telemetry_resources \
-    destination_rules virtual_service_cors_policies proxy_configs trust_bundles multi_cluster \
+    node_waypoint_capture_peer_authentications node_waypoint_capture_mesh_policies \
+    node_waypoint_capture_mesh_policies_resolved services local_inbound_services \
+    local_inbound_workloads local_ingress_listeners sidecar_ingress_declared \
+    declared_ingress_http_ports mesh_policies ext_authz_providers peer_authentications \
+    service_entries request_authentications telemetry_resources destination_rules \
+    virtual_service_cors_policies proxy_configs trust_bundles multi_cluster \
     outbound_traffic_policy sidecar_outbound_traffic_policy sidecar_egress_scope extension_configs \
     runtime_overlay";
 const WORKLOAD: &str = "spiffe_id selector service_name service_namespace addresses ports \

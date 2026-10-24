@@ -4574,15 +4574,16 @@ mod tests {
     /// destination it captures for — resolved BEFORE `mesh_policies` is
     /// narrowed to the subscription namespace — on the dedicated capture field
     /// only, bounded by the same CP scope / bearer authorization as the
-    /// destinations themselves, and narrowed by the slice builder to exactly the
-    /// policies that select a captured destination.
+    /// destinations themselves, and preserved across an incremental refilter.
+    /// Kept inline only because the CP filter seam is crate-private; the slice
+    /// builder's exact per-destination narrowing is pinned in
+    /// `tests/integration/mesh_node_waypoint_stream_scope_tests.rs`.
     #[test]
     fn mesh_request_filter_carries_capture_destination_authorization_policies() {
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{
             MeshPolicy, MeshRule, NodeWaypointEndpoint, PolicyAction, Workload,
         };
-        use crate::modes::mesh::slice::MeshSlice;
 
         let this_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-a";
         let other_waypoint = "spiffe://test.local/ns/ferrum/sa/node-waypoint-b";
@@ -4700,24 +4701,23 @@ mod tests {
             "the CP hop is namespace-level: owner = a captured destination's namespace or root"
         );
 
-        let slice = MeshSlice::from_gateway_config(&filtered, request.clone());
-        assert_eq!(
-            names(slice.node_waypoint_capture_mesh_policies.as_slice()),
-            vec![
-                "ledger-deny".to_string(),
-                "payments-deny".to_string(),
-                "root-deny".to_string(),
-                "secrets-deny".to_string(),
-            ],
-            "the slice carries exactly the policies that select a captured destination; a \
-             selector for a pod on another node never leaves the CP"
+        // Incremental refilter of the stream-local config (whose
+        // `mesh_policies` is already narrowed) must PRESERVE the inventory, not
+        // recompute it from the narrowed view and drop every foreign policy.
+        let refiltered = CpGrpcServer::filter_config_to_mesh_request_for_scope(
+            &filtered,
+            &request,
+            &CpScope::All,
         );
-        assert!(
-            slice
-                .mesh_policies
-                .iter()
-                .all(|policy| policy.namespace != "payments" && policy.namespace != "secrets"),
-            "the capture inventory must not widen the slice's own AuthorizationPolicy view"
+        let refiltered_mesh = refiltered.mesh.as_ref().expect("mesh should remain");
+        assert_eq!(
+            refiltered_mesh.node_waypoint_capture_mesh_policies,
+            mesh.node_waypoint_capture_mesh_policies,
+            "a refilter must preserve the CP-resolved destination policy inventory"
+        );
+        assert_eq!(
+            refiltered_mesh.node_waypoint_capture_destinations,
+            mesh.node_waypoint_capture_destinations
         );
 
         // `Single`-scope CP: no cross-namespace destination, so no foreign

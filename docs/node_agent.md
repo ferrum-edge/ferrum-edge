@@ -810,7 +810,9 @@ control plane that emits no inventory, an unauthorized namespace, an unknown
 NodeWaypoint identity, and a pod enrolled on a *different* node's NodeWaypoint
 all resolve to nothing and the connection is refused. A captured connection is
 authorized against the destination pod's own AuthorizationPolicy set from that
-inventory, not the NodeWaypoint namespace's. See
+inventory, not the NodeWaypoint namespace's; a control plane that sends
+destinations without proof that it resolved their AuthorizationPolicy set is
+refused and the previous complete generation keeps serving. See
 [`docs/mesh.md`](mesh.md) for the full contract.
 
 Every one of those gates is fail-closed: an unresolvable or ambiguous

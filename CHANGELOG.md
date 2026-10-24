@@ -115,7 +115,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a new `NodeWaypointCaptureMeshPoliciesCarrier` ECDS carrier, and
   `mesh_authz` evaluates it under per-pod scoping. The ordinary `mesh_policies`
   view is unchanged. Scoped destination policies also count toward the
-  missing-scope fail-closed rule.
+  missing-scope fail-closed rule. The inventory carries explicit completeness
+  evidence (`node_waypoint_capture_mesh_policies_resolved`; over xDS, the
+  carrier is emitted even when empty), and a slice with capture destinations
+  but no such evidence is refused (startup builds no capture-serving
+  generation; reload keeps the previous one), so a control plane that predates
+  this inventory cannot serve captured destinations without their policies.
+  Authenticated inbound HBONE relays to those destinations now resolve the
+  destination's scope from the same inventory, so their policies are evaluated
+  instead of the relay being refused for a missing scope.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now

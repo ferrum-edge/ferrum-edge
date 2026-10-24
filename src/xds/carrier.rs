@@ -128,7 +128,9 @@ pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL: &str =
 /// `MeshPoliciesCarrier`, which is the subscription-namespace view; without this
 /// carrier a captured pod's cross-namespace DENY/ALLOW never reaches an xDS DP
 /// and the scoped evaluator would judge the connection against an incomplete
-/// policy set.
+/// policy set. Its PRESENCE is the inventory's completeness evidence (emitted
+/// even when empty); a DP that recovers capture destinations without it refuses
+/// the slice.
 pub const FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_MESH_POLICIES_TYPE_URL: &str =
     "type.googleapis.com/ferrum.config.extension.v3.NodeWaypointCaptureMeshPoliciesCarrier";
 /// Inner `type_url` for the effective workload-label context carrier.
@@ -873,7 +875,11 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.node_waypoint_capture_peer_authentications.clone(),
         ));
     }
-    if !slice.node_waypoint_capture_mesh_policies.is_empty() {
+    // The destination AuthorizationPolicy carrier doubles as the inventory's
+    // COMPLETENESS evidence: it is emitted whenever the producer resolved the
+    // inventory, INCLUDING an empty result, so the DP can tell "resolved, no
+    // applicable policy" from "never resolved" and refuse the latter.
+    if slice.node_waypoint_capture_mesh_policies_resolved {
         carriers.push(MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(
             slice.node_waypoint_capture_mesh_policies.clone(),
         ));
@@ -1033,7 +1039,8 @@ pub fn apply_carrier(slice: &mut MeshSlice, carrier: MeshSliceCarrier) {
             slice.node_waypoint_capture_peer_authentications = value
         }
         MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value) => {
-            slice.node_waypoint_capture_mesh_policies = value
+            slice.node_waypoint_capture_mesh_policies = value;
+            slice.node_waypoint_capture_mesh_policies_resolved = true;
         }
         MeshSliceCarrier::WorkloadLabels(value) => slice.labels = value,
         MeshSliceCarrier::LabelsAmbiguous(value) => slice.labels_ambiguous = value,

@@ -1032,4 +1032,326 @@ mod node_waypoint_capture_inventory {
              {result:?}"
         );
     }
+
+    fn node_waypoint_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
+        super::super::mesh_test_support::runtime_for_topology(
+            ferrum_edge::modes::mesh::MeshTopology::NodeWaypoint,
+        )
+    }
+
+    fn prepare(slice: &MeshSlice) -> Result<GatewayConfig, String> {
+        ferrum_edge::modes::mesh::prepare_gateway_config_from_mesh_slice(
+            slice,
+            &node_waypoint_runtime(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// A capture-scoped producer that resolves NO applicable destination policy
+    /// still proves it resolved the inventory: the slice is marked complete,
+    /// the (empty) xDS carrier is still emitted, and the slice is served.
+    #[test]
+    fn an_empty_capture_authorization_inventory_is_explicitly_complete() {
+        let mut config = config_with_workloads();
+        config
+            .mesh
+            .as_deref_mut()
+            .expect("mesh")
+            .mesh_policies
+            .clear();
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+        assert!(!slice.node_waypoint_capture_destinations.is_empty());
+        assert!(slice.node_waypoint_capture_mesh_policies.is_empty());
+        assert!(slice.node_waypoint_capture_mesh_policies_resolved);
+        slice
+            .validate_node_waypoint_capture_inventory()
+            .expect("an explicitly complete empty inventory is valid");
+        prepare(&slice).expect("a complete empty inventory is served");
+
+        let mut rebuilt = MeshSlice::default();
+        let mut saw_empty_carrier = false;
+        for resource in ferrum_edge::xds::translator::translate_mesh_slice_carriers(&slice) {
+            let typed_extension =
+                <ferrum_edge::xds::proto::TypedExtensionConfig as prost::Message>::decode(
+                    resource.value.as_slice(),
+                )
+                .expect("ECDS resource decodes as TypedExtensionConfig");
+            let Some(inner) = typed_extension.typed_config.as_ref() else {
+                continue;
+            };
+            let Some(carrier) =
+                MeshSliceCarrier::decode(&inner.type_url, &inner.value).expect("carrier decodes")
+            else {
+                continue;
+            };
+            if let MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(policies) = &carrier {
+                saw_empty_carrier = policies.is_empty();
+            }
+            ferrum_edge::xds::carrier::apply_carrier(&mut rebuilt, carrier);
+        }
+        assert!(
+            saw_empty_carrier,
+            "the AuthorizationPolicy carrier is the completeness evidence and must be emitted \
+             even when empty"
+        );
+        assert!(rebuilt.node_waypoint_capture_mesh_policies_resolved);
+        rebuilt
+            .validate_node_waypoint_capture_inventory()
+            .expect("the recovered empty inventory is complete");
+    }
+
+    /// The shape an older producer sends — capture destinations and their
+    /// PeerAuthentication, but no destination AuthorizationPolicy evidence —
+    /// is refused at conversion, which is what both the initial-config path
+    /// and slice reload run. On reload the previously accepted complete
+    /// generation is left untouched.
+    #[test]
+    fn capture_destinations_without_policy_evidence_are_refused_at_startup_and_reload() {
+        let complete =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+        assert!(complete.node_waypoint_capture_mesh_policies_resolved);
+
+        let mut missing_evidence = complete.clone();
+        missing_evidence.node_waypoint_capture_mesh_policies.clear();
+        missing_evidence.node_waypoint_capture_mesh_policies_resolved = false;
+        assert!(
+            !missing_evidence
+                .node_waypoint_capture_destinations
+                .is_empty()
+        );
+
+        // Startup: nothing to fall back to, so no capture-serving generation.
+        let error = prepare(&missing_evidence)
+            .expect_err("capture destinations without policy evidence must be refused");
+        assert!(
+            error.contains("node_waypoint_capture_mesh_policies_resolved"),
+            "diagnostic must name the missing evidence: {error}"
+        );
+
+        // Reload: the accepted generation keeps its destination policies; the
+        // incomplete candidate is refused rather than replacing it.
+        let accepted = prepare(&complete).expect("complete generation is served");
+        assert!(
+            accepted
+                .mesh
+                .as_deref()
+                .expect("mesh")
+                .node_waypoint_capture_mesh_policies
+                .iter()
+                .any(|policy| policy.name == "payments-deny-all")
+        );
+        assert!(prepare(&missing_evidence).is_err());
+
+        // xDS: the older shape emits no AuthorizationPolicy carrier, so the
+        // recovered slice carries no evidence and is refused the same way.
+        let mut recovered = MeshSlice::default();
+        for resource in
+            ferrum_edge::xds::translator::translate_mesh_slice_carriers(&missing_evidence)
+        {
+            let typed_extension =
+                <ferrum_edge::xds::proto::TypedExtensionConfig as prost::Message>::decode(
+                    resource.value.as_slice(),
+                )
+                .expect("ECDS resource decodes as TypedExtensionConfig");
+            let Some(inner) = typed_extension.typed_config.as_ref() else {
+                continue;
+            };
+            if let Some(carrier) =
+                MeshSliceCarrier::decode(&inner.type_url, &inner.value).expect("carrier decodes")
+            {
+                assert!(
+                    !matches!(
+                        carrier,
+                        MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(_)
+                    ),
+                    "an unresolved inventory must not emit completeness evidence"
+                );
+                ferrum_edge::xds::carrier::apply_carrier(&mut recovered, carrier);
+            }
+        }
+        assert!(!recovered.node_waypoint_capture_destinations.is_empty());
+        assert!(
+            recovered
+                .validate_node_waypoint_capture_inventory()
+                .is_err()
+        );
+
+        // Policies without evidence are incoherent and refused too.
+        let mut policies_without_evidence = complete;
+        policies_without_evidence
+            .node_waypoint_capture_destinations
+            .clear();
+        policies_without_evidence.node_waypoint_capture_mesh_policies_resolved = false;
+        assert!(
+            policies_without_evidence
+                .validate_node_waypoint_capture_inventory()
+                .is_err()
+        );
+
+        // A slice with no capture inventory at all (any other topology) needs
+        // no evidence.
+        MeshSlice::default()
+            .validate_node_waypoint_capture_inventory()
+            .expect("no capture inventory, nothing to prove");
+    }
+
+    /// When the destination leaves this NodeWaypoint, its AuthorizationPolicy
+    /// leaves with it on the next generation, and the prepared config's
+    /// back-projection is replaced rather than merged.
+    #[test]
+    fn destination_policies_are_withdrawn_with_the_destination() {
+        let generation_one =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+        let prepared_one = prepare(&generation_one).expect("generation one");
+        assert!(
+            !prepared_one
+                .mesh
+                .as_deref()
+                .expect("mesh")
+                .node_waypoint_capture_mesh_policies
+                .is_empty()
+        );
+
+        // `ledger` is now enrolled on another node's NodeWaypoint.
+        let mut config = config_with_workloads();
+        config.mesh.as_deref_mut().expect("mesh").workloads[0] =
+            workload("payments", "ledger", OTHER_WAYPOINT, "10.244.1.7");
+        let generation_two = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+        assert!(generation_two.node_waypoint_capture_destinations.is_empty());
+        assert!(
+            generation_two
+                .node_waypoint_capture_mesh_policies
+                .is_empty()
+        );
+        assert!(generation_two.node_waypoint_capture_mesh_policies_resolved);
+        assert!(!generation_one.content_eq(&generation_two));
+
+        let prepared_two = prepare(&generation_two).expect("generation two");
+        let mesh = prepared_two.mesh.as_deref().expect("mesh");
+        assert!(mesh.node_waypoint_capture_destinations.is_empty());
+        assert!(
+            mesh.node_waypoint_capture_mesh_policies.is_empty(),
+            "a withdrawn destination's policies must not survive in the prepared config"
+        );
+    }
+
+    /// A CUSTOM policy that only the capture inventory carries still brings its
+    /// extension provider onto the slice; otherwise the delegation could never
+    /// bind and every captured connection to that destination would be denied.
+    #[test]
+    fn a_capture_only_custom_policy_carries_its_extension_provider() {
+        let mut config = config_with_workloads();
+        let mesh = config.mesh.as_deref_mut().expect("mesh");
+        mesh.ext_authz_providers = vec![
+            serde_json::from_value(serde_json::json!({
+                "name": "payments-authz",
+                "service": "authz.payments.svc.cluster.local",
+                "port": 9000,
+                "tls": true,
+                "timeout_ms": 1000,
+                "status_on_error": 403,
+            }))
+            .expect("provider"),
+        ];
+        mesh.mesh_policies = vec![policy(
+            "payments",
+            "payments-custom",
+            PolicyScope::Namespace {
+                namespace: "payments".to_string(),
+            },
+            PolicyAction::Custom {
+                provider: "payments-authz".to_string(),
+            },
+        )];
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+
+        assert_eq!(
+            policy_names(&slice.node_waypoint_capture_mesh_policies),
+            vec!["payments-custom"]
+        );
+        assert!(
+            slice.mesh_policies.is_empty(),
+            "the waypoint's own view carries no CUSTOM policy"
+        );
+        assert_eq!(
+            slice
+                .ext_authz_providers
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["payments-authz"],
+            "a provider referenced only by the capture inventory must ride the slice"
+        );
+    }
+
+    /// CP-driven slicing: the CP hands the slice builder a namespace-level
+    /// candidate inventory (owner = a captured destination's namespace or the
+    /// root namespace) beside an already-narrowed `mesh_policies`. The builder
+    /// keeps exactly the candidates that select a captured destination — a
+    /// selector for a pod on another node never leaves the CP — and leaves the
+    /// waypoint's own view alone.
+    #[test]
+    fn cp_resolved_candidates_are_narrowed_to_the_exact_destination_set() {
+        let app = |namespace: &str, app: &str| app_selector(namespace, app);
+        let namespace = |namespace: &str| PolicyScope::Namespace {
+            namespace: namespace.to_string(),
+        };
+        let config = GatewayConfig {
+            mesh: Some(Box::new(MeshConfig {
+                // What the CP filter leaves for a `ferrum` subscriber.
+                mesh_policies: vec![policy(
+                    "istio-system",
+                    "root-deny",
+                    PolicyScope::MeshWide,
+                    PolicyAction::Deny,
+                )],
+                node_waypoint_capture_destinations: vec![
+                    workload("payments", "ledger", THIS_WAYPOINT, "10.244.1.7"),
+                    workload("secrets", "vault", THIS_WAYPOINT, "10.244.1.9"),
+                ],
+                node_waypoint_capture_mesh_policies: vec![
+                    policy(
+                        "payments",
+                        "payments-deny",
+                        namespace("payments"),
+                        PolicyAction::Deny,
+                    ),
+                    policy(
+                        "payments",
+                        "ledger-deny",
+                        app("payments", "ledger"),
+                        PolicyAction::Deny,
+                    ),
+                    policy(
+                        "payments",
+                        "reports-deny",
+                        app("payments", "reports"),
+                        PolicyAction::Deny,
+                    ),
+                    policy(
+                        "istio-system",
+                        "root-deny",
+                        PolicyScope::MeshWide,
+                        PolicyAction::Deny,
+                    ),
+                    policy(
+                        "secrets",
+                        "secrets-deny",
+                        namespace("secrets"),
+                        PolicyAction::Deny,
+                    ),
+                ],
+                ..MeshConfig::default()
+            })),
+            ..GatewayConfig::default()
+        };
+        let slice = MeshSlice::from_gateway_config(&config, node_waypoint_request());
+
+        assert_eq!(
+            policy_names(&slice.node_waypoint_capture_mesh_policies),
+            vec!["ledger-deny", "payments-deny", "root-deny", "secrets-deny"]
+        );
+        assert_eq!(policy_names(&slice.mesh_policies), vec!["root-deny"]);
+        assert!(slice.node_waypoint_capture_mesh_policies_resolved);
+    }
 }

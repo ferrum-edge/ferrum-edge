@@ -3223,6 +3223,38 @@ mod tests {
     }
 
     #[test]
+    fn xds_config_fingerprint_includes_runtime_capture_authorization_inventory() {
+        let left = gateway_config_with_service(true, 0);
+        let mut right = left.clone();
+        right
+            .mesh
+            .as_mut()
+            .expect("mesh should exist")
+            .node_waypoint_capture_mesh_policies = vec![crate::modes::mesh::config::MeshPolicy {
+            name: "payments-deny".to_string(),
+            namespace: "payments".to_string(),
+            scope: crate::modes::mesh::config::PolicyScope::Namespace {
+                namespace: "payments".to_string(),
+            },
+            rules: vec![crate::modes::mesh::config::MeshRule {
+                action: crate::modes::mesh::config::PolicyAction::Deny,
+                ..crate::modes::mesh::config::MeshRule::default()
+            }],
+        }];
+
+        assert_eq!(
+            serde_json::to_vec(&left).expect("serialized config"),
+            serde_json::to_vec(&right).expect("serialized config"),
+            "the runtime-only capture inventory is skipped from raw GatewayConfig JSON"
+        );
+        assert_ne!(
+            config_fingerprint(&left),
+            config_fingerprint(&right),
+            "a capture-only AuthorizationPolicy change must invalidate the xDS stream config"
+        );
+    }
+
+    #[test]
     fn xds_config_fingerprint_includes_runtime_node_waypoint_assertors() {
         let mut left = gateway_config_with_service(true, 0);
         let mut right = left.clone();

@@ -1630,6 +1630,15 @@ fn prepare_normalized_gateway_config_for_mesh(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    // A capture inventory whose destination AuthorizationPolicy set was never
+    // resolved by its producer would authorize captured connections against
+    // an incomplete policy set. Refuse the candidate before anything is
+    // materialized: at startup no capture-serving generation is built, and on
+    // reload the previous complete generation keeps serving. Every slice
+    // source (native, xDS, file) converges here.
+    mesh_slice
+        .validate_node_waypoint_capture_inventory()
+        .map_err(|error| anyhow::anyhow!("Mesh slice validation failed: {error}"))?;
     // This is the untrusted/operator boundary. Reserved mesh IDs are invalid
     // here exactly like every other leading-underscore ID. Only after this
     // strict gate succeeds may the trusted materializers below create reserved
@@ -30878,6 +30887,7 @@ mod tests {
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
             node_waypoint_capture_mesh_policies: Vec::new(),
+            node_waypoint_capture_mesh_policies_resolved: false,
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -43576,6 +43586,8 @@ mod tests {
                 name: "reviews".to_string(),
             }],
             node_waypoint_capture_destinations: vec![enrolled],
+            // A capture-scoped producer always stamps the completeness marker.
+            node_waypoint_capture_mesh_policies_resolved: true,
             ..MeshSlice::default()
         };
         let pod_ip = "10.244.1.7"

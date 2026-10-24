@@ -138,6 +138,10 @@ pub struct MeshAuthz {
     destination_same_namespace_backend_alias_by_backend:
         HashMap<NamespacedDestinationBackendKey, DestinationBackendKey>,
     destination_service_backend_hosts: HashSet<String>,
+    /// Capture-destination scopes for the synthesized inbound HBONE relay
+    /// (NodeWaypoint per-pod scoping only); see
+    /// [`NodeWaypointCaptureDestinationScopes`].
+    node_waypoint_capture_destination_scopes: NodeWaypointCaptureDestinationScopes,
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     destination_route_upstreams_requiring_scope: HashSet<String>,
     has_route_upstream_metadata: bool,
@@ -378,6 +382,83 @@ enum NodeWaypointAuthorizedDestination {
         key: DestinationBackendKey,
         aliases: Vec<DestinationBackendKey>,
     },
+}
+
+/// Exact-destination policy scopes for the NodeWaypoint capture-destination
+/// inventory (`MeshSlice.node_waypoint_capture_destinations`).
+///
+/// The ordinary destination index is built from the subscription-namespace
+/// `services` / `workloads` views, so it cannot name an enrolled pod in another
+/// namespace — yet the inbound HBONE relay guard terminates for exactly those
+/// pods, and their own AuthorizationPolicy rides the capture inventory. This
+/// index lets the synthesized inbound relay evaluate that destination's
+/// policies against the destination's own scope instead of having no scope at
+/// all. It is a SEPARATE view: it never feeds routing, known destinations, or
+/// the ordinary service-derived index.
+///
+/// Resolution mirrors the transparent capture resolver: the address is matched
+/// canonically, a workload that declares ports admits only those ports (one
+/// that declares none does not constrain its address), and two matching records
+/// with divergent scopes resolve to NOTHING (fail closed) rather than picking
+/// whose policy applies. Built once per plugin generation; lookup is one parse
+/// plus one hash probe over a tiny per-address list.
+#[derive(Default)]
+struct NodeWaypointCaptureDestinationScopes {
+    by_address: HashMap<std::net::IpAddr, Vec<NodeWaypointCaptureDestinationScope>>,
+}
+
+struct NodeWaypointCaptureDestinationScope {
+    ports: Vec<u16>,
+    scope: crate::modes::mesh::runtime::PolicyScopeCache,
+}
+
+impl NodeWaypointCaptureDestinationScopes {
+    fn from_workloads(workloads: &[crate::modes::mesh::config::Workload]) -> Self {
+        let mut by_address: HashMap<std::net::IpAddr, Vec<NodeWaypointCaptureDestinationScope>> =
+            HashMap::new();
+        for workload in workloads {
+            let scope = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+            let ports: Vec<u16> = workload.ports.iter().map(|port| port.port).collect();
+            for address in &workload.addresses {
+                // Capture destinations are pod addresses; a non-IP record can
+                // never be the original destination of a captured or relayed
+                // connection, so it is not indexed (it resolves nothing).
+                let Ok(address) = address.trim().parse::<std::net::IpAddr>() else {
+                    continue;
+                };
+                by_address.entry(address.to_canonical()).or_default().push(
+                    NodeWaypointCaptureDestinationScope {
+                        ports: ports.clone(),
+                        scope: scope.clone(),
+                    },
+                );
+            }
+        }
+        Self { by_address }
+    }
+
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Option<&crate::modes::mesh::runtime::PolicyScopeCache> {
+        if port == 0 {
+            return None;
+        }
+        let address = host.trim().parse::<std::net::IpAddr>().ok()?.to_canonical();
+        let mut resolved: Option<&crate::modes::mesh::runtime::PolicyScopeCache> = None;
+        for entry in self.by_address.get(&address)? {
+            if !entry.ports.is_empty() && !entry.ports.contains(&port) {
+                continue;
+            }
+            match resolved {
+                Some(existing) if existing != &entry.scope => return None,
+                Some(_) => {}
+                None => resolved = Some(&entry.scope),
+            }
+        }
+        resolved
+    }
 }
 
 struct DestinationScopeMatch<'a> {
@@ -1899,6 +1980,15 @@ impl MeshAuthz {
         let service_waypoint_destination_scope_required =
             ambient_udp_source_scoping && slice.waypoint_name.is_some();
         let mut has_route_upstream_metadata = false;
+        // Only NodeWaypoint per-pod scoping consults the capture-destination
+        // scopes (for the synthesized inbound HBONE relay).
+        let node_waypoint_capture_destination_scopes = if per_pod_policy_scoping {
+            NodeWaypointCaptureDestinationScopes::from_workloads(
+                &slice.node_waypoint_capture_destinations,
+            )
+        } else {
+            NodeWaypointCaptureDestinationScopes::default()
+        };
         let destination_policy_scope_index =
             if per_pod_policy_scoping || service_waypoint_destination_scope_required {
                 let cluster_domains = normalized_cluster_domains(config);
@@ -2030,6 +2120,7 @@ impl MeshAuthz {
                 .namespaced_service_backend_hosts,
             destination_route_upstreams_requiring_scope: destination_policy_scope_index
                 .route_upstreams_requiring_scope,
+            node_waypoint_capture_destination_scopes,
             has_route_upstream_metadata,
             has_header_rules,
             relay_policy_superset_has_header_rules,
@@ -2410,6 +2501,34 @@ impl MeshAuthz {
                 },
                 scopes,
             })
+    }
+
+    /// Destination scope for the synthesized inbound HBONE relay from the
+    /// NodeWaypoint capture-destination inventory. `None` for any other proxy,
+    /// an unknown/non-IP destination, an undeclared port, or ambiguous records.
+    /// The authorized-destination stamp names the exact relayed backend, so
+    /// route dispatch stays bound to the destination whose policies were
+    /// evaluated.
+    fn capture_destination_scope_match_for_inbound_relay(
+        &self,
+        proxy: &Proxy,
+    ) -> Option<DestinationScopeMatch<'_>> {
+        if proxy.id != crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID
+            || proxy.upstream_id.is_some()
+        {
+            return None;
+        }
+        let scope = self
+            .node_waypoint_capture_destination_scopes
+            .resolve(&proxy.backend_host, proxy.backend_port)?;
+        let key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
+        Some(DestinationScopeMatch {
+            authorized_destination: NodeWaypointAuthorizedDestination::Backend {
+                aliases: vec![key.clone()],
+                key,
+            },
+            scopes: std::slice::from_ref(scope),
+        })
     }
 
     fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
@@ -3380,10 +3499,16 @@ impl Plugin for MeshAuthz {
                     "true".to_string(),
                 );
             }
-            let destination_scope_match = ctx
-                .matched_proxy
-                .as_ref()
-                .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
+            // The capture-destination scopes are consulted only for the exact
+            // synthesized inbound HBONE relay, and only when the ordinary
+            // service-derived index has no entry: an enrolled pod in another
+            // namespace is absent from that namespace-narrowed index but is a
+            // destination the relay guard terminates for. The source-assertion
+            // gate below is unchanged.
+            let destination_scope_match = ctx.matched_proxy.as_ref().and_then(|proxy| {
+                self.destination_scope_match_for_proxy(proxy)
+                    .or_else(|| self.capture_destination_scope_match_for_inbound_relay(proxy))
+            });
             let can_use_destination_scope = ctx.node_waypoint_policy_scope.is_some()
                 || can_use_inbound_relay_destination_scope_without_source_scope(
                     ctx,
