@@ -1468,6 +1468,57 @@ fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
     assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
 }
 
+/// ai_federation-MUSE-5: the per-provider companions carry the configured
+/// provider name, refcount the open gauge across instances sharing a name,
+/// remove the gauge entry when it returns to zero, and TTL-evict the counters.
+#[test]
+fn ai_federation_provider_circuit_metrics_are_labelled_and_released() {
+    let registry = MetricsRegistry::new();
+    registry.record_ai_federation_provider_circuit_opened("primary");
+    registry.record_ai_federation_provider_circuit_opened("primary");
+    registry.record_ai_federation_provider_circuit_opened("secondary");
+
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_ai_federation_provider_circuits_open{provider=\"primary\"} 2"));
+    assert!(
+        output.contains("ferrum_ai_federation_provider_circuits_open{provider=\"secondary\"} 1")
+    );
+    assert!(
+        output.contains(
+            "ferrum_ai_federation_provider_circuits_opened_total{provider=\"primary\"} 2"
+        )
+    );
+    // The aggregate series are independent of the labelled companions.
+    assert!(output.contains("ferrum_ai_federation_circuits_open 0"));
+
+    registry.record_ai_federation_provider_circuit_closed("primary");
+    registry.release_ai_federation_provider_open_circuit("primary");
+    registry.release_ai_federation_provider_open_circuit("secondary");
+    // Releasing a provider that never opened is a no-op, not a negative gauge.
+    registry.release_ai_federation_provider_open_circuit("never-opened");
+    let output = registry.render_uncached();
+    assert!(
+        !output.contains("ferrum_ai_federation_provider_circuits_open{"),
+        "a gauge entry back at zero must be removed: {output}"
+    );
+    assert!(!output.contains("never-opened"));
+    assert!(
+        output.contains(
+            "ferrum_ai_federation_provider_circuits_closed_total{provider=\"primary\"} 1"
+        )
+    );
+    assert!(
+        output.contains(
+            "ferrum_ai_federation_provider_circuits_opened_total{provider=\"secondary\"} 1"
+        )
+    );
+
+    registry.evict_stale(0);
+    let output = registry.render_uncached();
+    assert!(!output.contains("ferrum_ai_federation_provider_circuits_opened_total"));
+    assert!(!output.contains("ferrum_ai_federation_provider_circuits_closed_total"));
+}
+
 #[test]
 fn udp_amplification_metrics_are_unlabeled_process_counters() {
     let registry = MetricsRegistry::new();

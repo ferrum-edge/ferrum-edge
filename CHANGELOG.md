@@ -7,7 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`ai_federation` credentials can be `${FERRUM_PLUGIN_SECRET_<NAME>}`
+  references.** `api_key`, `google_service_account_json`,
+  `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token`
+  accept a whole-value reference resolved at construction through the shared
+  plugin-secret namespace (and its `_FILE` / `_VAULT` / `_AWS` / `_AZURE` /
+  `_GCP` startup materialization), like `ai_stream_router`'s `api_key`.
+  References outside the namespace are refused without being echoed.
+- **`ai_federation` per-provider `weight`.** When a provider in the leading
+  equal-`priority` group sets `weight` (1–1000), the first attempt is chosen
+  by weighted random selection among admitting providers; later attempts keep
+  the deterministic order. Configs without `weight` are unchanged.
+- **Per-provider `ai_federation` circuit metrics.**
+  `ferrum_ai_federation_provider_circuits_open{provider}` and
+  `ferrum_ai_federation_provider_circuits_{opened,closed}_total{provider}`
+  label circuit transitions with the configured provider name (bounded by
+  configuration) next to the existing aggregate series.
+
 ### Changed
+- **`ai_federation` refuses generation controls a translating provider cannot
+  represent, and maps them for Gemini/Vertex.** `anthropic`, `google_gemini`,
+  `google_vertex`, and `aws_bedrock` rebuild the provider request from a fixed
+  field set and used to drop `response_format`, `n`, `seed`, penalties,
+  `logprobs`, `tools[].function.strict`, and similar fields silently, so a
+  JSON-schema request could return unconstrained prose as a `200`. Gemini and
+  Vertex now map `response_format` `json_object` / `json_schema`
+  (`responseMimeType: application/json` plus `responseJsonSchema`), `n > 1`
+  (`candidateCount`), `seed`, and non-zero penalties; Anthropic maps
+  `parallel_tool_calls: false`. Every other non-neutral control is refused
+  during translation, before provider I/O, so fallback can reach a provider
+  that represents it and otherwise the request fails `400`
+  (`provider_translation_failed`). See the support matrix in
+  `docs/plugins.md`.
+- **`ai_federation` provider `connect_timeout_seconds` / `read_timeout_seconds`
+  are capped at 86400.** An unbounded per-call budget let one hanging provider
+  hold a non-queuing `max_concurrent_requests` permit indefinitely.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +174,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`ai_federation` preserves Gemini/Vertex thought signatures across tool
+  calls.** Gemini 3 thinking models require the `thoughtSignature` of a
+  `functionCall` part back on the next turn and answer `400` without it. The
+  signature is now exported as `tool_calls[i].extra_content.google.thought_signature`
+  (Google's OpenAI-compatibility convention, bounded at 64 KiB, never logged)
+  and restored on the reconstructed native part.
+- **Streaming `ai_federation` provider transport faults now trip the provider
+  circuit.** A claimed stream whose provider dispatch timed out or was reset
+  before headers (answered by a gateway-authored `502`/`504`, previously scored
+  a success under the default fallback statuses, so a timed-out half-open
+  probe could close the circuit) or whose body died on a read timeout or reset
+  after headers (previously a neutral release) is now scored a circuit failure
+  from trusted dispatch/body provenance. Client disconnects and gateway-local
+  refusals stay neutral, and scoring stays exactly-once.
+- **`ai_federation` documents the buffered provider-error envelope.** A buffered
+  provider non-2xx body is replaced by a fixed `upstream_error` envelope with the
+  provider's status and safe headers; this is now stated in `docs/plugins.md`
+  and the OpenAPI schema.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder

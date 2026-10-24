@@ -123,6 +123,7 @@ use super::utils::ambient_cloud_credentials::{
 use super::utils::aws_sigv4;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::openai_error::openai_error_body;
+use super::utils::plugin_secret_env::resolve_plugin_secret_env;
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::{
     AiUsageExport, EXTERNAL_OPERATION_COMPLETED_METADATA_KEY, Plugin, PluginHttpClient,
@@ -141,6 +142,8 @@ const MAX_STOP_SEQUENCES: usize = 4;
 const MAX_STOP_SEQUENCE_CHARS: usize = 1024;
 const MAX_MODEL_IDENTIFIER_BYTES: usize = 256;
 const MAX_PROVIDERS: usize = 128;
+/// Upper bound on a provider's weighted-selection `weight`.
+const MAX_PROVIDER_WEIGHT: u32 = 1000;
 const MAX_MODEL_MAPPINGS_PER_PROVIDER: usize = 1024;
 const MAX_FORWARDED_PROVIDER_HEADERS: usize = 32;
 const MAX_FORWARDED_PROVIDER_HEADER_VALUE_BYTES: usize = 1024;
@@ -156,6 +159,8 @@ const MIN_STREAM_EVENT_BYTES: usize = 4 * 1024;
 /// Upper bound an operator may configure for the streaming whole-exchange
 /// budget (24 hours). `0` means no gateway-imposed bound at all.
 const MAX_STREAM_READ_TIMEOUT_SECONDS: u64 = 86_400;
+/// Ceiling on a provider's `connect_timeout_seconds` / `read_timeout_seconds`.
+const MAX_PROVIDER_TIMEOUT_SECONDS: u64 = 86_400;
 /// Retained-state ceiling for one claimed stream is exactly one event — either
 /// the partial event being assembled or the held terminal marker, never both —
 /// so the whole streaming path costs O(max_event_bytes) regardless of how long
@@ -631,6 +636,10 @@ struct ResolvedProvider {
     provider_type: ProviderType,
     auth: AuthMethod,
     priority: u32,
+    /// Optional weighted-selection share among equal-priority providers.
+    /// `None` when the operator did not configure one (counts as `1` once any
+    /// provider of the same priority group is weighted).
+    weight: Option<u32>,
     model_patterns: Vec<String>,
     model_mapping: HashMap<String, String>,
     default_model: Option<String>,
@@ -688,6 +697,10 @@ struct ProviderCircuit {
     /// after admission (issue #6311) makes the commit fail rather than be
     /// overwritten.
     half_open_probe_state: AtomicU64,
+    /// Configured provider name for the per-provider circuit series. `None`
+    /// only for directly constructed test circuits, which then publish the
+    /// aggregate series alone.
+    metrics_provider: Option<Arc<str>>,
 }
 
 /// `ProviderCircuit::state` layout: the open-until deadline (0 = closed) in
@@ -789,7 +802,15 @@ impl ProviderCircuit {
             metrics_open: AtomicBool::new(false),
             half_open_in_flight: AtomicBool::new(false),
             half_open_probe_state: AtomicU64::new(0),
+            metrics_provider: None,
         }
+    }
+
+    /// Attach the configured provider name used as the `provider` label of the
+    /// per-provider circuit series.
+    fn with_metrics_provider(mut self, provider_name: &str) -> Self {
+        self.metrics_provider = Some(Arc::from(provider_name));
+        self
     }
 
     fn admit(&self) -> CircuitAdmission {
@@ -872,7 +893,11 @@ impl ProviderCircuit {
         let committed = self.commit_half_open_transition(transition);
         if committed && CircuitState::unpack(transition.next).open_until == 0 {
             if self.metrics_open.swap(false, Ordering::AcqRel) {
-                super::prometheus_metrics::global_registry().record_ai_federation_circuit_closed();
+                let registry = super::prometheus_metrics::global_registry();
+                registry.record_ai_federation_circuit_closed();
+                if let Some(provider) = self.metrics_provider.as_deref() {
+                    registry.record_ai_federation_provider_circuit_closed(provider);
+                }
             }
             info!(
                 provider = provider_name,
@@ -968,7 +993,11 @@ impl ProviderCircuit {
         // Deliberately leave `half_open_in_flight` alone: a live probe keeps
         // its slot until its own outcome or release returns it.
         if !self.metrics_open.swap(true, Ordering::AcqRel) {
-            super::prometheus_metrics::global_registry().record_ai_federation_circuit_opened();
+            let registry = super::prometheus_metrics::global_registry();
+            registry.record_ai_federation_circuit_opened();
+            if let Some(provider) = self.metrics_provider.as_deref() {
+                registry.record_ai_federation_provider_circuit_opened(provider);
+            }
         }
         warn!(
             provider = provider_name,
@@ -982,7 +1011,11 @@ impl ProviderCircuit {
 impl Drop for ProviderCircuit {
     fn drop(&mut self) {
         if self.metrics_open.load(Ordering::Acquire) {
-            super::prometheus_metrics::global_registry().release_ai_federation_open_circuit();
+            let registry = super::prometheus_metrics::global_registry();
+            registry.release_ai_federation_open_circuit();
+            if let Some(provider) = self.metrics_provider.as_deref() {
+                registry.release_ai_federation_provider_open_circuit(provider);
+            }
         }
     }
 }
@@ -1313,6 +1346,10 @@ pub struct AiFederation {
     /// response. Allocated even when streaming is disabled: it costs one relaxed
     /// atomic increment at construction and keeps the ownership check total.
     stream_owner_id: u64,
+    /// Whether any provider configured `weight`. When false the provider order
+    /// is the deterministic priority/configuration order and no random roll is
+    /// ever drawn.
+    weighted_selection: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1390,6 +1427,18 @@ impl AiFederation {
             let priority_u64 = optional_u64(pv, "priority")?.unwrap_or((i as u64) + 1);
             let priority = u32::try_from(priority_u64)
                 .map_err(|_| format!("ai_federation: provider {name:?} `priority` is too large"))?;
+            let weight = match optional_u64(pv, "weight")? {
+                None => None,
+                Some(raw) if (1..=u64::from(MAX_PROVIDER_WEIGHT)).contains(&raw) => {
+                    // Range-checked above, so the narrowing cannot fail.
+                    Some(u32::try_from(raw).unwrap_or(MAX_PROVIDER_WEIGHT))
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "ai_federation: provider {name:?} `weight` must be between 1 and {MAX_PROVIDER_WEIGHT}"
+                    ));
+                }
+            };
 
             let model_patterns = optional_string_vec(pv, "model_patterns")?.unwrap_or_default();
             if model_patterns.len() > MAX_MODEL_PATTERNS_PER_PROVIDER
@@ -1449,11 +1498,22 @@ impl AiFederation {
                     "ai_federation: provider {name:?} timeout values must be greater than zero"
                 ));
             }
+            // Same 24 h ceiling as `streaming.read_timeout_seconds` and the
+            // circuit cooldown: an unbounded per-call budget lets one hanging
+            // provider hold a non-queuing `max_concurrent_requests` permit
+            // indefinitely, exhausting the instance for every model.
+            if connect_timeout_seconds > MAX_PROVIDER_TIMEOUT_SECONDS
+                || read_timeout_seconds > MAX_PROVIDER_TIMEOUT_SECONDS
+            {
+                return Err(format!(
+                    "ai_federation: provider {name:?} `connect_timeout_seconds` and `read_timeout_seconds` must be between 1 and {MAX_PROVIDER_TIMEOUT_SECONDS}"
+                ));
+            }
             let connect_timeout = Duration::from_secs(connect_timeout_seconds);
             let read_timeout = Duration::from_secs(read_timeout_seconds);
             let max_response_body_bytes = parse_provider_response_limit(pv, &name)?;
             let circuit = parse_provider_circuit(pv, &name)?
-                .map(|config| Arc::new(ProviderCircuit::new(config)));
+                .map(|config| Arc::new(ProviderCircuit::new(config).with_metrics_provider(&name)));
 
             let base_url = optional_str(pv, "base_url")?.map(String::from);
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
@@ -1514,6 +1574,7 @@ impl AiFederation {
                 provider_type,
                 auth,
                 priority,
+                weight,
                 model_patterns,
                 model_mapping,
                 default_model,
@@ -1528,8 +1589,10 @@ impl AiFederation {
             });
         }
 
-        // Sort by priority (ascending — lower = tried first)
+        // Sort by priority (ascending — lower = tried first). The sort is
+        // stable, so equal priorities keep configuration order.
         providers.sort_by_key(|p| p.priority);
+        let weighted_selection = providers.iter().any(|p| p.weight.is_some());
 
         let fallback_enabled = optional_bool(config, "fallback_enabled")?.unwrap_or(true);
 
@@ -1570,6 +1633,7 @@ impl AiFederation {
             http_client,
             streaming,
             stream_owner_id: next_provider_claim_owner_id(),
+            weighted_selection,
         })
     }
 }
@@ -1596,6 +1660,7 @@ const AI_FEDERATION_PROVIDER_KEYS: &[&str] = &[
     "provider_type",
     "api_key",
     "priority",
+    "weight",
     "model_patterns",
     "model_mapping",
     "default_model",
@@ -1964,7 +2029,7 @@ fn validate_static_credential_header(
 
 /// Resolve a required static API key and prove it can be sent as a header value.
 fn required_api_key(config: &Value, name: &str) -> Result<String, String> {
-    let api_key = config_or_env_str(config, "api_key", None).ok_or(format!(
+    let api_key = config_secret_or_env_str(config, name, "api_key", None)?.ok_or(format!(
         "ai_federation: provider {name:?} missing `api_key`"
     ))?;
     // Header-value validity is a per-byte property, so proving the key itself
@@ -2011,9 +2076,11 @@ fn build_auth(
         },
 
         ProviderType::GoogleVertex => {
-            let sa_json = config_or_env_str(config, "google_service_account_json", None).ok_or(
-                format!("ai_federation: provider {name:?} missing `google_service_account_json`"),
-            )?;
+            let sa_json =
+                config_secret_or_env_str(config, name, "google_service_account_json", None)?
+                    .ok_or(format!(
+                        "ai_federation: provider {name:?} missing `google_service_account_json`"
+                    ))?;
             AuthMethod::GoogleOAuth2 {
                 cache: Arc::new(OAuth2Cache::new(sa_json).map_err(|error| {
                     format!("ai_federation: provider {name:?} OAuth configuration failed: {error}")
@@ -2035,16 +2102,21 @@ fn build_auth(
                 secret_access_key_from_env: !config_str_present(config, "aws_secret_access_key"),
                 session_token_from_env: false,
             };
-            let access_key_id =
-                config_or_env_str(config, "aws_access_key_id", Some(&["AWS_ACCESS_KEY_ID"]))
-                    .ok_or(format!(
-                        "ai_federation: provider {name:?} missing `aws_access_key_id`"
-                    ))?;
-            let secret_access_key = config_or_env_str(
+            let access_key_id = config_secret_or_env_str(
                 config,
+                name,
+                "aws_access_key_id",
+                Some(&["AWS_ACCESS_KEY_ID"]),
+            )?
+            .ok_or(format!(
+                "ai_federation: provider {name:?} missing `aws_access_key_id`"
+            ))?;
+            let secret_access_key = config_secret_or_env_str(
+                config,
+                name,
                 "aws_secret_access_key",
                 Some(&["AWS_SECRET_ACCESS_KEY"]),
-            )
+            )?
             .ok_or(format!(
                 "ai_federation: provider {name:?} missing `aws_secret_access_key`"
             ))?;
@@ -2055,7 +2127,8 @@ fn build_auth(
             let session_token_env = sources
                 .may_use_environment_session_token()
                 .then_some(AWS_SESSION_TOKEN_ENV);
-            let session_token = config_or_env_str(config, "aws_session_token", session_token_env);
+            let session_token =
+                config_secret_or_env_str(config, name, "aws_session_token", session_token_env)?;
             sources.session_token_from_env =
                 session_token.is_some() && !config_str_present(config, "aws_session_token");
             // SigV4 embeds the access key id in the `Authorization` value and
@@ -2101,6 +2174,40 @@ fn config_or_env_str(config: &Value, field: &str, env_vars: Option<&[&str]>) -> 
         }
     }
     None
+}
+
+/// Read a credential-bearing provider field.
+///
+/// A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference resolves against the
+/// process environment through the shared plugin-secret namespace boundary
+/// ([`resolve_plugin_secret_env`]), so a provider key, a Google service-account
+/// JSON document, or AWS secrets need not be stored as configuration rows. A
+/// `${...}` reference to any other variable is refused before anything is read,
+/// so a config writer cannot route an unrelated process secret to a provider
+/// endpoint it chose. A reference counts as CONFIG-sourced (the operator placed
+/// the value in the plugin namespace deliberately), so it never triggers the
+/// ambient-AWS endpoint scope. Absent or empty config values keep the
+/// field-specific environment fallback of [`config_or_env_str`]. Diagnostics
+/// never echo the reference or its value.
+fn config_secret_or_env_str(
+    config: &Value,
+    provider: &str,
+    field: &str,
+    env_vars: Option<&[&str]>,
+) -> Result<Option<String>, String> {
+    if let Some(raw) = config.get(field).and_then(Value::as_str)
+        && !raw.is_empty()
+    {
+        if let Some(var) = raw
+            .strip_prefix("${")
+            .and_then(|rest| rest.strip_suffix('}'))
+        {
+            let label = format!("ai_federation: provider {provider:?} `{field}`");
+            return resolve_plugin_secret_env(&label, var).map(Some);
+        }
+        return Ok(Some(raw.to_string()));
+    }
+    Ok(config_or_env_str(config, field, env_vars))
 }
 
 /// Whether the provider config itself carries a non-empty value for `field`,
@@ -2267,21 +2374,42 @@ fn provider_embeds_model_in_url(provider_type: ProviderType) -> bool {
 }
 
 impl AiFederation {
-    /// Find all providers matching a model name, in priority order.
+    /// Find all providers matching a model name, in attempt order.
     fn find_providers_for_model(&self, model: &str) -> Vec<&ResolvedProvider> {
-        self.providers
-            .iter()
-            .filter(|p| {
-                if p.model_patterns.is_empty() {
-                    // Empty patterns = catch-all
-                    true
-                } else {
-                    p.model_patterns
-                        .iter()
-                        .any(|pat| matches_model_glob(pat, model))
-                }
-            })
+        if !self.weighted_selection {
+            // The common unweighted case keeps its single allocation.
+            return self
+                .providers
+                .iter()
+                .filter(|provider| provider_matches_model(provider, model))
+                .collect();
+        }
+        self.ordered_provider_indices(model)
+            .into_iter()
+            .filter_map(|index| self.providers.get(index))
             .collect()
+    }
+
+    /// Indices of every provider matching `model`, in attempt order.
+    ///
+    /// The base order is ascending `priority`, configuration order within a
+    /// priority (empty `model_patterns` is a catch-all). When a provider
+    /// configures `weight`, the FIRST attempt among the leading equal-priority
+    /// group is chosen by weighted random selection; every later attempt keeps
+    /// the deterministic order. Shared by the buffered and streaming paths so
+    /// both select the same way.
+    fn ordered_provider_indices(&self, model: &str) -> Vec<usize> {
+        let mut order: Vec<usize> = self
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider_matches_model(provider, model))
+            .map(|(index, _)| index)
+            .collect();
+        if self.weighted_selection {
+            apply_weighted_first_choice(&self.providers, &mut order, weighted_selection_roll());
+        }
+        order
     }
 
     /// Resolve the actual model name to send to the provider.
@@ -2294,6 +2422,88 @@ impl AiFederation {
         }
         model.to_string()
     }
+}
+
+/// Move the weighted-random pick among the leading equal-priority group of
+/// `order` to the front, keeping every other candidate's relative order.
+///
+/// Only a group in which at least one provider configured `weight` is
+/// reordered (an unweighted group keeps configuration order); providers without
+/// a `weight` count as `1`. A provider whose circuit cannot currently admit
+/// competes with weight `0`, because the attempt loop would only skip it and
+/// hand its share to the next provider in configuration order. `roll` is the
+/// random draw, injected so selection is deterministic under test.
+fn apply_weighted_first_choice(providers: &[ResolvedProvider], order: &mut [usize], roll: u64) {
+    let Some(lead_priority) = order
+        .first()
+        .and_then(|index| providers.get(*index))
+        .map(|provider| provider.priority)
+    else {
+        return;
+    };
+    let group_len = order
+        .iter()
+        .take_while(|index| {
+            providers
+                .get(**index)
+                .is_some_and(|provider| provider.priority == lead_priority)
+        })
+        .count();
+    if group_len < 2 {
+        return;
+    }
+    let group = &order[..group_len];
+    if !group.iter().any(|index| {
+        providers
+            .get(*index)
+            .is_some_and(|provider| provider.weight.is_some())
+    }) {
+        return;
+    }
+    let weights: Vec<u64> = group
+        .iter()
+        .map(|index| {
+            providers
+                .get(*index)
+                .filter(|provider| {
+                    provider
+                        .circuit
+                        .as_ref()
+                        .is_none_or(|circuit| circuit.may_admit())
+                })
+                .map_or(0, |provider| u64::from(provider.weight.unwrap_or(1)))
+        })
+        .collect();
+    // At most MAX_PROVIDERS * MAX_PROVIDER_WEIGHT, far below u64::MAX.
+    let total: u64 = weights.iter().sum();
+    if total == 0 {
+        return;
+    }
+    let mut target = roll % total;
+    let mut chosen = 0;
+    for (position, weight) in weights.iter().enumerate() {
+        if target < *weight {
+            chosen = position;
+            break;
+        }
+        target -= *weight;
+    }
+    order[..=chosen].rotate_right(1);
+}
+
+/// One random draw for weighted provider selection. Taken only when a
+/// provider configured `weight`. Falls back to the monotonic clock if the
+/// system RNG is unavailable, which still spreads selection.
+fn weighted_selection_roll() -> u64 {
+    use crate::fips::backend::rand::SecureRandom as _;
+    let mut bytes = [0u8; 8];
+    if crate::fips::backend::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .is_ok()
+    {
+        return u64::from_ne_bytes(bytes);
+    }
+    crate::socket_opts::monotonic_now_ms()
 }
 
 // ---------------------------------------------------------------------------
@@ -2498,6 +2708,49 @@ struct ParsedToolCall {
     id: String,
     name: String,
     arguments: Value,
+    /// Opaque Gemini/Vertex thought signature carried on the OpenAI tool call
+    /// as `extra_content.google.thought_signature` (Google's OpenAI
+    /// compatibility convention). Restored on the reconstructed native
+    /// `functionCall` part; never logged.
+    thought_signature: Option<String>,
+}
+
+/// Upper bound on one opaque Gemini/Vertex thought signature carried through a
+/// tool call. Real signatures are a few KiB of base64; the bound keeps a
+/// hostile transcript from smuggling an unbounded blob through the extension.
+const MAX_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
+
+/// Read the `extra_content.google.thought_signature` extension of an OpenAI
+/// tool call. Absent at any level is `None`; a present but malformed value is
+/// an error so a continuation is never silently sent unsigned. The value is
+/// never echoed in a diagnostic.
+fn parse_tool_call_thought_signature(
+    call_object: &serde_json::Map<String, Value>,
+    scope: &str,
+) -> Result<Option<String>, String> {
+    let Some(extra) = call_object.get("extra_content") else {
+        return Ok(None);
+    };
+    let extra = extra
+        .as_object()
+        .ok_or_else(|| format!("ai_federation: {scope} extra_content must be an object"))?;
+    let Some(google) = extra.get("google") else {
+        return Ok(None);
+    };
+    let google = google
+        .as_object()
+        .ok_or_else(|| format!("ai_federation: {scope} extra_content.google must be an object"))?;
+    let Some(signature) = google.get("thought_signature") else {
+        return Ok(None);
+    };
+    match signature.as_str() {
+        Some(value) if !value.is_empty() && value.len() <= MAX_THOUGHT_SIGNATURE_BYTES => {
+            Ok(Some(value.to_string()))
+        }
+        _ => Err(format!(
+            "ai_federation: {scope} extra_content.google.thought_signature must be a non-empty string of at most {MAX_THOUGHT_SIGNATURE_BYTES} bytes"
+        )),
+    }
 }
 
 struct ProviderToolCall<'a> {
@@ -2578,10 +2831,15 @@ fn parse_openai_tool_calls(
                 "ai_federation: messages[{message_index}].tool_calls[{tool_index}] arguments must encode a JSON object"
             ));
         }
+        let thought_signature = parse_tool_call_thought_signature(
+            call_object,
+            &format!("messages[{message_index}].tool_calls[{tool_index}]"),
+        )?;
         parsed.push(ParsedToolCall {
             id: id.to_string(),
             name: name.to_string(),
             arguments,
+            thought_signature,
         });
     }
     Ok(parsed)
@@ -2839,6 +3097,318 @@ fn tool_names_by_id(messages: &[Value]) -> Result<HashMap<String, String>, Strin
         }
     }
     Ok(names)
+}
+
+/// A translating adapter that rebuilds the provider request from an explicit
+/// field set (as opposed to the OpenAI-compatible and Cohere adapters, which
+/// forward the client body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeAdapter {
+    Anthropic,
+    Gemini,
+    Bedrock,
+}
+
+impl NativeAdapter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Gemini",
+            Self::Bedrock => "Bedrock",
+        }
+    }
+}
+
+/// The client's requested output mode (`response_format`).
+#[derive(Debug, Clone, PartialEq)]
+enum ResponseFormatMode {
+    /// Absent, `null`, or `{"type":"text"}`: unconstrained text.
+    Text,
+    /// `{"type":"json_object"}`.
+    JsonObject,
+    /// `{"type":"json_schema", "json_schema": {...}}`, with its schema when one
+    /// was supplied.
+    JsonSchema(Option<Value>),
+}
+
+/// OpenAI generation controls beyond the base set (messages, token limit,
+/// temperature, top_p, stop, tools, tool_choice) that a translating adapter
+/// must either map natively or refuse.
+///
+/// Rebuilding a native body from a fixed field set used to DROP these
+/// silently, so a caller asking for JSON-schema output, several choices, a
+/// seed, or penalties received a `200` that did not honour the request. Each
+/// control is now either carried to its native equivalent or refused before any
+/// provider I/O with a translation error, which lets fallback reach a provider
+/// that can represent it and otherwise answers `400
+/// provider_translation_failed`. Neutral values (`n: 1`, zero penalties,
+/// `logprobs: false`, an empty `logit_bias`, `parallel_tool_calls: true`,
+/// `strict: false`) are accepted everywhere.
+#[derive(Debug, Clone, PartialEq)]
+struct TranslatedGenerationControls {
+    response_format: ResponseFormatMode,
+    /// `Some(n)` only when the client asked for more than one choice.
+    candidate_count: Option<u64>,
+    seed: Option<Value>,
+    /// Non-zero penalties only; zero is the provider default.
+    presence_penalty: Option<Value>,
+    frequency_penalty: Option<Value>,
+    /// `parallel_tool_calls: false` on a request that declares tools.
+    disable_parallel_tool_use: bool,
+}
+
+fn present_non_null<'a>(body: &'a Value, field: &str) -> Option<&'a Value> {
+    body.get(field).filter(|value| !value.is_null())
+}
+
+fn unrepresentable_control(adapter: NativeAdapter, field: &str, detail: &str) -> String {
+    format!(
+        "ai_federation: {} cannot represent `{field}` ({detail}); route this request to a provider that supports it",
+        adapter.label()
+    )
+}
+
+fn parse_response_format(body: &Value) -> Result<ResponseFormatMode, String> {
+    let Some(format) = present_non_null(body, "response_format") else {
+        return Ok(ResponseFormatMode::Text);
+    };
+    let object = format
+        .as_object()
+        .ok_or("ai_federation: 'response_format' must be an object")?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(ResponseFormatMode::Text),
+        Some("json_object") => Ok(ResponseFormatMode::JsonObject),
+        Some("json_schema") => {
+            let spec = object
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .ok_or("ai_federation: 'response_format.json_schema' must be an object")?;
+            if spec.get("name").is_some_and(|name| !name.is_string()) {
+                return Err(
+                    "ai_federation: 'response_format.json_schema.name' must be a string"
+                        .to_string(),
+                );
+            }
+            if spec
+                .get("strict")
+                .is_some_and(|strict| !strict.is_boolean())
+            {
+                return Err(
+                    "ai_federation: 'response_format.json_schema.strict' must be a boolean"
+                        .to_string(),
+                );
+            }
+            match spec.get("schema") {
+                None | Some(Value::Null) => Ok(ResponseFormatMode::JsonSchema(None)),
+                Some(schema @ Value::Object(_)) => {
+                    Ok(ResponseFormatMode::JsonSchema(Some(schema.clone())))
+                }
+                Some(_) => Err(
+                    "ai_federation: 'response_format.json_schema.schema' must be an object"
+                        .to_string(),
+                ),
+            }
+        }
+        _ => Err(
+            "ai_federation: 'response_format.type' must be text, json_object, or json_schema"
+                .to_string(),
+        ),
+    }
+}
+
+fn non_zero_penalty(body: &Value, field: &str) -> Result<Option<Value>, String> {
+    let Some(value) = present_non_null(body, field) else {
+        return Ok(None);
+    };
+    let number = value
+        .as_f64()
+        .ok_or_else(|| format!("ai_federation: '{field}' must be a number"))?;
+    if number == 0.0 {
+        Ok(None)
+    } else {
+        Ok(Some(value.clone()))
+    }
+}
+
+/// Parse and gate the extended generation controls for one translating
+/// adapter. See [`TranslatedGenerationControls`] for the support matrix.
+fn translated_generation_controls(
+    body: &Value,
+    adapter: NativeAdapter,
+) -> Result<TranslatedGenerationControls, String> {
+    let response_format = parse_response_format(body)?;
+    let candidate_count = match present_non_null(body, "n") {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(0) | None => {
+                return Err("ai_federation: 'n' must be a positive integer".to_string());
+            }
+            Some(1) => None,
+            Some(n) => Some(n),
+        },
+    };
+    let seed = match present_non_null(body, "seed") {
+        None => None,
+        Some(value) if value.is_i64() || value.is_u64() => Some(value.clone()),
+        Some(_) => return Err("ai_federation: 'seed' must be an integer".to_string()),
+    };
+    let presence_penalty = non_zero_penalty(body, "presence_penalty")?;
+    let frequency_penalty = non_zero_penalty(body, "frequency_penalty")?;
+    let declares_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    let disable_parallel_tool_use = match present_non_null(body, "parallel_tool_calls") {
+        None => false,
+        Some(Value::Bool(parallel)) => !parallel && declares_tools,
+        Some(_) => {
+            return Err("ai_federation: 'parallel_tool_calls' must be a boolean".to_string());
+        }
+    };
+
+    // Controls no translating adapter can honour: the normalized response has
+    // no slot for them, or the provider has no equivalent.
+    match present_non_null(body, "logprobs") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(unrepresentable_control(
+                adapter,
+                "logprobs",
+                "token log probabilities are not returned by this adapter",
+            ));
+        }
+        Some(_) => return Err("ai_federation: 'logprobs' must be a boolean".to_string()),
+    }
+    if present_non_null(body, "top_logprobs").is_some() {
+        return Err(unrepresentable_control(
+            adapter,
+            "top_logprobs",
+            "token log probabilities are not returned by this adapter",
+        ));
+    }
+    if present_non_null(body, "logit_bias")
+        .is_some_and(|bias| bias.as_object().is_none_or(|map| !map.is_empty()))
+    {
+        return Err(unrepresentable_control(
+            adapter,
+            "logit_bias",
+            "no native token-bias control",
+        ));
+    }
+    for field in [
+        "reasoning_effort",
+        "audio",
+        "prediction",
+        "web_search_options",
+    ] {
+        if present_non_null(body, field).is_some() {
+            return Err(unrepresentable_control(
+                adapter,
+                field,
+                "no translated equivalent",
+            ));
+        }
+    }
+    if let Some(modalities) = present_non_null(body, "modalities") {
+        let text_only = modalities
+            .as_array()
+            .is_some_and(|values| values.iter().all(|value| value.as_str() == Some("text")));
+        if !text_only {
+            return Err(unrepresentable_control(
+                adapter,
+                "modalities",
+                "only text output is translated",
+            ));
+        }
+    }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for (index, tool) in tools.iter().enumerate() {
+            match tool
+                .get("function")
+                .and_then(|function| function.get("strict"))
+            {
+                None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+                Some(Value::Bool(true)) => {
+                    return Err(unrepresentable_control(
+                        adapter,
+                        &format!("tools[{index}].function.strict"),
+                        "strict function-schema adherence has no native equivalent",
+                    ));
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "ai_federation: tools[{index}].function.strict must be a boolean"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Controls only the Gemini/Vertex `generationConfig` represents.
+    if adapter != NativeAdapter::Gemini {
+        match &response_format {
+            ResponseFormatMode::Text => {}
+            ResponseFormatMode::JsonObject => {
+                return Err(unrepresentable_control(
+                    adapter,
+                    "response_format",
+                    "no native JSON output mode",
+                ));
+            }
+            ResponseFormatMode::JsonSchema(_) => {
+                return Err(unrepresentable_control(
+                    adapter,
+                    "response_format",
+                    "no native JSON-schema output mode",
+                ));
+            }
+        }
+        if candidate_count.is_some() {
+            return Err(unrepresentable_control(
+                adapter,
+                "n",
+                "only one choice per request is supported",
+            ));
+        }
+        if seed.is_some() {
+            return Err(unrepresentable_control(
+                adapter,
+                "seed",
+                "no native sampling seed",
+            ));
+        }
+        if presence_penalty.is_some() {
+            return Err(unrepresentable_control(
+                adapter,
+                "presence_penalty",
+                "no native presence penalty",
+            ));
+        }
+        if frequency_penalty.is_some() {
+            return Err(unrepresentable_control(
+                adapter,
+                "frequency_penalty",
+                "no native frequency penalty",
+            ));
+        }
+    }
+    // Anthropic alone can disable parallel tool use (`tool_choice`).
+    if disable_parallel_tool_use && adapter != NativeAdapter::Anthropic {
+        return Err(unrepresentable_control(
+            adapter,
+            "parallel_tool_calls",
+            "parallel tool use cannot be disabled",
+        ));
+    }
+
+    Ok(TranslatedGenerationControls {
+        response_format,
+        candidate_count,
+        seed,
+        presence_penalty,
+        frequency_penalty,
+        disable_parallel_tool_use,
+    })
 }
 
 /// Translate an OpenAI Chat Completions request to the provider's native format.
@@ -3691,6 +4261,7 @@ fn translate_to_anthropic(
     let messages = openai_body["messages"]
         .as_array()
         .ok_or("ai_federation: request missing 'messages' array")?;
+    let controls = translated_generation_controls(openai_body, NativeAdapter::Anthropic)?;
 
     // Extract system messages into a single string. System content may
     // be either a plain string or an OpenAI-style content parts array
@@ -3821,7 +4392,19 @@ fn translate_to_anthropic(
                 .collect(),
         );
     }
-    if let Some(choice) = anthropic_tool_choice(openai_body)? {
+    let tool_choice = match anthropic_tool_choice(openai_body)? {
+        Some(choice) => Some(choice),
+        // `parallel_tool_calls: false` lives on Anthropic's `tool_choice`, so
+        // an absent choice becomes the explicit default (`auto`).
+        None if controls.disable_parallel_tool_use => Some(json!({ "type": "auto" })),
+        None => None,
+    };
+    if let Some(mut choice) = tool_choice {
+        if controls.disable_parallel_tool_use
+            && choice.get("type").and_then(Value::as_str) != Some("none")
+        {
+            choice["disable_parallel_tool_use"] = Value::Bool(true);
+        }
         body["tool_choice"] = choice;
     }
 
@@ -3872,6 +4455,7 @@ fn translate_to_gemini(
     let messages = openai_body["messages"]
         .as_array()
         .ok_or("ai_federation: request missing 'messages' array")?;
+    let controls = translated_generation_controls(openai_body, NativeAdapter::Gemini)?;
 
     // Extract system messages → systemInstruction. Content may be a
     // string or a multimodal parts array; flatten to text either way.
@@ -3945,12 +4529,19 @@ fn translate_to_gemini(
             parts.clear();
         }
         for call in tool_calls {
-            parts.push(json!({
+            let mut part = json!({
                 "functionCall": {
                     "name": call.name,
                     "args": call.arguments,
                 }
-            }));
+            });
+            // Gemini 3 rejects a function-calling continuation whose signed
+            // `functionCall` part lost its signature, so the signature the
+            // normalizer exported is restored on the same part.
+            if let Some(signature) = call.thought_signature {
+                part["thoughtSignature"] = Value::String(signature);
+            }
+            parts.push(part);
         }
         if parts.is_empty() {
             return Err(format!(
@@ -3983,6 +4574,37 @@ fn translate_to_gemini(
     }
     if let Some(stop) = normalized_stop_sequences(openai_body)? {
         gen_config.insert("stopSequences".to_string(), stop);
+    }
+    // Structured output: `responseMimeType` selects JSON mode and
+    // `responseJsonSchema` carries the client's JSON Schema unchanged (both
+    // Gemini API and Vertex AI accept it alongside `responseMimeType`).
+    match controls.response_format {
+        ResponseFormatMode::Text => {}
+        ResponseFormatMode::JsonObject | ResponseFormatMode::JsonSchema(None) => {
+            gen_config.insert(
+                "responseMimeType".to_string(),
+                Value::String("application/json".to_string()),
+            );
+        }
+        ResponseFormatMode::JsonSchema(Some(schema)) => {
+            gen_config.insert(
+                "responseMimeType".to_string(),
+                Value::String("application/json".to_string()),
+            );
+            gen_config.insert("responseJsonSchema".to_string(), schema);
+        }
+    }
+    if let Some(count) = controls.candidate_count {
+        gen_config.insert("candidateCount".to_string(), Value::from(count));
+    }
+    if let Some(seed) = controls.seed {
+        gen_config.insert("seed".to_string(), seed);
+    }
+    if let Some(penalty) = controls.presence_penalty {
+        gen_config.insert("presencePenalty".to_string(), penalty);
+    }
+    if let Some(penalty) = controls.frequency_penalty {
+        gen_config.insert("frequencyPenalty".to_string(), penalty);
     }
     if !gen_config.is_empty() {
         body["generationConfig"] = Value::Object(gen_config);
@@ -4042,6 +4664,8 @@ fn translate_to_bedrock(
     let messages = openai_body["messages"]
         .as_array()
         .ok_or("ai_federation: request missing 'messages' array")?;
+    // Bedrock Converse has no slot for any extended control; this only gates.
+    translated_generation_controls(openai_body, NativeAdapter::Bedrock)?;
 
     // Extract system messages. Content may be string or multimodal
     // parts array; flatten both forms.
@@ -4912,6 +5536,34 @@ fn gemini_prompt_is_blocked(resp: &Value) -> Result<bool, String> {
     }
 }
 
+/// The opaque `thoughtSignature` a Gemini/Vertex part carries, if any.
+///
+/// Gemini 3 thinking models attach it to (the first) `functionCall` part and
+/// require it back on that part in the next request. It is exported on the
+/// OpenAI tool call as `extra_content.google.thought_signature`. A present but
+/// unusable value fails normalization rather than being dropped, because a
+/// dropped signature only surfaces as a provider `400` on the client's next
+/// turn. Never logged or echoed.
+fn gemini_part_thought_signature<'a>(
+    part: &'a Value,
+    scope: &str,
+) -> Result<Option<&'a str>, String> {
+    let Some(signature) = part
+        .get("thoughtSignature")
+        .or_else(|| part.get("thought_signature"))
+    else {
+        return Ok(None);
+    };
+    match signature.as_str() {
+        Some(value) if !value.is_empty() && value.len() <= MAX_THOUGHT_SIGNATURE_BYTES => {
+            Ok(Some(value))
+        }
+        _ => Err(format!(
+            "ai_federation: {scope} thoughtSignature must be a non-empty string of at most {MAX_THOUGHT_SIGNATURE_BYTES} bytes"
+        )),
+    }
+}
+
 fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCounts), String> {
     let prompt_is_blocked = gemini_prompt_is_blocked(resp)?;
     let candidates: &[Value] = match resp.get("candidates") {
@@ -5034,7 +5686,15 @@ fn normalize_from_gemini(resp: &Value, model: &str) -> Result<(Value, TokenCount
                         })?;
                     let call_id =
                         format!("call_fed_{call_id_prefix}_{candidate_index}_{part_index}");
-                    tool_calls.push(openai_tool_call(&call_id, name, args)?);
+                    let mut call = openai_tool_call(&call_id, name, args)?;
+                    if let Some(signature) = gemini_part_thought_signature(
+                        part,
+                        &format!("Gemini candidates[{candidate_index}].parts[{part_index}]"),
+                    )? {
+                        call["extra_content"] =
+                            json!({ "google": { "thought_signature": signature } });
+                    }
+                    tool_calls.push(call);
                 }
                 _ => {
                     return Err(format!(
@@ -5684,6 +6344,20 @@ enum StreamOutcome {
     Released,
 }
 
+/// Whether a terminated stream body ended on a PROVIDER transport fault.
+///
+/// A client disconnect (including a client RPC deadline, which the body wrapper
+/// reports as a disconnect) and gateway-local classes
+/// (`client_side_no_backend_signal`: policy refusals, request-size limits,
+/// gateway buffer capacity, connection-limit and trust refusals) are not
+/// evidence about the provider and stay circuit-neutral.
+fn body_outcome_is_provider_fault(outcome: &crate::proxy::deferred_log::BodyOutcome) -> bool {
+    !outcome.client_disconnected
+        && outcome.body_error_class.is_some_and(|class| {
+            !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class))
+        })
+}
+
 impl StreamOutcome {
     fn as_str(self) -> &'static str {
         match self {
@@ -5783,6 +6457,22 @@ impl FederationStreamLifecycle {
     /// without `unwrap` regardless: the permit is then returned by the
     /// reservation's own drop instead.
     fn resolve(&self, outcome: StreamOutcome) {
+        self.resolve_inner(outcome, true);
+    }
+
+    /// Resolve the reservation exactly once as a provider FAILURE, overriding
+    /// any verdict staged at response headers.
+    ///
+    /// Used when the provider's body died on a transport fault (read timeout,
+    /// reset, protocol error) after headers: whatever status those headers
+    /// carried, the provider did not deliver the response, so a staged
+    /// "answered correctly" verdict must not be the one scored. Same
+    /// exactly-once take as [`Self::resolve`].
+    fn resolve_provider_fault(&self) {
+        self.resolve_inner(StreamOutcome::Failed, false);
+    }
+
+    fn resolve_inner(&self, outcome: StreamOutcome, prefer_staged: bool) {
         let taken = match self.reservation.lock() {
             Ok(mut slot) => slot.take(),
             Err(_) => return,
@@ -5791,7 +6481,14 @@ impl FederationStreamLifecycle {
             return;
         };
         let outcome = match self.staged_outcome.lock() {
-            Ok(mut staged) => staged.take().unwrap_or(outcome),
+            Ok(mut staged) => {
+                let staged = staged.take();
+                if prefer_staged {
+                    staged.unwrap_or(outcome)
+                } else {
+                    outcome
+                }
+            }
             Err(_) => outcome,
         };
         if let Ok(mut recorded) = self.resolved_outcome.lock() {
@@ -6719,15 +7416,9 @@ impl AiFederation {
         // Index-based selection: the claim records an INDEX into this
         // instance's own provider list (a name could be duplicated across
         // instances), so selection must yield indices rather than borrows.
-        // Same predicate and same priority order as
-        // [`AiFederation::find_providers_for_model`].
-        let matching_providers: Vec<usize> = self
-            .providers
-            .iter()
-            .enumerate()
-            .filter(|(_, provider)| provider_matches_model(provider, model))
-            .map(|(index, _)| index)
-            .collect();
+        // Same predicate and same attempt order (priority, then the optional
+        // weighted first choice) as [`AiFederation::find_providers_for_model`].
+        let matching_providers: Vec<usize> = self.ordered_provider_indices(model);
         if matching_providers.is_empty() {
             if self.fail_on_no_matching_provider {
                 let echoed_model = truncate_model_for_error(model);
@@ -7687,6 +8378,26 @@ impl Plugin for AiFederation {
             "true".to_string(),
         );
 
+        // A response proxy core authored for a provider TRANSPORT failure (the
+        // dispatch timed out, was reset, or was refused before any provider
+        // header arrived) is a provider fault whatever status it maps to — the
+        // default 504 for a read/connect timeout is not in the default
+        // fallback status set, so scoring it by status alone recorded a dead
+        // provider as healthy and a timed-out half-open probe could even close
+        // the circuit. The class comes from trusted dispatch provenance, never
+        // metadata. Gateway-local refusals and client disconnects
+        // (`client_side_no_backend_signal`) stay neutral.
+        if let Some(class) = ctx.last_backend_dispatch_error_class() {
+            if !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class)) {
+                self.stage_owned_stream(ctx, StreamOutcome::Failed);
+            }
+            // A gateway-local refusal (policy, connection limit, trust, buffer
+            // capacity) or a client disconnect produced this response without
+            // any provider verdict: stage nothing, so the claim resolves as a
+            // neutral release instead of being scored by its synthetic status.
+            return PluginResult::Continue;
+        }
+
         if !(200..300).contains(&response_status) {
             // Same circuit rule as the buffered path: a configured fallback
             // status and a redirect are provider faults, and every OTHER
@@ -7795,15 +8506,27 @@ impl Plugin for AiFederation {
         &self,
         ctx: &mut RequestContext,
         _response_status: u16,
-        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+        outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
         let Some(lifecycle) = self.owned_stream_lifecycle(ctx) else {
             return;
         };
-        // Prefer a staged non-2xx provider verdict; otherwise release without
-        // scoring (client gone before headers, unresolved 2xx cut, shutdown).
-        // Exact-once: a prior inspector resolve makes this a no-op.
-        lifecycle.resolve(StreamOutcome::Released);
+        if body_outcome_is_provider_fault(outcome) {
+            // The provider's body died on a transport fault (read timeout,
+            // reset, protocol error) that the inspector never saw: its driver
+            // exits on the error without calling `on_end`, so the truncation
+            // check cannot score it. A streaming provider that stalls or resets
+            // mid-generation must trip its circuit like the buffered path's
+            // body-read failure does. Exact-once: a prior inspector verdict
+            // (e.g. a proven `[DONE]` completion) makes this a no-op.
+            lifecycle.resolve_provider_fault();
+        } else {
+            // Prefer a staged non-2xx provider verdict; otherwise release
+            // without scoring (client gone, unresolved 2xx cut by a gateway
+            // policy, shutdown). Exact-once: a prior inspector resolve makes
+            // this a no-op.
+            lifecycle.resolve(StreamOutcome::Released);
+        }
         if let Some(outcome) = lifecycle.outcome() {
             ctx.metadata.insert(
                 META_STREAM_OUTCOME.to_string(),
@@ -8809,6 +9532,50 @@ pub mod test_helpers {
             .map(StreamOutcome::as_str)
     }
 
+    /// Provider names matching `model` in attempt order, with the weighted
+    /// first choice decided by the supplied `roll` instead of the system RNG.
+    pub fn ordered_provider_names_for_test(
+        plugin: &AiFederation,
+        model: &str,
+        roll: u64,
+    ) -> Vec<String> {
+        let mut order: Vec<usize> = plugin
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider_matches_model(provider, model))
+            .map(|(index, _)| index)
+            .collect();
+        apply_weighted_first_choice(&plugin.providers, &mut order, roll);
+        order
+            .into_iter()
+            .filter_map(|index| plugin.providers.get(index))
+            .map(|provider| provider.name.clone())
+            .collect()
+    }
+
+    /// Provider names matching `model` in the order the dispatch paths use
+    /// (system RNG for a weighted group).
+    pub fn provider_attempt_order_for_test(plugin: &AiFederation, model: &str) -> Vec<String> {
+        plugin
+            .find_providers_for_model(model)
+            .into_iter()
+            .map(|provider| provider.name.clone())
+            .collect()
+    }
+
+    /// Effective (connect, read) timeouts of a configured provider, in seconds.
+    pub fn provider_timeouts_seconds_for_test(
+        plugin: &AiFederation,
+        index: usize,
+    ) -> Option<(u64, u64)> {
+        let provider = plugin.providers.get(index)?;
+        Some((
+            provider.connect_timeout.as_secs(),
+            provider.read_timeout.as_secs(),
+        ))
+    }
+
     /// Free permits left in this instance's `max_concurrent_requests` semaphore.
     pub fn available_request_slots_for_test(plugin: &AiFederation) -> usize {
         plugin.request_slots.available_permits()
@@ -8824,6 +9591,16 @@ pub mod test_helpers {
     pub fn half_open_probe_in_flight_for_test(plugin: &AiFederation, index: usize) -> Option<bool> {
         let circuit = plugin.providers.get(index)?.circuit.as_ref()?;
         Some(circuit.half_open_in_flight.load(Ordering::Acquire))
+    }
+
+    /// Open the provider circuit at `index` with its full cooldown still
+    /// pending, so it cannot admit any request.
+    pub fn open_circuit_for_test(plugin: &AiFederation, index: usize) -> bool {
+        let Some(circuit) = plugin.providers.get(index).and_then(|p| p.circuit.as_ref()) else {
+            return false;
+        };
+        circuit.open("test", "forced_open_for_test");
+        true
     }
 
     /// Force the provider at `index` into the cooled-down (half-open eligible)
@@ -9116,6 +9893,7 @@ pub mod test_helpers {
                 api_key: "test-key".to_string(),
             },
             priority: 1,
+            weight: None,
             model_patterns: Vec::new(),
             model_mapping: HashMap::new(),
             default_model: None,
@@ -9149,6 +9927,7 @@ pub mod test_helpers {
                 api_key: "test-key".to_string(),
             },
             priority: 1,
+            weight: None,
             model_patterns: Vec::new(),
             model_mapping: HashMap::new(),
             default_model: None,

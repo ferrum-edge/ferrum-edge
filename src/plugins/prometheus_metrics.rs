@@ -951,6 +951,16 @@ pub struct MetricsRegistry {
     ai_federation_circuit_half_open_probes: AtomicU64,
     /// Provider attempts skipped because an ai_federation circuit was open.
     ai_federation_circuit_open_skips: AtomicU64,
+    /// Open/half-open ai_federation circuits by configured provider name.
+    /// Live state, not TTL-evicted: an entry is removed when its count returns
+    /// to zero (circuit closed or the circuit dropped on reload), so the key
+    /// set is bounded by the provider names of currently configured
+    /// federation instances.
+    ai_federation_provider_circuits_open: DashMap<Arc<str>, i64>,
+    /// Closed-to-open transitions by configured provider name (TTL-evicted).
+    ai_federation_provider_circuits_opened: DashMap<Arc<str>, TimestampedCounter>,
+    /// Half-open-to-closed recoveries by configured provider name (TTL-evicted).
+    ai_federation_provider_circuits_closed: DashMap<Arc<str>, TimestampedCounter>,
     /// Stream connections by (proxy_id, protocol)
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
@@ -1173,6 +1183,9 @@ impl MetricsRegistry {
             ai_federation_circuits_closed: AtomicU64::new(0),
             ai_federation_circuit_half_open_probes: AtomicU64::new(0),
             ai_federation_circuit_open_skips: AtomicU64::new(0),
+            ai_federation_provider_circuits_open: DashMap::with_shard_amount(shards),
+            ai_federation_provider_circuits_opened: DashMap::with_shard_amount(shards),
+            ai_federation_provider_circuits_closed: DashMap::with_shard_amount(shards),
             stream_connection_counter: DashMap::with_shard_amount(shards),
             stream_duration_buckets: DashMap::with_shard_amount(shards),
             ws_session_counter: DashMap::with_shard_amount(shards),
@@ -1923,6 +1936,51 @@ impl MetricsRegistry {
             |current| Some(current.saturating_sub(1)),
         );
         self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::record_ai_federation_circuit_opened`].
+    /// `provider` is the operator-configured provider name (bounded charset and
+    /// length, at most 128 per instance), never a model or request value.
+    pub fn record_ai_federation_provider_circuit_opened(&self, provider: &str) {
+        let key: Arc<str> = Arc::from(provider);
+        *self
+            .ai_federation_provider_circuits_open
+            .entry(Arc::clone(&key))
+            .or_insert(0) += 1;
+        self.ai_federation_provider_circuits_opened
+            .entry(key)
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::record_ai_federation_circuit_closed`].
+    pub fn record_ai_federation_provider_circuit_closed(&self, provider: &str) {
+        self.decrement_ai_federation_provider_open(provider);
+        self.ai_federation_provider_circuits_closed
+            .entry(Arc::from(provider))
+            .or_insert_with(|| TimestampedCounter::new(self.epoch))
+            .increment(self.epoch);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Per-provider companion of [`Self::release_ai_federation_open_circuit`]
+    /// (an open circuit dropped on reload).
+    pub fn release_ai_federation_provider_open_circuit(&self, provider: &str) {
+        self.decrement_ai_federation_provider_open(provider);
+        self.maybe_invalidate_cache();
+    }
+
+    fn decrement_ai_federation_provider_open(&self, provider: &str) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = self
+            .ai_federation_provider_circuits_open
+            .entry(Arc::from(provider))
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() <= 0 {
+                entry.remove();
+            }
+        }
     }
 
     pub fn record_ai_federation_half_open_probe(&self) {
@@ -2938,6 +2996,22 @@ impl MetricsRegistry {
             keep
         });
 
+        self.ai_federation_provider_circuits_opened.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
+        self.ai_federation_provider_circuits_closed.retain(|_, v| {
+            let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
+            if !keep {
+                evicted += 1;
+            }
+            keep
+        });
+
         self.hbone_tunnel_revocation_counter.retain(|_, v| {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
@@ -3554,6 +3628,9 @@ impl MetricsRegistry {
             + self.ws_frames_counter.len() * 180
             + self.hbone_relay_failure_counter.len() * 240
             + self.hbone_tunnel_revocation_counter.len() * 200
+            + self.ai_federation_provider_circuits_open.len() * 160
+            + self.ai_federation_provider_circuits_opened.len() * 160
+            + self.ai_federation_provider_circuits_closed.len() * 160
             + self.hbone_inner_pool_event_counter.len() * 160
             + self.mesh_tcp_egress_connection_counter.len() * 120
             + self
@@ -4464,6 +4541,47 @@ impl MetricsRegistry {
             output.push_str(&format!("# HELP {name} {help}\n"));
             output.push_str(&format!("# TYPE {name} counter\n"));
             render_process_counter(&mut output, name, value, &ns_label);
+        }
+
+        if !self.ai_federation_provider_circuits_open.is_empty() {
+            output.push_str(
+                "# HELP ferrum_ai_federation_provider_circuits_open Current ai_federation circuits in open or half-open recovery state, by configured provider name.\n",
+            );
+            output.push_str("# TYPE ferrum_ai_federation_provider_circuits_open gauge\n");
+            for entry in self.ai_federation_provider_circuits_open.iter() {
+                let provider = escape_label_value(entry.key());
+                output.push_str(&format!(
+                    "ferrum_ai_federation_provider_circuits_open{{provider=\"{}\"{}}} {}\n",
+                    provider,
+                    ns_label,
+                    *entry.value()
+                ));
+            }
+        }
+        for (name, help, map) in [
+            (
+                "ferrum_ai_federation_provider_circuits_opened_total",
+                "ai_federation circuit closed-to-open transitions, by configured provider name.",
+                &self.ai_federation_provider_circuits_opened,
+            ),
+            (
+                "ferrum_ai_federation_provider_circuits_closed_total",
+                "ai_federation circuit half-open recoveries, by configured provider name.",
+                &self.ai_federation_provider_circuits_closed,
+            ),
+        ] {
+            if map.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            for entry in map.iter() {
+                let provider = escape_label_value(entry.key());
+                let count = entry.value().value.load(Ordering::Relaxed);
+                output.push_str(&format!(
+                    "{name}{{provider=\"{provider}\"{ns_label}}} {count}\n"
+                ));
+            }
         }
 
         let amp = crate::udp_amplification::metrics_snapshot();

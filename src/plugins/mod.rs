@@ -2637,6 +2637,13 @@ pub struct RequestContext {
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
+    /// Error class of the LATEST dispatch attempt (`None` when it produced a
+    /// backend response or nothing was dispatched). Written beside
+    /// `backend_dispatch_state` by the same trusted transport call, so a
+    /// response-phase plugin can tell a gateway-authored transport-failure
+    /// response (timeout, reset, refused) from a real origin status without
+    /// reading plugin-writable metadata. Not serialized.
+    last_backend_dispatch_error_class: Option<crate::retry::ErrorClass>,
     /// Diagnostic-reference slot of this request (issue #5767). `None` unless
     /// `FERRUM_DIAGNOSTIC_REFS` enabled the store. Set only by the HTTP
     /// frontends; the terminal transaction log records the request's detail
@@ -3931,6 +3938,7 @@ impl RequestContext {
         error_class: Option<crate::retry::ErrorClass>,
         request_on_wire: bool,
     ) {
+        self.last_backend_dispatch_error_class = error_class;
         self.backend_dispatch_state = if error_class.is_none() {
             BackendDispatchState::BackendResponse
         } else if request_on_wire
@@ -3947,6 +3955,12 @@ impl RequestContext {
 
     pub(crate) fn backend_dispatch_state(&self) -> BackendDispatchState {
         self.backend_dispatch_state
+    }
+
+    /// Error class of the latest dispatch attempt; `None` when that attempt
+    /// produced a backend response or nothing was dispatched.
+    pub(crate) fn last_backend_dispatch_error_class(&self) -> Option<crate::retry::ErrorClass> {
+        self.last_backend_dispatch_error_class
     }
 
     /// Note that this request's terminal transaction record, logged with
@@ -4160,6 +4174,7 @@ impl RequestContext {
             self.response_transform_size_refusal_selected;
         ctx.route_request_timeout_phase = self.route_request_timeout_phase;
         ctx.backend_dispatch_state = self.backend_dispatch_state;
+        ctx.last_backend_dispatch_error_class = self.last_backend_dispatch_error_class;
         ctx.diagnostic_slot = self.diagnostic_slot.clone();
         ctx.grpc_deadline_at = self.grpc_deadline_at;
         ctx.mesh_labels = self.mesh_labels.clone();
@@ -4369,6 +4384,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: false,
             route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
+            last_backend_dispatch_error_class: None,
             diagnostic_slot: None,
             backend_attempt_trace: None,
             gateway_capacity_response_selected: false,
@@ -5898,6 +5914,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
             route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
+            last_backend_dispatch_error_class: self.last_backend_dispatch_error_class,
             diagnostic_slot: self.diagnostic_slot.clone(),
             backend_attempt_trace: self.backend_attempt_trace.clone(),
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,

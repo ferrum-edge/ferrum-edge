@@ -784,6 +784,45 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_ai_federation_provider_circuits_closed_total",
+    "type": "counter",
+    "help": "ai_federation circuit half-open recoveries, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_federation_provider_circuits_open",
+    "type": "gauge",
+    "help": "Current ai_federation circuits in open or half-open recovery state, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_federation_provider_circuits_opened_total",
+    "type": "counter",
+    "help": "ai_federation circuit closed-to-open transitions, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
     "name": "ferrum_ai_prompt_tokens_total",
     "type": "counter",
     "help": "Prompt tokens reported by AI providers.",
