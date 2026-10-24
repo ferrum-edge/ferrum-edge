@@ -2884,6 +2884,19 @@ fn rate_limiting_schema_and_runtime_admission_agree() {
             "limit_by": "spiffe",
             "limits": [{"scope": "default", "requests_per_minute": 100}]
         }),
+        // The aggregate dimension and a sized key cap.
+        json!({
+            "limit_by": "SERVICE",
+            "max_state_entries": 250000,
+            "limits": [{"scope": "default", "requests_per_second": 1000}]
+        }),
+        // A mixed-case Redis scheme is a valid URL (the constructor lowercases it).
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "REDIS://redis-host:6379/0",
+            "redis_tls": true,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
         // Consumer-scoped rules alongside the required default rule.
         json!({
             "limit_by": "consumer",
@@ -2972,6 +2985,23 @@ fn rate_limiting_schema_and_runtime_admission_agree() {
                     "requests_per_minute": 10
                 }
             ]
+        }),
+        // Consumer rules are a `limit_by: consumer` feature, not an aggregate one.
+        json!({
+            "limit_by": "service",
+            "limits": [
+                {"scope": "default", "requests_per_minute": 100},
+                {"scope": "consumers", "consumers": ["alice"], "requests_per_minute": 10}
+            ]
+        }),
+        // The key cap is bounded on both sides.
+        json!({
+            "max_state_entries": 0,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
+        }),
+        json!({
+            "max_state_entries": 10000001,
+            "limits": [{"scope": "default", "requests_per_minute": 100}]
         }),
         // Centralized mode without an endpoint.
         json!({

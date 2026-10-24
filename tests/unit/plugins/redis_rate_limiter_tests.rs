@@ -9750,3 +9750,186 @@ async fn ownership_writes_require_exact_ok_watch_and_multi_acknowledgements() {
         let _ = server.shutdown.send(());
     }
 }
+
+// ── Production-launch review fixes (rate_limiting-SOL-2, -CLAUDE-1/5) ─────
+
+/// rate_limiting-CLAUDE-1: admission accepts any letter case of the scheme,
+/// so the stored URL must be lowercase or `redis_tls` silently never upgrades
+/// `REDIS://` and the gateway sends `AUTH` over plaintext.
+#[test]
+fn a_mixed_case_redis_scheme_is_stored_lowercase_so_redis_tls_upgrades() {
+    let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "REDIS://cache.internal:6380/0",
+            "redis_tls": true
+        }),
+        "ferrum:test",
+    )
+    .expect("a mixed-case scheme is a valid Redis URL")
+    .expect("sync_mode=redis yields a config");
+    assert_eq!(config.url, "redis://cache.internal:6380/0");
+    assert_eq!(
+        redis_config_url_with_ip(&config, ip),
+        "rediss://cache.internal:6380/0",
+        "redis_tls must upgrade a mixed-case plaintext scheme and keep the hostname for SNI"
+    );
+
+    let tls = RedisConfig::from_plugin_config(
+        &json!({"sync_mode": "redis", "redis_url": "ReDiSs://10.0.0.5:6380/0"}),
+        "ferrum:test",
+    )
+    .expect("valid")
+    .expect("redis mode");
+    assert_eq!(tls.url, "rediss://10.0.0.5:6380/0");
+
+    // Only the scheme is normalized: userinfo, host, and path keep their bytes.
+    let spelled = RedisConfig::from_plugin_config(
+        &json!({"sync_mode": "redis", "redis_url": "Redis://User:Pass@Cache.Internal:6379/2"}),
+        "ferrum:test",
+    )
+    .expect("valid")
+    .expect("redis mode");
+    assert_eq!(spelled.url, "redis://User:Pass@Cache.Internal:6379/2");
+}
+
+/// rate_limiting-CLAUDE-1: TLS detection itself is case-insensitive, so even a
+/// directly constructed config keeps SNI and the `FERRUM_TLS_*` policy for a
+/// mixed-case `rediss://`.
+#[test]
+fn tls_scheme_detection_is_case_insensitive() {
+    let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let tls = make_config("REDISS://cache.internal:6380/0", false);
+    assert_eq!(
+        redis_config_url_with_ip(&tls, ip),
+        "REDISS://cache.internal:6380/0",
+        "a TLS URL must keep its hostname for SNI"
+    );
+    let upgraded = make_config("Redis://cache.internal:6380/0", true);
+    assert_eq!(
+        redis_config_url_with_ip(&upgraded, ip),
+        "rediss://cache.internal:6380/0"
+    );
+
+    let literal = "REDISS://10.0.0.5:6380/0";
+    let insecure = redis_client_tls_insecure(make_config(literal, false), literal, true)
+        .expect("a mixed-case rediss URL builds a TLS address");
+    assert!(
+        insecure,
+        "FERRUM_TLS_NO_VERIFY must reach a mixed-case rediss endpoint"
+    );
+}
+
+/// rate_limiting-SOL-2: cancelling the request future while its charge
+/// transaction is in flight must not strand an over-limit `INCR`. The fixture
+/// APPLIES each charge at once and holds only its reply, so the cancelled
+/// attempt's increment is on the server before the waiter is dropped; the
+/// detached decision must still read the reply, refuse, and hand it back.
+#[tokio::test]
+async fn a_cancelled_waiter_does_not_strand_an_over_limit_charge() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions {
+        charge_delay: Duration::from_millis(150),
+        delayed_charges: usize::MAX,
+        hold_phase: HoldPhase::AfterApply,
+        ..KeyspaceServerOptions::default()
+    })
+    .await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    // A one-minute window: 3.75s sub-buckets, so a 150ms reply hold never
+    // rolls the ladder over.
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(60),
+    }]);
+
+    let admitted = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("the first charge decides");
+    assert!(admitted.allowed, "the first request fits the budget");
+    assert_eq!(server.charged_total(), 1);
+
+    // The second request is over the limit; its waiter is dropped while the
+    // reply is held, as a gRPC deadline under `timeout_at` would drop it.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(30),
+        algorithm.check_redis(&client, "ip:127.0.0.1", &op),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the waiter must be cancelled while the charge reply is still held"
+    );
+
+    for _ in 0..6_000 {
+        if server.decrs() >= 1 && client.pending_compensations_for_test() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(server.incrs(), 2, "both requests charged");
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the cancelled over-limit attempt must still be handed back"
+    );
+    assert_eq!(
+        server.charged_total(),
+        1,
+        "only the admitted request may keep a charge"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// rate_limiting-CLAUDE-5: a Redis quota refusal carries a conservative
+/// `Retry-After` bound: the newest charge a reader counts leaves every ladder
+/// `K + 2` sub-buckets after the server bucket that settled the refusal, so
+/// the wait is more than 17 and at most 18 sixteenths of the window.
+#[tokio::test]
+async fn a_redis_quota_refusal_carries_a_retry_after_bound() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(64),
+    }]);
+
+    let admitted = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(admitted.allowed);
+    assert_eq!(
+        admitted.retry_after_seconds, None,
+        "an admission names no wait"
+    );
+
+    let refused = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(!refused.allowed);
+    // 64s window: 4s sub-buckets, so the wait is in (68s, 72s].
+    let retry_after = refused
+        .retry_after_seconds
+        .expect("a quota refusal names a wait");
+    assert!(
+        (69..=72).contains(&retry_after),
+        "Retry-After {retry_after} outside the (17/16, 18/16] window bound"
+    );
+
+    await_compensations(&client).await;
+    let _ = server.shutdown.send(());
+}

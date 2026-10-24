@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`rate_limiting` gains `limit_by: service`, a configurable key cap, and
+  `Retry-After`.** `limit_by: service` charges one aggregate budget per policy
+  shared by every caller (in the `authorize` phase, so requests an auth plugin
+  refuses spend nothing; once per connection/session on TCP/UDP), locally or
+  fleet-wide with `sync_mode: redis`; compose it beside a per-caller instance
+  to enforce both a per-caller and a total rate. `max_state_entries` (default
+  `100000`, `1`–`10000000`) replaces the hardcoded 100,000-key local/fallback
+  cap and is not part of the local-state fingerprint, so resizing keeps live
+  budgets. Every quota `429` now carries `Retry-After` (whole seconds,
+  independent of `expose_headers`): exact for the local token bucket and
+  sliding aggregate, a conservative upper bound (at most `9/8` of the window)
+  in Redis mode. Successful WebSocket handshake responses now carry the
+  `x-ratelimit-*` headers under `expose_headers` and have a backend
+  `x-ratelimit-identity` stripped, like every other admitted response.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +153,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **A cancelled Redis-mode `rate_limiting` request can no longer strand an
+  over-limit charge.** The charge transaction, its reply, settlement and any
+  hand-back now run on a task of their own that the request only awaits, so a
+  gRPC deadline, client disconnect, or reload that drops the request while the
+  charge is in flight no longer leaves the `INCR` uncompensated (which let
+  short-deadline callers keep re-arming a shared key's exhaustion). The same
+  applies to `graphql` and `grpc_method_router` quotas, which share the path.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder
@@ -329,6 +350,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`rate_limiting` `mcp_tool_calls` no longer passes unreadable MCP bodies
+  uncounted.** The strict recognizer's "no `tools/call`" was taken as proof the
+  request was call-free, so a body it could not read — UTF-16/32 JSON, a
+  byte-order mark, `NaN`, comments, invalid UTF-8, or a non-UTF-8 `charset` —
+  reached a lenient upstream (Python's `json.loads` on bytes) and executed tool
+  calls past an exhausted budget. An in-scope request is now refused with
+  JSON-RPC `-32600` when its `Content-Type` names a charset other than UTF-8
+  (as `mcp_gateway` refuses it), when its body could carry a `tools/call` but
+  is not strict JSON (`mcp_jsonrpc::may_carry_tool_call`), or when no body
+  snapshot exists; the limiter now requests the raw body bytes.
+- **A mixed-case Redis URL scheme no longer defeats `redis_tls`.** Admission
+  accepted `REDIS://` / `REDISS://` (URL schemes are case-insensitive), but the
+  `redis_tls` upgrade, SNI preservation and the CA-bundle / skip-verify policy
+  compared the raw string case-sensitively, so `REDIS://` with
+  `redis_tls: true` dialed plaintext and sent `AUTH` in the clear. The shared
+  Redis client now stores the scheme lowercase and matches it
+  case-insensitively, for every Redis-backed plugin.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

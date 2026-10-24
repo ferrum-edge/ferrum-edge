@@ -876,6 +876,11 @@ on a native-gRPC request.
   shared client `Arc`, so a dropped request future (gRPC deadline under
   `timeout_at`, client disconnect, reload retiring the instance) cannot strand
   the charge, and the refused caller does not pay the second round trip inline.
+  The WHOLE decision — charge transaction, reply, settlement, and hand-back —
+  likewise runs on its own task (`check_http_windows_redis_detached`) that the
+  request only awaits: a cancellation between the `INCR` and reading its reply
+  would otherwise strand an over-limit charge no code ever hands back. Keep the
+  algorithms' `check_redis` routed through that wrapper.
   A compensation that fails goes through `note_command_failure`
   so `redis_failure_policy` governs the NEXT decision, and the refusal still
   stands; the earlier charge then remains until the charged bucket expires.

@@ -1096,9 +1096,15 @@ async fn test_expose_headers_disabled_no_headers_on_rejection() {
     let result = plugin.on_request_received(&mut ctx2).await;
     match result {
         PluginResult::Reject { headers, .. } => {
+            // `Retry-After` is the client backoff contract, not budget
+            // telemetry, so it is the one header a quota 429 still carries.
             assert!(
-                headers.is_empty(),
-                "Headers should be empty when expose_headers is false"
+                headers.keys().all(|name| name == "retry-after"),
+                "only Retry-After may ride a refusal when expose_headers is false: {headers:?}"
+            );
+            assert!(
+                headers.contains_key("retry-after"),
+                "a quota 429 carries Retry-After: {headers:?}"
             );
         }
         _ => panic!("Expected Reject"),
@@ -3038,4 +3044,411 @@ fn mcp_tool_calls_config_is_closed_and_bounded() {
     let plugin = RateLimiting::new(&config, PluginHttpClient::default());
     let plugin = plugin.expect("null keeps request counting");
     assert_eq!(plugin.supported_protocols(), ALL_PROTOCOLS);
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes (rate_limiting-SOL-1..4, -CLAUDE-1/2/4/5/8)
+// ---------------------------------------------------------------------------
+
+/// An MCP POST carrying `body` as the proxy snapshots it for this limiter: the
+/// raw bytes (which it now requests), plus the UTF-8 text view only when the
+/// bytes are valid UTF-8.
+fn mcp_post_bytes(body: &[u8]) -> (RequestContext, HashMap<String, String>) {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/mcp".to_string();
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body));
+    if let Ok(text) = std::str::from_utf8(body) {
+        ctx.metadata
+            .insert("request_body".to_string(), text.to_string());
+    }
+    let headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    (ctx, headers)
+}
+
+fn utf16le_with_bom(text: &str) -> Vec<u8> {
+    let mut encoded = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+    encoded
+}
+
+/// rate_limiting-SOL-1: the strict recognizer's "no `tools/call`" is not proof
+/// the upstream executes none. A body strict UTF-8 JSON cannot read but a
+/// lenient parser (Python's `json.loads` on bytes) still decodes into a call
+/// must be refused, never forwarded uncharged past an exhausted budget.
+#[tokio::test]
+async fn mcp_tool_calls_refuse_bodies_strict_json_cannot_read() {
+    let plugin = mcp_limiter(json!({}));
+    assert!(
+        plugin.needs_request_body_bytes(),
+        "a tool-call limiter needs the raw bytes of a non-UTF-8 body"
+    );
+    assert!(
+        !make_rate_limiter(json!({"window_seconds": 60, "max_requests": 2}))
+            .needs_request_body_bytes()
+    );
+
+    // Exhaust the two-call budget with ordinary calls.
+    assert_continue(send_mcp(&plugin, &mcp_call(1, "a")).await.0);
+    assert_continue(send_mcp(&plugin, &mcp_call(2, "a")).await.0);
+    jsonrpc_refusal(send_mcp(&plugin, &mcp_call(3, "a")).await.0);
+
+    let call = mcp_call(4, "a").to_string();
+    let nan_call = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"a","arguments":{"x":NaN}}}"#;
+    let mut utf8_bom = b"\xEF\xBB\xBF".to_vec();
+    utf8_bom.extend_from_slice(call.as_bytes());
+    let mut latin1 = br#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"a","arguments":{"note":"caf"#.to_vec();
+    latin1.extend_from_slice(b"\xE9\"}}}");
+    let utf32le: Vec<u8> = call
+        .chars()
+        .flat_map(|ch| (ch as u32).to_le_bytes())
+        .collect();
+    let cases: [(&str, Vec<u8>); 6] = [
+        ("UTF-16LE with a BOM", utf16le_with_bom(&call)),
+        ("UTF-32LE without a BOM", utf32le),
+        ("UTF-8 with a BOM", utf8_bom),
+        ("NaN argument", nan_call.as_bytes().to_vec()),
+        (
+            "comment before the document",
+            format!("// x\n{call}").into_bytes(),
+        ),
+        ("invalid UTF-8 inside a string", latin1),
+    ];
+    for (label, body) in cases {
+        let (mut ctx, mut headers) = mcp_post_bytes(&body);
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let (refusal, _) = jsonrpc_refusal(result);
+        assert_eq!(
+            refusal["error"]["code"],
+            json!(-32600),
+            "{label}: {refusal}"
+        );
+        assert_eq!(
+            header(&ctx.metadata, "ratelimit_mcp_uninspectable"),
+            Some("unparseable_body"),
+            "{label}"
+        );
+    }
+
+    // A strictly valid body that merely carries an escape, or names
+    // `tools/call` outside the method, is read faithfully and stays free.
+    let plugin = mcp_limiter(json!({}));
+    for body in [
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"cursor":"a\nb"}}"#,
+        r#"{"jsonrpc":"2.0","id":8,"method":"prompts/get","params":{"name":"tools/call"}}"#,
+    ] {
+        for _ in 0..3 {
+            let (result, ctx) = send_raw(&plugin, body).await;
+            assert_continue(result);
+            assert!(!ctx.metadata.contains_key("ratelimit_mcp_uninspectable"));
+        }
+    }
+    assert_continue(send_mcp(&plugin, &mcp_call(9, "a")).await.0);
+}
+
+/// rate_limiting-CLAUDE-2: a JSON body declared in a charset other than UTF-8
+/// is refused like `mcp_gateway` refuses it, while UTF-8 spellings still count.
+#[tokio::test]
+async fn mcp_tool_calls_refuse_a_non_utf8_charset() {
+    let plugin = mcp_limiter(json!({}));
+    for content_type in [
+        "application/json; charset=iso-8859-1",
+        "application/json; charset=utf-7",
+        "application/json; charset*=utf-8''utf-8",
+    ] {
+        let (mut ctx, mut headers) = mcp_post_raw(&mcp_call(1, "a").to_string());
+        headers.insert("content-type".to_string(), content_type.to_string());
+        let (refusal, _) = jsonrpc_refusal(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(refusal["error"]["code"], json!(-32600), "{content_type}");
+        assert_eq!(
+            header(&ctx.metadata, "ratelimit_mcp_uninspectable"),
+            Some("unsupported_charset"),
+            "{content_type}"
+        );
+        assert!(
+            !ctx.metadata.contains_key("ratelimit_mcp_tool_calls"),
+            "a refused charset charges nothing: {content_type}"
+        );
+    }
+
+    for (id, content_type) in [
+        (2, "application/json; charset=utf-8"),
+        (3, "application/json; charset=\"UTF8\""),
+    ] {
+        let (mut ctx, mut headers) = mcp_post_raw(&mcp_call(id, "a").to_string());
+        headers.insert("content-type".to_string(), content_type.to_string());
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(header(&ctx.metadata, "ratelimit_mcp_tool_calls"), Some("1"));
+    }
+    // Both UTF-8 calls were charged, so the budget of two is spent.
+    jsonrpc_refusal(send_mcp(&plugin, &mcp_call(4, "a")).await.0);
+}
+
+/// rate_limiting-SOL-1: an in-scope POST without any body snapshot was never
+/// inspected, so it is refused rather than passed as call-free.
+#[tokio::test]
+async fn mcp_tool_calls_refuse_an_in_scope_post_without_a_body_snapshot() {
+    let plugin = mcp_limiter(json!({"endpoint_path": "/mcp"}));
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/mcp".to_string();
+    let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let (refusal, _) = jsonrpc_refusal(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(refusal["error"]["code"], json!(-32600), "{refusal}");
+    assert_eq!(
+        header(&ctx.metadata, "ratelimit_mcp_uninspectable"),
+        Some("missing_body")
+    );
+
+    // An empty body is a snapshot: it carries no call and passes uncounted.
+    let (mut ctx, mut headers) = mcp_post_bytes(b"");
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    // Out-of-scope paths are still never inspected.
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/pets".to_string();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut HashMap::new()).await);
+}
+
+/// rate_limiting-SOL-3 / -CLAUDE-4: a successful WebSocket handshake bypasses
+/// `after_proxy`, so the handshake hook must publish the staged budget and
+/// strip a backend-supplied identity header.
+#[tokio::test]
+async fn websocket_handshake_response_carries_rate_limit_headers() {
+    let plugin = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+
+    let mut response_headers = HashMap::from([(
+        "X-RateLimit-Identity".to_string(),
+        "backend-supplied".to_string(),
+    )]);
+    plugin.apply_websocket_handshake_response_headers(&ctx, 101, &mut response_headers);
+    assert_eq!(header(&response_headers, "x-ratelimit-limit"), Some("5"));
+    assert_eq!(
+        header(&response_headers, "x-ratelimit-remaining"),
+        Some("4")
+    );
+    assert_eq!(header(&response_headers, "x-ratelimit-window"), Some("60"));
+    assert!(
+        !response_headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("x-ratelimit-identity")),
+        "the handshake response must not carry a limiter identity: {response_headers:?}"
+    );
+
+    // Without expose_headers nothing is published, but the identity header is
+    // still stripped.
+    let hidden = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip"
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(hidden.on_request_received(&mut ctx).await);
+    let mut response_headers = HashMap::from([(
+        "x-ratelimit-identity".to_string(),
+        "backend-supplied".to_string(),
+    )]);
+    hidden.apply_websocket_handshake_response_headers(&ctx, 200, &mut response_headers);
+    assert!(response_headers.is_empty(), "{response_headers:?}");
+}
+
+/// rate_limiting-SOL-4 / -CLAUDE-6: `limit_by: service` is one aggregate budget
+/// shared by every caller, charged after authentication.
+#[tokio::test]
+async fn service_dimension_shares_one_budget_across_callers() {
+    let plugin = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 2,
+        "limit_by": "Service",
+        "expose_headers": true
+    }));
+    assert!(plugin.is_authorize_plugin(), "service charges in authorize");
+
+    // The request phase charges nothing.
+    for _ in 0..5 {
+        let mut ctx = create_test_context();
+        assert_continue(plugin.on_request_received(&mut ctx).await);
+    }
+
+    let mut first = create_test_context();
+    first.client_ip = "192.0.2.1".to_string();
+    assert_continue(plugin.authorize(&mut first).await);
+    assert_eq!(header(&first.metadata, "ratelimit_remaining"), Some("1"));
+
+    let mut second = create_test_context();
+    second.client_ip = "198.51.100.2".to_string();
+    second.identified_consumer = None;
+    assert_continue(plugin.authorize(&mut second).await);
+    assert_eq!(header(&second.metadata, "ratelimit_remaining"), Some("0"));
+
+    let mut third = create_test_context();
+    third.client_ip = "203.0.113.3".to_string();
+    assert_reject(plugin.authorize(&mut third).await, Some(429));
+
+    // Stream connections share one budget too.
+    let streams = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "service"
+    }));
+    let mut ctx = stream_context();
+    assert_continue(streams.on_stream_connect(&mut ctx).await);
+    let mut other = stream_context();
+    other.client_ip = "198.51.100.9".to_string();
+    assert!(matches!(
+        streams.on_stream_connect(&mut other).await,
+        PluginResult::Reject { .. }
+    ));
+
+    // Consumer-scoped rules stay a `limit_by: consumer` feature.
+    let config = json!({
+        "limit_by": "service",
+        "limits": [
+            { "scope": "default", "requests_per_minute": 10 },
+            { "scope": "consumers", "consumers": ["a"], "requests_per_minute": 20 }
+        ]
+    });
+    let error = RateLimiting::new(&config, PluginHttpClient::default())
+        .err()
+        .expect("consumer rules require limit_by=consumer");
+    assert!(error.contains("limit_by=consumer"), "{error}");
+}
+
+/// rate_limiting-CLAUDE-5: every quota 429 carries `Retry-After`, whatever
+/// `expose_headers` says, sized to when the refusing window frees budget.
+#[tokio::test]
+async fn quota_refusals_carry_retry_after() {
+    fn retry_after(result: PluginResult) -> u64 {
+        match result {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, 429);
+                headers
+                    .get("retry-after")
+                    .unwrap_or_else(|| panic!("a quota 429 carries Retry-After: {headers:?}"))
+                    .parse()
+                    .expect("Retry-After is whole seconds")
+            }
+            other => panic!("expected a 429, got {other:?}"),
+        }
+    }
+
+    // Sliding aggregate (> 5s): the oldest counted sub-interval leaves after
+    // at most `ceil(60 * 64 / 63)` = 61 seconds.
+    let sliding = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 1,
+        "limit_by": "ip"
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(sliding.on_request_received(&mut ctx).await);
+    let mut ctx = create_test_context();
+    let seconds = retry_after(sliding.on_request_received(&mut ctx).await);
+    assert!(
+        (60..=61).contains(&seconds),
+        "sliding Retry-After {seconds}"
+    );
+
+    // Token bucket (<= 5s): one token of `5 per 5s` refills in one second, not
+    // the whole window.
+    let bucket = make_rate_limiter(json!({
+        "window_seconds": 5,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }));
+    for _ in 0..5 {
+        let mut ctx = create_test_context();
+        assert_continue(bucket.on_request_received(&mut ctx).await);
+    }
+    let mut ctx = create_test_context();
+    assert_eq!(retry_after(bucket.on_request_received(&mut ctx).await), 1);
+
+    // The state-capacity refusal is not a budget verdict and carries none.
+    let capped = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "max_state_entries": 1
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(capped.on_request_received(&mut ctx).await);
+    let mut ctx = create_test_context();
+    ctx.client_ip = "198.51.100.7".to_string();
+    match capped.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert!(headers.is_empty(), "{headers:?}");
+        }
+        other => panic!("expected a capacity 429, got {other:?}"),
+    }
+}
+
+/// rate_limiting-CLAUDE-8: the local key cap is `max_state_entries`, bounded
+/// and validated; at the cap existing keys keep their budgets.
+#[tokio::test]
+async fn max_state_entries_bounds_distinct_local_keys() {
+    let plugin = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "max_state_entries": 2
+    }));
+    for ip in ["192.0.2.1", "192.0.2.2"] {
+        let mut ctx = create_test_context();
+        ctx.client_ip = ip.to_string();
+        assert_continue(plugin.on_request_received(&mut ctx).await);
+    }
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+    let mut ctx = create_test_context();
+    ctx.client_ip = "192.0.2.3".to_string();
+    assert_reject(plugin.on_request_received(&mut ctx).await, Some(429));
+    // A tracked key is still admitted at the cap.
+    let mut ctx = create_test_context();
+    ctx.client_ip = "192.0.2.1".to_string();
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    for (value, label) in [
+        (json!(0), "zero"),
+        (json!(10_000_001_u64), "above the ceiling"),
+        (json!(-1), "negative"),
+        (json!("100"), "a string"),
+        (Value::Null, "null"),
+    ] {
+        let config = rate_limiting_config(json!({
+            "window_seconds": 60,
+            "max_requests": 10,
+            "max_state_entries": value
+        }));
+        let error = RateLimiting::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("max_state_entries {label} must be rejected"));
+        assert!(
+            error.contains("`max_state_entries` must be an integer from 1 through 10000000"),
+            "{label}: {error}"
+        );
+    }
+    let config = rate_limiting_config(json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "max_state_entries": 10_000_000_u64
+    }));
+    assert!(RateLimiting::new(&config, PluginHttpClient::default()).is_ok());
 }
