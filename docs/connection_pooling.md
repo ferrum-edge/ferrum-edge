@@ -10,7 +10,7 @@ Connection pooling uses a **hybrid configuration** with global defaults and per-
 
 ```bash
 # Set global defaults (optional - shown with defaults)
-FERRUM_POOL_MAX_IDLE_PER_HOST=64
+FERRUM_POOL_MAX_IDLE_PER_HOST=1024
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=90
 FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE=true
 FERRUM_POOL_ENABLE_HTTP2=true
@@ -54,7 +54,7 @@ The adaptive setting controls the hyper/reqwest backend HTTP/2 pools. HBONE uses
 
 | Setting | Global Default | Description |
 |---------|----------------|-------------|
-| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `64` | Maximum idle connections per backend host. Must be between 4 and 1024 |
+| `FERRUM_POOL_MAX_IDLE_PER_HOST` | `1024` | Maximum idle connections per backend host. Must be between 4 and 1024 |
 | `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` | `90` | Seconds before idle connections are closed. Any `u64`, including `0` |
 | `FERRUM_POOL_ENABLE_HTTP_KEEP_ALIVE` | `true` | Enable HTTP keep-alive for connection reuse. Accepted: `true`/`false`/`1`/`0` |
 | `FERRUM_POOL_ENABLE_HTTP2` | `true` | Enable HTTP/2 multiplexing when supported. Accepted: `true`/`false`/`1`/`0` |
@@ -73,26 +73,17 @@ The adaptive setting controls the hyper/reqwest backend HTTP/2 pools. HBONE uses
 
 ## Sizing `FERRUM_POOL_MAX_IDLE_PER_HOST`
 
-This is the single most important pool setting for performance and reliability. It controls how many idle backend connections are kept alive per host.
+This setting controls how many idle backend connections are kept alive per host. The default, **1024**, is also the maximum.
 
 **Safety bounds:** Minimum **4**, maximum **1024**. Values outside this range refuse to start (`ferrum-edge validate` and `run` both fail).
 
-### Recommended Values by Workload
+**It is a ceiling, not a reservation.** The pool keeps only connections that concurrent requests actually opened, and each idle connection closes after `FERRUM_POOL_IDLE_TIMEOUT_SECONDS` (default 90). A backend serving 30 concurrent requests holds about 30 connections whatever the ceiling is.
 
-| Workload | Expected Concurrency | Recommended Value | Notes |
-|----------|---------------------|-------------------|-------|
-| Low-traffic internal API | < 20 concurrent | `16`-`32` | Default of 64 is fine |
-| Standard production API | 20-100 concurrent | `64`-`128` | Match peak concurrency per backend |
-| High-traffic public API | 100-500 concurrent | `128`-`256` | Monitor backend capacity |
-| Health checks / monitoring | Low volume | `16`-`32` | Small responses, fewer idle connections needed |
-| WebSocket services | Long-lived connections | `16`-`64` | Pool mainly holds upgrade handshakes |
+**A ceiling below a backend's steady concurrency causes churn.** Under steady load most connections sit idle between requests. When more of them are idle at once than the ceiling allows, every check-in beyond it closes a connection, and a later request dials a new one. On the mesh runtime benchmark at 100 concurrent requests, the former default of 64 made about 6% of requests open a new backend connection. At 1024 there was none (issue #6793).
 
-### How to Choose
+### When to lower it
 
-1. **Start with the default (64).** This handles most workloads well.
-2. **Match your expected peak concurrency.** If your gateway handles 200 concurrent requests to a single backend, set the value to at least `200`.
-3. **Monitor for connection churn.** If your logs show frequent "Backend request failed" errors under load, increase this value.
-4. **Do not exceed your backend's capacity.** Setting this to 1024 does not help if your backend can only handle 100 concurrent connections.
+Lower the ceiling only to bound idle file descriptors after bursts. The typical case is many backends with bursty traffic under a tight `ulimit -n`: after a burst, each backend can hold up to its burst concurrency idle until the idle timeout. Keep the value at or above the steady concurrency per backend, or the churn above returns. With HTTP/2 backends a single connection multiplexes many requests, so few connections are ever idle and the ceiling rarely matters.
 
 ## Timeout Mechanisms
 
@@ -155,7 +146,6 @@ Two things are deliberately NOT shared. Successful transports are not: a cold bu
 
 ### HTTP/HTTPS APIs
 ```bash
-FERRUM_POOL_MAX_IDLE_PER_HOST=128
 FERRUM_POOL_IDLE_TIMEOUT_SECONDS=120
 FERRUM_POOL_ENABLE_HTTP2=true
 ```

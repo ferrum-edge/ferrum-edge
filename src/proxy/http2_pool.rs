@@ -1243,8 +1243,16 @@ impl IdleH1 {
 
 /// Idle connections for one lane key. Lock-free: many concurrent requests to
 /// one backend all check in and out of the same lane.
+///
+/// The idle set grows in small blocks as connections go idle instead of
+/// reserving `max_idle_per_host` slots up front, so a high ceiling costs a
+/// lane nothing until its own concurrency fills it.
 struct Http1Lane {
-    idle: crossbeam_queue::ArrayQueue<IdleH1>,
+    idle: crossbeam_queue::SegQueue<IdleH1>,
+    /// Entries in `idle`, reserved before each push so concurrent check-ins
+    /// cannot overshoot `max_idle`.
+    idle_len: AtomicUsize,
+    max_idle: usize,
     /// Bumped when a drain withdraws this lane. A checkout taken under an older
     /// generation is never checked back in, so an exchange that outlived the
     /// drain cannot repopulate the pool with a connection it meant to retire.
@@ -1256,7 +1264,28 @@ struct Http1Lane {
 impl Http1Lane {
     fn retire(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        while self.idle.pop().is_some() {}
+        while self.pop_idle().is_some() {}
+    }
+
+    /// Pool `entry` unless the lane already holds its ceiling, in which case
+    /// it is handed back and the caller drops the connection.
+    fn push_idle(&self, entry: IdleH1) -> Result<(), IdleH1> {
+        if self.idle_len.fetch_add(1, Ordering::AcqRel) >= self.max_idle {
+            self.idle_len.fetch_sub(1, Ordering::AcqRel);
+            return Err(entry);
+        }
+        self.idle.push(entry);
+        Ok(())
+    }
+
+    fn pop_idle(&self) -> Option<IdleH1> {
+        let entry = self.idle.pop()?;
+        self.idle_len.fetch_sub(1, Ordering::AcqRel);
+        Some(entry)
+    }
+
+    fn idle_len(&self) -> usize {
+        self.idle.len()
     }
 }
 
@@ -1279,7 +1308,9 @@ impl Http1Lanes {
         }
         Arc::clone(&self.lanes.entry(key.to_owned()).or_insert_with(|| {
             Arc::new(Http1Lane {
-                idle: crossbeam_queue::ArrayQueue::new(self.max_idle_per_host),
+                idle: crossbeam_queue::SegQueue::new(),
+                idle_len: AtomicUsize::new(0),
+                max_idle: self.max_idle_per_host,
                 generation: AtomicU64::new(0),
             })
         }))
@@ -1321,8 +1352,8 @@ impl Http1Lanes {
             ..
         } = checkout;
         // A full lane drops the connection (the oldest-wins tradeoff of a
-        // bounded idle set); `push` hands the entry back and it drops here.
-        let _ = lane.idle.push(IdleH1 {
+        // bounded idle set); `push_idle` hands the entry back and it drops here.
+        let _ = lane.push_idle(IdleH1 {
             sender,
             socket,
             idle_since: std::time::Instant::now(),
@@ -1352,19 +1383,19 @@ impl Http1Lanes {
     fn sweep(&self) {
         let now = std::time::Instant::now();
         self.lanes.retain(|_, lane| {
-            for _ in 0..lane.idle.len() {
-                let Some(idle) = lane.idle.pop() else { break };
+            for _ in 0..lane.idle_len() {
+                let Some(idle) = lane.pop_idle() else { break };
                 if idle.sender.is_closed() || idle.expired(now) {
                     continue;
                 }
-                let _ = lane.idle.push(idle);
+                let _ = lane.push_idle(idle);
             }
-            !lane.idle.is_empty() || Arc::strong_count(lane) > 1
+            lane.idle_len() > 0 || Arc::strong_count(lane) > 1
         });
     }
 
     fn idle_connections(&self) -> usize {
-        self.lanes.iter().map(|lane| lane.idle.len()).sum()
+        self.lanes.iter().map(|lane| lane.idle_len()).sum()
     }
 }
 
@@ -1755,7 +1786,7 @@ impl Http2ConnectionPool {
         let generation = lane.generation.load(Ordering::Acquire);
         if !fresh {
             let now = std::time::Instant::now();
-            while let Some(idle) = lane.idle.pop() {
+            while let Some(idle) = lane.pop_idle() {
                 // Only ready senders are pooled; one that is no longer ready
                 // or open is closing, and waiting on it would park this
                 // request behind a connection that will never serve it.

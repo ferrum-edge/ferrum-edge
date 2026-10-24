@@ -371,9 +371,9 @@
 /// open PHYSICAL connections the Unix backend manager holds per admitted
 /// ingress target, including dedicated WebSockets.
 ///
-/// Matches the pool's own `max_idle_per_host` default, so the bound and the
-/// idle ceiling agree: every admitted carrier can be pooled, and a target
-/// cannot accumulate more physical connections than the idle set could hold.
+/// At or below the pool's `max_idle_per_host` default, so every admitted
+/// carrier can be pooled and this bound, not the idle ceiling, is what limits
+/// a target's physical connections.
 /// The bound is enforced by default rather than opt-in — an unbounded local
 /// transport is exactly the regression issue #3731 asks to prevent — and `0`
 /// is the explicit operator opt-out.
