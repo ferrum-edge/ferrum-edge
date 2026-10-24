@@ -107,6 +107,46 @@ ignore = [
     # and the two event parsers to a safe-Rust YAML parser (saphyr /
     # serde-saphyr).
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 unmaintained (archived 2024-03-25, patched = [], informational, no known vulnerability). Parents: serde_yaml 0.9.34+deprecated and the direct bounded-alias event parsers (api_specs/bounded_yaml.rs, config/yaml_alias_budget.rs). Inputs are operator-controlled config files/ConfigMap or authenticated, budget-bounded Admin API spec bodies. serde_yaml forks still use unsafe-libyaml; retire by migrating serde_yaml and both event parsers to a safe-Rust parser (saphyr/serde-saphyr). [expires:2026-12-31]" },
+
+    # ── crypto-bigint 0.5.5 — RUSTSEC-2026-0387 (published 2026-10-23), timing
+    # variability in operations meant to be constant-time (subtraction, zero
+    # counting, division, Montgomery multiplication, `UintRef` equality,
+    # `BoxedMontyForm::invert`). Fixed only in 0.7.6+; there is no patched
+    # 0.5.x. Time-boxed risk acceptance, PENDING OWNER ACCEPTANCE.
+    # Path: jsonwebtoken 11.1.0 (`rust_crypto` backend, enabled by the default
+    # `crypto-ring` profile) -> p256 0.13.2 / p384 0.13.1 -> elliptic-curve
+    # 0.13.8 -> crypto-bigint 0.5.5. jsonwebtoken 11.1.0 (latest) still requires
+    # p256 ^0.13.2 / p384 ^0.13; p256/p384 0.14 (elliptic-curve 0.14.2 ->
+    # crypto-bigint ^0.7.7) exist, but nothing we depend on uses them yet.
+    # Same graph in fuzz/ and tests/performance/mesh/.
+    # Reachability (source review of the registry crates):
+    #   - SECRET-DEPENDENT USE IS REACHABLE. jsonwebtoken `rust_crypto` signs
+    #     ES256/ES384 with p256/p384 `SigningKey`. Ferrum signs ES256 in
+    #     JWT-SVID minting (src/identity/jwt_svid/authority.rs, always ES256)
+    #     and in ES256/ES384 `private_key_jwt` client assertions
+    #     (oidc_relying_party, oauth2_introspection).
+    #   - p256 0.13 does its *scalar* arithmetic on crypto-bigint `U256`
+    #     (`add_mod`, `sub_mod`, `mul_wide`, `sbb`, `ct_lt`/`ct_gt`, with its
+    #     own Barrett reduction). ECDSA signing runs that code on the private
+    #     key and the nonce (k^-1, r*d, s, low-S check). Its field arithmetic
+    #     and p384's field and scalar arithmetic are its own code or fiat-crypto,
+    #     and use crypto-bigint only for encoding and range checks.
+    #   - The code the 0.7.6 fix changed does not exist in 0.5.5 in that form.
+    #     The `borrowing_sub` branch came from a 0.7-only workaround. 0.5.5
+    #     subtracts with u128 arithmetic. Zero counting, division and
+    #     Montgomery forms (`Residue`/`DynResidue`) are not called by
+    #     p256/p384/ecdsa 0.13 on secret data, and `UintRef`/`BoxedMontyForm`
+    #     do not exist in 0.5. 0.5.5 has never had the `cargo checkct` check,
+    #     though, so we cannot rule out compiler-dependent leakage on the
+    #     ES256 signing path.
+    #   - Verification (JWKS, DPoP, CP trust) uses public values only.
+    # Avoidance: the `fips` profile (jsonwebtoken `aws_lc_rs`) does not compile
+    # p256/p384. EdDSA assertion keys avoid it for oidc_relying_party and
+    # oauth2_introspection. JWT-SVID minting is always ES256, so only `fips`
+    # avoids it there.
+    # Exit: retire when jsonwebtoken moves to p256/p384 0.14 (elliptic-curve
+    # 0.14 / crypto-bigint >= 0.7.6) and the lockfile drops crypto-bigint 0.5.5.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 constant-time timing issues; fixed only in >=0.7.6, no patched 0.5.x. Reached via jsonwebtoken 11.1.0 rust_crypto (default crypto-ring) -> p256 0.13.2/p384 0.13.1 -> elliptic-curve 0.13.8; jsonwebtoken latest still pins p256 ^0.13. SECRET-DEPENDENT USE IS REACHABLE: ES256 JWT-SVID minting and ES256/ES384 private_key_jwt assertions sign through p256 0.13, whose scalar arithmetic (add_mod/sub_mod/mul_wide/sbb/ct_lt) runs on crypto-bigint 0.5.5 with the private key and nonce. The specific branches fixed in 0.7.6 are not present in 0.5.5 (0.7-only borrowing_sub workaround; zero counting/division/Montgomery not on this path; no UintRef/BoxedMontyForm), but 0.5.5 has never had a cargo checkct check. The fips profile avoids p256/p384. Time-boxed, pending owner acceptance. Exit: jsonwebtoken on p256/p384 0.14 (crypto-bigint >=0.7.6). [expires:2026-11-30]" },
 ]
 
 [bans]
