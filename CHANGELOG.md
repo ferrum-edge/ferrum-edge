@@ -139,6 +139,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **NodeWaypoint capture relays evaluate the destination pod's own
+  AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
+  for an enrolled pod in another namespace stamped that pod's exact policy
+  scope but received only its own namespace's `AuthorizationPolicy` set, so a
+  `DENY` (or an `ALLOW`'s implicit deny) declared in the destination's
+  namespace was not enforced. The slice now carries a dedicated
+  `node_waypoint_capture_mesh_policies` inventory — exactly the policies that
+  apply to a captured destination, authorized by the same CP scope / bearer
+  `ns` bounds as the destinations — over native MeshSubscribe, the file source,
+  and a new `NodeWaypointCaptureMeshPoliciesCarrier` ECDS carrier, and
+  `mesh_authz` evaluates it under per-pod scoping. The ordinary `mesh_policies`
+  view is unchanged. Scoped destination policies also count toward the
+  missing-scope fail-closed rule. The inventory carries explicit completeness
+  evidence (`node_waypoint_capture_mesh_policies_resolved`; over xDS, the
+  carrier is emitted even when empty), and a slice with capture destinations
+  but no such evidence is refused (startup builds no capture-serving
+  generation; reload keeps the previous one), so a control plane that predates
+  this inventory cannot serve captured destinations without their policies.
+  Authenticated inbound HBONE relays to those destinations now resolve the
+  destination's scope from the same inventory, which takes precedence over any
+  ordinary record for the same address, so their policies are evaluated instead
+  of the relay being refused for a missing scope. The transparent capture
+  resolver now compares destination addresses canonically, matching the relay
+  guard. The inventory is only certified complete when it was derived from the
+  authoritative, pre-narrowing configuration: the control plane records that it
+  resolved the inventory (including an empty answer) before narrowing, and a
+  slice is never rebuilt from a narrowed or Sidecar-widened routing view. Those
+  destination policies make a missing scope fail closed only for connections to
+  the captured destinations; unattributed UDP/DTLS sessions keep the previous
+  source-scope behaviour. A body-inspecting CUSTOM rule carried only by that
+  inventory buffers (and size-limits) only requests whose scope its policy
+  selects.
 - **Stale request completions no longer reset a reloaded circuit breaker**
   (issue #6799). A request completes with the breaker config it was admitted
   under. When that config had since been reloaded, every completion recorder
