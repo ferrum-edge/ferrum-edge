@@ -103,6 +103,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **A direct HTTP/1.1 check-in racing a drain no longer lands in the drained
+  pool** (issue #6793). A drain now marks the backend's lane retired under the
+  lane lock, and check-in reads that mark under the same lock. A connection
+  checked in while a reload, certificate rotation or pool clear withdrew its
+  backend is therefore either retired with the rest (and counted as
+  `reason="retired"`) or closed at once. Before, a check-in that raced the
+  drain, or a checkout that found the lane just before it was withdrawn, could
+  leave the connection in the withdrawn lane, uncounted, until the last
+  in-flight request on that lane finished.
 - **Client aborts record one terminal on every HTTP/3 and gRPC path**
   (issue #6772). A client that resets its request stream, sends
   `STOP_SENDING`, or closes its connection before response headers is now
