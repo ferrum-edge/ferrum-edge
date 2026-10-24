@@ -468,16 +468,22 @@ body the strict parser accepts is read in place.
 
 The lenient reading also accepts several documents separated by whitespace
 (NDJSON, a leading scalar such as `null` followed by an object, or a document
-followed by another one). When a document cannot be read, reading resumes
-inside it if it is an object or array, so the containers it holds are still
-read, and otherwise at the next whitespace-separated token or container after
-the error — as a sequence consumer that skips a bad value does, on the same
-line or the next. Every document it reads is inspected — before, after, or
-inside a part it could not read, including a JSON object embedded in text —
-so a backend that reads only the first, only the last, or each of them is
-covered by the same verdict. Re-reading inside refused containers is bounded
-by a work budget of four times the reading's length plus 64 KiB; a reading
-that exhausts it fails closed.
+followed by another one). When a document cannot be read, it is judged by its
+opening (below) and reading resumes at the next whitespace-separated token or
+container after the error — as a sequence consumer that skips a bad value
+does, on the same line or the next. Every document it reads is inspected —
+before or after a part it could not read, including a JSON object embedded in
+text — so a backend that reads only the first, only the last, or each of them
+is covered by the same verdict. Nothing is re-read inside a refused container:
+a refused container that opens like JSON fails closed instead, and one that
+does not is rejected by the parser at its second token, so what follows it is
+still read.
+
+All lenient readings of one body — its raw bytes, its UTF-16 / UTF-32 views,
+and the readings of a framed RPC stream — share one work budget of four times
+the body's length plus 64 KiB, counting the bytes recovery parses and the
+bytes the opening checks examine. A body that exhausts it fails closed, so
+judging a body costs time linear in its length.
 
 A body that `body_json_path` rules cannot read **fails closed**: every
 applicable `body_json_path` rule records a hit, and that rule's own action,
@@ -493,10 +499,10 @@ document — so treating such a body as having nothing to select would let one
 such token switch every JSON-path rule off. A body cannot be read when part of
 a reading is refused by both the strict and the lenient parse and:
 
-- that part **opens like a JSON object or array** — at the start of the
-  reading, or at any document the lenient reading stopped at (judged within
-  its first 64 bytes) — whatever the `Content-Type` says and whatever the
-  other readings did. After anything lenient parsers skip before and between
+- that part **opens like a JSON object or array** — any document the
+  lenient reading stopped at, however much skippable text precedes its first
+  token — whatever the `Content-Type` says and whatever the other readings
+  did. After anything lenient parsers skip before and between
   tokens — JSON whitespace, vertical tab, form feed, U+001C–U+001F, U+0085,
   U+00A0, U+FEFF, U+2028 / U+2029 and the other Unicode space separators,
   `//` and `#` comments (ended by LF, CR, U+2028 or U+2029), `/* */`
@@ -530,14 +536,17 @@ text body (`application/grpc-web-text[+codec]`) whose base64 decodes to such
 envelopes — is read as its messages: each uncompressed message of a `+json`
 codec is a document of its own, and any message that cannot be read fails
 closed. A compressed message is decoded by an RPC backend but not by the WAF,
-so it fails closed too: scope `body_json_path` rules away from compressed
-JSON-codec RPC traffic with `conditions` if that traffic must pass. Because
-the media type and the framing are both client-controlled and say nothing
-about the backend, a binary stream's raw bytes are judged as well, as the
-document a NUL-skipping parser (Json.NET) reads from them: the bytes as sent
-and the bytes with every NUL removed are both read and inspected. Their
-refusal alone weighs at most like a NUL-skipping opening, since a legitimate
-stream's envelopes are refused that way while its messages parse. A
+so it fails closed too. Because the media type and the framing are both
+client-controlled and say nothing about the backend, a binary stream's raw
+bytes are also read — as sent, and with every NUL removed, which is how a
+NUL-skipping parser such as Json.NET reads them — and judged like any other
+reading: a document there that cannot be read and opens like JSON fails
+closed even though the messages parse. A genuine stream can trip this: when
+an envelope's length byte is `[` (a message of 91, 347, … bytes) and the
+envelope's bytes therefore read as `[` followed by the message, or when the
+NUL-removed bytes otherwise assemble an array or object no parser here
+accepts. Scope `body_json_path` rules away from such RPC traffic (or from
+compressed JSON-codec RPC traffic) with `conditions` if it must pass. A
 non-JSON codec (`+proto`, a bare gRPC type) has no JSON reading and is not
 inspected by `body_json_path` rules. A look-alike media type, or a body whose
 framing does not validate, is judged as an ordinary body.
@@ -549,9 +558,11 @@ short by construction and is not judged. WebSocket messages carry no
 
 What remains outside `body_json_path` inspection is a part of a body that is
 not declared JSON, that could not be read as a JSON document, and that does
-not open like a JSON container as described above — for example a container
-behind more than 64 bytes of comments or Unicode whitespace part-way through
-a body, or an opening only a parser option beyond those listed accepts. `body_text` rules, byte
+not open like a JSON container as described above — for example an opening
+only a parser option beyond those listed accepts. Documents read from a
+refused reading are inspected from their own root: a value inside a refused
+container is not selected by its full path, which is why that container fails
+closed when it opens like JSON. `body_text` rules, byte
 rules and the body-scoped specials scan every body either way; pair a
 `body_json_path` rule with a `body_text` rule, or declare and validate JSON
 before it reaches the backend, when such a backend must be protected.

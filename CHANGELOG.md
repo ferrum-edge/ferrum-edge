@@ -349,16 +349,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declares JSON (`*/json`, `+json`) or the part opens like JSON once NULs
   are skipped. Whitespace-separated documents (NDJSON, a leading scalar
   followed by an object, a document followed by another) are now all
-  inspected; after a document that cannot be read, reading resumes inside it
-  (for an object or array) or at the next token or container, and every
-  document read around, after or inside such a part is inspected, within a
-  bounded work budget that fails closed when exhausted. A body that parses as
-  a gRPC / gRPC-Web (binary or base64 text) / Connect stream is read as its
-  uncompressed `+json` messages, a compressed `+json` message fails closed,
-  and a binary stream's raw bytes are still judged as the NUL-skipping JSON
-  reading a REST backend could take from them. A body scanned only up to
-  `max_scan_bytes` is not judged this way, an ordinary UTF-16 / UTF-32 body
-  is unaffected, and valid JSON bodies take the same single parse as before.
+  inspected; after a document that cannot be read, reading resumes at the
+  next token or container, and every document read around such a part is
+  inspected. All lenient readings of one body share a work budget of four
+  times its length plus 64 KiB, and a body that exhausts it fails closed. A
+  body that parses as a gRPC / gRPC-Web (binary or base64 text) / Connect
+  stream is read as its uncompressed `+json` messages, a compressed `+json`
+  message fails closed, and a binary stream's raw bytes (as sent and with NULs
+  removed) are judged like any other reading, so a genuine stream whose
+  envelope bytes assemble a refused JSON container (for example a 91-byte
+  message, whose length byte is `[`) fails closed and needs `conditions`
+  scoping. A body scanned only up to `max_scan_bytes` is not judged this way,
+  an ordinary UTF-16 / UTF-32 body is unaffected, and valid JSON bodies take
+  the same single parse as before.
 
 - **Redis rate-limit counter reads are bounded with `GETRANGE`** (issue
   #6653). The request-quota charge transaction, the sliding-window charge,

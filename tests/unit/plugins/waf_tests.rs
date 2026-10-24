@@ -1312,7 +1312,6 @@ fn json_documents_the_parser_refuses() -> Vec<String> {
         r#"[// c
 {"user":{"bio":"ordinary"}}]"#
             .to_string(),
-        r#"{"user":{"bio":"ordinary"}} trailing"#.to_string(),
         r#"{'user':{'bio':'ordinary'}}"#.to_string(),
         "  \r\n\t{\"user\":{\"bio\":\"ordinary\"},\"n\":1e400}".to_string(),
         // An unpaired surrogate (repaired by the lenient reading) does not
@@ -1351,6 +1350,16 @@ fn json_documents_the_parser_refuses() -> Vec<String> {
         r#"[foo,{"user":{"bio":"ordinary"}}]"#.to_string(),
         r#"[foo;{"user":{"bio":"ordinary"}}]"#.to_string(),
         "# c\n{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
+        // A refused container later in a sequence, its first member behind
+        // a long run of whitespace: the whole run is skipped before judging.
+        format!(
+            "null\n{{{}\"user\":{{\"bio\":\"ordinary\"}},\"n\":NaN}}",
+            " ".repeat(200)
+        ),
+        format!(
+            "null\n[{}{{\"user\":{{\"bio\":\"ordinary\"}}}},NaN]",
+            " ".repeat(200)
+        ),
         // Java / .NET whitespace: a record separator and NEL.
         "\u{1E}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
         "\u{85}{\"user\":{\"bio\":\"ordinary\"}}".to_string(),
@@ -1608,13 +1617,21 @@ async fn body_json_path_reads_framed_rpc_streams_as_their_messages() {
     smuggled.extend(rpc_frame(0x00, &[b' '; 93]));
     assert_eq!(smuggled[4], b'[');
     assert_eq!(smuggled[5 + 91 + 4], b']');
+    // The same with a trailing comma supplied by a third envelope's length
+    // (44, `,`): the NUL-skipping reading is an array Json.NET accepts and
+    // `serde_json` refuses, so it fails closed instead of being outweighed by
+    // the messages that parse.
+    let mut trailing_comma = rpc_frame(0x00, &first);
+    trailing_comma.extend(rpc_frame(0x00, &[b' '; 44]));
+    trailing_comma.extend(rpc_frame(0x00, &[b' '; 93]));
+    assert_eq!(trailing_comma[5 + 91 + 4], b',');
     let mut genuine = rpc_frame(0x00, benign);
     genuine.extend(rpc_frame(0x00, benign));
     for content_type in ["application/connect+json", "application/grpc+json"] {
         assert_json_path_verdicts(
             &plugin_at_index,
             content_type,
-            &[smuggled.clone()],
+            &[smuggled.clone(), trailing_comma.clone()],
             &[genuine.clone()],
         )
         .await;
@@ -1694,6 +1711,7 @@ async fn body_json_path_rule_inspects_every_document_of_a_sequence() {
         b"[INFO] {\"user\":{\"bio\":\"forbidden-canary\"}}",
         b"note: {\"user\":{\"bio\":\"forbidden-canary\"}} end",
         b"null [NaN, {\"user\":{\"bio\":\"forbidden-canary\"}}]",
+        b"{\"user\":{\"bio\":\"forbidden-canary\"}} trailing",
     ]
     .iter()
     .map(|body| body.to_vec())
@@ -1726,6 +1744,28 @@ async fn body_json_path_rule_inspects_every_document_of_a_sequence() {
         &encoded(&benign[..]),
     )
     .await;
+}
+
+#[tokio::test]
+async fn body_json_path_lenient_work_is_bounded_per_body_and_fails_closed() {
+    // Every lenient reading of one body shares one work budget. A body whose
+    // opening checks would rescan the same long comment at every token
+    // exhausts it and fails closed instead of costing quadratic time.
+    let plugin = enforcing_json_path_waf(false);
+    let rescans = format!("null {}", "// ".repeat(20_000)).into_bytes();
+    assert_json_path_verdicts(&plugin, "text/plain", &[rescans], &[]).await;
+
+    // So does a framed stream of many refused messages: the budget is per
+    // body, not per message.
+    let mut many = Vec::new();
+    for _ in 0..2_000 {
+        many.extend(rpc_frame(0x00, &[b'['; 128]));
+    }
+    assert_json_path_verdicts(&plugin, "application/grpc+json", &[many], &[]).await;
+
+    // Ordinary prose of the same size stays well inside it.
+    let prose = "plain words and more words ".repeat(2_500).into_bytes();
+    assert_json_path_verdicts(&plugin, "text/plain", &[], &[prose]).await;
 }
 
 #[tokio::test]
