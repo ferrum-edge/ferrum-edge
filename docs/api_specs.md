@@ -127,7 +127,7 @@ An array of `PluginConfig` objects. Fields follow the same schema as `POST /plug
 
 ### `x-ferrum-validate` (optional)
 
-Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response schemas plus their media types; the gateway runtime never reads the `api_specs` row on the request path.
+Set `x-ferrum-validate: true` to generate a proxy-scoped `openapi_validator` plugin from the spec's operation schemas. The generated plugin config embeds the resolved request and response schemas plus their media types, and each operation's path / query / header / cookie parameter descriptors (an optional parameter whose serialization the validator cannot deserialize is omitted; a required one refuses the import — see [openapi_validator.md](openapi_validator.md#request-parameters)); the gateway runtime never reads the `api_specs` row on the request path.
 
 Operation matching uses the full canonical inbound path (`ctx.path`, without the query string), before backend listen-path stripping. Generated `path_template` / `path_regex` include the literal `x-ferrum-proxy.listen_path` prefix followed by the effective server/`basePath` pathname and Paths key. For example, listen path `/p2/oas2` plus Paths key `/items` matches `/p2/oas2/items`; a server pathname `/v1` makes that `/p2/oas2/v1/items`. Do not repeat the listen prefix in Paths keys or server/basePath unless the intended inbound path contains it twice.
 

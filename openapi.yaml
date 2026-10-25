@@ -13748,6 +13748,15 @@ components:
               scope:
                 const: global
         - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: openapi_validator
+          then:
+            properties:
+              scope:
+                const: proxy
+        - if:
             required: [scope]
             properties:
               scope:
@@ -32089,10 +32098,14 @@ components:
       additionalProperties: false
       required: [operations]
       description: |
-        Plugin: openapi_validator — validates request and response bodies
-        against operation schemas generated from an attached OpenAPI/Swagger
-        document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. Multipart Content-Disposition accepts ordinary
+        Plugin: openapi_validator — validates request parameters (path, query,
+        header, cookie) and request and response bodies against operation
+        schemas generated from an attached OpenAPI/Swagger document. Supports
+        JSON, XML, form-urlencoded, multipart, text, and binary media types.
+        JSON Schema `format` is asserted under every `schema_draft` (unknown
+        formats such as OpenAPI's int32/int64/byte/password stay annotations).
+        Must be proxy-scoped; every config load rejects global and
+        proxy_group scope. Multipart Content-Disposition accepts ordinary
         `filename` or a single bounded RFC 5987/8187 `filename*` (UTF-8 only;
         unquoted ext-value) and rejects continuations, quoted `filename*`,
         bare/non-token parameter segments, conflicts, and hostile extended
@@ -32143,13 +32156,16 @@ components:
         validate_request:
           type: boolean
           default: true
-          description: Validate request bodies when an operation has a request schema.
+          description: >-
+            Validate request bodies when an operation has a request schema, and
+            request parameters when an operation declares `parameters`.
         validate_response:
           type: boolean
           default: true
           description: Validate response bodies when an operation has a response schema.
         request_content_types:
           type: array
+          minItems: 1
           uniqueItems: true
           items:
             $ref: "#/components/schemas/OpenapiValidatorMediaType"
@@ -32161,9 +32177,10 @@ components:
             - multipart/form-data
             - text/plain
             - application/octet-stream
-          description: Request media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types.
+          description: Request media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types. An explicitly empty list is rejected; omit the field for the default scope.
         response_content_types:
           type: array
+          minItems: 1
           uniqueItems: true
           items:
             $ref: "#/components/schemas/OpenapiValidatorMediaType"
@@ -32175,7 +32192,7 @@ components:
             - multipart/form-data
             - text/plain
             - application/octet-stream
-          description: Response media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types.
+          description: Response media types in scope. JSON includes `+json`, XML includes `+xml`, text/plain covers `text/*`, and application/octet-stream covers common binary application, image, audio, and video types. An explicitly empty list is rejected; omit the field for the default scope.
         fail_on_unknown_operation:
           type: boolean
           default: true
@@ -32223,7 +32240,11 @@ components:
             direct plugin configuration; POST /api-specs and PUT
             /api-specs/{id} generate it from the attached document when
             x-ferrum-validate is enabled. The importer replaces this from the
-            spec on every spec PUT.
+            spec on every spec PUT. Two operations with the same method and the
+            same path_regex are rejected. Within a method, overlapping
+            operations are ordered by literal-segment count, then by the
+            leftmost differing segment (literal before `{template}`), then by
+            document order; `operation_label` never affects selection.
         bypass:
           type: object
           additionalProperties: false
@@ -32448,6 +32469,17 @@ components:
                 Alternate single-schema form encoding map. Only valid with
                 application/x-www-form-urlencoded or multipart/form-data.
           description: Request body schemas by media type.
+        parameters:
+          type: array
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/OpenapiValidatorParameter"
+          description: >-
+            Declared OpenAPI parameters, validated in `before_proxy` when
+            `validate_request` is true. Generated from the operation's and its
+            Path Item's `parameters` (operation entries override Path Item
+            entries with the same `name` and `in`). `in` + `name` must be
+            unique (header names case-insensitively).
         responses:
           type: object
           propertyNames:
@@ -32467,6 +32499,79 @@ components:
             so the precedence rule holds. A status entry may alternatively use the
             OpenAPI Response Object shape `{description?, content: {mediaType: schema}}`;
             that form is closed and rejects any other key.
+
+    OpenapiValidatorParameter:
+      type: object
+      additionalProperties: false
+      required: [name, in, schema]
+      allOf:
+        - if:
+            properties:
+              in:
+                enum: [path, header]
+          then:
+            properties:
+              style:
+                const: simple
+        - if:
+            properties:
+              in:
+                enum: [query, cookie]
+          then:
+            properties:
+              style:
+                const: form
+        - if:
+            properties:
+              in:
+                const: path
+          then:
+            properties:
+              required:
+                const: true
+      description: >-
+        One OpenAPI Parameter Object in the validator's supported subset: each
+        location's default serialization (`simple` for path and header,
+        `form` for query and cookie) over scalar, array-of-scalar, and
+        object-of-scalar schemas. Anything else — another `style`, an array of
+        arrays/objects, or a `form` + `explode: true` object — is rejected at
+        construction (the importer omits such a parameter when it is optional
+        and refuses the import when it is required). Path values come from the
+        canonical request path, query values from the client's raw query string
+        (at most 1024 pairs), header values from the pristine wire request
+        headers (never a header map an earlier `before_proxy` hook mutated),
+        and cookie values from the wire `Cookie` header, percent-decoded per
+        the `form` serialization (at most 1024 pairs); a value
+        that repeats for a non-array schema, a missing required parameter, a
+        value that cannot be converted, or a schema failure is a request
+        violation with `error_response.request_status_code` and the problem
+        title "Request parameter validation failed". Diagnostics name the
+        declared parameter and never contain its value.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            Parameter name, at most 256 bytes without control characters. Path
+            parameters must match a `{name}` expression of `path_template`;
+            header names must be valid HTTP field names other than Accept,
+            Content-Type, or Authorization (which OpenAPI ignores).
+        in:
+          type: string
+          enum: [path, query, header, cookie]
+        required:
+          type: boolean
+          description: Defaults to true for path parameters (which must be required) and false otherwise.
+        schema:
+          $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+        style:
+          type: string
+          enum: [simple, form]
+          description: Only the location's default style is accepted (`simple` for path/header, `form` for query/cookie).
+        explode:
+          type: boolean
+          description: Defaults to true for query/cookie (`form`) and false for path/header (`simple`).
 
     OpenapiValidatorResponse:
       description: >
