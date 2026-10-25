@@ -28,26 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `ai_rate_limiter`: body-based classification and AI-only budget scope (#6847)
+### `cors` method and header lists are bounded (#6844)
 
-`ai_rate_limiter` now buffers and classifies every uncompressed `POST` from
-its body, not its `Content-Type`. On a route that mixes AI and non-AI traffic,
-review three effects before upgrading:
-
-- AI bodies sent with a non-JSON label (or none) are now reserved and charged.
-  Clients that relied on that gap will start receiving `429`s at the budget.
-- A JSON `POST` the gateway cannot parse is now a fail-closed AI candidate:
-  under the default `on_unmetered_response: charge_estimate` a `2xx` without
-  token usage is answered with `502`. Upstreams normally reject malformed JSON
-  with a `4xx`, which still just releases; scope the limiter to AI routes if a
-  backend legitimately accepts such bodies.
-- `GET` and other out-of-scope requests no longer consult the budget, so they
-  are no longer refused with `429` once AI traffic exhausts it, or with `503`
-  during a Redis outage.
-
-Budget `429`s now carry `Retry-After: <window_seconds>`. The new optional
-`consumer_limits`, `model_limits`, and `media_token_estimate` fields default to
-the previous behavior. Existing configurations need no edits.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 

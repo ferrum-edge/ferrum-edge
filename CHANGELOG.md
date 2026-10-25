@@ -8,30 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `ai_rate_limiter` classifies requests by their body and scopes
-  the budget to AI calls** (#6847). Every uncompressed `POST` is now buffered
-  and classified from its bytes whatever its `Content-Type`, so an AI body sent
-  as `text/plain`, unlabelled, or under a gRPC-Web label is reserved and
-  metered. A JSON `POST` that does not parse (or a non-UTF-8 JSON-labelled
-  body) is an uninspectable AI candidate like a still-compressed one, so under
-  the default `charge_estimate` a usage-less 2xx for it is refused with `502`.
-  Embedding/predict shapes (Cohere `texts`, Gemini `content.parts` /
-  `requests[].content.parts`, Vertex `instances[]`) and Cohere-scoped bare v1
-  `message` bodies are AI calls, and Cohere Embed is charged from
-  `meta.billed_units`. Conversely, out-of-scope traffic (`GET`, framed
-  gRPC-Web, parsed non-LLM JSON) no longer consults the budget and is never
-  refused with `429`/`503`. A body a request transform turns into an AI call is
-  re-classified and admitted at the final request-body stage. The prompt
-  estimate is now script-aware (CJK/emoji count a token per scalar), a
-  reservation that outlived its window charges its full actual usage, terminal
-  `response.incomplete` usage is read (also by `ai_token_metrics`), local
-  reservation ids are process-unique, and budget `429`s carry `Retry-After`.
-  New optional `consumer_limits`, `model_limits`, and `media_token_estimate`
-  settings add per-consumer and per-model budgets and a per-media reservation.
-  Only `POST` requests are classified. With `model_limits` set, a call whose
-  model cannot be read before dispatch is refused (`415` for a still-compressed
-  body, `400` for an unparseable one), and a transform that changes `model`
-  re-attributes the reservation to the final model's budget.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -163,6 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
