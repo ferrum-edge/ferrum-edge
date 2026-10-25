@@ -28506,9 +28506,11 @@ components:
             the plain string `"*.example.com"` matches every subdomain.
         allowed_methods:
           type: array
+          maxItems: 128
           items:
             type: string
             minLength: 1
+            maxLength: 256
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
             Preflight-only allowed methods returned in
@@ -28522,9 +28524,11 @@ components:
             Istio's empty list.
         allowed_headers:
           type: array
+          maxItems: 128
           items:
             type: string
             minLength: 1
+            maxLength: 256
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           description: >-
             Preflight-only allowed request headers returned in
@@ -28541,12 +28545,23 @@ components:
             preserves Istio's empty list.
         exposed_headers:
           type: array
+          maxItems: 128
           items:
             type: string
             minLength: 1
+            maxLength: 256
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: []
-          description: Response headers exposed to browser JavaScript
+          description: >-
+            Response headers exposed to browser JavaScript, returned in
+            Access-Control-Expose-Headers. Header names are case-insensitive.
+            With credentials disabled, `*` exposes every response header; with
+            credentials enabled, it is a literal token. Multiple policies
+            intersect exposure: an uncredentialed `*` intersected with an
+            explicit list keeps that list, and a credentialed policy's literal
+            `*` is omitted rather than widened when the aggregate disables
+            credentials. Bounded at 128 entries of at most 256 bytes each, like
+            allowed_methods and allowed_headers.
         allow_credentials:
           type: boolean
           default: false
@@ -28570,6 +28585,18 @@ components:
             when the suffix is a single label, a public suffix, or has a
             Public Suffix List rule beneath it (`*.com`, `*.co.uk`,
             `*.github.io`, `*.run.app`, `*.amazonaws.com`).
+        allow_private_network:
+          type: boolean
+          default: false
+          description: >-
+            Private Network Access opt-in. When true, a preflight from an
+            allowed origin that carries
+            `Access-Control-Request-Private-Network: true` is answered with
+            `Access-Control-Allow-Private-Network: true` (locally or, with
+            preflight_continue, on the forwarded response). The field is never
+            sent on actual responses or on preflights that did not ask, and a
+            backend's own value is always stripped. With multiple policies,
+            every matching policy must opt in.
         max_age:
           type: integer
           format: uint64
@@ -35528,12 +35555,20 @@ components:
         max_total_size_bytes (including omitted defaults), the 32 UTF-8 byte
         redis_integrity_key minimum, platform-sized integer limits, URL parsing,
         and the deployment backend egress policy. These residual checks are not
-        fully expressible in this schema. Provider-managed Responses conversations
-        and Gemini retained contexts bypass replay; other unmodeled root context
-        is canonically bound to exact and semantic identities. Cohere SYSTEM
-        history is retained as exact instruction state in semantic scopes.
-        Cache hits preserve finalized application bodies while current response
-        enforcement, live header rules, and negotiated compression still run.
+        fully expressible in this schema. Provider-managed Responses conversations,
+        Gemini retained contexts, and Cohere conversation_id requests bypass
+        replay; other unmodeled root context is canonically bound to exact and
+        semantic identities. Request bodies with duplicate JSON members, a
+        request Cache-Control no-store/no-cache, or an unprovable
+        response-presentation policy also bypass. Instruction state (system,
+        developer, instructions, systemInstruction, preamble, Cohere SYSTEM
+        history) is bound byte-exactly in semantic scopes. Exact keys and
+        semantic scopes bind the request's response-policy provenance (RTDS
+        gate content and static presentation-policy digest). Responses with
+        Cache-Control no-store/private or Set-Cookie are not stored;
+        provider-backed ai_federation answers are. Cache hits preserve
+        finalized application bodies while current response enforcement, live
+        header rules, and negotiated compression still run.
       allOf:
         - if:
             required: [semantic_similarity_enabled]
