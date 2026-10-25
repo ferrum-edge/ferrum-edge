@@ -983,6 +983,30 @@ impl JwksAuth {
             return Err(format!("jwks_auth: {reason}"));
         }
 
+        // An mTLS-bound provider that pins no issuer has no realm the
+        // verification-time sender-constraint guard can key on. Any sibling
+        // that does not also require the binding, and whose key set can verify
+        // the same token, would authenticate a certificate-bound token without
+        // its certificate whenever the bound provider rejects it on an
+        // `aud`/`exp` difference — including through an explicit/default
+        // `Authorization` location overlap. Key overlap is not knowable at
+        // admission (remote JWKS), so the mix is refused outright.
+        if let Some(open_mtls_idx) = providers
+            .iter()
+            .position(|provider| provider.issuer.is_none() && provider.require_mtls_binding)
+            && let Some(unbound_idx) = providers
+                .iter()
+                .position(|provider| !provider.require_mtls_binding)
+        {
+            return Err(format!(
+                "jwks_auth: `provider[{open_mtls_idx}]` sets `require_mtls_binding` without an \
+                 `issuer`, so its tokens cannot be told apart from those `provider[{unbound_idx}]` \
+                 accepts without a certificate binding; pin an exact `issuer` on the mTLS-bound \
+                 provider, set `require_mtls_binding` on every provider, or split them into \
+                 separate plugin instances"
+            ));
+        }
+
         // Scope/backend coherence is a plugin-level decision, not a per-provider
         // one: one Redis client backs every `shared` provider. `shared` without
         // a backend would silently be process-local — the exact "multi-replica
@@ -2274,9 +2298,21 @@ impl super::Plugin for JwksAuth {
         uris
     }
 
+    /// Static requirements for the publication snapshot.
+    ///
+    /// Discovery-backed providers are deliberately excluded. Their store can
+    /// move to a different URI while this generation is live (periodic
+    /// rediscovery), and a URI frozen into the committed publication snapshot
+    /// would keep the superseded store active — refreshing, and counted by
+    /// readiness until it expires — after the provider stopped using it.
+    /// They contribute instead through their generation-owned, replaceable
+    /// [`LateActiveRequirement`], registered at `commit_background_tasks` (or
+    /// when discovery first resolves after commit) and repointed on
+    /// rediscovery, so exactly the URI currently in use stays active.
     fn active_jwks_refresh_requirements(&self) -> Vec<(String, JwksRefreshRequirement)> {
         self.providers
             .iter()
+            .filter(|provider| !matches!(&provider.jwks_source, JwksSource::Discovery(_)))
             .filter_map(|provider| {
                 let store = provider.jwks_store.load();
                 store

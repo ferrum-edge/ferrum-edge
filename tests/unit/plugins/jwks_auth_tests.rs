@@ -6493,3 +6493,264 @@ async fn discovery_follows_a_jwks_uri_migration_without_reload() {
     );
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("migrated-user"));
 }
+
+// ─── Production-review fix round 1 ─────────────────────────────────────
+
+/// PR6828-SOL-1: an mTLS-bound provider that pins no issuer has no realm the
+/// sender-constraint guard can key on, so any sibling without the binding
+/// could authenticate its certificate-bound token without the certificate
+/// (for example through an explicit/default `Authorization` overlap). The mix
+/// is refused at construction in both orders, for issuer-less and pinned
+/// unbound siblings alike.
+#[test]
+fn issuer_less_mtls_provider_cannot_share_an_instance_with_an_unbound_provider() {
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ));
+    let mtls = json!({
+        "jwks": jwks,
+        "audiences": ["api"],
+        "require_mtls_binding": true,
+        "from_headers": [{"name": "Authorization"}]
+    });
+    for unbound in [
+        json!({ "jwks": jwks }),
+        json!({ "jwks": jwks, "issuer": "https://other.example.com" }),
+    ] {
+        for providers in [
+            json!([mtls.clone(), unbound.clone()]),
+            json!([unbound.clone(), mtls.clone()]),
+        ] {
+            let error = match JwksAuth::new(&json!({ "providers": providers }), default_client()) {
+                Ok(_) => panic!("issuer-less mTLS beside an unbound provider must be refused"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("require_mtls_binding") && error.contains("issuer"),
+                "{error}"
+            );
+        }
+    }
+}
+
+/// Issuer-less mTLS providers remain admissible when every provider requires
+/// the binding: a correctly bound request authenticates, and the same token
+/// without its certificate is refused through either location.
+#[tokio::test]
+async fn issuer_less_mtls_providers_that_all_require_binding_are_admitted() {
+    use ferrum_edge::plugins::utils::cert_hash::sha256_base64url_no_pad;
+
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ));
+    let cert_der = b"bound client certificate der".to_vec();
+    let thumbprint = sha256_base64url_no_pad(&cert_der);
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "jwks": jwks,
+                    "audiences": ["api"],
+                    "require_mtls_binding": true,
+                    "from_headers": [{"name": "Authorization"}]
+                },
+                { "jwks": jwks, "require_mtls_binding": true }
+            ]
+        }),
+        default_client(),
+    )
+    .expect("every provider requires mTLS binding");
+    let token = create_rs256_token(
+        &json!({"sub": "mtls-user", "aud": "api", "cnf": {"x5t#S256": thumbprint}}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+
+    let mut bound = make_ctx();
+    bound.tls_client_cert_der = Some(Arc::new(cert_der));
+    bound
+        .headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    assert_continue(
+        plugin
+            .authenticate(&mut bound, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(bound.authenticated_identity.as_deref(), Some("mtls-user"));
+
+    let mut unbound = make_ctx();
+    unbound
+        .headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    assert_reject(
+        plugin
+            .authenticate(&mut unbound, &ConsumerIndex::new(&[]))
+            .await,
+        Some(401),
+    );
+}
+
+/// Mount discovery (first `first_uri`, then `second_uri`) and two JWKS
+/// documents; returns `(discovery_url, first_uri, second_uri)`.
+async fn mount_migrating_discovery(server: &wiremock::MockServer) -> (String, String, String) {
+    let first_path = unique_jwks_path("committed-original-jwks");
+    let second_path = unique_jwks_path("committed-new-jwks");
+    let first_uri = format!("{}{}", server.uri(), first_path);
+    let second_uri = format!("{}{}", server.uri(), second_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{discovery_path}", server.uri());
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(first_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(
+                include_bytes!("../../../tests/fixtures/test_rsa_public.pem"),
+            )),
+        )
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(second_path))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            build_rsa_jwks_from_pem_with_kid(
+                include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem"),
+                "migrated-key",
+            ),
+        ))
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path.clone()))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": first_uri.clone()})),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": second_uri.clone()})),
+        )
+        .with_priority(2)
+        .mount(server)
+        .await;
+    (discovery_url, first_uri, second_uri)
+}
+
+/// Mirror the plugin cache's publication: collect every plugin's static
+/// requirements and install them as the committed generation.
+fn publish_static_requirements(plugins: &[&JwksAuth]) {
+    let requirements: HashMap<_, _> = plugins
+        .iter()
+        .flat_map(|plugin| plugin.active_jwks_refresh_requirements())
+        .collect();
+    ferrum_edge::plugins::utils::jwks_cache::retain_active_requirements(&requirements);
+}
+
+async fn wait_for_active_uri(plugin: &JwksAuth, uri: &str) {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while plugin.active_jwks_uris() != vec![uri.to_string()] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the discovery provider to use the expected JWKS URI"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// PR6828-SOL-2: a discovery-backed provider's URI must not be frozen into the
+/// committed publication snapshot. Otherwise, after rediscovery moves the
+/// provider to a new `jwks_uri`, the superseded store stays active — still
+/// refreshing and counted by readiness until it expires — though nothing uses
+/// it.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn rediscovery_retires_a_superseded_uri_captured_by_publication() {
+    use ferrum_edge::plugins::utils::jwks_cache::{cached_refresh_state, clear_jwks_cache};
+
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+    let server = wiremock::MockServer::start().await;
+    let (discovery_url, first_uri, second_uri) = mount_migrating_discovery(&server).await;
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_background_tasks(&plugin);
+    wait_for_active_uri(&plugin, &first_uri).await;
+
+    // A publication while the provider uses the first URI.
+    assert!(
+        plugin.active_jwks_refresh_requirements().is_empty(),
+        "discovery sources contribute through their replaceable late requirement"
+    );
+    publish_static_requirements(&[&plugin]);
+    assert!(cached_refresh_state(&first_uri).is_some());
+
+    wait_for_active_uri(&plugin, &second_uri).await;
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    while cached_refresh_state(&first_uri).is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the superseded discovery URI must be retired after migration"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert!(cached_refresh_state(&second_uri).is_some());
+
+    drop(plugin);
+    clear_jwks_cache();
+}
+
+/// A co-tenant that genuinely uses the superseded URI keeps it active.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn rediscovery_keeps_a_superseded_uri_a_co_tenant_still_uses() {
+    use ferrum_edge::plugins::utils::jwks_cache::{cached_refresh_state, clear_jwks_cache};
+
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    clear_jwks_cache();
+    let server = wiremock::MockServer::start().await;
+    let (discovery_url, first_uri, second_uri) = mount_migrating_discovery(&server).await;
+
+    let discovering = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let direct = JwksAuth::new(
+        &json!({
+            "providers": [{"jwks_uri": first_uri.clone()}],
+            "jwks_refresh_interval_secs": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_background_tasks(&direct);
+    start_background_tasks(&discovering);
+    wait_for_active_uri(&discovering, &first_uri).await;
+    publish_static_requirements(&[&discovering, &direct]);
+
+    wait_for_active_uri(&discovering, &second_uri).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert!(
+        cached_refresh_state(&first_uri).is_some(),
+        "a URI a committed co-tenant still uses must stay active"
+    );
+    assert_eq!(direct.active_jwks_uris(), vec![first_uri.clone()]);
+
+    drop(discovering);
+    drop(direct);
+    clear_jwks_cache();
+}

@@ -155,6 +155,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **BREAKING — `jwks_auth` refuses an issuer-less `require_mtls_binding`
+  provider beside an unbound provider** (issue #6828). Such a provider has no
+  issuer realm to distinguish its tokens, so a sibling without the binding
+  could authenticate its certificate-bound token without the certificate when
+  the bound provider rejected it on an `aud`/`exp` difference. Configuration
+  load now rejects the mix; pin an exact `issuer` on the mTLS-bound provider,
+  set `require_mtls_binding` on every provider, or split the providers into
+  separate plugin instances. A rediscovered OIDC `jwks_uri` also no longer
+  leaves the superseded store active (and counted by readiness) after a
+  configuration publication captured it.
 - **`jwks_auth` no longer lets an issuer-less provider strip a realm's DPoP
   or mTLS binding.** A provider without an `issuer` that shared key material
   with a `require_dpop`/`require_mtls_binding` provider accepted that realm's

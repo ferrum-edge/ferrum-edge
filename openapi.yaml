@@ -23790,6 +23790,11 @@ components:
                   Require cnf.x5t#S256 to match the frontend client
                   certificate. A provider without an issuer never
                   authenticates a token whose iss is this provider's issuer.
+                  A provider that sets this without an issuer is admitted
+                  only when every provider in the instance also sets it;
+                  otherwise the configuration is rejected, because an
+                  unbound sibling could accept its tokens without the
+                  certificate.
               require_dpop:
                 type: boolean
                 default: false

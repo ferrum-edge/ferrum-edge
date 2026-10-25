@@ -28,6 +28,19 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `jwks_auth`: issuer-less `require_mtls_binding` providers need bound siblings (#6828)
+
+A `jwks_auth` provider that sets `require_mtls_binding: true` but no `issuer`
+is now rejected at configuration load when any other provider in the same
+plugin instance does not also set `require_mtls_binding`. Without an issuer
+realm, the unbound sibling could accept the bound provider's tokens without
+the client certificate. Before upgrading, run `ferrum-edge validate` against
+your configuration; to fix a refused instance, pin the exact `issuer` on the
+mTLS-bound provider (recommended), set `require_mtls_binding` on every
+provider, or move the providers into separate plugin instances on their own
+routes. Instances whose providers all pin an issuer, or that have a single
+provider, are unaffected.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
