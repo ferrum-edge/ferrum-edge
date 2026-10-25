@@ -28,26 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `security_headers`: gateway-owned names, HSTS grammar, and size caps (#6864)
+### `cors` method and header lists are bounded (#6844)
 
-`set` and `remove` now refuse `Content-Type`, `Content-Encoding`,
-`Content-Range`, and the protocol-managed framing names (`Connection`,
-`Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`,
-`TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), case-insensitively. Before
-upgrading, delete such entries. Use `response_transformer` if a backend's
-content type really must change, and remove `remove` entries for framing
-names, which never had an effect. An `hsts` string or a
-`Strict-Transport-Security` `set` value must contain exactly one
-`max-age=<seconds>` directive and at most one valueless `includeSubDomains`
-(duplicates of other directives, such as `preload`, are not checked). Replace a value such as `includeSubDomains; preload`
-with `max-age=31536000; includeSubDomains; preload`, or use the `hsts` object
-form. A policy with more than 64 `set` entries, more than 64 `remove` names,
-or a value longer than 8192 bytes is refused: split it across instances or
-shorten it. Validate the edited configuration with `ferrum-edge validate`
-before rollout. With `override_existing: false`, a backend value for a built-in
-security header that browsers ignore entirely (empty, or ineffective for that
-header) is now replaced by the configured value; any value a browser acts on is
-still kept.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
@@ -182,6 +173,36 @@ A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
 answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
+
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
 
 ### Backend idle connections: higher default ceiling (#6793)
 

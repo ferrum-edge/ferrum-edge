@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,20 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`security_headers` decorates the H1/H2 authorization-expiry `401` and
-  replaces backend values browsers ignore** (PR #6864). The fixed `401` the
-  pre-commit authorization gate selects (including after the response hooks
-  ran) and the buffered plain-HTTP authorization terminal now carry the
-  route's static `security_headers` policy, with the JSON `Content-Type`
-  re-asserted and the reauthentication challenge restored when policy removes
-  it; no protected-response header survives. With `override_existing: false`,
-  a backend copy of a built-in security header that browsers ignore entirely
-  (empty, a lone `ALLOW-FROM …` or `ALLOWALL`, a Referrer-Policy with no known
-  token, an HSTS value without exactly one valid `max-age`, an empty CSP /
-  Permissions-Policy) is replaced instead of satisfying the policy. Any value a
-  browser acts on — including comma-folded `DENY, DENY` or `DENY, SAMEORIGIN`
-  and `no-referrer, future-policy` — is kept, even when it differs from the
-  configured default.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -405,21 +427,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **BREAKING: `security_headers` refuses gateway-owned names, HSTS values
-  browsers ignore, and oversized policies** (issue #6864). `set` and `remove`
-  reject protocol-managed hop-by-hop / framing fields (now also on `remove`,
-  where they were a no-op) and representation metadata — `Content-Type`,
-  `Content-Encoding`, `Content-Range`, case-insensitive. A `Content-Type`
-  rewrite could relabel a body that content-type-selective inspection (`waf`,
-  `body_validator`, AI response guards) had already released to streaming
-  under the backend's label. An `hsts` string and a `set` entry for
-  `Strict-Transport-Security` must carry exactly one well-formed `max-age`
-  (RFC 6797 §6.1); `includeSubDomains; preload`, `maxage=…`, a bare space, and
-  duplicate `max-age` or `includeSubDomains` directives used to load and give
-  no downgrade protection. `set` holds at most 64 entries, `remove` at most 64
-  names, and every configured value at most 8192 bytes. Each refusal fails
-  config admission.
-
+- **BREAKING — `ai_semantic_cache` hardening from the production-launch
+  review** (issue #6822). Exact keys and semantic scopes now bind the request's complete
+  response-side policy provenance (RTDS gate content plus the static
+  response-presentation digest), so an entry retained under an earlier
+  `response_transformer` rule — locally or by another replica in Redis — can no
+  longer replay past a new field-removal rule; a request whose presentation
+  policy is unprovable bypasses. Instruction state (`system`/`developer`
+  messages, Anthropic `system`, Responses `instructions` and
+  `system`/`developer` `input` items, Gemini `systemInstruction`, Cohere
+  `preamble`) is bound byte-exactly in semantic scopes and Responses
+  instruction items leave the embedding input. Cohere v1 `conversation_id`
+  requests, request bodies with duplicate JSON members, and requests carrying
+  `Cache-Control: no-store`/`no-cache` bypass lookup and storage; responses
+  with `Cache-Control: no-store`/`private` or `Set-Cookie` are never stored.
+  Composition admission refuses any final-request-body policy plugin ordered at
+  or after an `ai_semantic_cache` instance by `priority_override`. Key domains
+  move to v4, so previously retained entries are unreachable.
+- **`ai_semantic_cache` populates from `ai_federation` and tolerates replica
+  clock skew.** A provider-backed `ai_federation` 2xx answer (proven by
+  federation's internal external-operation provenance) is now stored, so the
+  documented cache-before-federation chain hits on repeats, but only when
+  federation recorded that the provider's original headers carried no
+  `Cache-Control: no-store`/`private` or `Set-Cookie`, and only from the
+  committed-response hook once the final synthetic headers (late
+  `after_proxy` header rules, rotated cookies) also allow it; fabricated
+  synthetic bodies remain ineligible. An authenticated Redis envelope sealed up
+  to 60 seconds in the reader's future is admitted, and an authentic envelope
+  that is expired or further in the future is a plain miss instead of being
+  quarantined and deleted. Canonical `"stream": true` requests skip the
+  embedding call.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
