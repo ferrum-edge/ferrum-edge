@@ -21,7 +21,11 @@
 //!   `flate2::bufread::GzDecoder`, whose DEFLATE window RFC 1951 fixes at
 //!   32 KiB. Each gzip coding must contain exactly one complete member; any
 //!   remaining bytes, including another valid member, are rejected. Request
-//!   normalization and both representation gates share this rule.
+//!   normalization and both representation gates share this rule. `zstd` is
+//!   decoded only by [`decode_charged_content_coding_chain`] (never by the
+//!   gates' [`decode_one_coding`]), one frame per layer, with its window capped
+//!   at the RFC 9659 8 MB limit ([`ZSTD_WINDOW_LOG_MAX`]) and any trailing byte
+//!   rejected.
 //! * **Charged before allocation.** Every growth of the output buffer is
 //!   reserved against an aggregate budget BEFORE the allocator is asked for it,
 //!   and topped up to the capacity the allocator actually returned. The active
@@ -155,12 +159,35 @@ pub(crate) const GZIP_DECODER_SCRATCH_BYTES: usize = 256 * 1024;
 /// across the ~10 allocations above.
 pub(crate) const BROTLI_DECODER_SCRATCH_BYTES: usize = 24 * 1024 * 1024;
 
-/// A content coding both gates can decode, and the heap its decoder needs.
+/// Largest `zstd` back-reference window a decode accepts, as a base-2 log.
+///
+/// RFC 9659 §3 caps the window of the `zstd` HTTP content coding at 8 MB, and a
+/// peer that named `zstd` has not agreed to anything larger. The decoder is told
+/// so through `ZSTD_d_windowLogMax`, which makes a frame header asking for a
+/// larger window a format error before the window is allocated — the `zstd`
+/// counterpart of refusing Large Window Brotli.
+pub(crate) const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+
+/// Conservative ceiling on the heap ONE `zstd` pass allocates, for the locked
+/// `zstd` 0.14 → `zstd-sys` 2.1 (`libzstd` 1.5.7) streaming decoder pinned to
+/// [`ZSTD_WINDOW_LOG_MAX`].
+///
+/// `ZSTD_estimateDStreamSize(window)` is the decompression context plus an
+/// input buffer of one block (128 KiB) and an output buffer of
+/// `window + block + 2 * WILDCOPY_OVERLENGTH`. With the window capped at
+/// `1 << 23` that is 8 MiB of history, two 128 KiB block buffers, and a context
+/// well under 256 KiB — on the order of 8.6 MiB. The stream is read straight
+/// out of the caller's resident slice, so the Rust wrapper adds no buffer of
+/// its own. `12 MiB` leaves more than 3 MiB of margin for allocator overhead.
+pub(crate) const ZSTD_DECODER_SCRATCH_BYTES: usize = 12 * 1024 * 1024;
+
+/// A content coding the strict decoder implements, and the heap its decoder
+/// needs.
 ///
 /// # Why the codec's own heap is charged
 ///
-/// The output buffer is not the whole resident cost of a decode. Both supported
-/// decoders allocate a working set on the FIRST read — before a single output
+/// The output buffer is not the whole resident cost of a decode. Every supported
+/// decoder allocates a working set on the FIRST read — before a single output
 /// byte exists, so before any output-growth reservation can have happened — and
 /// that working set is chosen by the attacker-supplied stream header, not by the
 /// gateway. Leaving it out would mean the aggregate budget bounds something
@@ -169,19 +196,31 @@ pub(crate) const BROTLI_DECODER_SCRATCH_BYTES: usize = 24 * 1024 * 1024;
 /// cannot reserve them is refused.
 ///
 /// They are conservative fixed ceilings rather than a budget-aware allocator:
-/// both codecs' allocations are bounded by format constants, so a ceiling is
+/// each codec's allocations are bounded by format constants (for `zstd`, by the
+/// window cap the decoder enforces), so a ceiling is
 /// provable by inspection and costs nothing on the decode path. They are
 /// deliberately over-estimates for a typical stream — a real `br` body uses a
 /// 4 MiB window, not the 16 MiB maximum — which is the safe direction.
+///
+/// # Which callers see `zstd`
+///
+/// The two representation gates decode through [`decode_one_coding`], which
+/// admits only `gzip` / `x-gzip` and `br`: both gates keep reporting `zstd` as an
+/// unsupported coding, exactly as before, so their client-visible terminals do
+/// not change. `zstd` is reachable only through
+/// [`decode_charged_content_coding_chain`], whose callers decode either a
+/// client upload the `compression` plugin was explicitly configured to accept
+/// in `zstd`, or the gateway's own `compression` output.
 #[derive(Clone, Copy)]
 pub(crate) enum SupportedCoding {
     Gzip,
     Brotli,
+    Zstd,
 }
 
 impl SupportedCoding {
-    /// The canonical lowercase tokens this decoder accepts. `x-gzip` is the
-    /// RFC 9110 deprecated alias for `gzip`.
+    /// The canonical lowercase tokens the representation gates accept. `x-gzip`
+    /// is the RFC 9110 deprecated alias for `gzip`.
     pub(crate) fn from_token(coding: &str) -> Option<Self> {
         match coding {
             "gzip" | "x-gzip" => Some(Self::Gzip),
@@ -190,11 +229,21 @@ impl SupportedCoding {
         }
     }
 
+    /// The tokens [`decode_charged_content_coding_chain`] accepts: everything
+    /// [`Self::from_token`] does, plus `zstd` (RFC 9659).
+    fn from_chain_token(coding: &str) -> Option<Self> {
+        match coding {
+            "zstd" => Some(Self::Zstd),
+            other => Self::from_token(other),
+        }
+    }
+
     /// The decoder heap this coding may allocate for one pass.
     pub(crate) fn scratch_bytes(self) -> usize {
         match self {
             Self::Gzip => GZIP_DECODER_SCRATCH_BYTES,
             Self::Brotli => BROTLI_DECODER_SCRATCH_BYTES,
+            Self::Zstd => ZSTD_DECODER_SCRATCH_BYTES,
         }
     }
 }
@@ -394,6 +443,10 @@ fn read_decoded_bounded(
 /// is active at a time across a stacked `Content-Encoding`, so the scratch is
 /// returned as soon as the pass ends while the decoded buffers it produced stay
 /// charged.
+///
+/// This is the representation gates' entry point, so it admits only the
+/// [`SupportedCoding::from_token`] set; `zstd` stays
+/// [`ChargedDecodeError::Unsupported`] here.
 pub(crate) fn decode_one_coding(
     coding: &str,
     data: &[u8],
@@ -405,6 +458,38 @@ pub(crate) fn decode_one_coding(
     let Some(coding) = SupportedCoding::from_token(coding) else {
         return Err(ChargedDecodeError::Unsupported);
     };
+    decode_supported_coding(coding, data, limit, concurrent_bytes, reservation, budget)
+}
+
+/// [`decode_one_coding`] that also admits `zstd` (RFC 9659), for inspectors
+/// that walk a coding chain themselves and must decode the `zstd` output the
+/// `compression` plugin can produce (`openapi_validator`). Same strictness,
+/// scratch charge, and output accounting; never used by the representation
+/// gates, which keep reporting `zstd` as unsupported.
+pub(crate) fn decode_one_chain_coding(
+    coding: &str,
+    data: &[u8],
+    limit: usize,
+    concurrent_bytes: usize,
+    reservation: &mut ResponseBufferReservation,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, ChargedDecodeError> {
+    let Some(coding) = SupportedCoding::from_chain_token(coding) else {
+        return Err(ChargedDecodeError::Unsupported);
+    };
+    decode_supported_coding(coding, data, limit, concurrent_bytes, reservation, budget)
+}
+
+/// Decode one already-resolved coding; the shared body of [`decode_one_coding`],
+/// [`decode_one_chain_coding`], and [`decode_charged_content_coding_chain`].
+fn decode_supported_coding(
+    coding: SupportedCoding,
+    data: &[u8],
+    limit: usize,
+    concurrent_bytes: usize,
+    reservation: &mut ResponseBufferReservation,
+    budget: BudgetRef<'_>,
+) -> Result<Vec<u8>, ChargedDecodeError> {
     let mut scratch = ResponseBufferReservation::new();
     if !scratch.reserve_in(budget, coding.scratch_bytes()) {
         return Err(ChargedDecodeError::CapacityRefused);
@@ -437,6 +522,35 @@ pub(crate) fn decode_one_coding(
             reservation,
             budget,
         ),
+        SupportedCoding::Zstd => {
+            // `with_buffer` reads the resident slice directly (no extra input
+            // buffer), `single_frame` stops after the first frame so whatever
+            // follows it stays visible below, and the window cap turns an
+            // oversized frame window into a decode error before it is
+            // allocated. Every failure, including a context that cannot be
+            // created, is a representation fault: nothing here is a budget
+            // refusal, and the scratch charge above already bounds the heap.
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(data)
+                .map_err(|_| ChargedDecodeError::Malformed)?
+                .single_frame();
+            decoder
+                .window_log_max(ZSTD_WINDOW_LOG_MAX)
+                .map_err(|_| ChargedDecodeError::Malformed)?;
+            let decoded = read_decoded_bounded(
+                (&mut decoder).take(take),
+                limit,
+                concurrent_bytes,
+                reservation,
+                budget,
+            )?;
+            // One complete frame and nothing after it — the same strictness the
+            // gzip single-member rule and the `br` trailing-byte check apply. A
+            // truncated frame already failed inside the read loop.
+            if !decoder.finish().is_empty() {
+                return Err(ChargedDecodeError::Malformed);
+            }
+            Ok(decoded)
+        }
     }
 }
 
@@ -484,6 +598,14 @@ fn amplification_is_within_bounds(raw_len: usize, decoded_len: usize, ratio: u32
 /// the field, bounded the layer COUNT, and resolved `identity`, so an
 /// `identity` member here is an unsupported coding rather than a no-op.
 ///
+/// Unlike [`decode_one_coding`], this also decodes `zstd` (RFC 9659): one
+/// complete frame per layer, its window capped at [`ZSTD_WINDOW_LOG_MAX`] and
+/// its decoder heap charged as [`ZSTD_DECODER_SCRATCH_BYTES`]. Its callers
+/// decide which codings they hand it — `compression` only passes `zstd` for an
+/// instance configured with that algorithm, and the response-side inspectors
+/// that decode the gateway's own `compression` output pass the codings that
+/// plugin can produce.
+///
 /// The charge is released when this returns: the reservation is local and the
 /// plaintext is handed back as a plain `Vec`. That is the DECODE working set
 /// bound the advisory names — the surviving plaintext is separately bounded per
@@ -515,8 +637,11 @@ pub(crate) fn decode_charged_content_coding_chain(
             None => (body, 0),
         };
         let input_len = input.len();
-        let decoded = decode_one_coding(
-            coding,
+        let Some(supported) = SupportedCoding::from_chain_token(coding) else {
+            return Err(ChargedDecodeError::Unsupported);
+        };
+        let decoded = decode_supported_coding(
+            supported,
             input,
             limits.max_decoded_bytes,
             concurrent,

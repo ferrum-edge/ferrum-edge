@@ -59,6 +59,11 @@ mod h2_body_write_timeout;
 #[cfg(feature = "http2")]
 pub use h2_body_write_timeout::Http2BodyWriteTimeout;
 
+#[cfg(feature = "http2")]
+mod h2_body_deadline;
+#[cfg(feature = "http2")]
+pub use h2_body_deadline::Http2BodyDeadline;
+
 #[cfg(all(feature = "http2", feature = "server"))]
 mod h2_stream_termination;
 #[cfg(all(feature = "http2", feature = "server"))]

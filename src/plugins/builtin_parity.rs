@@ -45,7 +45,10 @@ pub const BUILTIN_RESPONSE_BODY_PRODUCERS: &[&str] = &[
 /// built-in that can require framing but is missing here would let a proxy
 /// accept compression the plugin then cannot see, so
 /// `tests/unit/plugins/plugin_doc_parity_tests.rs` pins the set against the
-/// documented `on_ws_frame` / parser-limit phases. Out-of-tree plugins declare
+/// documented `on_ws_frame` / parser-limit phases. `api_chargeback` is the one
+/// built-in whose need is config-dependent (only bandwidth pricing requires the
+/// parsed relay); it is deliberately absent here and passthrough admission
+/// answers for it from its parsed pricing. Out-of-tree plugins declare
 /// the capability by overriding `requires_ws_frame_hooks()`,
 /// `websocket_size_limits()`, or `requires_websocket_framing()`; admission
 /// constructs them and asks the instance.
@@ -187,7 +190,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "sse",
         classification: BuiltinPluginClassification::Public,
         priority: 250,
-        active_phases: "on_request_received, before_proxy, after_proxy, transform_response_body",
+        active_phases: "on_request_received, before_proxy, after_proxy, transform_response_body, response_stream_inspector",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "SSE is HTTP-only (text/event-stream over chunked transfer)",
     },
@@ -243,7 +246,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "oidc_relying_party",
         classification: BuiltinPluginClassification::Public,
         priority: 1075,
-        active_phases: "on_request_received, authenticate, before_proxy, after_proxy",
+        active_phases: "on_request_received, authenticate, before_proxy, after_proxy, apply_websocket_handshake_response_headers",
         matrix_protocols: HTTP_FAMILY_PROTOCOLS,
         protocol_rationale: "Browser-oriented HTTP authentication flow",
     },
@@ -315,7 +318,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "mesh_authz",
         classification: BuiltinPluginClassification::Public,
         priority: 2075,
-        active_phases: "authorize, on_stream_connect",
+        active_phases: "authorize, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Applies Layer 2 mesh policy using SPIFFE or HBONE identities",
     },
@@ -380,7 +383,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ws_rate_limiting",
         classification: BuiltinPluginClassification::Public,
         priority: 2910,
-        active_phases: "on_ws_frame, on_ws_reassembly_frames",
+        active_phases: "on_ws_frame, on_ws_reassembly_frames, on_ws_disconnect",
         matrix_protocols: WS_ONLY_PROTOCOLS,
         protocol_rationale: "Per-connection frame rate limiting for WebSocket",
     },
@@ -500,9 +503,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "request_transformer",
         classification: BuiltinPluginClassification::Public,
         priority: 3000,
-        active_phases: "before_proxy, transform_request_body",
-        matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Modifies HTTP headers/query/body",
+        active_phases: "before_proxy, transform_request_body_with_context",
+        matrix_protocols: HTTP_FAMILY_PROTOCOLS,
+        protocol_rationale: "Modifies HTTP headers/query/body; WebSocket handshake headers/query only",
     },
     BuiltinPluginParityMeta {
         name: "serverless_function",
@@ -644,9 +647,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ws_frame_logging",
         classification: BuiltinPluginClassification::Public,
         priority: 9050,
-        active_phases: "on_ws_frame, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
+        active_phases: "on_ws_policy_close, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect",
         matrix_protocols: WS_ONLY_PROTOCOLS,
-        protocol_rationale: "`on_ws_frame` records policy decisions such as Close; delivery observations are emitted after successful destination sends",
+        protocol_rationale: "`on_ws_policy_close` records final policy Close decisions; delivery observations are emitted after successful destination sends",
     },
     BuiltinPluginParityMeta {
         name: "statsd_logging",

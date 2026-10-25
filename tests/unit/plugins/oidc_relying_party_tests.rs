@@ -31,6 +31,8 @@ use super::jwks_auth_support::{
 };
 use super::plugin_utils::{assert_continue, assert_reject, create_test_consumer};
 
+/// The issuer every fixture configures; discovery documents must echo it.
+const TEST_ISSUER: &str = "https://issuer.example.com";
 const AUTHORITY_MISMATCH_ERROR: &str =
     r#"{"error":"OIDC callback host does not match request host"}"#;
 const INVALID_AUTHORITY_ERROR: &str = r#"{"error":"OIDC missing or malformed request authority"}"#;
@@ -83,9 +85,15 @@ async fn discovery_transport_errors_use_the_redacted_endpoint() {
         "unsupported://test-user:test-password@example.test/",
         "private-path?key=test-query#test-fragment"
     );
-    let error = oidc_resolve_discovery_for_test(&PluginHttpClient::default(), endpoint, None, None)
-        .await
-        .expect_err("unsupported transport must fail");
+    let error = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        endpoint,
+        TEST_ISSUER,
+        None,
+        None,
+    )
+    .await
+    .expect_err("unsupported transport must fail");
     assert!(error.contains("discovery request failed"), "{error}");
     assert!(error.contains("example.test/redacted"), "{error}");
     let diagnostics = format!("{error}\n{}", logs.contents());
@@ -2939,6 +2947,7 @@ async fn oidc_discovered_jwks_store_joins_active_trust_health_after_commit() {
     Mock::given(method("GET"))
         .and(path("/oidc-trust/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/oidc-trust/authorize", server.uri()),
             "token_endpoint": format!("{}/oidc-trust/token", server.uri()),
             "jwks_uri": jwks_uri,
@@ -3016,6 +3025,7 @@ async fn oidc_staged_discovery_store_is_not_exposed_before_commit() {
     Mock::given(method("GET"))
         .and(path("/oidc-staged/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/oidc-staged/authorize", server.uri()),
             "token_endpoint": format!("{}/oidc-staged/token", server.uri()),
             "jwks_uri": jwks_uri,
@@ -3069,6 +3079,7 @@ async fn explicit_optional_endpoints_fill_discovery_gaps() {
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/authorize", server.uri()),
             "token_endpoint": format!("{}/token", server.uri()),
             "jwks_uri": format!("{}/jwks", server.uri())
@@ -3079,6 +3090,7 @@ async fn explicit_optional_endpoints_fill_discovery_gaps() {
     let (userinfo, end_session) = oidc_resolve_discovery_for_test(
         &PluginHttpClient::default(),
         &format!("{}/.well-known/openid-configuration", server.uri()),
+        TEST_ISSUER,
         Some("https://idp.example.com/userinfo".to_string()),
         Some("https://idp.example.com/end_session".to_string()),
     )
@@ -3103,6 +3115,7 @@ async fn explicit_optional_endpoints_override_discovered_values() {
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/authorize", server.uri()),
             "token_endpoint": format!("{}/token", server.uri()),
             "jwks_uri": format!("{}/jwks", server.uri()),
@@ -3115,6 +3128,7 @@ async fn explicit_optional_endpoints_override_discovered_values() {
     let (userinfo, end_session) = oidc_resolve_discovery_for_test(
         &PluginHttpClient::default(),
         &format!("{}/.well-known/openid-configuration", server.uri()),
+        TEST_ISSUER,
         Some("https://explicit.example.com/userinfo".to_string()),
         Some("https://explicit.example.com/end_session".to_string()),
     )
@@ -3139,6 +3153,7 @@ async fn discovered_optional_endpoints_used_without_overrides() {
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/authorize", server.uri()),
             "token_endpoint": format!("{}/token", server.uri()),
             "jwks_uri": format!("{}/jwks", server.uri()),
@@ -3151,6 +3166,7 @@ async fn discovered_optional_endpoints_used_without_overrides() {
     let (userinfo, end_session) = oidc_resolve_discovery_for_test(
         &PluginHttpClient::default(),
         &format!("{}/.well-known/openid-configuration", server.uri()),
+        TEST_ISSUER,
         None,
         None,
     )
@@ -3184,6 +3200,7 @@ async fn discovery_config_retains_explicit_optional_endpoints() {
     Mock::given(method("GET"))
         .and(path("/oidc-overrides/openid-configuration"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/oidc-overrides/authorize", server.uri()),
             "token_endpoint": format!("{}/oidc-overrides/token", server.uri()),
             "jwks_uri": jwks_uri,
@@ -3332,6 +3349,8 @@ async fn logout_requires_a_sealed_session_and_encodes_the_id_token_hint() {
         ] {
             let mut ctx = html_ctx();
             ctx.path = "/oauth/logout".to_string();
+            ctx.headers
+                .insert("sec-fetch-site".to_string(), "same-origin".to_string());
             if let Some(session) = session {
                 ctx.headers
                     .insert("cookie".to_string(), session.to_string());
@@ -3375,6 +3394,7 @@ async fn logout_revokes_discovered_refresh_tokens_with_best_effort_client_auth()
         Mock::given(method("GET"))
             .and(path("/discovery"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": TEST_ISSUER,
                 "authorization_endpoint": format!("{}/authorize", server.uri()),
                 "token_endpoint": format!("{}/token", server.uri()),
                 "jwks_uri": format!("{}/jwks", server.uri()),
@@ -3430,6 +3450,8 @@ async fn logout_revokes_discovered_refresh_tokens_with_best_effort_client_auth()
         let mut ctx = html_ctx();
         ctx.path = "/oauth/logout".to_string();
         ctx.headers
+            .insert("sec-fetch-site".to_string(), "same-origin".to_string());
+        ctx.headers
             .insert("cookie".to_string(), cookie_pair(&cookie).to_string());
         let PluginResult::Reject {
             status_code,
@@ -3461,10 +3483,11 @@ async fn discovery_rejects_untrusted_revocation_endpoints() {
     Mock::given(method("GET"))
         .and(path("/discovery"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/authorize", server.uri()),
             "token_endpoint": format!("{}/token", server.uri()),
             "jwks_uri": format!("{}/jwks", server.uri()),
-            "revocation_endpoint": "https://untrusted.example.com/revoke",
+            "revocation_endpoint": "http://untrusted.example.com/revoke",
         })))
         .mount(&server)
         .await;
@@ -3472,6 +3495,7 @@ async fn discovery_rejects_untrusted_revocation_endpoints() {
         oidc_resolve_discovery_for_test(
             &PluginHttpClient::default(),
             &format!("{}/discovery", server.uri()),
+            TEST_ISSUER,
             None,
             None,
         )
@@ -3941,6 +3965,8 @@ async fn accepted_logout_paths_reach_local_cookie_deletion() {
     let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid config");
     let mut ctx = html_ctx();
     ctx.path = "/oauth/sign-out".to_string();
+    ctx.headers
+        .insert("sec-fetch-site".to_string(), "same-origin".to_string());
     let PluginResult::Reject {
         status_code,
         headers,
@@ -4049,13 +4075,15 @@ async fn cross_origin_advertisements_do_not_block_their_explicit_overrides() {
     Mock::given(method("GET"))
         .and(path("/discovery"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/authorize", server.uri()),
             "token_endpoint": format!("{}/token", server.uri()),
             "jwks_uri": format!("{}/jwks", server.uri()),
-            // Advertised on a different origin than discovery_url, and never
-            // called because both are explicitly overridden below.
-            "userinfo_endpoint": "https://elsewhere.example.com/userinfo",
-            "end_session_endpoint": "https://elsewhere.example.com/end_session",
+            // Advertisements selected discovery would refuse (plaintext on a
+            // non-loopback host), never called because both are explicitly
+            // overridden below.
+            "userinfo_endpoint": "http://elsewhere.example.com/userinfo",
+            "end_session_endpoint": "http://elsewhere.example.com/end_session",
         })))
         .mount(&server)
         .await;
@@ -4063,6 +4091,7 @@ async fn cross_origin_advertisements_do_not_block_their_explicit_overrides() {
     let (userinfo, end_session) = oidc_resolve_discovery_for_test(
         &PluginHttpClient::default(),
         &format!("{}/discovery", server.uri()),
+        TEST_ISSUER,
         Some("https://issuer.example.com/userinfo".to_string()),
         Some("https://issuer.example.com/end_session".to_string()),
     )
@@ -4078,18 +4107,21 @@ async fn cross_origin_advertisements_do_not_block_their_explicit_overrides() {
     );
 }
 
-/// A selected discovered optional endpoint keeps its fail-closed same-origin
-/// validation: only the discarded advertisement is skipped (issue #5033).
+/// A selected discovered optional endpoint keeps its fail-closed validation:
+/// only the discarded advertisement is skipped (issue #5033).
 #[tokio::test]
 async fn selected_discovered_optional_endpoints_stay_fail_closed() {
     for field in ["userinfo_endpoint", "end_session_endpoint"] {
         let server = MockServer::start().await;
         let mut document = json!({
+            "issuer": TEST_ISSUER,
             "authorization_endpoint": format!("{}/authorize", server.uri()),
             "token_endpoint": format!("{}/token", server.uri()),
             "jwks_uri": format!("{}/jwks", server.uri()),
         });
-        document[field] = json!("https://elsewhere.example.com/endpoint");
+        // Cross-origin HTTPS endpoints are admitted once the issuer matched;
+        // a plaintext one on a non-loopback host never is.
+        document[field] = json!("http://elsewhere.example.com/endpoint");
         Mock::given(method("GET"))
             .and(path("/discovery"))
             .respond_with(ResponseTemplate::new(200).set_body_json(document))
@@ -4100,12 +4132,13 @@ async fn selected_discovered_optional_endpoints_stay_fail_closed() {
             oidc_resolve_discovery_for_test(
                 &PluginHttpClient::default(),
                 &format!("{}/discovery", server.uri()),
+                TEST_ISSUER,
                 None,
                 None,
             )
             .await
             .is_err(),
-            "a selected cross-origin {field} must still fail closed"
+            "a selected plaintext {field} must still fail closed"
         );
     }
 }
@@ -4457,6 +4490,90 @@ fn the_config_component_agrees_with_constructor_admission() {
         session("redis_url", json!("redis://x")),
         false,
     );
+
+    // MUSE-9: a present `null` is "unset" for the endpoint alternatives too.
+    let mut discovery_with_null_endpoints = provider(
+        "discovery_url",
+        json!("https://issuer.example.com/.well-known/openid-configuration"),
+    );
+    for key in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        discovery_with_null_endpoints["providers"][0][key] = json!(null);
+    }
+    case(
+        "discovery with null explicit endpoints",
+        discovery_with_null_endpoints,
+        true,
+    );
+    case(
+        "explicit endpoints with a null discovery_url",
+        provider("discovery_url", json!(null)),
+        true,
+    );
+    let mut partial_explicit_with_discovery = no_endpoints_with_discovery();
+    partial_explicit_with_discovery["providers"][0]["token_endpoint"] =
+        json!("https://issuer.example.com/token");
+    case(
+        "discovery plus one explicit endpoint",
+        partial_explicit_with_discovery,
+        false,
+    );
+
+    // SOL-5: callback/logout paths must already be canonical request paths.
+    let mut encoded_callback = provider("callback_path", json!("/oauth/%63allback"));
+    encoded_callback["providers"][0]["redirect_uri"] =
+        json!("https://app.example.com/oauth/%63allback");
+    case("percent-encoded callback path", encoded_callback, false);
+    case(
+        "empty-segment logout path",
+        provider("logout_path", json!("/oauth//logout")),
+        false,
+    );
+
+    // MUSE-13 / MUSE-14 fields.
+    case(
+        "forward_access_token enabled",
+        provider("forward_access_token", json!(true)),
+        true,
+    );
+    case("max_age_secs", provider("max_age_secs", json!(300)), true);
+    case(
+        "max_age_secs above the bound",
+        provider("max_age_secs", json!(31_536_001)),
+        false,
+    );
+    case(
+        "static authorization params",
+        provider(
+            "authorization_params",
+            json!({"prompt": "login", "acr_values": "urn:example:mfa"}),
+        ),
+        true,
+    );
+    case(
+        "authorization params overriding state",
+        provider("authorization_params", json!({"state": "fixed"})),
+        false,
+    );
+    case(
+        "non-string authorization param",
+        provider("authorization_params", json!({"prompt": 1})),
+        false,
+    );
+}
+
+fn no_endpoints_with_discovery() -> serde_json::Value {
+    let mut config = base_config();
+    let provider = config["providers"][0]
+        .as_object_mut()
+        .expect("provider object");
+    for key in ["authorization_endpoint", "token_endpoint", "jwks_uri"] {
+        provider.remove(key);
+    }
+    provider.insert(
+        "discovery_url".to_string(),
+        json!("https://issuer.example.com/.well-known/openid-configuration"),
+    );
+    config
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4785,5 +4902,1143 @@ async fn refresh_grant_carries_the_proxy_hop_count() {
             .map(|value| value.to_str().unwrap())
             .collect();
         assert_eq!(hops, expected, "hops={outbound_proxy_hops:?}");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Production-launch review fixes (SOL-1..5, MUSE-2..14)
+// ────────────────────────────────────────────────────────────────────
+
+/// The session cookie line(s) of a `Set-Cookie` value, as the browser jar
+/// would install them: every non-empty `name=value` pair, joined into the
+/// request `Cookie` header a later request carries.
+fn browser_cookie_header(set_cookie: &str) -> String {
+    set_cookie
+        .lines()
+        .filter_map(|line| {
+            let pair = line.split(';').next()?.trim();
+            let (_, value) = pair.split_once('=')?;
+            (!value.is_empty()).then(|| pair.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn api_ctx_with_cookie_header(cookie: &str) -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    ctx.request_is_secure = true;
+    ctx.headers.insert("cookie".to_string(), cookie.to_string());
+    ctx
+}
+
+fn token_endpoint_requests(requests: &[Request]) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.url.path() == "/token")
+        .count()
+}
+
+/// SOL-1: a successful WebSocket handshake bypasses `after_proxy`, so the
+/// rotated session (and an idle slide) must be delivered by the handshake
+/// decorator, alongside any other cookie already on the handshake.
+#[tokio::test]
+async fn websocket_handshake_delivers_the_rotated_session_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "socket@example.test",
+            "exp": now + 3600
+        }),
+        Some("original-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+
+    for status in [101, 200] {
+        let mut handshake_headers =
+            HashMap::from([("set-cookie".to_string(), "other=1; Path=/".to_string())]);
+        plugin.apply_websocket_handshake_response_headers(&ctx, status, &mut handshake_headers);
+        let set_cookie = handshake_headers
+            .get("set-cookie")
+            .expect("handshake Set-Cookie");
+        assert!(
+            set_cookie.lines().any(|line| line == "other=1; Path=/"),
+            "an existing handshake cookie is preserved: {set_cookie}"
+        );
+        let state = oidc_session_state_from_set_cookie_for_test(&plugin, set_cookie)
+            .expect("the rotated session reaches the handshake");
+        assert_eq!(
+            state.refresh_token.as_deref(),
+            Some("rotated-refresh-token")
+        );
+        assert_eq!(state.access_token, "new-access-token");
+    }
+    server.verify().await;
+
+    // An idle slide without any refresh is delivered the same way.
+    let slide_plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let sliding = oidc_sealed_session_cookie_for_test(
+        &slide_plugin,
+        json!({"sub": "alice", "exp": now + 3600}),
+        true,
+    )
+    .expect("session seals");
+    let mut slide_ctx = session_ctx(&sliding);
+    assert_continue(
+        slide_plugin
+            .authenticate(&mut slide_ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let mut handshake_headers = HashMap::new();
+    slide_plugin.apply_websocket_handshake_response_headers(
+        &slide_ctx,
+        101,
+        &mut handshake_headers,
+    );
+    let slid = handshake_headers
+        .get("set-cookie")
+        .expect("the slid session reaches the handshake");
+    let payload =
+        oidc_open_session_cookie_for_test(&slide_plugin, slid).expect("slid cookie opens");
+    assert!(
+        payload["last_touch_unix"]
+            .as_i64()
+            .is_some_and(|touch| touch >= now)
+    );
+}
+
+/// SOL-2: after a spent refresh token the claims-freshness gate still fails
+/// closed, but it must not delete the session cookie: the browser may already
+/// hold the winner's rotated cookie, and this response may be applied last.
+#[tokio::test]
+async fn expired_claims_after_a_spent_refresh_leave_the_browser_cookie_alone() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .mount(&server)
+        .await;
+    let plugin = OidcRelyingParty::new(
+        &refresh_config(&format!("{}/token", server.uri())),
+        PluginHttpClient::default(),
+    )
+    .expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    // Claims past expiry plus the default 60 s skew, but inside the idle and
+    // absolute session bounds.
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "stale@example.test",
+            "exp": now - 300
+        }),
+        Some("spent-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+
+    // API request: a bare 401 with no cookie deletion.
+    let mut api = session_ctx(&cookie);
+    match plugin
+        .authenticate(&mut api, &ConsumerIndex::new(&[]))
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 401);
+            assert!(
+                !headers.contains_key("set-cookie"),
+                "a spent refresh must not delete the browser's session cookie: {headers:?}"
+            );
+        }
+        other => panic!("expected a fail-closed challenge, got {other:?}"),
+    }
+
+    // Browser request: the new login flow's correlation cookie only.
+    let mut browser = html_ctx();
+    browser
+        .headers
+        .insert("cookie".to_string(), cookie_pair(&cookie).to_string());
+    match plugin
+        .authenticate(&mut browser, &ConsumerIndex::new(&[]))
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 302);
+            let set_cookie = headers.get("set-cookie").cloned().unwrap_or_default();
+            assert!(
+                !set_cookie
+                    .lines()
+                    .any(|line| line.starts_with("ferrum_session=")),
+                "a spent refresh must not delete the browser's session cookie: {set_cookie}"
+            );
+        }
+        other => panic!("expected a browser challenge, got {other:?}"),
+    }
+
+    // Without any refresh attempt (no refresh token) the expired session is
+    // still cleared as before.
+    let no_refresh = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "oidc-subject", "email": "stale@example.test", "exp": now - 300}),
+        None,
+        true,
+        false,
+    )
+    .expect("session seals");
+    let mut cleared = session_ctx(&no_refresh);
+    match plugin
+        .authenticate(&mut cleared, &ConsumerIndex::new(&[]))
+        .await
+    {
+        PluginResult::Reject { headers, .. } => assert!(
+            headers
+                .get("set-cookie")
+                .is_some_and(|value| value.starts_with("ferrum_session=; Max-Age=0")),
+            "{headers:?}"
+        ),
+        other => panic!("expected a challenge, got {other:?}"),
+    }
+}
+
+/// SOL-3: a 2xx refresh whose result cannot be adopted (here an ID token that
+/// does not verify) has still consumed the submitted refresh token. The spent
+/// token must be dropped from the session, never republished with a retry
+/// backoff, and never submitted again — by this request or a follower.
+#[tokio::test]
+async fn consumed_refresh_grant_with_an_unverifiable_id_token_drops_the_spent_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"keys": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "id_token": "not-a-verifiable-id-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+    let mut config = refresh_config(&format!("{}/token", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "consumed@example.test",
+            "exp": now + 3600
+        }),
+        Some("original-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    let mut first = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+    let rolled = rolling_cookie(&plugin, &mut first)
+        .await
+        .expect("the request that spent the token re-issues the session without it");
+    let payload = oidc_open_session_cookie_for_test(&plugin, &rolled).expect("cookie opens");
+    assert_eq!(payload["refresh_token_b64"], json!(null));
+    assert_eq!(
+        payload["access_token_b64"],
+        json!("test-access-token"),
+        "nothing from the unverified response is adopted"
+    );
+
+    // A request still carrying the spent token adopts the same state.
+    let mut late = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut late, &consumer_index).await);
+    let late_cookie = rolling_cookie(&plugin, &mut late)
+        .await
+        .expect("a late request adopts the dropped-token session");
+    let late_payload =
+        oidc_open_session_cookie_for_test(&plugin, &late_cookie).expect("cookie opens");
+    assert_eq!(late_payload["refresh_token_b64"], json!(null));
+
+    // The re-issued session never refreshes again.
+    let mut after = session_ctx(&rolled);
+    assert_continue(plugin.authenticate(&mut after, &consumer_index).await);
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        token_endpoint_requests(&requests),
+        1,
+        "the consumed refresh token must be submitted exactly once"
+    );
+}
+
+/// SOL-4 / MUSE-1: a sealed session too large for one browser cookie is split
+/// into `<name>.N` chunk cookies that each fit, reassembles on the next
+/// request, is hidden from the backend, and fails closed when incomplete.
+#[tokio::test]
+async fn large_sessions_are_split_into_browser_storable_chunk_cookies() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let now = chrono::Utc::now().timestamp();
+    let claims = json!({
+        "sub": "alice",
+        "exp": now + 3600,
+        "groups": "g".repeat(3500)
+    });
+    let set_cookie =
+        oidc_sealed_session_cookie_for_test(&plugin, claims, false).expect("session seals");
+    for line in set_cookie.lines() {
+        assert!(
+            line.len() <= 4000,
+            "every Set-Cookie line must fit a browser cookie ({} bytes)",
+            line.len()
+        );
+    }
+    assert!(
+        set_cookie
+            .lines()
+            .any(|line| line.starts_with("ferrum_session.0=2.")),
+        "chunk 0 carries the chunk count: {set_cookie}"
+    );
+    assert!(
+        set_cookie
+            .lines()
+            .any(|line| line.starts_with("ferrum_session.1=")),
+        "{set_cookie}"
+    );
+    assert!(
+        set_cookie
+            .lines()
+            .any(|line| line.starts_with("ferrum_session=; Max-Age=0")),
+        "the unchunked form is expired: {set_cookie}"
+    );
+
+    let header = browser_cookie_header(&set_cookie);
+    let mut ctx = api_ctx_with_cookie_header(&header);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+
+    let mut upstream = HashMap::from([("cookie".to_string(), format!("{header}; theme=dark"))]);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut upstream).await);
+    assert_eq!(
+        upstream.get("cookie").map(String::as_str),
+        Some("theme=dark"),
+        "chunk cookies are gateway credentials and never reach the backend"
+    );
+
+    // A browser that dropped a chunk is challenged and every chunk it still
+    // holds is expired.
+    let first_chunk_only = header
+        .split("; ")
+        .find(|pair| pair.starts_with("ferrum_session.0="))
+        .expect("chunk 0")
+        .to_string();
+    let mut incomplete = api_ctx_with_cookie_header(&first_chunk_only);
+    match plugin
+        .authenticate(&mut incomplete, &ConsumerIndex::new(&[]))
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 401);
+            let cleared = headers.get("set-cookie").expect("cleared cookies");
+            assert!(
+                cleared
+                    .lines()
+                    .any(|line| line.starts_with("ferrum_session.0=; Max-Age=0")),
+                "{cleared}"
+            );
+        }
+        other => panic!("an incomplete chunk set must fail closed, got {other:?}"),
+    }
+}
+
+/// SOL-4: a session the configured cap cannot hold is refused with a named
+/// cause instead of being emitted for the browser to discard.
+#[tokio::test]
+async fn sessions_above_the_cookie_cap_are_refused_with_a_named_cause() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let error = oidc_sealed_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "alice", "groups": "g".repeat(9000)}),
+        false,
+    )
+    .expect_err("an over-cap session must not seal");
+    assert!(error.contains("max_cookie_bytes"), "{error}");
+}
+
+/// SOL-4: a cookie name/path long enough to leave no usable room in a browser
+/// cookie is refused at admission.
+#[test]
+fn new_rejects_cookie_scopes_that_leave_no_room_for_the_session() {
+    let mut config = base_config();
+    config["session"]["path"] = json!(format!("/{}", "p".repeat(3200)));
+    let error = validate_plugin_config("oidc_relying_party", &config)
+        .expect_err("an oversized cookie scope must be rejected");
+    assert!(error.contains("session.path"), "{error}");
+}
+
+/// MUSE-4: the session cookie is persistent for its remaining absolute
+/// lifetime instead of ending with the browser session.
+#[tokio::test]
+async fn session_cookies_carry_their_remaining_absolute_lifetime() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let fresh = oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false)
+        .expect("session seals");
+    let max_age: i64 = cookie_attribute(&fresh, "max-age")
+        .flatten()
+        .expect("session cookie Max-Age")
+        .parse()
+        .expect("numeric Max-Age");
+    assert!((3590..=3600).contains(&max_age), "Max-Age={max_age}");
+
+    // A session issued 900 s ago (half the default idle window) has 2700 s of
+    // absolute lifetime left.
+    let aged = oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), true)
+        .expect("session seals");
+    let aged_max_age: i64 = cookie_attribute(&aged, "max-age")
+        .flatten()
+        .expect("session cookie Max-Age")
+        .parse()
+        .expect("numeric Max-Age");
+    assert!(
+        (2690..=2700).contains(&aged_max_age),
+        "Max-Age={aged_max_age}"
+    );
+}
+
+/// SOL-5: callback/logout paths are compared against the frontend's canonical
+/// request path, so a spelling canonicalization changes (or refuses) can never
+/// be reached and is dead configuration.
+#[test]
+fn new_rejects_non_canonical_callback_and_logout_paths() {
+    for callback_path in ["/oauth/%63allback", "/oauth//callback", "/oauth/./callback"] {
+        let mut config = base_config();
+        config["providers"][0]["callback_path"] = json!(callback_path);
+        config["providers"][0]["redirect_uri"] =
+            json!(format!("https://app.example.com{callback_path}"));
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("callback_path={callback_path} must be rejected"));
+        assert!(
+            error.contains("callback_path"),
+            "unexpected error for {callback_path}: {error}"
+        );
+    }
+    for logout_path in ["/oauth/%6cogout", "/oauth//logout", "/oauth/a\\b"] {
+        let mut config = base_config();
+        config["providers"][0]["logout_path"] = json!(logout_path);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("logout_path={logout_path} must be rejected"));
+        assert!(
+            error.contains("logout_path"),
+            "unexpected error for {logout_path}: {error}"
+        );
+    }
+}
+
+/// MUSE-2: the per-source pending-login cap still holds once the global replay
+/// cache is full, and the sealed-only allowance beyond it is bounded too.
+#[tokio::test]
+async fn per_source_login_cap_holds_when_the_replay_cache_is_full() {
+    let mut config = base_config();
+    config["behavior"]["state_cache_max_entries"] = json!(1);
+    config["behavior"]["state_cache_max_entries_per_source"] = json!(1);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let challenge_from = |source: &str| {
+        let mut ctx = html_ctx();
+        ctx.client_ip = source.to_string();
+        ctx
+    };
+
+    let mut first = challenge_from("192.0.2.1");
+    assert_reject(
+        plugin
+            .authenticate(&mut first, &ConsumerIndex::new(&[]))
+            .await,
+        Some(302),
+    );
+    // Same source with the replay cache full: still capped.
+    let mut same_source = challenge_from("192.0.2.1");
+    assert_reject(
+        plugin
+            .authenticate(&mut same_source, &ConsumerIndex::new(&[]))
+            .await,
+        Some(503),
+    );
+    // Another source is admitted as a sealed-only flow.
+    let mut other = challenge_from("192.0.2.2");
+    assert_reject(
+        plugin
+            .authenticate(&mut other, &ConsumerIndex::new(&[]))
+            .await,
+        Some(302),
+    );
+    // That source is now charged too.
+    let mut other_again = challenge_from("192.0.2.2");
+    assert_reject(
+        plugin
+            .authenticate(&mut other_again, &ConsumerIndex::new(&[]))
+            .await,
+        Some(503),
+    );
+    // And the sealed-only allowance is itself bounded.
+    let mut third = challenge_from("192.0.2.3");
+    assert_reject(
+        plugin
+            .authenticate(&mut third, &ConsumerIndex::new(&[]))
+            .await,
+        Some(503),
+    );
+}
+
+/// MUSE-3: a discovery document is used only when its `issuer` is exactly the
+/// configured issuer.
+#[tokio::test]
+async fn discovery_requires_the_configured_issuer() {
+    for (issuer, admitted) in [
+        (Some(TEST_ISSUER), true),
+        (Some("https://issuer.example.com/other-tenant"), false),
+        (Some("https://issuer.example.com/"), false),
+        (None, false),
+    ] {
+        let server = MockServer::start().await;
+        let mut document = json!({
+            "authorization_endpoint": format!("{}/authorize", server.uri()),
+            "token_endpoint": format!("{}/token", server.uri()),
+            "jwks_uri": format!("{}/jwks", server.uri()),
+        });
+        if let Some(issuer) = issuer {
+            document["issuer"] = json!(issuer);
+        }
+        Mock::given(method("GET"))
+            .and(path("/discovery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document))
+            .mount(&server)
+            .await;
+        let result = oidc_resolve_discovery_for_test(
+            &PluginHttpClient::default(),
+            &format!("{}/discovery", server.uri()),
+            TEST_ISSUER,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.is_ok(), admitted, "issuer={issuer:?}: {result:?}");
+    }
+}
+
+/// MUSE-11: once the issuer matched, HTTPS endpoints on other origins are
+/// accepted, so Google- and Microsoft-shaped discovery documents resolve.
+#[tokio::test]
+async fn issuer_validated_discovery_accepts_cross_origin_https_endpoints() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/discovery"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": TEST_ISSUER,
+            "authorization_endpoint": "https://accounts.example.com/o/oauth2/v2/auth",
+            "token_endpoint": "https://oauth2.example.net/token",
+            "jwks_uri": "https://www.example.org/oauth2/v3/certs",
+            "userinfo_endpoint": "https://openidconnect.example.net/v1/userinfo",
+        })))
+        .mount(&server)
+        .await;
+    let (userinfo, _) = oidc_resolve_discovery_for_test(
+        &PluginHttpClient::default(),
+        &format!("{}/discovery", server.uri()),
+        TEST_ISSUER,
+        None,
+        None,
+    )
+    .await
+    .expect("cross-origin HTTPS endpoints resolve");
+    assert_eq!(
+        userinfo.as_deref(),
+        Some("https://openidconnect.example.net/v1/userinfo")
+    );
+}
+
+/// MUSE-5: presentation and admission knobs are not part of the session
+/// context, so changing them keeps every session valid; a change to what a
+/// session asserts still invalidates it.
+#[tokio::test]
+async fn presentation_changes_keep_sessions_while_semantic_changes_invalidate_them() {
+    let original = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let cookie = oidc_sealed_session_cookie_for_test(&original, json!({"sub": "alice"}), false)
+        .expect("session seals");
+
+    let mut presentation = base_config();
+    presentation["behavior"]["post_login_default_path"] = json!("/home");
+    presentation["behavior"]["state_cache_max_entries"] = json!(50);
+    presentation["behavior"]["state_cache_max_entries_per_source"] = json!(5);
+    presentation["behavior"]["challenge_api_status"] = json!(403);
+    presentation["behavior"]["rp_initiated_logout"] = json!(false);
+    presentation["behavior"]["trusted_redirect_hosts"] =
+        json!(["app.example.com", "admin.example.com"]);
+    presentation["session"]["max_cookie_bytes"] = json!(6000);
+    presentation["providers"][0]["logout_path"] = json!("/oauth/bye");
+    let reloaded = OidcRelyingParty::new(&presentation, PluginHttpClient::default())
+        .expect("valid oidc config");
+    let mut ctx = session_ctx(&cookie);
+    assert_continue(
+        reloaded
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+
+    for (field, value) in [
+        ("client_id", json!("other-client")),
+        ("required_roles", json!(["admin"])),
+    ] {
+        let mut semantic = base_config();
+        semantic["providers"][0][field] = value;
+        let changed = OidcRelyingParty::new(&semantic, PluginHttpClient::default())
+            .expect("valid oidc config");
+        let mut ctx = session_ctx(&cookie);
+        assert_reject(
+            changed
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            Some(401),
+        );
+    }
+}
+
+async fn callback_plugin_with(
+    server: &MockServer,
+    configure: impl FnOnce(&mut serde_json::Value),
+) -> OidcRelyingParty {
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(server)
+        .await;
+    let mut config = callback_config();
+    config["providers"][0]["token_endpoint"] = json!(format!("{}/token", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    configure(&mut config);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    prepare_callback_jwks(server).await;
+    plugin
+}
+
+/// MUSE-6: the post-login redirect allowlist is an origin check — scheme,
+/// port, and userinfo included — not a bare host comparison.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn post_login_redirects_require_a_trusted_origin() {
+    const HOST_ONLY: &[&str] = &["App.Example.com"];
+    const DEFAULT_PORT: &[&str] = &["app.example.com:443"];
+    const OTHER_PORT: &[&str] = &["app.example.com:8443"];
+    for (trusted, target, expected) in [
+        (
+            HOST_ONLY,
+            "https://app.example.com/account",
+            "https://app.example.com/account",
+        ),
+        (HOST_ONLY, "http://app.example.com/account", "/"),
+        (HOST_ONLY, "https://app.example.com:9443/admin", "/"),
+        (HOST_ONLY, "https://user@app.example.com/account", "/"),
+        (
+            HOST_ONLY,
+            "https://APP.example.com/account",
+            "https://APP.example.com/account",
+        ),
+        // An explicit default port is the same origin as the bare host, in
+        // both the allowlist entry and the target (PR6833-SOL-4).
+        (
+            HOST_ONLY,
+            "https://app.example.com:443/account",
+            "https://app.example.com:443/account",
+        ),
+        (
+            DEFAULT_PORT,
+            "https://app.example.com/account",
+            "https://app.example.com/account",
+        ),
+        (
+            DEFAULT_PORT,
+            "https://app.example.com:443/account",
+            "https://app.example.com:443/account",
+        ),
+        (DEFAULT_PORT, "https://app.example.com:8443/account", "/"),
+        (
+            OTHER_PORT,
+            "https://app.example.com:8443/admin",
+            "https://app.example.com:8443/admin",
+        ),
+        (OTHER_PORT, "https://app.example.com/admin", "/"),
+    ] {
+        let server = MockServer::start().await;
+        let plugin = callback_plugin_with(&server, |config| {
+            config["behavior"]["trusted_redirect_hosts"] = json!(trusted);
+        })
+        .await;
+        let mut ctx = html_ctx();
+        ctx.query_params
+            .insert("rd".to_string(), target.to_string());
+        let challenge = issue_browser_challenge_for_context(&plugin, ctx).await;
+        let id_token = create_rs256_token(
+            &oidc_id_token_claims(&challenge),
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        );
+        mount_token_and_jwks(&server, &id_token).await;
+        let headers = assert_callback_redirect(
+            complete_callback(&plugin, &challenge, "authorization-code").await,
+        );
+        assert_eq!(
+            headers.get("location").map(String::as_str),
+            Some(expected),
+            "trusted={trusted:?} rd={target}"
+        );
+    }
+}
+
+/// PR6833-SOL-4: an allowlist entry that is not a bare `host` / `host:port`
+/// authority is refused at admission instead of silently matching nothing.
+#[test]
+fn new_rejects_trusted_redirect_entries_that_are_not_authorities() {
+    for entry in [
+        "app.example.com/account",
+        "user@app.example.com",
+        "app.example.com?x=1",
+        "app.example.com:notaport",
+    ] {
+        let mut config = base_config();
+        config["behavior"]["trusted_redirect_hosts"] = json!([entry]);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("trusted_redirect_hosts entry {entry:?} must be rejected"));
+        assert!(error.contains("trusted_redirect_hosts"), "{entry}: {error}");
+    }
+    let mut config = base_config();
+    config["behavior"]["trusted_redirect_hosts"] = json!(["app.example.com:443", "[::1]:8443"]);
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_ok());
+}
+
+/// PR6833-SOL-3: `max_cookie_bytes` bounds only what is issued. Lowering it on
+/// a reload keeps a chunked session larger than the new cap readable.
+#[tokio::test]
+async fn lowering_the_cookie_cap_keeps_existing_chunked_sessions() {
+    let original = OidcRelyingParty::new(&base_config(), PluginHttpClient::default())
+        .expect("valid oidc config");
+    let now = chrono::Utc::now().timestamp();
+    let set_cookie = oidc_sealed_session_cookie_for_test(
+        &original,
+        json!({"sub": "alice", "exp": now + 3600, "groups": "g".repeat(3500)}),
+        false,
+    )
+    .expect("session seals");
+    let header = browser_cookie_header(&set_cookie);
+    assert!(
+        header.len() > 4000,
+        "the fixture must exceed the lowered cap: {}",
+        header.len()
+    );
+
+    let mut lowered = base_config();
+    lowered["session"]["max_cookie_bytes"] = json!(4000);
+    let reloaded =
+        OidcRelyingParty::new(&lowered, PluginHttpClient::default()).expect("valid oidc config");
+    let mut ctx = api_ctx_with_cookie_header(&header);
+    assert_continue(
+        reloaded
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+}
+
+/// PR6833-SOL-1: a leader cancelled after the provider answered `2xx` (here
+/// while the JWKS keys for the refreshed ID token are still being fetched)
+/// must publish the dropped-token state, so the next request carrying the
+/// spent token adopts it instead of becoming a new leader and resubmitting.
+#[tokio::test]
+async fn cancelled_leader_after_an_accepted_refresh_never_resubmits_the_spent_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(json!({"keys": []})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "id_token": "refreshed-id-token-awaiting-jwks",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+    let mut config = refresh_config(&format!("{}/token", server.uri()));
+    config["providers"][0]["jwks_uri"] = json!(format!("{}/jwks", server.uri()));
+    let plugin =
+        OidcRelyingParty::new(&config, PluginHttpClient::default()).expect("valid refresh config");
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({
+            "sub": "oidc-subject",
+            "email": "cancelled@example.test",
+            "exp": now + 3600
+        }),
+        Some("original-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    // The leader posts the grant, receives the 2xx, then blocks on JWKS and is
+    // dropped by the deadline. (If a reused wiremock address left keys cached,
+    // it completes instead; either way the token must be spent exactly once.)
+    let mut cancelled = session_ctx(&cookie);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(1500),
+        plugin.authenticate(&mut cancelled, &consumer_index),
+    )
+    .await;
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        token_endpoint_requests(&requests),
+        1,
+        "the leader reached the token endpoint before it was cancelled"
+    );
+
+    let mut follower = session_ctx(&cookie);
+    assert_continue(plugin.authenticate(&mut follower, &consumer_index).await);
+    let adopted = rolling_cookie(&plugin, &mut follower)
+        .await
+        .expect("the follower adopts the published dropped-token session");
+    let payload = oidc_open_session_cookie_for_test(&plugin, &adopted).expect("cookie opens");
+    assert_eq!(payload["refresh_token_b64"], json!(null));
+    assert_eq!(payload["access_token_b64"], json!("test-access-token"));
+
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(
+        token_endpoint_requests(&requests),
+        1,
+        "a consumed refresh token must never be resubmitted after cancellation"
+    );
+}
+
+/// MUSE-14: static authorization parameters and `max_age` are sent with the
+/// authorization request; plugin-owned parameters cannot be overridden.
+#[tokio::test]
+async fn authorization_requests_carry_static_params_and_max_age() {
+    let mut config = base_config();
+    config["providers"][0]["max_age_secs"] = json!(300);
+    config["providers"][0]["authorization_params"] =
+        json!({"prompt": "login", "acr_values": "urn:example:mfa"});
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let mut ctx = html_ctx();
+    let PluginResult::Reject { headers, .. } = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await
+    else {
+        panic!("expected browser challenge");
+    };
+    let location = Url::parse(headers.get("location").expect("authorization URL")).unwrap();
+    let query: HashMap<_, _> = location.query_pairs().into_owned().collect();
+    assert_eq!(query.get("max_age").map(String::as_str), Some("300"));
+    assert_eq!(query.get("prompt").map(String::as_str), Some("login"));
+    assert_eq!(
+        query.get("acr_values").map(String::as_str),
+        Some("urn:example:mfa")
+    );
+    assert_eq!(
+        query.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
+
+    for reserved in ["state", "Nonce", "redirect_uri", "max_age", "response_mode"] {
+        let mut config = base_config();
+        let mut params = serde_json::Map::new();
+        params.insert(reserved.to_string(), json!("x"));
+        config["providers"][0]["authorization_params"] = serde_json::Value::Object(params);
+        let error = validate_plugin_config("oidc_relying_party", &config)
+            .err()
+            .unwrap_or_else(|| panic!("authorization_params.{reserved} must be rejected"));
+        assert!(error.contains("authorization_params"), "{error}");
+    }
+    let mut config = base_config();
+    config["providers"][0]["authorization_params"] = json!({"prompt": 1});
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_err());
+    let mut config = base_config();
+    config["providers"][0]["max_age_secs"] = json!(31_536_001);
+    assert!(validate_plugin_config("oidc_relying_party", &config).is_err());
+}
+
+/// MUSE-14: with `max_age_secs`, a callback ID token without a fresh
+/// `auth_time` is refused, and a session whose authentication is older than
+/// the policy re-challenges instead of refreshing.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn max_age_enforces_auth_time_at_callback_and_on_every_request() {
+    let now = chrono::Utc::now().timestamp();
+    for (auth_time, admitted) in [(None, false), (Some(now - 3600), false), (Some(now), true)] {
+        let server = MockServer::start().await;
+        let plugin = callback_plugin_with(&server, |config| {
+            config["providers"][0]["max_age_secs"] = json!(300);
+        })
+        .await;
+        let challenge = issue_browser_challenge(&plugin).await;
+        let mut claims = oidc_id_token_claims(&challenge);
+        if let Some(auth_time) = auth_time {
+            claims["auth_time"] = json!(auth_time);
+        }
+        let id_token = create_rs256_token(
+            &claims,
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        );
+        mount_token_and_jwks(&server, &id_token).await;
+        match complete_callback(&plugin, &challenge, "authorization-code").await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } if admitted => assert_eq!(status_code, 302, "{body}"),
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400);
+                assert_eq!(body, r#"{"error":"Invalid ID token auth_time"}"#);
+            }
+            other => panic!("expected a callback response, got {other:?}"),
+        }
+    }
+
+    let mut config = base_config();
+    config["providers"][0]["max_age_secs"] = json!(300);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    for (auth_time, admitted) in [(Some(now), true), (Some(now - 1000), false), (None, false)] {
+        let mut claims = json!({"sub": "alice", "exp": now + 3600});
+        if let Some(auth_time) = auth_time {
+            claims["auth_time"] = json!(auth_time);
+        }
+        let cookie =
+            oidc_sealed_session_cookie_for_test(&plugin, claims, false).expect("session seals");
+        let mut ctx = session_ctx(&cookie);
+        let result = plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await;
+        if admitted {
+            assert_continue(result);
+        } else {
+            assert_reject(result, Some(401));
+        }
+    }
+}
+
+/// MUSE-13: with `forward_access_token`, the backend receives the session's
+/// current access token as the only `Authorization` header; a client-supplied
+/// value never survives, and without the option nothing changes.
+#[tokio::test]
+async fn forward_access_token_owns_the_backend_authorization_header() {
+    let mut config = base_config();
+    config["providers"][0]["forward_access_token"] = json!(true);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    assert!(
+        plugin
+            .modified_request_header_names()
+            .is_some_and(|names| names.iter().any(|name| name == "authorization"))
+    );
+    let cookie = oidc_sealed_session_cookie_for_test(&plugin, json!({"sub": "alice"}), false)
+        .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let mut upstream = HashMap::from([
+        (
+            "Authorization".to_string(),
+            "Bearer client-forged".to_string(),
+        ),
+        ("x-other".to_string(), "kept".to_string()),
+    ]);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut upstream).await);
+    let authorization: Vec<_> = upstream
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    assert_eq!(authorization, vec!["Bearer test-access-token"]);
+    assert_eq!(upstream.get("x-other").map(String::as_str), Some("kept"));
+
+    // No accepted OIDC session: the client copy is still removed.
+    let mut unauthenticated = RequestContext::new("127.0.0.1".into(), "GET".into(), "/app".into());
+    let mut upstream = HashMap::from([("authorization".to_string(), "Bearer forged".to_string())]);
+    assert_continue(
+        plugin
+            .before_proxy(&mut unauthenticated, &mut upstream)
+            .await,
+    );
+    assert!(!upstream.contains_key("authorization"));
+
+    // Disabled (the default): the header is untouched.
+    let plain = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let cookie = oidc_sealed_session_cookie_for_test(&plain, json!({"sub": "alice"}), false)
+        .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+    assert_continue(plain.authenticate(&mut ctx, &ConsumerIndex::new(&[])).await);
+    let mut upstream = HashMap::from([("authorization".to_string(), "Bearer client".to_string())]);
+    assert_continue(plain.before_proxy(&mut ctx, &mut upstream).await);
+    assert_eq!(
+        upstream.get("authorization").map(String::as_str),
+        Some("Bearer client")
+    );
+}
+
+/// MUSE-13: the relayed token is the refreshed one.
+#[tokio::test]
+async fn forward_access_token_relays_the_refreshed_access_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "refreshed-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+    let mut config = refresh_config(&format!("{}/token", server.uri()));
+    config["providers"][0]["forward_access_token"] = json!(true);
+    let plugin = OidcRelyingParty::new(&config, PluginHttpClient::default()).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let cookie = oidc_sealed_refresh_session_cookie_for_test(
+        &plugin,
+        json!({"sub": "oidc-subject", "email": "relay@example.test", "exp": now + 3600}),
+        Some("original-refresh-token".to_string()),
+        true,
+        false,
+    )
+    .expect("session seals");
+    let mut ctx = session_ctx(&cookie);
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    let mut upstream = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut upstream).await);
+    assert_eq!(
+        upstream.get("authorization").map(String::as_str),
+        Some("Bearer refreshed-access-token")
+    );
+}
+
+/// MUSE-7 / issue #6660: logout is state-changing, so a cross-site link or form
+/// cannot trigger it. Refusals clear nothing and contact no provider.
+#[tokio::test]
+async fn logout_refuses_cross_site_requests() {
+    let plugin = OidcRelyingParty::new(&base_config(), PluginHttpClient::default()).unwrap();
+    let logout = |method: &str, fetch_site: Option<&str>| {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".into(),
+            method.to_string(),
+            "/oauth/logout".into(),
+        );
+        ctx.request_is_secure = true;
+        ctx.headers
+            .insert("host".to_string(), "app.example.com".to_string());
+        if let Some(fetch_site) = fetch_site {
+            ctx.headers
+                .insert("sec-fetch-site".to_string(), fetch_site.to_string());
+        }
+        ctx
+    };
+    for (method, fetch_site, expected) in [
+        ("GET", None, 403),
+        ("GET", Some("cross-site"), 403),
+        ("GET", Some("same-site"), 403),
+        ("GET", Some("same-origin"), 200),
+        ("GET", Some("none"), 200),
+        ("HEAD", Some("cross-site"), 403),
+        ("POST", None, 200),
+        ("POST", Some("same-origin"), 200),
+        ("POST", Some("cross-site"), 403),
+        ("PUT", Some("same-origin"), 405),
+    ] {
+        let mut ctx = logout(method, fetch_site);
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Reject {
+                status_code,
+                headers,
+                ..
+            } => {
+                assert_eq!(status_code, expected, "{method} {fetch_site:?}");
+                assert_eq!(
+                    headers.contains_key("set-cookie"),
+                    expected == 200,
+                    "only an accepted logout clears the session: {method} {fetch_site:?}"
+                );
+            }
+            other => panic!("logout must terminate locally, got {other:?}"),
+        }
     }
 }

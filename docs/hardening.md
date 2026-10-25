@@ -144,10 +144,12 @@ link-local, multicast and unspecified addresses. Precedence is first match wins:
 `FERRUM_BACKEND_ALLOW_CIDRS`, then `FERRUM_BACKEND_DENY_CIDRS`, then the
 dangerous-range baseline, then `FERRUM_BACKEND_ALLOW_IPS`.
 
-`kafka_logging` is admitted **only** under a fully open egress policy, because
-librdkafka dials cluster-advertised brokers Ferrum never screens. If you enable
-it you have given up backend egress enforcement process-wide — see
-[`kafka_logging` requires a fully-open egress policy](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
+`kafka_logging` is refused under any egress policy that can deny addresses,
+because librdkafka resolves broker hostnames and dials cluster-advertised
+brokers Ferrum never screens. Keep the policy on and attest a trusted cluster
+with `FERRUM_KAFKA_ALLOWED_BROKERS` (list every broker the cluster advertises,
+or its subnet) rather than disarming backend egress enforcement process-wide —
+see [`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies).
 
 Database connections have their own TLS surface: see
 [database_tls.md](database_tls.md) and, for MongoDB, [mongodb.md](mongodb.md).

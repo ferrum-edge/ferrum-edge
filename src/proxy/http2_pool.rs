@@ -644,17 +644,19 @@ impl Http2PoolManager {
     }
 
     fn effective_client_cert_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
-        proxy.resolved_tls.client_cert_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_cert_path
-            .as_deref())
+        proxy.resolved_tls.effective_client_cert_path(
+            self.global_env_config
+                .backend_tls_client_cert_path
+                .as_deref(),
+        )
     }
 
     fn effective_client_key_path<'a>(&'a self, proxy: &'a Proxy) -> Option<&'a str> {
-        proxy.resolved_tls.client_key_path.as_deref().or(self
-            .global_env_config
-            .backend_tls_client_key_path
-            .as_deref())
+        proxy.resolved_tls.effective_client_key_path(
+            self.global_env_config
+                .backend_tls_client_key_path
+                .as_deref(),
+        )
     }
 
     fn write_pool_key(

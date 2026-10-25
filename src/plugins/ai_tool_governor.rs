@@ -28,8 +28,11 @@
 //!   and legacy `choices[].delta.function_call` (the `functions` API's one
 //!   implicit call per choice) deltas, Anthropic `content_block_start` /
 //!   `content_block_delta` (`input_json_delta`) blocks, Cohere v2
-//!   `tool-call-start` / `tool-call-delta` events, and Google
-//!   `candidates[].content.parts[].functionCall` chunks, accumulated across
+//!   `tool-call-start` / `tool-call-delta` events, Google
+//!   `candidates[].content.parts[].functionCall` chunks, and OpenAI Responses
+//!   `response.output_item.added` / `response.function_call_arguments.delta`
+//!   events (whose `.done` / `response.completed` restatements must match the
+//!   accumulated call exactly), accumulated across
 //!   split frames; tool-call frames are HELD until
 //!   the call is complete and policy/approval clears it, then released — or the
 //!   stream is terminated with an SSE error event, never leaking the held call.
@@ -42,7 +45,9 @@
 //!   are not coerced.
 //!
 //! Actions per tool: `allow`, `deny`, `redact_args`, `require_approval`,
-//! `dry_run`. In `mode: dry_run` the plugin evaluates and emits metadata but
+//! `dry_run`. `tools` keys are exact names or `*` globs (an exact key always
+//! wins; among globs the most specific wins), and a policy may be scoped to
+//! mapped Consumers or their ACL groups (`allowed_*` / `denied_*`). In `mode: dry_run` the plugin evaluates and emits metadata but
 //! never rejects. In `mode: enforce` it fails closed when a configured policy
 //! or the approval endpoint cannot be evaluated, unless the approval
 //! `fail_on_error` says `warn`/`allow`. Enforce mode also fails closed on
@@ -121,6 +126,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 use url::Url;
 
+use crate::config::types::Consumer;
 use crate::fips::approved::Sha256;
 
 use crate::util::json_dup_keys;
@@ -129,7 +135,9 @@ use crate::util::unknown_keys::reject_unknown_keys;
 use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
+use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::response_body::read_response_body_bounded;
+use super::utils::socket_host::is_loopback_ip_literal_endpoint;
 use super::utils::sse::{
     encode_sse_error_event, is_sse_request, sse_event_on_fresh_line, sse_lines,
 };
@@ -171,6 +179,10 @@ pub const AI_TOOL_GOVERNOR_TOOL_POLICY_KEYS: &[&str] = &[
     "required_args",
     "blocked_arg_patterns",
     "json_schema",
+    "allowed_consumers",
+    "denied_consumers",
+    "allowed_groups",
+    "denied_groups",
 ];
 
 /// Accepted blocked-argument pattern entry keys.
@@ -183,6 +195,8 @@ pub const AI_TOOL_GOVERNOR_APPROVAL_KEYS: &[&str] = &[
     "cache_ttl_seconds",
     "fail_on_error",
     "include_arguments",
+    "headers",
+    "allow_plaintext",
 ];
 
 /// Accepted `response` object keys.
@@ -223,6 +237,43 @@ const MAX_APPROVAL_BATCH_DEADLINE: Duration = Duration::from_secs(30);
 /// batch. Attacker-selected unique argument sets cannot otherwise force an
 /// unbounded approval fan-out within the 4 MiB parse window.
 const MAX_GOVERNABLE_CALLS: usize = 64;
+/// Maximum approval webhook calls one governed batch keeps in flight at once.
+/// Parallel tool calls are the normal multi-tool shape, so resolving them one
+/// after another would add `N × webhook RTT`; this bounds the concurrent
+/// fan-out instead. Once an enforce-mode block is observed no further call is
+/// started, and every call still shares the whole-batch deadline.
+const MAX_CONCURRENT_APPROVALS: usize = 8;
+/// Maximum `tools` keys that contain a `*` wildcard. Glob keys are matched in
+/// order for every call that misses the exact-name index, so their count is
+/// bounded independently of exact keys.
+const MAX_TOOL_GLOB_KEYS: usize = 256;
+/// Maximum length of one glob `tools` key, in UTF-8 bytes.
+const MAX_TOOL_GLOB_KEY_BYTES: usize = 256;
+/// Maximum entries in one per-tool identity list (`allowed_consumers`, …).
+const MAX_CALLER_SCOPE_ENTRIES: usize = 256;
+/// Maximum length of one identity-list entry, in UTF-8 bytes.
+const MAX_CALLER_SCOPE_ENTRY_BYTES: usize = 512;
+/// Maximum `approval.headers` entries.
+const MAX_APPROVAL_HEADERS: usize = 32;
+/// Maximum `approval.headers` value length, in UTF-8 bytes.
+const MAX_APPROVAL_HEADER_VALUE_BYTES: usize = 8192;
+/// Diagnostic label for `approval.headers` secret references. Never carries the
+/// referenced name or its value.
+const APPROVAL_HEADERS_FIELD: &str = "ai_tool_governor: `approval.headers`";
+/// Header names the approval request owns itself: framing, connection control,
+/// the JSON body type, and the routing authority.
+const RESERVED_APPROVAL_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "host",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
+];
 /// Maximum `blocked_arg_patterns` entries per tool. Each pattern runs
 /// `replace_all` over the prior result during `redact_args`.
 const MAX_BLOCKED_ARG_PATTERNS: usize = 32;
@@ -272,6 +323,13 @@ const UNRECOGNIZED_RESPONSE_SHAPE: &str =
 /// Fixed-cardinality transaction-log label for [`UNRECOGNIZED_RESPONSE_SHAPE`].
 /// Never echoes body, provider, model, tool, or backend-controlled bytes.
 const UNRECOGNIZED_SHAPE_OBSERVATION: &str = "unrecognized_tool_call_shape";
+/// Fixed reason for a governed response that is a complete, well-formed JSON
+/// document (the bounded scanner validated it end to end) which `serde_json`
+/// still refuses to materialize — nesting past its 128-level recursion limit,
+/// or a number outside its range. Other parsers read such a document, so a
+/// tool call inside it was never evaluated: uninspectable, not "no calls".
+/// Malformed bytes keep the documented forward-on-parse-failure posture.
+const UNMATERIALIZABLE_RESPONSE_JSON: &str = "response body is well-formed JSON that exceeds the inspection parser's nesting or numeric limits and cannot be policy-checked";
 /// Metadata key for [`AMBIGUITY_OBSERVATION_REASON`]. Kept separate from
 /// `decision` so dry-run can record the observation as `decision=dry_run`
 /// without claiming enforcement via `decision=deny`.
@@ -494,6 +552,89 @@ struct ToolPolicy {
     required_args: Vec<String>,
     blocked_arg_patterns: Vec<BlockedArgPattern>,
     json_schema: Option<jsonschema::Validator>,
+    /// Optional caller-identity scope for this policy.
+    callers: CallerScope,
+}
+
+/// Per-tool caller-identity scope (`allowed_consumers`, `denied_consumers`,
+/// `allowed_groups`, `denied_groups`), evaluated against the gateway-mapped
+/// Consumer (its `username` and `acl_groups`). Empty means unrestricted.
+#[derive(Default)]
+struct CallerScope {
+    allowed_consumers: HashSet<String>,
+    denied_consumers: HashSet<String>,
+    allowed_groups: HashSet<String>,
+    denied_groups: HashSet<String>,
+}
+
+impl CallerScope {
+    fn is_empty(&self) -> bool {
+        self.allowed_consumers.is_empty()
+            && self.denied_consumers.is_empty()
+            && self.allowed_groups.is_empty()
+            && self.denied_groups.is_empty()
+    }
+
+    /// `None` when `caller` may use the tool, else a fixed refusal phrase.
+    ///
+    /// A configured scope with no mapped Consumer fails closed: neither a deny
+    /// list nor an allow list can be evaluated without one. A deny entry wins
+    /// over an allow entry; with any allow list configured the caller must
+    /// match at least one allowed consumer or group.
+    fn refusal(&self, caller: Option<&Consumer>) -> Option<&'static str> {
+        if self.is_empty() {
+            return None;
+        }
+        let Some(caller) = caller else {
+            return Some("restricted to identified consumers");
+        };
+        let username = caller.username.as_str();
+        if self.denied_consumers.contains(username)
+            || caller
+                .acl_groups
+                .iter()
+                .any(|group| self.denied_groups.contains(group))
+        {
+            return Some("denied for this consumer");
+        }
+        let restricted = !self.allowed_consumers.is_empty() || !self.allowed_groups.is_empty();
+        if restricted
+            && !self.allowed_consumers.contains(username)
+            && !caller
+                .acl_groups
+                .iter()
+                .any(|group| self.allowed_groups.contains(group))
+        {
+            return Some("not permitted for this consumer");
+        }
+        None
+    }
+}
+
+/// A `tools` key containing `*`, matched against tool names that have no exact
+/// policy. `*` matches any run of characters (including none); the key is
+/// anchored at both ends.
+struct ToolGlob {
+    pattern: String,
+    policy: ToolPolicy,
+}
+
+/// `approval.headers` with every secret reference resolved.
+type ResolvedApprovalHeaders = Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>;
+
+/// One configured `approval.headers` value.
+enum ApprovalHeaderValue {
+    /// A literal value, validated at admission.
+    Literal(reqwest::header::HeaderValue),
+    /// A whole-value `${FERRUM_PLUGIN_SECRET_<NAME>}` reference, shape-checked at
+    /// admission and resolved at the first approval call so config validation
+    /// never needs the live secret.
+    SecretEnv(String),
+}
+
+struct ApprovalHeader {
+    name: reqwest::header::HeaderName,
+    value: ApprovalHeaderValue,
 }
 
 /// Approval webhook configuration.
@@ -505,6 +646,38 @@ struct ApprovalConfig {
     cache_ttl: Duration,
     fail_on_error: FailOnError,
     include_arguments: bool,
+    /// Operator-configured request headers (for example an `Authorization`
+    /// credential for the approval service).
+    headers: Vec<ApprovalHeader>,
+    /// `headers` with every secret reference resolved, built once at the first
+    /// approval call. A failed resolution is not cached and surfaces as an
+    /// approval endpoint error (`fail_on_error`).
+    resolved_headers: tokio::sync::OnceCell<ResolvedApprovalHeaders>,
+}
+
+impl ApprovalConfig {
+    fn resolve_headers(&self) -> Result<ResolvedApprovalHeaders, String> {
+        let mut resolved = Vec::with_capacity(self.headers.len());
+        for header in &self.headers {
+            let value = match &header.value {
+                ApprovalHeaderValue::Literal(value) => value.clone(),
+                ApprovalHeaderValue::SecretEnv(env_name) => {
+                    let secret = resolve_plugin_secret_env(APPROVAL_HEADERS_FIELD, env_name)?;
+                    let mut value =
+                        reqwest::header::HeaderValue::from_str(&secret).map_err(|_| {
+                            format!(
+                                "{APPROVAL_HEADERS_FIELD} secret for `{}` is not a valid HTTP header value",
+                                header.name
+                            )
+                        })?;
+                    value.set_sensitive(true);
+                    value
+                }
+            };
+            resolved.push((header.name.clone(), value));
+        }
+        Ok(resolved)
+    }
 }
 
 /// Response-shaping configuration.
@@ -537,7 +710,11 @@ struct GovernorEngine {
     /// does not recognize. Lives on the engine (not the plugin) because the
     /// streaming inspector holds only an `Arc<GovernorEngine>`.
     unknown_shape_action: UnknownShapeAction,
+    /// Exact-name policies. An exact key always wins over every glob key.
     tools: HashMap<String, ToolPolicy>,
+    /// Glob policies, pre-sorted most specific first (see
+    /// [`tool_glob_specificity_order`]); the first match wins.
+    tool_globs: Vec<ToolGlob>,
     approval: Option<ApprovalConfig>,
     response: ResponseConfig,
     observability: ObservabilityConfig,
@@ -611,7 +788,18 @@ enum DefinitionOutcome {
 #[derive(Debug, Clone, Default)]
 struct CorrelationMeta {
     request_id: String,
+    /// Display identity (Consumer username, else the external subject). Not
+    /// authority-qualified; decisions key on `principal`.
     consumer: Option<String>,
+    /// Authority-qualified caller identity: a mapped Consumer by namespace and
+    /// record id, or an external subject together with the realm (mechanism +
+    /// verifying-authority digest) that vouched for it. Equal subject strings
+    /// from different authorities are different principals, so this — not the
+    /// bare `consumer` string — keys approval caching and governed-call
+    /// identities, and is sent to the webhook as `principal`.
+    principal: Option<Value>,
+    /// The mapped Consumer, for per-tool `allowed_*` / `denied_*` scopes.
+    caller: Option<Arc<Consumer>>,
     proxy: Option<String>,
     model: Option<String>,
     provider: Option<String>,
@@ -634,7 +822,9 @@ struct ApprovalInput<'a> {
 /// Per-call decision after resolution.
 struct CallDecision {
     name: String,
-    matched_policy: bool,
+    /// Key of the `tools` policy that governed the call (exact name or glob),
+    /// `None` when `default_action` decided.
+    policy_id: Option<String>,
     risk: RiskLevel,
     label: &'static str,
     blocks: bool,
@@ -645,6 +835,59 @@ struct CallDecision {
     approval_id: Option<String>,
     arguments_hash: Option<String>,
     reason: Option<String>,
+}
+
+/// The approval-dependent fields of one [`CallDecision`], computed by an
+/// approval resolution that runs concurrently with its batch siblings and
+/// applied to the decision afterwards.
+#[derive(Clone)]
+struct ApprovalResolution {
+    label: &'static str,
+    blocks: bool,
+    fail_closed: bool,
+    approval_id: Option<String>,
+    reason: Option<String>,
+}
+
+impl ApprovalResolution {
+    /// Dry-run: the webhook is never called; the observational label stands.
+    fn observed() -> Self {
+        Self {
+            label: "require_approval",
+            blocks: false,
+            fail_closed: false,
+            approval_id: None,
+            reason: None,
+        }
+    }
+
+    fn approved(approval_id: Option<String>) -> Self {
+        Self {
+            label: "approved",
+            blocks: false,
+            fail_closed: false,
+            approval_id,
+            reason: None,
+        }
+    }
+
+    fn refused(fail_closed: bool, approval_id: Option<String>, reason: &str) -> Self {
+        Self {
+            label: "approval_denied",
+            blocks: true,
+            fail_closed,
+            approval_id,
+            reason: Some(reason.to_string()),
+        }
+    }
+
+    fn apply(self, decision: &mut CallDecision) {
+        decision.label = self.label;
+        decision.blocks = self.blocks;
+        decision.fail_closed = self.fail_closed;
+        decision.approval_id = self.approval_id;
+        decision.reason = self.reason;
+    }
 }
 
 /// Aggregate decision across a batch of tool calls.
@@ -843,15 +1086,28 @@ impl GovernorEngine {
             .unwrap_or_else(Instant::now)
     }
 
-    /// Deterministic evaluation of one tool call. Returns the outcome, whether
-    /// an explicit policy matched, and the call's risk.
+    /// The policy governing `name`: the exact key when one exists, otherwise
+    /// the most specific matching glob key. Returns the policy key with it.
+    fn policy_for(&self, name: &str) -> Option<(&str, &ToolPolicy)> {
+        if let Some((key, policy)) = self.tools.get_key_value(name) {
+            return Some((key.as_str(), policy));
+        }
+        self.tool_globs
+            .iter()
+            .find(|glob| tool_glob_matches(&glob.pattern, name))
+            .map(|glob| (glob.pattern.as_str(), &glob.policy))
+    }
+
+    /// Deterministic evaluation of one tool call. Returns the outcome, the key
+    /// of the policy that matched (if any), and the call's risk.
     fn evaluate(
         &self,
         name: &str,
         raw_args: &str,
         parsed: Option<&Value>,
-    ) -> (PolicyOutcome, bool, RiskLevel) {
-        let Some(policy) = self.tools.get(name) else {
+        caller: Option<&Consumer>,
+    ) -> (PolicyOutcome, Option<&str>, RiskLevel) {
+        let Some((policy_id, policy)) = self.policy_for(name) else {
             let outcome = match self.default_action {
                 DefaultAction::Allow => PolicyOutcome::Allow,
                 DefaultAction::Deny => {
@@ -859,13 +1115,14 @@ impl GovernorEngine {
                 }
                 DefaultAction::RequireApproval => PolicyOutcome::RequireApproval,
             };
-            return (outcome, false, RiskLevel::Low);
+            return (outcome, None, RiskLevel::Low);
         };
+        let matched = Some(policy_id);
 
         if policy.action == ToolAction::Deny {
             return (
                 PolicyOutcome::Deny(format!("tool '{name}' is denied by policy")),
-                true,
+                matched,
                 policy.risk,
             );
         }
@@ -876,7 +1133,17 @@ impl GovernorEngine {
         // `required_args` / `json_schema` / `blocked_arg_patterns` would still
         // reject in enforce mode instead of letting operators observe safely.
         if policy.action == ToolAction::DryRun {
-            return (PolicyOutcome::DryRun, true, policy.risk);
+            return (PolicyOutcome::DryRun, matched, policy.risk);
+        }
+
+        // Caller-identity scope: decided before any argument check, and before
+        // approval, so a caller outside the scope never reaches the webhook.
+        if let Some(refusal) = policy.callers.refusal(caller) {
+            return (
+                PolicyOutcome::Deny(format!("tool '{name}' is {refusal}")),
+                matched,
+                policy.risk,
+            );
         }
 
         if let Some(max) = policy.max_arg_bytes
@@ -887,7 +1154,7 @@ impl GovernorEngine {
                     "tool '{name}' arguments exceed max_arg_bytes ({} > {max})",
                     raw_args.len()
                 )),
-                true,
+                matched,
                 policy.risk,
             );
         }
@@ -901,7 +1168,7 @@ impl GovernorEngine {
                                 PolicyOutcome::Deny(format!(
                                     "tool '{name}' missing required argument '{req}'"
                                 )),
-                                true,
+                                matched,
                                 policy.risk,
                             );
                         }
@@ -912,7 +1179,7 @@ impl GovernorEngine {
                         PolicyOutcome::Deny(format!(
                             "tool '{name}' arguments are not a JSON object"
                         )),
-                        true,
+                        matched,
                         policy.risk,
                     );
                 }
@@ -926,25 +1193,69 @@ impl GovernorEngine {
                     PolicyOutcome::Deny(format!(
                         "tool '{name}' arguments failed JSON Schema validation"
                     )),
-                    true,
+                    matched,
                     policy.risk,
                 );
             }
         }
 
+        // String-argument dialects (OpenAI / Cohere `function.arguments`) carry
+        // model-controlled JSON SOURCE, so a JSON escape (`\u005f`, `\/`, …)
+        // can hide a secret from a regex run over the raw text while the
+        // executing runtime decodes it. Screen the decoded views too.
+        let decoded = if policy.blocked_arg_patterns.is_empty() {
+            DecodedArgumentViews::empty()
+        } else {
+            DecodedArgumentViews::new(raw_args, parsed)
+        };
+        // An escaped arguments document that is well-formed JSON but too deep
+        // for the inspection parser has no decoded view at all, so its escapes
+        // could hide a match from every check below: uninspectable.
+        if !policy.blocked_arg_patterns.is_empty()
+            && parsed.is_none()
+            && raw_args.contains('\\')
+            && is_well_formed_json(raw_args.as_bytes())
+        {
+            return (
+                PolicyOutcome::Deny(format!(
+                    "tool '{name}' arguments exceed the inspection parser's limits and cannot be screened for blocked patterns"
+                )),
+                matched,
+                policy.risk,
+            );
+        }
+        let redacting = policy.action == ToolAction::RedactArgs;
         let mut matched_patterns = Vec::new();
         for bp in &policy.blocked_arg_patterns {
-            if bp.regex.is_match(raw_args) {
+            // Redaction can only act on raw matches; its decoded coverage is
+            // decided separately below.
+            if bp.regex.is_match(raw_args) || (!redacting && decoded.any_match(&bp.regex)) {
                 matched_patterns.push(bp.name.clone());
             }
         }
-        if !matched_patterns.is_empty() && policy.action != ToolAction::RedactArgs {
+        // Redaction rewrites the raw text, so it removes only the occurrences
+        // visible there. Decide on the decoded views of the ACTUAL rewritten
+        // arguments (this plugin's own placeholders removed): any surviving
+        // match is an escape-hidden occurrence the rewrite cannot remove.
+        let decoded_only = redacting
+            && !decoded.is_empty()
+            && self.redaction_leaves_decoded_match(raw_args, &policy.blocked_arg_patterns);
+        if decoded_only {
+            return (
+                PolicyOutcome::Deny(format!(
+                    "tool '{name}' arguments match a blocked pattern only in their JSON-decoded form and cannot be redacted in place"
+                )),
+                matched,
+                policy.risk,
+            );
+        }
+        if !matched_patterns.is_empty() && !redacting {
             return (
                 PolicyOutcome::Deny(format!(
                     "tool '{name}' arguments matched blocked pattern(s): {}",
                     matched_patterns.join(", ")
                 )),
-                true,
+                matched,
                 policy.risk,
             );
         }
@@ -953,18 +1264,58 @@ impl GovernorEngine {
             ToolAction::Allow => PolicyOutcome::Allow,
             ToolAction::RedactArgs => PolicyOutcome::Redact(matched_patterns),
             ToolAction::RequireApproval => PolicyOutcome::RequireApproval,
+            // Both returned above; kept total without an `unreachable!`.
             ToolAction::DryRun => PolicyOutcome::DryRun,
-            ToolAction::Deny => unreachable!("deny handled above"),
+            ToolAction::Deny => PolicyOutcome::Deny(format!("tool '{name}' is denied by policy")),
         };
-        (outcome, true, policy.risk)
+        (outcome, matched, policy.risk)
+    }
+
+    /// Whether a blocked pattern still matches a JSON-decoded view of the
+    /// arguments AFTER `redact_args` rewrote the raw text. This plugin's own
+    /// rendered placeholders are removed from each view first, so a pattern
+    /// that matches its own placeholder is not re-flagged. A rewrite that
+    /// cannot be computed or no longer parses is left to the redaction paths,
+    /// which already fail closed on amplification.
+    fn redaction_leaves_decoded_match(
+        &self,
+        raw_args: &str,
+        patterns: &[BlockedArgPattern],
+    ) -> bool {
+        let placeholder = &self.response.redaction_placeholder;
+        let Ok((redacted, _)) = redact_arguments(raw_args, patterns, placeholder) else {
+            return false;
+        };
+        let Ok(rewritten) = serde_json::from_str::<Value>(&redacted) else {
+            return false;
+        };
+        let rendered: Vec<String> = patterns
+            .iter()
+            .filter_map(|pattern| render_redaction_placeholder(placeholder, &pattern.name).ok())
+            .filter(|rendered| !rendered.is_empty())
+            .collect();
+        let strip = |view: &str| -> String {
+            let mut view = view.to_string();
+            for rendered in &rendered {
+                view = view.replace(rendered.as_str(), "");
+            }
+            view
+        };
+        let mut views = vec![strip(rewritten.to_string().as_str())];
+        views.extend(json_string_leaves(&rewritten).into_iter().map(strip));
+        patterns
+            .iter()
+            .any(|pattern| views.iter().any(|view| pattern.regex.is_match(view)))
     }
 
     /// Govern a tool *definition* (name only, no arguments).
     /// `require_approval` cannot be resolved for a bare definition because
-    /// there are no concrete arguments to send to the approval webhook.
-    fn definition_outcome(&self, name: &str) -> DefinitionOutcome {
-        match self.tools.get(name) {
-            Some(policy)
+    /// there are no concrete arguments to send to the approval webhook. A
+    /// definition outside the caller's identity scope is refused like a denied
+    /// tool: the model should never be offered a tool this caller may not use.
+    fn definition_outcome(&self, name: &str, caller: Option<&Consumer>) -> DefinitionOutcome {
+        match self.policy_for(name) {
+            Some((_, policy))
                 if matches!(
                     policy.action,
                     ToolAction::Deny | ToolAction::RequireApproval
@@ -972,8 +1323,11 @@ impl GovernorEngine {
             {
                 DefinitionOutcome::Deny(policy.risk)
             }
-            Some(policy) if policy.action == ToolAction::DryRun => {
+            Some((_, policy)) if policy.action == ToolAction::DryRun => {
                 DefinitionOutcome::DryRun(policy.risk)
+            }
+            Some((_, policy)) if policy.callers.refusal(caller).is_some() => {
+                DefinitionOutcome::Deny(policy.risk)
             }
             Some(_) => DefinitionOutcome::Allow,
             None if matches!(
@@ -1013,7 +1367,7 @@ impl GovernorEngine {
                 .take(MAX_GOVERNABLE_CALLS.saturating_add(1))
                 .map(|call| CallDecision {
                     name: call.name.clone(),
-                    matched_policy: false,
+                    policy_id: None,
                     risk: RiskLevel::High,
                     label: "deny",
                     blocks: true,
@@ -1038,13 +1392,21 @@ impl GovernorEngine {
             };
         }
 
+        let caller = corr.caller.as_deref();
         let mut per_call = Vec::with_capacity(calls.len());
         // Evaluation can run JSON Schema validation and every configured
         // blocked-argument regex. Cache it for the deterministic-denial
         // pre-scan and the main loop instead of doing that work twice.
         let evaluations: Vec<_> = calls
             .iter()
-            .map(|call| self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref()))
+            .map(|call| {
+                self.evaluate(
+                    &call.name,
+                    &call.raw_args,
+                    call.parsed_args.as_ref(),
+                    caller,
+                )
+            })
             .collect();
         // Preflight every deterministic redaction once before resolving any
         // approval. Keep successful rewrites (aggregate-capped) so the
@@ -1061,7 +1423,7 @@ impl GovernorEngine {
             if redaction_unavailable || patterns.is_empty() {
                 continue;
             }
-            let Some(policy) = self.tools.get(&call.name) else {
+            let Some((_, policy)) = self.policy_for(&call.name) else {
                 continue;
             };
             let Ok((redacted, changed)) = redact_arguments(
@@ -1089,23 +1451,27 @@ impl GovernorEngine {
             redacted_argument_bytes = next_total;
             redaction_memos.insert(redaction_memo_key(&call.name, &call.raw_args), redacted);
         }
-        let mut skip_approvals = self.mode == Mode::Enforce
+        let skip_approvals = self.mode == Mode::Enforce
             && (evaluations.iter().any(|(outcome, _, _)| match outcome {
                 PolicyOutcome::Deny(_) => true,
                 PolicyOutcome::Redact(patterns) => redaction_unavailable && !patterns.is_empty(),
                 _ => false,
             }) || redaction_amplification.iter().any(|failed| *failed));
-        // Whole-batch approval deadline: sequential webhook waits cannot exceed
-        // this ceiling even when every call misses the cache.
+        // Whole-batch approval deadline: approval waits cannot exceed this
+        // ceiling even when every call misses the cache.
         let approval_deadline = self
             .approval_now()
             .checked_add(MAX_APPROVAL_BATCH_DEADLINE)
             .unwrap_or_else(|| self.approval_now());
 
-        for ((call, (outcome, matched, risk)), amplification) in calls
+        // Deterministic decisions first; approval-gated calls are collected and
+        // resolved together below with bounded concurrency.
+        let mut pending_approvals: Vec<usize> = Vec::new();
+        for (index, ((call, (outcome, policy_id, risk)), amplification)) in calls
             .iter()
             .zip(evaluations)
             .zip(redaction_amplification.iter().copied())
+            .enumerate()
         {
             let arguments_hash = self
                 .observability
@@ -1114,14 +1480,14 @@ impl GovernorEngine {
 
             let mut cd = CallDecision {
                 name: call.name.clone(),
-                matched_policy: matched,
+                policy_id: policy_id.map(str::to_string),
                 risk,
                 label: "allow",
                 blocks: false,
                 fail_closed: false,
                 redact_patterns: Vec::new(),
                 approval_id: None,
-                arguments_hash: arguments_hash.clone(),
+                arguments_hash,
                 reason: None,
             };
 
@@ -1163,25 +1529,37 @@ impl GovernorEngine {
                     }
                 }
                 PolicyOutcome::RequireApproval => {
-                    if skip_approvals {
-                        cd.label = "require_approval";
-                    } else {
-                        self.resolve_require_approval(corr, call, ns, approval_deadline, &mut cd)
-                            .await;
-                        // Stop further webhook fan-out once enforce mode has a
-                        // blocking decision; remaining calls keep an
-                        // observational require_approval label.
-                        if cd.blocks && self.mode == Mode::Enforce {
-                            skip_approvals = true;
-                        }
+                    // Observational label until (and unless) the webhook
+                    // resolves it; a call never started keeps it.
+                    cd.label = "require_approval";
+                    if !skip_approvals {
+                        pending_approvals.push(index);
                     }
                 }
             }
+            per_call.push(cd);
+        }
 
-            // Raw arguments are logged only when the operator explicitly opts in
-            // with a positive `max_argument_log_bytes`, and only for a blocked
-            // call (audit trail). Default 0 keeps secrets out of logs entirely.
-            if cd.blocks && self.observability.max_argument_log_bytes > 0 {
+        if !pending_approvals.is_empty() {
+            self.resolve_pending_approvals(
+                corr,
+                calls,
+                ns,
+                approval_deadline,
+                &pending_approvals,
+                &mut per_call,
+            )
+            .await;
+        }
+
+        // Raw arguments are logged only when the operator explicitly opts in
+        // with a positive `max_argument_log_bytes`, and only for a blocked
+        // call (audit trail). Default 0 keeps secrets out of logs entirely.
+        if self.observability.max_argument_log_bytes > 0 {
+            for (call, cd) in calls.iter().zip(per_call.iter()) {
+                if !cd.blocks {
+                    continue;
+                }
                 debug!(
                     target: "ai_tool_governor",
                     tool = %call.name,
@@ -1190,8 +1568,6 @@ impl GovernorEngine {
                     truncate_str(&call.raw_args, self.observability.max_argument_log_bytes)
                 );
             }
-
-            per_call.push(cd);
         }
 
         let enforce = self.mode == Mode::Enforce;
@@ -1232,51 +1608,131 @@ impl GovernorEngine {
         }
     }
 
-    /// Resolve a `require_approval` outcome onto `cd`, honoring dry-run mode,
-    /// the approval cache, the webhook, and `fail_on_error`.
+    /// Resolve the batch's approval-gated calls (`pending` indexes into
+    /// `calls` / `per_call`) with at most [`MAX_CONCURRENT_APPROVALS`] webhook
+    /// calls in flight.
     ///
-    /// Risk and arguments hash are read from `cd` (already populated by the
-    /// caller) so this helper stays under clippy's `too_many_arguments` limit.
+    /// Every call shares `approval_deadline`. Once an enforce-mode call blocks
+    /// no further webhook call is STARTED — calls already in flight finish and
+    /// are recorded — and the unstarted ones keep their observational
+    /// `require_approval` label. Calls identical in name and arguments share a
+    /// single resolution when decisions are cacheable (`cache_ttl_seconds > 0`),
+    /// exactly as the second one would have hit the approval cache; the shared
+    /// result carries no fresh `approval_id`, like a cache hit.
+    async fn resolve_pending_approvals(
+        &self,
+        corr: &CorrelationMeta,
+        calls: &[ToolCall],
+        ns: &AtomicU64,
+        approval_deadline: Instant,
+        pending: &[usize],
+        per_call: &mut [CallDecision],
+    ) {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        let share_identical = self
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.cache_ttl > Duration::ZERO);
+        // Leader index for every distinct (name, arguments) pair, and the
+        // followers that reuse its resolution.
+        let mut leaders: Vec<usize> = Vec::with_capacity(pending.len());
+        let mut followers: Vec<(usize, usize)> = Vec::new();
+        if share_identical {
+            let mut first_seen: HashMap<(&str, &str), usize> = HashMap::new();
+            for &index in pending {
+                let call = &calls[index];
+                match first_seen.entry((call.name.as_str(), call.raw_args.as_str())) {
+                    std::collections::hash_map::Entry::Occupied(leader) => {
+                        followers.push((index, *leader.get()));
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(index);
+                        leaders.push(index);
+                    }
+                }
+            }
+        } else {
+            leaders.extend_from_slice(pending);
+        }
+
+        let mut queue = leaders.into_iter();
+        let mut in_flight = FuturesUnordered::new();
+        let mut resolved: HashMap<usize, ApprovalResolution> = HashMap::new();
+        let mut stop = false;
+        loop {
+            while !stop && in_flight.len() < MAX_CONCURRENT_APPROVALS {
+                let Some(index) = queue.next() else {
+                    break;
+                };
+                let risk = per_call[index].risk;
+                let arguments_hash = per_call[index].arguments_hash.clone();
+                let call = &calls[index];
+                in_flight.push(async move {
+                    let resolution = self
+                        .resolve_require_approval(
+                            corr,
+                            call,
+                            ns,
+                            approval_deadline,
+                            risk,
+                            arguments_hash,
+                        )
+                        .await;
+                    (index, resolution)
+                });
+            }
+            let Some((index, resolution)) = in_flight.next().await else {
+                break;
+            };
+            if resolution.blocks && self.mode == Mode::Enforce {
+                stop = true;
+            }
+            resolved.insert(index, resolution);
+        }
+
+        for (index, leader) in followers {
+            if let Some(resolution) = resolved.get(&leader) {
+                let mut shared = resolution.clone();
+                shared.approval_id = None;
+                shared.apply(&mut per_call[index]);
+            }
+        }
+        for (index, resolution) in resolved {
+            resolution.apply(&mut per_call[index]);
+        }
+    }
+
+    /// Resolve one `require_approval` outcome, honoring dry-run mode, the
+    /// approval cache, the webhook, the whole-batch deadline, and
+    /// `fail_on_error`.
     async fn resolve_require_approval(
         &self,
         corr: &CorrelationMeta,
         call: &ToolCall,
         ns: &AtomicU64,
         approval_deadline: Instant,
-        cd: &mut CallDecision,
-    ) {
+        risk: RiskLevel,
+        arguments_hash: Option<String>,
+    ) -> ApprovalResolution {
         // Dry-run never calls the webhook (a rollout must have no side effects);
         // it records the observational "require_approval" label.
         if self.mode == Mode::DryRun {
-            cd.label = "require_approval";
-            return;
+            return ApprovalResolution::observed();
         }
 
         let Some(approval) = &self.approval else {
             // Config validation guarantees an endpoint when require_approval is
             // reachable; defensively fail closed.
-            cd.label = "approval_denied";
-            cd.blocks = true;
-            cd.fail_closed = true;
-            cd.reason = Some("approval endpoint not configured".to_string());
-            return;
+            return ApprovalResolution::refused(true, None, "approval endpoint not configured");
         };
 
         let remaining = approval_deadline.saturating_duration_since(self.approval_now());
         if remaining.is_zero() {
-            cd.label = "approval_denied";
-            cd.blocks = true;
-            cd.fail_closed = true;
-            cd.reason = Some("approval batch deadline exceeded".to_string());
-            return;
+            return ApprovalResolution::refused(true, None, "approval batch deadline exceeded");
         }
 
-        // Copy fields needed for ApprovalInput before further &mut cd writes.
-        let risk = cd.risk;
-        let hash = cd
-            .arguments_hash
-            .clone()
-            .unwrap_or_else(|| sha256_hex(&call.raw_args));
+        let hash = arguments_hash.unwrap_or_else(|| sha256_hex(&call.raw_args));
         let input = ApprovalInput {
             corr,
             name: &call.name,
@@ -1289,34 +1745,27 @@ impl GovernorEngine {
             .resolve_approval(approval, &input, approval.timeout.min(remaining))
             .await
         {
-            Ok((true, id)) => {
-                cd.label = "approved";
-                cd.approval_id = id;
-            }
+            Ok((true, id)) => ApprovalResolution::approved(id),
             Ok((false, id)) => {
-                cd.label = "approval_denied";
-                cd.blocks = true;
-                cd.approval_id = id;
-                cd.reason = Some("approval denied by endpoint".to_string());
+                ApprovalResolution::refused(false, id, "approval denied by endpoint")
             }
             Err(err) => match approval.fail_on_error {
-                FailOnError::Reject => {
-                    cd.label = "approval_denied";
-                    cd.blocks = true;
-                    cd.fail_closed = true;
-                    cd.reason = Some(format!("approval endpoint error: {err}"));
-                }
+                FailOnError::Reject => ApprovalResolution {
+                    label: "approval_denied",
+                    blocks: true,
+                    fail_closed: true,
+                    approval_id: None,
+                    reason: Some(format!("approval endpoint error: {err}")),
+                },
                 FailOnError::Warn => {
                     warn_sampled!(
                         target: "ai_tool_governor",
                         tool = %call.name,
                         "approval endpoint error, failing open (warn): {err}"
                     );
-                    cd.label = "approved";
+                    ApprovalResolution::approved(None)
                 }
-                FailOnError::Allow => {
-                    cd.label = "approved";
-                }
+                FailOnError::Allow => ApprovalResolution::approved(None),
             },
         }
     }
@@ -1348,6 +1797,9 @@ impl GovernorEngine {
                 // omits absent fields and can decide differently for each, so a
                 // cached decision must not be shared across the two.
                 input.corr.consumer.as_deref(),
+                // The authority-qualified principal: equal subject strings
+                // verified by different authorities must never share a decision.
+                input.corr.principal.as_ref(),
                 input.corr.proxy.as_deref(),
                 input.corr.model.as_deref(),
                 input.corr.provider.as_deref(),
@@ -1421,6 +1873,9 @@ impl GovernorEngine {
             if let Some(v) = &corr.consumer {
                 map.insert("consumer".to_string(), json!(v));
             }
+            if let Some(v) = &corr.principal {
+                map.insert("principal".to_string(), v.clone());
+            }
             if let Some(v) = &corr.proxy {
                 map.insert("proxy".to_string(), json!(v));
             }
@@ -1436,13 +1891,20 @@ impl GovernorEngine {
             }
         }
 
-        let request = self
+        let headers = approval
+            .resolved_headers
+            .get_or_try_init(|| async { approval.resolve_headers() })
+            .await?;
+        let mut request = self
             .http_client
             .get()
             .map_err(|e| format!("request failed: {e}"))?
             .post(&approval.endpoint_url)
             .timeout(timeout)
             .json(&body);
+        for (name, value) in headers {
+            request = request.header(name.clone(), value.clone());
+        }
         // An approval endpoint that resolves back to the gateway is refused at
         // the proxy hop limit like a looping route (issue #6128).
         let request =
@@ -1545,6 +2007,7 @@ impl AiToolGovernor {
                 default_action: DefaultAction::Allow,
                 unknown_shape_action: UnknownShapeAction::Deny,
                 tools: HashMap::new(),
+                tool_globs: Vec::new(),
                 approval: None,
                 response: ResponseConfig {
                     deny_status_code: DEFAULT_DENY_STATUS,
@@ -1621,12 +2084,40 @@ impl AiToolGovernor {
 
         // Parse tool policies.
         let mut tools: HashMap<String, ToolPolicy> = HashMap::new();
+        let mut tool_globs: Vec<ToolGlob> = Vec::new();
         let mut any_require_approval = default_action == DefaultAction::RequireApproval;
         let mut needs_response_transform = false;
         if let Some(map) = optional_object(config, "tools")? {
             for (name, spec) in map {
                 if name.is_empty() {
                     return Err("ai_tool_governor: tool names must not be empty".to_string());
+                }
+                // A key containing `*` is a glob policy. Exact keys always win
+                // over globs; among globs the most specific match wins (see
+                // `tool_glob_specificity_order`). Globs are never A2A aliases.
+                if name.contains('*') {
+                    if name.len() > MAX_TOOL_GLOB_KEY_BYTES {
+                        return Err(format!(
+                            "ai_tool_governor: glob tool keys must be <= {MAX_TOOL_GLOB_KEY_BYTES} UTF-8 bytes"
+                        ));
+                    }
+                    if tool_globs.len() >= MAX_TOOL_GLOB_KEYS {
+                        return Err(format!(
+                            "ai_tool_governor: at most {MAX_TOOL_GLOB_KEYS} glob tool keys are allowed"
+                        ));
+                    }
+                    let policy = parse_tool_policy(name, spec)?;
+                    if policy.action == ToolAction::RequireApproval {
+                        any_require_approval = true;
+                    }
+                    if policy.action == ToolAction::RedactArgs {
+                        needs_response_transform = true;
+                    }
+                    tool_globs.push(ToolGlob {
+                        pattern: name.clone(),
+                        policy,
+                    });
+                    continue;
                 }
                 // A2A request extraction uses the gateway's canonical method
                 // names. Retain the raw key for ordinary AI/MCP tool calls, but
@@ -1673,9 +2164,11 @@ impl AiToolGovernor {
             );
         }
 
+        tool_globs.sort_by(|a, b| tool_glob_specificity_order(&a.pattern, &b.pattern));
+
         // A configuration that governs nothing is a no-op. `tools` may be empty
         // only when `default_action` itself governs (deny / require_approval).
-        if tools.is_empty() && default_action == DefaultAction::Allow {
+        if tools.is_empty() && tool_globs.is_empty() && default_action == DefaultAction::Allow {
             return Err(
                 "ai_tool_governor: no tool policies configured and `default_action` is `allow` — plugin would have no effect"
                     .to_string(),
@@ -1706,6 +2199,7 @@ impl AiToolGovernor {
             default_action,
             unknown_shape_action,
             tools,
+            tool_globs,
             approval,
             response,
             observability,
@@ -1746,6 +2240,8 @@ impl AiToolGovernor {
         CorrelationMeta {
             request_id: request_id.to_string(),
             consumer: ctx.effective_identity().map(str::to_string),
+            principal: correlation_principal(ctx),
+            caller: ctx.identified_consumer.clone(),
             proxy: ctx
                 .matched_proxy
                 .as_ref()
@@ -1824,9 +2320,8 @@ impl AiToolGovernor {
     fn governed_call_identity_hash(&self, corr: &CorrelationMeta, call: &ToolCall) -> String {
         if self
             .engine
-            .tools
-            .get(&call.name)
-            .is_some_and(|policy| policy.action == ToolAction::RedactArgs)
+            .policy_for(&call.name)
+            .is_some_and(|(_, policy)| policy.action == ToolAction::RedactArgs)
         {
             deterministic_call_identity_hash(call)
         } else {
@@ -1915,8 +2410,7 @@ impl AiToolGovernor {
         let policy_ids: Vec<&str> = batch
             .per_call
             .iter()
-            .filter(|c| c.matched_policy)
-            .map(|c| c.name.as_str())
+            .filter_map(|c| c.policy_id.as_deref())
             .collect();
         set_ranked_csv_metadata(
             m,
@@ -2078,8 +2572,15 @@ impl AiToolGovernor {
         // A body with no tool surface at all (ordinary REST JSON on a shared
         // proxy, an embeddings/moderations payload, a content-only completion)
         // stays out of scope in both postures — the same scoping the documented
-        // "unparseable JSON response is forwarded" limitation uses.
-        if !extract.calls.is_empty() || !body_carries_tool_call_marker(json) {
+        // "unparseable JSON response is forwarded" limitation uses. When calls
+        // WERE extracted, the backstop still covers a marker in a location no
+        // extractor read (a second call a normalizing client may honor).
+        let carries_unread_marker = if extract.calls.is_empty() {
+            body_carries_tool_call_marker(json)
+        } else {
+            body_carries_unclaimed_tool_call_marker(json)
+        };
+        if !carries_unread_marker {
             return None;
         }
         Self::write_unrecognized_shape_observation_into(&self.engine, &mut ctx.metadata);
@@ -2310,8 +2811,9 @@ impl AiToolGovernor {
             }
             let mut denied = Vec::new();
             let mut dry_run = Vec::new();
+            let caller = ctx.identified_consumer.clone();
             for name in definitions.names {
-                match self.engine.definition_outcome(&name) {
+                match self.engine.definition_outcome(&name, caller.as_deref()) {
                     DefinitionOutcome::Deny(risk) => denied.push((name, risk)),
                     DefinitionOutcome::DryRun(risk) => dry_run.push((name, risk)),
                     DefinitionOutcome::Allow => {}
@@ -2657,7 +3159,7 @@ impl AiToolGovernor {
         let Some(name) = function.get("name").and_then(Value::as_str) else {
             return RedactTransform::Unchanged;
         };
-        let Some(policy) = self.engine.tools.get(name) else {
+        let Some((_, policy)) = self.engine.policy_for(name) else {
             return RedactTransform::Unchanged;
         };
         if policy.action != ToolAction::RedactArgs || policy.blocked_arg_patterns.is_empty() {
@@ -3555,10 +4057,17 @@ impl Plugin for AiToolGovernor {
                 // cap); rejecting before the decode attempt would 502
                 // legitimate compressed responses.
                 let Some(encoding) = wire_encoding else {
-                    // Unencoded but unparseable despite the JSON label/shape:
-                    // no governable calls can be extracted from it and it was
-                    // never encoded, so forward (long-standing plaintext
-                    // semantics).
+                    // Unencoded but unparseable despite the JSON label/shape.
+                    // A complete, well-formed document `serde_json` merely
+                    // cannot materialize (nesting past its recursion limit)
+                    // is read by other parsers, so a tool call inside it was
+                    // never evaluated: uninspectable. Malformed bytes yield no
+                    // governable calls anywhere and keep the long-standing
+                    // forward semantics.
+                    if is_well_formed_json(body) {
+                        return self
+                            .uninspectable_governed_response(ctx, UNMATERIALIZABLE_RESPONSE_JSON);
+                    }
                     return PluginResult::Continue;
                 };
                 let Some(decoded) = decompress_within_limit(encoding, body) else {
@@ -3770,6 +4279,13 @@ impl Plugin for AiToolGovernor {
             return None;
         }
         let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
+        // Redaction's skip authorization is bound to the exact input
+        // `on_response_body` governed. A transform that ran between the two
+        // hooks (for example a `response_transformer` under a priority
+        // override) may have rewritten or injected calls this plugin never
+        // evaluated, so those must not inherit the governed state.
+        let input_unchanged = self.response_hash(ctx) == Some(sha256_hex_bytes(body).as_str());
+        let pre_redaction_calls = extract_response_tool_calls(&json).calls;
         // The redacted document is serialized through a sink bounded by this
         // response's retained ceiling as well as the inspectable limit, so an
         // escaping-amplified rewrite is refused while it is written
@@ -3799,23 +4315,50 @@ impl Plugin for AiToolGovernor {
                         return None;
                     }
                 };
-                // Record the redacted body's hash so `on_final_response_body` treats
-                // this plugin's own redaction as already-governed and skips it when
-                // no later transform runs. Also re-record the redacted calls'
-                // identity hashes (with the same per-policy identity rules and
-                // counts as `on_response_body`) so that even if a later transform
-                // changes the body hash or only the model/provider, the final
-                // re-check skips these already-redacted calls. Approval-capable
-                // siblings keep their correlation-aware identities and still
-                // require re-approval when those fields change.
-                self.set_response_hash(ctx, sha256_hex_bytes(&rewritten));
+                // Re-record the governed identities for the final re-check: a
+                // call is carried over only when its PRE-redaction identity is
+                // one `on_response_body` recorded (consumed as a multiset), and
+                // it is carried over under its post-redaction identity so this
+                // plugin's own `[REDACTED_TOOL_ARG:…]` form is not re-matched.
+                // A call introduced or changed since governance stays
+                // unrecorded and is governed by `on_final_response_body`.
+                // Approval-capable siblings keep their correlation-aware
+                // identities and still require re-approval when those fields
+                // change.
                 let provider = self.resolve_response_provider(ctx, &json);
                 let model = json
                     .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let corr = self.correlation(ctx, model, provider.as_deref());
-                self.record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).calls);
+                let post_redaction_calls = extract_response_tool_calls(&json).calls;
+                let mut remaining = governed_call_counts(ctx, self.instance_id);
+                let mut authorized: Vec<String> = Vec::new();
+                let mut all_authorized = pre_redaction_calls.len() == post_redaction_calls.len();
+                if all_authorized {
+                    for (before, after) in pre_redaction_calls.iter().zip(&post_redaction_calls) {
+                        let identity = self.governed_call_identity_hash(&corr, before);
+                        match remaining.get_mut(&identity) {
+                            Some(count) if *count > 0 => {
+                                *count -= 1;
+                                authorized.push(self.governed_call_identity_hash(&corr, after));
+                            }
+                            _ => all_authorized = false,
+                        }
+                    }
+                }
+                if let Some(state) = ctx.plugin_state_opt_mut() {
+                    state.ai_tool_governor_call_hashes.remove(&self.instance_id);
+                }
+                record_governed_identities(ctx, self.instance_id, &authorized);
+                // Only an unchanged, fully governed input lets the final
+                // re-check skip the redacted body by hash; otherwise it runs
+                // and governs whatever was not carried over above.
+                if input_unchanged && all_authorized {
+                    self.set_response_hash(ctx, sha256_hex_bytes(&rewritten));
+                } else {
+                    self.clear_response_hash(ctx);
+                }
                 Some(rewritten)
             }
             RedactTransform::AmplificationFailed => {
@@ -4111,7 +4654,12 @@ impl Plugin for AiToolGovernor {
         }
         // JSON-labeled/shaped but unparseable plaintext within the limit:
         // forward, mirroring `on_response_body` (rejecting every unparseable
-        // JSON-labeled response on a shared proxy would break unrelated routes).
+        // JSON-labeled response on a shared proxy would break unrelated routes)
+        // — unless it is well-formed JSON the parser merely cannot
+        // materialize, which is uninspectable rather than call-free.
+        if is_well_formed_json(body) {
+            return self.uninspectable_governed_response(ctx, UNMATERIALIZABLE_RESPONSE_JSON);
+        }
         PluginResult::Continue
     }
 
@@ -4286,6 +4834,38 @@ impl AiToolGovernor {
         MAX_APPROVAL_BATCH_DEADLINE
     }
 
+    /// Maximum approval webhook calls one batch keeps in flight at once.
+    pub fn max_concurrent_approvals() -> usize {
+        MAX_CONCURRENT_APPROVALS
+    }
+
+    /// Drive the live inspector's incremental SSE event-boundary scan over
+    /// `chunks` as they would arrive, returning the bytes examined (the span
+    /// from each resume point to the end of the buffer, an upper bound) and
+    /// the end offset of every event found, relative to the buffer it was
+    /// drained from.
+    pub fn sse_event_scan_work_for_tests(chunks: &[&[u8]]) -> (usize, Vec<usize>) {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut scan_from = 0usize;
+        let mut work = 0usize;
+        let mut ends = Vec::new();
+        for chunk in chunks {
+            buffer.extend_from_slice(chunk);
+            loop {
+                work = work.saturating_add(buffer.len().saturating_sub(scan_from));
+                let (found, resume) = next_event_end_from(&buffer, scan_from);
+                let Some(end) = found else {
+                    scan_from = resume;
+                    break;
+                };
+                ends.push(end);
+                buffer.drain(..end);
+                scan_from = 0;
+            }
+        }
+        (work, ends)
+    }
+
     /// Advance the approval-batch deadline clock without sleeping. Used to
     /// prove cumulative budget exhaustion deterministically while the
     /// production ceiling remains [`MAX_APPROVAL_BATCH_DEADLINE`].
@@ -4319,6 +4899,8 @@ enum ToolSlot {
     AnthropicBlock(usize),
     /// Cohere v2 `tool-call-start` / `tool-call-delta` event at this index.
     CohereIndex(usize),
+    /// OpenAI Responses `function_call` output item at this `output_index`.
+    ResponsesItem(usize),
     /// A provider-COMPLETE call that arrives whole in one frame (Google
     /// `functionCall`). Each occurrence is allocated a fresh ordinal, so two
     /// identical parts in successive chunks are two calls rather than one
@@ -4377,6 +4959,126 @@ impl StreamingToolCallAccumulator {
         self.push_anthropic_frame(frame);
         self.push_cohere_frame(frame);
         self.push_gemini_frame(frame);
+        self.push_responses_frame(frame);
+    }
+
+    /// OpenAI Responses streaming events, accumulated per `output_index`:
+    ///
+    /// - `response.output_item.added` with a `function_call` item opens the call
+    ///   (name, `call_id`, and any initial `arguments`);
+    /// - `response.function_call_arguments.delta` appends `delta`;
+    /// - `response.function_call_arguments.done`, `response.output_item.done`,
+    ///   and every `response.*` event that embeds the `response` object (its
+    ///   `output[]` `function_call` items, e.g. `response.completed`) restate the
+    ///   COMPLETE call. A client may act on any of these, so each restatement
+    ///   must match what the deltas built exactly — a different name or
+    ///   arguments makes the batch ungovernable (fail closed). A restatement of
+    ///   a call no earlier event opened is accumulated as a complete call.
+    fn push_responses_frame(&mut self, frame: &Value) {
+        let Some(kind) = frame.get("type").and_then(Value::as_str) else {
+            return;
+        };
+        if !kind.starts_with("response.") {
+            return;
+        }
+        match kind {
+            "response.output_item.added" | "response.output_item.done" => {
+                if let Some(item) = frame.get("item").filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call")
+                }) {
+                    match block_output_index(frame) {
+                        Some(index) if kind == "response.output_item.added" => {
+                            self.open_responses_call(index, item);
+                        }
+                        Some(index) => self.restate_responses_call(
+                            index,
+                            item.get("name"),
+                            item.get("arguments"),
+                        ),
+                        None => self.malformed = true,
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => match block_output_index(frame) {
+                Some(index) => {
+                    let slot = ToolSlot::ResponsesItem(index);
+                    if !self.positions.contains_key(&(0usize, slot)) {
+                        // Argument bytes for a call no event opened: the call
+                        // stays never-named and therefore ungovernable.
+                        self.malformed = true;
+                    }
+                    self.push_delta(0, slot, None, None, frame.get("delta"));
+                }
+                None => self.malformed = true,
+            },
+            "response.function_call_arguments.done" => match block_output_index(frame) {
+                Some(index) => {
+                    self.restate_responses_call(index, frame.get("name"), frame.get("arguments"));
+                }
+                None => self.malformed = true,
+            },
+            _ => {}
+        }
+        // Lifecycle events (`response.created`, `response.in_progress`,
+        // `response.completed`, `response.incomplete`, `response.failed`) embed
+        // the response object; its `output[]` restates every finished call.
+        match frame
+            .get("response")
+            .and_then(|response| response.get("output"))
+        {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        self.restate_responses_call(index, item.get("name"), item.get("arguments"));
+                    }
+                }
+            }
+            Some(_) => self.malformed = true,
+        }
+    }
+
+    /// `response.output_item.added`: open the call at `index`. A second open of
+    /// the same index is an identity change, never a continuation.
+    fn open_responses_call(&mut self, index: usize, item: &Value) {
+        let slot = ToolSlot::ResponsesItem(index);
+        if self.positions.contains_key(&(0usize, slot)) {
+            self.malformed = true;
+            return;
+        }
+        let call_id = match item.get("call_id").or_else(|| item.get("id")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+            Some(_) => {
+                self.malformed = true;
+                None
+            }
+        };
+        self.push_delta(0, slot, call_id, item.get("name"), item.get("arguments"));
+    }
+
+    /// A complete restatement of the call at `index`. Matches what was
+    /// accumulated exactly, or the batch is ungovernable. Creates the call when
+    /// no earlier event opened it.
+    fn restate_responses_call(
+        &mut self,
+        index: usize,
+        name: Option<&Value>,
+        arguments: Option<&Value>,
+    ) {
+        let key: (usize, ToolSlot) = (0, ToolSlot::ResponsesItem(index));
+        let existing_position = self.positions.get(&key).copied();
+        let Some(position) = existing_position else {
+            self.push_delta(0, key.1, None, name, arguments);
+            return;
+        };
+        let existing = &self.calls[position].1;
+        let name_conflicts = name.is_some_and(|name| name.as_str() != Some(existing.name.as_str()));
+        let arguments_conflict = arguments
+            .is_some_and(|arguments| arguments.as_str() != Some(existing.arguments.as_str()));
+        if name_conflicts || arguments_conflict {
+            self.malformed = true;
+        }
     }
 
     /// OpenAI (and every OpenAI-compatible backend): `choices[].delta.tool_calls`
@@ -4812,64 +5514,125 @@ enum StreamSniff {
 /// — the pre-round-12 behavior for that shape; fail-closed opaque treatment is
 /// reserved for binary/non-ASCII starts.)
 fn sniff_stream_shape(buf: &[u8]) -> StreamSniff {
+    sniff_stream_shape_from(buf, SniffProgress::Start).0
+}
+
+/// Where [`sniff_stream_shape_from`] stopped in a buffer that may still grow.
+///
+/// Every byte before the recorded offsets was already classified, and the
+/// decision there depended only on bytes already present, so resuming yields
+/// exactly the verdict of a fresh scan while each byte of an inconclusive
+/// prefix is examined a bounded number of times instead of once per chunk.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum SniffProgress {
+    /// Nothing decided yet: the buffer is still (a prefix of) the UTF-8 BOM.
+    #[default]
+    Start,
+    /// Past the optional BOM; `[.. scanned)` is leading whitespace.
+    Leading { scanned: usize },
+    /// Inside a line that started at `line_start`; `[line_start .. cursor)` is
+    /// printable field-name text without a `:` separator.
+    Line { line_start: usize, cursor: usize },
+    /// After a colonless line, skipping line terminators from `cursor`.
+    Between { cursor: usize },
+}
+
+/// Resumable form of [`sniff_stream_shape`] over a buffer that only grows by
+/// appending. Returns the verdict and, for [`StreamSniff::Inconclusive`], the
+/// progress to resume from on the next call.
+fn sniff_stream_shape_from(buf: &[u8], progress: SniffProgress) -> (StreamSniff, SniffProgress) {
     const BOM: &[u8] = b"\xEF\xBB\xBF";
-    // The buffer so far is a (possibly empty) prefix of the BOM: wait.
-    if BOM.starts_with(buf) {
-        return StreamSniff::Inconclusive;
-    }
-    let buf = buf.strip_prefix(BOM).unwrap_or(buf);
-    let Some(start) = buf.iter().position(|b| !b.is_ascii_whitespace()) else {
-        return StreamSniff::Inconclusive;
-    };
-    if matches!(buf[start], b'{' | b'[') {
-        return StreamSniff::Json;
-    }
-
-    let mut cursor = start;
-    while cursor < buf.len() {
-        let line_start = cursor;
-        while cursor < buf.len() {
-            match buf[cursor] {
-                // A field separator before the line ends proves SSE framing,
-                // including extension fields and comment lines.
-                b':' => return StreamSniff::Sse,
-                b'\r' | b'\n' => break,
-                // Control/binary or high-bit bytes cannot be an ASCII field
-                // name. `\t` (0x09) remains accepted for parity with the
-                // existing conservative shape detector.
-                0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0xFF => {
-                    return StreamSniff::Opaque;
+    let mut progress = progress;
+    loop {
+        progress = match progress {
+            SniffProgress::Start => {
+                // The buffer so far is a (possibly empty) prefix of the BOM: wait.
+                if BOM.starts_with(buf) {
+                    return (StreamSniff::Inconclusive, SniffProgress::Start);
                 }
-                _ => cursor += 1,
+                let body_start = if buf.starts_with(BOM) { BOM.len() } else { 0 };
+                SniffProgress::Leading {
+                    scanned: body_start,
+                }
             }
-        }
-
-        if cursor == buf.len() {
-            // Still inside a printable line with no separator. It may be an
-            // unknown colonless prelude followed by an SSE field in a later
-            // chunk, so keep holding until more bytes arrive.
-            return StreamSniff::Inconclusive;
-        }
-
-        let field = &buf[line_start..cursor];
-        if matches!(field, b"data" | b"event" | b"id" | b"retry") {
-            return StreamSniff::Sse;
-        }
-
-        // Unknown colonless fields and blank event separators are valid SSE
-        // syntax but do not alone distinguish SSE from arbitrary text. Skip
-        // them and look for a later field that supplies positive evidence.
-        while cursor < buf.len() && matches!(buf[cursor], b'\r' | b'\n') {
-            cursor += 1;
-        }
-        if cursor < buf.len() && matches!(buf[cursor], b'{' | b'[') {
-            return StreamSniff::Opaque;
-        }
+            SniffProgress::Leading { scanned } => {
+                let Some(offset) = buf
+                    .get(scanned..)
+                    .and_then(|rest| rest.iter().position(|b| !b.is_ascii_whitespace()))
+                else {
+                    return (
+                        StreamSniff::Inconclusive,
+                        SniffProgress::Leading {
+                            scanned: buf.len().max(scanned),
+                        },
+                    );
+                };
+                let start = scanned + offset;
+                if matches!(buf[start], b'{' | b'[') {
+                    return (StreamSniff::Json, SniffProgress::Start);
+                }
+                SniffProgress::Line {
+                    line_start: start,
+                    cursor: start,
+                }
+            }
+            SniffProgress::Line {
+                line_start,
+                mut cursor,
+            } => {
+                while cursor < buf.len() {
+                    match buf[cursor] {
+                        // A field separator before the line ends proves SSE
+                        // framing, including extension fields and comment lines.
+                        b':' => return (StreamSniff::Sse, SniffProgress::Start),
+                        b'\r' | b'\n' => break,
+                        // Control/binary or high-bit bytes cannot be an ASCII
+                        // field name. `\t` (0x09) remains accepted for parity
+                        // with the existing conservative shape detector.
+                        0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0xFF => {
+                            return (StreamSniff::Opaque, SniffProgress::Start);
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                if cursor >= buf.len() {
+                    // Still inside a printable line with no separator. It may
+                    // be an unknown colonless prelude followed by an SSE field
+                    // in a later chunk, so keep holding until more bytes arrive.
+                    return (
+                        StreamSniff::Inconclusive,
+                        SniffProgress::Line { line_start, cursor },
+                    );
+                }
+                let field = &buf[line_start..cursor];
+                if matches!(field, b"data" | b"event" | b"id" | b"retry") {
+                    return (StreamSniff::Sse, SniffProgress::Start);
+                }
+                // Unknown colonless fields do not alone distinguish SSE from
+                // arbitrary text. Skip the terminators and look for a later
+                // field that supplies positive evidence.
+                SniffProgress::Between { cursor }
+            }
+            SniffProgress::Between { mut cursor } => {
+                while cursor < buf.len() && matches!(buf[cursor], b'\r' | b'\n') {
+                    cursor += 1;
+                }
+                if cursor >= buf.len() {
+                    // Only colonless extension/blank lines have arrived so far.
+                    // A later chunk can still provide an SSE field; the
+                    // retained-body cap bounds the wait.
+                    return (StreamSniff::Inconclusive, SniffProgress::Between { cursor });
+                }
+                if matches!(buf[cursor], b'{' | b'[') {
+                    return (StreamSniff::Opaque, SniffProgress::Start);
+                }
+                SniffProgress::Line {
+                    line_start: cursor,
+                    cursor,
+                }
+            }
+        };
     }
-
-    // Only colonless extension/blank lines have arrived so far. A later chunk
-    // can still provide an SSE field; the retained-body cap bounds the wait.
-    StreamSniff::Inconclusive
 }
 
 /// Per-response streaming inspector. Holds tool-call SSE frames until the call
@@ -4903,6 +5666,12 @@ struct ToolCallStreamInspector {
     terminated: bool,
     /// Sniffed body shape (see [`StreamBodyShape`]).
     shape: StreamBodyShape,
+    /// Resume point of the shape sniff while `shape` is still `Unknown`, so an
+    /// inconclusive prefix is not rescanned from byte zero on every chunk.
+    sniff_progress: SniffProgress,
+    /// Resume point of the event-boundary scan inside `carry`, so a long
+    /// partial event is not rescanned from byte zero on every chunk.
+    event_scan_from: usize,
     /// Whether the bytes the client already received end mid-line, as a chain
     /// reports when a later inspector follows. This inspector's own releases
     /// are whole events, so they never leave a line open.
@@ -4937,6 +5706,8 @@ impl ToolCallStreamInspector {
             bypassed: false,
             terminated: false,
             shape: StreamBodyShape::Unknown,
+            sniff_progress: SniffProgress::Start,
+            event_scan_from: 0,
             client_line_open: false,
             feeds_inspector: false,
             deferred_cut: None,
@@ -4968,14 +5739,14 @@ impl ToolCallStreamInspector {
 
     fn record_frame_context(&mut self, frame: &Value) {
         if self.corr.model.is_none()
-            && let Some(model) = frame.get("model").and_then(Value::as_str)
+            && let Some(model) = stream_frame_model(frame)
         {
             self.corr.model = Some(model.to_string());
         }
         if self.corr.provider.is_none()
-            && let Some(provider) = detect_sse_provider(frame)
+            && let Some(provider) = stream_frame_provider(frame)
         {
-            self.corr.provider = Some(provider.as_str().to_string());
+            self.corr.provider = Some(provider);
         }
     }
 
@@ -5128,6 +5899,7 @@ impl ToolCallStreamInspector {
         self.terminated = true;
         self.held.clear();
         self.carry.clear();
+        self.event_scan_from = 0;
         self.reset_batch();
     }
 
@@ -5206,6 +5978,7 @@ impl ToolCallStreamInspector {
         }
         out.append(&mut self.held);
         out.append(&mut self.carry);
+        self.event_scan_from = 0;
         self.reset_batch();
         self.bypassed = true;
         ResponseStreamAction::Forward(Bytes::from(out))
@@ -5239,6 +6012,17 @@ impl ToolCallStreamInspector {
             return ResponseStreamAction::Forward(Bytes::from(body));
         }
         let Ok(json) = serde_json::from_slice::<Value>(strip_json_bom(&body)) else {
+            // Well-formed JSON the parser cannot materialize (nesting past its
+            // recursion limit) was never inspected; malformed bytes carry no
+            // governable call and keep the forward posture.
+            if self.engine.mode == Mode::Enforce && is_well_formed_json(&body) {
+                self.record_uninspectable_metadata();
+                warn_sampled!(
+                    target: "ai_tool_governor",
+                    "JSON-shaped stream exceeds the inspection parser's limits; cutting stream"
+                );
+                return self.terminate(Vec::new());
+            }
             return ResponseStreamAction::Forward(Bytes::from(body));
         };
         let extract = extract_response_tool_calls(&json);
@@ -5261,7 +6045,12 @@ impl ToolCallStreamInspector {
         // sanitized observation in BOTH postures, then cut in enforce (default
         // `unknown_shape_action: deny`) or release under the documented
         // `allow` opt-out.
-        if extract.calls.is_empty() && body_carries_tool_call_marker(&json) {
+        let carries_unread_marker = if extract.calls.is_empty() {
+            body_carries_tool_call_marker(&json)
+        } else {
+            body_carries_unclaimed_tool_call_marker(&json)
+        };
+        if carries_unread_marker {
             self.record_unrecognized_shape_observation();
             if self.engine.unknown_shape_action == UnknownShapeAction::Deny
                 && self.engine.mode == Mode::Enforce
@@ -5273,7 +6062,8 @@ impl ToolCallStreamInspector {
                 );
                 return self.terminate(Vec::new());
             }
-            return ResponseStreamAction::Forward(Bytes::from(body));
+            // The opt-out (or dry-run) forwards the unread location only; any
+            // readable call beside it is still governed below.
         }
         let calls = extract.calls;
         if calls.is_empty() {
@@ -5326,7 +6116,9 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         // not ride the SSE path where every "event" classifies as NoData and
         // forwards uninspected.
         if self.shape == StreamBodyShape::Unknown {
-            self.shape = match sniff_stream_shape(&self.carry) {
+            let (sniff, progress) = sniff_stream_shape_from(&self.carry, self.sniff_progress);
+            self.sniff_progress = progress;
+            self.shape = match sniff {
                 StreamSniff::Json => StreamBodyShape::Json,
                 StreamSniff::Sse => StreamBodyShape::Sse,
                 StreamSniff::Opaque => StreamBodyShape::Opaque,
@@ -5343,7 +6135,14 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         }
         let mut out: Vec<u8> = Vec::new();
 
-        while let Some(end) = next_event_end(&self.carry) {
+        loop {
+            let (found, resume) = next_event_end_from(&self.carry, self.event_scan_from);
+            let Some(end) = found else {
+                self.event_scan_from = resume;
+                break;
+            };
+            // The bytes after `end` have not been scanned yet.
+            self.event_scan_from = 0;
             // Enforce the retained-byte bound BEFORE draining and classifying
             // the event. Otherwise one complete >4 MiB `data:` frame is copied
             // and JSON-parsed before the cap below runs (and a non-JSON event
@@ -5355,10 +6154,19 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             match classify_event(&event) {
                 SseEvent::Frame(frame) => {
                     self.record_frame_context(&frame);
-                    if frame_has_tool_calls(&frame) {
+                    let consumed = frame_has_tool_calls(&frame);
+                    if consumed {
                         self.saw_tool_calls = true;
                         self.accumulator.push_frame(&frame);
-                    } else if body_carries_tool_call_marker(&frame) {
+                    }
+                    // A consumed frame can still carry a second marker in a
+                    // location its accumulator did not read.
+                    let carries_unread_marker = if consumed {
+                        frame_carries_unclaimed_tool_call_marker(&frame)
+                    } else {
+                        body_carries_tool_call_marker(&frame)
+                    };
+                    if carries_unread_marker {
                         // The frame carries a live tool-call marker that none
                         // of the provider accumulators claimed: a shape this
                         // plugin cannot read, so forwarding it would deliver
@@ -5432,6 +6240,25 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                         return self.terminate(out);
                     }
                     self.record_ambiguity_observation();
+                    if self.saw_tool_calls {
+                        self.held.extend_from_slice(&event);
+                    } else {
+                        out.extend_from_slice(&event);
+                    }
+                }
+                SseEvent::Uninspectable => {
+                    // Invalid UTF-8 or unmaterializable JSON: a client may
+                    // still read a tool call out of it, so enforce cuts before
+                    // releasing the event or anything held behind it.
+                    if self.engine.mode == Mode::Enforce {
+                        self.record_uninspectable_metadata();
+                        warn_sampled!(
+                            target: "ai_tool_governor",
+                            "SSE event cannot be inspected (invalid UTF-8 or parser limits); cutting stream"
+                        );
+                        self.held.clear();
+                        return self.terminate(out);
+                    }
                     if self.saw_tool_calls {
                         self.held.extend_from_slice(&event);
                     } else {
@@ -5529,6 +6356,20 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     self.record_frame_context(&frame);
                     self.saw_tool_calls = true;
                     self.accumulator.push_frame(&frame);
+                    if frame_carries_unclaimed_tool_call_marker(&frame) {
+                        self.record_unrecognized_shape_observation();
+                        if self.engine.unknown_shape_action == UnknownShapeAction::Deny
+                            && self.engine.mode == Mode::Enforce
+                        {
+                            self.record_uninspectable_metadata();
+                            warn_sampled!(
+                                target: "ai_tool_governor",
+                                "trailing SSE frame carries a tool-call shape this plugin cannot read; cutting stream"
+                            );
+                            self.held.clear();
+                            return self.terminate(Vec::new());
+                        }
+                    }
                     self.held.extend_from_slice(&event);
                 }
                 // Trailing mirror of the mid-stream unreadable-shape cut: a
@@ -5568,6 +6409,15 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 SseEvent::Ambiguous => {
                     self.record_ambiguity_observation();
                     trailing = event;
+                }
+                SseEvent::Uninspectable if self.engine.mode == Mode::Enforce => {
+                    self.record_uninspectable_metadata();
+                    warn_sampled!(
+                        target: "ai_tool_governor",
+                        "trailing SSE event cannot be inspected (invalid UTF-8 or parser limits); cutting stream"
+                    );
+                    self.held.clear();
+                    return self.terminate(Vec::new());
                 }
                 _ => trailing = event,
             }
@@ -5649,30 +6499,38 @@ fn terminator_at(buf: &[u8], i: usize) -> TermAt {
 /// as unparsed trailing bytes. A trailing `\r` is held (return `None`) until
 /// the next chunk disambiguates lone-CR from a straddled `\r\n`, so an event
 /// is never split inside one terminator.
-fn next_event_end(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
+///
+/// The scan starts at `from` and also returns the position to resume from once
+/// more bytes are appended. The decision at every position before that resume
+/// point depended only on bytes already present, so re-entering there yields
+/// exactly the result of a scan from zero while each retained byte of a
+/// fragmented event is examined a bounded number of times instead of once per
+/// arriving chunk (linear rather than quadratic work). Callers pass `0` after
+/// draining an event, since the remaining bytes were never scanned.
+fn next_event_end_from(buf: &[u8], from: usize) -> (Option<usize>, usize) {
+    let mut i = from.min(buf.len());
     while i < buf.len() {
         let first = match terminator_at(buf, i) {
             TermAt::None => {
                 i += 1;
                 continue;
             }
-            TermAt::Ambiguous => return None,
+            TermAt::Ambiguous => return (None, i),
             TermAt::Len(len) => len,
         };
         let after_first = i + first;
         if after_first >= buf.len() {
             // Line terminator at the buffer edge: the next byte decides
             // whether a blank line follows.
-            return None;
+            return (None, i);
         }
         match terminator_at(buf, after_first) {
             TermAt::None => i = after_first,
-            TermAt::Ambiguous => return None,
-            TermAt::Len(second) => return Some(after_first + second),
+            TermAt::Ambiguous => return (None, i),
+            TermAt::Len(second) => return (Some(after_first + second), 0),
         }
     }
-    None
+    (None, i)
 }
 
 enum SseEvent {
@@ -5684,6 +6542,10 @@ enum SseEvent {
     /// held bytes must not be released on the strength of a governed decision
     /// taken over a last-wins collapse.
     Ambiguous,
+    /// The event cannot be inspected at all: its bytes are not valid UTF-8, or
+    /// its `data:` payload is well-formed JSON the parser cannot materialize.
+    /// Enforce cuts before releasing it; dry-run forwards it.
+    Uninspectable,
     OtherData,
     NoData,
 }
@@ -5699,8 +6561,11 @@ fn classify_event(event: &[u8]) -> SseEvent {
     let event = event
         .strip_prefix(b"\xEF\xBB\xBF".as_slice())
         .unwrap_or(event);
+    // A WHATWG SSE client decodes invalid UTF-8 with replacement characters and
+    // still parses the event's intact `data:` lines, so an invalid byte (even
+    // in an ignored comment line) must not make the whole event look data-free.
     let Ok(text) = std::str::from_utf8(event) else {
-        return SseEvent::NoData;
+        return SseEvent::Uninspectable;
     };
     let mut data_lines: Vec<&str> = Vec::new();
     for line in sse_lines(text) {
@@ -5730,6 +6595,8 @@ fn classify_event(event: &[u8]) -> SseEvent {
     }
     match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => SseEvent::Frame(value),
+        // Well-formed JSON past the parser's limits was never inspected.
+        Err(_) if is_well_formed_json(trimmed.as_bytes()) => SseEvent::Uninspectable,
         Err(_) => SseEvent::OtherData,
     }
 }
@@ -5785,7 +6652,14 @@ fn collect_finished_choices(
     // NOT boundaries — a later block in the same message would open a second
     // batch and, with `require_approval`, a second webhook round for one turn.
     let is_message_terminal = match frame.get("type").and_then(Value::as_str) {
-        Some("message_stop") | Some("message-end") => true,
+        // OpenAI Responses closes the response with exactly one of these.
+        // `response.output_item.done` is deliberately NOT a boundary, for the
+        // same reason `content_block_stop` is not.
+        Some("message_stop")
+        | Some("message-end")
+        | Some("response.completed")
+        | Some("response.incomplete")
+        | Some("response.failed") => true,
         Some("message_delta") => frame
             .get("delta")
             .and_then(|delta| delta.get("stop_reason"))
@@ -5795,6 +6669,54 @@ fn collect_finished_choices(
     if is_message_terminal && acc.has_choice(0) {
         finished.insert(0);
     }
+}
+
+/// The model a streaming frame reports: top-level `model` (Chat Completions,
+/// Gemini, Cohere), else the `response.model` an OpenAI Responses lifecycle
+/// event embeds. Shared by the live inspector and buffered-SSE extraction so
+/// approval correlation is identical on both paths.
+fn stream_frame_model(frame: &Value) -> Option<&str> {
+    frame.get("model").and_then(Value::as_str).or_else(|| {
+        responses_event_response(frame)
+            .and_then(|response| response.get("model"))
+            .and_then(Value::as_str)
+    })
+}
+
+/// The provider a streaming frame identifies. OpenAI Responses events carry no
+/// top-level provider discriminator, so a `response.*` event is OpenAI.
+fn stream_frame_provider(frame: &Value) -> Option<String> {
+    if frame
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("response."))
+    {
+        return Some(
+            super::utils::ai_providers::AiProvider::OpenAi
+                .as_str()
+                .to_string(),
+        );
+    }
+    detect_sse_provider(frame).map(|provider| provider.as_str().to_string())
+}
+
+/// The `response` object an OpenAI Responses lifecycle event embeds.
+fn responses_event_response(frame: &Value) -> Option<&Value> {
+    frame
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| kind.starts_with("response."))
+        .and_then(|_| frame.get("response"))
+        .filter(|response| response.is_object())
+}
+
+/// The `output_index` an OpenAI Responses streaming event addresses. `None`
+/// when absent or unusable — malformed rather than guessed.
+fn block_output_index(frame: &Value) -> Option<usize> {
+    frame
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 /// The content-block / tool-event `index` an Anthropic or Cohere v2 streaming
@@ -5864,6 +6786,46 @@ fn frame_has_tool_calls(frame: &Value) -> bool {
         || anthropic_frame_has_tool_calls(frame)
         || cohere_frame_has_tool_calls(frame)
         || gemini_frame_has_tool_calls(frame)
+        || responses_frame_has_tool_calls(frame)
+}
+
+/// OpenAI Responses frame: a `function_call` output item event, a
+/// function-call arguments event, or a lifecycle event whose embedded
+/// `response.output` holds a `function_call` item (or is not an array, which
+/// the accumulator flags as malformed).
+fn responses_frame_has_tool_calls(frame: &Value) -> bool {
+    let Some(kind) = frame.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if !kind.starts_with("response.") {
+        return false;
+    }
+    match kind {
+        "response.output_item.added" | "response.output_item.done" => {
+            if frame
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+                == Some("function_call")
+            {
+                return true;
+            }
+        }
+        "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
+            return true;
+        }
+        _ => {}
+    }
+    match frame
+        .get("response")
+        .and_then(|response| response.get("output"))
+    {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(items)) => items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call")),
+        Some(_) => true,
+    }
 }
 
 /// OpenAI-family frame: modern `choices[].delta.tool_calls`, or the legacy
@@ -6016,18 +6978,21 @@ impl BufferedSseBatches {
         match classify_event(event) {
             SseEvent::Frame(frame) => {
                 if self.extract.model.is_none()
-                    && let Some(m) = frame.get("model").and_then(Value::as_str)
+                    && let Some(m) = stream_frame_model(&frame)
                 {
                     self.extract.model = Some(m.to_string());
                 }
                 if self.extract.provider.is_none()
-                    && let Some(p) = detect_sse_provider(&frame)
+                    && let Some(p) = stream_frame_provider(&frame)
                 {
-                    self.extract.provider = Some(p.as_str().to_string());
+                    self.extract.provider = Some(p);
                 }
                 if frame_has_tool_calls(&frame) {
                     self.saw_tool_calls = true;
                     self.acc.push_frame(&frame);
+                    if frame_carries_unclaimed_tool_call_marker(&frame) {
+                        self.extract.unreadable_shape = true;
+                    }
                 } else if body_carries_tool_call_marker(&frame) {
                     // Buffered mirror of the live inspector's
                     // unreadable-shape cut: a tool-call marker no provider
@@ -6052,6 +7017,7 @@ impl BufferedSseBatches {
                 self.extract.ungovernable = true;
                 self.extract.ambiguous = true;
             }
+            SseEvent::Uninspectable => self.extract.ungovernable = true,
             SseEvent::OtherData | SseEvent::NoData => {}
         }
     }
@@ -6178,12 +7144,15 @@ const TOOL_CALL_MARKER_KEYS: &[&str] = &[
 /// prefixed relatives) are not claimed.
 const TOOL_CALL_MARKER_TYPES: &[&str] = &["tool_use", "toolUse", "function_call", "tool-call"];
 
-/// Node budget for [`body_carries_tool_call_marker`]. The body is already
-/// bounded by [`MAX_PARSE_BYTES`], so a real provider response never
-/// approaches this; exhausting it means the scan could not prove the body
-/// carries no tool call, which is an ungovernable outcome rather than an
-/// allow.
-const TOOL_MARKER_SCAN_MAX_NODES: u32 = 250_000;
+/// Node budget for [`body_carries_tool_call_marker`]. Every JSON value occupies
+/// at least one byte of its source document, and every governed document is
+/// bounded by [`MAX_PARSE_BYTES`] (buffered bodies, decoded bodies, and SSE
+/// frames under the equal [`MAX_STREAM_HOLD_BYTES`] hold cap), so this budget
+/// always covers the whole document: a large payload with no tool surface (a
+/// batch of embedding vectors, a long numeric array) is scanned to the end and
+/// never rejected for its size alone. Exhausting it could only mean an
+/// out-of-contract input, which is still reported as a marker (fail closed).
+const TOOL_MARKER_SCAN_MAX_NODES: usize = MAX_PARSE_BYTES + 1;
 
 /// Whether `json` carries a live tool-call marker ANYWHERE in the document.
 ///
@@ -6198,40 +7167,243 @@ const TOOL_MARKER_SCAN_MAX_NODES: u32 = 250_000;
 ///
 /// Empty and `null` containers (`"tool_calls": []`, `"tool_calls": null`) are
 /// the documented "no calls" shapes and are NOT markers. The walk is iterative
-/// with an explicit stack (no recursion on backend-controlled nesting) and
-/// bounded by [`TOOL_MARKER_SCAN_MAX_NODES`].
+/// (no recursion on backend-controlled nesting), keeps one iterator per open
+/// container so its memory is bounded by nesting depth rather than width, and
+/// is bounded by [`TOOL_MARKER_SCAN_MAX_NODES`].
 fn body_carries_tool_call_marker(json: &Value) -> bool {
-    let mut stack: Vec<&Value> = vec![json];
+    tool_call_marker_walk(json, &HashSet::new())
+}
+
+/// Whether `json` carries a live tool-call marker OUTSIDE every location an
+/// extractor already read ([`claimed_response_tool_call_nodes`]).
+///
+/// Used when at least one call WAS extracted: the unknown-shape backstop then
+/// still covers a second call placed in a location no extractor reads (a
+/// normalizing client runtime may honor both), instead of being disabled by
+/// the readable sibling. Claimed subtrees — including the argument documents
+/// inside them — are skipped, so marker-like names inside a call's own
+/// arguments never count.
+fn body_carries_unclaimed_tool_call_marker(json: &Value) -> bool {
+    tool_call_marker_walk(json, &claimed_response_tool_call_nodes(json))
+}
+
+/// SSE-frame mirror of [`body_carries_unclaimed_tool_call_marker`] for a frame
+/// a streaming accumulator consumed.
+fn frame_carries_unclaimed_tool_call_marker(frame: &Value) -> bool {
+    tool_call_marker_walk(frame, &claimed_stream_frame_nodes(frame))
+}
+
+/// Address of a node inside a borrowed document, for the claimed-node sets.
+/// Only compared while the document is borrowed, so addresses stay valid.
+fn node_addr(value: &Value) -> usize {
+    std::ptr::from_ref(value).addr()
+}
+
+fn tool_call_marker_walk(json: &Value, claimed: &HashSet<usize>) -> bool {
+    enum Open<'a> {
+        Array(std::slice::Iter<'a, Value>),
+        Object(serde_json::map::Iter<'a>),
+    }
     let mut budget = TOOL_MARKER_SCAN_MAX_NODES;
-    while let Some(value) = stack.pop() {
-        if budget == 0 {
-            // Could not finish the scan: cannot prove the absence of a tool
-            // call, so report one (fail closed) rather than allow.
-            return true;
-        }
-        budget -= 1;
-        match value {
-            Value::Object(map) => {
-                let tagged = map
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| TOOL_CALL_MARKER_TYPES.contains(&kind));
-                if tagged {
-                    return true;
-                }
-                for (key, child) in map {
-                    let named = TOOL_CALL_MARKER_KEYS.contains(&key.as_str());
-                    if named && tool_call_marker_is_live(child) {
+    let mut open: Vec<Open<'_>> = Vec::new();
+    let mut next: Option<&Value> = Some(json);
+    loop {
+        if let Some(value) = next.take() {
+            if claimed.contains(&node_addr(value)) {
+                continue;
+            }
+            if budget == 0 {
+                // Could not finish the scan: cannot prove the absence of a
+                // tool call, so report one (fail closed) rather than allow.
+                return true;
+            }
+            budget -= 1;
+            match value {
+                Value::Object(map) => {
+                    let tagged = map
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| TOOL_CALL_MARKER_TYPES.contains(&kind));
+                    if tagged {
                         return true;
                     }
-                    stack.push(child);
+                    open.push(Open::Object(map.iter()));
+                }
+                Value::Array(items) => open.push(Open::Array(items.iter())),
+                _ => {}
+            }
+            continue;
+        }
+        let step = match open.last_mut() {
+            None => return false,
+            Some(Open::Array(items)) => items.next().map(|child| (None, child)),
+            Some(Open::Object(members)) => members.next().map(|(key, child)| (Some(key), child)),
+        };
+        let Some((key, child)) = step else {
+            open.pop();
+            continue;
+        };
+        if key.is_some_and(|key| TOOL_CALL_MARKER_KEYS.contains(&key.as_str()))
+            && !claimed.contains(&node_addr(child))
+            && tool_call_marker_is_live(child)
+        {
+            return true;
+        }
+        next = Some(child);
+    }
+}
+
+/// Every node an [`extract_response_tool_calls`] provider extractor reads a
+/// call from, mirroring each extractor's own claim conditions. Must change in
+/// step with the extractors.
+fn claimed_response_tool_call_nodes(json: &Value) -> HashSet<usize> {
+    let mut claimed = HashSet::new();
+    // OpenAI Chat Completions.
+    if let Some(choices) = json.get("choices").and_then(Value::as_array) {
+        for message in choices.iter().filter_map(|choice| choice.get("message")) {
+            for key in ["tool_calls", "function_call"] {
+                if let Some(node) = message.get(key) {
+                    claimed.insert(node_addr(node));
                 }
             }
-            Value::Array(items) => stack.extend(items.iter()),
-            _ => {}
         }
     }
-    false
+    // OpenAI Responses `output[]` function_call items.
+    if let Some(output) = json.get("output").and_then(Value::as_array) {
+        for item in output
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        {
+            claimed.insert(node_addr(item));
+        }
+    }
+    // Anthropic Messages `content[]` tool_use blocks (same claim as the
+    // extractor: envelope discriminator or a typed tool_use block).
+    let anthropic_envelope = json.get("type").and_then(Value::as_str) == Some("message")
+        || json.get("role").and_then(Value::as_str) == Some("assistant");
+    if let Some(blocks) = json.get("content").and_then(Value::as_array) {
+        let holds_tool_use = blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+        if anthropic_envelope || holds_tool_use {
+            claim_tool_use_blocks(blocks, "tool_use", &mut claimed);
+        }
+    }
+    // Bedrock Converse `output.message.content[]` toolUse blocks.
+    if let Some(blocks) = json
+        .get("output")
+        .filter(|output| output.is_object())
+        .and_then(|output| output.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    {
+        claim_tool_use_blocks(blocks, "toolUse", &mut claimed);
+    }
+    // Google Gemini `candidates[].content.parts[]` function calls.
+    if let Some(candidates) = json.get("candidates").and_then(Value::as_array) {
+        claim_gemini_function_calls(candidates, &mut claimed);
+    }
+    // Cohere v2 `message.tool_calls`.
+    if let Some(message) = json.get("message").filter(|message| message.is_object())
+        && (message.get("role").and_then(Value::as_str).is_some()
+            || message.get("tool_calls").is_some())
+        && let Some(tool_calls) = message.get("tool_calls")
+    {
+        claimed.insert(node_addr(tool_calls));
+    }
+    claimed
+}
+
+/// The resolved call object of each `content[]` block the shared
+/// `extract_tool_use_blocks` walker reads.
+fn claim_tool_use_blocks(blocks: &[Value], marker: &str, claimed: &mut HashSet<usize>) {
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some(marker) {
+            claimed.insert(node_addr(block));
+        } else if let Some(nested) = block.get(marker) {
+            claimed.insert(node_addr(nested));
+        }
+    }
+}
+
+fn claim_gemini_function_calls(candidates: &[Value], claimed: &mut HashSet<usize>) {
+    for part in candidates
+        .iter()
+        .filter_map(|candidate| candidate.get("content"))
+        .filter_map(|content| content.get("parts"))
+        .filter_map(Value::as_array)
+        .flatten()
+    {
+        if let Some(call) = gemini_function_call(part) {
+            claimed.insert(node_addr(call));
+        }
+    }
+}
+
+/// Every node of one SSE frame a streaming accumulator
+/// ([`StreamingToolCallAccumulator::push_frame`]) reads, mirroring each
+/// provider arm's claim conditions. Must change in step with those arms.
+fn claimed_stream_frame_nodes(frame: &Value) -> HashSet<usize> {
+    let mut claimed = HashSet::new();
+    // OpenAI Chat Completions deltas.
+    if let Some(choices) = frame.get("choices").and_then(Value::as_array) {
+        for delta in choices.iter().filter_map(|choice| choice.get("delta")) {
+            for key in ["tool_calls", "function_call"] {
+                if let Some(node) = delta.get(key) {
+                    claimed.insert(node_addr(node));
+                }
+            }
+        }
+    }
+    match frame.get("type").and_then(Value::as_str) {
+        // Anthropic Messages.
+        Some("content_block_start") => {
+            if let Some(block) = frame.get("content_block") {
+                claimed.insert(node_addr(block));
+            }
+        }
+        Some("content_block_delta") => {
+            if let Some(delta) = frame.get("delta") {
+                claimed.insert(node_addr(delta));
+            }
+        }
+        // Cohere v2.
+        Some("tool-call-start") | Some("tool-call-delta") => {
+            if let Some(tool_calls) = frame
+                .get("delta")
+                .and_then(|delta| delta.get("message"))
+                .and_then(|message| message.get("tool_calls"))
+            {
+                claimed.insert(node_addr(tool_calls));
+            }
+        }
+        // OpenAI Responses events.
+        Some(kind) if kind.starts_with("response.") => {
+            if let Some(item) = frame
+                .get("item")
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            {
+                claimed.insert(node_addr(item));
+            }
+            if let Some(output) = frame
+                .get("response")
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_array)
+            {
+                for item in output.iter().filter(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call")
+                }) {
+                    claimed.insert(node_addr(item));
+                }
+            }
+        }
+        _ => {}
+    }
+    // Google Gemini.
+    if let Some(candidates) = frame.get("candidates").and_then(Value::as_array) {
+        claim_gemini_function_calls(candidates, &mut claimed);
+    }
+    claimed
 }
 
 /// Whether a tool-call marker member actually carries a call. `null`, an empty
@@ -6773,12 +7945,47 @@ fn federation_provider(ctx: &RequestContext) -> Option<String> {
     .find_map(|key| ctx.metadata.get(key).filter(|p| !p.is_empty()).cloned())
 }
 
+/// Authority-qualified caller identity for approval correlation.
+///
+/// A mapped Consumer is identified by its namespace and record id (a username
+/// can be deleted and re-created). An external principal is its subject
+/// TOGETHER with the realm that verified it — the authentication mechanism and
+/// its opaque verifying-authority digest — because a subject string is only
+/// meaningful inside the authority that issued it. The digest is opaque (it
+/// reveals no issuer or URL), so it is safe to send to the approval webhook.
+fn correlation_principal(ctx: &RequestContext) -> Option<Value> {
+    if let Some(consumer) = ctx.identified_consumer.as_ref() {
+        return Some(json!({
+            "kind": "consumer",
+            "namespace": consumer.namespace,
+            "id": consumer.id,
+        }));
+    }
+    let subject = ctx.effective_identity()?;
+    let realm = ctx.authenticated_identity_realm();
+    Some(json!({
+        "kind": "external",
+        "subject": subject,
+        "mechanism": realm.map(|realm| realm.mechanism()),
+        "authority": realm.and_then(|realm| realm.authority().map(hex::encode)),
+    }))
+}
+
 /// The non-identity `Content-Encoding` header value, trimmed, or `None` when
 /// absent/empty/`identity`.
 fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
     header_value(headers, "content-encoding")
         .map(str::trim)
         .filter(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+}
+
+/// Whether `bytes` (after an optional BOM) is one complete, well-formed JSON
+/// document under the governed scan budgets. Consulted only after `serde_json`
+/// already refused the bytes, to tell "malformed" (forwarded: no parser reads a
+/// call out of it) from "well-formed but beyond `serde_json`'s nesting or
+/// numeric limits" (uninspectable: other parsers read it fine).
+fn is_well_formed_json(bytes: &[u8]) -> bool {
+    json_dup_keys::scan(strip_json_bom(bytes), &json_dup_keys::GOVERNED_JSON_LIMITS).is_ok()
 }
 
 /// Parse `body` as JSON only when it is within the inspectable size limit. A
@@ -6792,14 +7999,15 @@ fn parse_json_within_limit(body: &[u8]) -> Option<Value> {
     serde_json::from_slice(strip_json_bom(body)).ok()
 }
 
-/// Decompress a gateway-encoded response body (the same `gzip`/`br` encodings
-/// the `compression` plugin produces), bounded by [`MAX_PARSE_BYTES`] so a
-/// decompression bomb cannot blow up memory. Returns `None` for unsupported
-/// encodings, decode errors, or output past the limit.
+/// Decompress a gateway-encoded response body (the same `gzip`/`br`/`zstd`
+/// encodings the `compression` plugin produces), bounded by [`MAX_PARSE_BYTES`]
+/// so a decompression bomb cannot blow up memory. Returns `None` for
+/// unsupported encodings, decode errors, or output past the limit.
 fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
     let coding = match encoding.trim().to_ascii_lowercase().as_str() {
         "gzip" | "x-gzip" => "gzip",
         "br" => "br",
+        "zstd" => "zstd",
         _ => return None,
     };
     super::charged_decode::decode_charged_content_coding_chain(
@@ -6946,6 +8154,117 @@ fn sha256_hex(input: &str) -> String {
     sha256_hex_bytes(input.as_bytes())
 }
 
+/// JSON-decoded views of a tool call's arguments for `blocked_arg_patterns`.
+///
+/// The raw arguments of the string-argument dialects are model-controlled JSON
+/// source, so a regex over them can be evaded with JSON escapes the executing
+/// runtime decodes (`"api\u005fkey"`, `"http:\/\/"`). Escapes need a backslash,
+/// so the views are built only when the raw text contains one; otherwise the
+/// decoded strings are verbatim substrings of the raw text and add nothing.
+///
+/// Two views: the canonical re-serialization of the parsed document (escapes
+/// normalized, so structural regexes over member names still apply) and every
+/// decoded string leaf, member names included (so a regex sees control
+/// characters and quotes as the runtime does).
+struct DecodedArgumentViews<'v> {
+    canonical: Option<String>,
+    leaves: Vec<&'v str>,
+}
+
+impl<'v> DecodedArgumentViews<'v> {
+    fn empty() -> Self {
+        Self {
+            canonical: None,
+            leaves: Vec::new(),
+        }
+    }
+
+    fn new(raw: &str, parsed: Option<&'v Value>) -> Self {
+        let Some(parsed) = parsed else {
+            return Self::empty();
+        };
+        if !raw.contains('\\') {
+            return Self::empty();
+        }
+        let canonical = parsed.to_string();
+        Self {
+            canonical: (canonical != raw).then_some(canonical),
+            leaves: json_string_leaves(parsed),
+        }
+    }
+
+    fn any_match(&self, regex: &Regex) -> bool {
+        self.canonical
+            .as_deref()
+            .is_some_and(|canonical| regex.is_match(canonical))
+            || self.leaves.iter().any(|leaf| regex.is_match(leaf))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.canonical.is_none() && self.leaves.is_empty()
+    }
+}
+
+/// Every string in `value` — string values and object member names — in
+/// document order, walked with an explicit stack.
+fn json_string_leaves(value: &Value) -> Vec<&str> {
+    let mut leaves = Vec::new();
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::String(text) => leaves.push(text.as_str()),
+            Value::Array(items) => stack.extend(items.iter().rev()),
+            Value::Object(map) => {
+                for (key, child) in map {
+                    leaves.push(key.as_str());
+                    stack.push(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    leaves
+}
+
+/// Anchored `*`-only glob match for `tools` keys. `*` matches any run of
+/// characters, including none and including `.`, `/`, and `_`: a deny glob such
+/// as `*delete*` must not be escapable by the separator a tool name happens to
+/// use. Leading and trailing literals are anchored; interior literals are
+/// matched leftmost, which is exact for a `*`-only glob once both anchors are
+/// stripped. Linear in the name length per literal segment.
+fn tool_glob_matches(pattern: &str, name: &str) -> bool {
+    let Some((prefix, after_first)) = pattern.split_once('*') else {
+        return pattern == name;
+    };
+    let (interior, suffix) = after_first.rsplit_once('*').unwrap_or(("", after_first));
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(mut middle) = rest.strip_suffix(suffix) else {
+        return false;
+    };
+    for literal in interior.split('*').filter(|literal| !literal.is_empty()) {
+        let Some(position) = middle.find(literal) else {
+            return false;
+        };
+        middle = &middle[position + literal.len()..];
+    }
+    true
+}
+
+/// Precedence among glob `tools` keys that match one name: more literal
+/// (non-`*`) bytes first, then fewer wildcards, then the key's byte order. The
+/// result is a total order, so the winning policy never depends on map
+/// iteration order.
+fn tool_glob_specificity_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let literal_bytes = |pattern: &str| pattern.bytes().filter(|byte| *byte != b'*').count();
+    let wildcards = |pattern: &str| pattern.bytes().filter(|byte| *byte == b'*').count();
+    literal_bytes(b)
+        .cmp(&literal_bytes(a))
+        .then_with(|| wildcards(a).cmp(&wildcards(b)))
+        .then_with(|| a.cmp(b))
+}
+
 /// Strip a single leading UTF-8 BOM (`EF BB BF`) so JSON parsing/shape checks
 /// see the document itself. `serde_json` rejects a BOM-prefixed body, so a
 /// backend (or a `response_transformer`) that emits `\u{feff}{...}` would make
@@ -7007,6 +8326,7 @@ fn correlated_call_identity_hash(corr: &CorrelationMeta, call: &ToolCall) -> Str
     sha256_hex(
         &json!([
             corr.consumer.as_deref(),
+            corr.principal.as_ref(),
             corr.proxy.as_deref(),
             corr.model.as_deref(),
             corr.provider.as_deref(),
@@ -7364,6 +8684,13 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         }
     };
 
+    let callers = CallerScope {
+        allowed_consumers: parse_caller_scope_list(name, obj, "allowed_consumers")?,
+        denied_consumers: parse_caller_scope_list(name, obj, "denied_consumers")?,
+        allowed_groups: parse_caller_scope_list(name, obj, "allowed_groups")?,
+        denied_groups: parse_caller_scope_list(name, obj, "denied_groups")?,
+    };
+
     Ok(ToolPolicy {
         action,
         risk,
@@ -7371,7 +8698,46 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
         required_args,
         blocked_arg_patterns,
         json_schema,
+        callers,
     })
+}
+
+/// Parse one optional per-tool identity list (`allowed_consumers`, …): an
+/// array of non-empty, bounded strings. Entries are never echoed back.
+fn parse_caller_scope_list(
+    tool: &str,
+    obj: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<HashSet<String>, String> {
+    let Some(value) = obj.get(field) else {
+        return Ok(HashSet::new());
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        format!("ai_tool_governor: tool {tool:?} `{field}` must be an array of strings")
+    })?;
+    if entries.is_empty() {
+        return Err(format!(
+            "ai_tool_governor: tool {tool:?} `{field}` must not be empty (omit it instead)"
+        ));
+    }
+    if entries.len() > MAX_CALLER_SCOPE_ENTRIES {
+        return Err(format!(
+            "ai_tool_governor: tool {tool:?} `{field}` must have at most {MAX_CALLER_SCOPE_ENTRIES} entries"
+        ));
+    }
+    let mut out = HashSet::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        let entry = entry.as_str().ok_or_else(|| {
+            format!("ai_tool_governor: tool {tool:?} `{field}[{idx}]` must be a string")
+        })?;
+        if entry.is_empty() || entry.len() > MAX_CALLER_SCOPE_ENTRY_BYTES {
+            return Err(format!(
+                "ai_tool_governor: tool {tool:?} `{field}[{idx}]` must be 1-{MAX_CALLER_SCOPE_ENTRY_BYTES} UTF-8 bytes"
+            ));
+        }
+        out.insert(entry.to_string());
+    }
+    Ok(out)
 }
 
 fn parse_approval(
@@ -7485,6 +8851,28 @@ fn parse_approval(
         })?,
     };
 
+    // The approval verdict is an authorization decision, and the request can
+    // carry a credential (`headers`) and raw arguments (`include_arguments`).
+    // Cleartext is therefore admitted without an opt-in only to a loopback IP
+    // literal (a co-located sidecar); a MITM elsewhere could forge `allow`.
+    let allow_plaintext = match obj.get("allow_plaintext") {
+        None => false,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            "ai_tool_governor: `approval.allow_plaintext` must be a boolean".to_string()
+        })?,
+    };
+    if parsed.scheme() == "http"
+        && !allow_plaintext
+        && !is_loopback_ip_literal_endpoint(&without_url_userinfo(endpoint_url), parsed.host())
+    {
+        return Err(
+            "ai_tool_governor: `approval.endpoint_url` uses `http://` to a host that is not a loopback IP literal, which is rejected by default; use `https://` or set `approval.allow_plaintext: true`"
+                .to_string(),
+        );
+    }
+
+    let headers = parse_approval_headers(obj)?;
+
     Ok(Some(ApprovalConfig {
         endpoint_url: endpoint_url.to_string(),
         redacted_endpoint_url: redacted_approval_url(&parsed),
@@ -7493,7 +8881,90 @@ fn parse_approval(
         cache_ttl: Duration::from_secs(cache_ttl_seconds),
         fail_on_error,
         include_arguments,
+        headers,
+        resolved_headers: tokio::sync::OnceCell::new(),
     }))
+}
+
+/// `endpoint` with any URL userinfo (`user:pass@`) removed from its authority,
+/// so the loopback-literal check reads the host itself. The WHATWG parser ends
+/// userinfo at the LAST `@` of the authority, and so does this.
+fn without_url_userinfo(endpoint: &str) -> Cow<'_, str> {
+    let Some(scheme_end) = endpoint.find("://").map(|index| index + 3) else {
+        return Cow::Borrowed(endpoint);
+    };
+    let rest = &endpoint[scheme_end..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return Cow::Borrowed(endpoint);
+    };
+    Cow::Owned(format!("{}{}", &endpoint[..scheme_end], &rest[at + 1..]))
+}
+
+/// Parse `approval.headers`: header name → literal value, or a whole-value
+/// `${FERRUM_PLUGIN_SECRET_<NAME>}` reference resolved at the first approval
+/// call. Values are never echoed in diagnostics.
+fn parse_approval_headers(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<Vec<ApprovalHeader>, String> {
+    let Some(value) = obj.get("headers") else {
+        return Ok(Vec::new());
+    };
+    let map = value
+        .as_object()
+        .ok_or_else(|| format!("{APPROVAL_HEADERS_FIELD} must be an object"))?;
+    if map.len() > MAX_APPROVAL_HEADERS {
+        return Err(format!(
+            "{APPROVAL_HEADERS_FIELD} must have at most {MAX_APPROVAL_HEADERS} entries"
+        ));
+    }
+    let mut seen: HashSet<reqwest::header::HeaderName> = HashSet::with_capacity(map.len());
+    let mut headers = Vec::with_capacity(map.len());
+    for (key, value) in map {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| format!("{APPROVAL_HEADERS_FIELD} entry {key:?} must be a string"))?;
+        let name = reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
+            format!("{APPROVAL_HEADERS_FIELD} name {key:?} is not a valid HTTP header name")
+        })?;
+        if RESERVED_APPROVAL_HEADERS.contains(&name.as_str())
+            || crate::proxy::hop_limit::is_proxy_hops_header(key)
+        {
+            return Err(format!(
+                "{APPROVAL_HEADERS_FIELD} must not set {:?}; the gateway owns that header on the approval request",
+                name.as_str()
+            ));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(format!(
+                "{APPROVAL_HEADERS_FIELD} names {:?} more than once (header names are case-insensitive)",
+                name.as_str()
+            ));
+        }
+        if raw.is_empty() || raw.len() > MAX_APPROVAL_HEADER_VALUE_BYTES {
+            return Err(format!(
+                "{APPROVAL_HEADERS_FIELD} value for {key:?} must be 1-{MAX_APPROVAL_HEADER_VALUE_BYTES} UTF-8 bytes"
+            ));
+        }
+        let value = match raw
+            .strip_prefix("${")
+            .and_then(|rest| rest.strip_suffix('}'))
+        {
+            Some(env_name) => {
+                validate_plugin_secret_env_name(APPROVAL_HEADERS_FIELD, env_name)?;
+                ApprovalHeaderValue::SecretEnv(env_name.to_string())
+            }
+            None => {
+                let mut value = reqwest::header::HeaderValue::from_str(raw).map_err(|_| {
+                    format!("{APPROVAL_HEADERS_FIELD} value for {key:?} is not a valid HTTP header value")
+                })?;
+                value.set_sensitive(true);
+                ApprovalHeaderValue::Literal(value)
+            }
+        };
+        headers.push(ApprovalHeader { name, value });
+    }
+    Ok(headers)
 }
 
 fn parse_response(config: &Value) -> Result<ResponseConfig, String> {

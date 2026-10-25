@@ -1,17 +1,32 @@
 //! WebSocket Frame Logging Plugin
 //!
-//! Logs metadata for every WebSocket frame that the shared H1/H2/H3 relay
-//! successfully delivers (post-plugin, post-control-frame guard), plus
-//! plugin-generated policy Close decisions observed in the mutating chain.
-//! Provides frame-level observability without requiring packet captures.
+//! Logs metadata for every complete WebSocket message that the shared
+//! H1/H2/H3 relay successfully delivers (post-plugin, post-control-frame
+//! guard), plus every gateway-published policy Close decision. Provides
+//! message-level observability without requiring packet captures.
 //!
-//! Each delivered frame log entry includes: proxy_id, connection_id, direction,
-//! frame type, payload size in bytes, optional close code / reason length, and
-//! an optional payload fingerprint. Disconnect events on the same
+//! Granularity is one record per **reassembled message**, not per wire frame:
+//! tungstenite reassembles a fragmented Text/Binary message (initial non-final
+//! frame plus continuations) before the relay sees it, so a message sent as
+//! many fragments produces one record whose `size_bytes` is the reassembled
+//! payload length. Control frames (Ping/Pong/Close) are never fragmented and
+//! map one-to-one. Under `websocket_permessage_deflate: terminate`, sizes are
+//! the inflated (plaintext) lengths. The disconnect record's `frames_*`
+//! counters use the same unit (delivered messages).
+//!
+//! Each delivered record includes: plugin_id, proxy_id, connection_id,
+//! direction, frame type, payload size in bytes, optional close code / reason
+//! length, and an optional payload fingerprint. Disconnect events on the same
 //! `ws_frame_log` target reuse that admission `connection_id` so operators can
-//! join the terminal record to the frame stream. The ID is process-local;
+//! join the terminal record to the message stream. The ID is process-local;
 //! multi-instance aggregation must include a gateway instance identity
-//! alongside `proxy_id` and `connection_id`.
+//! alongside `proxy_id` and `connection_id`. `plugin_id` is the plugin-config
+//! resource id, so two effective instances on one proxy stay distinguishable.
+//!
+//! Volume controls (`sample_rate`, `direction`, `max_records_per_connection`)
+//! select which `delivered` records are emitted. `policy_close` decisions and
+//! the per-session disconnect record are bounded per session and always
+//! emitted at the configured level.
 //!
 //! This plugin never transforms or drops frames — it is purely observational.
 //!
@@ -39,21 +54,27 @@
 //!   "log_level": "info",
 //!   "include_payload_preview": false,
 //!   "payload_preview_bytes": 128,
-//!   "log_ping_pong": false
+//!   "log_ping_pong": false,
+//!   "sample_rate": 1.0,
+//!   "direction": "both",
+//!   "max_records_per_connection": 0
 //! }
 //! ```
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fips::backend::rand::SecureRandom;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tracing::callsite::{DefaultCallsite, Identifier};
 use tracing::field::FieldSet;
 use tracing::metadata::Kind;
 use tracing::{Level, Metadata, warn};
 
 use super::{
-    Direction, Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
+    Direction, Plugin, ProxyProtocol, RequestContext, WS_ONLY_PROTOCOLS, WebSocketFrameDirection,
     WsDisconnectContext, WsFrameDeliveryObservation,
 };
 
@@ -63,6 +84,9 @@ pub const WS_FRAME_LOGGING_CONFIG_KEYS: &[&str] = &[
     "include_payload_preview",
     "payload_preview_bytes",
     "log_ping_pong",
+    "sample_rate",
+    "direction",
+    "max_records_per_connection",
 ];
 
 /// Maximum leading payload bytes folded into a fingerprint digest.
@@ -74,6 +98,13 @@ pub const MAX_PAYLOAD_PREVIEW_BYTES: u64 = 65_536;
 #[allow(dead_code)] // Used by external unit tests that verify OpenAPI/default parity.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
+/// Accepted `direction` values, in documentation order.
+pub const DIRECTION_FILTER_VALUES: &[&str] = &["both", "client_to_backend", "backend_to_client"];
+
+/// `plugin_id` rendered when the instance was constructed without a
+/// plugin-config resource id (validation or direct construction).
+pub const UNATTRIBUTED_PLUGIN_ID: &str = "-";
+
 /// Log level for frame logging output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogLevel {
@@ -81,6 +112,25 @@ enum LogLevel {
     Debug,
     Info,
     Warn,
+}
+
+/// Which relay direction's `delivered` records are emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectionFilter {
+    Both,
+    ClientToBackend,
+    BackendToClient,
+}
+
+impl DirectionFilter {
+    #[inline]
+    fn admits(self, direction: WebSocketFrameDirection) -> bool {
+        match self {
+            Self::Both => true,
+            Self::ClientToBackend => direction == WebSocketFrameDirection::ClientToBackend,
+            Self::BackendToClient => direction == WebSocketFrameDirection::BackendToClient,
+        }
+    }
 }
 
 /// Build one distinct static probe callsite per macro expansion while keeping
@@ -161,12 +211,14 @@ impl LogLevel {
 /// Close code / reason length and preview are optional: the macro branches so
 /// absent fields are omitted entirely rather than logged as empty sentinels.
 macro_rules! emit_ws_frame_log {
-    ($level:ident, $proxy_id:expr, $conn_id:expr, $dir:expr, $obs:expr, $outcome:expr) => {{
+    ($level:ident, $plugin_id:expr, $proxy_id:expr, $conn_id:expr, $dir:expr, $obs:expr, $outcome:expr) => {{
         let obs = $obs;
+        let plugin_id: &str = $plugin_id;
         match (&obs.preview, obs.close_code, obs.close_reason_len) {
             (Some(preview), Some(code), Some(reason_len)) => {
                 tracing::$level!(
                     target: "ws_frame_log",
+                    plugin_id,
                     proxy_id = %$proxy_id,
                     connection_id = $conn_id,
                     direction = $dir,
@@ -182,6 +234,7 @@ macro_rules! emit_ws_frame_log {
             (Some(preview), None, None) => {
                 tracing::$level!(
                     target: "ws_frame_log",
+                    plugin_id,
                     proxy_id = %$proxy_id,
                     connection_id = $conn_id,
                     direction = $dir,
@@ -195,6 +248,7 @@ macro_rules! emit_ws_frame_log {
             (None, Some(code), Some(reason_len)) => {
                 tracing::$level!(
                     target: "ws_frame_log",
+                    plugin_id,
                     proxy_id = %$proxy_id,
                     connection_id = $conn_id,
                     direction = $dir,
@@ -209,6 +263,7 @@ macro_rules! emit_ws_frame_log {
             (None, None, None) => {
                 tracing::$level!(
                     target: "ws_frame_log",
+                    plugin_id,
                     proxy_id = %$proxy_id,
                     connection_id = $conn_id,
                     direction = $dir,
@@ -222,6 +277,7 @@ macro_rules! emit_ws_frame_log {
             (Some(preview), _, _) => {
                 tracing::$level!(
                     target: "ws_frame_log",
+                    plugin_id,
                     proxy_id = %$proxy_id,
                     connection_id = $conn_id,
                     direction = $dir,
@@ -235,6 +291,7 @@ macro_rules! emit_ws_frame_log {
             (None, _, _) => {
                 tracing::$level!(
                     target: "ws_frame_log",
+                    plugin_id,
                     proxy_id = %$proxy_id,
                     connection_id = $conn_id,
                     direction = $dir,
@@ -248,7 +305,9 @@ macro_rules! emit_ws_frame_log {
     }};
 }
 
-pub struct WsFrameLogging {
+/// Immutable construction-time configuration shared by the plugin-cache
+/// instance and every session-bound instance it hands the relay.
+struct WsFrameLoggingConfig {
     log_level: LogLevel,
     include_payload_preview: bool,
     payload_preview_bytes: usize,
@@ -256,14 +315,54 @@ pub struct WsFrameLogging {
     /// extra SHA-256 compressions on the WebSocket hot path.
     payload_fingerprint_key: Option<crate::fips::backend::hmac::Key>,
     log_ping_pong: bool,
+    /// `None` logs every connection (`sample_rate: 1`). Otherwise a connection
+    /// is sampled when `splitmix64(connection_id) < threshold`.
+    sample_threshold: Option<u64>,
+    direction: DirectionFilter,
+    /// `0` disables the per-connection cap.
+    max_records_per_connection: u64,
+    /// Plugin-config resource id, or [`UNATTRIBUTED_PLUGIN_ID`].
+    plugin_id: Box<str>,
+}
+
+pub struct WsFrameLogging {
+    config: Arc<WsFrameLoggingConfig>,
+    /// `delivered` records emitted on one session. Present only on the
+    /// session-bound instance `bind_ws_session` returns when
+    /// `max_records_per_connection` is non-zero, so an uncapped configuration
+    /// allocates nothing per session and touches no atomic per message.
+    session_records: Option<AtomicU64>,
 }
 
 impl WsFrameLogging {
+    /// Construct without a plugin-config resource id (validation and direct
+    /// construction). Records carry `plugin_id = "-"`.
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_config_id(config, None)
+    }
+
+    /// Construct with the stable plugin-config resource id that production
+    /// `PluginCache` builds pass, stamped on every record as `plugin_id`.
+    /// A supplied id that is blank or carries control characters fails closed.
+    pub fn new_with_config_id(
+        config: &Value,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
         let Some(object) = config.as_object() else {
             return Err("ws_frame_logging: config must be a JSON object".to_string());
         };
         reject_unknown_keys(object)?;
+
+        let plugin_id: Box<str> = match plugin_config_id {
+            None => UNATTRIBUTED_PLUGIN_ID.into(),
+            Some(id) if id.trim().is_empty() || id.chars().any(char::is_control) => {
+                return Err(
+                    "ws_frame_logging: plugin config id must be non-blank and must not contain control characters"
+                        .to_string(),
+                );
+            }
+            Some(id) => id.into(),
+        };
 
         // Validate log_level explicitly — unknown values are rejected per the
         // plugin-validation rules so misspellings (e.g. "info " or "INFO") are
@@ -341,6 +440,82 @@ impl WsFrameLogging {
                     .to_string(),
             );
         }
+
+        let log_ping_pong = match object.get("log_ping_pong") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: `log_ping_pong` must be a boolean; null is not allowed"
+                        .to_string(),
+                );
+            }
+            Some(v) => v
+                .as_bool()
+                .ok_or_else(|| "ws_frame_logging: `log_ping_pong` must be a boolean".to_string())?,
+            None => false,
+        };
+
+        let sample_threshold = match object.get("sample_rate") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: `sample_rate` must be a number between 0 and 1; null is not allowed"
+                        .to_string(),
+                );
+            }
+            Some(v) => {
+                let rate = v.as_f64().ok_or_else(|| {
+                    "ws_frame_logging: `sample_rate` must be a number between 0 and 1".to_string()
+                })?;
+                if !(0.0..=1.0).contains(&rate) {
+                    return Err(format!(
+                        "ws_frame_logging: `sample_rate` must be between 0 and 1 inclusive (got {rate})"
+                    ));
+                }
+                sample_threshold_for_rate(rate)
+            }
+            None => None,
+        };
+
+        let direction = match object.get("direction") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: `direction` must be a string (`both`, `client_to_backend`, or `backend_to_client`); null is not allowed"
+                        .to_string(),
+                );
+            }
+            Some(v) => match v.as_str() {
+                Some("both") => DirectionFilter::Both,
+                Some("client_to_backend") => DirectionFilter::ClientToBackend,
+                Some("backend_to_client") => DirectionFilter::BackendToClient,
+                Some(other) => {
+                    return Err(format!(
+                        "ws_frame_logging: invalid `direction` value {other:?} \
+                         (expected `both`, `client_to_backend`, or `backend_to_client`)"
+                    ));
+                }
+                None => {
+                    return Err(
+                        "ws_frame_logging: `direction` must be a string (`both`, `client_to_backend`, or `backend_to_client`)"
+                            .to_string(),
+                    );
+                }
+            },
+            None => DirectionFilter::Both,
+        };
+
+        let max_records_per_connection = match object.get("max_records_per_connection") {
+            Some(Value::Null) => {
+                return Err(
+                    "ws_frame_logging: `max_records_per_connection` must be a non-negative integer; null is not allowed"
+                        .to_string(),
+                );
+            }
+            Some(v) => v.as_u64().ok_or_else(|| {
+                "ws_frame_logging: `max_records_per_connection` must be a non-negative integer"
+                    .to_string()
+            })?,
+            None => 0,
+        };
+
         let payload_fingerprint_key = if include_payload_preview {
             let mut key = [0u8; 32];
             crate::fips::backend::rand::SystemRandom::new()
@@ -354,19 +529,6 @@ impl WsFrameLogging {
             ))
         } else {
             None
-        };
-
-        let log_ping_pong = match object.get("log_ping_pong") {
-            Some(Value::Null) => {
-                return Err(
-                    "ws_frame_logging: `log_ping_pong` must be a boolean; null is not allowed"
-                        .to_string(),
-                );
-            }
-            Some(v) => v
-                .as_bool()
-                .ok_or_else(|| "ws_frame_logging: `log_ping_pong` must be a boolean".to_string())?,
-            None => false,
         };
 
         // Surface a construction-time warning when the active tracing
@@ -387,24 +549,49 @@ impl WsFrameLogging {
         }
 
         Ok(Self {
-            log_level,
-            include_payload_preview,
-            payload_preview_bytes,
-            payload_fingerprint_key,
-            log_ping_pong,
+            config: Arc::new(WsFrameLoggingConfig {
+                log_level,
+                include_payload_preview,
+                payload_preview_bytes,
+                payload_fingerprint_key,
+                log_ping_pong,
+                sample_threshold,
+                direction,
+                max_records_per_connection,
+                plugin_id,
+            }),
+            session_records: None,
         })
     }
 
     /// Configured tracing level label (`trace`/`debug`/`info`/`warn`).
     #[allow(dead_code)] // Used by external unit tests; the binary uses the parsed enum directly.
     pub fn configured_log_level(&self) -> &'static str {
-        self.log_level.as_str()
+        self.config.log_level.as_str()
     }
 
     /// Leading payload bytes folded into fingerprints when previews are enabled.
     #[allow(dead_code)] // Used by external unit tests; runtime reads the field directly.
     pub fn payload_preview_bytes(&self) -> usize {
-        self.payload_preview_bytes
+        self.config.payload_preview_bytes
+    }
+
+    /// Plugin-config resource id stamped on every record as `plugin_id`.
+    #[allow(dead_code)] // Used by external unit tests; runtime reads the field directly.
+    pub fn plugin_id(&self) -> &str {
+        &self.config.plugin_id
+    }
+
+    /// Whether `delivered` records for `connection_id` pass `sample_rate`.
+    ///
+    /// Deterministic per connection (the whole session is either recorded or
+    /// not, so a sampled session stays coherent) and stateless: one mixing
+    /// hash of the process-local admission id, no allocation or shared state.
+    pub fn connection_sampled(&self, connection_id: u64) -> bool {
+        match self.config.sample_threshold {
+            None => true,
+            Some(threshold) => splitmix64(connection_id) < threshold,
+        }
     }
 
     fn frame_type_label(message: &Message) -> &'static str {
@@ -428,19 +615,21 @@ impl WsFrameLogging {
             Message::Text(s) => s.len(),
             Message::Binary(b) => b.len(),
             Message::Ping(d) | Message::Pong(d) => d.len(),
-            Message::Close(Some(cf)) => 2usize.saturating_add(cf.reason.len()),
-            Message::Close(None) => 0,
+            Message::Close(close) => Self::close_size(close.as_ref()),
             // `Frame` is raw-frame mode (unused by the gateway's WS path but
             // exposed for plugin flexibility). Use its payload length.
             Message::Frame(f) => f.payload().len(),
         }
     }
 
-    fn close_metadata(message: &Message) -> (Option<u16>, Option<usize>) {
-        match message {
-            Message::Close(Some(cf)) => (Some(u16::from(cf.code)), Some(cf.reason.len())),
-            Message::Close(None) => (None, None),
-            _ => (None, None),
+    fn close_size(close: Option<&CloseFrame>) -> usize {
+        close.map_or(0, |cf| 2usize.saturating_add(cf.reason.len()))
+    }
+
+    fn close_metadata(close: Option<&CloseFrame>) -> (Option<u16>, Option<usize>) {
+        match close {
+            Some(cf) => (Some(u16::from(cf.code)), Some(cf.reason.len())),
+            None => (None, None),
         }
     }
 
@@ -460,16 +649,16 @@ impl WsFrameLogging {
     /// during plugin construction, so log access alone is not enough to verify
     /// guessed credentials offline. See the module-level "Payload privacy" note.
     fn payload_preview(&self, message: &Message) -> Option<String> {
-        if !self.include_payload_preview {
+        if !self.config.include_payload_preview {
             return None;
         }
-        let key = self.payload_fingerprint_key.as_ref()?;
+        let key = self.config.payload_fingerprint_key.as_ref()?;
         let (full_len, bytes): (usize, &[u8]) = match message {
             Message::Text(s) => (s.len(), s.as_bytes()),
             Message::Binary(b) => (b.len(), b.as_ref()),
             _ => return None,
         };
-        let hashed_len = full_len.min(self.payload_preview_bytes);
+        let hashed_len = full_len.min(self.config.payload_preview_bytes);
         let truncated = hashed_len < full_len;
         Some(payload_fingerprint(
             key,
@@ -480,13 +669,16 @@ impl WsFrameLogging {
     }
 
     fn observation_from_message(&self, message: &Message) -> Option<WsFrameDeliveryObservation> {
-        if !self.log_ping_pong && matches!(message, Message::Ping(_) | Message::Pong(_)) {
+        if !self.config.log_ping_pong && matches!(message, Message::Ping(_) | Message::Pong(_)) {
             return None;
         }
-        if !self.log_level.is_enabled() {
+        if !self.config.log_level.is_enabled() {
             return None;
         }
-        let (close_code, close_reason_len) = Self::close_metadata(message);
+        let (close_code, close_reason_len) = match message {
+            Message::Close(close) => Self::close_metadata(close.as_ref()),
+            _ => (None, None),
+        };
         Some(WsFrameDeliveryObservation {
             frame_type: Self::frame_type_label(message),
             size_bytes: Self::frame_size(message),
@@ -508,9 +700,11 @@ impl WsFrameLogging {
             WebSocketFrameDirection::ClientToBackend => "client->backend",
             WebSocketFrameDirection::BackendToClient => "backend->client",
         };
-        match self.log_level {
+        let plugin_id: &str = &self.config.plugin_id;
+        match self.config.log_level {
             LogLevel::Trace => emit_ws_frame_log!(
                 trace,
+                plugin_id,
                 proxy_id,
                 connection_id,
                 dir_label,
@@ -519,6 +713,7 @@ impl WsFrameLogging {
             ),
             LogLevel::Debug => emit_ws_frame_log!(
                 debug,
+                plugin_id,
                 proxy_id,
                 connection_id,
                 dir_label,
@@ -527,6 +722,7 @@ impl WsFrameLogging {
             ),
             LogLevel::Info => emit_ws_frame_log!(
                 info,
+                plugin_id,
                 proxy_id,
                 connection_id,
                 dir_label,
@@ -535,6 +731,7 @@ impl WsFrameLogging {
             ),
             LogLevel::Warn => emit_ws_frame_log!(
                 warn,
+                plugin_id,
                 proxy_id,
                 connection_id,
                 dir_label,
@@ -543,6 +740,53 @@ impl WsFrameLogging {
             ),
         }
     }
+
+    /// One bounded marker per capped session, emitted on the first suppressed
+    /// `delivered` record so operators can tell a quiet session from a capped
+    /// one.
+    fn emit_record_cap_reached(&self, proxy_id: &str, connection_id: u64) {
+        let plugin_id: &str = &self.config.plugin_id;
+        let max_records_per_connection = self.config.max_records_per_connection;
+        macro_rules! emit_cap {
+            ($level:ident) => {
+                tracing::$level!(
+                    target: "ws_frame_log",
+                    plugin_id,
+                    proxy_id = %proxy_id,
+                    connection_id,
+                    max_records_per_connection,
+                    event = "record_cap_reached",
+                    "WebSocket frame record cap reached; further delivered records for this connection are suppressed"
+                )
+            };
+        }
+        match self.config.log_level {
+            LogLevel::Trace => emit_cap!(trace),
+            LogLevel::Debug => emit_cap!(debug),
+            LogLevel::Info => emit_cap!(info),
+            LogLevel::Warn => emit_cap!(warn),
+        }
+    }
+}
+
+/// Map `sample_rate` (already validated to `0..=1`) to the per-connection hash
+/// threshold. `1` samples every connection without hashing.
+fn sample_threshold_for_rate(rate: f64) -> Option<u64> {
+    if rate >= 1.0 {
+        return None;
+    }
+    // `rate * 2^64` is below 2^64 for every rate < 1; `as` saturates anyway.
+    Some((rate * 18_446_744_073_709_551_616.0_f64) as u64)
+}
+
+/// SplitMix64 finalizer: a fixed, well-distributed mix of the monotonic
+/// admission id, so consecutive connections are not sampled in runs.
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 fn reject_unknown_keys(object: &Map<String, Value>) -> Result<(), String> {
@@ -583,9 +827,10 @@ fn payload_fingerprint(
 }
 
 macro_rules! emit_ws_disconnect_log {
-    ($level:ident, $ctx:expr, $direction_label:expr, $error_class_label:expr, $io_side_label:expr, $correlation_id:expr) => {
+    ($level:ident, $ctx:expr, $plugin_id:expr, $direction_label:expr, $error_class_label:expr, $io_side_label:expr, $termination_reason:expr, $correlation_id:expr) => {
         tracing::$level!(
             target: "ws_frame_log",
+            plugin_id = $plugin_id,
             namespace = %$ctx.namespace,
             proxy_id = %$ctx.proxy_id,
             connection_id = $ctx.connection_id,
@@ -601,6 +846,7 @@ macro_rules! emit_ws_disconnect_log {
             direction = $direction_label,
             io_side = $io_side_label,
             error_class = %$error_class_label,
+            termination_reason = $termination_reason,
             consumer = $ctx.consumer_username.as_deref().unwrap_or("-"),
             auth_method = $ctx.auth_method.unwrap_or("-"),
             correlation_id = %$correlation_id,
@@ -632,43 +878,79 @@ impl Plugin for WsFrameLogging {
     }
 
     fn observes_ws_frame_decisions(&self) -> bool {
-        // Purely observational: after an earlier admission plugin synthesizes a
-        // terminal Close, the shared relay still invokes this hook so the final
-        // rejection is logged without allowing later mutating plugins to run.
+        // Purely observational: the relay ignores any `on_ws_frame` return
+        // value and reports every gateway-published policy Close through
+        // `on_ws_policy_close`, independent of this plugin's priority.
         true
     }
 
-    async fn on_ws_frame(
+    /// Hand the relay a session-bound instance carrying the per-connection
+    /// `delivered` record budget. Only allocated when
+    /// `max_records_per_connection` is configured; otherwise the shared
+    /// instance stays in place and no per-session state exists.
+    fn bind_ws_session(self: Arc<Self>, _ctx: &RequestContext) -> Option<Arc<dyn Plugin>> {
+        if self.config.max_records_per_connection == 0 {
+            return None;
+        }
+        Some(Arc::new(Self {
+            config: Arc::clone(&self.config),
+            session_records: Some(AtomicU64::new(0)),
+        }))
+    }
+
+    fn on_ws_policy_close(
         &self,
         proxy_id: &str,
         connection_id: u64,
         direction: WebSocketFrameDirection,
-        message: &Message,
-    ) -> Option<Message> {
-        // Ordinary frames are logged only after successful delivery via
-        // prepare/emit. This mutating-chain hook records plugin-generated
-        // policy Close decisions so they are neither missed nor double-counted
-        // with peer Close / cancellation polite-close paths.
-        if matches!(message, Message::Close(_))
-            && let Some(observation) = self.observation_from_message(message)
-        {
-            self.emit_observation(
-                proxy_id,
-                connection_id,
-                direction,
-                &observation,
-                "policy_close",
-            );
+        close: Option<&CloseFrame>,
+    ) {
+        // Decision record: not sampled, direction-filtered, or capped (at most
+        // one per relay half), so a policy-killed session is never invisible.
+        if !self.config.log_level.is_enabled() {
+            return;
         }
-        // Never transform frames — purely observational
-        None
+        let (close_code, close_reason_len) = Self::close_metadata(close);
+        let observation = WsFrameDeliveryObservation {
+            frame_type: "close",
+            size_bytes: Self::close_size(close),
+            preview: None,
+            close_code,
+            close_reason_len,
+        };
+        self.emit_observation(
+            proxy_id,
+            connection_id,
+            direction,
+            &observation,
+            "policy_close",
+        );
     }
 
-    fn prepare_ws_frame_delivery(&self, message: &Message) -> Option<WsFrameDeliveryObservation> {
+    fn prepare_ws_frame_delivery(
+        &self,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        message: &Message,
+    ) -> Option<WsFrameDeliveryObservation> {
         // Called only for frames the relay intends to forward after the final
         // control-frame guard (ordinary data/control and peer Close). Plugin
-        // policy Close is recorded separately in `on_ws_frame` with
+        // policy Close is recorded separately through `on_ws_policy_close` with
         // `outcome=policy_close` and never reaches this helper.
+        //
+        // Selection runs before any per-message work so filtered, unsampled,
+        // or capped messages skip fingerprinting entirely.
+        if !self.config.direction.admits(direction) || !self.connection_sampled(connection_id) {
+            return None;
+        }
+        // `> max`, not `>= max`: the message that finds the budget exactly
+        // spent still reaches `emit_ws_frame_delivery`, which reports the cap
+        // once instead of emitting it.
+        if let Some(emitted) = &self.session_records
+            && emitted.load(Ordering::Relaxed) > self.config.max_records_per_connection
+        {
+            return None;
+        }
         self.observation_from_message(message)
     }
 
@@ -679,6 +961,18 @@ impl Plugin for WsFrameLogging {
         direction: WebSocketFrameDirection,
         observation: WsFrameDeliveryObservation,
     ) {
+        if let Some(emitted) = &self.session_records {
+            // Both relay halves share this budget; one RMW keeps the cap exact
+            // under concurrent delivery and reports it exactly once.
+            let previous = emitted.fetch_add(1, Ordering::Relaxed);
+            let max = self.config.max_records_per_connection;
+            if previous >= max {
+                if previous == max {
+                    self.emit_record_cap_reached(proxy_id, connection_id);
+                }
+                return;
+            }
+        }
         self.emit_observation(
             proxy_id,
             connection_id,
@@ -697,9 +991,10 @@ impl Plugin for WsFrameLogging {
         // the session end with the per-frame stream on the same `ws_frame_log`
         // target via shared `connection_id`. Direction/io_side/error_class/
         // frames/bytes are always emitted so even clean closes produce a final
-        // record suitable for session accounting. Frame and byte totals are
+        // record suitable for session accounting. Message and byte totals are
         // success-only (incremented only after the destination sink accepts a
-        // forward).
+        // forward). The disconnect record is not subject to sampling, the
+        // direction filter, or the per-connection cap.
         let direction_label = match ctx.direction {
             Some(Direction::ClientToBackend) => "client_to_backend",
             Some(Direction::BackendToClient) => "backend_to_client",
@@ -716,48 +1011,66 @@ impl Plugin for WsFrameLogging {
             .as_ref()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "none".to_string());
+        // Bounded classification the relay always (over)writes, so plugin- or
+        // peer-influenced metadata cannot forge it. Surfaces session-level
+        // stops (idle timeout, drain, maximum lifetime, credential expiry,
+        // trust withdrawal) that are not policy Close frame records.
+        let termination_reason = ctx
+            .metadata
+            .get(crate::proxy::WS_TERMINATION_METADATA_KEY)
+            .map(String::as_str)
+            .unwrap_or("-");
         let correlation_id = ctx
             .metadata
             .get(super::REQUEST_ID_METADATA_KEY)
             .or_else(|| ctx.metadata.get("correlation_id"))
             .map(String::as_str)
             .unwrap_or("-");
+        let plugin_id: &str = &self.config.plugin_id;
 
         // Pick a tracing macro at the plugin's configured level so that log
         // targets routed by `ws_frame_log` match the frame output volume.
         // `connection_id` is the same process-local admission ID carried on
         // every frame event for this session (see `WsDisconnectContext`).
-        match self.log_level {
+        match self.config.log_level {
             LogLevel::Trace => emit_ws_disconnect_log!(
                 trace,
                 ctx,
+                plugin_id,
                 direction_label,
                 error_class_label,
                 io_side_label,
+                termination_reason,
                 correlation_id
             ),
             LogLevel::Debug => emit_ws_disconnect_log!(
                 debug,
                 ctx,
+                plugin_id,
                 direction_label,
                 error_class_label,
                 io_side_label,
+                termination_reason,
                 correlation_id
             ),
             LogLevel::Info => emit_ws_disconnect_log!(
                 info,
                 ctx,
+                plugin_id,
                 direction_label,
                 error_class_label,
                 io_side_label,
+                termination_reason,
                 correlation_id
             ),
             LogLevel::Warn => emit_ws_disconnect_log!(
                 warn,
                 ctx,
+                plugin_id,
                 direction_label,
                 error_class_label,
                 io_side_label,
+                termination_reason,
                 correlation_id
             ),
         }
@@ -767,7 +1080,6 @@ impl Plugin for WsFrameLogging {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
     #[test]

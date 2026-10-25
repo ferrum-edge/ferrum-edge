@@ -7251,8 +7251,8 @@ fn an_internally_disabled_local_mcp_gateway_shadows_an_enabled_global_one() {
 // function of configuration and enrolls a static replay digest. Only the
 // request-derived mode — no configured base plus
 // `discovery.trust_forwarded_headers` — is unprovable, because the rewritten
-// origin then depends on forwarded headers and on whether the connection carried
-// a TLS SNI hostname, and the deduplication fingerprint binds neither. Admission
+// origin then depends on forwarded headers and on whether the connection itself
+// is secure, and the deduplication fingerprint binds neither. Admission
 // must therefore refuse per instance, never by name.
 
 fn a2a_gateway_plugin_config(

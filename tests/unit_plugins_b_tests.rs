@@ -51,6 +51,7 @@ mod unit {
         mod oidc_refresh_flight_tests;
         mod oidc_relying_party_tests;
         mod opa_tests;
+        mod openapi_validator_review_tests;
         mod openapi_validator_tests;
         mod otel_tracing_attempt_spans_tests;
         mod otel_tracing_tests;
@@ -111,6 +112,7 @@ mod unit {
         mod validator_diagnostic_redaction_tests;
         mod waf_body_charset_parity_tests;
         mod waf_normalization_evasion_tests;
+        mod waf_review_hardening_tests;
         mod waf_rule_pack_coverage_tests;
         mod waf_tests;
         mod waf_tuning_controls_tests;

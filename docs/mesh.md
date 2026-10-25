@@ -1896,7 +1896,28 @@ or `-` spelling, at admission.
 operator header replaces any same-named client header or
 `includeRequestHeadersInCheck` value rather than being appended beside it, and
 case-variant duplicate fixed names are rejected at admission so the winner is
-never iteration-order dependent.
+never iteration-order dependent. A forwarded client header sent as several
+field lines reaches the provider as ALL of them, joined with `, ` (`; ` for
+`cookie`) — the same single reading the policy matchers use (see
+[Rule Matching](#rule-matching)).
+
+**The check carries the authenticated caller.** Every check also carries the
+gateway-asserted identity the local rules were evaluated against, so a
+provider can make an identity-aware decision ("may workload X call Y") without
+trusting a client header:
+
+| Header | Value |
+| --- | --- |
+| `x-ferrum-source-principal` | The authenticated source SPIFFE ID (`spiffe://<td>/ns/<ns>/sa/<sa>`): the mTLS peer, or — for authenticated HBONE from a trusted assertor — the verified baggage identity the rules were judged on. |
+| `x-ferrum-source-namespace` | The Kubernetes namespace component of that SPIFFE ID. |
+| `x-ferrum-source-service-account` | The service-account component of that SPIFFE ID. |
+| `x-ferrum-request-principal` | The validated JWT request principal (`<iss>/<sub>`) from the mesh `RequestAuthentication` plugin. |
+
+These are **unforgeable**: provider admission refuses every `x-ferrum-*` name
+in `includeRequestHeadersInCheck` and `includeAdditionalHeadersInCheck`, and the
+executor removes the names before stamping them, so the provider only ever
+sees the gateway's own value. An identity the gateway does not hold (a
+plaintext caller, no validated JWT) is **absent**, never empty.
 
 **Outcome classification** follows the Istio/Envoy HTTP ext-auth protocol
 exactly:
@@ -1915,7 +1936,11 @@ verbatim would put `Content-Length` on a response the client is required not to
 read a body for, leaving those bytes to be misparsed as the head of the next
 response on an HTTP/1.1 keep-alive connection. `3xx` (except `304`) and `4xx`
 pass through unchanged, so a redirect-to-login denial paired with
-`headersToDownstreamOnDeny: [location]` still works. Only the unrepresentable
+`headersToDownstreamOnDeny: [location]` still works. Every field line of a
+forwarded denial header survives: two `Set-Cookie` lines (a login state cookie
+and a nonce cookie) reach the client as two `Set-Cookie` fields on every
+protocol, and repeated list-valued fields such as `WWW-Authenticate` are joined
+with `, `. Only the unrepresentable
 status is replaced: the decision is still a denial and is still counted as
 `denied_by_provider`.
 
@@ -1976,19 +2001,56 @@ same workload keeps its ordinary accepted body size.
 > retaining an unbounded body behind a cap the operator asked for. An
 > accepted-but-unreachable flag would be worse than a visible refusal.
 
-**Mutation is deliberately narrow.** `headersToDownstreamOnDeny` is honoured:
-those headers land on the gateway-authored denial this plugin itself produces.
-`headersToUpstreamOnAllow` and `headersToDownstreamOnAllow` are **rejected at
-admission**. Ferrum runs the check in the `authorize` phase, before route
-dispatch and before every request/response transformer, so a header written
-there would order differently against operator-authored rules on each ingress
-path; a protocol-dependent mutation of an authenticated request is exactly the
-gap this feature must not introduce. Wildcard header entries are refused for
-the same reason a prefix rule cannot be shown to exclude hop-by-hop, routing,
-mesh-identity, or gateway-reserved names. The provider's own response **body**
-is never echoed to the client. Credentials (`authorization`, `cookie`) reach a
-provider only by being named explicitly in `includeRequestHeadersInCheck`; the
-full client header map and the request query string are never forwarded.
+**Provider-driven header mutation.** All three Istio mutation lists are
+honoured, each at one fixed point of the plugin chain:
+
+- `headersToDownstreamOnDeny` — copied onto the gateway-authored denial this
+  plugin itself produces.
+- `headersToUpstreamOnAllow` — on an allowed check, the named provider response
+  headers are applied to the backend-bound request in `mesh_authz`'s own
+  `before_proxy` hook (priority 2075). That is ONE defined point on every
+  HTTP-family ingress path (HTTP/1.1, HTTP/2, gRPC, HTTP/3, and the WebSocket
+  handshake all build their backend request from that hook's header map):
+  after authentication and authorization, **before** `mesh_route_dispatch`
+  (2995) and every request transformer (3000), which can still observe or
+  override the provider's value exactly as they would a client header. The
+  listed names are **provider-owned** on an allowed check: the client's copy is
+  removed in every spelling a backend folds together (case-insensitive, `_` ≡
+  `-`), so a forged `x-auth-request-user` can never reach the backend beside or
+  instead of the provider's value; the provider's value is then installed when
+  it returned one. A `failOpen` allow (the provider could not decide) installs
+  nothing and still strips the client's copies — nothing vouched for them. A
+  request no CUSTOM rule matched is untouched. The names the instance can
+  change are declared as `modified_request_header_names` — in every `_` / `-`
+  spelling the removal folds — so replay/cache ordering and the early
+  route-total preview account for them. Each `mesh_authz` instance stages and
+  applies only its OWN allowed result, so an operator `mesh_authz` global
+  beside the force-injected `__mesh_authz` cannot overwrite or consume the
+  other's provider-owned names or cookies. This is
+  stricter than Envoy, which forwards a client's same-named header when the
+  provider omits one.
+- `headersToDownstreamOnAllow` — on an allowed check, the named provider
+  response headers are applied to the backend response in `mesh_authz`'s
+  `after_proxy` hook (and to the successful WebSocket handshake). `Set-Cookie`
+  is **appended** beside any backend cookie (the session-refresh pattern);
+  every other name replaces the response's same-named field. It is not applied
+  to a gateway-generated rejection: the provider's allow did not produce that
+  response.
+
+Allowed-request results are staged in typed per-request plugin state, never in
+`metadata`, so a provider-minted token can never be serialized into a
+transaction log. The allow lists refuse, in addition to the hop-by-hop,
+framing, routing, mesh-identity, `forwarded`, `proxy-authorization`,
+`x-forwarded-*`, and `x-ferrum-*` names every mutation list refuses: for
+`headersToUpstreamOnAllow`, the gateway's own identity assertions (the whole
+`x-consumer-*` namespace, `x-authenticated-identity`, the GeoIP result, and
+`x-path-param-*` captures, in either `_`/`-` spelling), `content-*`, and
+`set-cookie`; for `headersToDownstreamOnAllow`, `content-*`. Wildcard header
+entries are refused because a prefix rule cannot be shown to exclude those
+names. The provider's own response **body** is never echoed to the client.
+Credentials (`authorization`, `cookie`) reach a provider only by being named
+explicitly in `includeRequestHeadersInCheck`; the full client header map and
+the request query string are never forwarded.
 
 **Protocol coverage.** The check runs on every HTTP-family ingress path
 identically — HTTP/1.1, HTTP/2, native gRPC, and HTTP/3 — because they share
@@ -2052,8 +2114,30 @@ first honours `failOpen`. `ferrum_mesh_ext_authz_check_failures_total`
 
 When alerting, use the `outcome` label values above; the finer reason tokens
 (`response_too_large`, `response_read_failed`, `request_build_failed`) appear
-only in per-request `mesh_authz.ext_authz_outcome` metadata and never as a
-metric label.
+only in per-request `mesh_authz.ext_authz_outcome` metadata and in the
+per-provider series below.
+
+**Per-provider attribution.** A waypoint can legitimately carry one provider
+per destination Service, so two series additionally attribute checks to the
+provider that ran them:
+
+- `ferrum_mesh_ext_authz_provider_checks_total{provider,outcome}` — every
+  outcome decided for a resolved provider, with `outcome` drawn from the
+  closed reason-token vocabulary above (`allowed`, `denied_by_provider`,
+  `timeout`, `response_too_large`, …).
+- `ferrum_mesh_ext_authz_check_duration_seconds{provider}` — a histogram of the
+  time from dispatching a check to the provider's response headers (or the
+  failure that ended it), with buckets from 1 ms to 30 s (the timeout ceiling).
+
+`provider` is the **operator-admitted** `extensionProviders[].name`, never a
+request-supplied value; outcomes decided before a provider is resolved
+(`provider_unbound`, `provider_conflict`, `unexecutable`) appear only in the
+process-wide series. The label set is bounded twice: at most 16 providers per
+generation, and at most 64 distinct names per process — names first seen after
+that share the `provider="__overflow__"` series, so no sequence of reloads can
+grow the label set. Series persist across reloads (a renamed provider keeps
+its old series until restart) and are emitted only once something was
+recorded.
 
 ### Rule Matching
 
@@ -2064,6 +2148,8 @@ Each `MeshRule` checks the following dimensions (all must match — a conjunctio
 - **Source negation / IP blocks** (per-source, ANDed with the positive `from`): Istio `notPrincipals`, `notServiceAccounts`, `notNamespaces`, `notTrustDomains`, `notRequestPrincipals`, `ipBlocks`, `notIpBlocks`, `remoteIpBlocks`, `notRemoteIpBlocks`. These are **conjunctive** with the positive matchers. Negative identity matchers fail the rule only when the corresponding source/JWT identity is present and matches an excluded pattern; if the identity is absent, the negative matcher succeeds, so `DENY notPrincipals: ["*"]` and `DENY notRequestPrincipals: ["*"]` catch anonymous traffic. That absent-identity rule applies to `notRequestPrincipals` only where a JWT could have been observed: on a Layer-4 session the field is unevaluable, not absent, so it resolves through the same non-HTTP-port model as its positive sibling — ignored by `DENY`/`CUSTOM`, never matched by `ALLOW`/`AUDIT`. A `from:`-only `ALLOW` carrying `notRequestPrincipals` therefore does not grant a raw TCP/UDP/TLS-passthrough session. IP block matchers fail closed when the IP they test is absent, so a positive `ipBlocks`/`remoteIpBlocks` constraint with no resolved IP does not match. `ipBlocks`/`notIpBlocks` match the direct connection peer IP (`source.ip`); `remoteIpBlocks`/`notRemoteIpBlocks` match the gateway-resolved client IP (`remote.ip`, XFF-derived when trusted proxies are configured). Unsupported source fields fail the resource closed at translation time (mirroring the `to.operation` side); a malformed CIDR rejects the resource or direct plugin config.
 - **Request matching** (`to`): methods, paths (glob), hosts (normalized, case-insensitive), ports (exact + glob patterns), headers (case-insensitive keys, normalized at config load). The negative `to.operation` matchers (`notMethods`/`notPaths`/`notHosts`/`notPorts`) are conjunctive; `notPorts` accepts the same bounded Istio port grammar as positive `ports` (`"*"`, `"<digits>*"`, `"*<digits>"` that can match an ordinary decimal port in `1..=65535`, plus literal `1`-`65535`) and evaluates through pre-normalized `not_ports` / `not_port_patterns` without per-request allocation. ALLOW/AUDIT rules fail closed when the corresponding request attribute is absent (including an unresolved destination/listener port for `notPorts`); DENY (and `CUSTOM`) rules follow Istio and treat **unsourceable** HTTP-only operation attributes as matches, so port scoping is recommended for DENY rules that mention HTTP fields and can see TCP traffic.
   Native `to.headers` matches only the ordinary HTTP request header map and rejects the pseudo-header names `:path`, `:method`, `:authority`, and `:scheme` during config validation, for every action. Use `to.paths`, `to.methods`, or `to.hosts` for those request facts; `when: request.headers[:path]` is also supported for path conditions and participates in the raw/stripped spelling rule below.
+  **The same never-match refusals apply to a `mesh_authz` plugin configured directly** — the flat `mesh_policies` form (file, database, or Admin API plugin config) and an embedded `mesh_slice` — not only to a validated mesh document: a `to.headers` pseudo-header, an invalid `hosts` / `notHosts` pattern, an inadmissible `port_patterns` / `not_port_patterns` entry, an empty `from[{}]` or `to[{}]` entry, and an empty policy `name` / `namespace` reject plugin construction with a field-specific diagnostic. Each would otherwise be accepted and silently never match, which is fail-open for a DENY.
+  **A repeated request header has exactly one reading.** When a client sends the same header as several field lines, `to.headers`, `when: request.headers[...]`, and the headers forwarded to a `CUSTOM` provider all judge the SAME value: every field line joined with `, ` (`; ` for `cookie`), exactly as the gateway materializes it for the backend — Envoy's header matchers likewise join repeated values. The reading no longer depends on whether some unrelated rule happened to force header materialization; once the request headers ARE materialized (every HTTP-family dispatcher does so before `authorize`), that view is authoritative, so a header an earlier plugin removed is absent for all three surfaces and is never read back from the pristine client block, and a header an earlier plugin published under an operator-cased key (`X-Tenant`) is found case-insensitively by all three surfaces, exactly as the backend receives it; a client cannot hide `x-tenant: banned` from a DENY behind an earlier `x-tenant: ok` line, and a pattern meant to catch a value that may arrive on a later field line should be written for the joined form (for example the suffix match `*banned`).
   **"Unsourceable" is not the same as "absent", and `headers` is where the difference is observable.** On a Layer-4 session (raw TCP, TLS passthrough, UDP, DTLS) there is no header map at all, so a `to.headers` predicate is unevaluable and a DENY/`CUSTOM` rule ignores it and still matches on its remaining constraints. On an HTTP-family request Ferrum HAS parsed the header map, so a header the client simply did not send is genuinely **absent** and fails a positive `to.headers` predicate for **every** action, DENY and `CUSTOM` included — matching Envoy's `HeaderMatcher`, where a missing field never satisfies an exact non-empty value, and matching the sibling `when: request.headers[...]` condition, which has always drawn this distinction. A DENY carrying `headers: {x-mode: blocked}` therefore refuses an HTTP request that carries `x-mode: blocked` and lets an HTTP request with no `x-mode` header through to the remaining tiers; to refuse the header-less request as well, add a second rule with no header predicate. `methods`, `paths`, `hosts` and `ports` are unaffected in practice: an HTTP-family request always carries a method and a canonical path, and a request with no resolvable authority or port has nothing for the matcher to read.
   `hosts` and `notHosts` match the literal requested hostname/authority after case, trailing-dot, and decimal-port normalization; they do not identify a service or expand its aliases. For example, one service may be reachable as `svc`, `svc.ferrum`, `svc.ferrum.svc`, and `svc.ferrum.svc.cluster.local`. A DENY naming only the FQDN does not cover the short-name aliases. To cover a destination, use an appropriately scoped policy with `to.ports`, enumerate every admitted alias, or choose a host wildcard whose breadth you intend (for example, `svc*` also covers other names beginning with `svc`). A host pattern without a port also matches that hostname with a port; explicit decimal ports are compared numerically (`svc:080` and `svc:80` are equivalent), `:*` remains a wildcard, and signed request ports are invalid. Host matching describes what the client asked for, not which service ultimately receives it.
 
@@ -3301,13 +3387,13 @@ Inbound mTLS peer validation continues to use the trust bundle carried in the sl
 
 When dry-run mode computes denied services, the data plane emits one transition warning when would-denies become active and one recovery info line when the next installed slice has no would-denies. It does not log per request. The `/health` response includes `mesh.egress_scope.sidecar_admitted_services` and `mesh.egress_scope.sidecar_denied_services` for readiness dashboards.
 
-The `mesh_outbound_registry` plugin exposes `ferrum_mesh_outbound_registry_decisions_total` with `mesh_namespace`, `host`, and `decision` labels. To keep label cardinality bounded, every `host` value is one of three fixed buckets: `host="<admit_explicit>"` for admits matched by an exact registry entry, `host="<admit_wildcard>"` for admits matched by a one-label wildcard entry, and `host="<denied>"` for every deny (the request Host header is attacker-controlled on that path). An applicable exact entry takes precedence for metrics when both kinds match; a bare-host entry cannot classify an explicit-port request as an exact admit. Operators can compare admit-vs-deny rates per namespace during rollout, but not per destination hostname — consult application logs for the requested host of denied traffic. Under effective `REGISTRY_ONLY`, outbound-capture HTTP route misses take the same configured reject status and deny-bucket metric as plugin-path denials.
+The `mesh_outbound_registry` plugin exposes `ferrum_mesh_outbound_registry_decisions_total` with `mesh_namespace`, `host`, and `decision` labels. To keep label cardinality bounded, every `host` value is one of three fixed buckets: `host="<admit_explicit>"` for admits matched by an exact registry entry, `host="<admit_wildcard>"` for admits matched by a wildcard entry, and `host="<denied>"` for every deny (the request Host header is attacker-controlled on that path). An applicable exact entry takes precedence for metrics when both kinds match; a bare-host entry cannot classify an explicit-port request as an exact admit. Operators can compare admit-vs-deny rates per namespace during rollout, but not per destination hostname. For attribution, every HTTP-lane denial (plugin hook or outbound-capture route miss) also logs a structured `warn` line, `Mesh REGISTRY_ONLY: rejecting HTTP egress to unadmitted destination`, with the denied `host` (echoed only when authority-shaped — hostname characters or a bracketed IPv6 literal, truncated to 256 bytes — and otherwise withheld as `<redacted scalar>`), `port`, `listen_port`, `client`, and `source` (`plugin` or `route_miss`). The line is rate-limited process-wide: the first denial logs immediately, then at most one line per second carrying `suppressed_since_last`. Under effective `REGISTRY_ONLY`, outbound-capture HTTP route misses take the same configured reject status and deny-bucket metric as plugin-path denials.
 
 The plugin's `config.namespace` supplies the `mesh_namespace` metric label and defaults to `ferrum`. Mesh injection explicitly sets it to the runtime namespace; direct instances do not inherit the enclosing `PluginConfig` resource namespace. Direct instances accept listener ports in 1–65535, with `outbound_listen_ports: []` applying wherever the plugin runs. An empty effective registry rejects every destination on those listeners, including when all entries are empty or whitespace-only.
 
-Registry entries are host authorities, with optional decimal ports in 1–65535 or `:*`, and optional leading one-label `*.` wildcards on hostnames. Hostname labels use ASCII letters, digits, and interior hyphens; internationalized names must be supplied in punycode. Surrounding whitespace, hostname case, trailing hostname dots, and IPv6 spelling are normalized. IPv4 names, bare or bracketed IPv6, and IPv6 any-port entries are supported; numeric IPv6 ports require brackets. URLs, paths, userinfo, internal whitespace, malformed brackets, misplaced wildcards, and invalid ports fail construction with the zero-based registry entry index. See the [plugin reference](plugins.md#mesh_outbound_registry) for all four configuration fields.
+Registry entries are host authorities, with optional decimal ports in 1–65535 or `:*`, and optional leading `*.` wildcards on hostnames. Wildcards match exactly one DNS label below the suffix by default (`wildcard_match: one_label`), the same contract as Sidecar egress scoping, the mesh DNS proxy, and the stream lane; mesh auto-injection always uses it. Operator-managed instances can set `wildcard_match: dns_suffix` for Envoy/Istio-style any-depth suffix matching (`*.example.com` admits `a.b.example.com`; the base domain never matches). Suffix probing is bounded: an authority over 253 bytes or with an empty label never matches a wildcard, and at most as many suffixes are probed as the deepest configured wildcard has labels. Request `Host` / `:authority` ports use the same decimal 1–65535 grammar, so `:0`, signed, or non-numeric ports are denied rather than parsed; the shared lookup also refuses port `0` from callers that split the authority themselves (the outbound-capture route-miss gate and the stream lane). Hostname labels use ASCII letters, digits, and interior hyphens; internationalized names must be supplied in punycode. Surrounding whitespace, hostname case, trailing hostname dots, and IPv6 spelling are normalized. IPv4 names, bare or bracketed IPv6, and IPv6 any-port entries are supported; numeric IPv6 ports require brackets. URLs, paths, userinfo, internal whitespace, malformed brackets, misplaced wildcards, and invalid ports fail construction with the zero-based registry entry index. See the [plugin reference](plugins.md#mesh_outbound_registry) for all five configuration fields.
 
-If a mesh-derived registry is invalid, the shared stream and HTTP route-miss enforcement state retains a deny-all registry on outbound capture listeners and emits a construction warning. It does not remove the `REGISTRY_ONLY` gate.
+Mesh-derived registries are built by one builder that drops any slice host or name outside the entry grammar (for example ServiceEntry host `*`, `foo.*.example.com`, an underscore name, or port `0`) and logs one `warn` per resource per registry build with the schema path and ordinals (for example `service_entries[2].hosts[0]`), the resource kind, and the fixed grammar reason. The namespace and name appear only when they are DNS-1123 names and are otherwise withheld; the rejected value itself is never logged, so a mistakenly pasted URL with userinfo cannot leak credentials. The dropped destination stays denied while the rest of the registry applies, identically on the HTTP plugin, the stream lane, and the egress-scope diagnostics, so one malformed resource cannot reject the whole data-plane config. Operator-authored registries remain strict. If a mesh-derived registry still fails construction, the shared stream and HTTP route-miss enforcement state retains a deny-all registry on outbound capture listeners and emits a construction warning. It does not remove the `REGISTRY_ONLY` gate.
 
 Stream-family egress (TCP / UDP / TCP+TLS / UDP+DTLS) is enforced at the connect / first-datagram stage rather than via a plugin: when `outbound_traffic_policy: registry_only` is active and the gateway owns at least one mesh outbound capture listener port, stream proxies bound to those ports consult the same slice-derived registry before dialing the backend. Rejection semantics differ from HTTP:
 
