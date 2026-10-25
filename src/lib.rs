@@ -1336,6 +1336,15 @@ pub mod _test_support {
         ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
     }
 
+    /// Model proxy core's typed marker for a route-rule total deadline that
+    /// expired while a backend held the request (the gateway-authored route
+    /// `504`), for direct plugin lifecycle tests.
+    pub fn mark_route_request_timeout_in_dispatch_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_route_request_timeout_exceeded(crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH);
+    }
+
     /// Attach a gateway diagnostic-reference slot to a request context, as
     /// the HTTP frontends do when `FERRUM_DIAGNOSTIC_REFS` is enabled, so
     /// external tests can observe what the rejection and attempt recording
@@ -3327,16 +3336,19 @@ pub mod _test_support {
 
     /// Resolve a live discovery document with optional operator-supplied
     /// `userinfo_endpoint` / `end_session_endpoint` overrides, returning the
-    /// effective optional endpoints as `(userinfo, end_session)`.
+    /// effective optional endpoints as `(userinfo, end_session)`. The
+    /// document's `issuer` must equal `expected_issuer`.
     pub async fn oidc_resolve_discovery_for_test(
         http_client: &crate::plugins::PluginHttpClient,
         discovery_url: &str,
+        expected_issuer: &str,
         explicit_userinfo_endpoint: Option<String>,
         explicit_end_session_endpoint: Option<String>,
     ) -> Result<(Option<String>, Option<String>), String> {
         let resolved = oidc_discovery_seams::resolve_discovery_for_test(
             http_client,
             discovery_url,
+            expected_issuer,
             explicit_userinfo_endpoint,
             explicit_end_session_endpoint,
         )
@@ -4292,6 +4304,42 @@ pub mod _test_support {
             ceiling,
             record_count,
         )
+    }
+
+    /// Deterministic probe: an immediate librdkafka `QueueFull` waits for
+    /// queue space within `budget` instead of dropping the record at once, and
+    /// a saturated producer stops waiting until an enqueue succeeds.
+    pub async fn kafka_logging_probe_queue_full_backoff_for_test(
+        free_queue_after: Option<std::time::Duration>,
+        budget: std::time::Duration,
+    ) -> Result<crate::plugins::kafka_logging::KafkaQueueFullProbeOutcome, String> {
+        crate::plugins::kafka_logging::probe_queue_full_backoff_for_test(free_queue_after, budget)
+            .await
+    }
+
+    /// Deterministic probe: the production flush-worker configuration hands
+    /// librdkafka many records per worker turn. Returns
+    /// `(flushes, records_flushed)`.
+    pub async fn kafka_logging_probe_worker_batching_for_test(
+        records: usize,
+    ) -> Result<(usize, usize), String> {
+        crate::plugins::kafka_logging::probe_worker_batching_for_test(records).await
+    }
+
+    /// The partition key `kafka_logging` derives for an HTTP summary.
+    pub fn kafka_logging_http_record_key_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::TransactionSummary,
+    ) -> Result<Option<String>, String> {
+        crate::plugins::kafka_logging::http_record_key_for_test(config, summary)
+    }
+
+    /// The partition key `kafka_logging` derives for a stream summary.
+    pub fn kafka_logging_stream_record_key_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::StreamTransactionSummary,
+    ) -> Result<Option<String>, String> {
+        crate::plugins::kafka_logging::stream_record_key_for_test(config, summary)
     }
 
     // ── plugins/loki_logging ────────────────────────────────────────────────
@@ -5614,9 +5662,12 @@ pub mod _test_support {
     /// Prepare deferred delivery observations for the final post-plugin message.
     pub fn prepare_ws_frame_deliveries_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
         message: &Message,
     ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
-        match crate::proxy::prepare_ws_frame_deliveries(plugins, message) {
+        match crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, message)
+        {
             crate::proxy::WsFrameDeliveryBatch::None => Vec::new(),
             crate::proxy::WsFrameDeliveryBatch::One(index, observation) => {
                 vec![(index, observation)]
@@ -5677,12 +5728,14 @@ pub mod _test_support {
             crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
                 .await;
         if matches!(&outgoing, Message::Close(_)) {
-            // Policy Close is already recorded by observational `on_ws_frame`
-            // hooks inside the applicator; the production relay does not also
-            // emit a delivered observation for that rejection path.
+            // Policy Close is already reported to decision observers
+            // (`on_ws_policy_close`) by the applicator after the full pass; the
+            // production relay does not also emit a delivered observation for
+            // that rejection path.
             return outgoing;
         }
-        let prepared = crate::proxy::prepare_ws_frame_deliveries(plugins, &outgoing);
+        let prepared =
+            crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, &outgoing);
         crate::proxy::emit_ws_frame_deliveries(
             plugins,
             proxy_id,
@@ -5691,6 +5744,89 @@ pub mod _test_support {
             prepared,
         );
         outgoing
+    }
+
+    /// Report one gateway policy Close to the decision observers in `plugins`
+    /// exactly as both relay halves do (`on_ws_policy_close`).
+    pub fn observe_ws_policy_close_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        close: Option<&CloseFrame>,
+    ) {
+        crate::proxy::observe_ws_policy_close(plugins, proxy_id, connection_id, direction, close)
+    }
+
+    /// Drive the production framed WebSocket relay (`run_websocket_session`,
+    /// shared by H1 Upgrade and H2/H3 Extended CONNECT) end to end over
+    /// caller-owned transports.
+    ///
+    /// `client_io` is the gateway's client-side byte transport (the relay runs
+    /// a server-role framer over it, so client frames must be masked);
+    /// `backend_ws_stream` is the gateway's client-role framer toward the
+    /// backend. `plugins` goes through the production per-session collection
+    /// (execution-trigger admission and `bind_ws_session` substitution) to
+    /// build the parser-policy, frame-hook, and disconnect lists. Tunnel mode,
+    /// the idle timeout, the session deadline, drain, client trust, and
+    /// `permessage-deflate` are all off, so the session ends only through peer
+    /// Close, transport EOF/error, or a policy Close. `client_transport_settle`
+    /// is the H3 bridge verdict seam ([`crate::proxy::WsClientTransportSettle`]).
+    pub async fn run_framed_websocket_relay_for_test<C, B>(
+        client_io: C,
+        backend_ws_stream: tokio_tungstenite::WebSocketStream<B>,
+        proxy_id: &str,
+        connection_id: u64,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        session_meta: crate::proxy::WsSessionMeta,
+        client_transport_settle: Option<crate::proxy::WsClientTransportSettle<'_>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let env_config = crate::config::EnvConfig::default();
+        let mut upgrade_ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        let (ws_framing_plugins, ws_frame_plugins) =
+            crate::proxy::collect_websocket_relay_plugins(plugins, true, &mut upgrade_ctx);
+        let ws_disconnect_plugins =
+            crate::proxy::collect_websocket_disconnect_plugins(plugins, &mut upgrade_ctx);
+        let adaptive_buffer = crate::adaptive_buffer::AdaptiveBufferTracker::new(
+            false, false, 300, 8_192, 65_536, 65_536, 64,
+        );
+        let session_deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now() + Duration::from_secs(3_600),
+            reason: crate::proxy::WsTerminationReason::MaxLifetime,
+        };
+        crate::proxy::run_websocket_session(
+            client_io,
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            None,
+            env_config.max_websocket_frame_size_bytes,
+            env_config.websocket_write_buffer_size,
+            false,
+            Duration::from_secs(30),
+            None,
+            session_deadline,
+            None,
+            Arc::new(crate::overload::OverloadState::new()),
+            crate::proxy::WsFragmentPolicy::from_env(&env_config),
+            &adaptive_buffer,
+            None,
+            None,
+            client_transport_settle,
+        )
+        .await
     }
 
     /// Run the production per-session plugin-collection step, including
@@ -6716,6 +6852,39 @@ pub mod _test_support {
         plugin.reset_rate_limit_rejection_warn_for_test();
     }
 
+    // ── plugins/mesh/outbound_registry ───────────────────────────────────────
+    /// Reset the process-wide HTTP REGISTRY_ONLY denial-log limiter so a
+    /// capture test can observe the next denial line.
+    pub fn mesh_outbound_registry_reset_http_deny_warn_for_test() {
+        crate::plugins::mesh::outbound_registry::reset_http_deny_warn_for_test();
+    }
+
+    /// Emit the HTTP REGISTRY_ONLY denial warning against a caller-owned
+    /// limiter and clock (deterministic log-capture coverage).
+    pub fn mesh_outbound_registry_warn_http_deny_with_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+        host: Option<&str>,
+        port: Option<u16>,
+        listen_port: Option<u16>,
+        client_ip: &str,
+    ) {
+        crate::plugins::mesh::outbound_registry::warn_http_registry_deny_with(
+            limiter,
+            now_ms,
+            host,
+            port,
+            listen_port,
+            client_ip,
+            crate::plugins::mesh::outbound_registry::DENY_SOURCE_PLUGIN,
+        );
+    }
+
+    /// Request-authority split used by `mesh_outbound_registry`.
+    pub fn mesh_outbound_registry_split_host_header_for_test(value: &str) -> (&str, Option<u16>) {
+        crate::plugins::mesh::outbound_registry::split_host_header(value)
+    }
+
     // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
     pub fn atomic_log_rate_limiter_with_window_for_test(
         window_ms: u64,
@@ -7203,6 +7372,43 @@ pub mod _test_support {
         connection_id: u64,
     ) -> bool {
         plugin.contains_connection_for_test(connection_id)
+    }
+
+    /// `ws_rate_limiting`'s production hard cap on resident local/fallback keys.
+    pub fn ws_rate_limiting_max_state_entries_for_test() -> usize {
+        crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test()
+    }
+
+    /// Seed one connection's local frame state at `now`, bypassing the cap.
+    pub fn ws_rate_limiting_seed_connection_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) {
+        plugin.seed_connection_at_for_test(connection_id, now);
+    }
+
+    /// Whether the production capacity gate admits `connection_id` at `now`.
+    /// Returns false only for a previously unseen key while the map is full.
+    pub fn ws_rate_limiting_admits_at_production_cap_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.seed_connection_at_with_cap_for_test(
+            connection_id,
+            now,
+            crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test(),
+        )
+    }
+
+    /// Run the production capacity/periodic eviction gate at `now`, as every
+    /// frame does before admission.
+    pub fn ws_rate_limiting_maybe_evict_at_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.maybe_evict_at_for_test(now)
     }
 
     /// Whether two `ws_rate_limiting` instances enforce on the same live state.
@@ -8486,27 +8692,29 @@ pub mod _test_support {
             .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
     }
 
-    /// The request trailers a gRPC dispatch would send, read back from
-    /// owner-scoped request staging exactly as the dispatch paths read them.
+    /// The request trailers a gRPC dispatch would send, read back from the
+    /// owner's typed request staging exactly as the dispatch paths read them.
     ///
     /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
     /// the sort is stable, so repeated values of one name keep wire order.
     pub fn staged_grpc_web_request_trailers(
-        metadata: &crate::plugins::MetadataMap,
+        ctx: &crate::plugins::RequestContext,
     ) -> Option<Vec<(String, String)>> {
-        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
-            let mut entries: Vec<(String, String)> = map
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_string(),
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            entries
-        })
+        crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers).map(
+            |map| {
+                let mut entries: Vec<(String, String)> = map
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries
+            },
+        )
     }
 
     pub fn response_content_type(original_ct: &str) -> String {
@@ -9927,6 +10135,45 @@ pub mod _test_support {
             plugins, None, None, headers, body_bytes,
         )
         .await
+    }
+
+    /// Model the H1/H2 buffered request-body hook round trip: clone the live
+    /// context into the compatibility hook context, run the transform chain and
+    /// the final request-body chain on that clone, then hand state back to the
+    /// live context exactly as the dispatcher does (typed terminals and staged
+    /// state first, then the metadata swap). Returns the backend-bound body and
+    /// the final chain's verdict.
+    pub async fn run_buffered_request_body_hook_round_trip_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            body,
+        )
+        .await;
+        let result = crate::proxy::run_final_request_body_hooks(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            &transformed,
+        )
+        .await;
+        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
+        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
+        let request_body = ctx.metadata.remove("request_body");
+        ctx.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
+        (transformed, result)
     }
 
     pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(
@@ -11704,6 +11951,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::DecryptedApp,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::dtls_reply_commit_after_backend_hooks(
             plugins, &ctx, plan, &trust.0,
@@ -11974,6 +12222,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::udp_reply_commit_after_backend_hooks(plugins, &ctx, plan)
             .await
@@ -12055,8 +12304,31 @@ pub mod _test_support {
         protected_status: u16,
         protected_body: &[u8],
     ) -> PrecommitAuthorizationGateForTest {
+        precommit_authorization_gate_with_policy_for_test(
+            ctx,
+            max_lifetime_seconds,
+            request_uses_grpc_content_type,
+            protected_status,
+            HashMap::new(),
+            protected_body,
+            &[],
+        )
+    }
+
+    /// The same production gate, starting from an already-decorated protected
+    /// response and given the route's precomputed initial-response header
+    /// policy slice, as the H1/H2 funnel passes it.
+    pub fn precommit_authorization_gate_with_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+        request_uses_grpc_content_type: bool,
+        protected_status: u16,
+        protected_headers: HashMap<String, String>,
+        protected_body: &[u8],
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> PrecommitAuthorizationGateForTest {
         let mut status = protected_status;
-        let mut headers = HashMap::new();
+        let mut headers = protected_headers;
         let mut body = crate::retry::ResponseBody::buffered(protected_body.to_vec());
         let termination = crate::proxy::apply_precommit_authorization_terminal(
             ctx,
@@ -12065,6 +12337,7 @@ pub mod _test_support {
             &mut status,
             &mut headers,
             &mut body,
+            initial_response_header_policy_plugins,
         );
         let body = match body {
             crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
@@ -12077,6 +12350,29 @@ pub mod _test_support {
             body,
             log_metadata: crate::proxy::clone_log_metadata(ctx),
         }
+    }
+
+    /// The buffered-response authorization terminal builder on a plain HTTP
+    /// request (no gRPC-Web content type), given an already-decorated
+    /// protected header map and the route's initial-response header policy.
+    /// Returns `(status, headers, body_bytes)`.
+    pub fn buffered_authorization_terminal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        protected_headers: HashMap<String, String>,
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        let mut headers = protected_headers;
+        let mut body = bytes::Bytes::from_static(b"protected");
+        let status = crate::proxy::replace_buffered_response_with_authorization_terminal(
+            ctx,
+            termination,
+            None,
+            &mut headers,
+            &mut body,
+            initial_response_header_policy_plugins,
+        );
+        (status, headers, body.to_vec())
     }
 
     /// The authorization-lifetime plan and bounded protocol family every H1/H2
@@ -16087,6 +16383,28 @@ pub mod _test_support {
             Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
             Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
         }
+    }
+
+    /// Undo a body's `Content-Encoding` exactly as `openapi_validator` does
+    /// before schema validation, charged against an ISOLATED budget.
+    ///
+    /// On success returns the plaintext and the budget's available bytes
+    /// measured WHILE the decoded body is still held (as during inspection).
+    /// `Err(None)` is the decode-capacity refusal (the plugin's `503` capacity
+    /// terminal); `Err(Some(detail))` is the fixed violation detail.
+    pub fn openapi_validator_decode_body_in(
+        probe: &ResponseBufferBudgetProbe,
+        content_encoding: Option<&str>,
+        body: &[u8],
+        max_body_bytes: usize,
+    ) -> Result<(Vec<u8>, usize), Option<String>> {
+        crate::plugins::openapi_validator::decode_body_for_test(
+            content_encoding,
+            body,
+            max_body_bytes,
+            probe.0.handle(),
+            |plaintext| (plaintext.to_vec(), probe.available_bytes()),
+        )
     }
 
     /// The exact backend-request header filter the H3 cross-protocol bridge

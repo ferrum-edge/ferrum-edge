@@ -6455,8 +6455,14 @@ async fn multipart_preserves_non_utf8_file_bytes_for_metadata_validation() {
 #[test]
 fn composed_scalar_validators_are_precompiled_outside_request_conversion() {
     let source = include_str!("../../../src/plugins/openapi_validator.rs");
+    // Every validator is built by the one schema-draft compiler, which asserts
+    // `format` under every draft selector.
+    assert!(
+        !source.contains("jsonschema::validator_for("),
+        "validator construction must stay inside the schema-draft compiler"
+    );
     assert_eq!(
-        source.matches("jsonschema::validator_for(schema)").count(),
+        source.matches(".should_validate_formats(true)").count(),
         1,
         "validator construction must stay inside the schema-draft compiler"
     );

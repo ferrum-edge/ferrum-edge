@@ -22,19 +22,27 @@
 //! applied exactly once to the synthetic cohort as well.
 //!
 //! The triggering request itself proceeds normally through the proxy pipeline
-//! and is not blocked by the load test.
+//! and is not blocked by the load test. A trigger that declares a
+//! `Content-Length` above the 10 MiB replay ceiling is not buffered: it is
+//! forwarded under the ordinary request-body limits and no load test starts.
+//! Known limitation: an undeclared-length (chunked) trigger body above the
+//! ceiling is refused with `413`, since the ceiling also bounds collection.
 //!
 //! ## Multi-node fan-out
 //!
 //! When `gateway_addresses` is configured, the originating controller fans out
-//! once with `X-Loadtesting-Fanout: 1`. Peer nodes that accept a fan-out
-//! trigger start a local cohort only — they never re-fanout — and terminate
-//! the control request with `204` before backend dispatch. A receiver that
+//! once with `X-Loadtesting-Fanout: 1` and the run's `X-Loadtesting-Run-Id`.
+//! Peer nodes that accept a fan-out trigger start a local cohort only — they
+//! never re-fanout — and terminate the control request with `204` plus
+//! `X-Loadtesting-Ack: <run id>` before backend dispatch. A receiver that
 //! refuses the trigger because a process-wide resource budget is exhausted
-//! answers `503` instead, still before backend dispatch. Fan-out stays
-//! fire-and-forget for the application request, but any parsed HTTP outcome
-//! other than `204` (a rejection status, or an unfollowed redirect) means no
-//! remote cohort started and is reported with a bounded, sanitized warning.
+//! answers `503` instead, and one whose trigger key fails answers `403`; both
+//! terminate before backend dispatch. Fan-out stays fire-and-forget for the
+//! application request, but any parsed HTTP outcome other than the correlated
+//! acknowledgment (a rejection status, an unfollowed redirect, or a bare `204`
+//! from a backend) means no remote cohort started and is reported with a
+//! bounded, sanitized warning. Each fan-out call is a single attempt, bounded
+//! by the run duration and cancelled with the local run.
 //!
 //! ## HTTPS loopback
 //!
@@ -78,12 +86,16 @@ use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
 use crate::plugins::utils::http_client::{DedicatedClientAlpn, DedicatedPluginClient};
-use crate::proxy::headers::{SecondaryRequestHostPolicy, filter_secondary_request_headers};
+use crate::proxy::headers::{
+    SecondaryRequestHostPolicy, field_names_equivalent_for_backends,
+    filter_secondary_request_headers,
+};
 use crate::retry::classify_reqwest_error;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Authoritative closed set of top-level `load_testing` configuration keys.
 pub const LOAD_TESTING_CONFIG_KEYS: &[&str] = &[
+    "allow_plaintext",
     "concurrent_clients",
     "duration_seconds",
     "gateway_addresses",
@@ -112,22 +124,57 @@ pub const MAX_GATEWAY_ADDRESSES: usize = 32;
 const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
 
 /// A matching trigger may retain one shared request body for its local cohort
-/// and bounded fan-out work. Keep that body bounded even when the global
-/// request-body limit is configured as unlimited, and cap aggregate retained
-/// replay bodies across plugin instances.
+/// and bounded fan-out work. Keep that retained body bounded even when the
+/// global request-body limit is configured as unlimited, and cap aggregate
+/// retained replay bodies across plugin instances. A trigger declaring a
+/// larger `Content-Length` is forwarded without a run; an undeclared-length
+/// trigger body above it is refused with `413` at collection.
 pub const MAX_REPLAY_REQUEST_BODY_BYTES: usize = 10_485_760;
 const MAX_PROCESS_RETAINED_BODY_BYTES: u64 = 67_108_864;
 
 pub(crate) const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
 pub(crate) const HEADER_FANOUT: &str = "x-loadtesting-fanout";
+/// Per-run correlation id the controller sends on every fan-out control
+/// request. A receiver adopts a well-formed value as its own run id so peer
+/// start/finish logs join the controller's, and echoes it in
+/// [`HEADER_FANOUT_ACK`].
+pub(crate) const HEADER_RUN_ID: &str = "x-loadtesting-run-id";
+/// Response header on a peer's admission acknowledgment, carrying the run id
+/// of the fan-out request it admitted. A `204` without the matching value
+/// (for example one returned by an application backend) is not an ack.
+pub(crate) const HEADER_FANOUT_ACK: &str = "x-loadtesting-ack";
+/// Reserved request control headers, stripped from the effective request on
+/// every path and from every synthetic/fan-out snapshot. Matched with
+/// backend-folded equivalence (ASCII case-insensitive, `_` == `-`).
+const RESERVED_CONTROL_HEADERS: [&str; 3] = [HEADER_TRIGGER_KEY, HEADER_FANOUT, HEADER_RUN_ID];
+/// Every spelling of the trigger-key header a CGI-style backend folds onto
+/// one variable, declared for generic request-header log redaction.
+const TRIGGER_KEY_REDACTION_SPELLINGS: [&str; 4] = [
+    HEADER_TRIGGER_KEY,
+    "x_loadtesting_key",
+    "x-loadtesting_key",
+    "x_loadtesting-key",
+];
 const FANOUT_MARKER: &str = "1";
-/// The only response a peer returns when it admits a fan-out trigger. Every
-/// other parsed HTTP outcome means no remote cohort started.
+/// Run ids are 32 lowercase hex characters (a v4 UUID in simple form).
+const RUN_ID_LEN: usize = 32;
+/// The only status a peer returns when it admits a fan-out trigger, always
+/// together with [`HEADER_FANOUT_ACK`]. Every other parsed HTTP outcome means
+/// no remote cohort started.
 const FANOUT_ACK_STATUS: u16 = 204;
 /// The terminal response a peer returns when it refuses a fan-out trigger
 /// because the process-wide active-client or retained-body budget is
 /// exhausted. No cohort started, so this must never be the `204` ack.
 const FANOUT_RESOURCE_REFUSAL_STATUS: u16 = 503;
+/// The terminal response to a request carrying the fan-out marker whose
+/// trigger key fails authentication. Such a request is a control request, not
+/// application traffic, so it never reaches the backend.
+const FANOUT_AUTH_REFUSAL_STATUS: u16 = 403;
+/// Domain-separation label for the non-reversible key fingerprint logged with
+/// run start/finish records.
+const KEY_FINGERPRINT_LABEL: &[u8] = b"ferrum-edge/load_testing/key-fingerprint/v1\0";
+/// Bytes of the SHA-256 digest rendered (as hex) in the key fingerprint.
+const KEY_FINGERPRINT_BYTES: usize = 8;
 const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 
 static PROCESS_ACTIVE_CLIENTS: AtomicU64 = AtomicU64::new(0);
@@ -397,6 +444,8 @@ pub struct LoadTesting {
     gateway_base_url: String,
     gateway_addresses: Vec<String>,
     request_headers_to_redact: Vec<String>,
+    /// Non-reversible fingerprint of `key` for start/finish audit records.
+    key_fingerprint: String,
     state: Arc<LoadTestingState>,
     /// Keeps plugin-instance ownership alive; must outlive task-only state refs.
     _owner: LoadTestingOwner,
@@ -620,7 +669,9 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
             build_load_test_client,
         )?;
 
-        let gateway_addresses = parse_gateway_addresses(config, &http_client, &gateway_base_url)?;
+        let allow_plaintext = optional_bool(config, "allow_plaintext")?.unwrap_or(false);
+        let gateway_addresses =
+            parse_gateway_addresses(config, &http_client, &gateway_base_url, allow_plaintext)?;
         let compatibility = LoadTestingCompatibility {
             key: key.clone(),
             concurrent_clients: concurrent_clients as u32,
@@ -648,6 +699,7 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
         };
         let owner = LoadTestingOwner::acquire(Arc::clone(&state));
 
+        let key_fingerprint = trigger_key_fingerprint(&key);
         Ok(Self {
             http_client,
             load_test_client,
@@ -659,7 +711,11 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
             max_response_body_bytes,
             gateway_base_url,
             gateway_addresses,
-            request_headers_to_redact: vec![HEADER_TRIGGER_KEY.to_string()],
+            request_headers_to_redact: TRIGGER_KEY_REDACTION_SPELLINGS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            key_fingerprint,
             state,
             _owner: owner,
         })
@@ -694,6 +750,58 @@ listener is disabled; set `gateway_tls` to select an enabled listener and/or set
             .get(HEADER_FANOUT)
             .is_some_and(|value| value == FANOUT_MARKER)
     }
+}
+
+/// Non-reversible, domain-separated fingerprint of the trigger key, so audit
+/// records can show which key armed a run (and spot a rolling key mismatch
+/// between nodes) without ever logging the secret.
+fn trigger_key_fingerprint(key: &str) -> String {
+    use crate::fips::backend::digest;
+    let mut input = Vec::with_capacity(KEY_FINGERPRINT_LABEL.len() + key.len());
+    input.extend_from_slice(KEY_FINGERPRINT_LABEL);
+    input.extend_from_slice(key.as_bytes());
+    let fingerprint = digest::digest(&digest::SHA256, &input);
+    hex::encode(&fingerprint.as_ref()[..KEY_FINGERPRINT_BYTES])
+}
+
+fn new_run_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn is_valid_run_id(value: &str) -> bool {
+    value.len() == RUN_ID_LEN
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `name` is one of this plugin's reserved request control headers in
+/// any spelling a backend could fold onto it (case, and `_` for `-`).
+fn is_reserved_control_header(name: &str) -> bool {
+    RESERVED_CONTROL_HEADERS
+        .iter()
+        .any(|reserved| field_names_equivalent_for_backends(name, reserved))
+}
+
+/// Whether the ingress request declares a body larger than the replay
+/// ceiling. Such a trigger is never buffered for replay (the primary request
+/// streams on unchanged) and starts no load test.
+fn declared_body_exceeds_replay_ceiling(headers: &HashMap<String, String>) -> bool {
+    headers
+        .get("content-length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|declared| declared > MAX_REPLAY_REQUEST_BODY_BYTES as u64)
+}
+
+/// A peer's admission acknowledgment: the documented status AND the run id
+/// this controller sent, echoed in [`HEADER_FANOUT_ACK`].
+fn is_fanout_acknowledgment(response: &reqwest::Response, run_id: &str) -> bool {
+    response.status().as_u16() == FANOUT_ACK_STATUS
+        && response
+            .headers()
+            .get(HEADER_FANOUT_ACK)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == run_id)
 }
 
 fn retain_shared_state(
@@ -732,6 +840,7 @@ fn parse_gateway_addresses(
     config: &Value,
     http_client: &PluginHttpClient,
     local_base_url: &str,
+    allow_plaintext: bool,
 ) -> Result<Vec<String>, String> {
     match config.get("gateway_addresses") {
         Some(Value::Array(addresses)) => {
@@ -777,6 +886,22 @@ fn parse_gateway_addresses(
                 if !seen.insert(label.clone()) {
                     return Err(format!(
                         "load_testing: duplicate `gateway_addresses` entry for {label:?}"
+                    ));
+                }
+                // A fan-out control request carries the fleet trigger key plus
+                // the triggering request's credentials and body. Cleartext is
+                // admitted without the explicit opt-in only to a loopback IP
+                // literal, matching the other credential-carrying plugin
+                // endpoints (issue #6617).
+                if parsed.scheme() == "http"
+                    && !allow_plaintext
+                    && !super::utils::socket_host::is_loopback_ip_literal_endpoint(
+                        url,
+                        parsed.host(),
+                    )
+                {
+                    return Err(format!(
+                        "load_testing: `gateway_addresses` entry {label:?} uses `http://` to a host that is not a loopback IP literal, which is rejected by default because fan-out sends the trigger key and the triggering request's credentials; use `https://` or set `allow_plaintext: true`"
                     ));
                 }
                 urls.push(normalized);
@@ -964,6 +1089,18 @@ impl Plugin for LoadTesting {
         false
     }
 
+    /// The replay ceiling is also the trigger's collection ceiling. The
+    /// generic collector reserves its whole ceiling from the aggregate
+    /// request-buffer budget before reading, so without this bound even a
+    /// tiny trigger would reserve the full global/route upload limit and could
+    /// be refused with `503` when that limit exceeds the budget.
+    ///
+    /// Known limitation: a trigger body WITHOUT a declared length (chunked
+    /// HTTP/1.1, HTTP/2 or HTTP/3 DATA without `Content-Length`) larger than
+    /// this ceiling is refused with `413`, because the collector cannot hand
+    /// the consumed prefix back to the primary stream. A trigger that declares
+    /// a larger `Content-Length` is never selected for buffering (see
+    /// `should_buffer_request_body`) and is forwarded without a run.
     fn request_body_buffer_limit(&self) -> Option<usize> {
         Some(MAX_REPLAY_REQUEST_BODY_BYTES)
     }
@@ -971,7 +1108,11 @@ impl Plugin for LoadTesting {
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         // Preserve the ordinary and wrong-key hot paths: an unauthenticated
         // caller must not force body retention merely by naming the header.
+        // A matching trigger that declares more than the replay ceiling can
+        // never be replayed, so it keeps streaming like any other request
+        // instead of being retained; `before_proxy` then skips the run.
         self.trigger_key_present_and_matches(&ctx.headers)
+            && !declared_body_exceeds_replay_ceiling(&ctx.headers)
     }
 
     fn request_headers_to_redact(&self) -> &[String] {
@@ -996,27 +1137,70 @@ impl Plugin for LoadTesting {
         // The one-hop marker is likewise ingress provenance: a transformer may
         // not manufacture it, and removing it must not re-enable peer fan-out.
         let is_fanout = Self::is_fanout_control_request(&ctx.headers);
+        let carries_fanout_marker = ctx.headers.contains_key(HEADER_FANOUT);
 
         // These names are reserved control-plane inputs. Strip them on every
         // path, including a wrong key, so attacker-chosen lookalikes never reach
-        // later plugins or application backends.
-        headers.retain(|name, _| {
-            !name.eq_ignore_ascii_case(HEADER_TRIGGER_KEY)
-                && !name.eq_ignore_ascii_case(HEADER_FANOUT)
-        });
+        // later plugins or application backends. Match every spelling a
+        // CGI-style backend folds onto the same variable (`_` == `-`).
+        headers.retain(|name, _| !is_reserved_control_header(name));
 
         if !key_matches {
+            if carries_fanout_marker {
+                // A fan-out control request is not application traffic. With a
+                // failed key (for example a rolling key change between nodes)
+                // forwarding it would execute the copied method, body, and
+                // credentials against this node's backend, and a backend `204`
+                // could then pass for an admission. Terminate it instead; the
+                // sender reports the refusal status.
+                tracing::debug!(
+                    "load_testing: refusing a fan-out control request whose trigger key did not authenticate"
+                );
+                return fanout_auth_refusal_result();
+            }
             return PluginResult::Continue;
         }
 
+        // A peer adopts the controller's well-formed run id so start/finish
+        // records on every node of one campaign share it; anything else gets
+        // a fresh id.
+        let run_id = if is_fanout {
+            ctx.headers
+                .get(HEADER_RUN_ID)
+                .filter(|value| is_valid_run_id(value))
+                .cloned()
+                .unwrap_or_else(new_run_id)
+        } else {
+            new_run_id()
+        };
+
         let Some(run_cancel) = self.state.begin_run() else {
-            tracing::warn!("load_testing: test already in progress, ignoring trigger");
+            tracing::warn!(
+                run_id = %run_id,
+                "load_testing: test already in progress, ignoring trigger"
+            );
             return if is_fanout {
-                fanout_ack_result()
+                fanout_ack_result(&run_id)
             } else {
                 PluginResult::Continue
             };
         };
+
+        // A body this plugin declined to buffer (declared above the replay
+        // ceiling), or one that another plugin buffered beyond it, cannot be
+        // replayed intact. Forward the triggering request unchanged and start
+        // nothing rather than replaying a missing or oversized body.
+        let retained_body_len = ctx.request_body_bytes.as_ref().map_or(0, Bytes::len);
+        if declared_body_exceeds_replay_ceiling(&ctx.headers)
+            || retained_body_len > MAX_REPLAY_REQUEST_BODY_BYTES
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                replay_body_ceiling_bytes = MAX_REPLAY_REQUEST_BODY_BYTES,
+                "load_testing: triggering request body exceeds the replay ceiling; forwarding it without starting a load test"
+            );
+            return self.refuse_for_resource_budget(is_fanout);
+        }
 
         if !try_reserve_process_clients(u64::from(self.concurrent_clients)) {
             tracing::warn!(
@@ -1089,9 +1273,13 @@ impl Plugin for LoadTesting {
         let gateway_addresses = self.gateway_addresses.clone();
         let http_client = self.http_client.clone();
         let trigger_key = self.key.clone();
+        let key_fingerprint = self.key_fingerprint.clone();
 
         // Originating controllers fan out once. Peer fan-out receivers never
         // re-forward, which collapses the previous quadratic mesh amplification.
+        // Every peer call shares one admission-time deadline, so a task first
+        // polled late still cannot outlive the run.
+        let fanout_deadline = tokio::time::Instant::now() + duration;
         if !is_fanout && !gateway_addresses.is_empty() {
             for addr in &gateway_addresses {
                 let fanout_url = build_url(addr, &path, raw_query.as_deref());
@@ -1099,9 +1287,12 @@ impl Plugin for LoadTesting {
                 let mut fanout_hdrs = fanout_headers.clone();
                 fanout_hdrs.push((HEADER_TRIGGER_KEY.to_string(), trigger_key.clone()));
                 fanout_hdrs.push((HEADER_FANOUT.to_string(), FANOUT_MARKER.to_string()));
+                fanout_hdrs.push((HEADER_RUN_ID.to_string(), run_id.clone()));
                 let client = http_client.clone();
                 let remote_label = sanitize_gateway_label(addr);
                 let body = Arc::clone(&request_body);
+                let fanout_cancel = run_cancel.clone();
+                let expected_ack = run_id.clone();
 
                 tokio::spawn(async move {
                     // The fan-out control request preserves the triggering
@@ -1131,33 +1322,61 @@ impl Plugin for LoadTesting {
                     if let Some(bytes) = &body.bytes {
                         req = req.body(bytes.clone());
                     }
+                    // The control request is owned by the run: it is a single
+                    // attempt (a replayed trigger could start a second cohort on
+                    // a peer whose first one already ended), it is bounded by
+                    // the run duration, and last-owner removal cancels it
+                    // together with the local workers, dropping its retained
+                    // body and key.
+                    let outcome = tokio::select! {
+                        _ = fanout_cancel.cancelled() => {
+                            tracing::debug!(
+                                remote = %remote_label,
+                                "load_testing: fan-out cancelled with the local run"
+                            );
+                            return;
+                        }
+                        outcome = tokio::time::timeout_at(
+                            fanout_deadline,
+                            client.execute_http1_redacted_single_attempt(req, "load_testing_fanout", &remote_label),
+                        ) => outcome,
+                    };
                     // A parsed HTTP response is not an accepted trigger. Only
-                    // `fanout_ack_result()`'s 204 means the peer admitted a
-                    // cohort; a 4xx/5xx refusal (including a peer's 503
-                    // resource-budget refusal), an unfollowed redirect, or any
-                    // other status is a silent peer failure unless it is
-                    // reported (issue #5158). Log the status alone — never the
-                    // key, raw path/query, or response body — and keep the
-                    // originating application request fire-and-forget.
-                    match client
-                        .execute_http1_redacted(req, "load_testing_fanout", &remote_label)
-                        .await
-                    {
-                        Ok(response) if response.status().as_u16() == FANOUT_ACK_STATUS => {}
-                        Ok(response) => {
+                    // `fanout_ack_result()`'s 204 carrying this run's id in
+                    // `X-Loadtesting-Ack` means the peer admitted a cohort; a
+                    // 4xx/5xx refusal (including a peer's 503 resource-budget
+                    // or 403 key refusal), an unfollowed redirect, a bare 204
+                    // from an application backend, or any other status is a
+                    // silent peer failure unless it is reported (issue #5158).
+                    // Log the status alone — never the key, raw path/query, or
+                    // response body — and keep the originating application
+                    // request fire-and-forget.
+                    match outcome {
+                        Ok(Ok(response)) if is_fanout_acknowledgment(&response, &expected_ack) => {}
+                        Ok(Ok(response)) => {
                             tracing::warn!(
                                 remote = %remote_label,
+                                run_id = %expected_ack,
                                 status = response.status().as_u16(),
                                 expected_status = FANOUT_ACK_STATUS,
                                 "load_testing: remote node did not acknowledge the fan-out \
                                  trigger; no remote cohort was started"
                             );
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             tracing::warn!(
                                 remote = %remote_label,
+                                run_id = %expected_ack,
                                 error = %err,
                                 "load_testing: failed to fan out trigger to remote node"
+                            );
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                remote = %remote_label,
+                                run_id = %expected_ack,
+                                "load_testing: fan-out trigger did not complete within the run \
+                                 duration; abandoned"
                             );
                         }
                     }
@@ -1176,15 +1395,28 @@ impl Plugin for LoadTesting {
             proxy_hops,
         });
 
+        // Start audit record. The key itself is never logged; the fingerprint
+        // identifies which configured key armed the run.
+        let fanout_peers = if is_fanout {
+            0
+        } else {
+            gateway_addresses.len()
+        };
         info!(
             proxy = %proxy_name,
+            run_id = %run_id,
+            key_fingerprint = %key_fingerprint,
+            client_ip = %ctx.client_ip,
+            consumer = ctx.effective_identity().unwrap_or("-"),
             concurrent_clients = concurrent_clients,
             duration_seconds = duration_secs,
             ramp = ramp,
             fanout_control = is_fanout,
+            fanout_peers = fanout_peers,
             "load_testing: starting load test"
         );
 
+        let run_ack_id = run_id.clone();
         tokio::spawn(async move {
             // Move the already-created guard into the future. If the runtime
             // drops this future before its first poll, the reservation is still
@@ -1423,6 +1655,9 @@ impl Plugin for LoadTesting {
 
             info!(
                 proxy = %proxy_name,
+                run_id = %run_id,
+                key_fingerprint = %key_fingerprint,
+                concurrent_clients = concurrent_clients,
                 outcome = ?result.outcome,
                 attempted_requests = result.attempted_requests,
                 responses_received = result.responses_received,
@@ -1450,7 +1685,7 @@ impl Plugin for LoadTesting {
         });
 
         if is_fanout {
-            fanout_ack_result()
+            fanout_ack_result(&run_ack_id)
         } else {
             PluginResult::Continue
         }
@@ -1505,9 +1740,17 @@ impl Drop for ProcessClientBudget {
     }
 }
 
-fn fanout_ack_result() -> PluginResult {
+fn fanout_ack_result(run_id: &str) -> PluginResult {
     PluginResult::Reject {
         status_code: FANOUT_ACK_STATUS,
+        body: String::new(),
+        headers: HashMap::from([(HEADER_FANOUT_ACK.to_string(), run_id.to_string())]),
+    }
+}
+
+fn fanout_auth_refusal_result() -> PluginResult {
+    PluginResult::Reject {
+        status_code: FANOUT_AUTH_REFUSAL_STATUS,
         body: String::new(),
         headers: HashMap::new(),
     }
@@ -1538,12 +1781,17 @@ fn filter_outbound_headers(
     // hand `client_ip::resolve_client_ip` an attacker-chosen address on
     // backend-bound traffic and steer `ip_restriction` / `geo_restriction` /
     // IP-keyed rate limits with it (issue #4164).
-    filter_secondary_request_headers(
+    let mut snapshot = filter_secondary_request_headers(
         headers,
         SecondaryRequestHostPolicy::Preserve,
         peer_trusted,
-        &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
-    )
+        &RESERVED_CONTROL_HEADERS,
+    );
+    // The shared sanitizer matches exclusions case-insensitively only; also
+    // drop the underscore spellings a CGI-style backend folds onto the same
+    // control variables, so they are never replayed by any synthetic request.
+    snapshot.retain(|(name, _)| !is_reserved_control_header(name));
+    snapshot
 }
 
 fn record_status(counters: &mut WorkerCounters, status: u16) {
