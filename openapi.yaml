@@ -32546,6 +32546,7 @@ components:
           propertyNames:
             type: string
             minLength: 1
+            maxLength: 65535
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
             not:
               anyOf:
