@@ -8242,6 +8242,11 @@ async fn handle_h3_request(
                 authorization_termination: ctx
                     .authorization_termination()
                     .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+                // The cross-protocol bridge does not surface its route cut
+                // bit here; consumers compare `observed_at` with the route
+                // deadline instead. Built as soon as the bridge returns.
+                route_policy_cut: false,
+                observed_at: tokio::time::Instant::now(),
             };
             run_response_stream_termination_hooks(
                 &plugins,
@@ -9732,6 +9737,8 @@ async fn handle_h3_request(
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+            route_policy_cut: route_deadline_cut,
+            observed_at: tokio::time::Instant::now(),
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;
@@ -10366,6 +10373,8 @@ async fn handle_h3_request(
             authorization_termination: ctx
                 .authorization_termination()
                 .map(crate::proxy::auth_lifetime::StreamAuthTermination::as_str),
+            route_policy_cut: h3_stream_result.route_deadline_cut,
+            observed_at: tokio::time::Instant::now(),
         };
         run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
             .await;

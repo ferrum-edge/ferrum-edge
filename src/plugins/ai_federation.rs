@@ -684,7 +684,16 @@ struct ProviderCircuit {
     /// Packed [`CircuitState`]: cooldown deadline, half-open successes, and
     /// open-cycle epoch. Every transition is one atomic update of this word.
     state: AtomicU64,
-    metrics_open: AtomicBool,
+    /// What the gauges currently publish for this circuit. Updated only by
+    /// [`ProviderCircuit::reconcile_metrics`], under this lock, from the
+    /// CURRENT state word, so concurrent close/reopen transitions cannot leave
+    /// the published gauge disagreeing with the circuit. Touched only on cold
+    /// open/close transitions and drop, never on admission.
+    metrics_published: std::sync::Mutex<CircuitMetricsPublication>,
+    /// Count of committed half-open-to-closed transitions, bumped right after
+    /// the closing compare-and-exchange and before publication, so a reconcile
+    /// that finds the circuit open again can still record the interposed close.
+    close_commits: AtomicU64,
     /// Owned by the single admitted half-open probe: set only by `admit()`'s
     /// false-to-true compare-and-exchange and cleared only by that probe's own
     /// outcome or release. `open()` never clears it, so a delayed failure from
@@ -701,6 +710,13 @@ struct ProviderCircuit {
     /// only for directly constructed test circuits, which then publish the
     /// aggregate series alone.
     metrics_provider: Option<Arc<str>>,
+}
+
+/// The gauge/counter view a circuit last published.
+#[derive(Debug, Default)]
+struct CircuitMetricsPublication {
+    open: bool,
+    close_commits_seen: u64,
 }
 
 /// `ProviderCircuit::state` layout: the open-until deadline (0 = closed) in
@@ -799,7 +815,8 @@ impl ProviderCircuit {
             config,
             consecutive_failures: AtomicU32::new(0),
             state: AtomicU64::new(0),
-            metrics_open: AtomicBool::new(false),
+            metrics_published: std::sync::Mutex::new(CircuitMetricsPublication::default()),
+            close_commits: AtomicU64::new(0),
             half_open_in_flight: AtomicBool::new(false),
             half_open_probe_state: AtomicU64::new(0),
             metrics_provider: None,
@@ -892,13 +909,8 @@ impl ProviderCircuit {
     ) -> bool {
         let committed = self.commit_half_open_transition(transition);
         if committed && CircuitState::unpack(transition.next).open_until == 0 {
-            if self.metrics_open.swap(false, Ordering::AcqRel) {
-                let registry = super::prometheus_metrics::global_registry();
-                registry.record_ai_federation_circuit_closed();
-                if let Some(provider) = self.metrics_provider.as_deref() {
-                    registry.record_ai_federation_provider_circuit_closed(provider);
-                }
-            }
+            self.close_commits.fetch_add(1, Ordering::AcqRel);
+            self.reconcile_metrics();
             info!(
                 provider = provider_name,
                 "ai_federation: provider circuit closed after successful half-open probe"
@@ -992,13 +1004,7 @@ impl ProviderCircuit {
         self.consecutive_failures.store(0, Ordering::Release);
         // Deliberately leave `half_open_in_flight` alone: a live probe keeps
         // its slot until its own outcome or release returns it.
-        if !self.metrics_open.swap(true, Ordering::AcqRel) {
-            let registry = super::prometheus_metrics::global_registry();
-            registry.record_ai_federation_circuit_opened();
-            if let Some(provider) = self.metrics_provider.as_deref() {
-                registry.record_ai_federation_provider_circuit_opened(provider);
-            }
-        }
+        self.reconcile_metrics();
         warn!(
             provider = provider_name,
             reason,
@@ -1008,9 +1014,65 @@ impl ProviderCircuit {
     }
 }
 
+impl ProviderCircuit {
+    /// Bring the published gauges and transition counters in line with the
+    /// CURRENT circuit state.
+    ///
+    /// Called after every state transition (open, reopen, half-open close).
+    /// The state word changes first and publication follows, so two
+    /// transitions can interleave between their state change and their
+    /// publication (a half-open close preempted while a late failure reopens
+    /// the circuit). Publishing a delta per transition then left the gauges
+    /// claiming "closed" for a circuit that was open. Here every publication
+    /// is serialized and derived from the latest state, so the last reconcile
+    /// always publishes the true state; an interposed close that the circuit
+    /// already reopened from is still counted (closed then opened) through
+    /// `close_commits`. A poisoned lock (impossible: nothing here panics)
+    /// skips publication rather than panicking.
+    fn reconcile_metrics(&self) {
+        let Ok(mut published) = self.metrics_published.lock() else {
+            return;
+        };
+        let open_now = CircuitState::unpack(self.state.load(Ordering::Acquire)).open_until != 0;
+        let close_commits = self.close_commits.load(Ordering::Acquire);
+        let closed_since = close_commits != published.close_commits_seen;
+        published.close_commits_seen = close_commits;
+        let registry = super::prometheus_metrics::global_registry();
+        let provider = self.metrics_provider.as_deref();
+        let record_opened = || {
+            registry.record_ai_federation_circuit_opened();
+            if let Some(provider) = provider {
+                registry.record_ai_federation_provider_circuit_opened(provider);
+            }
+        };
+        let record_closed = || {
+            registry.record_ai_federation_circuit_closed();
+            if let Some(provider) = provider {
+                registry.record_ai_federation_provider_circuit_closed(provider);
+            }
+        };
+        match (published.open, open_now) {
+            (false, true) => record_opened(),
+            (true, false) => record_closed(),
+            // Closed and reopened between two publications: the gauges stay
+            // open, and both transitions are counted.
+            (true, true) if closed_since => {
+                record_closed();
+                record_opened();
+            }
+            _ => {}
+        }
+        published.open = open_now;
+    }
+}
+
 impl Drop for ProviderCircuit {
     fn drop(&mut self) {
-        if self.metrics_open.load(Ordering::Acquire) {
+        let published_open = match self.metrics_published.get_mut() {
+            Ok(published) => published.open,
+            Err(poisoned) => poisoned.into_inner().open,
+        };
+        if published_open {
             let registry = super::prometheus_metrics::global_registry();
             registry.release_ai_federation_open_circuit();
             if let Some(provider) = self.metrics_provider.as_deref() {
@@ -3300,10 +3362,145 @@ const GEMINI_STRICT_SCHEMA_FORMATS: &[&str] = &["date-time", "date", "time"];
 /// rather than walked, so hostile nesting cannot grow the stack.
 const MAX_STRICT_SCHEMA_DEPTH: usize = 32;
 
+/// Upper bound on `$defs` entries in a strict schema, so the reference-graph
+/// walk below is bounded.
+const MAX_STRICT_SCHEMA_DEFS: usize = 256;
+
+/// The reference-graph node a `$ref` names: `None` for the root (`#`), or the
+/// root `$defs` entry.
+type StrictSchemaRefTarget<'a> = Option<&'a str>;
+
+/// Screen a complete strict JSON Schema against what Gemini/Vertex
+/// `responseJsonSchema` enforces.
+///
+/// Beyond the keyword subset ([`screen_gemini_strict_schema`]), references are
+/// held to the shapes Google documents (GenerateContent `GenerationConfig`
+/// response JSON schema restrictions): a `$ref` node carries no sibling
+/// keyword (other than the root's own `$defs`), targets only `#` or an existing
+/// root `#/$defs/<name>`, `$defs` appears only at the root, and the reference
+/// graph is acyclic. Google admits recursion only through optional
+/// properties; telling those apart reliably is not attempted here, so a
+/// strict schema with ANY recursive reference is refused (conservative; send
+/// it with `strict: false` to forward it as guidance).
+fn screen_gemini_strict_schema_document(root: &Value) -> Result<(), String> {
+    let defs = match root.get("$defs") {
+        None => None,
+        Some(Value::Object(defs)) if defs.len() <= MAX_STRICT_SCHEMA_DEFS => Some(defs),
+        Some(Value::Object(_)) => {
+            return Err(format!(
+                "strict json_schema declares more than {MAX_STRICT_SCHEMA_DEFS} `$defs` entries"
+            ));
+        }
+        Some(_) => return Err("strict json_schema `$defs` must be an object".to_string()),
+    };
+    screen_gemini_strict_schema(root, defs, 0, true)?;
+
+    // Reference graph: the root plus every `$defs` entry, each with the
+    // targets its own subtree references (a definition's references are
+    // collected without descending into the root `$defs`).
+    let mut nodes: Vec<(StrictSchemaRefTarget<'_>, Vec<StrictSchemaRefTarget<'_>>)> = Vec::new();
+    let mut root_refs = Vec::new();
+    collect_strict_schema_refs(root, true, &mut root_refs);
+    nodes.push((None, root_refs));
+    if let Some(defs) = defs {
+        for (name, definition) in defs {
+            let mut refs = Vec::new();
+            collect_strict_schema_refs(definition, false, &mut refs);
+            nodes.push((Some(name.as_str()), refs));
+        }
+    }
+    // Iterative three-colour DFS: 0 unvisited, 1 on the stack, 2 done.
+    let index_of =
+        |target: StrictSchemaRefTarget<'_>| nodes.iter().position(|(node, _)| *node == target);
+    let mut colour = vec![0u8; nodes.len()];
+    for start in 0..nodes.len() {
+        if colour[start] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        colour[start] = 1;
+        while let Some((node, next_edge)) = stack.last().copied() {
+            let edges = &nodes[node].1;
+            if next_edge == edges.len() {
+                colour[node] = 2;
+                stack.pop();
+                continue;
+            }
+            if let Some(top) = stack.last_mut() {
+                top.1 += 1;
+            }
+            let Some(target) = index_of(edges[next_edge]) else {
+                // Unresolvable targets were already refused by the screen.
+                continue;
+            };
+            match colour[target] {
+                0 => {
+                    colour[target] = 1;
+                    stack.push((target, 0));
+                }
+                1 => {
+                    return Err(
+                        "strict json_schema uses a recursive `$ref`, which Gemini only honours through optional properties"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect the `$ref` targets of one schema subtree. `at_root` skips the
+/// root's own `$defs` (each definition is its own graph node).
+fn collect_strict_schema_refs<'a>(
+    schema: &'a Value,
+    at_root: bool,
+    out: &mut Vec<StrictSchemaRefTarget<'a>>,
+) {
+    let Value::Object(object) = schema else {
+        return;
+    };
+    for (keyword, value) in object {
+        match keyword.as_str() {
+            "$ref" => {
+                if let Some(reference) = value.as_str() {
+                    out.push(reference.strip_prefix("#/$defs/"));
+                }
+            }
+            "$defs" if at_root => {}
+            "properties" | "$defs" => {
+                if let Some(members) = value.as_object() {
+                    for member in members.values() {
+                        collect_strict_schema_refs(member, false, out);
+                    }
+                }
+            }
+            "anyOf" | "prefixItems" => {
+                if let Some(members) = value.as_array() {
+                    for member in members {
+                        collect_strict_schema_refs(member, false, out);
+                    }
+                }
+            }
+            "items" | "additionalProperties" => {
+                collect_strict_schema_refs(value, false, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Check one strict JSON Schema node (and every nested subschema) against the
 /// Gemini-enforced subset. The error names the first offending keyword,
-/// bounded, without echoing any schema value.
-fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), String> {
+/// bounded, without echoing any schema value. `defs` is the root `$defs`
+/// object every `#/$defs/<name>` reference must resolve into.
+fn screen_gemini_strict_schema(
+    schema: &Value,
+    defs: Option<&serde_json::Map<String, Value>>,
+    depth: usize,
+    at_root: bool,
+) -> Result<(), String> {
     if depth > MAX_STRICT_SCHEMA_DEPTH {
         return Err(format!(
             "strict json_schema nests deeper than {MAX_STRICT_SCHEMA_DEPTH} levels"
@@ -3315,6 +3512,18 @@ fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), Strin
         Value::Object(object) => object,
         _ => return Err("strict json_schema contains a non-object subschema".to_string()),
     };
+    // Google forbids sibling keywords next to `$ref`; the root may still
+    // declare the `$defs` its reference points into.
+    if object.contains_key("$ref")
+        && object
+            .keys()
+            .any(|keyword| keyword != "$ref" && !(at_root && keyword == "$defs"))
+    {
+        return Err(
+            "strict json_schema combines `$ref` with sibling keywords, which Gemini does not support"
+                .to_string(),
+        );
+    }
     for (keyword, value) in object {
         if !GEMINI_STRICT_SCHEMA_KEYWORDS.contains(&keyword.as_str()) {
             return Err(format!(
@@ -3335,23 +3544,40 @@ fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), Strin
                 }
             }
             "$ref" => {
-                // Only document-local references resolve inside the schema the
-                // provider receives.
-                if !value
-                    .as_str()
-                    .is_some_and(|reference| reference.starts_with('#'))
-                {
+                // Only the root (`#`) or an existing root definition resolves
+                // inside the schema the provider receives.
+                let resolves = value.as_str().is_some_and(|reference| {
+                    reference == "#"
+                        || reference
+                            .strip_prefix("#/$defs/")
+                            .is_some_and(|name| defs.is_some_and(|defs| defs.contains_key(name)))
+                });
+                if !resolves {
                     return Err(
-                        "strict json_schema `$ref` must be a local `#...` reference".to_string()
+                        "strict json_schema `$ref` must be `#` or name an existing `#/$defs/<name>` entry"
+                            .to_string(),
                     );
                 }
             }
-            "properties" | "$defs" => {
+            "$defs" => {
+                if !at_root {
+                    return Err(
+                        "strict json_schema declares `$defs` below the root schema".to_string()
+                    );
+                }
+                let members = value
+                    .as_object()
+                    .ok_or_else(|| "strict json_schema `$defs` must be an object".to_string())?;
+                for member in members.values() {
+                    screen_gemini_strict_schema(member, defs, depth + 1, false)?;
+                }
+            }
+            "properties" => {
                 let members = value
                     .as_object()
                     .ok_or_else(|| format!("strict json_schema `{keyword}` must be an object"))?;
                 for member in members.values() {
-                    screen_gemini_strict_schema(member, depth + 1)?;
+                    screen_gemini_strict_schema(member, defs, depth + 1, false)?;
                 }
             }
             "anyOf" | "prefixItems" => {
@@ -3359,11 +3585,11 @@ fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), Strin
                     .as_array()
                     .ok_or_else(|| format!("strict json_schema `{keyword}` must be an array"))?;
                 for member in members {
-                    screen_gemini_strict_schema(member, depth + 1)?;
+                    screen_gemini_strict_schema(member, defs, depth + 1, false)?;
                 }
             }
             "items" | "additionalProperties" => {
-                screen_gemini_strict_schema(value, depth + 1)?;
+                screen_gemini_strict_schema(value, defs, depth + 1, false)?;
             }
             _ => {}
         }
@@ -3554,7 +3780,7 @@ fn translated_generation_controls(
             schema,
             strict: true,
         } = &response_format
-        && let Err(detail) = screen_gemini_strict_schema(schema, 0)
+        && let Err(detail) = screen_gemini_strict_schema_document(schema)
     {
         return Err(unrepresentable_control(adapter, "response_format", &detail));
     }
@@ -6521,9 +6747,7 @@ enum StreamOutcome {
 /// neutral: a client disconnect (including a client RPC deadline, which the
 /// body wrapper reports as a disconnect), an authorization-lifetime
 /// termination, and a route-rule total request deadline
-/// ([`route_policy_deadline_elapsed`]). The route cut is logged as a
-/// `read_write_timeout` exactly like a provider read timeout, so its
-/// provenance comes from the request's typed deadline, never the class.
+/// ([`body_outcome_is_route_policy_cut`]).
 fn body_outcome_is_provider_fault(
     ctx: &RequestContext,
     outcome: &crate::proxy::deferred_log::BodyOutcome,
@@ -6533,25 +6757,32 @@ fn body_outcome_is_provider_fault(
         && crate::proxy::backend_dispatch::error_class_is_post_wire_backend_failure(
             outcome.body_error_class,
         )
-        && !route_policy_deadline_elapsed(ctx)
+        && !body_outcome_is_route_policy_cut(ctx, outcome)
 }
 
-/// Whether the matched route rule's TOTAL request deadline produced, or could
-/// have produced, this request's timeout.
+/// Whether the route rule's total request deadline, not the provider, ended
+/// this body.
 ///
-/// True when proxy core recorded a route-deadline phase (a gateway-authored
-/// route `504`) or when the armed total deadline has already elapsed at the
-/// terminal. The route budget ends a healthy long generation or a slow-reading
-/// client exactly as it ends a slow provider, so core settles it
-/// health-neutrally; a provider timeout that coincides with an elapsed route
-/// deadline is indistinguishable from it and is treated neutrally too. The
-/// provider's own `read_timeout_seconds` / `connect_timeout_seconds` are
+/// Decided from what the transport recorded AT THE TERMINAL, never from the
+/// clock when this deferred hook happens to run: a provider reset or read
+/// timeout observed before the deadline stays a provider fault even if the
+/// termination hook is scheduled after it. The typed `route_policy_cut` bit
+/// is authoritative where the transport carries it (H1/H2 body wrapper,
+/// native HTTP/3 relays). Otherwise the route cut is recognized by its own
+/// shape — a `read_write_timeout` OBSERVED at or after the armed total
+/// deadline, which is exactly when the route wrapper fires; a provider
+/// timeout coinciding with it is indistinguishable and is treated neutrally.
+/// The provider's own `read_timeout_seconds` / `connect_timeout_seconds` are
 /// backend budgets, not route deadlines, and still score as faults.
-fn route_policy_deadline_elapsed(ctx: &RequestContext) -> bool {
-    ctx.route_request_timeout_recorded()
-        || ctx
-            .route_request_deadline_at()
-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+fn body_outcome_is_route_policy_cut(
+    ctx: &RequestContext,
+    outcome: &crate::proxy::deferred_log::BodyOutcome,
+) -> bool {
+    outcome.route_policy_cut
+        || (outcome.body_error_class == Some(crate::retry::ErrorClass::ReadWriteTimeout)
+            && ctx
+                .route_request_deadline_at()
+                .is_some_and(|deadline| outcome.observed_at >= deadline))
 }
 
 impl StreamOutcome {
@@ -8587,10 +8818,12 @@ impl Plugin for AiFederation {
         // (`client_side_no_backend_signal`) stay neutral.
         if let Some(class) = ctx.last_backend_dispatch_error_class() {
             // A route-rule total deadline that expired before the response
-            // head is gateway policy, not provider evidence, exactly like the
-            // body-phase cut (see `route_policy_deadline_elapsed`).
+            // head is gateway policy, not provider evidence. Proxy core marks
+            // that expiry on the context with a typed phase when it authors
+            // the route `504`, so the decision never depends on when this
+            // hook runs.
             if !crate::proxy::backend_dispatch::client_side_no_backend_signal(Some(class))
-                && !route_policy_deadline_elapsed(ctx)
+                && !ctx.route_request_timeout_recorded()
             {
                 self.stage_owned_stream(ctx, StreamOutcome::Failed);
             }
@@ -9832,6 +10065,40 @@ pub mod test_helpers {
     pub fn half_open_probe_in_flight_for_test(plugin: &AiFederation, index: usize) -> Option<bool> {
         let circuit = plugin.providers.get(index)?.circuit.as_ref()?;
         Some(circuit.half_open_in_flight.load(Ordering::Acquire))
+    }
+
+    /// Replay the close/reopen publication race deterministically: a
+    /// half-open success commits its CLOSING state transition and is
+    /// "preempted" before publishing; a late failure from an earlier `Closed`
+    /// admission then reopens the circuit; the close finally publishes.
+    /// Returns whether the close committed and the `/metrics` exposition
+    /// rendered while the reopened circuit is alive, then drops the circuit.
+    pub fn close_reopen_publication_race_for_test(provider: &str) -> (bool, String) {
+        let circuit = ProviderCircuit::new(ProviderCircuitConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_secs(60),
+            success_threshold: 1,
+        })
+        .with_metrics_provider(provider);
+        circuit.open(provider, "forced_open_for_test");
+        backdate_circuit_cooldown(&circuit, 1);
+        if circuit.admit() != CircuitAdmission::HalfOpenProbe {
+            return (false, String::new());
+        }
+        let transition = circuit.half_open_success_transition();
+        let committed = circuit.commit_half_open_transition(transition)
+            && CircuitState::unpack(transition.next).open_until == 0;
+        if committed {
+            circuit.close_commits.fetch_add(1, Ordering::AcqRel);
+        }
+        // Interposed reopen, publishing before the preempted close does.
+        circuit.record_failure(provider, CircuitAdmission::Closed);
+        // The preempted close resumes its publication.
+        circuit.reconcile_metrics();
+        circuit.half_open_in_flight.store(false, Ordering::Release);
+        let output = crate::plugins::prometheus_metrics::global_registry().render_uncached();
+        drop(circuit);
+        (committed, output)
     }
 
     /// Open the provider circuit at `index` with its full cooldown still

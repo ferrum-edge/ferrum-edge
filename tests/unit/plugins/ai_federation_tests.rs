@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    record_backend_dispatch_outcome_for_test, set_response_presentation_policy_digest_for_test,
+    mark_route_request_timeout_in_dispatch_for_test, record_backend_dispatch_outcome_for_test,
+    set_response_presentation_policy_digest_for_test,
 };
 use ferrum_edge::PluginCache;
 use ferrum_edge::plugins::ai_federation;
@@ -10956,6 +10957,8 @@ async fn streaming_route_total_deadline_cut_is_circuit_neutral() {
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
     expire_route_total_deadline(&mut ctx).await;
     record_backend_dispatch_outcome_for_test(&mut ctx, Some(ErrorClass::ReadWriteTimeout), true);
+    // Proxy core records the route-deadline phase when it authors the 504.
+    mark_route_request_timeout_in_dispatch_for_test(&mut ctx);
     let mut response_headers = HashMap::new();
     let _ = plugin
         .after_proxy(&mut ctx, 504, &mut response_headers)
@@ -11247,4 +11250,320 @@ fn streaming_weighted_selection_gives_no_share_to_ineligible_providers() {
     // The buffered path can use Anthropic, so it keeps its share there.
     let (_, order) = test_helpers::weighted_roll_drawn_for_test(&plugin, "any-model", false, 0);
     assert_eq!(order[0], "claude");
+}
+
+// ---------------------------------------------------------------------------
+// PR #6816 review round 2
+// ---------------------------------------------------------------------------
+
+/// PR6816-SOL-1 (round 2): the cause is decided from what the transport
+/// recorded at the terminal, not from the clock when the deferred hook runs.
+/// A provider fault observed BEFORE the route deadline still opens the
+/// circuit even when the termination hook runs after the deadline.
+#[tokio::test]
+async fn provider_fault_observed_before_the_route_deadline_still_counts() {
+    for class in [ErrorClass::ConnectionReset, ErrorClass::ReadWriteTimeout] {
+        let plugin = streaming_circuit_plugin(json!({}));
+        let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+        assert!(matches!(result, PluginResult::Continue), "{result:?}");
+        let mut response_headers = event_stream_response_headers();
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+        ctx.route_override_request_timeout_ms = Some(40);
+        ctx.arm_route_request_deadline(false);
+        // The provider fault is observed while the route budget still runs...
+        let outcome = BodyOutcome::error(class, 32, false);
+        assert!(
+            ctx.route_request_deadline_at()
+                .is_some_and(|deadline| outcome.observed_at < deadline)
+        );
+        // ...and the deferred termination hook only runs after it elapsed.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &outcome)
+            .await;
+        assert_eq!(
+            test_helpers::stream_outcome_for_test(&plugin, &ctx),
+            Some("failed"),
+            "{class:?}"
+        );
+        assert_eq!(
+            test_helpers::circuit_is_closed_for_test(&plugin, 0),
+            Some(false)
+        );
+    }
+}
+
+/// The typed route-cut bit is authoritative, and only a timeout (never a
+/// reset) can be inferred as the route cut from its observation time.
+#[tokio::test]
+async fn route_policy_cut_provenance_is_typed_and_class_specific() {
+    // The transport's typed bit: neutral even with no deadline armed.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = event_stream_response_headers();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            200,
+            &BodyOutcome::error(ErrorClass::ReadWriteTimeout, 32, false)
+                .with_route_policy_cut(true),
+        )
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("released")
+    );
+    assert_eq!(
+        test_helpers::circuit_is_closed_for_test(&plugin, 0),
+        Some(true)
+    );
+
+    // A reset observed after the deadline is not the route wrapper's cut.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    let mut response_headers = event_stream_response_headers();
+    let _ = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    expire_route_total_deadline(&mut ctx).await;
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            200,
+            &BodyOutcome::error(ErrorClass::ConnectionReset, 32, false),
+        )
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+
+    // Pre-header: without core's typed route-timeout marker a 504 transport
+    // timeout is the provider's, however late the hook runs.
+    let plugin = streaming_circuit_plugin(json!({}));
+    let (mut ctx, _headers, result) = claim_stream(&plugin, &streaming_body("gpt-4o")).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+    expire_route_total_deadline(&mut ctx).await;
+    record_backend_dispatch_outcome_for_test(&mut ctx, Some(ErrorClass::ReadWriteTimeout), true);
+    let mut response_headers = HashMap::new();
+    let _ = plugin
+        .after_proxy(&mut ctx, 504, &mut response_headers)
+        .await;
+    assert_eq!(
+        test_helpers::stream_outcome_staged_for_test(&plugin, &ctx),
+        Some("failed")
+    );
+}
+
+/// PR6816-SOL-2 (round 2): reference shapes Google cannot represent are
+/// refused for a strict schema; supported references still pass.
+#[test]
+fn gemini_strict_schema_references_follow_google_restrictions() {
+    fn strict(schema: Value) -> Value {
+        with_fields(
+            sample_openai_request(),
+            json!({"response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "s", "strict": true, "schema": schema}
+            }}),
+        )
+    }
+    // Root `$ref` with its own `$defs`, and an acyclic definition chain.
+    for accepted in [
+        json!({
+            "$ref": "#/$defs/root",
+            "$defs": {
+                "root": {"type": "object", "properties": {"leaf": {"$ref": "#/$defs/leaf"}}},
+                "leaf": {"type": "string"}
+            }
+        }),
+        json!({
+            "type": "object",
+            "properties": {"score": {"$ref": "#/$defs/score"}},
+            "$defs": {"score": {"type": "number", "minimum": 0, "maximum": 1}}
+        }),
+    ] {
+        assert!(
+            translated_body("google_gemini", &strict(accepted.clone())).is_ok(),
+            "refused {accepted}"
+        );
+    }
+
+    for (needle, schema) in [
+        (
+            "sibling",
+            json!({
+                "type": "object",
+                "properties": {"score": {"$ref": "#/$defs/score", "maximum": 1}},
+                "$defs": {"score": {"type": "number", "minimum": 0}}
+            }),
+        ),
+        (
+            "`$ref`",
+            json!({"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}),
+        ),
+        (
+            "`$ref`",
+            json!({"type": "object", "properties": {"x": {"$ref": "#/properties/y"}}}),
+        ),
+        (
+            "below the root",
+            json!({
+                "type": "object",
+                "properties": {"x": {"type": "object", "$defs": {"y": {"type": "string"}}}}
+            }),
+        ),
+        (
+            "recursive",
+            json!({
+                "type": "object",
+                "properties": {"child": {"$ref": "#"}},
+                "required": ["child"]
+            }),
+        ),
+        (
+            "recursive",
+            json!({
+                "$ref": "#/$defs/a",
+                "$defs": {
+                    "a": {"type": "object", "properties": {"b": {"$ref": "#/$defs/b"}}},
+                    "b": {"type": "array", "items": {"$ref": "#/$defs/a"}}
+                }
+            }),
+        ),
+        (
+            "maxLength",
+            json!({
+                "type": "object",
+                "properties": {"x": {"$ref": "#/$defs/x"}},
+                "$defs": {"x": {"type": "string", "maxLength": 3}}
+            }),
+        ),
+    ] {
+        let error = translated_body("google_gemini", &strict(schema.clone()))
+            .expect_err("an unrepresentable strict reference shape must be refused");
+        assert!(error.contains(needle), "{needle}: {error}");
+        assert!(error.contains("response_format"), "{error}");
+    }
+}
+
+/// A strict schema with a reference sibling never reaches the Gemini primary;
+/// the capable fallback receives the schema unchanged.
+#[tokio::test]
+async fn strict_reference_sibling_falls_back_without_gemini_io() {
+    let gemini_server = MockServer::start().await;
+    let openai_server = MockServer::start().await;
+    mount_openai_success(&openai_server).await;
+    let schema = json!({
+        "type": "object",
+        "properties": {"score": {"$ref": "#/$defs/score", "maximum": 1}},
+        "required": ["score"],
+        "additionalProperties": false,
+        "$defs": {"score": {"type": "number", "minimum": 0}}
+    });
+    let plugin = ai_federation::AiFederation::new(
+        &json!({"providers": [
+            {
+                "name": "gemini-primary",
+                "provider_type": "google_gemini",
+                "api_key": "gemini-test",
+                "base_url": gemini_server.uri(),
+                "allow_plaintext": true
+            },
+            {
+                "name": "openai-fallback",
+                "provider_type": "openai",
+                "api_key": "sk-test",
+                "base_url": openai_server.uri(),
+                "allow_plaintext": true
+            }
+        ]}),
+        create_test_http_client(),
+    )
+    .unwrap();
+    let body = json!({
+        "model": "shared-model",
+        "messages": [{"role": "user", "content": "Score it"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "s", "strict": true, "schema": schema.clone()}
+        }
+    });
+    let mut ctx = post_json_ctx(&body);
+    let result = run_federation_final_body(&plugin, &mut ctx, &json_headers()).await;
+    match result {
+        PluginResult::RejectBinary { status_code, .. } => assert_eq!(status_code, 200),
+        other => panic!("expected the fallback provider's response, got {other:?}"),
+    }
+    let outbound = first_received_json(&openai_server).await;
+    assert_eq!(outbound["response_format"]["json_schema"]["schema"], schema);
+    assert_no_provider_requests(&gemini_server).await;
+}
+
+fn metric_value(output: &str, family: &str, provider: &str) -> Option<String> {
+    let needle = format!("provider=\"{provider}\"");
+    output
+        .lines()
+        .find(|line| line.starts_with(&format!("{family}{{")) && line.contains(&needle))
+        .and_then(|line| line.rsplit(' ').next())
+        .map(str::to_string)
+}
+
+/// PR6816-SOL-3: a half-open close preempted after its state change while a
+/// late failure reopens the circuit must leave the labelled gauge open and
+/// count both transitions; dropping the circuit then releases the series.
+#[test]
+fn close_reopen_publication_race_keeps_the_labelled_gauge_open() {
+    let provider = "fed-review-r2-race-probe";
+    let (committed, output) = test_helpers::close_reopen_publication_race_for_test(provider);
+    assert!(
+        committed,
+        "the half-open close must commit for the race to apply"
+    );
+    assert_eq!(
+        metric_value(
+            &output,
+            "ferrum_ai_federation_provider_circuits_open",
+            provider
+        )
+        .as_deref(),
+        Some("1"),
+        "the reopened circuit must still publish as open: {output}"
+    );
+    assert_eq!(
+        metric_value(
+            &output,
+            "ferrum_ai_federation_provider_circuits_opened_total",
+            provider
+        )
+        .as_deref(),
+        Some("2"),
+        "the interposed reopen is a new open cycle"
+    );
+    assert_eq!(
+        metric_value(
+            &output,
+            "ferrum_ai_federation_provider_circuits_closed_total",
+            provider
+        )
+        .as_deref(),
+        Some("1")
+    );
+    let after = ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+    assert_eq!(
+        metric_value(
+            &after,
+            "ferrum_ai_federation_provider_circuits_open",
+            provider
+        ),
+        None,
+        "dropping the circuit releases its gauge series"
+    );
 }

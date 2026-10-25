@@ -69,6 +69,16 @@ pub struct BodyOutcome {
     /// `auth_lifetime::StreamAuthTermination`; never a token, claim, identity,
     /// provider name, or absolute expiry.
     pub authorization_termination: Option<&'static str>,
+    /// True when the matched route rule's TOTAL request deadline cut this body
+    /// (the route wrapper fired). The cut keeps its `read_write_timeout`
+    /// class in the log, so this typed bit is the only provenance that tells
+    /// it apart from a backend read timeout. `false` where the transport does
+    /// not carry the bit; consumers then fall back to [`Self::observed_at`].
+    pub route_policy_cut: bool,
+    /// Monotonic instant the body terminal was OBSERVED by the transport, not
+    /// when a deferred consumer ran. Lets a consumer compare the event itself
+    /// with a request deadline even when its hook is scheduled later.
+    pub observed_at: tokio::time::Instant,
 }
 
 impl BodyOutcome {
@@ -82,6 +92,8 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
+            observed_at: tokio::time::Instant::now(),
         }
     }
 
@@ -96,6 +108,8 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
+            observed_at: tokio::time::Instant::now(),
         }
     }
 
@@ -110,7 +124,16 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
+            observed_at: tokio::time::Instant::now(),
         }
+    }
+
+    /// Record that the route rule's total request deadline cut this body
+    /// (see [`Self::route_policy_cut`]).
+    pub fn with_route_policy_cut(mut self, route_policy_cut: bool) -> Self {
+        self.route_policy_cut = route_policy_cut;
+        self
     }
 
     pub fn with_grpc_status(mut self, grpc_status: Option<u32>) -> Self {
