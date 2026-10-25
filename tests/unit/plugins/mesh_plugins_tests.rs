@@ -7063,6 +7063,733 @@ async fn mesh_authz_on_stream_connect_scope_missing_metadata_stamped() {
     );
 }
 
+// NodeWaypoint capture-destination AuthorizationPolicy inventory.
+//
+// A captured connection is stamped with the DESTINATION pod's exact scope, and
+// that pod can live outside the waypoint's subscription namespace, so its own
+// policies ride `MeshSlice.node_waypoint_capture_mesh_policies` rather than the
+// namespace-narrowed `mesh_policies`. `mesh_authz` must evaluate them under
+// per-pod scoping, and only against the scopes they select.
+
+fn payments_frontend_only_allow() -> MeshPolicy {
+    MeshPolicy {
+        name: "ledger-frontend-only".to_string(),
+        namespace: "payments".to_string(),
+        scope: PolicyScope::Namespace {
+            namespace: "payments".to_string(),
+        },
+        rules: vec![MeshRule {
+            from: vec![PrincipalMatch {
+                spiffe_id_pattern: Some(
+                    "spiffe://cluster.local/ns/payments/sa/frontend".to_string(),
+                ),
+                namespace_pattern: None,
+                trust_domain: Some(TrustDomain::new("cluster.local").expect("trust domain")),
+                trust_domain_pattern: None,
+            }],
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Allow,
+        }],
+    }
+}
+
+fn captured_payments_stream(scope_namespace: &str) -> StreamConnectionContext {
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    let mut ctx = stream_context();
+    ctx.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new(format!(
+            "spiffe://cluster.local/ns/{scope_namespace}/sa/ledger"
+        ))
+        .expect("spiffe"),
+        scope_namespace,
+        HashMap::from([("app".to_string(), "ledger".to_string())]),
+    )));
+    ctx
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_enforces_capture_destination_allow_floor() {
+    // The destination's own ALLOW admits only `payments/frontend`; an
+    // unauthenticated captured peer matches no ALLOW and is implicitly denied.
+    let with_inventory = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    let mut captured = captured_payments_stream("payments");
+    let result = with_inventory.on_stream_connect(&mut captured).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "the captured destination's ALLOW floor must refuse a non-matching peer, got {result:?}"
+    );
+
+    // The same policy must not leak onto a pod it does not select.
+    let mut unrelated = captured_payments_stream("ferrum");
+    assert!(
+        matches!(
+            with_inventory.on_stream_connect(&mut unrelated).await,
+            PluginResult::Continue
+        ),
+        "a foreign destination policy must not apply to a pod in another namespace"
+    );
+
+    // Control: without the inventory the evaluator has no applicable policy and
+    // admits — which is exactly why a slice carrying capture destinations
+    // without completeness evidence is refused at slice conversion
+    // (`MeshSlice::validate_node_waypoint_capture_inventory`) before any plugin
+    // is built from it.
+    let without_inventory = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let mut captured = captured_payments_stream("payments");
+    assert!(matches!(
+        without_inventory.on_stream_connect(&mut captured).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_source_scope_census_ignores_capture_destination_policies() {
+    // A stream without a per-pod scope is SOURCE-attributed (UDP/DTLS sessions,
+    // outbound capture): the transparent capture relay always stamps its
+    // destination scope. Capture-inventory policies select capture
+    // DESTINATIONS, so they must not turn an unattributed UDP/DTLS session into
+    // a `scope_missing` refusal no supplied scope could satisfy — the session
+    // is judged mesh-wide-only exactly as before the inventory existed. An
+    // ordinary scoped policy keeps the fail-closed refusal.
+    let capture_only = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+    let with_ordinary_scoped = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            mesh_policies: vec![policy_with_scope(
+                "ferrum-deny",
+                PolicyScope::Namespace {
+                    namespace: "ferrum".to_string(),
+                },
+                PolicyAction::Deny,
+            )],
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+    }))
+    .expect("plugin config");
+
+    for scheme in [BackendScheme::Udp, BackendScheme::Dtls, BackendScheme::Tcp] {
+        let session = || {
+            StreamConnectionContext::new(
+                "10.244.1.7".to_string(),
+                "10.244.1.7".to_string(),
+                "__mesh-nw-udp-echo".to_string(),
+                None,
+                5353,
+                scheme,
+                Arc::new(ConsumerIndex::new(&[])),
+            )
+        };
+
+        let mut ctx = session();
+        let result = capture_only.on_stream_connect(&mut ctx).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{scheme:?}: capture-inventory policies must not refuse an unattributed session, \
+             got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .as_ref()
+                .and_then(|m| m.get("mesh_authz.scope_missing"))
+                .map(String::as_str),
+            Some("true"),
+            "{scheme:?}: the missing scope is still recorded"
+        );
+
+        let mut ctx = session();
+        let result = with_ordinary_scoped.on_stream_connect(&mut ctx).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "{scheme:?}: an ordinary scoped policy keeps the fail-closed refusal, got {result:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .as_ref()
+                .and_then(|m| m.get("mesh_authz.deny_policy"))
+                .map(String::as_str),
+            Some("scope_missing")
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_capture_inventory_is_inert_without_per_pod_scoping() {
+    // Outside NodeWaypoint per-pod scoping the inventory is never evaluated; the
+    // construction-time filter keeps judging the proxy's own identity.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "payments".to_string(),
+            node_waypoint_capture_mesh_policies: vec![payments_frontend_only_allow()],
+            ..MeshSlice::default()
+        },
+    }))
+    .expect("plugin config");
+    let mut ctx = stream_context();
+    assert!(matches!(
+        plugin.on_stream_connect(&mut ctx).await,
+        PluginResult::Continue
+    ));
+}
+
+// NodeWaypoint inbound HBONE relay to a capture destination in another
+// namespace. The relay carries no source-pod scope; with an honored source
+// assertion the destination's own scope comes from the capture-destination
+// inventory, so the destination's AuthorizationPolicy (delivered on the capture
+// inventory) is evaluated instead of refusing every relay `scope_missing`.
+
+const CAPTURE_RELAY_PEER: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b";
+const CAPTURE_FRONTEND: &str = "spiffe://cluster.local/ns/payments/sa/frontend";
+const CAPTURE_OTHER: &str = "spiffe://cluster.local/ns/payments/sa/other";
+
+fn capture_destination(namespace: &str, app: &str, address: &str, ports: &[u16]) -> Workload {
+    Workload {
+        spiffe_id: SpiffeId::new(format!("spiffe://cluster.local/ns/{namespace}/sa/{app}"))
+            .expect("spiffe"),
+        selector: WorkloadSelector {
+            labels: HashMap::from([("app".to_string(), app.to_string())]),
+            namespace: Some(namespace.to_string()),
+        },
+        service_name: app.to_string(),
+        service_namespace: None,
+        addresses: vec![address.to_string()],
+        ports: ports
+            .iter()
+            .map(|port| WorkloadPort {
+                port: *port,
+                protocol: AppProtocol::Tcp,
+                name: None,
+            })
+            .collect(),
+        trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+        namespace: namespace.to_string(),
+        network: None,
+        cluster: None,
+        weight: None,
+        locality: None,
+        service_account: Some(app.to_string()),
+        pod_uid: None,
+        node_waypoint: None,
+        remote_provenance: false,
+    }
+}
+
+fn capture_relay_plugin(destinations: Vec<Workload>, policies: Vec<MeshPolicy>) -> MeshAuthz {
+    MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            node_waypoint_capture_destinations: destinations,
+            node_waypoint_capture_mesh_policies: policies,
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+        "trusted_hbone_assertors": [{
+            "assertor": CAPTURE_RELAY_PEER,
+            "asserts": [CAPTURE_FRONTEND, CAPTURE_OTHER],
+        }],
+    }))
+    .expect("plugin config")
+}
+
+fn capture_relay_request(peer: &str, asserted: &str, host: &str, port: u16) -> RequestContext {
+    hbone_relay_request_context(
+        peer,
+        Some(&format!("source.principal={asserted}")),
+        host,
+        port,
+    )
+}
+
+fn namespace_deny(namespace: &str, name: &str) -> MeshPolicy {
+    MeshPolicy {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        scope: PolicyScope::Namespace {
+            namespace: namespace.to_string(),
+        },
+        rules: vec![MeshRule {
+            from: Vec::new(),
+            to: Vec::new(),
+            when: Vec::new(),
+            request_principals: Vec::new(),
+            not_request_principals: Vec::new(),
+            source_negation: Default::default(),
+            never_matches: false,
+            action: PolicyAction::Deny,
+        }],
+    }
+}
+
+fn deny_policy(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("mesh_authz.deny_policy")
+        .map(String::as_str)
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_inbound_relay_evaluates_capture_destination_allow() {
+    let plugin = capture_relay_plugin(
+        vec![capture_destination(
+            "payments",
+            "ledger",
+            "10.244.1.7",
+            &[8080],
+        )],
+        vec![payments_frontend_only_allow()],
+    );
+
+    // The destination's ALLOW admits the asserted frontend, and the decision is
+    // bound to the exact relayed backend.
+    let mut allowed =
+        capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = plugin.authorize(&mut allowed).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a source the destination's ALLOW names must be relayed, got {result:?}"
+    );
+    assert_eq!(
+        allowed
+            .metadata
+            .get("mesh_authz.node_waypoint_authorized_backend")
+            .map(String::as_str),
+        Some("10.244.1.7|8080")
+    );
+    assert!(!allowed.metadata.contains_key("mesh_authz.scope_missing"));
+
+    // A source that ALLOW does not name is refused by the destination policy
+    // itself (implicit deny), not by a missing scope.
+    let mut refused = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_OTHER, "10.244.1.7", 8080);
+    let result = plugin.authorize(&mut refused).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "a source outside the destination ALLOW must be refused, got {result:?}"
+    );
+    assert_ne!(deny_policy(&refused), Some("scope_missing"));
+    assert_ne!(deny_policy(&refused), Some("destination_scope_missing"));
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_inbound_relay_enforces_capture_destination_deny() {
+    let plugin = capture_relay_plugin(
+        vec![capture_destination(
+            "payments",
+            "ledger",
+            "10.244.1.7",
+            &[8080],
+        )],
+        vec![namespace_deny("payments", "payments-deny")],
+    );
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "the destination's own DENY must refuse the relay, got {result:?}"
+    );
+    assert_eq!(deny_policy(&ctx), Some("payments-deny"));
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_inbound_relay_capture_scope_fails_closed() {
+    let refuse = |result: PluginResult, ctx: &RequestContext, why: &str| {
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "{why}: expected a 403, got {result:?}"
+        );
+        assert_eq!(deny_policy(ctx), Some("scope_missing"), "{why}");
+    };
+
+    // A port the destination does not declare resolves no scope.
+    let plugin = capture_relay_plugin(
+        vec![capture_destination(
+            "payments",
+            "ledger",
+            "10.244.1.7",
+            &[8080],
+        )],
+        vec![payments_frontend_only_allow()],
+    );
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 9090);
+    let result = plugin.authorize(&mut ctx).await;
+    refuse(result, &ctx, "undeclared destination port");
+
+    // Without an honored source assertion the destination scope is not used.
+    let mut ctx = capture_relay_request(
+        "spiffe://cluster.local/ns/ferrum/sa/untrusted",
+        CAPTURE_FRONTEND,
+        "10.244.1.7",
+        8080,
+    );
+    let result = plugin.authorize(&mut ctx).await;
+    refuse(result, &ctx, "unhonored source assertion");
+
+    // Only the synthesized inbound relay uses the capture inventory: any other
+    // proxy keeps the ordinary index and the ordinary census, so the capture
+    // destination's scope is never stamped for it.
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let mut proxy = (**ctx.matched_proxy.as_ref().expect("relay proxy")).clone();
+    proxy.id = "some-operator-route".to_string();
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    let _ = plugin.authorize(&mut ctx).await;
+    assert!(
+        !ctx.metadata
+            .contains_key("mesh_authz.node_waypoint_authorized_backend"),
+        "a non-relay proxy must not be bound to a capture destination's scope"
+    );
+
+    // Two records claiming the address with divergent scopes are ambiguous.
+    let ambiguous = capture_relay_plugin(
+        vec![
+            capture_destination("payments", "ledger", "10.244.1.7", &[8080]),
+            capture_destination("payments", "reports", "10.244.1.7", &[8080]),
+        ],
+        vec![payments_frontend_only_allow()],
+    );
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = ambiguous.authorize(&mut ctx).await;
+    refuse(result, &ctx, "ambiguous capture destination");
+}
+
+#[tokio::test]
+async fn mesh_authz_node_waypoint_inbound_relay_capture_scope_follows_withdrawal() {
+    // Generation 1: ledger is enrolled and its ALLOW admits the frontend.
+    let generation_one = capture_relay_plugin(
+        vec![capture_destination(
+            "payments",
+            "ledger",
+            "10.244.1.7",
+            &[8080],
+        )],
+        vec![payments_frontend_only_allow()],
+    );
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    assert!(matches!(
+        generation_one.authorize(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    // Generation 2: ledger left the node; another destination with a scoped
+    // policy remains. A relay to the withdrawn address no longer resolves a
+    // destination scope and fails closed; the remaining one is judged by its
+    // own namespace's policy.
+    let generation_two = capture_relay_plugin(
+        vec![capture_destination(
+            "secrets",
+            "vault",
+            "10.244.1.9",
+            &[8200],
+        )],
+        vec![namespace_deny("secrets", "secrets-deny")],
+    );
+    let mut withdrawn =
+        capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = generation_two.authorize(&mut withdrawn).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&withdrawn), Some("scope_missing"));
+
+    let mut remaining =
+        capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.9", 8200);
+    let result = generation_two.authorize(&mut remaining).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&remaining), Some("secrets-deny"));
+}
+
+/// An ordinary (subscription-namespace) Service record that claims the same
+/// address/port as a capture destination must never decide the relay's scope:
+/// the relay guard admitted the capture destination, so its scope is
+/// authoritative, an unresolvable capture lookup fails closed instead of
+/// falling back, and only an address the capture inventory does not name keeps
+/// the ordinary index.
+#[tokio::test]
+async fn mesh_authz_node_waypoint_inbound_relay_capture_scope_is_authoritative() {
+    let old_app = capture_destination("ferrum", "old-app", "10.244.1.7", &[8080]);
+    let local_app = capture_destination("ferrum", "local-app", "10.244.1.50", &[8080]);
+    let service = |workload: &Workload| MeshService {
+        name: workload.service_name.clone(),
+        namespace: workload.namespace.clone(),
+        ports: vec![ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Tcp,
+            name: None,
+            target_port: None,
+        }],
+        workloads: vec![WorkloadRef {
+            spiffe_id: workload.spiffe_id.clone(),
+        }],
+        protocol_overrides: HashMap::new(),
+        cluster_ips: Vec::new(),
+        uid: None,
+        allow_path_parameters: false,
+    };
+    let plugin_for = |capture: Vec<Workload>| {
+        MeshAuthz::new(&json!({
+            "mesh_slice": MeshSlice {
+                namespace: "ferrum".to_string(),
+                services: vec![service(&old_app), service(&local_app)],
+                workloads: vec![old_app.clone(), local_app.clone()],
+                mesh_policies: vec![namespace_deny("ferrum", "ferrum-deny")],
+                node_waypoint_capture_destinations: capture,
+                node_waypoint_capture_mesh_policies: vec![namespace_deny(
+                    "payments",
+                    "payments-deny",
+                )],
+                node_waypoint_capture_mesh_policies_resolved: true,
+                ..MeshSlice::default()
+            },
+            "per_pod_policy_scoping": true,
+            "trusted_hbone_assertors": [{
+                "assertor": CAPTURE_RELAY_PEER,
+                "asserts": [CAPTURE_FRONTEND],
+            }],
+        }))
+        .expect("plugin config")
+    };
+
+    // The capture owner's DENY applies even though the ordinary index also
+    // names the address (under a `ferrum` scope whose own DENY would yield a
+    // different verdict).
+    let plugin = plugin_for(vec![capture_destination(
+        "payments",
+        "ledger",
+        "10.244.1.7",
+        &[8080],
+    )]);
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&ctx), Some("payments-deny"));
+
+    // An equivalent IPv4-mapped spelling of the capture record is the same
+    // address and stays authoritative.
+    let plugin = plugin_for(vec![capture_destination(
+        "payments",
+        "ledger",
+        "::ffff:10.244.1.7",
+        &[8080],
+    )]);
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&ctx), Some("payments-deny"));
+
+    // Divergent capture owners fail closed; the ordinary record is not a
+    // fallback.
+    let plugin = plugin_for(vec![
+        capture_destination("payments", "ledger", "10.244.1.7", &[8080]),
+        capture_destination("payments", "reports", "10.244.1.7", &[8080]),
+    ]);
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&ctx), Some("scope_missing"));
+
+    // A captured address on a port the capture record does not declare fails
+    // closed too, even though the ordinary record declares it.
+    let plugin = plugin_for(vec![capture_destination(
+        "payments",
+        "ledger",
+        "10.244.1.7",
+        &[9090],
+    )]);
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&ctx), Some("scope_missing"));
+
+    // An address the capture inventory does not name keeps the ordinary
+    // service-derived scope.
+    let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.50", 8080);
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&ctx), Some("ferrum-deny"));
+}
+
+/// The relay ownership guard also admits capture destinations declared by
+/// hostname (matched ASCII-case-insensitively). Such a destination is scoped
+/// from the capture inventory too: an ordinary record declaring the same name
+/// never decides its scope.
+#[tokio::test]
+async fn mesh_authz_node_waypoint_inbound_relay_capture_scope_covers_hostnames() {
+    let old_app = capture_destination("ferrum", "old-app", "ledger.internal", &[8080]);
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_slice": MeshSlice {
+            namespace: "ferrum".to_string(),
+            services: vec![MeshService {
+                name: "old-app".to_string(),
+                namespace: "ferrum".to_string(),
+                ports: vec![ServicePort {
+                    port: 8080,
+                    protocol: AppProtocol::Tcp,
+                    name: None,
+                    target_port: None,
+                }],
+                workloads: vec![WorkloadRef {
+                    spiffe_id: old_app.spiffe_id.clone(),
+                }],
+                protocol_overrides: HashMap::new(),
+                cluster_ips: Vec::new(),
+                uid: None,
+                allow_path_parameters: false,
+            }],
+            workloads: vec![old_app],
+            mesh_policies: vec![namespace_deny("ferrum", "ferrum-deny")],
+            node_waypoint_capture_destinations: vec![capture_destination(
+                "payments",
+                "ledger",
+                "Ledger.Internal",
+                &[8080],
+            )],
+            node_waypoint_capture_mesh_policies: vec![namespace_deny("payments", "payments-deny")],
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        },
+        "per_pod_policy_scoping": true,
+        "trusted_hbone_assertors": [{
+            "assertor": CAPTURE_RELAY_PEER,
+            "asserts": [CAPTURE_FRONTEND],
+        }],
+    }))
+    .expect("plugin config");
+
+    for host in ["ledger.internal", "LEDGER.internal"] {
+        let mut ctx = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, host, 8080);
+        let result = plugin.authorize(&mut ctx).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "{host}: expected the capture destination's DENY, got {result:?}"
+        );
+        assert_eq!(deny_policy(&ctx), Some("payments-deny"), "{host}");
+    }
+
+    // An undeclared port on the capture-declared name fails closed.
+    let mut ctx = capture_relay_request(
+        CAPTURE_RELAY_PEER,
+        CAPTURE_FRONTEND,
+        "ledger.internal",
+        9090,
+    );
+    let result = plugin.authorize(&mut ctx).await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 403,
+            ..
+        }
+    ));
+    assert_eq!(deny_policy(&ctx), Some("scope_missing"));
+}
+
 #[tokio::test]
 async fn workload_metrics_inbound_listener_stamps_mesh_direction_inbound() {
     // GAP-3F: the mesh inbound listener stamps `ctx.mesh_direction = Inbound`
@@ -8298,6 +9025,108 @@ fn mesh_authz_node_waypoint_still_buffers_on_its_source_side_leg() {
         plugin.should_buffer_request_body(&outbound),
         "per_pod_policy_scoping keeps destination-scoped enforcement on this leg"
     );
+}
+
+/// A body-inspecting CUSTOM policy that only the NodeWaypoint capture
+/// inventory carries must not prebuffer (or `413` at its `maxRequestBytes`) a
+/// request to a workload it cannot select: the prebuffer runs before
+/// `authorize`, so it applies the same destination/source scope selection.
+/// A request to the captured destination still gets the buffer and ceiling.
+#[test]
+fn mesh_authz_capture_only_custom_body_rule_buffers_only_selected_requests() {
+    use ferrum_edge::modes::mesh::runtime::PolicyScopeCache;
+
+    let delegate: MeshPolicy = serde_json::from_value(json!({
+        "name": "payments-delegate",
+        "namespace": "payments",
+        "scope": {"kind": "namespace", "namespace": "payments"},
+        "rules": [{"action": {"custom": {"provider": "payments-authz"}}}]
+    }))
+    .expect("policy");
+    let provider = serde_json::from_value(json!({
+        "name": "payments-authz",
+        "service": "127.0.0.1",
+        "port": 9000,
+        "timeout_ms": 500,
+        "status_on_error": 403,
+        "include_request_body_in_check": {"max_request_bytes": 1024}
+    }))
+    .expect("provider");
+    let plugin = MeshAuthz::new_with_http_client(
+        &json!({
+            "mesh_slice": MeshSlice {
+                node_id: "node-a".to_string(),
+                namespace: "ferrum".to_string(),
+                version: "test".to_string(),
+                ext_authz_providers: vec![provider],
+                node_waypoint_capture_destinations: vec![capture_destination(
+                    "payments",
+                    "ledger",
+                    "10.244.1.7",
+                    &[8080],
+                )],
+                node_waypoint_capture_mesh_policies: vec![delegate],
+                node_waypoint_capture_mesh_policies_resolved: true,
+                ..MeshSlice::default()
+            },
+            "per_pod_policy_scoping": true,
+            "trusted_hbone_assertors": [{
+                "assertor": CAPTURE_RELAY_PEER,
+                "asserts": [CAPTURE_FRONTEND],
+            }],
+        }),
+        Some(PluginHttpClient::default()),
+    )
+    .expect("body-inspecting mesh_authz generation builds");
+    let ferrum_pod = || {
+        Some(Arc::new(PolicyScopeCache::new(
+            SpiffeId::new("spiffe://cluster.local/ns/ferrum/sa/client").expect("spiffe"),
+            "ferrum",
+            HashMap::from([("app".to_string(), "client".to_string())]),
+        )))
+    };
+
+    // An enrolled `ferrum` pod uploading to an unrelated `ferrum` Service.
+    let mut unrelated = admin_request_context(Some(MeshTrafficDirection::Outbound));
+    unrelated.node_waypoint_policy_scope = ferrum_pod();
+    unrelated.matched_proxy = Some(Arc::new(
+        serde_json::from_value::<Proxy>(json!({
+            "id": "upload",
+            "namespace": "ferrum",
+            "hosts": ["upload.ferrum"],
+            "listen_path": "/",
+            "backend_scheme": "http",
+            "backend_host": "10.244.1.50",
+            "backend_port": 8080
+        }))
+        .expect("proxy"),
+    ));
+    assert!(
+        !plugin.should_buffer_request_body(&unrelated),
+        "a foreign capture-only CUSTOM rule must not buffer an unrelated workload's request"
+    );
+
+    // No scope evidence at all: only a mesh-wide policy could apply.
+    let unscoped = admin_request_context(Some(MeshTrafficDirection::Inbound));
+    assert!(!plugin.should_buffer_request_body(&unscoped));
+
+    // The captured destination, reached through the synthesized inbound relay,
+    // still requests the buffer and the provider's ceiling.
+    let relayed = capture_relay_request(CAPTURE_RELAY_PEER, CAPTURE_FRONTEND, "10.244.1.7", 8080);
+    assert!(
+        plugin.should_buffer_request_body(&relayed),
+        "a request the capture policy selects must still be prebuffered"
+    );
+    assert_eq!(plugin.request_body_buffer_limit(), Some(1024));
+
+    // A source pod the policy selects (namespace `payments`) also buffers.
+    let mut payments_source = admin_request_context(Some(MeshTrafficDirection::Outbound));
+    payments_source.node_waypoint_policy_scope = Some(Arc::new(PolicyScopeCache::new(
+        SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger").expect("spiffe"),
+        "payments",
+        HashMap::from([("app".to_string(), "ledger".to_string())]),
+    )));
+    assert!(plugin.should_buffer_request_body(&payments_source));
 }
 
 #[tokio::test]
