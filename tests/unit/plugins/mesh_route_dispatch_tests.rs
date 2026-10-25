@@ -934,6 +934,7 @@ fn upstream_override_without_snapshot_resets_source_tls() {
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
         tls_refused: false,
+        suppress_global_client_identity: false,
     };
     proxy_template.dispatch_port_overrides = Some(HashMap::from([(
         8080,
@@ -1004,6 +1005,7 @@ fn direct_backend_override_clears_existing_upstream_id() {
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
         tls_refused: false,
+        suppress_global_client_identity: false,
     };
     let proxy = Arc::new(proxy_template);
     let mut ctx = ctx();
@@ -1107,6 +1109,7 @@ fn explicit_tls_override_applies_to_clone() {
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
         tls_refused: false,
+        suppress_global_client_identity: false,
     });
 
     let result = ctx.apply_route_overrides(Arc::clone(&proxy));
@@ -1458,6 +1461,51 @@ fn mesh_route_dispatch_rejects_consumer_assertion_request_transform_destinations
             );
         }
 
+        let removal = json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+                "request_transform": [{"operation": "remove", "key": key}]
+            }]
+        });
+        MeshRouteDispatch::new(&removal)
+            .unwrap_or_else(|e| panic!("remove of {key} must remain allowed; got: {e}"));
+    }
+}
+
+/// The router's `x-path-param-*` captures are gateway assertions nothing
+/// re-asserts after the route-header finalizer, so a route list may not write
+/// them either (PR #6858, matching `request_transformer` admission).
+#[test]
+fn mesh_route_dispatch_rejects_path_param_request_transform_destinations() {
+    for key in [
+        "x-path-param-account",
+        "X-Path-Param-Id",
+        "X_Path_Param_Account",
+    ] {
+        for operation in ["add", "update"] {
+            let config = json!({
+                "rules": [{
+                    "match": {"methods": ["GET"]},
+                    "destination": {"backend_host": "svc.internal", "backend_port": 8080},
+                    "request_transform": [{
+                        "operation": operation,
+                        "key": key,
+                        "value": "other-account"
+                    }]
+                }]
+            });
+            let error = MeshRouteDispatch::new(&config)
+                .expect_err("an x-path-param-* request_transform destination must fail admission");
+            assert!(
+                error.contains("rules[0].request_transform[0]"),
+                "{operation} {key}: {error}"
+            );
+            assert!(
+                error.contains("`x-path-param-*`"),
+                "{operation} {key}: {error}"
+            );
+        }
         let removal = json!({
             "rules": [{
                 "match": {"methods": ["GET"]},

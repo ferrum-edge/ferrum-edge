@@ -221,3 +221,77 @@ async fn a_failure_before_admission_notifies_no_plugins_and_claims_no_generation
         "no plugin from a generation that never admitted this attempt may be notified"
     );
 }
+
+/// Frontend DTLS plugin reject (PR #6872 review): the accepted-DTLS handler
+/// used to close and return before building any summary, so metadata the
+/// rejecting chain wrote — `ip_restriction.reason` — never reached a log sink.
+/// The handler now emits one zero-byte, client-side summary through the same
+/// setup-failure path as a plain-UDP plugin reject.
+#[tokio::test]
+async fn a_frontend_dtls_plugin_rejection_emits_one_summary_with_the_rejection_reason() {
+    use ferrum_edge::plugins::ip_restriction::{IpRestriction, REJECTION_REASON_METADATA_KEY};
+    use ferrum_edge::plugins::{Direction, PluginResult, StreamFrontendTransport};
+
+    let proxy = udp_proxy();
+    for (config, expected) in [
+        (
+            serde_json::json!({"deny": ["198.51.100.0/24"]}),
+            "ip_denied",
+        ),
+        (
+            serde_json::json!({"allow": ["10.0.0.0/8"]}),
+            "not_in_allow_list",
+        ),
+    ] {
+        let (capture_plugins, captured) = capture();
+        let restriction: Arc<dyn Plugin> =
+            Arc::new(IpRestriction::new(&config).expect("valid ip_restriction config"));
+        let mut plugins = vec![Arc::clone(&restriction)];
+        plugins.extend(capture_plugins);
+
+        let mut ctx = admitted_ctx(Some(7));
+        ctx.frontend_transport = StreamFrontendTransport::Dtls;
+        assert!(matches!(
+            restriction.on_stream_connect(&mut ctx).await,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ));
+
+        let emitted = ferrum_edge::_test_support::emit_dtls_plugin_rejection_summary_for_test(
+            plugins,
+            &proxy,
+            &ctx,
+            "198.51.100.4",
+            LISTEN_PORT,
+        )
+        .await;
+        assert!(emitted, "a rejected DTLS admission emits its summary");
+
+        let summaries = captured.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(summaries.len(), 1, "exactly one rejection summary");
+        let summary = &summaries[0];
+        assert_eq!(
+            summary
+                .metadata
+                .get(REJECTION_REASON_METADATA_KEY)
+                .map(String::as_str),
+            Some(expected)
+        );
+        assert_eq!(summary.client_ip, "198.51.100.4");
+        assert_eq!(summary.listen_port, LISTEN_PORT);
+        assert_eq!(summary.bytes_sent, 0);
+        assert_eq!(summary.bytes_received, 0);
+        assert_eq!(summary.proxy_lifecycle_generation, Some(7));
+        assert_eq!(
+            summary.disconnect_direction,
+            Some(Direction::ClientToBackend)
+        );
+        assert_ne!(
+            summary.disconnect_cause,
+            Some(DisconnectCause::BackendError),
+            "a plugin reject is client-side and backend-health neutral"
+        );
+    }
+}

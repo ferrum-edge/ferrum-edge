@@ -312,3 +312,37 @@ fn runtime_config_validation_rejects_passthrough_with_frame_plugin() {
         "strip must not be refused: {errors:?}"
     );
 }
+
+/// api_chargeback bills WebSocket bandwidth from the parsed relay's payload
+/// counters, so a bandwidth-priced instance needs the parsed relay and is
+/// refused on a passthrough proxy, while a per-call-only instance is admitted.
+#[test]
+fn passthrough_refuses_api_chargeback_only_when_it_prices_bandwidth() {
+    let chargeback = |config: Value| -> PluginConfig {
+        serde_json::from_value(json!({
+            "id": "billing",
+            "plugin_name": "api_chargeback",
+            "config": config,
+            "scope": "proxy",
+            "proxy_id": PROXY_ID,
+            "enabled": true,
+        }))
+        .expect("plugin config JSON")
+    };
+
+    let bandwidth_priced = graph(
+        proxy("passthrough", &["billing"]),
+        vec![chargeback(
+            json!({"bandwidth_pricing": {"price_per_byte_received": 0.001}}),
+        )],
+    );
+    assert_refused(&bandwidth_priced, "api_chargeback");
+
+    let per_call_only = graph(
+        proxy("passthrough", &["billing"]),
+        vec![chargeback(
+            json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]}),
+        )],
+    );
+    assert_admitted(&per_call_only);
+}

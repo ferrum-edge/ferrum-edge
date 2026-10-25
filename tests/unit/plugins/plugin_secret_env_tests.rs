@@ -171,6 +171,17 @@ fn ai_stream_router_api_key_reference(name: &str) -> Value {
     })
 }
 
+fn soap_ws_security_password_reference(name: &str) -> Value {
+    json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": format!("${{{name}}}")}]
+        }
+    })
+}
+
 fn mcp_gateway_server_header_reference(name: &str) -> Value {
     json!({
         "mode": "aggregate_router",
@@ -241,14 +252,29 @@ fn proxy_alerts_smtp_credential_env(name: &str) -> Value {
     }))
 }
 
+fn ai_tool_governor_approval_header_reference(name: &str) -> Value {
+    json!({
+        "tools": {"deploy": {"action": "require_approval"}},
+        "approval": {
+            "endpoint_url": "https://approval.example.com/decide",
+            "headers": {"Authorization": format!("${{{name}}}")}
+        }
+    })
+}
+
 /// Every plugin config field that names a process environment variable, as
 /// `(plugin, config builder)`. A new env-reference field belongs here.
 type ConfigBuilder = fn(&str) -> Value;
 
-const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 7] = [
+const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 9] = [
     ("api_chargeback_sink", api_chargeback_sink_password_ref),
     ("ai_semantic_firewall", ai_semantic_firewall_api_key_env),
     ("ai_stream_router", ai_stream_router_api_key_reference),
+    ("soap_ws_security", soap_ws_security_password_reference),
+    (
+        "ai_tool_governor",
+        ai_tool_governor_approval_header_reference,
+    ),
     ("mcp_gateway", mcp_gateway_server_header_reference),
     ("workload_metrics", workload_metrics_lightstep_token_env),
     ("proxy_alerts", proxy_alerts_webhook_url_env),
