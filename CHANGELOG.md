@@ -28,10 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reservation ids are process-unique, and budget `429`s carry `Retry-After`.
   New optional `consumer_limits`, `model_limits`, and `media_token_estimate`
   settings add per-consumer and per-model budgets and a per-media reservation.
-  Only `POST` requests are classified. A call whose model cannot be read
-  before dispatch is charged against the strictest listed model budget, and a
-  transform that changes `model` re-attributes the reservation to the final
-  model's budget.
+  Only `POST` requests are classified. With `model_limits` set, a call whose
+  model cannot be read before dispatch is refused (`415` for a still-compressed
+  body, `400` for an unparseable one), and a transform that changes `model`
+  re-attributes the reservation to the final model's budget.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

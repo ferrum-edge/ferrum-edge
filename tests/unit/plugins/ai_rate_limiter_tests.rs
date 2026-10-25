@@ -9806,9 +9806,10 @@ async fn model_limits_give_a_model_its_own_budget_window() {
         Some("100000")
     );
     assert!(!has_scoped_meta(&other, "ai_ratelimit_budget_model"));
-    assert!(
-        observed_usage(&plugin).await < 100,
-        "the default window must not carry the model budget's 120 tokens"
+    assert_eq!(
+        scoped_meta(&other, "ai_ratelimit_usage"),
+        scoped_meta(&other, "ai_ratelimit_reserved_tokens"),
+        "the default window holds only this call's reservation, not o1's 120 tokens"
     );
 }
 
@@ -9913,97 +9914,94 @@ async fn an_unparseable_json_object_under_a_grpc_web_label_is_a_candidate() {
     assert!(!has_scoped_meta(&frame, "ai_ratelimit_request"));
 }
 
-/// PR6847-SOL-2: a candidate whose model cannot be read is charged against
-/// the strictest listed model budget, never the larger default window.
+/// PR6847-SOL-2: each listed model owns an independent window, so with
+/// `model_limits` a candidate whose model cannot be read is refused rather
+/// than admitted against any single window — here model `b` is exhausted
+/// while the smaller `a` window is still empty.
 #[tokio::test]
 async fn uninspectable_candidates_cannot_escape_a_model_budget() {
-    let plugin = model_budget_limiter();
-
-    // Still-compressed JSON: pinned to o1's budget and window.
-    let mut compressed = create_test_context();
-    compressed.method = "POST".to_string();
-    let mut gzip_headers = json_headers();
-    gzip_headers.insert("content-encoding".to_string(), "gzip".to_string());
-    assert_continue(
-        plugin
-            .before_proxy(&mut compressed, &mut gzip_headers)
-            .await,
-    );
-    assert_eq!(
-        scoped_meta(&compressed, "ai_ratelimit_budget_model").map(String::as_str),
-        Some("o1")
-    );
-    assert_eq!(
-        scoped_meta(&compressed, "ai_ratelimit_limit").map(String::as_str),
-        Some("100")
-    );
-    assert_continue(
-        plugin
-            .on_response_body(
-                &mut compressed,
-                200,
-                &mut json_headers(),
-                &openai_response(400, 100),
-            )
-            .await,
-    );
-    // The charge landed on o1's window...
-    let mut o1 = post_ctx_with_body(&chat_body("o1"));
-    assert_reject(
-        plugin.before_proxy(&mut o1, &mut json_headers()).await,
-        Some(429),
-    );
-    // ...and not on the default window.
-    let mut cheap = post_ctx_with_body(&chat_body("cheap"));
-    assert_continue(plugin.before_proxy(&mut cheap, &mut json_headers()).await);
-    assert_eq!(
-        scoped_meta(&cheap, "ai_ratelimit_limit").map(String::as_str),
-        Some("100000")
-    );
-
-    // An unparseable body is pinned the same way.
-    let fresh = model_budget_limiter();
-    let mut deep = post_ctx_with_body(&too_deep_chat_body("o1"));
-    assert_continue(fresh.before_proxy(&mut deep, &mut json_headers()).await);
-    assert_eq!(
-        scoped_meta(&deep, "ai_ratelimit_budget_model").map(String::as_str),
-        Some("o1")
-    );
-
-    // No pin when the default ceiling is already the strictest.
-    let roomy = AiRateLimiter::new(
-        &json!({"token_limit": 1000, "limit_by": "ip", "model_limits": {"big": 1_000_000}}),
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "model_limits": {"a": 100, "b": 200}
+        }),
         PluginHttpClient::default(),
     )
     .unwrap();
-    let mut deep = post_ctx_with_body(&too_deep_chat_body("big"));
-    assert_continue(roomy.before_proxy(&mut deep, &mut json_headers()).await);
-    assert!(!has_scoped_meta(&deep, "ai_ratelimit_budget_model"));
+    let mut b = post_ctx_with_body(&chat_body("b"));
+    assert_continue(plugin.before_proxy(&mut b, &mut json_headers()).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut b, 200, &mut json_headers(), &openai_response(150, 50))
+            .await,
+    );
+    let mut b_again = post_ctx_with_body(&chat_body("b"));
+    assert_reject(
+        plugin.before_proxy(&mut b_again, &mut json_headers()).await,
+        Some(429),
+    );
+
+    // A still-compressed call (to `b`, unknowably) is refused with 415.
+    let (mut compressed, mut gzip_headers) = budget_probe();
+    match plugin
+        .before_proxy(&mut compressed, &mut gzip_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 415);
+            assert_eq!(
+                headers.get("accept-encoding").map(String::as_str),
+                Some("identity")
+            );
+        }
+        other => panic!("an unknown-model compressed call must be refused, got {other:?}"),
+    }
+    assert!(!has_scoped_meta(&compressed, "ai_ratelimit_request"));
+
+    // An unparseable body is refused with 400.
+    let mut deep = post_ctx_with_body(&too_deep_chat_body("b"));
+    assert_reject(
+        plugin.before_proxy(&mut deep, &mut json_headers()).await,
+        Some(400),
+    );
+
+    // Without model budgets the same candidate is admitted as before.
+    let plain = local_limiter(10_000, "total_tokens", "ip");
+    let (mut compressed, mut gzip_headers) = budget_probe();
+    assert_continue(plain.before_proxy(&mut compressed, &mut gzip_headers).await);
+    assert!(has_scoped_meta(&compressed, "ai_ratelimit_request"));
 }
 
-/// PR6847-SOL-2: the decoded fallback re-attributes the provisional pin to the
-/// model the final plaintext names.
+/// PR6847-SOL-2: the decoded fallback is attributed to the model its final
+/// plaintext names and checked against that model's window; a plaintext that
+/// still cannot be read is refused.
 #[tokio::test]
 async fn the_decoded_fallback_attributes_its_real_model() {
     let plugin = model_budget_limiter();
-    for (model, expected) in [("cheap", None), ("o1", Some("o1"))] {
+    let deferred = || {
         let mut ctx = create_test_context();
         ctx.method = "POST".to_string();
         ctx.metadata.insert(
             "compression:request_encoding".to_string(),
             "gzip".to_string(),
         );
+        ctx
+    };
+    for (model, expected) in [("cheap", None), ("o1", Some("o1"))] {
+        let mut ctx = deferred();
         let mut headers = json_headers();
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
         assert!(has_scoped_meta(
             &ctx,
             "ai_ratelimit_deferred_compressed_classify"
         ));
-        assert_eq!(
-            scoped_meta(&ctx, "ai_ratelimit_budget_model").map(String::as_str),
-            Some("o1"),
-            "an unknown model is provisionally pinned to the strictest budget"
-        );
+        assert!(!has_scoped_meta(&ctx, "ai_ratelimit_budget_model"));
         assert_continue(
             plugin
                 .on_final_request_body_with_context(&mut ctx, &headers, chat_body(model).as_bytes())
@@ -10015,7 +10013,76 @@ async fn the_decoded_fallback_attributes_its_real_model() {
             expected,
             "{model}: the decoded body's model decides the budget"
         );
+        if model == "o1" {
+            assert_continue(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut json_headers(), &openai_response(80, 40))
+                    .await,
+            );
+        }
     }
+
+    // o1 is now exhausted: a decoded o1 call is refused on o1's window.
+    let mut ctx = deferred();
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, chat_body("o1").as_bytes())
+            .await,
+        Some(429),
+    );
+
+    // A decoded plaintext that does not parse cannot name its model.
+    let mut ctx = deferred();
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                too_deep_chat_body("o1").as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+}
+
+/// PR6847-SOL-3 (round 2): a transform that rewrites an admitted call into a
+/// body the gateway cannot parse may now name any model, so it is refused —
+/// and the gateway rejection releases the admitted reservation.
+#[tokio::test]
+async fn an_admitted_call_rewritten_into_an_unparseable_body_is_refused() {
+    let plugin = model_budget_limiter();
+    let cheap = chat_body("cheap");
+
+    let mut ctx = post_ctx_with_body(&cheap);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    let reservation = reserved_tokens(&ctx);
+    assert!(reservation > 0);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &json_headers(),
+                too_deep_chat_body("o1").as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+    // The proxy replays the rejection through `after_proxy`, which releases.
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    assert_continue(plugin.after_proxy(&mut ctx, 400, &mut HashMap::new()).await);
+
+    let mut next = post_ctx_with_body(&cheap);
+    assert_continue(plugin.before_proxy(&mut next, &mut json_headers()).await);
+    assert_eq!(
+        scoped_meta(&next, "ai_ratelimit_usage").map(String::as_str),
+        Some(reservation.to_string().as_str()),
+        "the refused call's reservation was released"
+    );
 }
 
 /// PR6847-SOL-3: a transform that changes `model` moves the reservation to

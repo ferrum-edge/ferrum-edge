@@ -79,6 +79,7 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+const UNKNOWN_MODEL_REJECT_BODY: &str = r#"{"error":"AI request model unavailable","details":"model_limits requires an uncompressed, parseable request body so the requested model's token budget can be enforced"}"#;
 
 /// Base names of every per-request reservation-lifecycle metadata entry this
 /// plugin owns. Each is turned into an INSTANCE-SCOPED `ctx.metadata` key by
@@ -858,23 +859,31 @@ impl AiRateLimiter {
         self.token_limit
     }
 
-    /// The model budget an AI candidate whose `model` cannot be read is
-    /// charged against when `model_limits` is configured
-    /// (`PR6847-SOL-2`).
+    /// Refusal for an AI candidate whose `model` cannot be read while
+    /// `model_limits` is configured (`PR6847-SOL-2`).
     ///
-    /// A still-compressed or unparseable body may be a call to any model, so
-    /// substituting the (usually much larger) default window would let a
-    /// listed model's ceiling be exceeded simply by making the body
-    /// uninspectable. Fail closed instead: charge the STRICTEST listed model
-    /// budget when it is smaller than this request's default ceiling. A
-    /// co-located `compression` plugin with `decompress_request: true` lets
-    /// such requests be attributed to their real model.
-    fn uninspectable_budget_model(&self, ctx: &RequestContext) -> Option<String> {
-        let (model, limit) = self
-            .model_limits
-            .iter()
-            .min_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))?;
-        (*limit < self.default_limit(ctx)).then(|| model.clone())
+    /// Each listed model owns an independent window, so a request that may be
+    /// a call to ANY model cannot be enforced against any single window: the
+    /// default window is usually far larger, and even the strictest listed
+    /// window may be empty while the model actually called is exhausted.
+    /// Rather than admit such a request against the wrong budget, refuse it.
+    /// A still content-coded body is answered `415` with
+    /// `Accept-Encoding: identity`; an unparseable one `400`. A co-located
+    /// `compression` plugin with `decompress_request: true` makes compressed
+    /// calls inspectable, and so attributable to their real model.
+    fn reject_unknown_model(&self, still_encoded: bool) -> PluginResult {
+        let mut headers = HashMap::new();
+        let status_code = if still_encoded {
+            headers.insert("accept-encoding".to_string(), "identity".to_string());
+            415
+        } else {
+            400
+        };
+        PluginResult::Reject {
+            status_code,
+            body: UNKNOWN_MODEL_REJECT_BODY.to_string(),
+            headers,
+        }
     }
 
     fn check_budget_op(&self, limit: u64) -> AiRateLimitOp {
@@ -1494,11 +1503,12 @@ impl AiRateLimiter {
     /// the default `charge_estimate` rejects a usage-less 2xx instead of
     /// treating the absent estimate as a free charge.
     ///
-    /// With `model_limits`, `before_proxy` pinned the request to the strictest
-    /// model budget because its model was unknown. Now that the model is
-    /// readable, the request is re-attributed to its real budget window and
-    /// re-checked against it; nothing was reserved, so moving the window
-    /// releases nothing (`PR6847-SOL-2`).
+    /// With `model_limits`, `before_proxy` could only check the default window
+    /// because the model was unknown. Now that the model is readable, a listed
+    /// model's request is attributed to its own budget window and checked
+    /// against it; nothing was reserved, so moving the window releases
+    /// nothing. A plaintext that still cannot be read is refused, since no
+    /// model budget can be established for it (`PR6847-SOL-2`).
     async fn classify_deferred_final_body(
         &self,
         ctx: &mut RequestContext,
@@ -1533,13 +1543,11 @@ impl AiRateLimiter {
         };
         let matched_model = match class {
             RequestClass::Ai { budget_model, .. } => Some(budget_model),
-            RequestClass::Uninspectable => None,
-            RequestClass::Deferred | RequestClass::NonAi => {
-                // Not an AI call after all: drop the provisional model pin so
-                // nothing is attributed to it.
-                ctx.metadata.remove(&self.keys.budget_model);
-                return PluginResult::Continue;
+            RequestClass::Uninspectable if !self.model_limits.is_empty() => {
+                return self.reject_unknown_model(has_non_identity_content_encoding(headers));
             }
+            RequestClass::Uninspectable => None,
+            RequestClass::Deferred | RequestClass::NonAi => return PluginResult::Continue,
         };
         if let Some(matched_model) = matched_model
             && !self.model_limits.is_empty()
@@ -1617,7 +1625,10 @@ impl AiRateLimiter {
                     estimate,
                     budget_model,
                 } => (estimate, budget_model, false),
-                RequestClass::Uninspectable => (0, self.uninspectable_budget_model(ctx), true),
+                RequestClass::Uninspectable if !self.model_limits.is_empty() => {
+                    return self.reject_unknown_model(false);
+                }
+                RequestClass::Uninspectable => (0, None, true),
                 RequestClass::Deferred | RequestClass::NonAi => return PluginResult::Continue,
             };
         if let Some(model) = budget_model {
@@ -1649,10 +1660,16 @@ impl AiRateLimiter {
     /// the final model's window and ceiling with the final body's estimate —
     /// refused with the usual `429`/`503` if that window cannot cover it — so
     /// every later reconciliation charges the window of the model the
-    /// provider actually served. A body that no longer parses, or no longer
-    /// looks like an AI call, keeps its admitted attribution.
+    /// provider actually served. A body that no longer looks like an AI call
+    /// keeps its admitted attribution. A changed body that no longer PARSES
+    /// may now name any model, so it is refused like any other request whose
+    /// model budget cannot be established (`PR6847-SOL-3`); the gateway
+    /// rejection releases the admitted reservation.
     async fn reattribute_final_model(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
         let Some(json) = std::str::from_utf8(body).ok().and_then(parse_request_json) else {
+            if json_body_start(body).is_some() {
+                return self.reject_unknown_model(false);
+            }
             return PluginResult::Continue;
         };
         if !json_looks_like_ai_request(&json, self.cohere_native_request(ctx)) {
@@ -3411,15 +3428,17 @@ impl Plugin for AiRateLimiter {
         //    (Case B). The rare decoded fallback without a refreshed text view
         //    defers classification to `on_final_request_body`; a usage-less 2xx
         //    can therefore never turn the missing estimate into a free call.
-        // The model budget this request is charged against. A candidate whose
-        // model cannot be read is pinned to the strictest listed model budget
-        // rather than the default window (`PR6847-SOL-2`).
+        // With model budgets, a candidate whose model cannot be read cannot be
+        // enforced against any single model window, so it is refused
+        // (`PR6847-SOL-2`). The deferred decode fallback is budget-checked on
+        // its default window here and attributed to its real model by the
+        // final request-body hook, before anything is reserved.
+        if !self.model_limits.is_empty() && matches!(class, RequestClass::Uninspectable) {
+            return self.reject_unknown_model(still_compressed);
+        }
         let budget_model = match &class {
             RequestClass::Ai { budget_model, .. } => budget_model.clone(),
-            RequestClass::Uninspectable | RequestClass::Deferred => {
-                self.uninspectable_budget_model(ctx)
-            }
-            RequestClass::NonAi => None,
+            RequestClass::Uninspectable | RequestClass::Deferred | RequestClass::NonAi => None,
         };
         if let Some(model) = budget_model {
             ctx.metadata.insert(self.keys.budget_model.clone(), model);
