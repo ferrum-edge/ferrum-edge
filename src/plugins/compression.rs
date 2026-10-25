@@ -285,11 +285,23 @@ pub(crate) const REQUEST_ACCEPT_ENCODING_METADATA_KEY: &str = "compression:accep
 
 /// The origin's validator, recorded when `weaken_strong_etag` commits a coding.
 ///
-/// The shared body-transform lifecycle deletes every content-bound validator
-/// once the bytes change, so the compressed response's weak form is re-attached
-/// from this value in `on_response_body_transformed`; an aborted encode puts the
-/// original back on the restored identity response instead.
+/// Used ONLY by abort recovery, and only while the live `ETag` is still exactly
+/// the weak form compression wrote: that proves no semantic transform replaced
+/// the body (the shared lifecycle deletes validators when one does) and no later
+/// hook replaced the field, so the restored identity body really is the bytes
+/// the origin validator describes.
 const WEAKENED_ETAG_ORIGIN_METADATA_KEY: &str = "compression:weakened_etag_origin";
+
+/// The live `ETag` captured immediately before the gateway encodes, under
+/// `weaken_strong_etag`.
+///
+/// Captured at encode time rather than at commit time, after every semantic
+/// transform and header hook: a body rewrite earlier in the transform phase has
+/// already retired the origin validator, so nothing is captured and nothing is
+/// re-attached for a document the origin never served. Consumed by
+/// `on_response_body_transformed`, which re-attaches its weak form after the
+/// lifecycle's own validator cleanup for the encoded bytes.
+const ENCODE_ETAG_METADATA_KEY: &str = "compression:encode_etag";
 
 /// The client's own `Accept-Encoding` for response negotiation.
 ///
@@ -410,9 +422,13 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
     }
     ctx.metadata.remove(RESPONSE_ALGORITHM_METADATA_KEY);
     ctx.clear_gateway_response_compression();
-    // The identity body is the origin's bytes again, so the validator
-    // `weaken_strong_etag` rewrote for the coded variant goes back to the
-    // origin's own value.
+    // `weaken_strong_etag` rewrote the origin validator to its weak form for the
+    // coded variant. The aborted encode serves the identity body instead, which
+    // is the origin's bytes ONLY if nothing rewrote them in between — so the
+    // origin validator comes back only while the live field is still exactly
+    // the weak form compression wrote (a semantic rewrite deleted it; a later
+    // hook replaced it). Otherwise the live field is left as it is.
+    ctx.metadata.remove(ENCODE_ETAG_METADATA_KEY);
     let weakened_origin_etag = ctx.metadata.remove(WEAKENED_ETAG_ORIGIN_METADATA_KEY);
     let identity_unacceptable =
         client_accept_encoding(ctx).is_some_and(|value| identity_coding_quality(value) == 0.0);
@@ -437,7 +453,12 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
         response_body.len().to_string(),
     );
     if let Some(origin_etag) = weakened_origin_etag {
-        response_headers.insert("etag".to_string(), origin_etag);
+        let live_is_compressions_weak_form = response_headers
+            .get("etag")
+            .is_some_and(|live| etag_weak_form(&origin_etag).as_deref() == Some(live.as_str()));
+        if live_is_compressions_weak_form {
+            response_headers.insert("etag".to_string(), origin_etag);
+        }
     }
     warn_sampled!(
         "compression: restored identity response after failed gateway content coding \
@@ -1923,8 +1944,9 @@ fn etags_have_weak_form(response_headers: &HashMap<String, String>) -> bool {
 }
 
 /// Rewrite every `ETag` field to its weak form for a coded variant, recording
-/// the origin's canonical `etag` value so it can be re-attached after the body
-/// transform (weak form) or restored on an aborted encode (origin form).
+/// the origin's canonical `etag` value for abort recovery (see
+/// [`WEAKENED_ETAG_ORIGIN_METADATA_KEY`]). What survives to the encode is
+/// captured separately, at encode time.
 ///
 /// Callers have already proven [`etags_have_weak_form`]; a field without one is
 /// left untouched rather than guessed at.
@@ -2827,13 +2849,17 @@ impl Plugin for CompressionPlugin {
         true
     }
 
-    /// Re-attach the weak validator `weaken_strong_etag` committed.
+    /// Re-attach the weak validator `weaken_strong_etag` keeps on the coded
+    /// variant.
     ///
     /// The shared lifecycle has just retired every content-bound validator for
     /// the encoded bytes, which is right for a strong `ETag`; its weak form
     /// still names a semantically equivalent representation, so the coded
     /// variant keeps it (RFC 9110 §8.8.1). Only the encode owner re-attaches,
-    /// and only the value it recorded at commit.
+    /// and only the validator that was live on the body it ENCODED (captured
+    /// at encode time), never the origin's: a semantic rewrite earlier in the
+    /// transform phase already retired that one, and resurrecting it would
+    /// equate the origin's document with a different one.
     fn on_response_body_transformed(
         &self,
         ctx: &mut RequestContext,
@@ -2842,10 +2868,11 @@ impl Plugin for CompressionPlugin {
         if !self.config.weaken_strong_etag || !self.is_response_encode_owner(ctx) {
             return;
         }
+        ctx.metadata.remove(WEAKENED_ETAG_ORIGIN_METADATA_KEY);
         if let Some(weak) = ctx
             .metadata
-            .remove(WEAKENED_ETAG_ORIGIN_METADATA_KEY)
-            .and_then(|origin| etag_weak_form(&origin))
+            .remove(ENCODE_ETAG_METADATA_KEY)
+            .and_then(|live| etag_weak_form(&live))
         {
             response_headers.insert("etag".to_string(), weak);
         }
@@ -2968,6 +2995,21 @@ impl Plugin for CompressionPlugin {
         // ceiling — the same size as the window the transform phase reserved —
         // so an expanding encode is refused during construction rather than
         // after a larger buffer is resident (GHSA-pwcm-6rh8-f2gh).
+        // `weaken_strong_etag`: record the validator that is live on the body
+        // being encoded — after every semantic transform and header hook — so
+        // only that one is re-attached once the lifecycle retires validators
+        // for the encoded bytes.
+        if self.config.weaken_strong_etag {
+            match response_headers.get("etag") {
+                Some(live) => {
+                    ctx.metadata
+                        .insert(ENCODE_ETAG_METADATA_KEY.to_string(), live.clone());
+                }
+                None => {
+                    ctx.metadata.remove(ENCODE_ETAG_METADATA_KEY);
+                }
+            }
+        }
         let compressed = self
             .compress_response_body(body, algo, permit, ctx.retained_response_body_ceiling())
             .await;

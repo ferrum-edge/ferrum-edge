@@ -8169,3 +8169,135 @@ async fn weaken_strong_etag_refuses_malformed_validators_and_restores_on_abort()
         "the identity body is the origin's bytes, so it gets the origin validator back"
     );
 }
+
+/// Drive an optional `response_transformer` body rule (4000) then
+/// `compression` with `weaken_strong_etag` through `after_proxy` and the shared
+/// buffered body lifecycle, production order, for a strong-`ETag` JSON
+/// response. `None` runs compression alone (the no-rewrite control).
+async fn run_weakening_lifecycle_after_body_rule(
+    body_rule: Option<serde_json::Value>,
+) -> (bool, HashMap<String, String>, bytes::Bytes, RequestContext) {
+    use ferrum_edge::plugins::response_transformer::ResponseTransformer;
+    let compression = Arc::new(make_plugin(json!({
+        "algorithms": ["gzip"],
+        "min_content_length": 0,
+        "weaken_strong_etag": true
+    }))) as Arc<dyn Plugin>;
+    let mut plugins: Vec<Arc<dyn Plugin>> = Vec::new();
+    if let Some(rule) = body_rule {
+        plugins.push(Arc::new(
+            ResponseTransformer::new(&json!({ "rules": [rule] })).expect("valid transformer"),
+        ));
+    }
+    plugins.push(compression);
+
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    for plugin in &plugins {
+        plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    }
+    let original = br#"{"state":"private","note":"origin representation"}"#.to_vec();
+    let mut status = 200u16;
+    let mut headers = json_response_headers(original.len());
+    headers.insert("etag".to_string(), "\"v1\"".to_string());
+    stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
+    for plugin in &plugins {
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, status, &mut headers).await,
+            PluginResult::Continue
+        ));
+    }
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(headers.get("etag").map(String::as_str), Some("W/\"v1\""));
+
+    let mut body = bytes::Bytes::from(original);
+    let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut headers,
+        &mut body,
+        None,
+        false,
+    )
+    .await;
+    (rewritten, headers, body, ctx)
+}
+
+/// PR6848-SOL-1: a semantic body rewrite retires the origin validator, and the
+/// weakening must not resurrect it on the encoded, DIFFERENT document.
+#[tokio::test]
+async fn weaken_strong_etag_does_not_resurrect_a_validator_after_a_semantic_rewrite() {
+    let (rewritten, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(Some(
+        json!({"operation": "update", "target": "body", "key": "state", "value": "public"}),
+    ))
+    .await;
+    assert!(rewritten);
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&gunzip_bytes(&body)).expect("encoded body is the rewritten JSON");
+    assert_eq!(decoded["state"], "public");
+    assert!(
+        headers.keys().all(|key| !key.eq_ignore_ascii_case("etag")),
+        "the origin validator does not describe the rewritten document: {headers:?}"
+    );
+}
+
+/// PR6848-SOL-1 control: with no semantic rewrite, compression alone still
+/// keeps the weak validator through the full lifecycle.
+#[tokio::test]
+async fn weaken_strong_etag_keeps_the_weak_validator_when_no_semantic_rewrite_ran() {
+    let (rewritten, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(None).await;
+    assert!(rewritten, "compression still encoded the body");
+    assert_eq!(headers.get("etag").map(String::as_str), Some("W/\"v1\""));
+    let decoded: serde_json::Value =
+        serde_json::from_slice(&gunzip_bytes(&body)).expect("encoded body is the origin JSON");
+    assert_eq!(decoded["state"], "private");
+}
+
+/// PR6848-SOL-1: an encode abort after a semantic rewrite must not put the
+/// origin's strong validator on the rewritten identity body either.
+#[tokio::test]
+async fn weaken_strong_etag_abort_after_a_semantic_rewrite_does_not_restore_the_origin_validator() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+    with_test_codec_budget(0, || async {
+        let (_, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(Some(
+            json!({"operation": "update", "target": "body", "key": "state", "value": "public"}),
+        ))
+        .await;
+        assert!(
+            !headers.contains_key("content-encoding"),
+            "codec saturation restores the identity representation"
+        );
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&body).expect("identity body is the rewritten JSON");
+        assert_eq!(decoded["state"], "public");
+        assert!(
+            headers.keys().all(|key| !key.eq_ignore_ascii_case("etag")),
+            "the rewritten identity body must not carry the origin validator: {headers:?}"
+        );
+    })
+    .await;
+}
+
+/// PR6848-SOL-1 control: an abort with no semantic rewrite still restores the
+/// origin validator, because the identity body is then the origin's bytes.
+#[tokio::test]
+async fn weaken_strong_etag_abort_without_a_rewrite_restores_the_origin_validator() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+    with_test_codec_budget(0, || async {
+        let (_, headers, body, _ctx) = run_weakening_lifecycle_after_body_rule(None).await;
+        assert!(!headers.contains_key("content-encoding"));
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&body).expect("identity body is the origin JSON");
+        assert_eq!(decoded["state"], "private");
+        assert_eq!(headers.get("etag").map(String::as_str), Some("\"v1\""));
+    })
+    .await;
+}
