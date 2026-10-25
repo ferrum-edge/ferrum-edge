@@ -51,6 +51,13 @@ fn assert_gated_unrouted_delivery(arm: &str, surface: &str, after_head: &str) {
         arm[log..].contains("&state.env_config.namespace,"),
         "{surface}: a route miss is attributed to the serving namespace"
     );
+    // The logging future is boxed so its state never inflates the dispatcher's
+    // request state machine (a debug-build H3 handler overflowed the worker
+    // stack when it was inlined).
+    assert!(
+        arm[gate..log].contains("Box::pin("),
+        "{surface}: the unrouted log future must be boxed"
+    );
 }
 
 #[test]

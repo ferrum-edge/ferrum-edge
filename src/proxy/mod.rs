@@ -35522,13 +35522,15 @@ async fn handle_proxy_request_inner(
                         epoch.plugin_cache.unrouted_transaction_log_plugins()
                     {
                         ctx.materialize_headers();
-                        log_unrouted_request(
+                        // Boxed: keep the logging future's state off the
+                        // request handler's (worker-stack) state machine.
+                        Box::pin(log_unrouted_request(
                             &unrouted_log_plugins,
                             &ctx,
                             &state.env_config.namespace,
                             StatusCode::NOT_FOUND.as_u16(),
                             start_time,
-                        )
+                        ))
                         .await;
                     }
                     return Ok(response);
