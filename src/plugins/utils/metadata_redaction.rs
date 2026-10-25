@@ -188,6 +188,8 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "ai_ratelimit_reserved_tokens",
     "ai_ratelimit_usage",
     "ai_ratelimit_window",
+    "ai_request_guard.action",
+    "ai_request_guard.reason",
     "ai_request_guard.uninspectable_body",
     "ai_request_guard.uninspectable_body_action",
     "ai_request_guard.uninspectable_body_reason",
