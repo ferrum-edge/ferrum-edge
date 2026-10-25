@@ -670,7 +670,7 @@ impl Plugin for SpiffeIdentity {
                 PluginResult::Continue
             }
             PeerSpiffeExtraction::NoSpiffeId => self.on_missing_identity(),
-            PeerSpiffeExtraction::Invalid(reason) => invalid_svid_reject(*reason),
+            PeerSpiffeExtraction::Invalid(reason) => invalid_svid_reject(reason),
             PeerSpiffeExtraction::Unparsed(error) => {
                 debug!(
                     "spiffe_identity: could not parse peer cert for SPIFFE ID: {}",
