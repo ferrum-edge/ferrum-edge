@@ -28,6 +28,24 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ai_prompt_compressor` refuses residual preserve markers (#6854)
+
+With `preserve_tag` configured, the final request-body hook now refuses (`400`)
+an admitted Chat/Text Completions (or fixed-family) JSON `POST` whose final
+string values still contain a configured marker. Check for body transforms
+that run after the compressor (priority 4055), such as a `request_transformer`
+rule with a later `priority_override`, and make sure they never write
+`<TAG>` / `</TAG>` into prompt-bearing values.
+
+Content-coded candidate requests are now buffered and their decoded view is
+verified. An unsupported or malformed `Content-Encoding` on such a request is a
+`400` instead of passthrough. To keep compressing those uploads, configure
+`compression` with `decompress_request: true`. Otherwise make sure clients send
+only `gzip`, `br`, or `identity`.
+
+`compress_roles` now accepts at most 32 entries of at most 64 characters. Trim
+a longer list before upgrading; such a config is rejected at load.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

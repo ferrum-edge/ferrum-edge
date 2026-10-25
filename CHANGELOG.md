@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `ai_prompt_compressor` refuses residual preserve markers and
+  bounds `compress_roles`** (issue #6854). With `preserve_tag` configured, the
+  final request-body hook now re-verifies the exact backend-visible body of
+  candidate JSON `POST`s. An admitted body whose string values still contain a
+  configured marker gets a `400`, for example a marker a later body transform
+  wrote or one that bounded removal could not resolve. Content-coded candidates
+  are now buffered and claimed by the shared request representation gate. Their
+  decoded `gzip`/`br` view is verified the same way, and an unsupported or
+  malformed `Content-Encoding` on such a request is a `400` instead of
+  passthrough. Marker removal now repeats until no marker is synthesized (at
+  most eight passes). `compress_roles` accepts at most 32 entries of at most 64
+  characters. Integer fields now accept integral float spellings such as
+  `200.0`.
+- **`ai_prompt_compressor` budget, observe, sampling, and provider families**
+  (#6854). New optional `target_max_tokens` compresses only requests whose
+  aggregate eligible text exceeds the budget, and only as much as needed.
+  `mode: observe` records would-be savings under
+  `ai_prompt_compressor.observed_*` and forwards the original prompt.
+  `sample_rate` applies statistical work to a deterministic fraction of
+  requests. A skipped compression records
+  `ai_prompt_compressor.instances.<id>.skipped` (`saturated`, `work_limit`, or
+  `not_sampled`). New fixed families `request_family: responses` (OpenAI
+  Responses `instructions` / `input` message text) and `anthropic_messages`
+  (Anthropic `system` / `messages[].content` text blocks); `auto` is
+  unchanged. Bodies too short to reach `min_content_tokens` are skipped before
+  they are copied or parsed.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +165,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`ai_prompt_compressor` no longer drops the word after an uppercase
+  negation, and keeps scope words** (#6854). `NOT`, `NEVER`, `CANNOT`, and
+  `DON'T` / `DON’T` were classified as protected acronyms, so the word they
+  negated could be dropped and the negation re-bound to a later clause
+  (`DO NOT delete. RESTART …` became `DO NOT RESTART …`). They are now critical
+  words that keep their complement. `unless`, `except`, and `only` now keep
+  their complement too, and conditions (`if`, `must`, `before`, `after`,
+  `until`, `exactly`), quantifiers (`all`, `every`, `each`, `any`), and
+  spelled-out numbers are always kept.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
