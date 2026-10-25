@@ -157,22 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`transaction_debugger` emits exactly one body-capture record per
-  direction and classifies pre-header client aborts correctly.** The
-  header-phase and final-body hooks now share a private per-request record
-  flag, so a transform that grows, empties, or relabels a body between them
-  yields one record (for example `over_capture_limit` / `empty_body`) instead
-  of none or two, and a re-invoked final hook is a no-op. A terminal carrying
-  both `client_disconnected` and the `client_disconnect` error class (the 499 /
-  `CANCELLED` pre-header cancellation) now reports
-  `outcome=client_disconnected` rather than `dispatch_error`. The documented
-  built-in redaction inventories now list `last-event-id` and `embeddingkey`.
-  New opt-in options narrow and extend capture: `capture_request_header` /
-  `capture_request_header_value`, `capture_sample_rate`, and
-  `capture_expires_at` target capture (other requests never buffer and report
-  `not_selected` / `capture_expired`), and `capture_body_prefix` renders a
-  redacted prefix of complete lines or pairs for over-cap `text/plain` / form
-  bodies up to 1 MiB.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
@@ -443,15 +427,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`transaction_debugger` redacts credential-shaped values it previously
-  logged.** JWT detection no longer requires a literal `eyJ` prefix: a compact
-  JWS/JWE token is recognized from its base64url-decoded JSON protected
-  header, so a header containing whitespace (`{ "alg": … }`, encoding to
-  `eyAi…`) is redacted in JSON, form, and `text/plain` captures. Captures and
-  the request/response header dumps also redact AWS access key ids,
-  well-known provider API keys (GitHub, GitLab, Slack, `sk-…`, Stripe, Google,
-  npm), and PEM private keys — in `text/plain` every line of a private-key
-  block — whatever field or header carries them.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
