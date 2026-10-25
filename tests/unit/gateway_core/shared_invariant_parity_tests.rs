@@ -1940,6 +1940,7 @@ const EXPECTED_OBJECT_ADMISSION_FIELDS: &[&str] = &[
     "src/modes/mesh/slice.rs:MeshSlice.mesh_policies",
     "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_assertors",
     "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_destinations",
+    "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_mesh_policies",
     "src/modes/mesh/slice.rs:MeshSlice.node_waypoint_capture_peer_authentications",
     "src/modes/mesh/slice.rs:MeshSlice.peer_authentications",
     "src/modes/mesh/slice.rs:MeshSlice.proxy_configs",

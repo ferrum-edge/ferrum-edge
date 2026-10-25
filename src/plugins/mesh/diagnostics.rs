@@ -38,7 +38,7 @@ impl Schema {
 
     fn child(self, field: &str) -> Self {
         match (self, field) {
-            (Self::Slice, "mesh_policies") => Self::Policy,
+            (Self::Slice, "mesh_policies" | "node_waypoint_capture_mesh_policies") => Self::Policy,
             (Self::Slice, "revision") => Self::Fields("authority sequence"),
             (Self::Slice, "service_waypoint_bound_services") => Self::Fields("namespace name"),
             (Self::Slice, "node_waypoint_assertors") => Self::Fields("spiffe_id asserts"),
@@ -220,13 +220,14 @@ const SLICE: &str = "node_id namespace istio_root_namespace workload_spiffe_id w
     waypoint_gateway_class service_waypoint_bound_services labels labels_ambiguous \
     virtual_service_l4_proxies virtual_service_l4_upstreams version revision workloads \
     ambient_udp_source_workloads node_waypoint_assertors node_waypoint_capture_destinations \
-    node_waypoint_capture_peer_authentications services local_inbound_services \
+    node_waypoint_capture_peer_authentications node_waypoint_capture_mesh_policies \
+    node_waypoint_capture_mesh_policies_resolved services local_inbound_services \
     local_inbound_workloads local_ingress_listeners sidecar_ingress_declared \
     declared_ingress_http_ports mesh_policies ext_authz_providers peer_authentications \
     service_entries request_authentications telemetry_resources destination_rules \
     virtual_service_cors_policies proxy_configs trust_bundles multi_cluster \
-    outbound_traffic_policy sidecar_outbound_traffic_policy sidecar_egress_scope \
-    extension_configs runtime_overlay";
+    outbound_traffic_policy sidecar_outbound_traffic_policy sidecar_egress_scope extension_configs \
+    runtime_overlay";
 const WORKLOAD: &str = "spiffe_id selector service_name service_namespace addresses ports \
     trust_domain namespace network cluster weight locality service_account pod_uid \
     node_waypoint";
