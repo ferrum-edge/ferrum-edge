@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `request_deduplication` caps live in-flight markers and moves
+  logical keys to `v7`** (issue #6818). New `max_inflight_entries` (default
+  `max_entries`) is a hard ceiling on live local in-flight markers, counted
+  exactly and reserved by one atomic compare-and-swap. Interrupted streamed
+  responses keep their marker until `inflight_ttl_seconds`, so a client
+  resetting fresh-key requests could previously grow retained markers without
+  bound. A new key past the cap now gets `503` (`Idempotency in-flight
+  capacity is saturated`) and any Redis ownership it acquired is released;
+  tracked keys still replay or conflict, live ownership is never evicted, and
+  execution barriers keep their own `max_entries` budget. A deployment that
+  set a small `max_entries` for completed retention but runs more concurrent
+  idempotent requests than that must raise `max_inflight_entries`. Logical
+  keys move from `v6:` to `v7:` (`ferrum-dedup-logical-v7`): entries keyed
+  under `v6` are not reachable after the upgrade.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -145,21 +159,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     that policy used to address a fresh key, so an identical retry of a
     completed payment executed again within its TTL. The policy is now bound
     into the request fingerprint: an unchanged policy replays, a changed one
-    returns `409`. Logical keys move to `v7:` (`ferrum-dedup-logical-v7`);
-    entries keyed under `v6` are not reachable.
-  - New `max_inflight_entries` (default `max_entries`) hard-caps live local
-    in-flight markers. Interrupted streamed responses keep their marker until
-    `inflight_ttl_seconds`, so a client resetting fresh-key requests could grow
-    retained markers without bound. A new key past the cap now gets `503`
-    (any Redis ownership it acquired is released); tracked keys still replay
-    or conflict, and live ownership is never evicted.
+    returns `409`. The logical-key version change is listed under Changed.
   - New opt-in `caller_partition: authenticated_identity`. When the gateway
     verified a principal (a Consumer, a peer SPIFFE identity, or an external
     identity committed with its realm), the key binds that principal instead
-    of credential digests and the peer address, and the fingerprint binds
-    credential-header presence rather than values. A retry after a token
-    refresh, a per-request signature, or an address change then replays. The
-    default `credential` partition is unchanged.
+    of credential digests and the peer address. The fingerprint binds only the
+    presence, not the value, of credential headers, gateway-captured
+    credential query parameters, and the signature-context headers `date`,
+    `x-amz-date`, `x-amz-content-sha256`, `digest` and `content-digest`. A
+    retry after a token refresh, an `hmac_auth`/SigV4 re-signature, or an
+    address change then replays. The default `credential` partition is
+    unchanged.
   - Case-variant spellings of the idempotency header with different values,
     or of the authority/framing/coding headers the fingerprint reads, are
     refused with `400` instead of being resolved by map iteration order.

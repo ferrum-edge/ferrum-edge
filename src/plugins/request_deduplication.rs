@@ -236,6 +236,22 @@ const FINGERPRINT_LOOKUP_HEADERS: [&str; FINGERPRINT_LOOKUP_HEADER_COUNT] = [
     "content-length",
     "transfer-encoding",
 ];
+/// Signature-context headers a re-signed retry regenerates even though the
+/// operation is unchanged: the HTTP `Date` that `hmac_auth` signs and checks
+/// for freshness, AWS SigV4's `x-amz-date` and `x-amz-content-sha256`, and the
+/// body-digest fields (`digest`, `content-digest`) that `hmac_auth` signs.
+/// Only under `caller_partition: authenticated_identity` with a verified
+/// principal are these presence-bound in the fingerprint; the request body is
+/// still bound through its own digest, so a digest header adds nothing a
+/// changed body would not already change. Everywhere else they stay
+/// value-bound. Names are lowercase, as the fingerprint header list is.
+const PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS: &[&str] = &[
+    "content-digest",
+    "date",
+    "digest",
+    "x-amz-content-sha256",
+    "x-amz-date",
+];
 const HOP_BY_HOP_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "connection",
     "content-encoding",
@@ -1004,6 +1020,13 @@ pub(crate) struct RequestDeduplicationLocalState {
     completed_count: AtomicUsize,
     completed_size_bytes: AtomicUsize,
     inflight_count: AtomicUsize,
+    /// Exact number of `DeduplicationEntry::InFlight` entries: live markers
+    /// only, never execution barriers. This is the single admission counter
+    /// for `max_inflight_entries`; every transition into the `InFlight`
+    /// variant reserves through one CAS on it and every transition out of the
+    /// variant releases it, so the ceiling never depends on sampling a second
+    /// atomic.
+    live_inflight_count: AtomicUsize,
     /// Number of explicit per-key execution barriers. Unlike active in-flight
     /// work, this durable security state is hard-capped at `max_entries`.
     execution_barrier_count: AtomicUsize,
@@ -1032,6 +1055,7 @@ impl RequestDeduplicationLocalState {
             completed_count: AtomicUsize::new(0),
             completed_size_bytes: AtomicUsize::new(0),
             inflight_count: AtomicUsize::new(0),
+            live_inflight_count: AtomicUsize::new(0),
             execution_barrier_count: AtomicUsize::new(0),
             execution_barrier_overflow_until_ms: AtomicU64::new(0),
             local_inflight_sequence: AtomicU64::new(0),
@@ -1403,34 +1427,32 @@ impl RequestDeduplication {
         decrement_atomic(&self.local.execution_barrier_count);
     }
 
-    /// Reserve one live in-flight slot for a key that is not yet counted.
+    /// Reserve one live in-flight slot through a single CAS on
+    /// `live_inflight_count`.
     ///
-    /// `inflight_count` covers live markers and execution barriers alike;
-    /// barriers have their own `max_entries` cap, so only the live share is
-    /// held to `max_inflight_entries`. The compare-and-swap is the admission
-    /// point, taken before the entry is inserted, so concurrent new keys can
-    /// never overshoot the ceiling between check and insert. Without it an
-    /// interrupted streamed response leaves its marker until
-    /// `inflight_ttl_seconds`, and a client resetting fresh-key requests could
+    /// Called on every transition INTO the `InFlight` variant that is not
+    /// already a live marker: a vacant key, an expired completion, and an
+    /// expired execution barrier. Execution barriers are counted separately
+    /// (`execution_barrier_count`, capped by `max_entries`), so the admission
+    /// decision reads exactly one counter and concurrent admissions and
+    /// conversions can never both take the last slot. `try_update` retries the
+    /// CAS on contention and fails only when the closure refuses. Without this
+    /// ceiling an interrupted streamed response keeps its marker until
+    /// `inflight_ttl_seconds`, so a client resetting fresh-key requests could
     /// grow retained markers far beyond any live-connection count.
-    fn try_reserve_inflight_slot(&self) -> bool {
-        let barriers = self.local.execution_barrier_count.load(Ordering::Relaxed);
-        let limit = self.max_inflight_entries.saturating_add(barriers);
+    fn try_reserve_live_inflight_slot(&self) -> bool {
         self.local
-            .inflight_count
+            .live_inflight_count
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current < limit).then_some(current + 1)
+                (current < self.max_inflight_entries).then_some(current + 1)
             })
             .is_ok()
     }
 
-    /// Whether an expired execution barrier, which is already counted in
-    /// `inflight_count`, may turn into a live in-flight marker without the live
-    /// share exceeding `max_inflight_entries`.
-    fn converted_inflight_slot_within_capacity(&self) -> bool {
-        let current = self.local.inflight_count.load(Ordering::Relaxed);
-        let barriers = self.local.execution_barrier_count.load(Ordering::Relaxed);
-        current.saturating_sub(barriers) < self.max_inflight_entries
+    /// Release one live slot on a transition OUT of the `InFlight` variant
+    /// (removal, publication to a completion, or conversion to a barrier).
+    fn release_live_inflight_slot(&self) {
+        decrement_atomic(&self.local.live_inflight_count);
     }
 
     /// Whether this request's caller dimension is the verified principal
@@ -1524,6 +1546,11 @@ impl RequestDeduplication {
     #[allow(dead_code)]
     pub(crate) fn inflight_count_snapshot_for_tests(&self) -> usize {
         self.local.inflight_count.load(Ordering::Relaxed)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn live_inflight_count_snapshot_for_tests(&self) -> usize {
+        self.local.live_inflight_count.load(Ordering::Relaxed)
     }
 
     /// Whether this instance's Redis client demands the no-eviction retention
@@ -1800,12 +1827,22 @@ impl RequestDeduplication {
         // so bind the published outbound query when one exists. Falling back
         // to the raw wire query preserves synthetic/direct test contexts and
         // requests whose query was not transformed.
-        hasher.text(
-            "query",
-            ctx.outbound_query_string()
-                .or_else(|| ctx.raw_query_string())
-                .unwrap_or(""),
-        );
+        let query = ctx
+            .outbound_query_string()
+            .or_else(|| ctx.raw_query_string())
+            .unwrap_or("");
+        // Under the opt-in principal partition a credential carried in a
+        // configured query location (`jwt_auth` `token_lookup: query:<name>`,
+        // `key_auth` query keys, ...) is presence-bound like a credential
+        // header, using the gateway-captured private inventory of present
+        // credential query parameters. Every other query pair stays bound
+        // verbatim, and the default credential partition is unchanged.
+        let query_credentials = ctx.query_credential_partition_digests();
+        if principal_scoped && !query_credentials.is_empty() {
+            append_principal_scoped_query(&mut hasher, query, query_credentials);
+        } else {
+            hasher.text("query", query);
+        }
         // The fingerprint must also witness the effective destination: a
         // header-selected route rewrite changes what the backend would do with
         // an otherwise identical request, and a conflicting fingerprint is what
@@ -1823,20 +1860,24 @@ impl RequestDeduplication {
         // Under the opt-in principal partition the credential bytes are the
         // one thing a same-principal retry is expected to change (a refreshed
         // token, a per-request signature), so only their presence is bound;
-        // the verified principal itself is already in the logical key.
+        // the verified principal itself is already in the logical key. The
+        // same applies to the signature-context headers a re-signed retry
+        // regenerates (`PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS`).
         let mut fields = request_headers_for_fingerprint(headers, &self.header_name);
         hasher.count("headers", fields.len());
         for (header_name, value) in fields.drain(..) {
             hasher.text("header_name", &header_name);
-            if replay_partition::is_request_credential_context_header(ctx, &header_name) {
-                if principal_scoped {
-                    hasher.bool_value("header_value_principal_scoped", true);
-                } else {
-                    hasher.nested(
-                        "header_value_digest",
-                        &replay_partition::value_digest(value),
-                    );
-                }
+            let credential =
+                replay_partition::is_request_credential_context_header(ctx, &header_name);
+            if principal_scoped
+                && (credential || is_principal_scoped_signature_context_header(&header_name))
+            {
+                hasher.bool_value("header_value_principal_scoped", true);
+            } else if credential {
+                hasher.nested(
+                    "header_value_digest",
+                    &replay_partition::value_digest(value),
+                );
             } else {
                 hasher.text("header_value", value);
             }
@@ -1860,7 +1901,7 @@ impl RequestDeduplication {
         match self.local.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
                 // Reserve before inserting, while the shard entry is held.
-                if !self.try_reserve_inflight_slot() {
+                if !self.try_reserve_live_inflight_slot() {
                     return LocalDeduplicationAction::CapacityExhausted;
                 }
                 entry.insert(DeduplicationEntry::InFlight {
@@ -1869,6 +1910,7 @@ impl RequestDeduplication {
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
+                self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => {
@@ -1985,7 +2027,7 @@ impl RequestDeduplication {
         let _guard = self.accounting_guard();
         match self.local.local_cache.entry(key.to_string()) {
             Entry::Vacant(entry) => {
-                if !self.try_reserve_inflight_slot() {
+                if !self.try_reserve_live_inflight_slot() {
                     return LocalDeduplicationAction::CapacityExhausted;
                 }
                 entry.insert(DeduplicationEntry::InFlight {
@@ -1994,6 +2036,7 @@ impl RequestDeduplication {
                     fingerprint: fingerprint.to_string(),
                     owner_token: owner_token.to_string(),
                 });
+                self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                 LocalDeduplicationAction::Fresh
             }
             Entry::Occupied(mut entry) => match entry.get() {
@@ -2014,7 +2057,7 @@ impl RequestDeduplication {
                         } else {
                             LocalDeduplicationAction::Replay(cached.clone())
                         }
-                    } else if !self.try_reserve_inflight_slot() {
+                    } else if !self.try_reserve_live_inflight_slot() {
                         // The expired completion stays for the cleanup scan;
                         // nothing is admitted without a live slot.
                         LocalDeduplicationAction::CapacityExhausted
@@ -2023,6 +2066,7 @@ impl RequestDeduplication {
                         self.mark_completed_sequence_pruned(*sequence);
                         self.sub_completed_size_locked(retained_size);
                         decrement_atomic(&self.local.completed_count);
+                        self.local.inflight_count.fetch_add(1, Ordering::Relaxed);
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
                             retention: self.inflight_ttl,
@@ -2046,9 +2090,10 @@ impl RequestDeduplication {
                                 DeduplicationConflict::FingerprintMismatch,
                             )
                         }
-                    } else if !self.converted_inflight_slot_within_capacity() {
-                        // Already counted, but as a barrier: turning it into a
-                        // live marker must still fit the live budget.
+                    } else if !self.try_reserve_live_inflight_slot() {
+                        // Counted as a barrier, not as a live marker: turning
+                        // it into one reserves through the same CAS as any
+                        // other admission.
                         LocalDeduplicationAction::CapacityExhausted
                     } else {
                         // A barrier is accounted with the in-flight/fixed-state
@@ -2582,7 +2627,10 @@ impl RequestDeduplication {
                     } if current == fingerprint && current_owner_token == owner_token
                 )
             })
-            .map(|_| decrement_atomic(&self.local.inflight_count))
+            .map(|_| {
+                self.release_live_inflight_slot();
+                decrement_atomic(&self.local.inflight_count)
+            })
     }
 
     /// Remove only the execution barrier published by this exact local owner.
@@ -2730,6 +2778,9 @@ impl RequestDeduplication {
                         fingerprint: fingerprint.to_string(),
                         owner_token: owner_token.to_string(),
                     });
+                    // InFlight -> barrier: the live slot moves to the
+                    // separately capped barrier budget.
+                    self.release_live_inflight_slot();
                 } else {
                     self.extend_execution_barrier_overflow(
                         inserted_at,
@@ -2739,6 +2790,7 @@ impl RequestDeduplication {
                 self.local.inflight_count.load(Ordering::Relaxed)
             } else {
                 entry.remove();
+                self.release_live_inflight_slot();
                 decrement_atomic(&self.local.inflight_count)
             };
             return LocalCompletionAction::Skipped {
@@ -2759,6 +2811,7 @@ impl RequestDeduplication {
                         fingerprint: fingerprint.to_string(),
                         owner_token: owner_token.to_string(),
                     });
+                    self.release_live_inflight_slot();
                 } else {
                     self.extend_execution_barrier_overflow(
                         inserted_at,
@@ -2778,6 +2831,7 @@ impl RequestDeduplication {
             } else {
                 if !publish_execution_barrier_on_skip {
                     entry.remove();
+                    self.release_live_inflight_slot();
                 }
                 None
             };
@@ -2829,7 +2883,11 @@ impl RequestDeduplication {
             cached: redis_copy,
             sequence,
             completed_count: self.local.completed_count.fetch_add(1, Ordering::Relaxed) + 1,
-            inflight_count: decrement_atomic(&self.local.inflight_count),
+            inflight_count: {
+                // InFlight -> Completed releases the live slot.
+                self.release_live_inflight_slot();
+                decrement_atomic(&self.local.inflight_count)
+            },
         }
     }
 
@@ -2949,6 +3007,7 @@ impl RequestDeduplication {
             } => {
                 let keep = now.duration_since(*started_at) < *retention;
                 if !keep {
+                    self.release_live_inflight_slot();
                     decrement_atomic(&self.local.inflight_count);
                 }
                 keep
@@ -3468,6 +3527,40 @@ fn unambiguous_header_value<'a>(
         }
     }
     Ok(found)
+}
+
+/// Whether `name` (already lowercased) is one of the
+/// [`PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS`].
+fn is_principal_scoped_signature_context_header(name: &str) -> bool {
+    PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS.contains(&name)
+}
+
+/// Bind the fingerprint query under the principal partition: credential
+/// parameters named in the gateway-captured inventory contribute only their
+/// raw name, every other pair is bound verbatim, and pair order and count are
+/// framed. Names are compared after `application/x-www-form-urlencoded`
+/// decoding, the form the authentication plugins captured; a pair whose name
+/// does not decode to an inventoried credential stays value-bound, which can
+/// only cost a conflict, never a replay across a non-credential difference.
+fn append_principal_scoped_query(
+    hasher: &mut PartitionHasher,
+    query: &str,
+    credentials: &[(String, [u8; 32])],
+) {
+    hasher.bool_value("query_principal_scoped", true);
+    let pairs = query.split('&').filter(|pair| !pair.is_empty());
+    hasher.count("query_pairs", pairs.clone().count());
+    for pair in pairs {
+        let is_credential = url::form_urlencoded::parse(pair.as_bytes())
+            .next()
+            .is_some_and(|(name, _)| credentials.iter().any(|(known, _)| name == known.as_str()));
+        if is_credential {
+            let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+            hasher.text("query_credential_name", raw_name);
+        } else {
+            hasher.text("query_pair", pair);
+        }
+    }
 }
 
 /// Whether every [`FINGERPRINT_LOOKUP_HEADERS`] name resolves to at most one

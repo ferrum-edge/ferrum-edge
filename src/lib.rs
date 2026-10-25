@@ -4095,6 +4095,22 @@ pub mod _test_support {
         plugin.inflight_count_snapshot_for_tests()
     }
 
+    /// Record a present credential query parameter exactly as an
+    /// authentication plugin's `mark_query_credentials_for_redaction` hook does
+    /// (`jwt_auth` `token_lookup: query:<name>`, `key_auth` query keys). The
+    /// value is read from `ctx.query_params`.
+    pub fn mark_query_credential_for_test(ctx: &mut crate::plugins::RequestContext, name: &str) {
+        crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+    }
+
+    /// Exact live in-flight marker count (execution barriers excluded): the
+    /// `max_inflight_entries` admission counter.
+    pub fn request_deduplication_live_inflight_count_snapshot_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> usize {
+        plugin.live_inflight_count_snapshot_for_tests()
+    }
+
     /// Whether a constructed `request_deduplication` instance's Redis client
     /// requires the no-eviction retention screen (`None` in local mode).
     pub fn request_deduplication_redis_requires_no_eviction_for_test(

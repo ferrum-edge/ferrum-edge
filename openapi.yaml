@@ -39887,7 +39887,7 @@ components:
           type: integer
           minimum: 1
           maximum: 18446744073709551615
-          description: Hard ceiling on live local in-flight markers per policy identity — requests currently executing plus interrupted or ambiguous requests (for example a client that reset a streamed response) whose markers are retained until inflight_ttl_seconds. Defaults to max_entries when omitted. A request with a new idempotency key that cannot reserve a slot is refused with 503 and any Redis ownership it acquired is released; requests for keys that are already tracked still replay or conflict, and live ownership is never evicted to admit new work. Execution barriers are bounded separately by max_entries. Must be greater than zero and representable as an unsigned 64-bit integer.
+          description: Hard ceiling on live local in-flight markers per policy identity, counted exactly and reserved by a single atomic compare-and-swap — requests currently executing plus interrupted or ambiguous requests (for example a client that reset a streamed response) whose markers are retained until inflight_ttl_seconds. Defaults to max_entries when omitted. A request with a new idempotency key that cannot reserve a slot is refused with 503 and any Redis ownership it acquired is released; requests for keys that are already tracked still replay or conflict, and live ownership is never evicted to admit new work. Execution barriers are bounded separately by max_entries. Must be greater than zero and representable as an unsigned 64-bit integer.
         max_entry_size_bytes:
           type: integer
           minimum: 1
@@ -39936,7 +39936,12 @@ components:
             the authentication boundary) the key binds that principal only —
             no credential digests and no peer address — and the request
             fingerprint binds the presence but not the values of credential
-            headers. Two credentials of one principal with different scopes
+            headers, of credential query parameters an authentication plugin
+            captured from its configured query location, and of the
+            signature-context headers `date`, `x-amz-date`,
+            `x-amz-content-sha256`, `digest`, and `content-digest` that an
+            hmac_auth or SigV4 re-signature regenerates; every other header and
+            query pair stays value-bound. Two credentials of one principal with different scopes
             then share an operation, so scope-level distinction rests on the
             authorization plugins that ran before deduplication. Requests
             without a verified principal fall back to `credential`. The mode is

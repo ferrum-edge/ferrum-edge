@@ -2,11 +2,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     finalize_plugin_rejection_for_test, finalize_plugin_rejection_without_committed_hooks_for_test,
-    finalized_response_replay_for_test, request_deduplication_completed_size_snapshot_for_test,
+    finalized_response_replay_for_test, mark_query_credential_for_test,
+    request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_execution_barriers_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_inflight_count_snapshot_for_test,
+    request_deduplication_live_inflight_count_snapshot_for_test,
     request_deduplication_logical_keys_from_context_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test,
@@ -5444,6 +5446,133 @@ async fn new_keys_are_refused_once_live_inflight_capacity_is_saturated() {
     );
 }
 
+/// PR6818-SOL-1: the live ceiling is enforced by one CAS on one exact counter,
+/// so many distinct new keys racing on separate workers admit exactly the
+/// ceiling, refuse the rest, and return the counter to zero once released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_new_keys_admit_exactly_the_live_inflight_ceiling() {
+    const CEILING: usize = 4;
+    const CONTENDERS: usize = 32;
+    let plugin = Arc::new(make_plugin(json!({ "max_inflight_entries": CEILING })));
+    let start = Arc::new(Barrier::new(CONTENDERS));
+    let mut tasks = Vec::with_capacity(CONTENDERS);
+    for index in 0..CONTENDERS {
+        let plugin = Arc::clone(&plugin);
+        let start = Arc::clone(&start);
+        tasks.push(tokio::spawn(async move {
+            let mut ctx = new_ctx("POST", "/concurrent");
+            let mut headers =
+                HashMap::from([("idempotency-key".to_string(), format!("concurrent-{index}"))]);
+            start.wait().await;
+            let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+            let admitted = match result {
+                PluginResult::Continue => true,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ref body,
+                    ..
+                } if body.contains("in-flight capacity") => false,
+                other => panic!("unexpected admission result: {other:?}"),
+            };
+            (admitted, ctx)
+        }));
+    }
+
+    let mut admitted = Vec::new();
+    let mut refused = 0usize;
+    for task in tasks {
+        let (was_admitted, ctx) = task.await.expect("admission task");
+        if was_admitted {
+            admitted.push(ctx);
+        } else {
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        admitted.len(),
+        CEILING,
+        "exactly the ceiling must be admitted"
+    );
+    assert_eq!(refused, CONTENDERS - CEILING);
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        CEILING
+    );
+
+    for mut ctx in admitted {
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(1))
+            .await;
+    }
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        0,
+        "every release must return its slot exactly"
+    );
+}
+
+/// Execution barriers have their own `max_entries` budget: converting an
+/// owner's marker into a barrier frees its live slot for new work.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn execution_barriers_do_not_consume_live_inflight_slots() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 60,
+        "max_inflight_entries": 1,
+        "max_entry_size_bytes": 1
+    }));
+
+    let mut owner = new_ctx("POST", "/api");
+    let mut owner_headers =
+        HashMap::from([("idempotency-key".to_string(), "barrier-owner".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+    owner.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut owner, 200, &HashMap::new(), b"done")
+        .await;
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        0,
+        "the barrier must not hold a live slot"
+    );
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        1
+    );
+
+    let mut fresh = new_ctx("POST", "/api");
+    let mut fresh_headers =
+        HashMap::from([("idempotency-key".to_string(), "after-barrier".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut fresh, &mut fresh_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        1
+    );
+
+    let mut duplicate = new_ctx("POST", "/api");
+    let mut duplicate_headers =
+        HashMap::from([("idempotency-key".to_string(), "barrier-owner".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut duplicate, &mut duplicate_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+}
+
 /// A clean completion frees its live slot immediately, so the ceiling bounds
 /// concurrent and retained markers rather than throughput.
 #[tokio::test]
@@ -7231,6 +7360,123 @@ async fn credential_partition_remains_default_and_fallback() {
             PluginResult::Continue
         ),
         "without a verified principal the opt-in must fall back to the credential partition"
+    );
+}
+
+/// A verified-principal request whose credential is carried in a configured
+/// query location, as `jwt_auth` `token_lookup: query:access_token` marks it.
+fn query_principal_ctx(
+    key: &str,
+    consumer: &Arc<ferrum_edge::config::types::Consumer>,
+    token: &str,
+    amount: u32,
+) -> RequestContext {
+    let mut ctx = dedup_ctx("127.0.0.1", key);
+    ctx.identified_consumer = Some(Arc::clone(consumer));
+    ctx.auth_method = Some("jwt_auth");
+    ctx.set_raw_query_string(format!("access_token={token}&amount={amount}"));
+    ctx.query_params
+        .insert("access_token".to_string(), token.to_string());
+    ctx.query_params
+        .insert("amount".to_string(), amount.to_string());
+    mark_query_credential_for_test(&mut ctx, "access_token");
+    ctx
+}
+
+/// PR6818-SOL-2: a refreshed query-parameter credential of the same verified
+/// principal replays under `caller_partition: authenticated_identity`, while a
+/// changed non-credential query pair still conflicts and another principal
+/// stays isolated.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_presence_binds_query_credentials() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let mut original = query_principal_ctx("query-rotation", &alice, "jwt-a", 100);
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"query-created").await,
+        PluginResult::Continue
+    ));
+
+    let mut refreshed = query_principal_ctx("query-rotation", &alice, "jwt-b", 100);
+    let mut refreshed_headers = refreshed.headers.clone();
+    match plugin
+        .before_proxy(&mut refreshed, &mut refreshed_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"query-created"),
+        other => panic!("a refreshed query credential must replay: {other:?}"),
+    }
+
+    let mut changed = query_principal_ctx("query-rotation", &alice, "jwt-b", 200);
+    let mut changed_headers = changed.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut changed, &mut changed_headers)
+            .await,
+    );
+
+    let bob = consumer_principal("consumer-bob", "bob");
+    let mut other = query_principal_ctx("query-rotation", &bob, "jwt-a", 100);
+    let mut other_headers = other.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+/// PR6818-MUSE-2: a re-signed retry (fresh `Authorization` signature, `Date`,
+/// `x-amz-date`, and `x-amz-content-sha256`) of the same verified principal
+/// replays under the opt-in, while any other changed header still conflicts.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_presence_binds_signature_context_headers() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let alice = consumer_principal("consumer-alice", "alice");
+    let signed = |signature: &str, date: &str, tenant: &str| {
+        let mut ctx = principal_ctx("127.0.0.1", "signed-order", Some(&alice), signature);
+        for (name, value) in [
+            ("date", date),
+            ("x-amz-date", date),
+            ("x-amz-content-sha256", signature),
+            ("x-tenant", tenant),
+        ] {
+            ctx.headers.insert(name.to_string(), value.to_string());
+        }
+        ctx
+    };
+
+    let mut original = signed("sig-1", "Mon, 05 Oct 2026 10:00:00 GMT", "acme");
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"signed-created").await,
+        PluginResult::Continue
+    ));
+
+    let mut resigned = signed("sig-2", "Mon, 05 Oct 2026 10:00:07 GMT", "acme");
+    let mut resigned_headers = resigned.headers.clone();
+    match plugin
+        .before_proxy(&mut resigned, &mut resigned_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"signed-created"),
+        other => panic!("a re-signed retry of the same principal must replay: {other:?}"),
+    }
+
+    let mut other_tenant = signed("sig-3", "Mon, 05 Oct 2026 10:00:09 GMT", "globex");
+    let mut other_tenant_headers = other_tenant.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut other_tenant, &mut other_tenant_headers)
+            .await,
     );
 }
 
