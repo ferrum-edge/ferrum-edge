@@ -640,6 +640,9 @@ fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
     registry.configure(60, 3600, 0, 10_000, "contract-ns");
     registry.record(&make_summary("contract-proxy"));
+    for decision in ferrum_edge::plugins::prometheus_metrics::AdaptiveConcurrencyDecision::ALL {
+        registry.record_adaptive_concurrency_decision("contract-proxy", decision);
+    }
     let mut grpc_summary = make_summary("contract-grpc-proxy");
     grpc_summary
         .metadata

@@ -19313,6 +19313,7 @@ components:
         - caches
         - consumer_index
         - rate_limiting
+        - adaptive_concurrency
         - tcp_connection_throttle
       properties:
         gateway:
@@ -19337,6 +19338,8 @@ components:
           $ref: "#/components/schemas/AdminMetricsConsumerIndex"
         rate_limiting:
           $ref: "#/components/schemas/AdminMetricsRateLimiting"
+        adaptive_concurrency:
+          $ref: "#/components/schemas/AdminMetricsAdaptiveConcurrency"
         tcp_connection_throttle:
           $ref: "#/components/schemas/AdminMetricsTcpConnectionThrottle"
         database_polling:
@@ -19731,6 +19734,40 @@ components:
           description: |
             Total number of rate-limit keys currently tracked across all
             rate_limiting plugin instances (deduplicated by plugin identity)
+
+    AdminMetricsAdaptiveConcurrency:
+      type: object
+      additionalProperties: false
+      description: |
+        Live `adaptive_concurrency` limiter state across every policy (one per
+        namespace + plugin-config id), summed at read time from each policy's
+        active tracking space. Per-target values are not listed, so the
+        response size does not grow with `max_tracked_keys`. Untracked
+        admissions beyond the key cap and permits still finishing against a
+        structurally retired tracking space are not included. Shed, shadow
+        would-reject, and key-cap bypass decisions are counted by the
+        `ferrum_adaptive_concurrency_decisions_total` Prometheus family.
+      required: [policy_count, tracked_target_count, limit_total, in_flight_total]
+      properties:
+        policy_count:
+          type: integer
+          minimum: 0
+          description: Live adaptive_concurrency policies.
+        tracked_target_count:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Backend target keys tracked across those policies.
+        limit_total:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Sum of the tracked targets' current adaptive limits.
+        in_flight_total:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Sum of the tracked targets' current in-flight admissions.
 
     AdminMetricsTcpConnectionThrottle:
       type: object
@@ -30680,7 +30717,7 @@ components:
         shadow_mode:
           type: boolean
           default: false
-          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space.
+          description: Learn and expose state without rejecting requests when the current in-flight count is at or above the limit; each such admission is counted as `would_reject` on `ferrum_adaptive_concurrency_decisions_total`. Retired cache/load-balancer views and requests crossing a structural generation handoff still fail closed so they cannot repopulate the replacement tracking space.
         expose_headers:
           type: boolean
           default: false

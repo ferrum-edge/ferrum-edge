@@ -2528,6 +2528,7 @@ Returns (abridged; cached for 5 seconds):
   "caches": { ... },
   "consumer_index": { ... },
   "rate_limiting": { ... },
+  "adaptive_concurrency": { ... },
   "tcp_connection_throttle": { ... }
 }
 ```

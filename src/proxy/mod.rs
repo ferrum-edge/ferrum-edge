@@ -17389,6 +17389,18 @@ async fn handle_websocket_request_authenticated(
                     reason,
                     "Rejecting WebSocket upgrade: invalid backend permessage-deflate answer"
                 );
+                // The backend answered the upgrade with an extension response
+                // the gateway cannot honor: a backend protocol fault. Settle the
+                // admission permit as a failure before it drops, so the adaptive
+                // limiter backs off instead of silently releasing the slot.
+                if let Some(permits) = backend_admission_permits.as_ref() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error: false,
+                        error_class: Some(retry::ErrorClass::ProtocolError),
+                        backend_elapsed: backend_admission_start.elapsed(),
+                    });
+                }
                 log_rejected_request_with_path(
                     &plugins,
                     &ctx,
@@ -43157,6 +43169,12 @@ async fn handle_proxy_request_inner(
     // Assigned on every continuing dispatch path before first read; leave
     // uninitialized so an unused starter `None` cannot trip `-D warnings`.
     let passthrough_request_bytes_latch: Option<Arc<body::DirectH2BytesLatch>>;
+    // Direct-H2 withholds early backend response headers until the client
+    // upload reaches a terminal size/authorization decision. That wait belongs
+    // to the client, so it is carried out of the dispatcher together with the
+    // attempt start it was measured under and excluded from the adaptive
+    // sample below. Assigned on every continuing dispatch path, like the latch.
+    let direct_h2_client_upload_gate: (Instant, Duration);
     // Set when the retry loop breaks on a gateway-synthesized dispatch refusal
     // for a ROTATED candidate that was never dialed (mesh-transport / secured
     // transport screens). `final_upstream_target` deliberately points at that
@@ -43293,11 +43311,14 @@ async fn handle_proxy_request_inner(
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: mesh_read_timeout_ms,
                 passthrough_request_bytes,
+                client_upload_gate_wait,
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = mesh_read_timeout_ms;
                 passthrough_request_bytes_latch = passthrough_request_bytes;
+                direct_h2_client_upload_gate =
+                    (backend_admission_started_at, client_upload_gate_wait);
                 let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
@@ -44143,12 +44164,15 @@ async fn handle_proxy_request_inner(
                 request_body_exceeded,
                 streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
                 passthrough_request_bytes,
+                client_upload_gate_wait,
                 ..
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
                 streaming_h2_read_timeout_ms = effective_streaming_h2_read_timeout_ms;
                 passthrough_request_bytes_latch = passthrough_request_bytes;
+                direct_h2_client_upload_gate =
+                    (backend_admission_started_at, client_upload_gate_wait);
                 let mut response = *response;
                 if charge_generic_grpc_route_attempt_budget_expiry(
                     &ctx,
@@ -44660,7 +44684,19 @@ async fn handle_proxy_request_inner(
     let backend_admission_response_status = recorded_backend_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
-    let backend_admission_elapsed = final_backend_dispatch_elapsed;
+    // Only the attempt that measured the direct-H2 upload gate subtracts it: a
+    // retry resets `backend_admission_started_at`, so a stale gate never
+    // shortens another attempt's sample. Streamed responses therefore sample
+    // response-header arrival (TTFB) and buffered ones the backend round trip,
+    // never the client's upload time (`docs/plugins.md`).
+    let backend_admission_elapsed = {
+        let (gate_attempt_started_at, gate_wait) = direct_h2_client_upload_gate;
+        if gate_attempt_started_at == backend_admission_started_at {
+            final_backend_dispatch_elapsed.saturating_sub(gate_wait)
+        } else {
+            final_backend_dispatch_elapsed
+        }
+    };
     let mut is_streaming_response = matches!(
         &response_body,
         ResponseBody::Streaming { .. }
@@ -48935,6 +48971,11 @@ enum BackendDispatchResult {
         /// Join for unlimited direct-H2 passthrough byte publication. `None`
         /// on every other dispatch (reqwest, limited H2, mesh, H3).
         passthrough_request_bytes: Option<Arc<body::DirectH2BytesLatch>>,
+        /// Time the direct-H2 dispatcher held already-received backend response
+        /// headers while waiting for the client upload to finish. Client time,
+        /// excluded from the adaptive-concurrency latency sample. `ZERO` on
+        /// every other dispatch.
+        client_upload_gate_wait: Duration,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
@@ -49036,6 +49077,7 @@ fn backend_dispatch_response(
         request_body_exceeded: None,
         streaming_h2_read_timeout_ms: None,
         passthrough_request_bytes: None,
+        client_upload_gate_wait: Duration::ZERO,
     }
 }
 
@@ -50280,6 +50322,7 @@ async fn proxy_to_backend(
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
 
@@ -50358,6 +50401,7 @@ async fn proxy_to_backend(
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
 
@@ -50495,6 +50539,7 @@ async fn proxy_to_backend(
             request_body_exceeded,
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
 
@@ -50873,6 +50918,7 @@ async fn proxy_to_backend(
                     }
                 };
                 let mut passthrough_request_bytes = None;
+                let mut client_upload_gate_wait = Duration::ZERO;
                 let (backend_resp, request_body_exceeded) = construct_proxy_future(|| {
                     proxy_to_backend_http2(
                         state,
@@ -50894,6 +50940,7 @@ async fn proxy_to_backend(
                         route_request_body_limit,
                         route_response_body_limit,
                         &mut passthrough_request_bytes,
+                        &mut client_upload_gate_wait,
                     )
                 })
                 .await;
@@ -50904,6 +50951,7 @@ async fn proxy_to_backend(
                     request_body_exceeded,
                     streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
                     passthrough_request_bytes,
+                    client_upload_gate_wait,
                 };
             }
             // Fall through to the reqwest path: `h2_admission_permits` drops here,
@@ -53649,6 +53697,7 @@ async fn proxy_to_backend_direct_h1(
             request_body_exceeded: Some(body_size_exceeded),
             streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
             passthrough_request_bytes: None,
+            client_upload_gate_wait: Duration::ZERO,
         };
     }
     let collected = match collect_response_under_authorization(
@@ -56881,6 +56930,7 @@ fn route_deadline_dispatch_result(
         request_body_exceeded: None,
         streaming_h2_read_timeout_ms: None,
         passthrough_request_bytes: None,
+        client_upload_gate_wait: Duration::ZERO,
     }
 }
 
@@ -63158,6 +63208,10 @@ async fn proxy_to_backend_http2(
     // unlimited arm so transaction summaries can wait for forwarded bytes
     // after an early backend response without gating those headers here.
     passthrough_request_bytes: &mut Option<Arc<body::DirectH2BytesLatch>>,
+    // Out-parameter: how long already-received response headers were withheld
+    // waiting for the client upload's terminal decision. Set only when that
+    // gate forwards the response; left `ZERO` on every other return.
+    client_upload_gate_wait: &mut Duration,
 ) -> (
     retry::BackendResponse,
     Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -63784,6 +63838,9 @@ async fn proxy_to_backend_http2(
     // response headers withheld until its upload terminates — applies whenever a
     // request-size limit is set, and additionally for any authenticated request.
     if let Some(body_completion_rx) = body_completion_rx {
+        // Response headers are already here: from now until the gate forwards
+        // them, the request waits on the client upload, not the backend.
+        let upload_gate_started_at = Instant::now();
         // The header phase has already spent its own deadline, so the upload
         // phase reuses the operator whole-upload stall guard composed with any
         // client RPC deadline. Without it a backend that answers early and then
@@ -63953,7 +64010,9 @@ async fn proxy_to_backend_http2(
                     true
                 });
         match classify_direct_h2_upload_outcome(outcome, pump_outcome, authorization_expired) {
-            DirectH2UploadGate::Forward => {}
+            DirectH2UploadGate::Forward => {
+                *client_upload_gate_wait = upload_gate_started_at.elapsed();
+            }
             DirectH2UploadGate::RequestBodyTooLarge => return request_body_too_large(),
             DirectH2UploadGate::AuthorizationExpired => {
                 return (

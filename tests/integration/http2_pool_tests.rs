@@ -3664,8 +3664,9 @@ async fn test_grpc_h2c_upload_coalesces_small_connection_window_increments() {
 /// Direct-H2 backend for the #6314 settlement regression. `/upload` sends its
 /// response headers once the first request DATA frame arrives and then holds
 /// both directions open, so the gateway sees an early response while the
-/// client upload is unfinished. `/complete` drains the upload and answers 503.
-/// Every early answer is reported on `early_answers`.
+/// client upload is unfinished. `/early-ok` answers a complete `200` at the
+/// same point and keeps draining the upload. `/complete` drains the upload and
+/// answers 503. Every early answer is reported on `early_answers`.
 async fn start_early_answer_h2_tls_backend(
     early_answers: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> (tokio::task::JoinHandle<()>, u16) {
@@ -3718,6 +3719,7 @@ async fn early_answer_backend_response(
     early_answers: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Result<Response<EarlyAnswerBody>, std::convert::Infallible> {
     let complete = req.uri().path() == "/complete";
+    let early_ok = req.uri().path() == "/early-ok";
     let mut upload = req.into_body();
     if complete {
         let _ = upload.collect().await;
@@ -3733,6 +3735,14 @@ async fn early_answer_backend_response(
     let _ = upload.frame().await;
     tokio::spawn(drain_backend_upload(upload));
     let _ = early_answers.send(());
+    if early_ok {
+        let response = Response::builder()
+            .status(200)
+            .header("content-type", "text/plain")
+            .body(Full::new(Bytes::from_static(b"early ok")).boxed())
+            .expect("early complete response");
+        return Ok(response);
+    }
     let held = http_body_util::StreamBody::new(futures_util::stream::pending::<HeldFrame>());
     let response = Response::builder()
         .status(200)
@@ -3993,6 +4003,60 @@ async fn direct_h2_backend_failure_trains_adaptive_limit() {
         assert_eq!(
             target.limit, 2,
             "write timeout {write_timeout_ms}ms: a backend 5xx halves the limit"
+        );
+    }
+}
+
+/// adaptive_concurrency-SOL-1: a direct-H2 backend answers a complete `200`
+/// before the client upload finishes, and the gateway withholds it until the
+/// upload reaches its terminal size decision. The client then waits well over
+/// a second before sending its valid final chunk. That wait is the client's:
+/// the healthy latency sample must reflect the backend's response, not the
+/// upload gate, so a slow uploader cannot raise the learned EWMA and shrink a
+/// healthy target's limit. Holds with and without the upload pump.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_h2_client_upload_delay_is_not_sampled_as_backend_latency() {
+    const CLIENT_UPLOAD_DELAY: Duration = Duration::from_millis(1_500);
+    // Far below the client's delay (plus the early-answer settle time), and
+    // far above a loopback TLS dial plus one response on a loaded runner.
+    const MAX_BACKEND_SAMPLE_US: u64 = 1_000_000;
+    for write_timeout_ms in ADAPTIVE_6314_WRITE_TIMEOUTS_MS {
+        let (early_tx, mut early_answers) = tokio::sync::mpsc::unbounded_channel();
+        let (_backend, backend_port) = start_early_answer_h2_tls_backend(early_tx).await;
+        let (state, gateway_addr, _gateway) = start_adaptive_direct_h2_gateway(
+            backend_port,
+            "adaptive-sol1-upload-delay",
+            write_timeout_ms,
+        )
+        .await;
+
+        let mut client = open_chunked_upload(gateway_addr, "/h2test/early-ok").await;
+        await_early_answer(&mut early_answers, &state).await;
+        tokio::time::sleep(CLIENT_UPLOAD_DELAY).await;
+        client
+            .write_all(b"0\r\n\r\n")
+            .await
+            .expect("write final chunk");
+
+        let (status, body) = read_gateway_response(&mut client).await;
+        assert_eq!(
+            status, 200,
+            "write timeout {write_timeout_ms}ms: the vetted early 200 is forwarded: {body}"
+        );
+        let target = settled_adaptive_target(&state).await;
+        assert_eq!(
+            target.samples, 1,
+            "write timeout {write_timeout_ms}ms: one healthy sample"
+        );
+        assert_eq!(
+            target.limit, 4,
+            "write timeout {write_timeout_ms}ms: a healthy response must not shrink"
+        );
+        assert!(
+            target.latency_ewma_us < MAX_BACKEND_SAMPLE_US,
+            "write timeout {write_timeout_ms}ms: the {}ms client upload delay was sampled as backend latency ({}us)",
+            CLIENT_UPLOAD_DELAY.as_millis(),
+            target.latency_ewma_us
         );
     }
 }
