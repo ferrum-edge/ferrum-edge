@@ -454,11 +454,17 @@ struct McpPolicy {
     /// Public `mcp://` resource URI, or public resource-template URI, to its
     /// action (`allow` / `deny`).
     resources: HashMap<String, PolicyAction>,
-    /// Whether `resources` denies some public resource-template URI (a key
-    /// carrying a `{...}` expression). Only then can a template deny cover a
-    /// resource otherwise allowed, so only then do resource reads and lists
-    /// consult the template catalog.
-    template_deny: bool,
+    /// Every configured exact-resource deny (`policy.resources` key without a
+    /// `{...}` expression, in `mcp://{server_id}/...` form) decoded to its
+    /// `(server_id, upstream URI)` identity at load. Reads and lists compare
+    /// it directly against the resolved upstream URI, so a deny never depends
+    /// on that resource having been discovered in this session.
+    exact_resource_denies: HashSet<(String, String)>,
+    /// Every configured resource-template deny (`policy.resources` key with a
+    /// `{...}` expression) compiled at load to `(server_id, upstream URI
+    /// template matcher)`, the same matcher discovered templates use. Like
+    /// exact denies, it decides without the session's template catalog.
+    template_resource_denies: Vec<(String, Arc<Regex>)>,
     /// Every ACL group name referenced by a `policy.tools.*.allowed_groups` or
     /// `denied_groups` list, interned at config load to its bit position in an
     /// [`McpGroupSet`]. Empty when no tool entry carries a group condition, in
@@ -488,6 +494,21 @@ impl McpPolicy {
             .get(public_key)
             .copied()
             .unwrap_or(self.default_resource_action)
+    }
+
+    /// Whether a configured exact or template deny covers this upstream
+    /// resource of `server_id`, decided from configuration alone.
+    fn configured_resource_deny(&self, server_id: &str, upstream_uri: &str) -> bool {
+        (!self.exact_resource_denies.is_empty()
+            && self
+                .exact_resource_denies
+                .contains(&(server_id.to_string(), upstream_uri.to_string())))
+            || self
+                .template_resource_denies
+                .iter()
+                .any(|(deny_server, matcher)| {
+                    deny_server == server_id && matcher.is_match(upstream_uri)
+                })
     }
 
     /// Whether any tool entry carries a per-consumer group condition.
@@ -3147,6 +3168,26 @@ impl McpGateway {
             .get(&self.sessions.upstream_session_header)
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
+        // From the moment the upstream has minted a session id, this call owns
+        // it until it is committed to the downstream session. Every early
+        // error return below (body, JSON-RPC error, protocol version, a failed
+        // `notifications/initialized`) and a cancellation of this future drop
+        // the guard, which hands the id to independent best-effort cleanup;
+        // only a successful commit disarms it.
+        let mut pending_upstream =
+            PendingUpstreamSession::new(upstream_session_id.as_deref().map(|upstream_id| {
+                PendingUpstreamCleanup {
+                    http_client: self.http_client.clone(),
+                    server: server.clone(),
+                    upstream_session_header: self.sessions.upstream_session_header.clone(),
+                    teardown: UpstreamSessionTeardown {
+                        server_id: server.server_id.clone(),
+                        upstream_session_id: upstream_id.to_string(),
+                        protocol_version: session.protocol_version.clone(),
+                    },
+                    hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
+                }
+            }));
         let response_body = upstream_response_json(
             response,
             &server.server_id,
@@ -3199,6 +3240,7 @@ impl McpGateway {
             ));
         }
 
+        pending_upstream.set_protocol_version(&negotiated_protocol_version);
         self.send_upstream_initialized_notification(
             ctx,
             server,
@@ -3221,7 +3263,7 @@ impl McpGateway {
                     Some(upstream) => {
                         upstream.initialized = true;
                         upstream.upstream_session_id = upstream_session_id.clone();
-                        upstream.protocol_version = Some(negotiated_protocol_version.clone());
+                        upstream.protocol_version = Some(negotiated_protocol_version);
                         true
                     }
                     None => false,
@@ -3230,23 +3272,12 @@ impl McpGateway {
             None => false,
         };
         if !committed {
-            if let Some(orphaned) = upstream_session_id {
-                delete_upstream_session(
-                    &self.http_client,
-                    server,
-                    &self.sessions.upstream_session_header,
-                    UpstreamSessionTeardown {
-                        server_id: server.server_id.clone(),
-                        upstream_session_id: orphaned,
-                        protocol_version: negotiated_protocol_version,
-                    },
-                    crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
-                    &ctx.plugin_http_call_ns,
-                )
+            pending_upstream
+                .clean_up_now(&ctx.plugin_http_call_ns)
                 .await;
-            }
             return Err("downstream MCP session ended during upstream initialization".to_string());
         }
+        pending_upstream.disarm();
         Ok(upstream_session_id)
     }
 
@@ -5234,19 +5265,6 @@ impl McpGateway {
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
             return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
-        // A configured template deny can cover an exact resource: load the
-        // template catalog (best effort) so the listing matches what a read of
-        // each listed resource decides. The read itself fails closed.
-        if self.policy.template_deny
-            && self
-                .ensure_resource_templates(ctx, downstream_session_id)
-                .await
-                .is_err()
-        {
-            warn_sampled!(
-                "MCP resource template catalog unavailable while filtering resources/list"
-            );
-        }
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
         };
@@ -5269,7 +5287,7 @@ impl McpGateway {
         let resources: Vec<Value> = catalog
             .resources
             .values()
-            .filter(|entry| entry.enabled && self.resource_listing_allowed(&catalog, entry))
+            .filter(|entry| entry.enabled && self.resource_listing_allowed(entry))
             .map(resource_entry_to_public_value)
             .collect();
         json_response(
@@ -5885,27 +5903,28 @@ impl McpGateway {
             }
         };
         // Resource policy is decided once the read resolved to an upstream
-        // binding, before any upstream initialize or dispatch. A configured
-        // template deny can cover an exact resource, so the template catalog
-        // must be current before the decision; when it cannot be loaded the
-        // read fails closed rather than skipping that deny.
-        if self.policy.template_deny
-            && let Err(error) = self
-                .ensure_resource_templates(ctx, downstream_session_id)
-                .await
-        {
-            return catalog_error_response(
-                envelope.id.clone(),
-                "MCP resource template catalog unavailable",
-                error,
-            );
-        }
+        // binding, before any upstream initialize or dispatch. Configured
+        // denies are decided from configuration; when a default-derived deny
+        // depends on an exact-resource catalog this server never listed, the
+        // read fails closed rather than treating the missing binding as absent.
         let resource_action = {
             let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
                 return session_not_found_response();
             };
             let catalog = catalog_lock.read().await;
             self.resource_read_action(&catalog, &public_uri, &server_id, &upstream_uri)
+        };
+        let Some(resource_action) = resource_action else {
+            self.note_item_policy_denial(ctx, "resource");
+            return json_rpc_error(
+                envelope.id.clone(),
+                -32006,
+                "MCP catalog unavailable",
+                Some(
+                    "the resource policy cannot be decided because this server's resources list has never succeeded"
+                        .to_string(),
+                ),
+            );
         };
         if resource_action != PolicyAction::Allow {
             self.note_item_policy_denial(ctx, "resource");
@@ -5975,76 +5994,87 @@ impl McpGateway {
     }
 
     /// The policy action for a `resources/read` that resolved to
-    /// `(server_id, upstream_uri)`.
+    /// `(server_id, upstream_uri)`, or `None` when it cannot be decided.
     ///
     /// An explicit `policy.resources` entry for the requested public URI wins.
-    /// Otherwise every catalog binding of the same upstream URI decides, and
-    /// deny wins: each exact resource of that server with that upstream URI
-    /// (so an alternate percent-encoding of a denied resource's public URI
-    /// cannot reach it through a template) AND each matching enabled resource
-    /// template (so a denied template cannot be bypassed through an exact
-    /// resource it covers). A read with no binding falls back to
+    /// Otherwise any configured exact or template deny covering the resolved
+    /// upstream URI denies — decided from configuration, so a deny never
+    /// fails open because this session's catalog lacks the binding. Then every
+    /// discovered binding of the same upstream URI decides and any deny wins:
+    /// each exact resource of that server with that upstream URI AND each
+    /// matching enabled template. A read with no binding falls back to
     /// `policy.default_resource_action`.
+    ///
+    /// With a non-allow default, an exact resource that was never discovered
+    /// would deny a read routed through an allowed template; when this
+    /// server's exact-resource list has never succeeded that cannot be ruled
+    /// out, so the decision is `None` and the read fails closed.
     fn resource_read_action(
         &self,
         catalog: &McpCatalog,
         public_uri: &str,
         server_id: &str,
         upstream_uri: &str,
-    ) -> PolicyAction {
+    ) -> Option<PolicyAction> {
         if let Some(action) = self.policy.resources.get(public_uri) {
-            return *action;
+            return Some(*action);
         }
-        // Every binding decides and any deny wins: an exact resource allowed
-        // only by default never masks a matching template deny, and vice versa.
-        let mut bound = false;
+        if self
+            .policy
+            .configured_resource_deny(server_id, upstream_uri)
+        {
+            return Some(PolicyAction::Deny);
+        }
+        let mut exact_bound = false;
         for entry in catalog
             .resources
             .values()
             .filter(|entry| entry.server_id == server_id && entry.upstream_uri == upstream_uri)
         {
-            bound = true;
+            exact_bound = true;
             let action = self.policy.action_for_resource(&entry.public_uri);
             if action != PolicyAction::Allow {
-                return action;
+                return Some(action);
             }
         }
+        let mut template_bound = false;
         for entry in catalog.resource_templates.values().filter(|entry| {
             entry.enabled
                 && entry.server_id == server_id
                 && entry.uri_template_regex.is_match(upstream_uri)
         }) {
-            bound = true;
+            template_bound = true;
             let action = self.policy.action_for_resource(&entry.public_uri_template);
             if action != PolicyAction::Allow {
-                return action;
+                return Some(action);
             }
         }
-        if bound {
-            PolicyAction::Allow
-        } else {
-            self.policy.default_resource_action
+        if !exact_bound && !template_bound {
+            return Some(self.policy.default_resource_action);
         }
+        if !exact_bound
+            && self.policy.default_resource_action != PolicyAction::Allow
+            && !catalog
+                .last_good
+                .contains(&(server_id.to_string(), "resources"))
+        {
+            return None;
+        }
+        Some(PolicyAction::Allow)
     }
 
-    /// Whether `resources/list` publishes an exact resource: the same decision
-    /// a `resources/read` of its own public URI gets. The template pass runs
-    /// only when the policy configures a template deny, so the ordinary list
-    /// stays one map lookup per resource.
-    fn resource_listing_allowed(&self, catalog: &McpCatalog, entry: &ResourceCatalogEntry) -> bool {
+    /// Whether `resources/list` publishes an exact resource: the decision a
+    /// `resources/read` of its own public URI gets, from configuration alone
+    /// (its explicit entry, then any configured exact or template deny, then
+    /// the default), so the listing never depends on the template catalog.
+    fn resource_listing_allowed(&self, entry: &ResourceCatalogEntry) -> bool {
         if let Some(action) = self.policy.resources.get(&entry.public_uri) {
             return *action == PolicyAction::Allow;
         }
-        if self.policy.default_resource_action != PolicyAction::Allow {
-            return false;
-        }
-        !self.policy.template_deny
-            || self.resource_read_action(
-                catalog,
-                &entry.public_uri,
-                &entry.server_id,
-                &entry.upstream_uri,
-            ) == PolicyAction::Allow
+        !self
+            .policy
+            .configured_resource_deny(&entry.server_id, &entry.upstream_uri)
+            && self.policy.default_resource_action == PolicyAction::Allow
     }
 
     /// Metadata for a prompt / resource request refused by policy.
@@ -8696,6 +8726,102 @@ enum ResponseRewriteOutcome {
     Ambiguous,
 }
 
+/// Strip the client credential headers an aggregate-routed call must not carry
+/// to the tool-selected upstream: [`MCP_CLIENT_CREDENTIAL_HEADERS`] and every
+/// name in the route's credential-header registry (which also lists the
+/// configured `servers.*.headers` names, so a client copy cannot survive).
+/// Case-insensitive, allocation-free, and never logs a value.
+fn strip_client_credential_headers(ctx: &RequestContext, headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| {
+        !(MCP_CLIENT_CREDENTIAL_HEADERS
+            .iter()
+            .any(|credential| name.eq_ignore_ascii_case(credential))
+            || ctx.request_header_requires_redaction(name))
+    });
+}
+
+/// Everything needed to delete an upstream MCP session independently of the
+/// request that minted it.
+struct PendingUpstreamCleanup {
+    http_client: PluginHttpClient,
+    server: McpServerConfig,
+    upstream_session_header: String,
+    teardown: UpstreamSessionTeardown,
+    hops: Option<u8>,
+}
+
+impl PendingUpstreamCleanup {
+    async fn run(self, accumulator: &AtomicU64) {
+        delete_upstream_session(
+            &self.http_client,
+            &self.server,
+            &self.upstream_session_header,
+            self.teardown,
+            self.hops,
+            accumulator,
+        )
+        .await;
+    }
+}
+
+/// Cleanup ownership of an upstream session minted by an in-flight
+/// `initialize` that has not yet been committed to its downstream session.
+///
+/// Until [`Self::disarm`] runs, dropping the guard — an error return or a
+/// cancelled request future — spawns a bounded best-effort `DELETE` for the
+/// minted id, so neither a failed `notifications/initialized` nor a vanished
+/// downstream owner can leave the upstream session orphaned.
+struct PendingUpstreamSession {
+    cleanup: Option<PendingUpstreamCleanup>,
+}
+
+impl PendingUpstreamSession {
+    fn new(cleanup: Option<PendingUpstreamCleanup>) -> Self {
+        Self { cleanup }
+    }
+
+    /// Record the negotiated protocol version the cleanup `DELETE` carries.
+    fn set_protocol_version(&mut self, protocol_version: &str) {
+        if let Some(cleanup) = self.cleanup.as_mut() {
+            cleanup.teardown.protocol_version = protocol_version.to_string();
+        }
+    }
+
+    /// The upstream session was committed to its downstream session, whose
+    /// removal now owns its teardown.
+    fn disarm(&mut self) {
+        self.cleanup = None;
+    }
+
+    /// Delete the minted upstream session on the current request (its owner is
+    /// already gone), charging the call to `accumulator`.
+    async fn clean_up_now(&mut self, accumulator: &AtomicU64) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.run(accumulator).await;
+        }
+    }
+}
+
+impl Drop for PendingUpstreamSession {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let accumulator = AtomicU64::new(0);
+            if tokio::time::timeout(REAPER_TEARDOWN_TIMEOUT, cleanup.run(&accumulator))
+                .await
+                .is_err()
+            {
+                warn_sampled!("MCP upstream session cleanup after a failed initialize timed out");
+            }
+        });
+    }
+}
+
 /// One initialized upstream MCP session to tear down, detached from its
 /// downstream session so the session's catalog and other state can be released
 /// before any network I/O.
@@ -11000,9 +11126,8 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
         parse_item_default_action(policy, "default_resource_action")?.unwrap_or(default_action);
     let prompts = parse_item_policy_map(policy, "prompts")?;
     let resources = parse_item_policy_map(policy, "resources")?;
-    let template_deny = resources
-        .iter()
-        .any(|(key, action)| *action != PolicyAction::Allow && key.contains('{'));
+    let (exact_resource_denies, template_resource_denies) =
+        parse_resource_deny_bindings(&resources)?;
     Ok(McpPolicy {
         default_action,
         hide_denied_tools,
@@ -11011,10 +11136,66 @@ fn parse_policy(object: &Map<String, Value>) -> Result<McpPolicy, String> {
         default_resource_action,
         prompts,
         resources,
-        template_deny,
+        exact_resource_denies,
+        template_resource_denies,
         grant_groups,
     })
 }
+
+/// Decode every non-allow `policy.resources` key into the upstream identity it
+/// denies, so resource denies are enforced from configuration and never fail
+/// open because a session's catalog lacks the binding (a failed or partial
+/// `resources/list` / `resources/templates/list`).
+///
+/// A key in `mcp://{server_id}/{percent-encoded upstream URI}` form is an exact
+/// deny; one carrying a `{...}` expression is a template deny and must decode
+/// to a valid URI template (the public template URI keeps expressions raw and
+/// percent-encodes the literal parts). A template deny that cannot be compiled
+/// is refused at load: silently ignoring it would leave its resources open. An
+/// exact key in any other form can only ever match that exact requested
+/// spelling, which the per-key lookup already handles.
+fn parse_resource_deny_bindings(
+    resources: &HashMap<String, PolicyAction>,
+) -> Result<ResourceDenyBindings, String> {
+    let mut exact = HashSet::new();
+    let mut templates = Vec::new();
+    for (key, action) in resources {
+        if *action == PolicyAction::Allow {
+            continue;
+        }
+        let is_template = key.contains('{');
+        let decoded = key
+            .strip_prefix("mcp://")
+            .and_then(|rest| rest.split_once('/'))
+            .and_then(|(server_id, encoded)| {
+                percent_decode_str(encoded)
+                    .decode_utf8()
+                    .ok()
+                    .map(|upstream| (server_id.to_string(), upstream.into_owned()))
+            });
+        match (decoded, is_template) {
+            (Some((server_id, upstream_template)), true) => {
+                let matcher = uri_template_regex(&upstream_template).map_err(|_| {
+                    "mcp_gateway: `policy.resources` template deny keys must be public resource-template URIs (`mcp://{server_id}/...` with valid `{...}` expressions)".to_string()
+                })?;
+                templates.push((server_id, Arc::new(matcher)));
+            }
+            (None, true) => {
+                return Err(
+                    "mcp_gateway: `policy.resources` template deny keys must be public resource-template URIs (`mcp://{server_id}/...` with valid `{...}` expressions)".to_string(),
+                );
+            }
+            (Some(identity), false) => {
+                exact.insert(identity);
+            }
+            (None, false) => {}
+        }
+    }
+    Ok((exact, templates))
+}
+
+/// Exact `(server_id, upstream URI)` denies and compiled template denies.
+type ResourceDenyBindings = (HashSet<(String, String)>, Vec<(String, Arc<Regex>)>);
 
 /// `allow` / `deny` action spelling shared by the prompt and resource
 /// families. `hide_from_discovery` is a tool-only action: a prompt or resource

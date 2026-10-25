@@ -370,7 +370,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-32001`); set the family defaults to `allow` to keep the previous open
   behavior. A read is refused when ANY binding of its upstream URI (an exact
   resource or a matching template) is denied, unless the requested public URI
-  has its own entry. Aggregate-routed calls no longer carry the client's
+  has its own entry; configured denies are decided from configuration, so they
+  hold even when a server's resource or template list has never succeeded. Aggregate-routed calls no longer carry the client's
   `Authorization`, `Proxy-Authorization`, `Cookie`, route credential headers,
   or any query string to the tool-selected upstream: the gateway commits an
   empty backend query and re-asserts the header boundary over the final
@@ -406,8 +407,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sessions.session_ttl_seconds`, 1–60 s) that reclaims expired sessions at
   rest; their upstream `DELETE`s run on a separate bounded worker (8 in
   flight, 10 s each, best-effort queue), so a slow upstream never delays the
-  next sweep. An upstream `initialize` whose result arrives after its session
-  was removed now deletes that upstream session instead of orphaning it. Both
+  next sweep. An upstream session minted by `initialize` is owned by that call
+  until it is committed: if the downstream session was removed meanwhile, or
+  `notifications/initialized` fails, or the request is cancelled, the gateway
+  deletes it instead of orphaning it. Both
   per-server catalog and resource-template discovery fan out concurrently (up
   to 8 servers at a time).
 

@@ -18614,6 +18614,19 @@ async fn late_upstream_initialize_after_session_expiry_is_deleted() {
     )
     .await;
     assert!(matches!(result, PluginResult::Reject { .. }), "{result:?}");
+    // Removal witness: had the initialize commit won, the session would have
+    // just been touched and would still be live.
+    let (result, _, _) = session_request(
+        &plugin,
+        &session_id,
+        json!({ "jsonrpc": "2.0", "id": 1111, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    assert_eq!(
+        reject_raw(result).0,
+        404,
+        "the reaper removed the session while initialize was in flight"
+    );
 
     let late_deletes = || async {
         server
@@ -18641,4 +18654,325 @@ async fn late_upstream_initialize_after_session_expiry_is_deleted() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     assert_eq!(late_deletes().await, 1, "deleted exactly once");
+}
+
+/// A mock upstream whose `initialize` mints `upstream_session` immediately and
+/// whose `notifications/initialized` answers `notification`; DELETEs succeed.
+async fn start_mcp_notification_server(
+    upstream_session: &str,
+    notification: ResponseTemplate,
+) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", upstream_session)
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "serverInfo": { "name": "notification-test", "version": "1" }
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(notification)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn deletes_for(server: &MockServer, upstream_session: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "DELETE"
+                && request
+                    .headers
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(upstream_session)
+        })
+        .count()
+}
+
+async fn await_one_delete(server: &MockServer, upstream_session: &str, case: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while deletes_for(server, upstream_session).await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{case}: the minted upstream session must be deleted, not orphaned"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        deletes_for(server, upstream_session).await,
+        1,
+        "{case}: deleted exactly once"
+    );
+}
+
+fn tools_only_aggregate_config(upstream_url: &str) -> Value {
+    let mut config = aggregate_config(upstream_url);
+    config["servers"]["github"]["expose_resources"] = json!(false);
+    config["servers"]["github"]["expose_prompts"] = json!(false);
+    config
+}
+
+/// PR6819-SOL-9 (round 2): an upstream session minted by `initialize` is
+/// owned by the call until it is committed, so a failed
+/// `notifications/initialized` deletes it instead of leaking it.
+#[tokio::test]
+async fn failed_initialized_notification_deletes_the_minted_upstream_session() {
+    let server =
+        start_mcp_notification_server("minted-then-failed", ResponseTemplate::new(503)).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &tools_only_aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let (result, _, _) = session_request(
+        &plugin,
+        &session_id,
+        json!({ "jsonrpc": "2.0", "id": 1120, "method": "tools/list", "params": {} }),
+    )
+    .await;
+    assert!(matches!(result, PluginResult::Reject { .. }), "{result:?}");
+    await_one_delete(&server, "minted-then-failed", "notification failure").await;
+}
+
+/// PR6819-SOL-9 (round 2): cancelling the request future while
+/// `notifications/initialized` is pending still deletes the minted upstream
+/// session.
+#[tokio::test]
+async fn cancelled_initialize_deletes_the_minted_upstream_session() {
+    let server = start_mcp_notification_server(
+        "minted-then-cancelled",
+        ResponseTemplate::new(202).set_delay(std::time::Duration::from_secs(30)),
+    )
+    .await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &tools_only_aggregate_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let (mut ctx, mut headers) =
+        mcp_ctx(json!({ "jsonrpc": "2.0", "id": 1121, "method": "tools/list", "params": {} }));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        plugin.before_proxy(&mut ctx, &mut headers),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the request is cancelled mid-notification"
+    );
+    await_one_delete(&server, "minted-then-cancelled", "cancellation").await;
+}
+
+/// A resource upstream listing README and the `file:///project/{path}`
+/// template, with each list answering 200 or 500 as requested.
+async fn start_mcp_resource_family_server(resources_ok: bool, templates_ok: bool) -> MockServer {
+    let server = MockServer::start().await;
+    let resources = if resources_ok {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "resources",
+            "result": { "resources": [{
+                "uri": "file:///project/README.md",
+                "name": "README",
+                "mimeType": "text/markdown"
+            }] }
+        }))
+    } else {
+        ResponseTemplate::new(500)
+    };
+    let templates = if templates_ok {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "templates",
+            "result": { "resourceTemplates": [{
+                "uriTemplate": "file:///project/{path}",
+                "name": "Project file"
+            }] }
+        }))
+    } else {
+        ResponseTemplate::new(500)
+    };
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(resources)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "resources/templates/list"}),
+        ))
+        .respond_with(templates)
+        .mount(&server)
+        .await;
+    server
+}
+
+fn resource_policy_config(servers: Value, policy: Value) -> Value {
+    json!({
+        "mode": "aggregate_router",
+        "endpoint": { "path": "/mcp", "protocol_versions": ["2025-11-25"] },
+        "sessions": { "initialize_upstreams": "passthrough" },
+        "discovery": {
+            "aggregate_tools": false,
+            "aggregate_prompts": false,
+            "aggregate_resources": true
+        },
+        "policy": policy,
+        "servers": servers
+    })
+}
+
+fn resource_server(url: &str, namespace: &str) -> Value {
+    json!({
+        "upstream_url": url,
+        "namespace": namespace,
+        "expose_tools": false,
+        "expose_resources": true
+    })
+}
+
+const PROJECT_README_PUBLIC_URI: &str = "mcp://a/file%3A%2F%2F%2Fproject%2FREADME%2Emd";
+const PROJECT_TEMPLATE_PUBLIC_URI: &str = "mcp://a/file%3A%2F%2F%2Fproject%2F{path}";
+
+/// PR6819-SOL-6 (round 2): a configured template deny is enforced from
+/// configuration, so it holds even when the owning server's template list has
+/// never succeeded while an unrelated server's template list did.
+#[tokio::test]
+async fn template_deny_holds_when_the_owning_servers_template_list_failed() {
+    let a = start_mcp_resource_family_server(true, false).await;
+    let b = start_mcp_resource_family_server(true, true).await;
+    let config = resource_policy_config(
+        json!({
+            "a": resource_server(&format!("{}/mcp", a.uri()), "a"),
+            "b": resource_server(&format!("{}/mcp", b.uri()), "b")
+        }),
+        json!({
+            "default_action": "allow",
+            "resources": { (PROJECT_TEMPLATE_PUBLIC_URI): { "action": "deny" } }
+        }),
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = session_list(&plugin, &session_id, "resources/templates/list", 1129).await;
+    let listed =
+        sorted_resource_uris(&session_list(&plugin, &session_id, "resources/list", 1130).await);
+    assert!(
+        listed.iter().any(|uri| uri.starts_with("mcp://b/")),
+        "the healthy server's resources stay listed: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(|uri| uri == PROJECT_README_PUBLIC_URI),
+        "a resource a denied template covers is not listed: {listed:?}"
+    );
+    let (result, _, _) = session_request(
+        &plugin,
+        &session_id,
+        resource_read(1131, PROJECT_README_PUBLIC_URI),
+    )
+    .await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+}
+
+/// PR6819-SOL-6 (round 2): a configured exact deny is compared with the
+/// resolved upstream URI directly, so it holds through an allowed template
+/// spelling even when the server's exact-resource list has never succeeded.
+#[tokio::test]
+async fn exact_deny_holds_through_a_template_when_the_resource_list_failed() {
+    let a = start_mcp_resource_family_server(false, true).await;
+    let config = resource_policy_config(
+        json!({ "a": resource_server(&format!("{}/mcp", a.uri()), "a") }),
+        json!({
+            "default_action": "allow",
+            "resources": {
+                (PROJECT_README_PUBLIC_URI): { "action": "deny" },
+                (PROJECT_TEMPLATE_PUBLIC_URI): { "action": "allow" }
+            }
+        }),
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let alternate = PROJECT_TEMPLATE_PUBLIC_URI.replace("{path}", "README.md");
+    let (result, _, _) = session_request(
+        &plugin,
+        &session_id,
+        resource_read(1132, alternate.as_str()),
+    )
+    .await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], json!(-32001), "{body}");
+}
+
+/// PR6819-SOL-6 (round 2): with a deny default, a template-routed read cannot
+/// rule out a default-denied exact resource while this server's resource list
+/// has never succeeded, so it fails closed with -32006.
+#[tokio::test]
+async fn default_deny_template_read_fails_closed_without_a_resource_list() {
+    let a = start_mcp_resource_family_server(false, true).await;
+    let config = resource_policy_config(
+        json!({ "a": resource_server(&format!("{}/mcp", a.uri()), "a") }),
+        json!({
+            "default_action": "deny",
+            "resources": { (PROJECT_TEMPLATE_PUBLIC_URI): { "action": "allow" } }
+        }),
+    );
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let generated = PROJECT_TEMPLATE_PUBLIC_URI.replace("{path}", "notes.txt");
+    let (result, ctx, _) = session_request(
+        &plugin,
+        &session_id,
+        resource_read(1133, generated.as_str()),
+    )
+    .await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], json!(-32006), "{body}");
+    assert!(ctx.route_override_backend_host.is_none());
+}
+
+#[test]
+fn malformed_template_resource_deny_keys_are_refused() {
+    for key in [
+        "file:///project/{path}",
+        "mcp://a/file%3A%2F%2F%2Fproject%2F{path",
+    ] {
+        let config = resource_policy_config(
+            json!({ "a": resource_server("http://127.0.0.1:9/mcp", "a") }),
+            json!({ "resources": { (key): { "action": "deny" } } }),
+        );
+        assert!(create_plugin("mcp_gateway", &config).is_err(), "{key}");
+    }
 }
