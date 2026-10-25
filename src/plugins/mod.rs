@@ -1358,6 +1358,11 @@ pub struct UdpDatagramContext<'a> {
     /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
     /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
+    /// The same canonical client identity as a typed address, computed once
+    /// per session alongside [`Self::client_ip`], so a hook that keys or masks
+    /// by address (for example `udp_rate_limiting`'s IPv6 prefix grouping)
+    /// never re-parses or re-allocates per datagram.
+    pub client_ip_addr: std::net::IpAddr,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
@@ -2386,6 +2391,16 @@ pub struct RequestContext {
     /// wrapper. Its wire signature binds the literal bytes the client signed.
     /// Never route, authorize, or log this value.
     raw_path: Option<hmac_auth::HmacWirePath>,
+    /// The client's wire method, retained only when a frontend rewrote
+    /// [`Self::method`] (HTTP/2 and HTTP/3 WebSocket Extended CONNECT become
+    /// `GET`). Private to `hmac_auth`'s RFC 9421 `@method` derivation; route,
+    /// policy, and backend semantics keep reading [`Self::method`].
+    hmac_wire_method: Option<String>,
+    /// The client's request-target, retained only when it cannot be
+    /// reconstructed from the path and query (an HTTP/1.1 absolute-form
+    /// target, or a present-but-empty query). Private to `hmac_auth`'s RFC 9421
+    /// `@request-target` derivation through the debug-redacted wrapper.
+    hmac_wire_request_target: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are
     /// ASCII-lowercased with a trailing DNS dot removed; an explicit
@@ -4032,6 +4047,17 @@ pub(crate) struct PluginRequestState {
     /// isolation. Bounded by the number of attached WAF instances (operator
     /// configuration), never by request content.
     pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
+    /// `grpc-encoding` framing witness `ai_transcript_audit` records from the
+    /// LIVE `before_proxy` header map for a native-gRPC request on a
+    /// `grpc`-enrolled instance, before the backend-effective method is known.
+    /// A call enrolled only at the backend-path boundary has no other
+    /// authoritative framing source when a deferred `before_proxy` hook
+    /// short-circuits it (no final request-body hook runs), and
+    /// `RequestContext::headers` may be the original inbound map rather than the
+    /// backend-visible one. Kept out of public metadata so no other plugin can
+    /// rewrite it and it never reaches a transaction log.
+    pub(crate) ai_transcript_audit_grpc_request_encoding:
+        Option<ai_transcript_audit::GrpcMessageEncoding>,
     /// Per-`transaction_debugger`-instance record that a body-capture record
     /// was already emitted for each direction, so the header-phase and
     /// final-body hooks emit exactly one record between them. Content-free
@@ -4470,6 +4496,8 @@ impl RequestContext {
             method,
             path,
             raw_path: None,
+            hmac_wire_method: None,
+            hmac_wire_request_target: None,
             request_authority: None,
             request_is_secure: false,
             outbound_proxy_hops: None,
@@ -6000,6 +6028,8 @@ impl RequestContext {
             method: self.method.clone(),
             path: self.path.clone(),
             raw_path: self.raw_path.clone(),
+            hmac_wire_method: self.hmac_wire_method.clone(),
+            hmac_wire_request_target: self.hmac_wire_request_target.clone(),
             request_authority: self.request_authority.clone(),
             outbound_proxy_hops: self.outbound_proxy_hops,
             request_is_secure: self.request_is_secure,
@@ -7320,6 +7350,32 @@ impl RequestContext {
     #[inline]
     pub(crate) fn set_raw_path_for_hmac(&mut self, raw_path: String) {
         self.raw_path = Some(hmac_auth::HmacWirePath::new(raw_path));
+    }
+
+    /// Record the client's wire method when a frontend rewrites
+    /// [`Self::method`] (WebSocket Extended CONNECT → `GET`), so RFC 9421
+    /// `@method` covers the method the client actually signed.
+    #[inline]
+    pub(crate) fn set_wire_method_for_hmac(&mut self, wire_method: String) {
+        self.hmac_wire_method = Some(wire_method);
+    }
+
+    /// Record the frontend request line for RFC 9421 derivation: the wire
+    /// method when it differs from [`Self::method`], and the request-target
+    /// when [`hmac_auth::unreconstructible_request_target`] says the path and
+    /// query cannot reproduce it. Allocates nothing for an ordinary request.
+    pub(crate) fn record_wire_request_line_for_hmac(
+        &mut self,
+        wire_method: &str,
+        version: http::Version,
+        uri: &http::Uri,
+    ) {
+        if wire_method != self.method {
+            self.hmac_wire_method = Some(wire_method.to_owned());
+        }
+        if let Some(target) = hmac_auth::unreconstructible_request_target(version, uri) {
+            self.hmac_wire_request_target = Some(hmac_auth::HmacWirePath::new(target));
+        }
     }
 
     /// Parse the raw query string into `self.query_params`. Keys and values are
@@ -10643,7 +10699,7 @@ pub struct StreamTransactionSummary {
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), request_deduplication (3010), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_token_metrics (4070), ai_response_guard (4075), security_headers (4080), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
 pub mod priority {
@@ -10763,13 +10819,20 @@ pub mod priority {
     ///   hit short-circuits before that later external side effect.
     pub const AI_SEMANTIC_CACHE: u16 = 4057;
     pub const AI_FEDERATION: u16 = 4060;
+    /// `ai_token_metrics`: observability-only usage extraction. Pinned after
+    /// `ai_federation` (4060), which stages its typed usage first, and BEFORE
+    /// `ai_response_guard` (4075): a guard rejection breaks the
+    /// `on_response_body` loop and replaces a provider-consumed 2xx body, and
+    /// on a stream a guard cut stops later inspectors from seeing the terminal
+    /// usage event. Observing first keeps the billed generation's tokens and
+    /// cost in metadata and Prometheus even when policy then refuses it.
+    pub const AI_TOKEN_METRICS: u16 = 4070;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
     /// `security_headers`: injects response security headers and strips
     /// fingerprinting headers in `after_proxy`. Runs late in the response band
     /// so it is authoritative over `response_transformer` (4000) and
     /// `compression` (4050) header changes.
     pub const SECURITY_HEADERS: u16 = 4080;
-    pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const STATSD_LOGGING: u16 = 9075;

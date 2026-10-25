@@ -2539,7 +2539,21 @@ struct KeyspaceState {
     /// only way to exercise a clock-mode transition rather than a startup
     /// verdict.
     time_mode: Arc<std::sync::Mutex<ServerTimeMode>>,
+    /// Reply barrier for the next CHARGE `EXEC` once a test arms it.
+    reply_barrier: Arc<ReplyBarrier>,
     options: KeyspaceServerOptions,
+}
+
+/// Holds the reply of ONE armed charge `EXEC` after its commands applied.
+///
+/// `applied` is signalled once the transaction's `INCR`s are in the keyspace;
+/// the reply is then withheld until the test signals `release`. This pins the
+/// interleaving "charge applied, reply not yet read" without racing timers.
+#[derive(Default)]
+struct ReplyBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    applied: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl KeyspaceState {
@@ -2755,6 +2769,14 @@ impl KeyspaceState {
                 if self.options.extra_exec_element {
                     body.extend_from_slice(b":1\r\n");
                 }
+                if batch_contains(&batch, "INCR")
+                    && self.reply_barrier.armed.swap(false, Ordering::AcqRel)
+                {
+                    // `notify_one` keeps a permit, so neither side can miss the
+                    // other however the two tasks are scheduled.
+                    self.reply_barrier.applied.notify_one();
+                    self.reply_barrier.release.notified().await;
+                }
                 if !schedule.hold.is_zero() && schedule.phase == HoldPhase::AfterApply {
                     tokio::time::sleep(schedule.hold).await;
                 }
@@ -2793,6 +2815,15 @@ impl KeyspaceServer {
             .lock()
             .expect("raw values mutex")
             .insert(key.to_string(), value);
+    }
+
+    /// Arm the reply barrier for the next charge `EXEC` (see [`ReplyBarrier`]).
+    fn hold_next_charge_reply(&self) -> Arc<ReplyBarrier> {
+        self.state
+            .reply_barrier
+            .armed
+            .store(true, Ordering::Release);
+        Arc::clone(&self.state.reply_barrier)
     }
 
     fn counter(&self, key: &str) -> i64 {
@@ -2899,6 +2930,7 @@ async fn spawn_keyspace_redis_server(options: KeyspaceServerOptions) -> Keyspace
         ops: Arc::new(std::sync::Mutex::new(Vec::new())),
         clock_probes: Arc::new(AtomicUsize::new(0)),
         time_mode: Arc::new(std::sync::Mutex::new(options.time_mode)),
+        reply_barrier: Arc::new(ReplyBarrier::default()),
         options,
     };
     let accept_state = state.clone();
@@ -9828,6 +9860,283 @@ async fn ownership_writes_require_exact_ok_watch_and_multi_acknowledgements() {
         );
         let _ = server.shutdown.send(());
     }
+}
+
+// ── Production-launch review fixes (rate_limiting-SOL-2, -CLAUDE-1/5) ─────
+
+/// rate_limiting-CLAUDE-1: admission accepts any letter case of the scheme,
+/// so the stored URL must be lowercase or `redis_tls` silently never upgrades
+/// `REDIS://` and the gateway sends `AUTH` over plaintext.
+#[test]
+fn a_mixed_case_redis_scheme_is_stored_lowercase_so_redis_tls_upgrades() {
+    let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "REDIS://cache.internal:6380/0",
+            "redis_tls": true
+        }),
+        "ferrum:test",
+    )
+    .expect("a mixed-case scheme is a valid Redis URL")
+    .expect("sync_mode=redis yields a config");
+    assert_eq!(config.url, "redis://cache.internal:6380/0");
+    assert_eq!(
+        redis_config_url_with_ip(&config, ip),
+        "rediss://cache.internal:6380/0",
+        "redis_tls must upgrade a mixed-case plaintext scheme and keep the hostname for SNI"
+    );
+
+    let tls = RedisConfig::from_plugin_config(
+        &json!({"sync_mode": "redis", "redis_url": "ReDiSs://10.0.0.5:6380/0"}),
+        "ferrum:test",
+    )
+    .expect("valid")
+    .expect("redis mode");
+    assert_eq!(tls.url, "rediss://10.0.0.5:6380/0");
+
+    // Only the scheme is normalized: userinfo, host, and path keep their bytes.
+    let spelled = RedisConfig::from_plugin_config(
+        &json!({"sync_mode": "redis", "redis_url": "Redis://User:Pass@Cache.Internal:6379/2"}),
+        "ferrum:test",
+    )
+    .expect("valid")
+    .expect("redis mode");
+    assert_eq!(spelled.url, "redis://User:Pass@Cache.Internal:6379/2");
+}
+
+/// rate_limiting-CLAUDE-1: TLS detection itself is case-insensitive, so even a
+/// directly constructed config keeps SNI and the `FERRUM_TLS_*` policy for a
+/// mixed-case `rediss://`.
+#[test]
+fn tls_scheme_detection_is_case_insensitive() {
+    let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let tls = make_config("REDISS://cache.internal:6380/0", false);
+    assert_eq!(
+        redis_config_url_with_ip(&tls, ip),
+        "REDISS://cache.internal:6380/0",
+        "a TLS URL must keep its hostname for SNI"
+    );
+    let upgraded = make_config("Redis://cache.internal:6380/0", true);
+    assert_eq!(
+        redis_config_url_with_ip(&upgraded, ip),
+        "rediss://cache.internal:6380/0"
+    );
+
+    let literal = "REDISS://10.0.0.5:6380/0";
+    let insecure = redis_client_tls_insecure(make_config(literal, false), literal, true)
+        .expect("a mixed-case rediss URL builds a TLS address");
+    assert!(
+        insecure,
+        "FERRUM_TLS_NO_VERIFY must reach a mixed-case rediss endpoint"
+    );
+}
+
+/// rate_limiting-SOL-2: cancelling the request future while its charge
+/// transaction is in flight must not strand an over-limit `INCR`.
+///
+/// Deterministic: the fixture signals once the over-limit attempt's `EXEC` has
+/// APPLIED and withholds its reply; only then is the waiter dropped (as a gRPC
+/// deadline under `timeout_at` drops a hook), and only after that is the reply
+/// released. An inline charge dies with its waiter and never reads the reply;
+/// the detached decision must still read it, refuse, and hand the charge back.
+#[tokio::test]
+async fn a_cancelled_waiter_does_not_strand_an_over_limit_charge() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    // A one-minute window: 3.75s sub-buckets, so holding a reply never rolls
+    // the ladder over.
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(60),
+    }]);
+
+    let admitted = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("the first charge decides");
+    assert!(admitted.allowed, "the first request fits the budget");
+    assert_eq!(server.charged_total(), 1);
+
+    let barrier = server.hold_next_charge_reply();
+    {
+        let waiter = algorithm.check_redis(&client, "ip:127.0.0.1", &op);
+        tokio::pin!(waiter);
+        tokio::select! {
+            _ = barrier.applied.notified() => {}
+            decided = &mut waiter => {
+                panic!("the over-limit attempt decided before its reply was released: {decided:?}")
+            }
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                panic!("the over-limit charge never reached the server")
+            }
+        }
+        assert_eq!(server.incrs(), 2, "the over-limit charge is applied");
+        assert_eq!(server.charged_total(), 2);
+        // Leaving this block drops the waiter: the cancellation under test.
+    }
+    barrier.release.notify_one();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while server.decrs() == 0 || client.pending_compensations_for_test() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancelled over-limit charge was never handed back"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(server.incrs(), 2, "no further charge was issued");
+    assert_eq!(
+        server.decrs(),
+        1,
+        "the cancelled over-limit attempt must be handed back exactly once"
+    );
+    assert_eq!(
+        server.charged_total(),
+        1,
+        "only the admitted request may keep a charge"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// rate_limiting-CLAUDE-5 / PR6814-SOL-1: a Redis quota refusal carries a
+/// conservative `Retry-After` bound. The newest charge a reader counts leaves
+/// every SETTLED reader's ladder — including one whose selection lags its
+/// execution by the one bucket settlement admits — once readers execute
+/// `K + 3` sub-buckets after the server bucket that settled the refusal, so
+/// the wait is more than 18 and at most 19 sixteenths of the window.
+#[tokio::test]
+async fn a_redis_quota_refusal_carries_a_retry_after_bound() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1,
+        duration: Duration::from_secs(64),
+    }]);
+
+    let admitted = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(admitted.allowed);
+    assert_eq!(
+        admitted.retry_after_seconds, None,
+        "an admission names no wait"
+    );
+
+    let refused = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(!refused.allowed);
+    // 64s window: 4s sub-buckets, so the wait is in (72s, 76s].
+    let retry_after = refused
+        .retry_after_seconds
+        .expect("a quota refusal names a wait");
+    assert!(
+        (73..=76).contains(&retry_after),
+        "Retry-After {retry_after} outside the (18/16, 19/16] window bound"
+    );
+
+    await_compensations(&client).await;
+    let _ = server.shutdown.send(());
+}
+
+/// The lag the bound must cover, as bucket arithmetic: a charge keyed at
+/// `b` is still inside the ladder of a settled reader that selected `b + K + 1`
+/// and executed in `b + K + 2`, and leaves only for a reader executing in
+/// `b + K + 3` (which may have selected no earlier than `b + K + 2`).
+#[test]
+fn the_redis_retry_bound_covers_a_reader_that_selects_one_bucket_behind() {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{
+        REDIS_WINDOW_SUB_BUCKETS, REDIS_WINDOW_TRAILING_SUB_BUCKETS, sub_bucket_charge_is_settled,
+    };
+
+    let window_seconds = 16;
+    let k = REDIS_WINDOW_SUB_BUCKETS as u64;
+    let charged = 1_000_u64;
+    // The ladder of a reader that SELECTED `selected`: its trailing keys reach
+    // back `REDIS_WINDOW_TRAILING_SUB_BUCKETS` buckets.
+    let oldest_read = |selected: u64| selected - REDIS_WINDOW_TRAILING_SUB_BUCKETS as u64;
+    let at = |bucket: u64| Duration::from_secs(bucket * window_seconds / k);
+
+    // Executes in `b + K + 2` having selected one bucket behind: settled, and
+    // it still reads the charge.
+    let lagging = RedisRateLimitClient::sub_bucket_at(at(charged + k + 1), window_seconds);
+    assert!(sub_bucket_charge_is_settled(lagging, at(charged + k + 2)));
+    assert!(
+        oldest_read(lagging.index) <= charged,
+        "a lagging reader at b + K + 2 still counts the charge"
+    );
+
+    // Executing in `b + K + 3`, the earliest selection settlement admits is
+    // `b + K + 2`, whose ladder starts after the charge.
+    let earliest = RedisRateLimitClient::sub_bucket_at(at(charged + k + 2), window_seconds);
+    assert!(sub_bucket_charge_is_settled(earliest, at(charged + k + 3)));
+    assert!(oldest_read(earliest.index) > charged);
+    let too_early = RedisRateLimitClient::sub_bucket_at(at(charged + k + 1), window_seconds);
+    assert!(
+        !sub_bucket_charge_is_settled(too_early, at(charged + k + 3)),
+        "settlement never admits a reader two buckets behind"
+    );
+}
+
+/// PR6814-MUSE-1: with several refusing windows, `Retry-After` is the longest
+/// wait, while `limit` / `window_seconds` still name the first refusing window.
+#[tokio::test]
+async fn a_multi_window_redis_refusal_names_the_longest_wait() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitAlgorithm, RateLimitWindowSpec,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+    let op = DynamicRateLimitOp::new(vec![
+        RateLimitWindowSpec {
+            limit: 1,
+            duration: Duration::from_secs(1),
+        },
+        RateLimitWindowSpec {
+            limit: 1,
+            duration: Duration::from_secs(64),
+        },
+    ]);
+
+    assert!(
+        algorithm
+            .check_redis(&client, "ip:127.0.0.1", &op)
+            .await
+            .expect("decides")
+            .allowed
+    );
+    let refused = algorithm
+        .check_redis(&client, "ip:127.0.0.1", &op)
+        .await
+        .expect("decides");
+    assert!(!refused.allowed);
+    assert_eq!(refused.window_seconds, Some(1), "the first refusing window");
+    let retry_after = refused
+        .retry_after_seconds
+        .expect("a quota refusal names a wait");
+    assert!(
+        (73..=76).contains(&retry_after),
+        "Retry-After {retry_after} must be the 64s window's bound, not the 1s window's"
+    );
+
+    await_compensations(&client).await;
+    let _ = server.shutdown.send(());
 }
 
 // ── ws_rate_limiting aggregate budgets on a shared Redis key (PR #6867) ───

@@ -1972,6 +1972,10 @@ impl<'a> SchemaSerializable for DebugHttpRecord<'a> {
             .any(|f| f.name == source)
     }
 
+    fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.summary.metadata.get(key).map(String::as_str)
+    }
+
     fn serialize_native<S>(
         &self,
         source: &'static str,
@@ -2116,6 +2120,10 @@ impl<'a> SchemaSerializable for DebugStreamRecord<'a> {
             .any(|f| f.name == source)
     }
 
+    fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.summary.metadata.get(key).map(String::as_str)
+    }
+
     fn serialize_native<S>(
         &self,
         source: &'static str,
@@ -2242,6 +2250,10 @@ impl<'a> SchemaSerializable for DebugWsRecord<'a> {
         crate::plugins::utils::log_schema::DEBUG_WS_FIELDS
             .iter()
             .any(|f| f.name == source)
+    }
+
+    fn metadata_value(&self, key: &str) -> Option<&str> {
+        self.summary.metadata.get(key).map(String::as_str)
     }
 
     fn serialize_native<S>(

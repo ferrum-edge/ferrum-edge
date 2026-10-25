@@ -4821,8 +4821,17 @@ pub(crate) fn store_request_body_metadata(
         && (ctx.request_body_sha256.is_none() || ctx.request_body_sha512.is_none())
     {
         use crate::fips::approved::{Sha256, Sha512};
-        ctx.request_body_sha256 = Some(Sha256::digest(body));
-        ctx.request_body_sha512 = Some(Sha512::digest(body));
+        // Hash only for the algorithms the client's digest field presented;
+        // the consumer refuses a presented algorithm whose snapshot is absent,
+        // so skipping an unrequested one never weakens verification.
+        let (wants_sha256, wants_sha512) =
+            crate::plugins::hmac_auth::presented_body_digest_algorithms(ctx);
+        if wants_sha256 && ctx.request_body_sha256.is_none() {
+            ctx.request_body_sha256 = Some(Sha256::digest(body));
+        }
+        if wants_sha512 && ctx.request_body_sha512.is_none() {
+            ctx.request_body_sha512 = Some(Sha512::digest(body));
+        }
     }
 }
 
@@ -34376,6 +34385,11 @@ async fn handle_proxy_request_inner(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // RFC 9421 `hmac_auth` signs the client's request line: retain the wire
+    // method an Extended CONNECT WebSocket rewrite replaced, and any
+    // request-target the path and query cannot reproduce. Allocation-free for
+    // an ordinary request.
+    ctx.record_wire_request_line_for_hmac(req.method().as_str(), inbound_version, req.uri());
     // Whether DATA may follow the head, from the transport itself: hyper
     // reports end-of-stream for an HTTP/1.1 request without body framing and
     // for an HTTP/2 HEADERS frame carrying END_STREAM. Body policies read this

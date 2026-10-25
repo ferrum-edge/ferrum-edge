@@ -961,7 +961,7 @@ async fn test_consumer_fallback_to_ip() {
 
 #[tokio::test]
 async fn test_reads_tokens_from_ai_token_metrics_metadata() {
-    // When ai_token_metrics runs first (priority 4100), it writes token counts
+    // When ai_token_metrics runs first (priority 4070), it writes token counts
     // to ctx.metadata. ai_rate_limiter (priority 4200) should read from
     // metadata instead of re-parsing the response body.
     let plugin = AiRateLimiter::new(

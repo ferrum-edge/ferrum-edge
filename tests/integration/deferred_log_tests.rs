@@ -2490,3 +2490,58 @@ async fn grpc_web_passthrough_drop_without_a_logger_classifies_the_backend_statu
     assert_eq!(drain_passthrough(body).await, wire);
     assert_eq!(recorded.statuses(), vec![503]);
 }
+
+/// A stream observer publishes typed AI usage from its terminal hook, after the
+/// header-commit summary skeleton was captured. The fired summary must carry
+/// that usage, or `prometheus_metrics` never counts streamed tokens or cost
+/// (ai_token_metrics-SOL-2).
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_hook_ai_usage_export_reaches_the_logged_summary() {
+    let token_metrics: Arc<dyn Plugin> = Arc::new(
+        ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics::new(&serde_json::json!({
+            "cost_per_prompt_token": 0.000001,
+            "cost_per_completion_token": 0.000002
+        }))
+        .expect("valid ai_token_metrics config"),
+    );
+    let (capturing, captured) = CapturingPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![token_metrics, Arc::new(capturing)];
+    let mut ctx = make_ctx();
+    let body: &[u8] = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\ndata: [DONE]\n\n";
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("ai_token_metrics observes a 2xx SSE stream");
+    match inspector.on_chunk(body).await {
+        ResponseStreamAction::Forward(bytes) => assert_eq!(&bytes[..], body),
+        ResponseStreamAction::Terminate(_) => panic!("observer must not truncate"),
+    }
+    let _ = inspector.on_end().await;
+    drop(inspector);
+    assert!(
+        ctx.authoritative_ai_usage_export().is_none(),
+        "usage is published by the terminal hook, not at header commit"
+    );
+
+    let logger =
+        DeferredTransactionLogger::new(make_summary_with_status(200), Arc::new(plugins), ctx);
+    logger.fire(BodyOutcome::success(body.len() as u64));
+
+    let captures = wait_for_captures(&captured, 1).await;
+    assert_eq!(captures.len(), 1, "log should fire exactly once");
+    let export = captures[0]
+        .ai_usage_export
+        .as_ref()
+        .expect("terminal-hook usage must reach the logged summary");
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.prompt_tokens, Some(11));
+    assert_eq!(export.completion_tokens, Some(7));
+    assert_eq!(export.total_tokens, Some(18));
+    assert!(export.cost.is_some());
+    assert_eq!(
+        captures[0]
+            .metadata
+            .get("ai_total_tokens")
+            .map(String::as_str),
+        Some("18")
+    );
+}

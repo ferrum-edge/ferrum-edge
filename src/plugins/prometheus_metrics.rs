@@ -885,6 +885,23 @@ const OAUTH2_INTROSPECTION_CACHE_ADMISSION_SKIP_REASONS: [&str; 7] = [
 ];
 const OAUTH2_INTROSPECTION_CACHE_EVICTION_REASONS: [&str; 2] = ["capacity", "expired"];
 
+/// `response_caching` lookup outcomes, as `(X-Cache-Status value, metric label)`.
+/// A fixed, compiled-in set: the label is the outcome class only and never a
+/// cache key, path, host, caller, or plugin-instance identifier.
+const RESPONSE_CACHE_LOOKUP_STATUSES: [(&str, &str); 5] = [
+    ("HIT", "hit"),
+    ("MISS", "miss"),
+    ("BYPASS", "bypass"),
+    ("REVALIDATED", "revalidated"),
+    ("PREDICTED-BYPASS", "predicted_bypass"),
+];
+
+fn response_cache_lookup_status_index(status: &str) -> Option<usize> {
+    RESPONSE_CACHE_LOOKUP_STATUSES
+        .iter()
+        .position(|(candidate, _)| *candidate == status)
+}
+
 fn oauth2_introspection_cache_class_index(class: &str) -> Option<usize> {
     OAUTH2_INTROSPECTION_CACHE_CLASSES
         .iter()
@@ -1023,6 +1040,10 @@ pub struct MetricsRegistry {
     oauth2_introspection_cache_evictions: [[AtomicU64; 2]; 2],
     /// Bounded eviction/cleanup tickets examined.
     oauth2_introspection_cache_cleanup_work: AtomicU64,
+    /// `response_caching` lookup outcomes by the fixed
+    /// [`RESPONSE_CACHE_LOOKUP_STATUSES`] classes. Each slot is padded onto its
+    /// own cache line because every cache-eligible request increments one.
+    response_cache_lookups: [CachePadded<AtomicU64>; 5],
     /// Admin configuration mutations refused because the Admin API is in
     /// read-only mode. Counted only on real admission attempts, not on
     /// observe-only health probes.
@@ -1307,6 +1328,7 @@ impl MetricsRegistry {
                 std::array::from_fn(|_| AtomicU64::new(0))
             }),
             oauth2_introspection_cache_cleanup_work: AtomicU64::new(0),
+            response_cache_lookups: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             admin_read_only_rejected_mutations: AtomicU64::new(0),
             request_mirror_dispatched: AtomicU64::new(0),
             request_mirror_completed: AtomicU64::new(0),
@@ -1978,6 +2000,17 @@ impl MetricsRegistry {
     pub(crate) fn record_oauth2_introspection_cache_cleanup_work(&self) {
         self.oauth2_introspection_cache_cleanup_work
             .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Record one `response_caching` lookup outcome by its `X-Cache-Status`
+    /// value (`HIT`, `MISS`, `BYPASS`, `REVALIDATED`, `PREDICTED-BYPASS`).
+    /// Any other value is ignored, so the exported label set stays fixed.
+    pub fn record_response_cache_lookup(&self, status: &str) {
+        let Some(index) = response_cache_lookup_status_index(status) else {
+            return;
+        };
+        self.response_cache_lookups[index].fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -4721,6 +4754,17 @@ impl MetricsRegistry {
                 .load(Ordering::Relaxed),
             &ns_label,
         );
+
+        output.push_str(
+            "# HELP ferrum_response_cache_lookups_total response_caching lookup outcomes by X-Cache-Status class, across every plugin instance in this process.\n",
+        );
+        output.push_str("# TYPE ferrum_response_cache_lookups_total counter\n");
+        for (index, (_, label)) in RESPONSE_CACHE_LOOKUP_STATUSES.iter().enumerate() {
+            let value = self.response_cache_lookups[index].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "ferrum_response_cache_lookups_total{{status=\"{label}\"{ns_label}}} {value}\n"
+            ));
+        }
 
         // request_mirror lifecycle (aggregate, label-safe; no URLs/plugin IDs).
         // Terminal outcomes for dispatched tasks sum to dispatched:

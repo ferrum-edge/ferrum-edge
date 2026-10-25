@@ -238,6 +238,7 @@ mod tls_offload_tests;
 mod tls_tests;
 mod udp_amplification_tests;
 mod udp_auth_lifetime_tests;
+mod udp_datagram_policy_fence_tests;
 mod udp_dtls_idle_activity_tests;
 mod udp_egress_isolation_tests;
 mod udp_port_handoff_tests;

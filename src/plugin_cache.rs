@@ -2513,18 +2513,85 @@ fn validate_tcp_connection_throttle_attachment(
     }
 }
 
-/// Validate protocol attachment semantics for every enabled TCP throttle in a
+/// `udp_rate_limiting` runs only as a UDP/DTLS datagram hook. A proxy or
+/// proxy-group attachment that reaches a TCP or HTTP-family proxy would be
+/// filtered out of every protocol view that proxy runs — protection that
+/// looks configured but never enforces — so it fails visibly, the mirror of
+/// [`validate_tcp_connection_throttle_attachment`]. A global policy keeps the
+/// ordinary per-protocol filtering, so a mixed deployment applies it to its
+/// UDP/DTLS listeners only.
+fn validate_udp_rate_limiting_attachment(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+) -> Result<(), String> {
+    if !pc.enabled {
+        return Ok(());
+    }
+    if pc.scope == PluginScope::Global {
+        // Filter-only by design (a mixed deployment applies it to its UDP/DTLS
+        // listeners), but a global policy with no UDP/DTLS proxy at all
+        // enforces nothing; say so instead of loading silently.
+        let mut attached = gateway_config.proxies.iter().filter(|proxy| {
+            tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
+        });
+        let mut any_attached = false;
+        let covers_udp = attached.any(|proxy| {
+            any_attached = true;
+            matches!(
+                proxy.effective_scheme(),
+                BackendScheme::Udp | BackendScheme::Dtls
+            )
+        });
+        if any_attached && !covers_udp {
+            warn!(
+                plugin = "udp_rate_limiting",
+                plugin_config_id = ?pc.id,
+                "Global udp_rate_limiting has no UDP/DTLS proxy to protect; it is inert until one is configured"
+            );
+        }
+        return Ok(());
+    }
+    let unsupported: Vec<String> = gateway_config
+        .proxies
+        .iter()
+        .filter(|proxy| scoped_plugin_config_applies_to_proxy(pc, proxy))
+        .filter(|proxy| {
+            !matches!(
+                proxy.effective_scheme(),
+                BackendScheme::Udp | BackendScheme::Dtls
+            )
+        })
+        .map(|proxy| format!("{:?} ({})", proxy.id, proxy.effective_scheme()))
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "udp_rate_limiting: plugin config {:?} is attached to unsupported TCP or HTTP-family proxy/proxies {}; only UDP/DTLS is supported (use tcp_connection_throttle for TCP connection admission or rate_limiting for HTTP-family requests)",
+        pc.id,
+        unsupported.join(", ")
+    ))
+}
+
+/// Validate protocol attachment semantics for every enabled stream-only
+/// protection — `tcp_connection_throttle` and `udp_rate_limiting` — in a
 /// complete candidate graph. Admin admission and config-source validation use
 /// this before persistence/publication so unsupported protection is never
-/// accepted only to be silently filtered from a UDP/DTLS or HTTP plugin list.
+/// accepted only to be silently filtered from another protocol's plugin list.
 pub(crate) fn validate_tcp_connection_throttle_attachments(
     gateway_config: &GatewayConfig,
 ) -> Result<(), Vec<String>> {
     let errors: Vec<String> = gateway_config
         .plugin_configs
         .iter()
-        .filter(|pc| pc.enabled && pc.plugin_name == "tcp_connection_throttle")
-        .filter_map(|pc| validate_tcp_connection_throttle_attachment(pc, gateway_config).err())
+        .filter(|pc| pc.enabled)
+        .filter_map(|pc| match pc.plugin_name.as_str() {
+            "tcp_connection_throttle" => {
+                validate_tcp_connection_throttle_attachment(pc, gateway_config).err()
+            }
+            "udp_rate_limiting" => validate_udp_rate_limiting_attachment(pc, gateway_config).err(),
+            _ => None,
+        })
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -2857,6 +2924,126 @@ fn try_create_plugin(
     finalize_created_plugin(pc, created)
 }
 
+/// SHA-256 policy digest of a UDP datagram-hook plugin set.
+pub(crate) type UdpDatagramPolicyDigest = [u8; 32];
+
+/// Live datagram-hook plugin instance (keyed by its `Arc` data pointer) →
+/// digest of the plugin config it was built from.
+type UdpDatagramPolicyRegistry =
+    std::sync::RwLock<HashMap<usize, (std::sync::Weak<dyn Plugin>, UdpDatagramPolicyDigest)>>;
+
+/// Process registry of datagram-hook instance policy digests, filled once per
+/// constructed instance at the cache-construction funnel and read only while
+/// a protocol entry is built. Entries are `Weak`, pruned on every insert, so
+/// retention is bounded by the live plugin generations. Never touched on a
+/// datagram path.
+static UDP_DATAGRAM_POLICY_DIGESTS: std::sync::OnceLock<UdpDatagramPolicyRegistry> =
+    std::sync::OnceLock::new();
+
+fn plugin_instance_key(plugin: &Arc<dyn Plugin>) -> usize {
+    Arc::as_ptr(plugin) as *const () as usize
+}
+
+/// Digest of everything in one plugin config that decides how its instance
+/// treats datagrams: identity (namespace, id, kind), scope and target,
+/// priority override, execution trigger, and the full config document.
+/// Timestamps and labels are excluded, so a full reload that reconstructs an
+/// unchanged config yields the same digest. `None` (fall back to instance
+/// identity) only if a component cannot be serialized.
+fn udp_datagram_plugin_config_digest(pc: &PluginConfig) -> Option<UdpDatagramPolicyDigest> {
+    use crate::fips::approved::Sha256;
+
+    let scope = serde_json::to_vec(&pc.scope).ok()?;
+    let trigger = serde_json::to_vec(&pc.trigger).ok()?;
+    let config = serde_json::to_vec(&pc.config).ok()?;
+    let priority_override = pc.priority_override.map(u16::to_le_bytes);
+    let mut hasher = Sha256::new();
+    // Length-prefixed framing: no component can be re-read as part of another.
+    let mut absorb = |label: &str, value: &[u8]| {
+        hasher.update((label.len() as u64).to_le_bytes());
+        hasher.update(label.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    };
+    absorb("v", b"ferrum-edge/udp-datagram-plugin-policy/v1");
+    absorb("namespace", pc.namespace.as_bytes());
+    absorb("id", pc.id.as_bytes());
+    absorb("plugin_name", pc.plugin_name.as_bytes());
+    absorb("scope", &scope);
+    absorb("proxy_id", pc.proxy_id.as_deref().unwrap_or("").as_bytes());
+    absorb(
+        "priority_override",
+        priority_override
+            .as_ref()
+            .map_or(&[][..], |bytes| &bytes[..]),
+    );
+    absorb("trigger", &trigger);
+    absorb("config", &config);
+    Some(hasher.finalize())
+}
+
+fn register_udp_datagram_policy_digest(pc: &PluginConfig, plugin: &Arc<dyn Plugin>) {
+    let Some(digest) = udp_datagram_plugin_config_digest(pc) else {
+        return;
+    };
+    let registry = UDP_DATAGRAM_POLICY_DIGESTS.get_or_init(Default::default);
+    let mut guard = registry
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    guard.insert(
+        plugin_instance_key(plugin),
+        (Arc::downgrade(plugin), digest),
+    );
+}
+
+fn registered_udp_datagram_policy_digest(
+    plugin: &Arc<dyn Plugin>,
+) -> Option<UdpDatagramPolicyDigest> {
+    let registry = UDP_DATAGRAM_POLICY_DIGESTS.get()?;
+    let guard = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (weak, digest) = guard.get(&plugin_instance_key(plugin))?;
+    let live = weak.upgrade()?;
+    Arc::ptr_eq(&live, plugin).then_some(*digest)
+}
+
+/// Stable policy digest of the datagram-hook plugins in `plugins`, in chain
+/// order (`udp_rate_limiting` and every other `requires_udp_datagram_hooks`
+/// plugin; the rest are ignored because an established session never re-runs
+/// them).
+///
+/// Each instance contributes the digest of the plugin config it was built
+/// from, so a full rebuild that reconstructs semantically identical instances
+/// (file-mode `SIGHUP`, a DP full snapshot, a DB-mode full reload) yields the
+/// SAME digest and established UDP/DTLS sessions continue, while any change to
+/// a datagram plugin's config, trigger, priority, presence, or order changes
+/// it. An instance that was not built through the cache funnel contributes its
+/// `Arc` identity instead, which is the conservative (session-ending) answer.
+pub(crate) fn udp_datagram_policy_digest(plugins: &[Arc<dyn Plugin>]) -> UdpDatagramPolicyDigest {
+    use crate::fips::approved::Sha256;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-edge/udp-datagram-policy/v1");
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.requires_udp_datagram_hooks())
+    {
+        match registered_udp_datagram_policy_digest(plugin) {
+            Some(digest) => {
+                hasher.update(b"cfg");
+                hasher.update(digest);
+            }
+            None => {
+                hasher.update(b"ptr");
+                hasher.update((plugin_instance_key(plugin) as u64).to_le_bytes());
+            }
+        }
+    }
+    hasher.finalize()
+}
+
 /// Apply the shared post-construction contract to a plugin instance built for
 /// `pc`: compile and admit an execution trigger, wrap a priority override, and
 /// turn a construction failure into the configured failure-policy outcome.
@@ -2920,6 +3107,9 @@ fn finalize_created_plugin(
             } else {
                 plugin
             };
+            if plugin.requires_udp_datagram_hooks() {
+                register_udp_datagram_policy_digest(pc, &plugin);
+            }
             Ok(Some(plugin))
         }
         Ok(None) => {
@@ -4579,6 +4769,38 @@ fn create_adaptive_concurrency_plugin(
 struct ProxyGroupPluginInstance {
     plugin: Arc<dyn Plugin>,
     config: PluginConfig,
+    /// Raw named-schema definition the instance's `schema_ref` resolved to
+    /// when it was constructed (`None` when the config carries no
+    /// `schema_ref`, or the name was unresolved). Loggers compile `schema_ref`
+    /// once at construction, so the referenced definition is part of what the
+    /// shared instance IS: an incremental rebuild must not retain a group
+    /// instance whose own row is unchanged when the definition it resolved has
+    /// since changed.
+    schema_ref_definition: Option<Arc<serde_json::Value>>,
+}
+
+impl ProxyGroupPluginInstance {
+    /// Record a freshly constructed group instance together with the
+    /// named-schema definition its `schema_ref` resolves to right now. Called
+    /// on the same thread, inside the same reload bracket, as the
+    /// construction itself, so the captured definition is the one the
+    /// constructor compiled.
+    fn new(plugin: Arc<dyn Plugin>, config: PluginConfig) -> Self {
+        let schema_ref_definition = proxy_group_schema_ref_definition(&config);
+        Self {
+            plugin,
+            config,
+            schema_ref_definition,
+        }
+    }
+}
+
+/// The raw named-schema definition a plugin config's `schema_ref` resolves to
+/// in the registry view of the calling thread (the open reload staging map on
+/// the reload thread, the live map elsewhere).
+fn proxy_group_schema_ref_definition(config: &PluginConfig) -> Option<Arc<serde_json::Value>> {
+    let name = config.config.get("schema_ref")?.as_str()?;
+    crate::plugins::utils::log_schema::registry::lookup_named_raw(name)
 }
 
 /// Built-in plugin types whose constructed instance can participate in a
@@ -5643,6 +5865,9 @@ pub(crate) fn node_waypoint_destination_authz_ready_over_globals_for_test(
 struct ProtocolEntry {
     plugins: PluginList,
     phase: PluginPhaseData,
+    /// [`udp_datagram_policy_digest`] of `plugins`, computed once when the
+    /// entry is built. `Some` only for the UDP view.
+    udp_datagram_policy_digest: Option<UdpDatagramPolicyDigest>,
 }
 
 /// All per-proxy protocol data, swapped atomically as one unit.
@@ -5774,9 +5999,12 @@ fn build_protocol_entry(
     if view_omits_route_admission_policy(plugins, globals, proto) {
         phase.capabilities.0 |= PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY;
     }
+    let udp_datagram_policy_digest =
+        (proto == ProxyProtocol::Udp).then(|| udp_datagram_policy_digest(&filtered));
     ProtocolEntry {
         plugins: filtered,
         phase,
+        udp_datagram_policy_digest,
     }
 }
 
@@ -5815,6 +6043,7 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     ProtocolEntry {
         plugins: composed,
         phase,
+        udp_datagram_policy_digest: None,
     }
 }
 
@@ -6469,6 +6698,24 @@ impl PluginCacheInner {
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             self.get_plugins_for_protocol(key.as_str(), protocol)
         })
+    }
+
+    /// Precomputed [`udp_datagram_policy_digest`] of the UDP plugin list
+    /// [`Self::plugins_for_protocol`] returns for `(namespace, proxy_id)`.
+    /// Lock-free and allocation-free when the entry exists (the digest was
+    /// computed when the entry was built); a missing entry is the empty set.
+    pub(crate) fn udp_datagram_policy_digest(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> UdpDatagramPolicyDigest {
+        let precomputed = PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.protocol_entry(key.as_str(), ProxyProtocol::Udp)
+                .and_then(|entry| entry.udp_datagram_policy_digest)
+        });
+        precomputed.unwrap_or_else(|| udp_datagram_policy_digest(&[]))
     }
 
     /// Authenticate-phase plugins for a composed `proxy_key` + protocol.
@@ -7712,6 +7959,19 @@ impl PluginCache {
                 HashMap::new()
             };
 
+        // Unwind-safety net for the named-schema reload bracket opened below:
+        // the explicit commit/abort calls on every normal path disarm it, and
+        // its `Drop` discards the staging map if construction panics before
+        // either runs (see `registry::begin_reload_guarded`).
+        let _schema_reload_guard = if rebuild_globals {
+            Some(
+                crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                    .map_err(|error| format!("Config reload rejected: {error}"))?,
+            )
+        } else {
+            None
+        };
+
         // Rebuild globals if any global plugin config changed
         let mut new_globals = if rebuild_globals {
             let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
@@ -7728,9 +7988,8 @@ impl PluginCache {
             // `transaction_log_schema` itself changed — the bracket is
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
-            // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload()
-                .map_err(|error| format!("Config reload rejected: {error}"))?;
+            // was the trigger for the rebuild. The bracket itself was opened
+            // just above, guarded against unwinding.
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -7894,6 +8153,16 @@ impl PluginCache {
         // instances that are still referenced in the post-delta config. This
         // keeps state shared with unchanged proxies but drops cascade-deleted
         // group state once the last proxy association is removed.
+        //
+        // A retained instance must also still resolve the same named-schema
+        // definition: loggers compile `schema_ref` at construction, so when a
+        // global `transaction_log_schema` change re-staged the registry
+        // (`rebuild_globals`) and the definition a group instance resolved has
+        // changed, retaining it would keep emitting the old output contract
+        // (for example a newly added privacy `omit`) indefinitely. Such groups
+        // are reconstructed against the staged registry below, and every proxy
+        // associated with them is rebuilt so they keep sharing one instance.
+        let mut schema_invalidated_groups: Vec<NamespacedResourceId> = Vec::new();
         let mut group_plugin_instances: ProxyGroupInstanceMap = current
             .proxy_group_plugins
             .iter()
@@ -7902,6 +8171,12 @@ impl PluginCache {
                     return None;
                 }
                 let pc = proxy_group_configs.get(identity)?;
+                if rebuild_globals
+                    && proxy_group_schema_ref_definition(pc) != existing.schema_ref_definition
+                {
+                    schema_invalidated_groups.push(identity.clone());
+                    return None;
+                }
                 if pc.plugin_name == "adaptive_concurrency"
                     && !adaptive_concurrency_instances
                         .contains_key(&adaptive_concurrency_policy_id(pc))
@@ -7921,6 +8196,22 @@ impl PluginCache {
                 }
             })
             .collect();
+        if !schema_invalidated_groups.is_empty() {
+            for proxy in &config.proxies {
+                let references_invalidated_group = proxy.plugins.iter().any(|assoc| {
+                    schema_invalidated_groups.iter().any(|identity| {
+                        *identity
+                            == NamespacedResourceId::new(
+                                proxy.namespace.as_str(),
+                                assoc.plugin_config_id.as_str(),
+                            )
+                    })
+                });
+                if references_invalidated_group {
+                    proxy_ids_to_rebuild.insert(proxy_namespaced_id(proxy));
+                }
+            }
+        }
         if let Some(forced) = forced_country_mmdb_instances {
             for (id, plugin_config) in &active_country_mmdb_configs {
                 if plugin_config.scope != PluginScope::ProxyGroup {
@@ -7932,10 +8223,7 @@ impl PluginCache {
                             plugin_config.namespace.as_str(),
                             plugin_config.id.as_str(),
                         ),
-                        ProxyGroupPluginInstance {
-                            plugin: Arc::clone(plugin),
-                            config: (*plugin_config).clone(),
-                        },
+                        ProxyGroupPluginInstance::new(Arc::clone(plugin), (*plugin_config).clone()),
                     );
                 }
             }
@@ -8050,10 +8338,10 @@ impl PluginCache {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
@@ -8658,8 +8946,11 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload()
-            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        // The guard is an unwind-safety net only: the explicit commit/abort
+        // calls below close the bracket on every normal path.
+        let _schema_reload_guard =
+            crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -8839,10 +9130,10 @@ impl PluginCache {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);

@@ -1571,6 +1571,7 @@ mod udp_datagram_faults {
     ) -> UdpDatagramContext<'a> {
         UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
+            client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_id: Arc::from("udp-proxy"),
             proxy_name: Some(Arc::from("udp")),
             listen_port: 9000,
@@ -1928,6 +1929,7 @@ mod blast_radius {
     fn client_datagram(payload: &[u8]) -> UdpDatagramContext<'_> {
         UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
+            client_ip_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             proxy_id: Arc::from("udp-proxy"),
             proxy_name: None,
             listen_port: 9000,

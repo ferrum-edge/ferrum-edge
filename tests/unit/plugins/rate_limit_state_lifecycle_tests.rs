@@ -904,3 +904,32 @@ fn udp_rate_limiting_defaults_and_unset_axes_share_state() {
         "an unbounded byte axis is not the same policy as a bounded one"
     );
 }
+
+/// `ipv6_prefix` and `direction` decide which datagrams share one counter, so
+/// they are effective semantics: an omitted value and its explicit default
+/// share state, and a real change isolates onto fresh state.
+#[test]
+fn udp_rate_limiting_prefix_and_direction_are_effective_semantics() {
+    let omitted = json!({"datagrams_per_second": 10});
+    let explicit_defaults = json!({
+        "datagrams_per_second": 10,
+        "ipv6_prefix": 64,
+        "direction": "both"
+    });
+    assert!(
+        udp_pair("norm-udp-defaults", &omitted, &explicit_defaults),
+        "omitted ipv6_prefix/direction are the effective /64 and both-direction defaults"
+    );
+
+    let wider = json!({"datagrams_per_second": 10, "ipv6_prefix": 56});
+    assert!(
+        !udp_pair("norm-udp-prefix", &omitted, &wider),
+        "a changed IPv6 grouping prefix must isolate onto fresh state"
+    );
+
+    let ingress_only = json!({"datagrams_per_second": 10, "direction": "client_to_backend"});
+    assert!(
+        !udp_pair("norm-udp-direction", &omitted, &ingress_only),
+        "a changed counted direction must isolate onto fresh state"
+    );
+}
