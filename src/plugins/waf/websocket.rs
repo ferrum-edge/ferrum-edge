@@ -73,7 +73,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use super::rules::{RuleAction, Severity};
-use super::scan::{ScanOutcome, ScanSubject};
+use super::scan::{BodyExtent, ScanOutcome, ScanSubject};
 use super::{BodyDirection, GlobalMode, TimeoutAction, TooLargeAction, Waf};
 use crate::plugins::{
     Plugin, ProxyProtocol, RequestContext, WebSocketFrameDirection, WebSocketSizeLimits,
@@ -538,10 +538,12 @@ impl Plugin for WafWsSession {
             return None;
         }
 
+        let message_len = payload.len();
         let payload = match self.clamp(proxy_id, connection_id, direction, payload) {
             Ok(value) => value,
             Err(terminal) => return terminal,
         };
+        let extent = BodyExtent::of(payload.len() < message_len);
 
         // The scan subject is built inside the closure so nothing but `&self`
         // (and the message slice) is held across the budget yield.
@@ -550,9 +552,9 @@ impl Plugin for WafWsSession {
             .run_body_scan_with_budget(|| {
                 let subject = ScanSubject::WebSocketSession(&self.policy);
                 match governed {
-                    BodyDirection::Request => {
-                        self.waf.scan_request_body_rules(subject, payload, None)
-                    }
+                    BodyDirection::Request => self
+                        .waf
+                        .scan_request_body_rules(subject, payload, None, extent),
                     BodyDirection::Response => {
                         self.waf.scan_response_body_rules(subject, payload, None)
                     }
