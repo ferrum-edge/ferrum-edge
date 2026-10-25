@@ -28,40 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `ws_logging`: collector credentials move to `custom_headers`; disconnect records gain fields (#6852)
+### `cors` method and header lists are bounded (#6844)
 
-`ws_logging` now refuses an `endpoint_url` whose query carries a
-credential-shaped parameter name (exact `jwt`, `pass`, `pwd`, `sid`,
-`sig`, `signature`; any name ending in `key`; or any name containing `token`,
-`secret`, `password`, `passwd`, `passphrase`, `api_key` / `apikey` /
-`api-key`, `access_key` / `accesskey`, `assertion`, `auth` (so also `authorization`, `x-auth`), `bearer`,
-`cookie`, `credential`, or `session`), a name that is still percent-encoded
-after one decode, an explicit port `0`, or a fragment. Such a config fails
-validation (Admin API `400`, file-mode/`validate` failure; `KeepLastKnownGood`
-keeps the previous instance). Move the credential into the new
-`custom_headers` object, preferably through the plugin-secret namespace. The
-reference is only shape-checked at admission, so a control plane does not need
-the variable; set it on every serving node, where an unset or empty value
-rejects the config reload (the previous configuration keeps serving) or aborts
-gateway startup:
-
-```yaml
-plugin_name: ws_logging
-config:
-  endpoint_url: "wss://collector.example.com/ingest"
-  custom_headers:
-    Authorization: "Bearer ${FERRUM_PLUGIN_SECRET_LOG_COLLECTOR_TOKEN}"
-```
-
-The collector must accept the credential as a handshake header. Non-credential
-query parameters (`?stream=edge`) are still admitted.
-
-WebSocket disconnect records now include `http_method`, `request_path`,
-`handshake_status_code`, and `connection_id`. Log pipelines with a closed
-column set must accept them (or drop them with a `schema` `omit`).
-Flattened disconnect metadata keys named `http_method` or `request_path` now
-yield to the native values under `on_collision: skip`. An existing schema
-`order` needs no change: disconnect-only fields it does not list are appended.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
@@ -196,6 +173,36 @@ A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
 answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
+
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
 
 ### Backend idle connections: higher default ceiling (#6793)
 
