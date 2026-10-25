@@ -5987,6 +5987,20 @@ pub mod _test_support {
         plugin.admit_sealed_redis_hit_for_tests(redis_key, status_code, headers, body)
     }
 
+    /// Seal an authenticated envelope as a writer whose wall clock is
+    /// `seal_offset_seconds` ahead of (positive) or behind (negative) this
+    /// replica and classify it as a Redis lookup would: `"admit"`, `"miss"`
+    /// (authentic but not fresh, never quarantined), or `"quarantine"`.
+    pub fn ai_semantic_cache_redis_hit_verdict_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        redis_key: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        seal_offset_seconds: i64,
+    ) -> &'static str {
+        plugin.redis_hit_verdict_for_tests(redis_key, headers, body, seal_offset_seconds)
+    }
+
     pub fn ai_semantic_cache_instance_id_for_test(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
     ) -> u64 {

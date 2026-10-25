@@ -28,34 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `opa`: identity realms, repeated headers, credential redaction, and empty bodies (#6860)
+### `cors` method and header lists are bounded (#6844)
 
-- **Realm-aware policies.** For an external identity (no mapped Consumer),
-  `input.consumer` now includes `realm: {mechanism, authority}`. Policies that
-  authorize on `input.consumer.identity` should also match `realm` (and
-  require it to be non-null): read each authority's digest from OPA's
-  decision log for a test request and pin it in Rego. Existing fields are
-  unchanged.
-- **Repeated headers are denied by default.** A request that repeats a
-  non-list header (for example two `X-Role` lines) now receives
-  `deny_status` before OPA is called (`opa.reason` `ambiguous_header`).
-  Clients that legitimately send such duplicates must fold them, or set
-  `header_ambiguity_policy: delegate` and deny on
-  `input.header_ambiguity` in Rego. List-valued fields (`Accept*`,
-  `Cache-Control`, `Cookie`, `Via`, `X-Forwarded-*`, …) are unaffected.
-- **More names are redacted.** Headers and query parameters that the shared
-  sensitive-name classifier recognizes as credentials (`x-vault-token`,
-  `x-session-id`, `refresh_token`, `client_secret`, `password`,
-  `X-Amz-Signature`, …) no longer reach `input.headers`, `input.query`, or
-  the pair lists. A policy that read one must stop relying on it; for query
-  names, `include_query_credentials: true` restores them.
-- **Empty bodies.** With `include_body: true`, a bodiless HTTP/1.1 or HTTP/2
-  request now has `input.body == ""` (it was `null`), matching HTTP/3 and
-  `Content-Length: 0`. `null` now only means no body was collected (for
-  example a WebSocket handshake). Rules that tested `input.body == null` for
-  an empty request must test `""`.
-- New opt-in keys `decision_request_headers`, `decision_deny_response`, and
-  `max_concurrent_decisions` change nothing unless configured.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
@@ -190,6 +173,36 @@ A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
 answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
+
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
 
 ### Backend idle connections: higher default ceiling (#6793)
 
