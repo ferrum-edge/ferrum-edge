@@ -28,6 +28,37 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ws_logging`: collector credentials move to `custom_headers`; disconnect records gain fields (#6852)
+
+`ws_logging` now refuses an `endpoint_url` whose query carries a
+credential-shaped parameter name (exact `auth`, `jwt`, `key`, `pass`, `pwd`,
+`sid`, `sig`, `signature`, or any name containing `token`, `secret`,
+`password`, `passwd`, `api_key` / `apikey` / `api-key`, `access_key` /
+`accesskey`, `authorization`, `bearer`, `credential`, or `session`), a name
+that is still percent-encoded after one decode, an explicit port `0`, or a
+fragment. Such a config fails validation (Admin API `400`, file-mode/`validate`
+failure; `KeepLastKnownGood` keeps the previous instance). Move the credential
+into the new `custom_headers` object, preferably through the plugin-secret
+namespace:
+
+```yaml
+plugin_name: ws_logging
+config:
+  endpoint_url: "wss://collector.example.com/ingest"
+  custom_headers:
+    Authorization: "Bearer ${FERRUM_PLUGIN_SECRET_LOG_COLLECTOR_TOKEN}"
+```
+
+The collector must accept the credential as a handshake header. Non-credential
+query parameters (`?stream=edge`) are still admitted.
+
+WebSocket disconnect records now include `http_method`, `request_path`,
+`handshake_status_code`, and `connection_id`. Log pipelines with a closed
+column set must accept them (or drop them with a `schema` `omit`), and a
+`ws_logging` schema whose `order` lists every field without `"*"` must add
+them. Flattened disconnect metadata keys named `http_method` or
+`request_path` now yield to the native values under `on_collision: skip`.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

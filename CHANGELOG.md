@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `ws_logging` refuses credential-shaped `endpoint_url` query
+  parameters; collector credentials move to `custom_headers`** (issue #6852).
+  A query parameter whose decoded name is `auth`, `jwt`, `key`, `pass`, `pwd`,
+  `sid`, `sig`, or `signature`, or contains `token`, `secret`, `password`,
+  `passwd`, `api_key` / `apikey` / `api-key`, `access_key` / `accesskey`,
+  `authorization`, `bearer`, `credential`, or `session`, is refused at
+  config load, as is a name still percent-encoded after one decode, an
+  explicit port `0`, and a fragment. The new `custom_headers` object adds
+  headers to the WebSocket upgrade request; a value may embed one
+  `${FERRUM_PLUGIN_SECRET_<NAME>}` reference, values are never logged, and
+  admin API projections redact them. Handshake-owned headers (`Host`,
+  `Upgrade`, `Sec-WebSocket-Key`, …) are refused.
+- **BREAKING — `ws_logging` WebSocket disconnect records gain
+  `http_method`, `request_path`, `handshake_status_code`, and
+  `connection_id`** (issue #6852). They repeat the upgrade handshake and
+  carry the session ID `ws_frame_logging` frame events use, and are
+  schema-addressable. Pipelines with a closed column set must accept them, a
+  `ws_logging` schema `order` without `"*"` must list them, and flattened
+  disconnect metadata named `http_method` / `request_path` now yields to the
+  native value under `on_collision: skip`.
+- **`ws_logging` dialing, inbound frames, and codec memory** (issue #6852).
+  When the endpoint resolves to several addresses, each but the last may
+  spend at most an equal share of the remaining `connect_timeout_ms`, so a
+  silently unreachable first address can no longer keep a reachable one from
+  being dialed. `inbound_message_policy: ignore` keeps the connection when a
+  collector sends greetings or per-batch acknowledgements (the default
+  `invalidate` is unchanged). A successful send of a batch above 1 MiB now
+  closes the connection afterwards, freeing the WebSocket codec's output
+  buffer, which no byte lease charges once the batch is sent.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -361,6 +390,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The `tungstenite::handshake::client` log target is always off** (issue
+  #6852). It renders the complete WebSocket upgrade request at TRACE — path,
+  query, and every header, including a proxied client's `Authorization` /
+  `Cookie` and `ws_logging` collector credentials. Every output filter the
+  gateway builds (startup and RTDS `ferrum.log.level` reload) now forces that
+  target off, even when `RUST_LOG` names it explicitly; the module emits
+  nothing at WARN or above.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their
