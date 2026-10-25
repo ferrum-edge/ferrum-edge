@@ -9391,6 +9391,7 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
+| `name` | String \| null | omitted | Optional operator label, 1–128 printable ASCII characters without whitespace. Published as `mesh_route_dispatch.rule_name` match metadata (see [Match observability](#match-observability)) |
 | `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`, `timeout_ms`, `timeout_disabled: true`, `request_timeout_ms`, `attempt_timeout_ms`, `retry`, `retry_disabled: true`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
 | `destination` | Object | `{}` | Route override applied on match. At least one field must be set unless the rule carries a `redirect` |
 | `timeout_ms` | u64 \| null | omitted | Route-local backend response/read timeout. `0` means "no timeout". Cannot be combined with `timeout_disabled: true` |
@@ -9411,11 +9412,13 @@ type column says so. Unknown keys are rejected at every level.
 |---|---|---|---|
 | `methods` | (String \| Object)[] | `[]` | Any-of. A bare string is an `exact` match; the object form is an Istio `StringMatch` with **exactly one** of `exact` / `prefix` / `regex`. `exact` and `prefix` operands must be non-empty RFC 9110 method tokens — an empty value or one containing a space (`"GET POST"`) is rejected at load, because it could never match. `exact` preserves operator casing (`"get"` matches only `get`); `prefix` is ASCII-uppercased at load; `regex` is compiled verbatim between full-input anchors. Empty array = no method restriction |
 | `headers` | Object | `{}` | All-of, keyed by header name. Names must be RFC 9110 tokens and are ASCII-lowercased at load; duplicates after normalization are rejected. Values take the same bare-string / `StringMatch` shapes as `methods`. An `exact: ""` predicate legitimately means "present and empty"; empty `prefix` / `regex` operands are rejected |
-| `query_params` | Object | `{}` | All-of equality on the canonical decoded query — see the fail-closed contract above |
+| `without_headers` | Object | `{}` | Negated header predicates (Istio `withoutHeaders`), keyed and normalized like `headers`, with the same value shapes. The rule fails when **any** listed header is present and its value satisfies the matcher; an absent header never vetoes it, so `{"x-legacy": {"regex": ".*"}}` requires the header to be absent (the translator's projection of Istio's presence-only `withoutHeaders: {x-legacy: {}}`) |
+| `query_params` | Object | `{}` | All-of, keyed by exact parameter name, on the canonical decoded query — see the fail-closed contract above. A value is a bare string (`exact`) or a `StringMatch` with exactly one of `exact` / `prefix` / `regex`; `regex` must match the full decoded value, and empty `prefix` / `regex` operands are rejected |
 | `authority` | String \| Object \| null | omitted | `Host` / `:authority` predicate, bare string or `StringMatch`. Case-sensitive for `exact` / `prefix`, including an explicit request port; write `(?i)` for a case-insensitive `regex`. All operands must be non-empty |
 | `source_namespace` | String \| null | omitted | Source workload namespace, read from the peer SPIFFE ID. Exact and case-sensitive; empty or whitespace-bearing values are rejected. Fails closed (no match) when there is no resolved peer identity |
 | `uri` | Object \| null | omitted | `StringMatch` on the request path. Normally omitted because the proxy's `listen_path` already gates URI selection; the translator emits it for `ignoreUriCase` routes and collapsed route-order fallbacks. `regex` must match the full path |
 | `ignore_uri_case` | bool | `false` | Fold ASCII case for `uri.exact` / `uri.prefix` only. Rejected without a `uri` predicate, and it never affects `uri.regex`, headers, methods, or authority |
+| `port` | 1–65535 \| null | omitted | Destination port the client addressed (Istio `match.port`), from trusted provenance only: the original destination when capture rewrote the accept socket, otherwise the frontend listener port — never `Host` or forwarding headers. A request with neither does not match |
 
 **`rules[].destination`**
 
@@ -9443,16 +9446,16 @@ type column says so. Unknown keys are rejected at every level.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `uri` | String \| null | omitted | Replacement path. Must be a canonical absolute path with no query or fragment; percent escapes, dot segments, backslashes, and CRLF are rejected at load, and the composed path is re-checked before publication |
-| `authority` | String \| null | omitted | Replacement `Host` / `:authority`. Non-empty, CRLF-free, no whitespace |
+| `authority` | String \| null | omitted | Replacement `Host` / `:authority`. Must be exactly `host` or `host:port`: a DNS name or IPv4 literal (letters, digits, `-`, `.`, `_`) or a bracketed IPv6 literal, optionally followed by a decimal port `1`–`65535`. A path, query, fragment, userinfo, whitespace, or a bare (unbracketed) IPv6 literal is rejected at load |
 | `match_prefix` | String \| null | omitted | The literal prefix to replace with `uri`. Replacement is literal: the unmatched suffix is appended **verbatim**, so `match_prefix: /prefix/old` + `uri: /new` forwards `/prefix/oldtail` as `/newtail`, never `/new/tail`. A doubled separator is collapsed when both sides carry a `/` (`match_prefix: /prefix` + `uri: /` forwards `/prefix/etc` as `/etc`). A suffix whose first complete segment is `.` or `..` keeps its boundary so the canonical-path check refuses it (`/prefix/old../admin` composes `/new/../admin` and returns `400`); other dot-leading suffixes remain literal (`/prefix/old.env` becomes `/new.env`, and `..hidden` becomes `/new..hidden`). An empty string strips nothing and prepends `uri` (`match_prefix: ""` + `uri: /v2` forwards `/users` as `/v2/users`); the Gateway API translator emits it for a `URLRewrite` / `RequestRedirect` `ReplacePrefixMatch` under the root `PathPrefix: /`. Omit the field for whole-path replacement. A `match_prefix` with no `uri` is inert and dropped |
 
 **`rules[].redirect`** — every field is optional; a status-only redirect preserves the request URL.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. Must be non-empty: a Gateway API `ReplacePrefixMatch` with an empty `replacePrefixMatch` (strip the matched prefix) is translated to `uri: /`, which composes `/old` → `/`, `/old/` → `/`, and `/old/child` → `/child` under `match_prefix: /old`. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
+| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. Must be an absolute path (leading `/`) whose path component is already canonical (no dot segments, backslashes, or escapes that decode differently), without a fragment or whitespace; it may carry its own `?query` unless `match_prefix` is set, because the unmatched suffix is appended after `uri`. A relative value is rejected at load because it would be concatenated onto the authority (`uri: new` would have redirected `app.example.com` to the different host `app.example.comnew`). A Gateway API `ReplacePrefixMatch` with an empty `replacePrefixMatch` (strip the matched prefix) is translated to `uri: /`, which composes `/old` → `/`, `/old/` → `/`, and `/old/child` → `/child` under `match_prefix: /old`. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
 | `match_prefix` | String \| null | omitted | Prefix replaced by `uri`, with the same literal-substitution contract as `rewrite.match_prefix` |
-| `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset |
+| `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset. Same `host` / `host:port` grammar as `rewrite.authority` |
 | `port` | 1–65535 \| null | omitted | Replacement authority port. Mutually exclusive with `derive_port` |
 | `derive_port` | String \| null | omitted | `FROM_PROTOCOL_DEFAULT` (80/http, 443/https) or `FROM_REQUEST_PORT` (original-destination port under capture, otherwise the frontend listener port — never `X-Forwarded-Port` / `Forwarded`). Mutually exclusive with `port` |
 | `scheme` | String \| null | omitted | `http` or `https`, ASCII-lowercased before validation (so `HTTPS` is accepted). The request's frontend scheme is preserved when unset |
@@ -9511,6 +9514,10 @@ still rejected at admission.
 - **Whole-destination replacement.** A matching instance replaces all four
   override fields (`upstream_id`, `backend_host`, `backend_port`, `backend_tls`);
   a non-matching instance leaves an earlier instance's override intact.
+- **`Host` ownership.** A matching rule without `rewrite.authority` undoes only a
+  `Host` rewrite an earlier dispatch instance made, restoring the value that was
+  live just before that rewrite. A `Host` another plugin set before the dispatch
+  block is the forwarded authority the rule inherits and is left untouched.
 - **Protocol scope.** The plugin runs on HTTP, gRPC, and WebSocket at priority
   2995. A WebSocket override selects the upgrade backend only — frames are not
   re-routed after the upgrade — and an HBONE `CONNECT` is matched on the outer
@@ -9709,10 +9716,35 @@ and nothing is allocated for it.
 
 Route header transforms are published onto the request context and applied by
 proxy core after the last **eligible** (enabled) `request_transformer` /
-`response_transformer` in the chain. A proxy with no such instance forwards the
-request normally and applies neither transform. The VirtualService translator
-auto-emits an `apply_route_overrides: true` consumer; when configuring the plugin
-directly, add one yourself (see the third example below).
+`response_transformer` in the chain. The request list is applied after the
+LATER of that consumer and the last `mesh_route_dispatch` instance, so a
+consumer that a `priority_override` moves ahead of the dispatcher still has the
+matched rule's list applied once the dispatcher has published it — route policy
+is never silently dropped because of chain order.
+
+A chain whose rules carry `request_transform` / `response_transform` but that has
+no configured `request_transformer` / `response_transformer` respectively is
+**refused** at plugin-cache construction and admin admission, naming the missing
+consumer; without one the list would be silently dropped and, for example, a
+route rule that strips a sensitive request header would forward it untouched.
+The VirtualService and Gateway API translators auto-emit an
+`apply_route_overrides: true` consumer; when configuring the plugin directly, add
+one yourself (see the third example below). The check counts a configured
+transformer whatever its RTDS gate: an instance an RTDS overlay disables is not
+eligible at runtime and leaves the route list unused, exactly as before, so the
+kill switch never wedges a reload.
+
+##### Match observability
+
+Every matching rule — including one that answers with its own `redirect` or an
+aborted `fault` — publishes transaction-log metadata
+`mesh_route_dispatch.rule_index` (the rule's zero-based position in its
+instance's `rules`) and, when the rule sets `name`, `mesh_route_dispatch.rule_name`.
+A later matching instance overwrites both and removes a stale name when its own
+rule is unnamed. A NodeWaypoint authorization `403` that refuses the matched
+destination withdraws both keys, since the vetoed rule served nothing. Both keys
+are on the built-in safe-metadata allowlist, so they are visible in every
+logging sink by default.
 
 ##### Examples
 

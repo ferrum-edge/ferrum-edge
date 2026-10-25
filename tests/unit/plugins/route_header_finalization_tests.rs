@@ -687,3 +687,170 @@ fn route_transform_diagnostics_keep_indexes_and_withhold_supplied_values() {
         assert!(!rendered.contains("UNREGISTERED_ROUTE_TOKEN"), "{rendered}");
     }
 }
+
+fn route_dispatch_config(transform_field: &str) -> serde_json::Value {
+    json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"backend_host": "backend.internal", "backend_port": 8080},
+        transform_field: [
+            {"operation": "remove", "target": "header", "key": "X-Internal-Role"},
+            {"operation": "update", "target": "header", "key": "X-Tenant", "value": "route-a"},
+            {"operation": "add", "target": "header", "key": "X-Route-Add", "value": "once"}
+        ]
+    }]})
+}
+
+#[tokio::test]
+async fn cache_backed_route_request_policy_applies_when_consumer_precedes_dispatch() {
+    // mesh_route_dispatch-SOL-1: a priority override places the sole consumer
+    // BEFORE the dispatcher publishes its list. Finalizing at the consumer
+    // took an empty slot and silently forwarded the attacker header.
+    let config = make_config(vec![
+        plugin_config(
+            "rt-early",
+            "request_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            Some(2990),
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            route_dispatch_config("request_transform"),
+            None,
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let consumer = plugins
+        .iter()
+        .position(|p| p.name() == "request_transformer")
+        .expect("consumer in chain");
+    let producer = plugins
+        .iter()
+        .position(|p| p.name() == "mesh_route_dispatch")
+        .expect("producer in chain");
+    assert!(
+        consumer < producer,
+        "the scenario requires the consumer to run before the dispatcher"
+    );
+    assert!(plugins[producer].publishes_route_request_header_transforms());
+
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::from([
+        ("x-internal-role".to_string(), "admin".to_string()),
+        ("x-tenant".to_string(), "client".to_string()),
+    ]);
+    run_request_chain(&plugins, &mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("backend.internal")
+    );
+    assert!(
+        !headers.contains_key("x-internal-role"),
+        "route remove must apply even though the consumer ran first; got {:?}",
+        headers.get("x-internal-role")
+    );
+    assert_eq!(headers.get("x-tenant").map(String::as_str), Some("route-a"));
+    assert_eq!(
+        headers.get("x-route-add").map(String::as_str),
+        Some("once"),
+        "non-idempotent route add must apply exactly once"
+    );
+    assert!(ctx.route_override_request_transform.is_none());
+}
+
+fn cache_build_error(config: &GatewayConfig) -> String {
+    match PluginCache::new(config) {
+        Ok(_) => panic!("cache construction must refuse the composition"),
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn cache_refuses_route_transforms_without_a_configured_consumer() {
+    // mesh_route_dispatch-CLAUDE-2: with no transformer on the chain the
+    // published lists were silently dropped (a strip rule forwarded the
+    // header untouched).
+    let request_only = make_config(vec![plugin_config(
+        "mrd",
+        "mesh_route_dispatch",
+        route_dispatch_config("request_transform"),
+        None,
+        None,
+    )]);
+    let error = cache_build_error(&request_only);
+    assert!(
+        error.contains("no request_transformer to apply them"),
+        "{error}"
+    );
+
+    let response_only = make_config(vec![plugin_config(
+        "mrd",
+        "mesh_route_dispatch",
+        route_dispatch_config("response_transform"),
+        None,
+        None,
+    )]);
+    let error = cache_build_error(&response_only);
+    assert!(
+        error.contains("no response_transformer to apply them"),
+        "{error}"
+    );
+
+    // The translator-shaped empty consumer satisfies each direction.
+    for (field, consumer) in [
+        ("request_transform", "request_transformer"),
+        ("response_transform", "response_transformer"),
+    ] {
+        let config = make_config(vec![
+            plugin_config(
+                "consumer",
+                consumer,
+                json!({"rules": [], "apply_route_overrides": true}),
+                None,
+                None,
+            ),
+            plugin_config(
+                "mrd",
+                "mesh_route_dispatch",
+                route_dispatch_config(field),
+                None,
+                None,
+            ),
+        ]);
+        assert!(PluginCache::new(&config).is_ok(), "{field} with {consumer}");
+    }
+
+    // An RTDS-disabled transformer is still the operator's configured
+    // consumer: its kill switch must not wedge the reload.
+    let rtds_disabled = make_config(vec![
+        plugin_config(
+            "rt-disabled",
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Disabled",
+                    "value": "no"
+                }],
+                "runtime_overlay_scope": "gate",
+                "runtime_overlay_resolved_enabled": false
+            }),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            route_dispatch_config("request_transform"),
+            None,
+            None,
+        ),
+    ]);
+    assert!(PluginCache::new(&rtds_disabled).is_ok());
+}

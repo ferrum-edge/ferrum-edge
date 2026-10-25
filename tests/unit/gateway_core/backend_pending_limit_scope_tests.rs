@@ -654,7 +654,7 @@ fn explicit_tls_override_wins_over_destination_snapshot() {
 
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     ctx.route_override_upstream_id = Some("upstream-b".to_string());
-    ctx.route_override_resolved_tls = Some(BackendTlsConfig {
+    ctx.route_override_resolved_tls = Some(Arc::new(BackendTlsConfig {
         client_cert_path: Some("/certs/explicit.pem".to_string()),
         client_key_path: Some("/certs/explicit.key".to_string()),
         server_ca_cert_path: Some("/certs/explicit-ca.pem".to_string()),
@@ -663,7 +663,7 @@ fn explicit_tls_override_wins_over_destination_snapshot() {
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
         tls_refused: false,
-    });
+    }));
 
     let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);
     assert_eq!(

@@ -32535,6 +32535,29 @@ pub(crate) fn insert_reauthentication_challenge(
     );
 }
 
+/// Chain index after which proxy core applies the matched route request-header
+/// list (GHSA-3xxr-xhhj-9962).
+///
+/// The list is applied exactly once, after the LATER of the last eligible
+/// `request_transformer` (so a later static rule cannot undo route policy) and
+/// the last instance that may publish it (`mesh_route_dispatch`). A priority
+/// override can legitimately place the consumer before the producer; finalizing
+/// at the consumer would then take an empty slot and the producer's list,
+/// published afterwards, would silently never apply. `None` when the chain has
+/// no eligible consumer: a disabled RTDS transformer neither consumes nor
+/// suppresses the list, and plugin-cache composition refuses a producer with
+/// no configured consumer at all. Neither participant defers its
+/// `before_proxy` hook, so the boundary always falls inside the initial pass.
+fn route_request_header_finalization_index(plugins: &[Arc<dyn Plugin>]) -> Option<usize> {
+    let last_consumer = plugins
+        .iter()
+        .rposition(|plugin| plugin.participates_in_route_request_header_finalization())?;
+    let last_producer = plugins
+        .iter()
+        .rposition(|plugin| plugin.publishes_route_request_header_transforms());
+    Some(last_producer.map_or(last_consumer, |producer| producer.max(last_consumer)))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum BackendPathBeforeProxyPass {
     Initial,
@@ -32549,9 +32572,7 @@ pub(crate) async fn run_before_proxy_hooks_for_backend_path_policy(
     backend_path_is_policy_bound: bool,
     pass: BackendPathBeforeProxyPass,
 ) -> PluginResult {
-    let last_route_request_finalizer = plugins
-        .iter()
-        .rposition(|plugin| plugin.participates_in_route_request_header_finalization());
+    let last_route_request_finalizer = route_request_header_finalization_index(plugins);
     for (index, plugin) in plugins.iter().enumerate() {
         let deferred =
             backend_path_is_policy_bound && plugin.defer_before_proxy_until_backend_path_resolved();

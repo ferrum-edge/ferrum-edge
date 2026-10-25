@@ -13229,6 +13229,78 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             parity_rule(json!({"attempt_timeout_ms": 0})),
             false,
         ),
+        // Plugin-review hardening: operand grammar, rule labels, and the
+        // Istio match fields (withoutHeaders, queryParams StringMatch, port).
+        (
+            "rule_name_label",
+            parity_rule(json!({"name": "ns/vs:route-1"})),
+            true,
+        ),
+        (
+            "rule_name_whitespace",
+            parity_rule(json!({"name": "has space"})),
+            false,
+        ),
+        (
+            "redirect_uri_relative",
+            parity_rule(json!({"redirect": {"uri": "new"}})),
+            false,
+        ),
+        (
+            "redirect_uri_fragment",
+            parity_rule(json!({"redirect": {"uri": "/new#frag"}})),
+            false,
+        ),
+        (
+            "redirect_uri_with_query",
+            parity_rule(json!({"redirect": {"uri": "/new?x=1"}})),
+            true,
+        ),
+        (
+            "redirect_authority_with_path",
+            parity_rule(json!({"redirect": {"authority": "a/b"}})),
+            false,
+        ),
+        (
+            "rewrite_authority_userinfo",
+            parity_rule(json!({"rewrite": {"authority": "user@backend"}})),
+            false,
+        ),
+        (
+            "rewrite_authority_bracketed_ipv6_port",
+            parity_rule(json!({"rewrite": {"authority": "[2001:db8::10]:8080"}})),
+            true,
+        ),
+        (
+            "match_without_headers_regex",
+            parity_rule(json!({"match": {"without_headers": {"x-legacy": {"regex": ".*"}}}})),
+            true,
+        ),
+        (
+            "match_without_headers_invalid_name",
+            parity_rule(json!({"match": {"without_headers": {"x bad": "1"}}})),
+            false,
+        ),
+        (
+            "match_query_params_prefix",
+            parity_rule(json!({"match": {"query_params": {"tier": {"prefix": "gold"}}}})),
+            true,
+        ),
+        (
+            "match_query_params_empty_regex",
+            parity_rule(json!({"match": {"query_params": {"tier": {"regex": ""}}}})),
+            false,
+        ),
+        (
+            "match_port",
+            parity_rule(json!({"match": {"port": 8080}})),
+            true,
+        ),
+        (
+            "match_port_zero",
+            parity_rule(json!({"match": {"port": 0}})),
+            false,
+        ),
     ] {
         assert_component_validity(&spec, "MeshRouteDispatchConfig", &config, accepted);
         assert_eq!(

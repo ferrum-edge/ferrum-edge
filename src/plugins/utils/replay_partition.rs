@@ -670,7 +670,7 @@ fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestCo
         None => hasher.bool_value("dst.response_transform_present", false),
     }
 
-    append_route_override_backend_tls_partition(hasher, ctx.route_override_resolved_tls.as_ref());
+    append_route_override_backend_tls_partition(hasher, ctx.route_override_resolved_tls.as_deref());
 
     // DNS intent selects which address a same-host direct override dials
     // (`ClearInherited` drops the proxy's `dns_override` pin), so two rules

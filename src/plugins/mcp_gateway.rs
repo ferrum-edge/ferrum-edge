@@ -1149,7 +1149,7 @@ struct McpAdmittedDestination {
     path: Option<String>,
     path_is_absolute: bool,
     authority: Option<String>,
-    resolved_tls: Option<BackendTlsConfig>,
+    resolved_tls: Option<Arc<BackendTlsConfig>>,
 }
 
 impl McpAdmittedDestination {
@@ -1876,7 +1876,7 @@ impl McpGateway {
         ctx.route_override_backend_scheme = Some(target.scheme);
         ctx.route_override_backend_host = Some(target.host.clone());
         ctx.route_override_backend_port = Some(target.port);
-        ctx.route_override_resolved_tls = Some(BackendTlsConfig::default_verify());
+        ctx.route_override_resolved_tls = Some(Arc::new(BackendTlsConfig::default_verify()));
         ctx.route_override_path = Some(target.path.clone());
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(target.authority.clone());

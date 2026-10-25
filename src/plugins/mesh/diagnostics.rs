@@ -184,15 +184,10 @@ impl Schema {
             }
             (Self::Fields(SERVICE), "workloads") => Self::Fields("spiffe_id"),
             (Self::Route, "rules") => Self::Fields(ROUTE_RULE),
-            (Self::Fields(ROUTE_RULE), "match") => Self::Fields(
-                "methods headers query_params source_namespace authority uri ignore_uri_case",
-            ),
-            (
-                Self::Fields(
-                    "methods headers query_params source_namespace authority uri ignore_uri_case",
-                ),
-                "methods" | "authority" | "uri",
-            ) => Self::Fields("exact prefix regex"),
+            (Self::Fields(ROUTE_RULE), "match") => Self::Fields(ROUTE_MATCH),
+            (Self::Fields(ROUTE_MATCH), "methods" | "authority" | "uri") => {
+                Self::Fields("exact prefix regex")
+            }
             (Self::Fields(ROUTE_RULE), "destination") => Self::Fields(DESTINATION),
             (Self::Fields(DESTINATION), "backend_tls") => Self::Fields(
                 "client_cert_path client_key_path server_ca_cert_path verify_server_cert sni san_allow_list",
@@ -238,9 +233,11 @@ const WORKLOAD: &str = "spiffe_id selector service_name service_namespace addres
 const SERVICE: &str = "name namespace ports workloads protocol_overrides cluster_ips uid";
 const POLICY_RULE: &str = "from to when request_principals not_request_principals \
     source_negation never_matches action";
-const ROUTE_RULE: &str = "match destination timeout_ms timeout_disabled request_timeout_ms \
+const ROUTE_RULE: &str = "name match destination timeout_ms timeout_disabled request_timeout_ms \
     attempt_timeout_ms retry retry_disabled request_transform response_transform fault rewrite \
     redirect";
+const ROUTE_MATCH: &str = "methods headers without_headers query_params source_namespace \
+    authority uri ignore_uri_case port";
 const DESTINATION: &str = "upstream_id backend_host backend_port backend_tls \
     requires_node_waypoint_authz";
 const RETRY: &str = "max_retries retryable_status_codes retryable_methods backoff \

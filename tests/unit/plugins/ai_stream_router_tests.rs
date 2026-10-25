@@ -2333,7 +2333,10 @@ async fn test_backend_tls_default_and_inherit() {
             .map(String::as_str),
         Some("true")
     );
-    assert_eq!(ctx2.route_override_resolved_tls, Some(inherited_tls));
+    assert_eq!(
+        ctx2.route_override_resolved_tls,
+        Some(Arc::new(inherited_tls))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6312,7 +6315,7 @@ async fn claim_commits_default_public_verification_for_an_https_provider() {
     let (ctx, _raw) = claimed_ctx(&plugin, "gpt-4o").await;
     assert_eq!(
         ctx.route_override_resolved_tls,
-        Some(BackendTlsConfig::default_verify())
+        Some(Arc::new(BackendTlsConfig::default_verify()))
     );
 }
 
@@ -6324,26 +6327,26 @@ async fn final_body_rejects_later_backend_tls_weakening_clearing_and_retargeting
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.verify_server_cert = false;
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // SNI retargeted.
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.sni = Some("evil.example.com".to_string());
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // A different trust anchor.
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.server_ca_cert_path = Some("/tmp/attacker-ca.pem".to_string());
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // Ferrum's own backend mTLS identity attached to a third party.
         |ctx| {
             let mut tls = BackendTlsConfig::default_verify();
             tls.client_cert_path = Some("/tmp/gateway.pem".to_string());
             tls.client_key_path = Some("/tmp/gateway.key".to_string());
-            ctx.route_override_resolved_tls = Some(tls);
+            ctx.route_override_resolved_tls = Some(Arc::new(tls));
         },
         // Cleared entirely, which would fall back to the proxy's own resolution.
         |ctx| ctx.route_override_resolved_tls = None,
@@ -6398,7 +6401,10 @@ async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_muta
         plugin.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    assert_eq!(ctx.route_override_resolved_tls, Some(inherited.clone()));
+    assert_eq!(
+        ctx.route_override_resolved_tls,
+        Some(Arc::new(inherited.clone()))
+    );
     assert!(matches!(
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, &raw)
@@ -6409,7 +6415,7 @@ async fn inherit_backend_tls_commits_the_proxy_resolution_and_rejects_later_muta
     // Now weaken exactly one field of the inherited configuration.
     let mut weakened = inherited;
     weakened.verify_server_cert = false;
-    ctx.route_override_resolved_tls = Some(weakened);
+    ctx.route_override_resolved_tls = Some(Arc::new(weakened));
     let result = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, &raw)
         .await;

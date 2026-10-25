@@ -1218,7 +1218,7 @@ pub struct RequestContext {
     pub route_override_upstream_id: Option<String>,
     pub route_override_backend_host: Option<String>,
     pub route_override_backend_port: Option<u16>,
-    pub route_override_resolved_tls: Option<BackendTlsConfig>,
+    pub route_override_resolved_tls: Option<Arc<BackendTlsConfig>>,
 }
 ```
 

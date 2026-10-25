@@ -5063,7 +5063,7 @@ fn virtual_service_routes(
         // dispatch rule (or, for mirror, attached as a proxy-scoped plugin).
         // Extracted before the backend check because a `redirect` route is
         // valid with NO backend — Istio forbids `route` + `redirect` together.
-        let route_rewrite_value = route_rewrite_value(http);
+        let route_rewrite_value = route_rewrite_value(object, http)?;
         let route_redirect_value = route_redirect_value(object, http)?;
 
         let backends = route_backends(object, http, acc, index)?;
@@ -5795,7 +5795,10 @@ fn route_timeout_ms(http: &Value) -> Option<u64> {
 /// `mesh_route_dispatch_rules_for_proxy` from each match entry's URI prefix —
 /// it is NOT derived here. Returns `None` when neither field is present so a
 /// `rewrite: {}` block does not emit an inert action.
-fn route_rewrite_value(http: &Value) -> Option<Value> {
+fn route_rewrite_value(
+    object: &K8sObject,
+    http: &Value,
+) -> Result<Option<Value>, K8sTranslateError> {
     let rewrite = http.get("rewrite").and_then(Value::as_object);
     let mut out = serde_json::Map::new();
     if let Some(uri) = rewrite
@@ -5813,15 +5816,28 @@ fn route_rewrite_value(http: &Value) -> Option<Value> {
     if let Some(authority) = authority
         && !authority.is_empty()
     {
+        // The dispatch plugin writes this verbatim into the forwarded `Host`
+        // and refuses a non-`host[:port]` operand at construction; refusing it
+        // here keeps the failure scoped to this VirtualService.
+        if let Some(reason) =
+            crate::plugins::mesh_route_dispatch::route_authority_operand_error(authority)
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService http[].rewrite.authority (or headers.request.set host) must be `host` or `host:port`: {reason}"
+                ),
+            ));
+        }
         out.insert(
             "authority".to_string(),
             Value::String(authority.to_string()),
         );
     }
     if out.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(Value::Object(out))
+    Ok(Some(Value::Object(out)))
 }
 
 fn route_request_header_authority(http: &Value) -> Option<&str> {
@@ -5875,11 +5891,32 @@ fn route_redirect_value(
     if let Some(uri) = redirect.get("uri").and_then(Value::as_str)
         && !uri.is_empty()
     {
+        // Same admission the dispatch plugin applies at construction: a
+        // relative, fragment-bearing, or non-canonical URI would compose a
+        // corrupted `Location`, so refuse it as this resource's failure.
+        if let Some(reason) =
+            crate::plugins::mesh_route_dispatch::redirect_uri_operand_error(uri, false)
+        {
+            return Err(invalid_resource(
+                object,
+                format!("VirtualService http[].redirect.uri {reason}"),
+            ));
+        }
         out.insert("uri".to_string(), Value::String(uri.to_string()));
     }
     if let Some(authority) = redirect.get("authority").and_then(Value::as_str)
         && !authority.is_empty()
     {
+        if let Some(reason) =
+            crate::plugins::mesh_route_dispatch::route_authority_operand_error(authority)
+        {
+            return Err(invalid_resource(
+                object,
+                format!(
+                    "VirtualService http[].redirect.authority must be `host` or `host:port`: {reason}"
+                ),
+            ));
+        }
         out.insert(
             "authority".to_string(),
             Value::String(authority.to_string()),
@@ -15298,11 +15335,12 @@ extensionProviders:
 
     #[test]
     fn virtual_service_regex_uri_with_ignored_predicates_fails_closed() {
-        // Unsupported non-URI match shapes (regex method/header/queryParam)
-        // cannot be enforced by mesh_route_dispatch. A match entry with URI
-        // plus only unsupported predicate types must not materialize a naked
-        // URI proxy, because that would forward every regex-URI request
-        // without the method/header/query gates.
+        // Unsupported non-URI match shapes cannot be enforced by
+        // mesh_route_dispatch. A match entry with URI plus an unsupported
+        // predicate (`sourceLabels`; regex method/header/queryParam values
+        // are first-class now) must not materialize a naked URI proxy,
+        // because that would forward every regex-URI request without the
+        // gates.
         let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -15313,7 +15351,8 @@ extensionProviders:
                             "uri": {"regex": "/v[0-9]+/api"},
                             "method": {"regex": "GET|POST"},
                             "headers": {"x-canary": {"regex": "v[0-9]+"}},
-                            "queryParams": {"variant": {"regex": "beta|stable"}}
+                            "queryParams": {"variant": {"regex": "beta|stable"}},
+                            "sourceLabels": {"app": "billing"}
                         }],
                         "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}]
                     }]
