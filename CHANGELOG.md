@@ -139,6 +139,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`request_mirror` replays the backend method and refuses before preparing
+  egress.** The shadow request now uses the backend-effective method, so an
+  `mcp_gateway` OpenAPI bridge that turns a `POST` MCP `tools/call` into
+  `GET`/`DELETE`/`PATCH` mirrors that same operation instead of the client
+  `POST`. A mirror attempt refused for `max_in_flight` saturation, the
+  per-request `max_mirrored_request_body_bytes` ceiling, or the aggregate
+  `max_retained_request_body_bytes` budget is now decided before credential
+  provenance, query policy, header sanitization, or the body copy, so a
+  saturated mirror or a decompression-inflated body never pays that work (or a
+  second full body allocation) on the primary request path. Mirror query
+  policy classifies each pair once and skips redundant decoded-value digests.
+  The `RequestMirrorConfig.mirror_host` OpenAPI pattern now accepts a bare
+  IPv6 literal, matching the constructor.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
