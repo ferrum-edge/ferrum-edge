@@ -500,9 +500,9 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "request_transformer",
         classification: BuiltinPluginClassification::Public,
         priority: 3000,
-        active_phases: "before_proxy, transform_request_body",
-        matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Modifies HTTP headers/query/body",
+        active_phases: "before_proxy, transform_request_body_with_context",
+        matrix_protocols: HTTP_FAMILY_PROTOCOLS,
+        protocol_rationale: "Modifies HTTP headers/query/body; WebSocket handshake headers/query only",
     },
     BuiltinPluginParityMeta {
         name: "serverless_function",

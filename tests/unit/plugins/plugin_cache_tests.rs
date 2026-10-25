@@ -11874,6 +11874,33 @@ fn test_modifies_request_headers_flag_computed() {
 }
 
 #[test]
+fn request_transformer_joins_the_websocket_handshake_view() {
+    // request_transformer-SOL-3: header/query rules (and route-header
+    // finalization) must run on WebSocket handshakes too.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config(
+            "ps1",
+            "request_transformer",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let websocket = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::WebSocket);
+    assert!(
+        websocket
+            .iter()
+            .any(|plugin| plugin.name() == "request_transformer"),
+        "the WebSocket view must carry request_transformer"
+    );
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::WebSocket);
+    assert!(caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS));
+}
+
+#[test]
 fn test_hmac_auth_rejects_request_body_transformer_composition() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["hmac", "transform"])],

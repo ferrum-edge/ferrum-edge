@@ -1,7 +1,8 @@
 //! Tests for request_transformer plugin
 
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, RequestContext, priority, request_transformer::RequestTransformer,
+    HTTP_FAMILY_PROTOCOLS, Plugin, RequestContext, priority,
+    request_transformer::RequestTransformer,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -28,7 +29,8 @@ async fn test_request_transformer_creation() {
     .unwrap();
     assert_eq!(plugin.name(), "request_transformer");
     assert_eq!(plugin.priority(), priority::REQUEST_TRANSFORMER);
-    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    // Header/query rules also run on WebSocket handshakes (request_transformer-SOL-3).
+    assert_eq!(plugin.supported_protocols(), HTTP_FAMILY_PROTOCOLS);
     assert!(plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
     assert!(!plugin.is_auth_plugin());
@@ -928,15 +930,19 @@ async fn test_request_transformer_modifies_request_headers_false_for_query_only(
 }
 
 #[tokio::test]
-async fn test_request_transformer_modifies_request_headers_false_for_body_only() {
+async fn test_request_transformer_modifies_request_headers_true_for_body_only() {
+    // Body rules remove stale content-integrity fields (`Content-Digest`, …)
+    // from the outbound map in `before_proxy`, so they need the cloned header
+    // map (request_transformer-SOL-2).
     let plugin = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": "body", "key": "v", "value": "1"}
         ]
     }))
     .unwrap();
-    assert!(!plugin.modifies_request_headers());
+    assert!(plugin.modifies_request_headers());
     assert!(plugin.modifies_request_body());
+    assert!(!plugin.modifies_request_query());
 }
 
 #[tokio::test]
@@ -1543,6 +1549,7 @@ fn test_request_transformer_disabled_generation_drops_mutation_and_buffering_cap
     let plugin = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": "header", "key": "X-Sanitized", "value": "yes"},
+            {"operation": "remove", "target": "query", "key": "debug"},
             {"operation": "remove", "target": "body", "key": "secret"}
         ],
         "runtime_overlay_scope": "gated",
@@ -1553,6 +1560,13 @@ fn test_request_transformer_disabled_generation_drops_mutation_and_buffering_cap
     assert!(
         !plugin.modifies_request_headers(),
         "a disabled generation must not force request-header cloning"
+    );
+    // request_transformer-claude-3: the query capability honors the same gate,
+    // so a disabled generation cannot trip later-than-dedup/cache composition
+    // refusals or early-route-total query accounting.
+    assert!(
+        !plugin.modifies_request_query(),
+        "a disabled generation must not advertise query mutation"
     );
     assert!(
         !plugin.modifies_request_body(),
@@ -2671,5 +2685,513 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes (request_transformer-SOL-*, -claude-*)
+// ---------------------------------------------------------------------------
+
+fn post_ctx() -> RequestContext {
+    RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/test".to_string(),
+    )
+}
+
+/// Parse a JSON object into its members' raw lexemes, so assertions compare
+/// the exact bytes the backend receives rather than two values already rounded
+/// through the same `serde_json::Value` representation.
+fn raw_members(body: &[u8]) -> HashMap<String, String> {
+    let members: HashMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_slice(body).expect("transformed body is a JSON object");
+    members
+        .into_iter()
+        .map(|(name, raw)| (name, raw.get().to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn body_rewrite_preserves_lossy_number_lexemes_exactly() {
+    // request_transformer-SOL-1: removing an unrelated field re-serializes the
+    // whole document; numbers outside the 64-bit integer range and decimals
+    // beyond binary64 precision must reach the backend byte-for-byte.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let body = br#"{"id":18446744073709551617,"neg":-9223372036854775809,"pi":3.14159265358979323846264338327950288,"price":1.50,"tiny":2.5e-3,"zero":-0,"plain":42,"nested":[1.10,{"x":123456789012345678901234567890}],"debug":true}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("the remove rule rewrites the body");
+    let members = raw_members(&out);
+    assert!(!members.contains_key("debug"));
+    assert_eq!(members["id"], "18446744073709551617");
+    assert_eq!(members["neg"], "-9223372036854775809");
+    assert_eq!(members["pi"], "3.14159265358979323846264338327950288");
+    assert_eq!(members["price"], "1.50");
+    assert_eq!(members["tiny"], "2.5e-3");
+    assert_eq!(members["zero"], "-0");
+    assert_eq!(members["plain"], "42");
+    assert_eq!(
+        members["nested"],
+        r#"[1.10,{"x":123456789012345678901234567890}]"#
+    );
+}
+
+#[tokio::test]
+async fn body_rename_and_update_keep_number_lexemes_where_they_land() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "body", "key": "amount", "new_key": "total"},
+            {"operation": "update", "target": "body", "key": "rate", "value": 5}
+        ]
+    }))
+    .unwrap();
+    let body = br#"{"amount":1.000000000000000000001,"rate":0.30000000000000000000001,"keep":98765432109876543210}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("rename + update rewrite the body");
+    let members = raw_members(&out);
+    assert!(!members.contains_key("amount"));
+    assert_eq!(members["total"], "1.000000000000000000001");
+    assert_eq!(
+        members["rate"], "5",
+        "an overwritten number takes the rule value"
+    );
+    assert_eq!(members["keep"], "98765432109876543210");
+}
+
+#[tokio::test]
+async fn body_number_preservation_never_turns_a_client_string_into_a_number() {
+    // A client string shaped like the private stand-in disables substitution;
+    // the string must survive as a string.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let body = br#"{"s":"\u0000ferrum-number:0","n":1.5,"debug":true}"#;
+    let out = plugin
+        .transform_request_body(body, Some("application/json"), &HashMap::new())
+        .await
+        .expect("the remove rule rewrites the body");
+    let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(value["s"], json!("\u{0}ferrum-number:0"));
+    assert_eq!(value["n"], json!(1.5));
+    assert!(value.get("debug").is_none());
+}
+
+#[tokio::test]
+async fn body_rules_strip_stale_request_integrity_headers() {
+    // request_transformer-SOL-2: a digest computed over the client's bytes
+    // must not reach the backend beside a body the rules may rewrite.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "body", "key": "gateway_added", "value": true}]
+    }))
+    .unwrap();
+    for content_type in [
+        Some("application/json"),
+        Some("application/vnd.api+json"),
+        None,
+    ] {
+        let mut ctx = post_ctx();
+        let mut headers: HashMap<String, String> = HashMap::new();
+        if let Some(content_type) = content_type {
+            headers.insert("content-type".to_string(), content_type.to_string());
+        }
+        headers.insert("content-digest".to_string(), "sha-256=:stale:".to_string());
+        headers.insert("Repr-Digest".to_string(), "sha-256=:stale:".to_string());
+        headers.insert("digest".to_string(), "SHA-256=stale".to_string());
+        headers.insert("content-md5".to_string(), "stale".to_string());
+        headers.insert("x-keep".to_string(), "1".to_string());
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        for stale in ["content-digest", "Repr-Digest", "digest", "content-md5"] {
+            assert!(
+                !headers.contains_key(stale),
+                "{stale} must be removed for {content_type:?}"
+            );
+        }
+        assert_eq!(headers.get("x-keep").map(String::as_str), Some("1"));
+    }
+}
+
+#[tokio::test]
+async fn integrity_headers_survive_when_body_rules_cannot_rewrite() {
+    let body_plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "body", "key": "gateway_added", "value": true}]
+    }))
+    .unwrap();
+
+    // A declared non-JSON upload is never rewritten.
+    let mut ctx = post_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert(
+        "content-digest".to_string(),
+        "sha-256=:original:".to_string(),
+    );
+    body_plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(headers.contains_key("content-digest"));
+
+    // A bodiless GET is never rewritten.
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert(
+        "content-digest".to_string(),
+        "sha-256=:original:".to_string(),
+    );
+    body_plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(headers.contains_key("content-digest"));
+
+    // Header-only rules never touch the body.
+    let header_plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "x-a", "value": "1"}]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(
+        "content-digest".to_string(),
+        "sha-256=:original:".to_string(),
+    );
+    header_plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(headers.contains_key("content-digest"));
+}
+
+#[test]
+fn admission_refuses_path_param_assertion_destinations() {
+    // request_transformer-claude-1: the router's `x-path-param-*` captures
+    // are gateway assertions nothing re-asserts after `before_proxy`.
+    for destination in [
+        "x-path-param-account",
+        "X-Path-Param-Id",
+        "X_Path_Param_Account",
+        "x_path-param-tenant",
+    ] {
+        for operation in ["add", "update", "rename"] {
+            let rule = if operation == "rename" {
+                json!({"target": "header", "operation": operation,
+                    "key": "x-legacy-account", "new_key": destination})
+            } else {
+                json!({"target": "header", "operation": operation,
+                    "key": destination, "value": "forged"})
+            };
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .expect("an x-path-param-* destination must fail admission");
+            assert!(
+                error.contains("`rule[0]`"),
+                "{operation} {destination}: {error}"
+            );
+            assert!(
+                error.contains("`x-path-param-*`"),
+                "{operation} {destination}: {error}"
+            );
+        }
+        for rule in [
+            json!({"target": "header", "operation": "remove", "key": destination}),
+            json!({"target": "header", "operation": "rename",
+                "key": destination, "new_key": "x-captured"}),
+        ] {
+            assert!(RequestTransformer::new(&json!({"rules": [rule]})).is_ok());
+        }
+    }
+    for destination in ["x-path-param", "x-path-params-id"] {
+        let config = json!({"rules": [
+            {"target": "header", "operation": "add", "key": destination, "value": "v"}
+        ]});
+        assert!(
+            RequestTransformer::new(&config).is_ok(),
+            "{destination} is outside the route-capture namespace"
+        );
+    }
+}
+
+#[test]
+fn admission_refuses_underscore_spellings_of_gateway_owned_destinations() {
+    // request_transformer-claude-2: CGI-style backends fold `_` onto `-`, so
+    // the underscore spelling lands on the gateway-owned variable.
+    for destination in [
+        "X_Forwarded_For",
+        "x_forwarded_proto",
+        "x_forwarded-host",
+        "content_length",
+        "Transfer_Encoding",
+        "proxy_authorization",
+        "keep_alive",
+        "proxy_connection",
+        "x_ferrum_original_content_encoding",
+        "x_grpc_web_mode",
+    ] {
+        for operation in ["add", "update", "rename"] {
+            let rule = if operation == "rename" {
+                json!({"target": "header", "operation": operation,
+                    "key": "x-origin-ip", "new_key": destination})
+            } else {
+                json!({"target": "header", "operation": operation,
+                    "key": destination, "value": "client-chosen"})
+            };
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .expect("a folded gateway-owned destination must fail admission");
+            assert!(
+                error.contains(&destination.to_ascii_lowercase()),
+                "{operation} {destination}: {error}"
+            );
+            assert!(
+                error.contains("gateway-owned"),
+                "{operation} {destination}: {error}"
+            );
+        }
+        for rule in [
+            json!({"target": "header", "operation": "remove", "key": destination}),
+            json!({"target": "header", "operation": "rename",
+                "key": destination, "new_key": "x-captured"}),
+        ] {
+            assert!(RequestTransformer::new(&json!({"rules": [rule]})).is_ok());
+        }
+    }
+}
+
+#[test]
+fn body_paths_with_empty_segments_fail_admission() {
+    // request_transformer-claude-4.
+    for key in ["", "user.", ".user", "a..b", "a.\\\\."] {
+        for rule in [
+            json!({"operation": "add", "target": "body", "key": key, "value": "x"}),
+            json!({"operation": "update", "target": "body", "key": key, "value": "x"}),
+            json!({"operation": "remove", "target": "body", "key": key}),
+            json!({"operation": "rename", "target": "body", "key": key, "new_key": "moved"}),
+            json!({"operation": "rename", "target": "body", "key": "source", "new_key": key}),
+        ] {
+            let error = RequestTransformer::new(&json!({"rules": [rule]}))
+                .err()
+                .unwrap_or_else(|| panic!("empty segment in {key:?} must fail admission"));
+            assert!(error.contains("empty path segment"), "{key:?}: {error}");
+        }
+    }
+    // Escaped literal dots are single non-empty segments.
+    for key in ["meta.weird\\.key", "trailing\\.", "\\.leading"] {
+        assert!(
+            RequestTransformer::new(&json!({"rules": [
+                {"operation": "update", "target": "body", "key": key, "value": "x"}
+            ]}))
+            .is_ok(),
+            "{key:?} has no empty segment"
+        );
+    }
+}
+
+#[tokio::test]
+async fn header_and_query_values_resolve_bounded_template_variables() {
+    // request_transformer-claude-5.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "x-user-copy", "value": "$(consumer.username)"},
+            {"operation": "add", "target": "header", "key": "x-client", "value": "ip=$(client_ip)"},
+            {"operation": "update", "target": "header", "key": "x-req", "value": "$(request_id)"},
+            {"operation": "update", "target": "header", "key": "x-tenant-copy", "value": "t-$(header.x-tenant)-$(query.region)"},
+            {"operation": "add", "target": "header", "key": "x-literal", "value": "cost $$(5) $ ok"},
+            {"operation": "add", "target": "query", "key": "tenant", "value": "$(header.x-tenant)"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.identified_consumer = Some(std::sync::Arc::new(
+        super::plugin_utils::create_test_consumer(),
+    ));
+    ctx.metadata
+        .insert("request_id".to_string(), "req-123".to_string());
+    ctx.set_raw_query_string("region=eu%2Dwest".to_string());
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("x-tenant".to_string(), "acme".to_string());
+
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        headers.get("x-user-copy").map(String::as_str),
+        Some("testuser")
+    );
+    assert_eq!(
+        headers.get("x-client").map(String::as_str),
+        Some("ip=127.0.0.1")
+    );
+    assert_eq!(headers.get("x-req").map(String::as_str), Some("req-123"));
+    assert_eq!(
+        headers.get("x-tenant-copy").map(String::as_str),
+        Some("t-acme-eu-west")
+    );
+    assert_eq!(
+        headers.get("x-literal").map(String::as_str),
+        Some("cost $(5) $ ok")
+    );
+    let outbound = ctx.outbound_query_string().expect("query rule published");
+    assert!(outbound.contains("tenant=acme"), "{outbound}");
+    assert!(
+        !ctx.metadata
+            .contains_key(ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY)
+    );
+}
+
+#[tokio::test]
+async fn unresolvable_or_unsafe_templates_skip_the_rule_and_say_why() {
+    use ferrum_edge::plugins::request_transformer::RULE_SKIPPED_METADATA_KEY;
+
+    // Missing variable: no consumer, no partial value.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-user", "value": "user=$(consumer.username)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!headers.contains_key("x-user"));
+    assert_eq!(
+        ctx.metadata
+            .get(RULE_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("template_unresolved")
+    );
+
+    // A decoded query value carrying CR/LF never becomes a header value.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-region", "value": "$(query.region)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("region=eu%0D%0AX-Injected:%201".to_string());
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!headers.contains_key("x-region"));
+    assert!(!headers.contains_key("x-injected"));
+    assert_eq!(
+        ctx.metadata
+            .get(RULE_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("template_invalid_header_value")
+    );
+
+    // An authentication-owned query credential is never a template source.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.api_key)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("api_key=s3cr3t".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let mut headers: HashMap<String, String> = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(!headers.contains_key("x-copied"));
+    assert_eq!(
+        ctx.metadata
+            .get(RULE_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("template_unresolved")
+    );
+}
+
+#[test]
+fn malformed_or_credential_templates_fail_admission() {
+    for (value, reason) in [
+        ("$(nope)", "unknown template variable"),
+        ("$(consumer.username", "unterminated"),
+        ("$(header.authorization)", "credential-bearing header"),
+        ("$(header.Cookie)", "credential-bearing header"),
+        ("$(header.bad name)", "valid HTTP header"),
+        ("$(query.)", "must name a query parameter"),
+        (
+            "$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)$(client_ip)",
+            "more than 8 template variables",
+        ),
+    ] {
+        for target in ["header", "query"] {
+            let error = RequestTransformer::new(&json!({"rules": [
+                {"operation": "update", "target": target, "key": "x-dest", "value": value}
+            ]}))
+            .err()
+            .unwrap_or_else(|| panic!("{target} value {value:?} must fail admission"));
+            assert!(error.contains(reason), "{target} {value:?}: {error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn body_non_application_publishes_a_value_free_reason() {
+    // request_transformer-claude-6.
+    use ferrum_edge::plugins::request_transformer::BODY_SKIPPED_METADATA_KEY;
+
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "internal.secret"}]
+    }))
+    .unwrap();
+    let headers: HashMap<String, String> = HashMap::new();
+
+    let mut ctx = post_ctx();
+    let out = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            b"{not json SENSITIVE",
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(out.is_none());
+    assert_eq!(
+        ctx.metadata
+            .get(BODY_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("parse_error")
+    );
+
+    let mut ctx = post_ctx();
+    let out = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            br#"{"internal":{"other":"SENSITIVE"}}"#,
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(out.is_none());
+    assert_eq!(
+        ctx.metadata
+            .get(BODY_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("no_rule_applied")
+    );
+
+    let mut ctx = post_ctx();
+    let out = plugin
+        .transform_request_body_with_context(
+            &mut ctx,
+            br#"{"internal":{"secret":"SENSITIVE"}}"#,
+            Some("application/json"),
+            &headers,
+        )
+        .await;
+    assert!(out.is_some());
+    assert!(!ctx.metadata.contains_key(BODY_SKIPPED_METADATA_KEY));
+
+    // A declared non-JSON upload is reported from `before_proxy`, before the
+    // streaming path skips the body hook entirely.
+    let mut ctx = post_ctx();
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get(BODY_SKIPPED_METADATA_KEY)
+            .map(String::as_str),
+        Some("non_json_content_type")
+    );
+    for value in ctx.metadata.values() {
+        assert!(!value.contains("SENSITIVE"));
     }
 }
