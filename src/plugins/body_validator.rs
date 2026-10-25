@@ -1285,14 +1285,11 @@ impl BodyValidator {
         // An undeclared closed-enum occurrence (permitted: strict mode already
         // refused it above) is stripped from a separate inspection copy so the
         // decoded tree has conforming proto2 merge/oneof/initialization
-        // semantics. That copy and its per-level buffers hold at most twice the
-        // payload.
+        // semantics. The rewrite is in place in ONE payload-sized buffer, which
+        // is therefore the copy's entire allocation, charged here before it
+        // exists.
         let strip_closed_enums = preflight.undeclared_closed_enum;
-        let inspection_copy_bound = if strip_closed_enums {
-            payload.len().saturating_mul(2)
-        } else {
-            0
-        };
+        let inspection_copy_bound = if strip_closed_enums { payload.len() } else { 0 };
         // String and bytes values are copied out of the payload, so the
         // payload length bounds them; messages and values are charged at a
         // conservative per-node cost.
@@ -1305,12 +1302,18 @@ impl BodyValidator {
             return Err(ProtobufFailure::Capacity);
         }
         let inspection_copy = if strip_closed_enums {
-            let mut stripped = Vec::with_capacity(payload.len());
+            let mut stripped = vec![0u8; payload.len()];
+            let mut writer = WireWriter {
+                out: stripped.as_mut_slice(),
+                len: 0,
+            };
             if let Err(error) =
-                strip_undeclared_closed_enums(&payload, Some(descriptor), None, &mut stripped)
+                strip_undeclared_closed_enums(&payload, Some(descriptor), None, &mut writer)
             {
                 return Err(error.into_failure());
             }
+            let written = writer.len;
+            stripped.truncate(written);
             Some(stripped)
         } else {
             None
@@ -2197,6 +2200,65 @@ fn closed_enum_value_is_declared(enum_type: &EnumDescriptor, value: u64) -> bool
     enum_type.get_value(value as i32).is_some()
 }
 
+/// Fixed-capacity output for [`strip_undeclared_closed_enums`].
+///
+/// The sanitizer writes into ONE caller-allocated slice of exactly the
+/// payload's length and never allocates: a nested message or packed list keeps
+/// its original length-prefix width, and the slot is back-filled once the
+/// rewritten content's length is known. Bytes are only ever removed, so the
+/// output can never outgrow the input, and an attempt to would be refused as
+/// malformed rather than reallocating outside the charged working set.
+struct WireWriter<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl WireWriter<'_> {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), PreflightError> {
+        let end = self
+            .len
+            .checked_add(bytes.len())
+            .filter(|end| *end <= self.out.len())
+            .ok_or(PreflightError::Malformed)?;
+        self.out[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+
+    /// Reserve `width` bytes for a length prefix, returning its offset.
+    fn reserve_slot(&mut self, width: usize) -> Result<usize, PreflightError> {
+        let start = self.len;
+        let end = start
+            .checked_add(width)
+            .filter(|end| *end <= self.out.len())
+            .ok_or(PreflightError::Malformed)?;
+        self.len = end;
+        Ok(start)
+    }
+
+    /// Back-fill a reserved slot with the length of everything written after
+    /// it, as a varint padded to the slot's original width (continuation bits
+    /// on every byte but the last). Protobuf readers accept a non-minimal
+    /// varint, and the rewritten length never exceeds the original one, so it
+    /// always fits.
+    fn fill_length_slot(&mut self, start: usize, width: usize) -> Result<(), PreflightError> {
+        let content_start = start + width;
+        let mut value = (self.len - content_start) as u64;
+        if width < 10 && value >> (7 * width) != 0 {
+            return Err(PreflightError::Malformed);
+        }
+        for index in 0..width {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if index + 1 < width {
+                byte |= 0x80;
+            }
+            self.out[start + index] = byte;
+        }
+        Ok(())
+    }
+}
+
 /// Re-encode an already preflighted message with every undeclared closed-enum
 /// occurrence removed: the inspection representation a conforming proto2
 /// reader would build, where such a number goes to the unknown-field set and
@@ -2206,15 +2268,16 @@ fn closed_enum_value_is_declared(enum_type: &EnumDescriptor, value: u64) -> bool
 /// and oneof semantics — and therefore the post-decode `required` walk —
 /// conform, including across merged submessage occurrences. Only the
 /// inspection copy is rewritten; the backend still receives the original
-/// bytes. Bytes are only ever removed, so the output is never larger than the
-/// input, and every nested level's buffer holds a disjoint slice of it. The
+/// bytes. The rewrite is in place in one fixed output (see [`WireWriter`]),
+/// so its whole allocation is the single payload-sized buffer the caller
+/// charged before allocating it — no per-nesting-level buffer exists. The
 /// preflight already validated the framing and bounded the depth, so the same
 /// grammar errors are reported as malformed here.
 fn strip_undeclared_closed_enums(
     buf: &[u8],
     descriptor: Option<&MessageDescriptor>,
     end_group: Option<u32>,
-    out: &mut Vec<u8>,
+    out: &mut WireWriter<'_>,
 ) -> Result<usize, PreflightError> {
     let mut pos = 0usize;
     while pos < buf.len() {
@@ -2224,7 +2287,7 @@ fn strip_undeclared_closed_enums(
         let number = u32::try_from(key >> 3).map_err(|_| PreflightError::Malformed)?;
         if wire_type == 4 {
             return if end_group == Some(number) {
-                out.extend_from_slice(&buf[field_start..pos]);
+                out.push(&buf[field_start..pos])?;
                 Ok(pos)
             } else {
                 Err(PreflightError::Malformed)
@@ -2243,59 +2306,54 @@ fn strip_undeclared_closed_enums(
                         if !closed_enum_value_is_declared(enum_type, value)
                 );
                 if !undeclared {
-                    out.extend_from_slice(&buf[field_start..pos]);
+                    out.push(&buf[field_start..pos])?;
                 }
             }
             1 => {
                 take_wire_bytes(buf, &mut pos, 8).ok_or(PreflightError::Malformed)?;
-                out.extend_from_slice(&buf[field_start..pos]);
+                out.push(&buf[field_start..pos])?;
             }
             5 => {
                 take_wire_bytes(buf, &mut pos, 4).ok_or(PreflightError::Malformed)?;
-                out.extend_from_slice(&buf[field_start..pos]);
+                out.push(&buf[field_start..pos])?;
             }
             2 => {
                 let tag_end = pos;
                 let len = read_wire_varint(buf, &mut pos)
                     .and_then(|len| usize::try_from(len).ok())
                     .ok_or(PreflightError::Malformed)?;
+                let width = pos - tag_end;
                 let payload =
                     take_wire_bytes(buf, &mut pos, len).ok_or(PreflightError::Malformed)?;
-                let rewritten = match shape {
+                match shape {
                     WireFieldShape::Message(nested) => {
-                        let mut inner = Vec::with_capacity(payload.len());
-                        strip_undeclared_closed_enums(payload, Some(&nested), None, &mut inner)?;
-                        Some(inner)
+                        out.push(&buf[field_start..tag_end])?;
+                        let slot = out.reserve_slot(width)?;
+                        strip_undeclared_closed_enums(payload, Some(&nested), None, out)?;
+                        out.fill_length_slot(slot, width)?;
                     }
                     WireFieldShape::ClosedEnum {
                         enum_type,
                         repeated: true,
                     } => {
-                        let mut inner = Vec::with_capacity(payload.len());
+                        out.push(&buf[field_start..tag_end])?;
+                        let slot = out.reserve_slot(width)?;
                         let mut element = 0usize;
                         while element < payload.len() {
                             let start = element;
                             let value = read_wire_varint(payload, &mut element)
                                 .ok_or(PreflightError::Malformed)?;
                             if closed_enum_value_is_declared(&enum_type, value) {
-                                inner.extend_from_slice(&payload[start..element]);
+                                out.push(&payload[start..element])?;
                             }
                         }
-                        Some(inner)
+                        out.fill_length_slot(slot, width)?;
                     }
-                    _ => None,
-                };
-                match rewritten {
-                    Some(inner) => {
-                        out.extend_from_slice(&buf[field_start..tag_end]);
-                        push_wire_varint(out, inner.len() as u64);
-                        out.extend_from_slice(&inner);
-                    }
-                    None => out.extend_from_slice(&buf[field_start..pos]),
+                    _ => out.push(&buf[field_start..pos])?,
                 }
             }
             3 => {
-                out.extend_from_slice(&buf[field_start..pos]);
+                out.push(&buf[field_start..pos])?;
                 let nested = match shape {
                     WireFieldShape::Message(nested) => Some(nested),
                     _ => None,
@@ -2311,18 +2369,6 @@ fn strip_undeclared_closed_enums(
         return Err(PreflightError::Malformed);
     }
     Ok(pos)
-}
-
-fn push_wire_varint(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
 }
 
 fn default_grpc_max_decompressed_size_bytes() -> Result<usize, String> {

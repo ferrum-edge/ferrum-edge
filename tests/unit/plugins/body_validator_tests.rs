@@ -6957,6 +6957,7 @@ fn proto3_review_set() -> Vec<u8> {
 /// message Holder { optional Request child = 1; }
 /// message Ided { required int32 id = 1; }
 /// message Choice { oneof choice { Ided child = 1; Mode mode = 2; } }
+/// message Node { optional Node next = 1; optional bytes data = 2; optional Mode mode = 3; }
 /// ```
 fn proto2_enum_set() -> Vec<u8> {
     let mode = pb_enum("Mode", &[("SAFE", 0)]);
@@ -6994,6 +6995,14 @@ fn proto2_enum_set() -> Vec<u8> {
         ),
         "choice",
     );
+    let node = pb_message(
+        "Node",
+        &[
+            pb_message_field("next", 1, PB_LABEL_OPTIONAL, ".e2.Node"),
+            pb_field("data", 2, PB_LABEL_OPTIONAL, PB_TYPE_BYTES),
+            pb_enum_field("mode", 3, PB_LABEL_OPTIONAL, ".e2.Mode"),
+        ],
+    );
     pb_file(
         "e2.proto",
         "e2",
@@ -7005,9 +7014,12 @@ fn proto2_enum_set() -> Vec<u8> {
             (PB_FILE_MESSAGE, holder),
             (PB_FILE_MESSAGE, ided),
             (PB_FILE_MESSAGE, choice),
+            (PB_FILE_MESSAGE, node),
         ],
     )
 }
+
+const PB_TYPE_BYTES: u64 = 12;
 
 fn review_descriptor_dir(set: Vec<u8>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -8334,4 +8346,121 @@ async fn a_service_prefix_replacement_selects_the_backend_method() {
             "{name}: the body requirements must be recomputed after the backend path is bound"
         );
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PR #6845 fix round 3
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A `Node` chain 32 levels deep (the nesting bound) whose leaf carries
+/// `leaf_bytes` of data and whose root carries one undeclared closed-enum
+/// `mode`, which activates the inspection-copy rewrite for the whole tree.
+fn deep_node_with_unknown_enum(leaf_bytes: usize, extra_unknown_at_every_level: bool) -> Vec<u8> {
+    let mut message = pb_len_field(2, &vec![b'x'; leaf_bytes]);
+    for _ in 0..32 {
+        let mut parent = Vec::new();
+        if extra_unknown_at_every_level {
+            parent.extend(pb_varint_field(3, 7));
+        }
+        parent.extend(pb_len_field(1, &message));
+        message = parent;
+    }
+    let mut root = pb_varint_field(3, 7);
+    root.extend(message);
+    root
+}
+
+/// PR6845-SOL-9: the closed-enum inspection copy is ONE payload-sized buffer,
+/// charged before it exists, at every nesting depth. The working set a frame
+/// needs is the payload, that one copy, and the reflected-node allowance —
+/// so a budget of exactly that admits it, and one block less refuses it and
+/// returns every charge. (The earlier per-level buffers charged twice the
+/// payload yet held up to depth + 1 payload-sized buffers at once.)
+#[test]
+fn the_closed_enum_inspection_copy_is_one_charged_payload_sized_buffer() {
+    use ferrum_edge::_test_support::{
+        ResponseBufferBudgetProbe,
+        body_validator_protobuf_request_outcome_in_budget_for_test as outcome,
+    };
+    const BLOCK: usize = 64 * 1024;
+    const GRPC: &str = "application/grpc";
+
+    let dir = review_descriptor_dir(proto2_enum_set());
+    let plugin = review_plugin(&dir, json!({"protobuf_request_type": "e2.Node"}));
+    let payload = deep_node_with_unknown_enum(200_000, false);
+    let frame = grpc_frame(&payload);
+
+    // payload + one inspection copy + 33 messages / ~35 values of reflected
+    // allowance, rounded up to whole budget blocks.
+    let reflected = 33 * 256 + 40 * 64;
+    let needed = (2 * payload.len() + reflected).div_ceil(BLOCK);
+    let fits = ResponseBufferBudgetProbe::new(BLOCK, needed * BLOCK);
+    let available = fits.available_bytes();
+    assert_eq!(outcome(&plugin, &fits, "/e2.Svc/Run", GRPC, &frame), "pass");
+    assert_eq!(
+        fits.available_bytes(),
+        available,
+        "a pass releases every charge"
+    );
+
+    let short = ResponseBufferBudgetProbe::new(BLOCK, (needed - 1) * BLOCK);
+    let available = short.available_bytes();
+    assert_eq!(
+        outcome(&plugin, &short, "/e2.Svc/Run", GRPC, &frame),
+        "capacity"
+    );
+    assert_eq!(
+        short.available_bytes(),
+        available,
+        "a refusal releases every charge"
+    );
+
+    // An undeclared enum at EVERY level is rewritten in the same single buffer
+    // and still decodes (the shortened length prefixes are re-encoded at their
+    // original width, which protobuf readers accept).
+    let every_level = grpc_frame(&deep_node_with_unknown_enum(200_000, true));
+    let roomy = ResponseBufferBudgetProbe::new(BLOCK, 64 * BLOCK);
+    assert_eq!(
+        outcome(&plugin, &roomy, "/e2.Svc/Run", GRPC, &every_level),
+        "pass"
+    );
+
+    // Structural pin: the rewrite writes into a fixed slice and allocates
+    // nothing per level.
+    let source = include_str!("../../../src/plugins/body_validator.rs");
+    let start = source
+        .find("fn strip_undeclared_closed_enums(")
+        .expect("sanitizer present");
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .expect("the sanitizer body ends at its top-level brace");
+    let body = &rest[..end];
+    for allocation in ["Vec::", "vec![", ".to_vec()", "with_capacity"] {
+        assert!(
+            !body.contains(allocation),
+            "the sanitizer must not allocate (`{allocation}` found)"
+        );
+    }
+}
+
+/// The rewritten inspection copy keeps closed-enum semantics at depth: an
+/// undeclared `mode` deep in the chain neither fails nor masks validation, and
+/// strict mode still refuses it.
+#[tokio::test]
+async fn deep_closed_enum_rewrites_preserve_validation_outcomes() {
+    let dir = review_descriptor_dir(proto2_enum_set());
+    let headers = grpc_request_headers();
+    let plugin = review_plugin(&dir, json!({"protobuf_request_type": "e2.Node"}));
+    let frame = grpc_frame(&deep_node_with_unknown_enum(64, true));
+    assert_continue(plugin.on_final_request_body(&headers, &frame).await);
+
+    let strict = review_plugin(
+        &dir,
+        json!({"protobuf_request_type": "e2.Node", "protobuf_reject_unknown_fields": true}),
+    );
+    assert_reject(
+        strict.on_final_request_body(&headers, &frame).await,
+        Some(400),
+    );
 }
