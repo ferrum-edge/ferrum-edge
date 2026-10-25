@@ -45,9 +45,12 @@ upgrading:
   literal `$(` with `$$(`; an unknown variable, or a credential-class source
   name (`$(header.authorization)`, `$(query.access_token)`, …), is refused at
   load.
-- `mesh_route_dispatch` `request_transform` (VirtualService
-  `headers.request.set/add`) add/update destinations under `x-path-param-*`
-  are refused, so a VirtualService that sets one fails translation.
+- `mesh_route_dispatch` `request_transform` add/update destinations under
+  `x-path-param-*` are refused. The translators refuse the offending resource
+  only: an HTTPRoute/GRPCRoute `RequestHeaderModifier` `set`/`add` of such a
+  name reports `Accepted=False` (`UnsupportedValue`), and a VirtualService
+  `headers.request.set`/`add` of an `x-path-param-*` or `x-consumer-*` name
+  is refused at translation; the rest of the cluster's config still loads.
 
 Behaviour changes that need no config edit but may matter downstream:
 

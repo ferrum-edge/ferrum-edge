@@ -3433,3 +3433,23 @@ fn skip_reasons_survive_default_log_serialization() {
     // Only the two exact keys are reviewed, not the namespace.
     assert!(metadata_value_is_redacted("request_transformer.other"));
 }
+
+#[tokio::test]
+async fn digest_retirement_folds_underscore_spellings() {
+    // Muse round-2 MUSE-3(b): `Content_Digest` folds onto the same CGI
+    // variable as `Content-Digest` at Rack/WSGI/PHP backends.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let mut inbound: HashMap<String, String> = HashMap::new();
+    inbound.insert("content-type".to_string(), "application/json".to_string());
+    inbound.insert("content_digest".to_string(), "sha-256=:stale:".to_string());
+    inbound.insert("Repr_Digest".to_string(), "sha-256=:stale:".to_string());
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(&[&plugin], &mut ctx, inbound)
+        .await
+        .expect("the stale digests are retired");
+    assert!(!outbound.contains_key("content_digest"));
+    assert!(!outbound.contains_key("Repr_Digest"));
+}

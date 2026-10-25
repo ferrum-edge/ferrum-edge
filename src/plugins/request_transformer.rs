@@ -1066,11 +1066,13 @@ enum BodyPass {
     Unchanged,
 }
 
-/// Whether `name` is a request field computed over the request content.
+/// Whether `name` is a request field computed over the request content,
+/// under the backend folding (`_` ≡ `-`, ASCII case-insensitive): a
+/// `Content_Digest` reaches a CGI-style backend as the same variable.
 pub(crate) fn is_body_bound_request_integrity_header(name: &str) -> bool {
     BODY_BOUND_REQUEST_INTEGRITY_HEADERS
         .iter()
-        .any(|bound| name.eq_ignore_ascii_case(bound))
+        .any(|bound| crate::proxy::headers::field_names_equivalent_for_backends(name, bound))
 }
 
 /// Whether request-transformer body rules may replace the bytes of a request

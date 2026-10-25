@@ -3542,6 +3542,23 @@ fn validate_vs_header_block(
                         ),
                     ));
                 }
+                // Gateway-owned request assertions: `mesh_route_dispatch`
+                // refuses these `request_transform` destinations at
+                // construction, so refuse this VirtualService here instead of
+                // emitting a plugin config that fails later.
+                if direction == "request"
+                    && (crate::proxy::headers::is_path_param_assertion_header(&normalized)
+                        || crate::proxy::headers::is_consumer_assertion_header(&normalized))
+                {
+                    return Err(invalid_resource(
+                        object,
+                        format!(
+                            "VirtualService {field} cannot write gateway-owned request header \
+                             {normalized:?}: the `x-path-param-*` route-capture and \
+                             `x-consumer-*` consumer assertion namespaces are gateway-owned"
+                        ),
+                    ));
+                }
                 let value = value.as_str().ok_or_else(|| {
                     invalid_resource(
                         object,
