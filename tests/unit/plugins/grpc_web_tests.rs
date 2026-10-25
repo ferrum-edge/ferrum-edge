@@ -1037,7 +1037,7 @@ async fn run_grpc_web_request_pipeline(
         .transform_request_body_with_context(&mut ctx, wire_body, None, &headers)
         .await
         .unwrap_or_else(|| wire_body.to_vec());
-    let staged = ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata);
+    let staged = ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx);
     let outcome = plugin
         .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
         .await;
@@ -1500,8 +1500,8 @@ async fn staged_request_trailers_reject_a_tampered_staging_block() {
             base64::engine::general_purpose::STANDARD.encode(staged),
         );
         assert!(
-            ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata).is_none(),
-            "{case}: plugin-writable staging must be re-validated at dispatch"
+            ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx).is_none(),
+            "{case}: plugin-writable metadata must never forge dispatched request trailers"
         );
     }
 }
@@ -4836,7 +4836,7 @@ async fn staged_request_trailers_are_omitted_from_transaction_summaries() {
     // Backend dispatch still gets the native trailers: this is omission from the
     // log projection, not removal of the transport contract.
     assert_eq!(
-        ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata),
+        ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
         Some(vec![("x-app-session".to_string(), CANARY.to_string())]),
         "native trailer delivery must be unaffected"
     );
@@ -5157,39 +5157,173 @@ async fn full_size_request_trailer_block_without_optional_whitespace_is_delivere
     assert!(staged.is_none());
 }
 
-/// grpc_web-SOL-2: when the staged trailer block cannot be recovered the way
-/// dispatch reads it, the owner's final hook refuses the request instead of
-/// letting dispatch silently send it without the trailers it stripped.
+/// PR6826-SOL-1: the split trailer block is request-private typed state, so a
+/// later hook deleting, forging, or clearing gRPC-Web metadata — between the
+/// transform and the owner's final hook, or after it — can neither drop nor
+/// replace the trailers dispatch sends. Driven through the H1/H2 hook-context
+/// round trip so the typed state must also survive adoption onto the live
+/// context.
 #[tokio::test]
-async fn unrecoverable_staged_request_trailers_fail_the_final_hook() {
+async fn split_request_trailers_survive_later_hooks_rewriting_metadata() {
     use base64::Engine;
+    use ferrum_edge::plugins::RequestContext;
 
-    let plugin = create_plugin_default();
+    #[derive(Clone, Copy)]
+    enum Tamper {
+        Forge,
+        ClearGrpcWebMetadata,
+    }
+
+    fn tamper(ctx: &mut RequestContext, how: Tamper) {
+        match how {
+            Tamper::Forge => {
+                ctx.metadata.insert(
+                    "grpc_web.request_trailers".to_string(),
+                    base64::engine::general_purpose::STANDARD.encode(r#"[["x-app-id","forged"]]"#),
+                );
+            }
+            Tamper::ClearGrpcWebMetadata => {
+                ctx.metadata.retain(|key, _| !key.starts_with("grpc_web"));
+            }
+        }
+    }
+
+    struct MetadataTamperer {
+        on_transform: Option<Tamper>,
+        on_final: Option<Tamper>,
+    }
+
+    #[async_trait::async_trait]
+    impl Plugin for MetadataTamperer {
+        fn name(&self) -> &str {
+            "metadata_tamperer"
+        }
+
+        fn modifies_request_body(&self) -> bool {
+            true
+        }
+
+        fn needs_final_request_body_context(&self) -> bool {
+            true
+        }
+
+        async fn transform_request_body_with_context(
+            &self,
+            ctx: &mut RequestContext,
+            _body: &[u8],
+            _content_type: Option<&str>,
+            _request_headers: &HashMap<String, String>,
+        ) -> Option<Vec<u8>> {
+            if let Some(how) = self.on_transform {
+                tamper(ctx, how);
+            }
+            None
+        }
+
+        async fn on_final_request_body_with_context(
+            &self,
+            ctx: &mut RequestContext,
+            _headers: &HashMap<String, String>,
+            _body: &[u8],
+        ) -> PluginResult {
+            if let Some(how) = self.on_final {
+                tamper(ctx, how);
+            }
+            PluginResult::Continue
+        }
+    }
+
     let message = request_frame(0x00, b"hello");
-    let mut body = message.clone();
-    body.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\n"));
+    let mut with_trailer = message.clone();
+    with_trailer.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\n"));
 
+    let compositions = [
+        (
+            "forged between transform and final",
+            Some(Tamper::Forge),
+            None,
+        ),
+        (
+            "forged after the owner's final hook",
+            None,
+            Some(Tamper::Forge),
+        ),
+        (
+            "gRPC-Web metadata cleared after the owner's final hook",
+            None,
+            Some(Tamper::ClearGrpcWebMetadata),
+        ),
+    ];
+    for (case, on_transform, on_final) in compositions {
+        for (content_type, wire) in [
+            ("application/grpc-web+proto", with_trailer.clone()),
+            (
+                "application/grpc-web-text+proto",
+                grpc_web_text_body(&with_trailer),
+            ),
+        ] {
+            let grpc_web = create_plugin_default();
+            let plugins: Vec<Arc<dyn Plugin>> = vec![
+                grpc_web.clone(),
+                Arc::new(MetadataTamperer {
+                    on_transform,
+                    on_final,
+                }),
+            ];
+            let mut ctx = create_grpc_web_context(content_type);
+            assert!(matches!(
+                grpc_web.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ));
+            let mut headers = ctx.headers.clone();
+            assert!(matches!(
+                grpc_web.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ));
+
+            let (transformed, outcome) =
+                ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+                    &plugins, &mut ctx, &headers, wire,
+                )
+                .await;
+            assert!(
+                matches!(outcome, PluginResult::Continue),
+                "{case} ({content_type}): got {outcome:?}"
+            );
+            assert_eq!(transformed, message, "{case} ({content_type})");
+            assert_eq!(
+                ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx),
+                Some(vec![("x-app-id".to_string(), "42".to_string())]),
+                "{case} ({content_type}): dispatch must send exactly the validated block"
+            );
+        }
+    }
+
+    // A genuine request without a trailer frame still dispatches, with no
+    // trailers — even when a later hook plants a forged staging value.
+    let grpc_web = create_plugin_default();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![
+        grpc_web.clone(),
+        Arc::new(MetadataTamperer {
+            on_transform: Some(Tamper::Forge),
+            on_final: Some(Tamper::Forge),
+        }),
+    ];
     let mut ctx = create_grpc_web_context("application/grpc-web+proto");
-    plugin.on_request_received(&mut ctx).await;
+    grpc_web.on_request_received(&mut ctx).await;
     let mut headers = ctx.headers.clone();
-    plugin.before_proxy(&mut ctx, &mut headers).await;
-    let transformed = plugin
-        .transform_request_body_with_context(&mut ctx, &body, None, &headers)
-        .await
-        .expect("trailer frame is split off");
+    grpc_web.before_proxy(&mut ctx, &mut headers).await;
+    let (transformed, outcome) =
+        ferrum_edge::_test_support::run_buffered_request_body_hook_round_trip_for_test(
+            &plugins,
+            &mut ctx,
+            &headers,
+            message.clone(),
+        )
+        .await;
+    assert!(matches!(outcome, PluginResult::Continue), "got {outcome:?}");
     assert_eq!(transformed, message);
-
-    ctx.metadata.insert(
-        "grpc_web.request_trailers".to_string(),
-        base64::engine::general_purpose::STANDARD.encode(r#"[["authorization","Bearer x"]]"#),
-    );
-    assert!(ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata).is_none());
-    assert_grpc_web_request_rejected(
-        plugin
-            .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
-            .await,
-        "unrecoverable staged trailers",
-    );
+    assert!(ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx).is_none());
 }
 
 /// grpc_web-SOL-3: segmented text decoding writes every segment into one

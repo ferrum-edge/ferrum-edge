@@ -150,8 +150,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailer block with a mandatory space after each colon, so an admitted block
   at the 8 KiB bound written without that optional space was silently dropped;
   the re-check now uses the minimal `name:value` form an admitted block never
-  exceeds, and a staged block that cannot be recovered fails the final
-  request-body hook. Text-mode request decoding no longer allocates once per
+  exceeds. The split trailer block now lives in request-private typed state
+  that every dispatch path (HTTP/1.1, HTTP/2, HTTP/3, retry replay) reads,
+  instead of in plugin-writable metadata, so a later plugin deleting or
+  rewriting `grpc_web.request_trailers` can no longer make dispatch drop or
+  forge the trailers already stripped from the body. Text-mode request decoding no longer allocates once per
   padded flush segment, final trailer reconciliation on buffered text responses
   decodes only the trailer suffix when checking whether the frame changed, and
   trailer-frame field selection and sorting runs once per frame instead of

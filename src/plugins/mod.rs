@@ -2556,6 +2556,15 @@ pub struct RequestContext {
     /// metadata. Keeping a credential/body-derived digest here also prevents
     /// transaction-log serialization.
     soap_ws_security_authenticated_body_digest: Option<[u8; 32]>,
+    /// The validated request trailer block the `grpc_web` translation owner
+    /// split off a gRPC-Web request body. Request-private typed state rather
+    /// than `metadata`: the trailer frame is already gone from the body, so a
+    /// plugin deleting or rewriting a metadata entry must not be able to make
+    /// dispatch silently drop (or forge) these trailers. Only `grpc_web` can
+    /// populate it; every gRPC dispatch path (H1/H2, H3, retry replay) reads it,
+    /// and the H1/H2 body-hook context hands it back to the live context in
+    /// [`Self::adopt_final_request_body_hook_terminals`].
+    pub(crate) grpc_web_request_trailers: grpc_web::StagedRequestTrailers,
     pub timestamp_received: DateTime<Utc>,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
@@ -4353,6 +4362,7 @@ impl RequestContext {
             websocket_shutdown_rx: None,
             client_trust_session: None,
             soap_ws_security_authenticated_body_digest: None,
+            grpc_web_request_trailers: grpc_web::StagedRequestTrailers::default(),
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
@@ -4817,6 +4827,12 @@ impl RequestContext {
     /// late transport encoding of a decoded cache hit. These private decisions
     /// are only ever set, never cleared, when adopting the hook stage's state.
     pub(crate) fn adopt_final_request_body_hook_terminals(&mut self, hook_ctx: &RequestContext) {
+        // The `grpc_web` request-body transform runs on this hook context on
+        // H1/H2 and stages the split trailer block here as typed state; it must
+        // reach the live context that dispatch reads, or the stripped trailers
+        // would be lost. The hook context was cloned from this one, so taking
+        // its value is a no-op when no trailer frame was split.
+        self.grpc_web_request_trailers = hook_ctx.grpc_web_request_trailers.clone();
         self.semantic_cache_response_replay |= hook_ctx.semantic_cache_response_replay;
         if hook_ctx.gateway_capacity_response_selected() {
             self.mark_gateway_capacity_response_selected();
@@ -5882,6 +5898,9 @@ impl RequestContext {
             client_trust_session: self.client_trust_session.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,
+            // Carried so a hook run that splits no trailer frame keeps an
+            // already-staged block, and adopted back afterwards.
+            grpc_web_request_trailers: self.grpc_web_request_trailers.clone(),
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,

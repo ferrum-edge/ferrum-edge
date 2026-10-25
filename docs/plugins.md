@@ -6420,18 +6420,21 @@ client as a gRPC-Web terminal frame) before any backend dispatch:
   bytes) inside the existing gRPC receive ceiling. The block does not stay body
   bytes — it becomes a header block the backend holds decoded — so it may not
   consume the whole body budget. The 8 KiB bound is measured on the received
-  block, and dispatch re-checks the staged block against its minimal
-  `name:value` CRLF form, which an admitted block never exceeds, so every
-  admitted block — including one exactly at the bound with no space after its
-  colons — reaches the backend intact. If the staged block can no longer be
-  recovered by the time the final request-body hook runs, the request fails
-  closed with a 400 instead of being dispatched without its trailers.
+  block, and staging re-checks the block against its minimal `name:value` CRLF
+  form, which an admitted block never exceeds, so every admitted block —
+  including one exactly at the bound with no space after its colons — reaches
+  the backend intact.
 
 Duplicate names are preserved as repeated trailer entries. Retries replay the
 same complete request, trailers included. The validated block is staged as
-request-private transport state for dispatch and is **omitted entirely** from
-every transaction-log projection (native serializers and custom log schemas
-alike), so application trailing metadata is never written to a log sink.
+request-private, typed transport state on the request context — never in
+plugin-writable request metadata — so a later plugin that deletes, rewrites, or
+clears gRPC-Web metadata can neither drop nor forge the trailers that every
+dispatch path (HTTP/1.1, HTTP/2, HTTP/3, and retry replay) sends. It is never
+part of any transaction-log projection (native serializers and custom log
+schemas alike), and the reserved `grpc_web.request_trailers` metadata key stays
+omitted from logs, so application trailing metadata is never written to a log
+sink.
 Request streaming is unchanged: only the already-buffered gRPC-Web envelope is
 inspected, and native gRPC requests keep their streaming fast path and
 backpressure.

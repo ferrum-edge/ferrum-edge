@@ -221,11 +221,13 @@ const META_GRPC_WEB_OWNER: &str = "grpc_web.owner";
 /// trailer frame was rejected, so a second pass cannot re-run the parse and
 /// overwrite the staged diagnostic.
 const META_GRPC_WEB_REQUEST_DECODED: &str = "grpc_web.request_decoded";
-/// Base64-encoded JSON array of `[name, value]` request trailer pairs split
-/// off the request body by the translation owner. Consumed by the gRPC
-/// dispatch paths via [`staged_request_trailers`], which re-validates every
-/// entry (`ctx.metadata` is plugin-writable, so being present is not proof of
-/// provenance).
+/// Reserved, log-omitted metadata name for gRPC-Web request trailers.
+///
+/// Nothing in the gateway writes or reads trailers through this key: the
+/// owner-validated block lives in request-private typed state
+/// ([`StagedRequestTrailers`]) so plugin-writable metadata can neither delete
+/// nor forge it. The name stays reserved so a value planted under it is still
+/// omitted from transaction logs.
 const META_GRPC_WEB_REQUEST_TRAILERS: &str = "grpc_web.request_trailers";
 /// Diagnostic recorded when the owner's request-body translation failed: the
 /// request trailer frame failed validation, the text-mode body was not valid
@@ -522,13 +524,6 @@ pub(crate) const MAX_REQUEST_TRAILER_ENTRIES: usize = 64;
 const MAX_REQUEST_TRAILER_NAME_BYTES: usize = 128;
 /// Maximum length of a single request trailer value.
 const MAX_REQUEST_TRAILER_VALUE_BYTES: usize = 4096;
-/// Maximum base64-encoded JSON staging size for one validated trailer block.
-///
-/// JSON escaping can at most double the accepted 8 KiB wire payload; the
-/// remaining factor covers tuple punctuation and base64 expansion. Check this
-/// before decoding plugin-writable metadata so a forged staging value cannot
-/// trigger an unbounded allocation.
-const MAX_REQUEST_TRAILER_STAGING_BYTES: usize = 4 * MAX_REQUEST_TRAILER_BLOCK_BYTES;
 /// Bytes a request trailer line spends beyond its name and value in the
 /// minimal wire form `name:value\r\n` — the colon plus CRLF. Optional
 /// whitespace around the value is not counted, because the parser trims it.
@@ -770,61 +765,84 @@ fn base64_metadata_member_is_valid(member: &str) -> bool {
                 .is_ok())
 }
 
-/// Serialize validated request trailers for owner-scoped request staging.
-fn encode_request_trailers(trailers: &[(String, String)]) -> Result<String, &'static str> {
-    serde_json::to_vec(trailers)
-        .map(|raw| BASE64.encode(raw))
-        .map_err(|_| ERR_TRAILER_STAGING_FAILED)
-}
-
-/// Remove request-private gRPC-Web staging from a transaction-log metadata
-/// projection.
+/// Remove a gRPC-Web request-trailer staging key from a transaction-log
+/// metadata projection.
 ///
-/// [`META_GRPC_WEB_REQUEST_TRAILERS`] holds the client's COMPLETE trailing
-/// metadata block. It is transport state consumed at dispatch, not
-/// observability metadata, and application trailing metadata may carry
-/// credentials — so it is OMITTED from every summary rather than redacted by
-/// outer-key name matching, which cannot see the names embedded in the encoded
-/// value. Base64 is an encoding, not confidentiality.
-///
-/// This runs on the log CLONE only; `ctx.metadata` keeps the entry so
-/// [`staged_request_trailers`] can still emit the backend's native trailers.
-/// `metadata_redaction::is_internal_only_metadata_key` classifies the same key
-/// so a custom log schema cannot project it back either.
+/// The validated request trailer block is request-private TYPED state
+/// ([`StagedRequestTrailers`] on the request context) and is never written to
+/// `ctx.metadata`, so it cannot reach a log sink through the metadata map.
+/// [`META_GRPC_WEB_REQUEST_TRAILERS`] stays a reserved, log-omitted key anyway,
+/// so a value any plugin plants under that name (application trailing metadata
+/// may carry credentials) is OMITTED from every summary rather than redacted by
+/// outer-key name matching. `metadata_redaction::is_internal_only_metadata_key`
+/// classifies the same key so a custom log schema cannot project it back either.
 pub(crate) fn redact_internal_log_metadata<MS: std::hash::BuildHasher>(
     metadata: &mut HashMap<String, String, MS>,
 ) {
     metadata.remove(META_GRPC_WEB_REQUEST_TRAILERS);
 }
 
-/// Decode the staged request trailer block into a native HTTP/2 trailer map.
+/// The validated request trailer block the translation owner split off a
+/// gRPC-Web request body, as request-private typed state.
 ///
-/// Called by the gRPC dispatch paths with the request metadata map. Every entry
-/// is re-validated: `ctx.metadata` is writable by any plugin, so the staged
-/// block being present is not evidence that this plugin wrote it. Any anomaly
-/// answers `None` (dispatch without trailers) rather than forwarding a block
-/// this function cannot prove is the one the owner validated.
-pub(crate) fn staged_request_trailers(
-    metadata: &crate::plugins::MetadataMap,
-) -> Option<http::HeaderMap> {
-    let encoded = metadata.get(META_GRPC_WEB_REQUEST_TRAILERS)?;
-    if encoded.len() > MAX_REQUEST_TRAILER_STAGING_BYTES {
+/// The owner strips the terminal trailer frame from the backend-bound body, so
+/// from that point this record is the ONLY representation of those trailers.
+/// It therefore lives on the request context rather than in `ctx.metadata`:
+/// metadata is writable by every plugin, and a later hook deleting or
+/// rewriting a metadata entry would otherwise make dispatch send the DATA
+/// without the trailers it already removed. Only this module can populate it
+/// (the inner value is private and built solely from entries that passed
+/// [`validated_request_trailer_map`]); the H1/H2 body-hook context adopts it
+/// back onto the live context, and every gRPC dispatch path — first attempt
+/// and retry replay, H1/H2 and H3 — reads it through
+/// [`staged_request_trailers`].
+#[derive(Clone, Default)]
+pub(crate) struct StagedRequestTrailers(Option<std::sync::Arc<http::HeaderMap>>);
+
+/// Application trailing metadata may carry credentials, so a `Debug` rendering
+/// of the request context reports only how many trailers are staged.
+impl std::fmt::Debug for StagedRequestTrailers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedRequestTrailers")
+            .field("entries", &self.0.as_ref().map(|map| map.len()))
+            .finish()
+    }
+}
+
+impl StagedRequestTrailers {
+    /// Stage a validated trailer block, or `None` when an entry fails the
+    /// dispatch-time revalidation (which an admitted block never does).
+    pub(crate) fn from_validated_pairs(trailers: Vec<(String, String)>) -> Option<Self> {
+        validated_request_trailer_map(trailers).map(|map| Self(Some(std::sync::Arc::new(map))))
+    }
+}
+
+/// The native HTTP/2 request trailers a gRPC dispatch sends for this request:
+/// the owner-validated block split off a gRPC-Web body, or `None` when the
+/// request carried no trailer frame. Read from typed request state, never from
+/// plugin-writable metadata, so a hook cannot delete or forge them.
+pub(crate) fn staged_request_trailers(staged: &StagedRequestTrailers) -> Option<http::HeaderMap> {
+    staged.0.as_deref().cloned()
+}
+
+/// Build the native trailer map for a request trailer block, re-checking every
+/// entry against the same rules [`parse_request_trailer_block`] admitted it
+/// under (defense in depth: the map becomes an HTTP/2 header block the backend
+/// holds decoded). Any anomaly answers `None`, which the owner turns into a
+/// request refusal rather than a dispatch without trailers.
+fn validated_request_trailer_map(trailers: Vec<(String, String)>) -> Option<http::HeaderMap> {
+    if trailers.is_empty() || trailers.len() > MAX_REQUEST_TRAILER_ENTRIES {
         return None;
     }
-    let raw = BASE64.decode(encoded).ok()?;
-    let parsed: Vec<(String, String)> = serde_json::from_slice(&raw).ok()?;
-    if parsed.is_empty() || parsed.len() > MAX_REQUEST_TRAILER_ENTRIES {
-        return None;
-    }
-    let mut map = http::HeaderMap::with_capacity(parsed.len());
+    let mut map = http::HeaderMap::with_capacity(trailers.len());
     let mut reconstructed_wire_bytes = 0usize;
-    for (name, value) in parsed {
+    for (name, value) in trailers {
         // Measure the CANONICAL minimal wire form, `name:value\r\n`. Admission
         // bounds the received block, whose every line spells at least that
         // much (the space after the colon is optional OWS the parser trims), so
         // a block `split_request_trailer_frame` admitted can never exceed this
         // bound here. Counting a mandatory `: ` separator instead overcounted
-        // one byte per line and silently dropped full-size admitted blocks.
+        // one byte per line and refused full-size admitted blocks.
         reconstructed_wire_bytes = reconstructed_wire_bytes
             .checked_add(name.len())?
             .checked_add(value.len())?
@@ -4847,16 +4865,17 @@ impl Plugin for GrpcWebPlugin {
                     data_len = frame.data_end,
                     "Converted gRPC-Web request trailer frame to native gRPC trailers"
                 );
-                let encoded = match encode_request_trailers(&frame.trailers) {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        self.latch_request_translation_error(ctx, error);
-                        return None;
-                    }
+                let RequestTrailerFrame { data_end, trailers } = frame;
+                // The trailer frame is about to leave the body for good, so the
+                // validated block goes into request-private TYPED state that
+                // dispatch reads directly — not into plugin-writable metadata,
+                // where a later hook could delete or rewrite the only copy.
+                let Some(staged) = StagedRequestTrailers::from_validated_pairs(trailers) else {
+                    self.latch_request_translation_error(ctx, ERR_TRAILER_STAGING_FAILED);
+                    return None;
                 };
-                ctx.metadata
-                    .insert(META_GRPC_WEB_REQUEST_TRAILERS.to_string(), encoded);
-                Some(framed[..frame.data_end].to_vec())
+                ctx.grpc_web_request_trailers = staged;
+                Some(framed[..data_end].to_vec())
             }
             None => None,
         };
@@ -4922,20 +4941,6 @@ impl Plugin for GrpcWebPlugin {
         // field-specific diagnostic before the request can reach the backend.
         if let Some(error) = ctx.metadata.get(META_GRPC_WEB_REQUEST_TRAILER_ERROR) {
             return invalid_grpc_web_request(error);
-        }
-        // The staged trailer block must still be recoverable exactly as
-        // dispatch will read it. Dispatch treats an unreadable block as "no
-        // trailers", so a block that cannot round-trip here would otherwise be
-        // dropped silently after its frame was already stripped from the body.
-        if ctx.metadata.contains_key(META_GRPC_WEB_REQUEST_TRAILERS)
-            && staged_request_trailers(&ctx.metadata).is_none()
-        {
-            debug!(
-                plugin = "grpc_web",
-                instance = %self.instance_id_str,
-                "Fail closed: staged request trailers cannot be recovered for dispatch"
-            );
-            return invalid_grpc_web_request(ERR_TRAILER_STAGING_FAILED);
         }
         validate_grpc_web_request_frames(body, headers)
             .map_or_else(invalid_grpc_web_request, |()| PluginResult::Continue)
