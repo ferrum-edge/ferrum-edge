@@ -28,6 +28,31 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `udp_rate_limiting`: UDP/DTLS-only attachments and session retirement on hook reloads (#6868)
+
+A proxy- or proxy-group-scoped `udp_rate_limiting` plugin config whose targets
+include a TCP/TCP+TLS or HTTP-family proxy is now refused at configuration
+admission (admin API, file load, database/CP snapshot) and plugin-cache
+validation. Such an attachment never enforced anything — the plugin only runs
+on UDP/DTLS datagrams — so remove it, attach it to the UDP/DTLS proxies only,
+or make it a global policy (globals keep applying to UDP/DTLS listeners only).
+Use `tcp_connection_throttle` for TCP connection admission and `rate_limiting`
+for HTTP-family requests.
+
+A reload that changes a UDP/DTLS proxy's datagram-hook plugin instances (adding,
+removing, or reconfiguring `udp_rate_limiting`, `waf`, `fault_injection`, or
+another datagram plugin, or rebuilding that proxy's plugin chain) now ends that
+proxy's established sessions at their next datagram, which is dropped; the
+client's following datagram opens a new session under the current policy.
+Plain-UDP backends see the client arrive from a new gateway source port, and
+DTLS-terminating clients must complete a new handshake. Local rate-limit
+budgets carry over for a compatible policy. If a protocol cannot tolerate that,
+schedule datagram-plugin changes for those proxies in a maintenance window.
+Reloads that leave the proxy's datagram hooks untouched do not end sessions.
+The new optional `ipv6_prefix` (default 64) and `direction` (default `both`)
+keys keep the previous behavior when omitted. See
+[plugins.md](plugins.md#udp_rate_limiting).
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now

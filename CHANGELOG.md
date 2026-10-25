@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `udp_rate_limiting` attaches only to UDP/DTLS proxies, and a
+  datagram-hook reload ends established UDP/DTLS sessions** (issue #6868). A
+  proxy- or proxy-group-scoped `udp_rate_limiting` whose targets include a
+  TCP/TCP+TLS or HTTP-family proxy is now refused at configuration admission and
+  plugin-cache validation instead of loading as protection that never runs
+  (globals keep per-protocol filtering). Separately, an established UDP/DTLS
+  session used to keep the datagram hooks it was admitted with for its whole
+  life — so adding, tightening, or removing `udp_rate_limiting` (or any
+  datagram plugin) never reached a flow that kept sending. A reload that
+  changes the proxy's datagram-hook instances now ends such a session; its
+  next datagram is admitted under the current policy (plain-UDP clients see a
+  new backend source port, DTLS clients handshake again). Reloads that leave
+  the proxy's hooks untouched do not end sessions, and the per-datagram check
+  is one atomic load while nothing changed.
+- **`udp_rate_limiting` gains `ipv6_prefix` and `direction`** (issue #6868).
+  `ipv6_prefix` (1–128, default 64) groups IPv6 clients the same way
+  `rate_limiting` does; `direction` (`both` default, `client_to_backend`,
+  `backend_to_client`) limits one direction only and neither counts nor drops
+  the other. Both are part of the local-state compatibility fingerprint.
+  `UdpDatagramContext` (custom UDP plugins) gains `client_ip_addr`, the typed
+  canonical client address computed once per session.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +160,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`udp_rate_limiting` review hardening** (issue #6868).
+  - A state map exactly full of clients that had all gone idle stayed closed
+    to every new client until the next 100,000-hook sample: capacity cleanup
+    tested `len > cap`, which atomic admission makes unreachable. It now
+    reclaims idle entries at the cap (still at most once per second, never
+    evicting live budgets), local and Redis-fallback alike.
+  - Steady in-window admission of an existing client takes a shared shard
+    reference instead of the exclusive entry guard, so many sessions behind
+    one NAT address or IPv6 prefix no longer serialize per datagram; rollover,
+    insert, and cleanup keep the exclusive guard.
+  - The IPv6 key is no longer re-parsed, re-masked, and re-allocated for every
+    datagram: the local key is the masked typed address.
+  - Datagrams dropped fail-closed during a Redis outage are now counted in
+    `ferrum_rate_limit_enforcement_unavailable_total`.
+  - Docs state the Redis `noeviction` requirement, the Redis-mode per-session
+    throughput ceiling, and exactly which datagrams the hook sees.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
