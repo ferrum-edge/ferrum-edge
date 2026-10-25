@@ -9110,6 +9110,112 @@ fn transaction_log_schema_delta_reload_updates_registry_without_runtime_entries(
 }
 
 #[test]
+fn transaction_log_schema_delta_reload_rebuilds_proxy_group_schema_ref_consumers() {
+    // Regression: a proxy-group logger with `schema_ref` was retained across
+    // an incremental reload whenever its own row was unchanged, so it kept the
+    // schema compiled at construction after the referenced named definition
+    // changed — a newly added privacy `omit` never reached that sink.
+    use ferrum_edge::plugins::utils::log_schema::registry;
+
+    let _guard = registry::lock_for_tests();
+    registry::reset_for_tests();
+
+    let audit_v1 = json!({
+        "summary_type": "http",
+        "static_fields": { "schema_version": "v1" }
+    });
+    let definitions = |audit: serde_json::Value, extra: bool| {
+        let mut schemas = serde_json::Map::new();
+        schemas.insert("audit".to_string(), audit);
+        if extra {
+            schemas.insert("unrelated".to_string(), json!({}));
+        }
+        json!({ "schemas": schemas })
+    };
+    let schema_plugin = make_plugin_config_with_json(
+        "schemas",
+        "transaction_log_schema",
+        definitions(audit_v1.clone(), false),
+        PluginScope::Global,
+        None,
+    );
+    let group_logger = make_plugin_config_with_json(
+        "group-log",
+        "stdout_logging",
+        json!({ "schema_ref": "audit" }),
+        PluginScope::ProxyGroup,
+        None,
+    );
+    let proxies = || {
+        vec![
+            make_proxy("p1", "/api", vec!["group-log"]),
+            make_proxy("p2", "/web", vec!["group-log"]),
+        ]
+    };
+    let config_v1 = make_config(proxies(), vec![schema_plugin.clone(), group_logger.clone()]);
+    let cache = PluginCache::new(&config_v1).expect("initial cache");
+    let apply = |old: &GatewayConfig, new: &GatewayConfig| {
+        let delta = ConfigDelta::compute(old, new);
+        assert!(delta.global_plugin_configs_changed);
+        let proxy_ids = delta.proxy_ids_needing_plugin_rebuild(old, new);
+        cache
+            .apply_delta(
+                new,
+                &proxy_ids,
+                &delta.removed_proxy_ids,
+                delta.global_plugin_configs_changed,
+            )
+            .expect("schema delta reload");
+    };
+    let group_ptr =
+        |proxy: &str| plugin_ptr_by_name(&cache.get_plugins("ferrum", proxy), "stdout_logging");
+    let original = group_ptr("p1");
+    assert_eq!(original, group_ptr("p2"), "one shared group instance");
+
+    // A global change that leaves the referenced definition byte-identical
+    // keeps the shared instance (and whatever state it holds).
+    let mut schema_same = schema_plugin.clone();
+    schema_same.config = definitions(audit_v1, true);
+    schema_same.updated_at += chrono::Duration::seconds(1);
+    let config_same = make_config(proxies(), vec![schema_same.clone(), group_logger.clone()]);
+    apply(&config_v1, &config_same);
+    assert_eq!(
+        group_ptr("p1"),
+        original,
+        "unchanged definition keeps the instance"
+    );
+    assert_eq!(group_ptr("p2"), original);
+
+    // Changing the referenced definition replaces the group instance, and the
+    // replacement is still shared by every associated proxy.
+    let mut schema_v2 = schema_same;
+    schema_v2.config = definitions(
+        json!({
+            "summary_type": "http",
+            "omit": ["client_ip", "consumer_username"],
+            "static_fields": { "schema_version": "v2" }
+        }),
+        true,
+    );
+    schema_v2.updated_at += chrono::Duration::seconds(1);
+    let config_v2 = make_config(proxies(), vec![schema_v2, group_logger]);
+    apply(&config_same, &config_v2);
+    let replaced = group_ptr("p1");
+    assert_ne!(
+        replaced, original,
+        "changed definition rebuilds the group logger"
+    );
+    assert_eq!(
+        replaced,
+        group_ptr("p2"),
+        "the rebuilt instance stays shared"
+    );
+    let audit = registry::lookup_named("audit").expect("audit committed");
+    assert!(audit.omits_tag("client_ip"));
+    assert!(audit.omits_tag("consumer_username"));
+}
+
+#[test]
 fn test_get_plugins_for_protocol_filters_by_protocol() {
     // ip_restriction = ALL_PROTOCOLS, cors = HTTP_ONLY
     let config = make_config(

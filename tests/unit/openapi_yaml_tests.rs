@@ -292,6 +292,12 @@ fn transaction_log_schema_openapi_matches_constructor_admission() {
         .build(&schema)
         .expect("TransactionLogSchemaConfig schema compiles");
 
+    let too_many_static: serde_json::Map<String, serde_json::Value> = (0..65)
+        .map(|index| (format!("stamp_{index}"), json!("v")))
+        .collect();
+    let too_many_derived: Vec<serde_json::Value> = (0..33)
+        .map(|index| json!({ "name": format!("derived_{index}"), "kind": "outcome" }))
+        .collect();
     for config in [
         json!({ "schemas": {} }),
         json!({ "schemas": { "": {} } }),
@@ -310,6 +316,42 @@ fn transaction_log_schema_openapi_matches_constructor_admission() {
         json!({ "schemas": { "basic": { "metadata": { "mode": "nested", "prefix": 3 } } } }),
         json!({
             "schemas": { "basic": { "metadata": { "mode": "omit", "on_collision": "bad" } } }
+        }),
+        // Bounds and transforms are documented with the same limits the
+        // compiler enforces.
+        json!({ "schemas": { "basic": { "omit": vec!["proxy_id"; 257] } } }),
+        json!({ "schemas": { "basic": { "rename": { "proxy_id": "k".repeat(129) } } } }),
+        json!({ "schemas": { "basic": { "static_fields": too_many_static.clone() } } }),
+        json!({ "schemas": { "basic": { "derived_fields": too_many_derived.clone() } } }),
+        json!({
+            "schemas": { "basic": { "metadata": { "mode": "flatten", "prefix": "p".repeat(65) } } }
+        }),
+        json!({ "schemas": { ("n".repeat(129)): {} } }),
+        json!({
+            "schemas": { "basic": { "transforms": { "client_ip": { "type": "truncate" } } } }
+        }),
+        json!({
+            "schemas": { "basic": { "transforms": {
+                "http_method": { "type": "truncate", "max_bytes": 4 }
+            } } }
+        }),
+        json!({
+            "schemas": { "basic": { "transforms": {
+                "client_ip": { "type": "truncate", "max_bytes": 65537 }
+            } } }
+        }),
+        json!({
+            "schemas": { "basic": { "transforms": {
+                "client_ip": { "type": "ip_prefix", "ipv4_bits": 33 }
+            } } }
+        }),
+        json!({
+            "schemas": { "basic": { "transforms": {
+                "client_ip": { "type": "hash", "secret_ref": "a-literal-secret-value-of-some-length" }
+            } } }
+        }),
+        json!({
+            "schemas": { "basic": { "transforms": { "client_ip": { "type": "mask" } } } }
         }),
     ] {
         let documented = validator.validate(&config);
@@ -330,7 +372,12 @@ fn transaction_log_schema_openapi_matches_constructor_admission() {
                     "static_fields": { "env": "production" },
                     "derived_fields": [{ "name": "outcome", "kind": "outcome" }],
                     "metadata": { "mode": "flatten", "prefix": "meta_" },
-                    "timestamp_format": "epoch_ms"
+                    "timestamp_format": "epoch_ms",
+                    "transforms": {
+                        "client_ip": { "type": "ip_prefix", "ipv4_bits": 16, "ipv6_bits": 32 },
+                        "consumer_username": { "type": "truncate", "max_bytes": 8 },
+                        "backend_resolved_ip": { "type": "ip_prefix" }
+                    }
                 }
             }
         }),
@@ -424,6 +471,7 @@ fn api_chargeback_sink_schema_matches_constructor_admission() {
         json!({ "metadata": { "mode": "omit" } }),
         json!({ "metadata": { "mode": "flatten" } }),
         json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
+        json!({ "transforms": { "client_ip": { "type": "truncate", "max_bytes": 4 } } }),
     ] {
         assert!(
             shared_validator.validate(&projection).is_ok(),

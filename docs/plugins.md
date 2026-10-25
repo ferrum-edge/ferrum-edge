@@ -486,8 +486,10 @@ logs and metrics for accounting. Explicit debug logging retains per-event volume
 > **Customizing transaction log output**: every logging plugin below
 > accepts an optional `schema:` block (or
 > `schema_ref:` against a named `transaction_log_schema` plugin) to
-> rename keys, drop fields, reorder output, add static stamping, and
-> emit a few derived fields. Metadata redaction always applies on every
+> rename keys, drop fields, reorder output, add static stamping,
+> emit a few derived fields, and minimize selected values (`transforms`:
+> truncate, IP-prefix anonymization, keyed HMAC pseudonyms). Metadata
+> redaction always applies on every
 > path. See **[docs/log_schema.md](log_schema.md)** for the full
 > reference, including the per-plugin caveats (statsd's tag-name
 > mapping, Kafka partition keys, Loki labels, WebSocket-disconnect
@@ -513,7 +515,7 @@ later full-config load.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `schemas` | Object | *(required)* | Map of schema name → schema definition. Must contain at least one entry; names must be non-empty and unique across every enabled `transaction_log_schema` in the namespace. Each value is the same schema object accepted by a logging plugin's inline `schema:` — see **[docs/log_schema.md](log_schema.md)** for the field reference (`summary_type`, `omit`, `rename`, `order`, `static_fields`, `derived_fields`, `metadata`, `timestamp_format`). |
+| `schemas` | Object | *(required)* | Map of schema name → schema definition. Must contain 1–256 entries; names must be non-empty, at most 128 bytes, and unique across every enabled `transaction_log_schema` in the namespace. Each value is the same schema object accepted by a logging plugin's inline `schema:` — see **[docs/log_schema.md](log_schema.md)** for the field reference (`summary_type`, `omit`, `rename`, `order`, `static_fields`, `derived_fields`, `metadata`, `timestamp_format`, `transforms`) and its size bounds. |
 
 Unknown outer config keys and unknown nested fixed-shape keys (schema,
 `derived_fields` entry, `metadata` policy) are rejected with their full path.
@@ -527,7 +529,11 @@ replaced wholesale on each config reload — renamed or removed schemas do not
 leak — and admin create/update/delete, batch, and restore validate the complete
 prospective namespace graph (definitions staged before referrers) without
 touching the live registry. A `schema_ref` naming a schema absent from the
-prospective namespace is rejected.
+prospective namespace is rejected. When a reload changes a named definition,
+every referrer is rebuilt against it — `proxy_group`-scoped loggers included,
+which are otherwise retained across incremental reloads while their own config
+row is unchanged — so the new output contract (for example an added `omit`)
+reaches every sink on that reload.
 
 ```yaml
 plugin_name: transaction_log_schema

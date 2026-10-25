@@ -294,6 +294,15 @@ pub const INVENTORY: &[CryptoOperation] = &[
         rationale: "routed through the backend alias",
     },
     CryptoOperation {
+        operation: "HMAC-SHA256 log-field pseudonymization (log-schema `hash` transform)",
+        location: "src/plugins/utils/log_schema/transform.rs",
+        implementation: "crate::fips::approved (module-backed HMAC-SHA-256)",
+        disposition: Disposition::ModuleRoutable,
+        rationale: "the keyed pseudonym is computed through fips::approved::HmacSha256Key, so it \
+                    reaches the selected module; the key is a FERRUM_PLUGIN_SECRET_* value of at \
+                    least 32 bytes, matching the FIPS HMAC key floor",
+    },
+    CryptoOperation {
         operation: "AI semantic-cache Redis envelope authentication",
         location: "src/plugins/ai_semantic_cache.rs",
         implementation: "crate::fips::approved (module-backed HMAC-SHA-256)",

@@ -20801,7 +20801,17 @@ components:
         sensitive-data substring or a credential-class name (for example
         `session_id`, `client_assertion`, `gpg_passphrase`, `private_rsa_key`;
         see docs/log_schema.md), while a `static_fields` string value that
-        looks like a literal HTTP auth credential is refused.
+        looks like a literal HTTP auth credential is refused. Under
+        `metadata.mode: flatten`, `omit` may not list `metadata` and `rename`
+        may not rename it; under `metadata.mode: omit`, `rename` may not rename
+        it (those directives would otherwise be silently ignored). The whole
+        `static_fields` object serialized as JSON (escaped keys and values,
+        quotes, separators, braces) must be at most 16384 bytes and a static
+        value may nest at most 8 objects/arrays deep.
+        `transforms` keys must be fields of the selected `summary_type`, may
+        not also be omitted, `ip_prefix` applies only to `client_ip` /
+        `backend_resolved_ip`, and a `hash` `secret_ref` must resolve to a set
+        `FERRUM_PLUGIN_SECRET_<NAME>` value of at least 32 bytes.
         See docs/log_schema.md.
       additionalProperties: false
       properties:
@@ -20815,15 +20825,19 @@ components:
             only customizes types it claims to handle).
         omit:
           type: array
+          maxItems: 256
           items: { type: string, minLength: 1 }
           description: Native field names to drop from output.
         rename:
           type: object
+          maxProperties: 256
           propertyNames: { minLength: 1 }
-          additionalProperties: { type: string, minLength: 1 }
-          description: Map of native field name -> output key.
+          additionalProperties: { type: string, minLength: 1, maxLength: 128 }
+          description: >-
+            Map of native field name -> output key (at most 128 bytes).
         order:
           type: array
+          maxItems: 256
           uniqueItems: true
           items: { type: string, minLength: 1 }
           description: >-
@@ -20833,16 +20847,23 @@ components:
             a repeated output key (or a second `"*"`) is rejected.
         static_fields:
           type: object
-          propertyNames: { minLength: 1 }
+          maxProperties: 64
+          propertyNames: { minLength: 1, maxLength: 128 }
           additionalProperties:
             not: { type: "null" }
           description: >-
             Literal JSON values injected at top level. Keys / nested
             keys matching sensitive substrings or credential-class names
             (for example `session_id`) are rejected at compile time. A `null` value is rejected — use `omit`
-            to drop a field.
+            to drop a field. At most 64 entries; keys are at most 128 bytes;
+            the whole object serialized as JSON (escaped keys and values
+            included) is at most 16384 bytes; a value nests at most 8
+            objects/arrays deep. Static fields
+            are stamped into every record, so these bounds are a per-record
+            cost cap.
         derived_fields:
           type: array
+          maxItems: 32
           description: Computed values; emitted alongside native fields.
           items:
             type: object
@@ -20852,6 +20873,7 @@ components:
               name:
                 type: string
                 minLength: 1
+                maxLength: 128
                 description: Output key for the derived value.
               kind:
                 type: string
@@ -20876,6 +20898,7 @@ components:
               default: nested
             prefix:
               type: string
+              maxLength: 64
               pattern: "^[^\\x00-\\x1F\\x7F-\\x9F]*$"
               description: >-
                 Prepended to each metadata key when promoted to top-level
@@ -20891,8 +20914,9 @@ components:
               description: >-
                 Behavior when a metadata key collides with an
                 already-emitted field; only `flatten` reads it. `skip` keeps
-                the existing value; `overwrite` emits a duplicate JSON key
-                (last value wins per parser convention). Validated in every
+                the existing value; `overwrite` replaces the colliding field's
+                value in place with the (redacted) metadata value, so every
+                key appears exactly once in the record. Validated in every
                 mode, like `prefix`.
         timestamp_format:
           type: string
@@ -20903,6 +20927,67 @@ components:
             (`timestamp_received`, `timestamp_connected`,
             `timestamp_disconnected`). Parse failures fall back to the
             raw RFC3339 string.
+        transforms:
+          type: object
+          propertyNames:
+            enum:
+              - client_ip
+              - consumer_username
+              - request_path
+              - request_user_agent
+              - backend_target
+              - backend_resolved_ip
+              - sni_hostname
+          additionalProperties:
+            oneOf:
+              - type: object
+                additionalProperties: false
+                required: [type, max_bytes]
+                properties:
+                  type: { const: truncate }
+                  max_bytes:
+                    type: integer
+                    minimum: 1
+                    maximum: 65536
+              - type: object
+                additionalProperties: false
+                required: [type]
+                properties:
+                  type: { const: ip_prefix }
+                  ipv4_bits:
+                    type: integer
+                    minimum: 0
+                    maximum: 32
+                    default: 24
+                  ipv6_bits:
+                    type: integer
+                    minimum: 0
+                    maximum: 128
+                    default: 48
+              - type: object
+                additionalProperties: false
+                required: [type, secret_ref]
+                properties:
+                  type: { const: hash }
+                  secret_ref:
+                    type: string
+                    pattern: "^\\$\\{FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*\\}$"
+          description: >-
+            Per-field value transforms, keyed by native source field name
+            (before `rename`), applied when the field is emitted:
+            `truncate` keeps at most `max_bytes` bytes (cut on a UTF-8
+            boundary); `ip_prefix` keeps the network prefix of an IP address
+            (`ipv4_bits` default 24, `ipv6_bits` default 48; IPv4-mapped IPv6
+            is masked as IPv4; a value that is not an address is emitted as
+            `null`); `hash` replaces the value with the lowercase-hex keyed
+            HMAC-SHA-256 under the secret named by `secret_ref`, which must be
+            a `${FERRUM_PLUGIN_SECRET_<NAME>}` reference resolved at
+            construction (literal secrets are refused; the value must be at
+            least 32 bytes). Only the transaction-summary loggers support
+            `transforms`; `api_chargeback`, `api_chargeback_sink`, and
+            `transaction_debugger` reject the key, and statsd ignores it.
+            Kafka partition keys and Loki labels read typed fields and are
+            not transformed.
 
     # ── Plugin Config Schemas ──────────────────────────────────────────
     # Per-plugin configuration schemas. The `config` field on PluginConfig
@@ -22353,7 +22438,8 @@ components:
         schemas:
           type: object
           minProperties: 1
-          propertyNames: { minLength: 1 }
+          maxProperties: 256
+          propertyNames: { minLength: 1, maxLength: 128 }
           additionalProperties:
             $ref: "#/components/schemas/SummaryLogSchema"
           description: >-
@@ -22648,7 +22734,10 @@ components:
             cannot be declared safe. Requires log_request_body or
             log_response_body true when the array is nonempty.
         schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
+          allOf:
+            - $ref: "#/components/schemas/SummaryLogSchema"
+            - properties:
+                transforms: false
         schema_ref:
           type: string
           description: >-
@@ -40354,6 +40443,7 @@ components:
               - required: [timestamp_format]
               - required: [metadata]
               - required: [order]
+              - required: [transforms]
           properties:
             omit:
               type: array
@@ -40736,6 +40826,7 @@ components:
             summary_type: false
             timestamp_format: false
             metadata: false
+            transforms: false
             omit:
               items:
                 $ref: "#/components/schemas/ApiChargebackSinkLogField"
