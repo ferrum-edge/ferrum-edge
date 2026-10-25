@@ -4,6 +4,7 @@ use ferrum_edge::_test_support::{
     request_mirror_metrics_snapshot_for_test, request_mirror_resolve_timeout_ms_for_test,
     request_mirror_retained_request_body_bytes_for_test, request_mirror_sample_phase_for_test,
     request_mirror_sample_threshold_for_test, request_mirror_should_mirror_for_test,
+    set_backend_method_override_for_test,
 };
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
@@ -2766,6 +2767,31 @@ async fn test_mirror_preserves_supported_and_extension_methods() {
 }
 
 #[tokio::test]
+async fn test_mirror_replays_the_backend_method_a_bridge_selected() {
+    // `mcp_gateway`'s OpenAPI bridge turns a client `POST` MCP `tools/call`
+    // into a REST operation and records the backend method separately from
+    // `ctx.method`. The shadow must replay the operation the primary backend
+    // receives, not the client `POST` combined with the bridge's REST body.
+    for backend_method in ["GET", "DELETE", "PATCH", "PUT", "POST"] {
+        let mut ctx = make_ctx_with_proxy();
+        assert_eq!(ctx.method, "POST");
+        set_backend_method_override_for_test(&mut ctx, Some(backend_method));
+
+        let request_line =
+            capture_mirror_request_line_with_config(&mut ctx, json!({"mirror_path": "/pets/7"}))
+                .await;
+        assert!(
+            request_line.starts_with(&format!("{backend_method} /pets/7")),
+            "mirror must use the backend method {backend_method}: {request_line}"
+        );
+        assert_eq!(
+            ctx.method, "POST",
+            "the client method stays on the context for policy and logging"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_mirror_preserves_raw_query_edge_cases() {
     // Issue #2444: repeated pairs, order, flags, empty values, `+`, encoded
     // delimiters, percent escapes, and non-ASCII encoded bytes must survive.
@@ -3988,6 +4014,11 @@ async fn retained_body_budget_drops_when_exhausted_and_releases_on_completion() 
         1,
         "the exhausted second attempt is a byte-budget drop"
     );
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).egress_preparations,
+        1,
+        "only the admitted first attempt may pay egress preparation and the body copy"
+    );
 
     let _ = release.send(());
     let _ = first.collect_mirror_result().await;
@@ -4704,6 +4735,11 @@ async fn mirror_metrics_count_concurrency_drops() {
         m.concurrency_drops, 1,
         "the saturated second attempt is a concurrency drop: {m:?}"
     );
+    assert_eq!(
+        m.egress_preparations, 1,
+        "the saturated attempt must be refused before credential provenance, \
+         query policy, and header sanitization run: {m:?}"
+    );
 }
 
 #[test]
@@ -4974,6 +5010,11 @@ async fn advisory_saturated_permits_keep_the_request_streaming() {
     assert_eq!(
         request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
         0
+    );
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).egress_preparations,
+        0,
+        "a drop decided at pre-buffer admission must not pay egress preparation"
     );
 
     // Releasing the admitted context returns both the permit and the bytes.
@@ -6118,9 +6159,56 @@ async fn advisory_body_inflated_past_the_ceiling_is_attributed_to_the_ceiling() 
         "the refusal is still a byte-admission drop"
     );
     assert_eq!(
+        metrics.egress_preparations, 0,
+        "a body above the ceiling must be refused from its borrowed length, \
+         before preparation or an owned copy of the oversized body"
+    );
+    assert_eq!(
         request_mirror_retained_request_body_bytes_for_test(&plugin),
         0,
         "the staged ceiling reservation must be released, not leaked"
+    );
+}
+
+#[tokio::test]
+async fn refused_mirror_publishes_a_query_free_target_without_preparing_egress() {
+    // The refusal is decided before the query credential policy runs, so the
+    // attributable target is built from the query-free base. It must match the
+    // stripped form a dispatched mirror logs: no query at all, so neither the
+    // credential nor ordinary application parameters are echoed.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_in_flight": 4,
+        "max_retained_request_body_bytes": 1024 * 1024,
+        "max_mirrored_request_body_bytes": 1024
+    }));
+
+    let mut ctx = advisory_ctx(Some(512));
+    ctx.set_raw_query_string("access_token=s3cr3t&page=2".to_string());
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'z'; 4096]));
+    let mut headers = HashMap::new();
+    headers.insert("authorization".to_string(), "Bearer s3cr3t".to_string());
+    plugin_utils::assert_continue(plugin.finalized_egress(&mut ctx, &mut headers).await);
+
+    let dropped = ctx
+        .collect_mirror_result()
+        .await
+        .expect("a refused mirror must publish an attributable result");
+    let target = dropped.mirror_target_url.clone();
+    assert!(
+        target.starts_with("http://mirror.local:80/") && !target.contains('?'),
+        "refusal target must be the query-free mirror URL, got {target}"
+    );
+    assert!(
+        !target.contains("s3cr3t") && !target.contains("page"),
+        "refusal target must not echo any query data, got {target}"
+    );
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).egress_preparations,
+        0
     );
 }
 
@@ -6836,6 +6924,62 @@ async fn query_pair_reusing_a_credential_value_is_withheld_from_the_mirror() {
     assert!(
         default_line.contains("?x=1 ") && !default_line.contains("9876"),
         "default mirror must drop both the credential and its renamed copy: {default_line}"
+    );
+}
+
+/// A credential's percent- and form-decoded forms are still recognised under
+/// a renamed, non-sensitive name. Decoded digests are skipped only when the
+/// raw value has no `%` (percent-decoding is the identity) or no `+` (the form
+/// decoding equals the percent decoding), so both directions must still match.
+#[tokio::test]
+async fn query_pair_reusing_a_decoded_credential_value_is_withheld_from_the_mirror() {
+    // Credential presented form-encoded; copies percent-encoded and raw.
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string(
+        "access_token=se+cret&copy=se%20cret&plain=se+cret&page=2".to_string(),
+    );
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        line.contains("?page=2 ") && !line.contains("cret"),
+        "every encoding of the presented credential must be withheld: {line}"
+    );
+
+    // Credential presented percent-encoded; copy carries the decoded bytes raw.
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("access_token=se%2Bcret&copy=se+cret&page=2".to_string());
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        line.contains("?page=2 ") && !line.contains("cret"),
+        "the percent-decoded credential must be withheld under a new name: {line}"
+    );
+}
+
+/// Single-pass query rebuild: pairs before the first dropped one are kept in
+/// order, empty segments vanish once a rebuild starts, and later pairs are
+/// still classified. A query with nothing to drop is forwarded byte-for-byte.
+#[tokio::test]
+async fn query_rebuild_keeps_order_and_drops_empty_segments_after_a_strip() {
+    for (raw, expected) in [
+        ("a=1&&b=2&access_token=t&c=3&&", "?a=1&b=2&c=3 "),
+        ("access_token=t&a=1&&b=2", "?a=1&b=2 "),
+        ("&a=1&api_key=k&b=2&session_id=s&c=3", "?a=1&b=2&c=3 "),
+        ("a=1&&b=2&", "?a=1&&b=2& "),
+    ] {
+        let mut ctx = make_ctx_with_proxy();
+        ctx.set_raw_query_string(raw.to_string());
+        let line = capture_mirror_request_line(&mut ctx).await;
+        assert!(
+            line.contains(expected),
+            "query {raw:?} must mirror as {expected:?}: {line}"
+        );
+    }
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("access_token=t&api_key=k".to_string());
+    let line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !line.contains('?') && !line.contains('&'),
+        "an all-sensitive query yields a target with no query: {line}"
     );
 }
 

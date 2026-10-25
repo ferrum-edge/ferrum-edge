@@ -400,7 +400,6 @@ plugin_configs:
     config:
       set:
         X-Synthetic-Policy: "enforced"
-        Content-Type: "text/plain"
         Grpc-Status: "0"
         Grpc-Message: "policy override"
       remove: []

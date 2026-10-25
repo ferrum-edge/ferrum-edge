@@ -3052,6 +3052,85 @@ async fn sliding_and_pair_reads_fail_closed_on_non_integer_counter() {
     let _ = server.shutdown.send(());
 }
 
+/// ai_rate_limiter-MUSE-1 (centralized half): a request that outlives two
+/// windows reconciles after its reserved window has left the pair admission
+/// reads. Its correction must not land in that dead key: the full actual usage
+/// is charged to the CURRENT window, and a release has nothing live to debit.
+#[tokio::test]
+async fn an_aged_out_redis_token_reservation_charges_the_current_window() {
+    use ferrum_edge::plugins::utils::rate_limit::{
+        AiRateLimitOp, AiTokenRateAlgorithm, RateLimitAlgorithm, ReservationBackend,
+    };
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let client = Arc::new(keyspace_client(server.port));
+    let window_seconds = 86_400;
+    let algorithm = AiTokenRateAlgorithm::new(1_000_000, window_seconds);
+
+    // The production arm samples the wall-clock window itself. Each attempt
+    // uses a fresh key and is accepted only when the window index was the same
+    // before and after every operation, so a run straddling a window boundary
+    // retries instead of failing.
+    for attempt in 0..3 {
+        let key = format!("consumer:long-stream-{attempt}");
+        let current = RedisRateLimitClient::window_progress(window_seconds).index;
+        let aged = current.saturating_sub(3);
+        let current_key = client.make_slot_key(&key, &[&current.to_string()]);
+        let aged_key = client.make_slot_key(&key, &[&aged.to_string()]);
+
+        // Reserved 100 three windows ago; actually consumed 600.
+        algorithm
+            .check_redis(
+                &client,
+                &key,
+                &AiRateLimitOp::AdjustUsage {
+                    reservation_id: None,
+                    reserved_window_index: Some(aged),
+                    reservation_backend: ReservationBackend::Redis,
+                    actual_tokens: 600,
+                    delta: 500,
+                },
+            )
+            .await
+            .expect("the reconciliation reaches the fake keyspace");
+        let charged = server.counter(&current_key);
+        let dead = server.counter(&aged_key);
+
+        // A release of an aged-out reservation debits nothing live.
+        algorithm
+            .check_redis(
+                &client,
+                &key,
+                &AiRateLimitOp::AdjustUsage {
+                    reservation_id: None,
+                    reserved_window_index: Some(aged),
+                    reservation_backend: ReservationBackend::Redis,
+                    actual_tokens: 0,
+                    delta: -100,
+                },
+            )
+            .await
+            .expect("the release reaches the fake keyspace");
+        let after_release = server.counter(&current_key);
+
+        let budget = algorithm
+            .check_redis(&client, &key, &AiRateLimitOp::CheckBudget)
+            .await
+            .expect("the budget read reaches the fake keyspace");
+
+        if RedisRateLimitClient::window_progress(window_seconds).index != current {
+            continue;
+        }
+        assert_eq!(charged, 600);
+        assert_eq!(dead, 0, "the dead window is never written");
+        assert_eq!(after_release, 600);
+        assert_eq!(budget.usage, Some(600));
+        let _ = server.shutdown.send(());
+        return;
+    }
+    panic!("the window index rolled over during every attempt");
+}
+
 /// Two requests that select adjacent sub-buckets must not both be admitted
 /// against a one-request quota, even when the NEWER ladder executes first.
 ///

@@ -2951,6 +2951,121 @@ async fn the_gate_publishes_the_terminal_class_before_the_summary_is_built() {
     }
 }
 
+fn route_security_policy() -> Vec<Arc<dyn ferrum_edge::plugins::Plugin>> {
+    let policy = ferrum_edge::plugins::security_headers::SecurityHeaders::new(&serde_json::json!({
+        "hsts": true,
+        "content_security_policy": "default-src 'none'",
+        "set": { "X-Policy": "required" },
+        "remove": ["server", "WWW-Authenticate"]
+    }))
+    .expect("security policy");
+    vec![Arc::new(policy)]
+}
+
+fn decorated_protected_headers() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("content-type".to_string(), "text/html".to_string()),
+        ("set-cookie".to_string(), "session=protected".to_string()),
+        ("x-backend-meta".to_string(), "secret".to_string()),
+        ("x-content-type-options".to_string(), "nosniff".to_string()),
+    ])
+}
+
+/// The fixed plain-HTTP `401` carries the route's static security policy and
+/// keeps its own content type and reauthentication challenge authoritative,
+/// while nothing from the protected response survives.
+fn assert_policy_decorated_authorization_terminal(
+    status: u16,
+    headers: &std::collections::HashMap<String, String>,
+    body: &[u8],
+) {
+    assert_eq!(status, 401);
+    assert_eq!(body, br#"{"error":"Unauthorized"}"#);
+    fn header<'a>(
+        headers: &'a std::collections::HashMap<String, String>,
+        name: &str,
+    ) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+    assert_eq!(header(headers, "content-type"), Some("application/json"));
+    assert!(
+        header(headers, "www-authenticate").is_some_and(|challenge| !challenge.is_empty()),
+        "a policy `remove` cannot leave the 401 without its challenge: {headers:?}"
+    );
+    assert_eq!(header(headers, "x-content-type-options"), Some("nosniff"));
+    assert_eq!(header(headers, "x-frame-options"), Some("SAMEORIGIN"));
+    assert_eq!(
+        header(headers, "referrer-policy"),
+        Some("strict-origin-when-cross-origin")
+    );
+    assert_eq!(
+        header(headers, "strict-transport-security"),
+        Some("max-age=31536000; includeSubDomains")
+    );
+    assert_eq!(
+        header(headers, "content-security-policy"),
+        Some("default-src 'none'")
+    );
+    assert_eq!(header(headers, "x-policy"), Some("required"));
+    assert_eq!(
+        header(headers, "set-cookie"),
+        None,
+        "backend cookies must not survive"
+    );
+    assert_eq!(
+        header(headers, "x-backend-meta"),
+        None,
+        "backend metadata must not survive"
+    );
+}
+
+/// security_headers-SOL-1: the final H1/H2 gate replaces the whole decorated
+/// header map after every response hook ran, so it must reapply the route's
+/// precomputed initial-response policy to the fixed terminal itself.
+#[tokio::test]
+async fn the_final_gate_reapplies_the_route_security_policy_to_its_terminal() {
+    let mut ctx = authenticated_ctx();
+    let received_at = request_received_at_for_test(&ctx);
+    set_request_credential_deadline_for_test(&mut ctx, Some(received_at));
+
+    let policy = route_security_policy();
+    let gate = ferrum_edge::_test_support::precommit_authorization_gate_with_policy_for_test(
+        &mut ctx,
+        DEFAULT_MAX,
+        false,
+        200,
+        decorated_protected_headers(),
+        b"protected",
+        &policy,
+    );
+
+    assert_eq!(
+        gate.termination,
+        Some(StreamAuthTermination::CredentialExpired)
+    );
+    assert_policy_decorated_authorization_terminal(gate.status, &gate.headers, &gate.body);
+}
+
+/// The buffered-response terminal builder's plain-HTTP branch overwrites the
+/// map the same way and receives the same policy slice.
+#[tokio::test]
+async fn the_buffered_plain_terminal_reapplies_the_route_security_policy() {
+    let mut ctx = authenticated_ctx();
+    let policy = route_security_policy();
+    let (status, headers, body) =
+        ferrum_edge::_test_support::buffered_authorization_terminal_for_test(
+            &mut ctx,
+            StreamAuthTermination::CredentialExpired,
+            decorated_protected_headers(),
+            &policy,
+        );
+
+    assert_policy_decorated_authorization_terminal(status, &headers, &body);
+}
+
 /// The same gate on native gRPC selects the legal trailers-only terminal and
 /// still publishes the bounded class for the terminal summary.
 #[tokio::test]

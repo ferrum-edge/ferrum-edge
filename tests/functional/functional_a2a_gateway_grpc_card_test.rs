@@ -1104,8 +1104,8 @@ async fn a2a_grpc_agent_card_is_rewritten_on_the_live_data_path() {
     );
     assert_eq!(
         string_field(&interfaces[1], 1).as_deref(),
-        Some("https://planner.internal/grpc"),
-        "a non-JSONRPC interface must be preserved verbatim",
+        Some(PUBLIC_BASE),
+        "a GRPC interface the gateway fronts must name the gateway's public origin",
     );
     assert!(
         !has_field(&message, 17),

@@ -540,6 +540,48 @@ async fn oversize_message_block_action_closes_without_enforcing_rule() {
     assert_policy_close(&outgoing);
 }
 
+/// A `global_exemptions.header_present` secret on the upgrade request exempts
+/// the session from the strict `on_body_too_large: block` cap too, exactly as
+/// it already suppressed every rule and every `fail_closed` decision.
+#[tokio::test]
+async fn header_present_exemption_also_suppresses_the_strict_size_cap() {
+    let plugins = vec![waf(json!({
+        "include_default_rules": false,
+        "max_scan_bytes": 16,
+        "on_body_too_large": "block",
+        "global_exemptions": {
+            "header_present": { "x-skip-waf": "trusted-hop-shared-secret" }
+        },
+        "custom_rules": [
+            {
+                "id": "CUSTOM-WS-MONITOR",
+                "name": "monitored token",
+                "category": "custom",
+                "target": "body_text",
+                "match_kind": "contains",
+                "pattern": PROHIBITED,
+                "action": "monitor"
+            }
+        ]
+    }))];
+    let original = oversize_message();
+
+    let mut exempt_ctx = upgrade_ctx("/ws");
+    exempt_ctx.headers.insert(
+        "x-skip-waf".to_string(),
+        "trusted-hop-shared-secret".to_string(),
+    );
+    let exempt = relay_to_backend(&plugins, &exempt_ctx, original.clone()).await;
+    assert_eq!(
+        exempt, original,
+        "a header-exempt session must not be closed by the strict size cap"
+    );
+
+    let governed_ctx = upgrade_ctx("/ws");
+    let governed = relay_to_backend(&plugins, &governed_ctx, original).await;
+    assert_policy_close(&governed);
+}
+
 #[tokio::test]
 async fn a_message_at_the_scan_ceiling_is_still_fully_inspected() {
     let mut config = enforcing_request_rule();
@@ -557,6 +599,39 @@ async fn a_message_at_the_scan_ceiling_is_still_fully_inspected() {
 /// 1 ms budget. No built-in or custom rule under test matches it.
 fn over_budget_clean_message() -> Message {
     Message::Text("a".repeat(1_000_000).into())
+}
+
+/// `on_scan_timeout: block` closes every over-budget session except one whose
+/// upgrade carried a `global_exemptions.header_present` secret, mirroring the
+/// HTTP `finish_timeout`. The timed-out outcome is forced through the
+/// session-bound decision, so the verdict never depends on scan speed.
+#[test]
+fn scan_timeout_block_spares_a_header_present_exempt_session() {
+    let mut config = enforcing_request_rule();
+    config["on_scan_timeout"] = json!("block");
+    config["global_exemptions"] = json!({
+        "header_present": { "x-skip-waf": "trusted-hop-shared-secret" }
+    });
+    let plugin = Arc::new(Waf::new(&config).expect("valid waf config"));
+
+    let mut exempt_ctx = upgrade_ctx("/ws");
+    exempt_ctx.headers.insert(
+        "x-skip-waf".to_string(),
+        "trusted-hop-shared-secret".to_string(),
+    );
+    assert!(
+        !Arc::clone(&plugin).ws_clean_timed_out_message_closes_for_test(
+            &exempt_ctx,
+            WebSocketFrameDirection::ClientToBackend
+        ),
+        "a header-exempt session is not closed on a clean but late message"
+    );
+
+    let governed_ctx = upgrade_ctx("/ws");
+    assert!(plugin.ws_clean_timed_out_message_closes_for_test(
+        &governed_ctx,
+        WebSocketFrameDirection::ClientToBackend
+    ));
 }
 
 /// A message the WAF scanned end to end and found clean is forwarded on the
