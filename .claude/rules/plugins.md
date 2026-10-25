@@ -94,7 +94,13 @@ paths:
   framing — and a gateway-minted `correlation_id` header whose live value still
   matches private request provenance (issue #3929). Client-supplied correlation
   values remain origin-visible dimensions; do not globally ignore `x-request-id`
-  or trust a client-spoofable metadata/header marker. A conditional
+  or trust a client-spoofable metadata/header marker. The only operator
+  relaxation is `ignore_request_headers`, which REMOVES each named header from
+  the backend request before keying (so the key still binds everything the
+  origin receives); never turn it into a key-only exclusion. The key also binds
+  the frontend scheme (`request_is_secure`, which regenerates
+  `X-Forwarded-Proto`) and the matched proxy's `backend_path` /
+  `strip_listen_path` / `preserve_host_header`. A conditional
   revalidation, a pure client no-cache/no-store refresh, and `Content-Length: 0`
   are addressed to an entry rather than selecting a different one — keying the
   raw view would put each of them in a partition the entry cannot be reached
@@ -265,8 +271,10 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     `run_final_request_body_hooks_with_provenance` immediately before step 6 on
     every dispatch ladder (`GHSA-3973-47g5-4mcx`). A plugin claims a request with
     `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`,
-    deny-policy `a2a_gateway` configurations, and `preserve_tag`-configured
-    `ai_prompt_compressor` instances on candidate JSON `POST`s)
+    deny-policy `a2a_gateway` configurations, `preserve_tag`-configured
+    `ai_prompt_compressor` instances on candidate JSON `POST`s, and
+    `ai_transcript_audit` under a fail-closed `on_sink_error` /
+    `on_buffer_full: reject` sink policy)
     only when its configured policy would BOTH inspect this representation and
     be able to REFUSE it — a `monitor`-mode WAF, a body rule set that only logs,
     and an `on_body_too_large: skip` body outside the scan window all lose an
@@ -885,6 +893,11 @@ on a native-gRPC request.
   shared client `Arc`, so a dropped request future (gRPC deadline under
   `timeout_at`, client disconnect, reload retiring the instance) cannot strand
   the charge, and the refused caller does not pay the second round trip inline.
+  The WHOLE decision — charge transaction, reply, settlement, and hand-back —
+  likewise runs on its own task (`check_http_windows_redis_detached`) that the
+  request only awaits: a cancellation between the `INCR` and reading its reply
+  would otherwise strand an over-limit charge no code ever hands back. Keep the
+  algorithms' `check_redis` routed through that wrapper.
   A compensation that fails goes through `note_command_failure`
   so `redis_failure_policy` governs the NEXT decision, and the refusal still
   stands; the earlier charge then remains until the charged bucket expires.

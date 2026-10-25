@@ -13422,12 +13422,13 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
         r#"{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"crm.lookup","#,
         r#""arguments":{"e":"alice@example.com","n":NaN}}}"#
     );
-    // A UTF-8 byte-order mark: strict JSON refuses it, lenient decoders strip it.
+    // A UTF-8 byte-order mark: strict JSON refuses it, lenient decoders strip
+    // it — and so does the audit, which therefore reads the call itself.
     let bom_call = format!(
         "\u{feff}{}",
         mcp_call_value(json!(75), "crm.lookup", json!({"e": "alice@example.com"}))
     );
-    for body in [nan_call, bom_call.as_str()] {
+    for (body, calls_read) in [(nan_call, false), (bom_call.as_str(), true)] {
         let mut ctx = mcp_ctx(&json!({}));
         ctx.metadata
             .insert("request_body".to_string(), body.to_string());
@@ -13442,7 +13443,11 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
         let mcp = &records[0]["mcp"];
         assert!(mcp.is_object(), "{records:#?}");
         assert_eq!(mcp["batch"], json!(false), "{mcp}");
-        assert_eq!(mcp["calls"], json!([]), "{mcp}");
+        if calls_read {
+            assert_eq!(mcp["calls"][0]["tool"], "crm.lookup", "{mcp}");
+        } else {
+            assert_eq!(mcp["calls"], json!([]), "{mcp}");
+        }
         assert!(
             !records[0].to_string().contains("alice@example.com"),
             "{records:#?}"
@@ -13482,7 +13487,8 @@ async fn mcp_audit_keeps_lenient_parser_tool_calls_as_candidates() {
 #[tokio::test]
 async fn mcp_audit_stages_content_type_less_bom_prefixed_tool_calls() {
     // Without a Content-Type only bodies the lenient prefilter does not flag
-    // are skipped; a BOM-prefixed call is flagged, so it is still audited.
+    // are skipped; a BOM-prefixed call is flagged, so it is still audited, and
+    // the BOM is stripped before parsing, so the call itself is read.
     let body = format!(
         "\u{feff}{}",
         mcp_call_value(json!(77), "crm.lookup", json!({"q": "x"}))
@@ -13499,7 +13505,10 @@ async fn mcp_audit_stages_content_type_less_bom_prefixed_tool_calls() {
     )
     .await;
     assert_eq!(records.len(), 1, "{records:#?}");
-    assert_eq!(records[0]["mcp"]["calls"], json!([]), "{records:#?}");
+    assert_eq!(
+        records[0]["mcp"]["calls"][0]["tool"], "crm.lookup",
+        "{records:#?}"
+    );
 }
 
 #[tokio::test]
@@ -13801,4 +13810,870 @@ fn mcp_arguments_capture_requires_mcp_calls_and_a_body_mode() {
     });
     let config = config_with_sink("https://audit.example.com/x", overrides);
     assert!(AiTranscriptAudit::new(&config, loopback_http_client()).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review regressions
+// ---------------------------------------------------------------------------
+
+/// The secret every structural-redaction regression below tries to smuggle
+/// out. It matches no built-in PII pattern, so only the sensitive-member-name
+/// policy (which needs a structural parse) can remove it.
+const GENERIC_SECRET: &str = "correct horse battery staple";
+
+#[tokio::test]
+async fn redacted_body_never_pattern_redacts_an_unparseable_mcp_document() {
+    // ai_transcript_audit-SOL-1: a JSON-like body the whole-document parse
+    // refuses used to fall back to regex-only redaction, which cannot see a
+    // generic `password` value, so it was exported verbatim under
+    // `mode: redacted_body`.
+    let response = json!({"jsonrpc": "2.0", "id": 1, "result": {"isError": false}});
+
+    // A UTF-8 BOM is stripped before the structural parse, so the document is
+    // redacted by member name and still exported.
+    let bom_call = format!(
+        "\u{feff}{}",
+        mcp_call_value(json!(1), "lookup", json!({ "password": GENERIC_SECRET }))
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), bom_call.clone());
+    let records = mcp_roundtrip(json!({}), &mut ctx, bom_call.as_bytes(), &response).await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let excerpt = records[0]["request_body"]
+        .as_str()
+        .expect("a BOM-prefixed document is structurally redacted and exported");
+    assert!(excerpt.contains("lookup"), "{excerpt}");
+    assert!(
+        !records[0].to_string().contains(GENERIC_SECRET),
+        "{records:#?}"
+    );
+
+    // `NaN` (a lenient-parser document) and a batch past the whole-document
+    // nesting limit cannot be parsed at all: the excerpt is withheld.
+    let nan_call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"lookup","arguments":{{"password":"{GENERIC_SECRET}","n":NaN}}}}}}"#
+    );
+    let deep_batch = mcp_batch_past_whole_document_recursion_limit().replacen(
+        r#""id":74,"#,
+        &format!(r#""id":74,"password":"{GENERIC_SECRET}","#),
+        1,
+    );
+    assert!(deep_batch.contains(GENERIC_SECRET));
+    assert!(serde_json::from_str::<Value>(&deep_batch).is_err());
+    let deep_response = json!([{"jsonrpc": "2.0", "id": 74, "result": {"isError": false}}]);
+    for (body, response) in [(nan_call, &response), (deep_batch, &deep_response)] {
+        let mut ctx = mcp_ctx(&json!({}));
+        ctx.metadata
+            .insert("request_body".to_string(), body.clone());
+        let records = mcp_roundtrip(json!({}), &mut ctx, body.as_bytes(), response).await;
+        assert_eq!(records.len(), 1, "the call must still be audited");
+        let record = &records[0];
+        assert!(record.get("request_body").is_none(), "{record}");
+        assert_eq!(
+            record["request_body_omitted_reason"], "unparseable_document",
+            "{record}"
+        );
+        assert_eq!(record["request_body_truncated"], true, "{record}");
+        assert!(record["request_hash"].is_string(), "{record}");
+        assert!(!record.to_string().contains(GENERIC_SECRET), "{record}");
+    }
+}
+
+#[tokio::test]
+async fn full_body_keeps_exporting_unparseable_documents_raw() {
+    // The explicit raw-capture opt-in is unaffected by the withholding rule.
+    let nan_call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"lookup","arguments":{{"password":"{GENERIC_SECRET}","n":NaN}}}}}}"#
+    );
+    let mut ctx = mcp_ctx(&json!({}));
+    ctx.metadata
+        .insert("request_body".to_string(), nan_call.clone());
+    let records = mcp_roundtrip(
+        json!({ "mode": "full_body", "allow_full_body": true }),
+        &mut ctx,
+        nan_call.as_bytes(),
+        &json!({"jsonrpc": "2.0", "id": 1, "result": {"isError": false}}),
+    )
+    .await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let excerpt = records[0]["request_body"].as_str().expect("raw excerpt");
+    assert!(excerpt.contains(GENERIC_SECRET), "{excerpt}");
+    assert!(records[0].get("request_body_omitted_reason").is_none());
+}
+
+#[tokio::test]
+async fn unparseable_json_responses_and_sse_frames_are_withheld_not_pattern_redacted() {
+    // The response side shares the redactor: a JSON-typed buffered response
+    // the parser refuses is withheld as a whole.
+    let response = format!(r#"{{"choices":[],"client_secret":"{GENERIC_SECRET}","n":NaN}}"#);
+    let records = capture_roundtrip(json!({}), response.as_bytes()).await;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    let record = &records[0];
+    assert!(record.get("response_body").is_none(), "{record}");
+    assert_eq!(
+        record["response_body_omitted_reason"], "unparseable_document",
+        "{record}"
+    );
+    assert!(!record.to_string().contains(GENERIC_SECRET), "{record}");
+
+    // An event stream keeps frame-by-frame redaction, but a JSON-shaped frame
+    // the parser refuses is replaced instead of exported as pattern-redacted
+    // text.
+    let parseable = r#"{"type":"message_start","message":{"id":"msg_1"}}"#;
+    let unparseable =
+        format!(r#"{{"type":"content_block_delta","token":"{GENERIC_SECRET}","n":NaN}}"#);
+    let capture = format!("data: {parseable}\n\ndata: {unparseable}\n\n");
+    let excerpt = streamed_sse_excerpt(&[capture.as_bytes()]).await;
+    assert!(!excerpt.contains(GENERIC_SECRET), "{excerpt}");
+    assert!(excerpt.contains("message_start"), "{excerpt}");
+    assert!(excerpt.contains("[UNPARSEABLE]"), "{excerpt}");
+}
+
+/// `ai_transcript_audit-SOL-2`: an audit-only native-gRPC proxy (no
+/// `grpc_method_router`, so no `grpc_full_method`) whose listen-path stripping
+/// or `backend_path` assembly changes the method must decide enrollment on the
+/// backend-effective path the proxy binds, not on the client path.
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_enrollment_uses_the_bound_backend_path_without_a_method_router() {
+    let plain = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    assert!(
+        !plain.requires_backend_path_resolution(),
+        "an HTTP-only instance does not join the backend-path boundary"
+    );
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    assert!(
+        plugin.requires_backend_path_resolution(),
+        "a grpc-enrolled instance must make the proxy bind the backend-effective path"
+    );
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // `listen_path: /audit`, `strip_listen_path: true`,
+    // `backend_path: /test.Greeter`: the client sends `/audit/SayHello`, the
+    // backend receives `/test.Greeter/SayHello`.
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    let mut headers = grpc_headers();
+    let req = grpc_frame(&hello_request_bytes("contact agent@example.com"));
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the client path is not enrolled"
+    );
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the bound backend-effective method is enrolled, so it must be captured"
+    );
+    let resp = grpc_frame(&hello_response_bytes("ok"));
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, &resp)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the excerpt must name the backend-effective method: {request_body}"
+    );
+
+    // The inverse: an enrolled client path whose backend-effective method is
+    // a different, unenrolled one is refuted, not captured as the wrong method.
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the provisional client-path method is enrolled"
+    );
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/Other",
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &req)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false"),
+        "the bound backend-effective method refutes the provisional enrollment"
+    );
+}
+
+#[tokio::test]
+async fn tool_governor_unkeyed_argument_digests_are_never_harvested() {
+    // ai_transcript_audit-SOL-3: `ai_tool_governor.arguments_hashes` is a plain
+    // SHA-256 of each call's raw arguments — an offline guessing oracle for a
+    // small argument space. Other governor decision fields stay harvested.
+    for mode in ["redacted_body", "metadata_only"] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, json!({ "mode": mode })),
+            loopback_http_client(),
+        )
+        .unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+            .await;
+        let unkeyed_digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        ctx.metadata.insert(
+            "ai_tool_governor.arguments_hashes".to_string(),
+            unkeyed_digest.to_string(),
+        );
+        ctx.metadata
+            .insert("ai_tool_governor.decision".to_string(), "allow".to_string());
+        ctx.metadata.insert(
+            "ai_tool_governor.tool_names".to_string(),
+            "lookup".to_string(),
+        );
+        let mut summary = create_test_transaction_summary();
+        summary.response_status_code = 200;
+        summary.metadata = ctx.metadata.clone();
+        plugin.log(&summary).await;
+
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "{mode}: {records:?}");
+        let record = &records[0];
+        assert!(
+            !record.to_string().contains(unkeyed_digest),
+            "{mode}: the unkeyed argument digest must not be exported: {record}"
+        );
+        assert!(
+            record["guardrails"]
+                .get("ai_tool_governor.arguments_hashes")
+                .is_none(),
+            "{mode}: {record}"
+        );
+        assert_eq!(
+            record["guardrails"]["ai_tool_governor.decision"], "allow",
+            "{mode}: {record}"
+        );
+        assert_eq!(
+            record["guardrails"]["ai_tool_governor.tool_names"], "lookup",
+            "{mode}: {record}"
+        );
+    }
+}
+
+/// A sink that fails closed on delivery errors, pointed at `endpoint`.
+fn fail_closed_sink(endpoint: &str) -> Value {
+    json!({
+        "type": "http",
+        "endpoint_url": endpoint,
+        "allow_insecure_loopback": true,
+        "batch_size": 1,
+        "flush_interval_ms": 100,
+        "on_sink_error": "reject"
+    })
+}
+
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("gzip write");
+    encoder.finish().expect("gzip finish")
+}
+
+#[test]
+fn fail_closed_audit_claims_the_final_representation_of_candidate_posts_only() {
+    // ai_transcript_audit-M1: the claim is what makes the shared request
+    // representation gate decode a content-coded AI request (or refuse it)
+    // before this plugin classifies it.
+    let fail_closed = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "sink": fail_closed_sink("https://audit.example.com/x") }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let fail_open = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let ctx = make_ctx();
+    assert!(fail_closed.enforces_final_request_body_policy(&ctx, &headers, b"coded"));
+    assert!(
+        !fail_open.enforces_final_request_body_policy(&ctx, &headers, b"coded"),
+        "a fail-open audit cannot refuse, so it must not turn an undecodable body into a 400"
+    );
+    let mut get = make_ctx();
+    get.method = "GET".to_string();
+    assert!(!fail_closed.enforces_final_request_body_policy(&get, &headers, b"coded"));
+    let mut text_headers = headers.clone();
+    text_headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert!(!fail_closed.enforces_final_request_body_policy(&ctx, &text_headers, b"coded"));
+    let grpc = grpc_ctx("/test.Greeter/SayHello");
+    assert!(!fail_closed.enforces_final_request_body_policy(&grpc, &headers, b"coded"));
+}
+
+#[tokio::test]
+async fn fail_closed_audit_classifies_content_coded_requests_on_the_decoded_view() {
+    // ai_transcript_audit-M1: a gzip AI request used to be classified on its
+    // coded octets, never staged, and so never reached fail-closed admission.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = Arc::new(
+        AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, json!({ "sink": fail_closed_sink(&endpoint) })),
+            loopback_http_client(),
+        )
+        .expect("valid config"),
+    );
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let coded = gzip_bytes(ai_request_body());
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = make_ctx();
+
+    // The production gate decodes the body because this instance claims it.
+    let as_dyn: Arc<dyn Plugin> = plugin.clone();
+    let plugins = vec![as_dyn];
+    let outcome = ferrum_edge::_test_support::evaluate_final_request_representation(
+        &plugins, &ctx, &headers, &coded,
+    );
+    let plaintext = match outcome {
+        ferrum_edge::_test_support::FinalRequestRepresentationOutcome::Decoded(plaintext) => {
+            plaintext
+        }
+        other => panic!("the fail-closed claim must decode the coded body: {other:?}"),
+    };
+    assert_eq!(plaintext.as_slice(), ai_request_body());
+
+    ferrum_edge::_test_support::stage_final_request_body_plaintext(&mut ctx, plaintext);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &coded)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the decoded AI request must be staged so fail-closed admission applies"
+    );
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let excerpt = records[0]["request_body"].as_str().expect("excerpt");
+    assert!(excerpt.contains("gpt-4o"), "{excerpt}");
+    assert!(!excerpt.contains("123-45-6789"), "{excerpt}");
+}
+
+#[tokio::test]
+async fn fail_closed_audit_stages_json_documents_no_parser_can_read() {
+    // ai_transcript_audit-M1: with MCP recognition off, a UTF-16 AI request is
+    // not readable by the strict parser, yet a lenient upstream executes it.
+    // Under a fail-closed policy it is conservatively audited (excerpt
+    // withheld) instead of being forwarded with no record and no admission.
+    let utf16: Vec<u8> = std::str::from_utf8(ai_request_body())
+        .expect("utf-8 fixture")
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let capture = json!({ "mcp_tool_calls": false });
+
+    let open_plugin = AiTranscriptAudit::new(
+        &config_with_sink("http://127.0.0.1:1/ingest", json!({ "capture": capture })),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    open_plugin.start_background_tasks().expect("live start");
+    open_plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    open_plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &utf16)
+        .await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "fail-open policies keep the heuristic classification"
+    );
+
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": capture, "sink": fail_closed_sink(&endpoint) }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &utf16)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "an unreadable JSON document is in fail-closed audit scope"
+    );
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert!(record.get("request_body").is_none(), "{record}");
+    assert_eq!(
+        record["request_body_omitted_reason"], "unparseable_document",
+        "{record}"
+    );
+    assert!(record["request_hash"].is_string(), "{record}");
+}
+
+/// A fail-closed (`on_sink_error: reject`), request-only audit whose collector
+/// refuses every batch, returned once an ordinary AI request is already
+/// rejected for the unhealthy sink.
+async fn unhealthy_fail_closed_audit(capture: Value) -> (MockServer, AiTranscriptAudit) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": capture,
+                "sampling": {
+                    "rate": 1.0,
+                    "always_capture_on_error": false,
+                    "always_capture_on_guardrail": false
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint,
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "on_sink_error": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &json_headers(), ai_request_body())
+        .await;
+    let mut summary = create_test_transaction_summary();
+    summary.metadata = first.metadata.clone();
+    plugin.log(&summary).await;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        if matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+                .await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            return (server, plugin);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the collector's 401 never marked the sink unhealthy");
+}
+
+#[tokio::test]
+async fn fail_closed_audit_refuses_every_unreadable_candidate_body_while_the_sink_is_down() {
+    // PR6815-SOL-1: with MCP recognition off, a comment-led or
+    // non-ASCII-whitespace-led AI request is unreadable to the strict parser
+    // but executed by a lenient upstream. No lead-byte heuristic may decide
+    // whether it is audited: under a reject policy it must reach fail-closed
+    // admission, including when it arrives content-coded.
+    let capture = json!({
+        "request": true,
+        "response": false,
+        "streaming_response": false,
+        "mcp_tool_calls": false
+    });
+    let (_server, plugin) = unhealthy_fail_closed_audit(capture).await;
+    let document = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#;
+    let lenient = [
+        format!("/* client context */ {document}"),
+        format!("// client context\n{document}"),
+        format!("\u{a0}{document}"),
+        r#"{"model":"gpt-4o","messages":[],}"#.to_string(),
+    ];
+    for body in &lenient {
+        assert!(serde_json::from_str::<Value>(body).is_err(), "{body}");
+        let mut ctx = make_ctx();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body.as_bytes())
+            .await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ..
+                }
+            ),
+            "an unreadable candidate body must not bypass fail-closed admission: {body}"
+        );
+    }
+
+    // The same comment-led request, gzip-coded: the claimed gate decodes it
+    // and the plugin decides the decoded plaintext the same way.
+    let plugin = Arc::new(plugin);
+    let coded = gzip_bytes(lenient[0].as_bytes());
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = make_ctx();
+    let as_dyn: Arc<dyn Plugin> = plugin.clone();
+    let plugins = vec![as_dyn];
+    let plaintext = match ferrum_edge::_test_support::evaluate_final_request_representation(
+        &plugins, &ctx, &headers, &coded,
+    ) {
+        ferrum_edge::_test_support::FinalRequestRepresentationOutcome::Decoded(plaintext) => {
+            plaintext
+        }
+        other => panic!("the fail-closed claim must decode the coded body: {other:?}"),
+    };
+    ferrum_edge::_test_support::stage_final_request_body_plaintext(&mut ctx, plaintext);
+    let result = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &coded)
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ),
+        "a decoded unreadable candidate body must not bypass fail-closed admission"
+    );
+}
+
+#[tokio::test]
+async fn multiline_sse_events_are_redacted_as_one_document() {
+    // PR6815-SOL-2: an SSE event's payload is all of its `data:` lines joined
+    // with `\n`. A JSON document spread over several lines must be redacted
+    // (or withheld) as that one document, never line by line, or the
+    // continuation line carrying the value escapes member-name redaction.
+    let parseable = format!(
+        "data: {{\"type\":\"content_block_delta\",\"password\":\ndata: \"{GENERIC_SECRET}\"}}\n\n"
+    );
+    let unparseable = format!(
+        "data: {{\"type\":\"content_block_delta\",\"token\":\ndata: \"{GENERIC_SECRET}\",\"n\":NaN}}\n\n"
+    );
+    for capture in [parseable.clone(), parseable.replace('\n', "\r\n")] {
+        let bytes = capture.as_bytes();
+        let (head, tail) = bytes.split_at(bytes.len() / 2);
+        let excerpt = streamed_sse_excerpt(&[head, tail]).await;
+        assert!(!excerpt.contains(GENERIC_SECRET), "{excerpt}");
+        assert!(excerpt.contains("content_block_delta"), "{excerpt}");
+    }
+    for capture in [unparseable.clone(), unparseable.replace('\n', "\r\n")] {
+        let excerpt = streamed_sse_excerpt(&[capture.as_bytes()]).await;
+        assert!(!excerpt.contains(GENERIC_SECRET), "{excerpt}");
+        assert!(excerpt.contains("[UNPARSEABLE]"), "{excerpt}");
+    }
+
+    // The buffered SSE capture shares the same redactor.
+    for capture in [&parseable, &unparseable] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(
+                &endpoint,
+                json!({ "capture": { "streaming_response": true } }),
+            ),
+            loopback_http_client(),
+        )
+        .expect("valid config");
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+            .await;
+        plugin
+            .capture_final_response_body(
+                &mut ctx,
+                200,
+                &content_type_headers("text/event-stream"),
+                capture.as_bytes(),
+            )
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            !records[0].to_string().contains(GENERIC_SECRET),
+            "{records:#?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_late_enrollment_is_staged_at_the_backend_path_boundary() {
+    // PR6815-SOL-3: a call enrolled only by its backend-effective method must
+    // be staged when that method becomes authoritative, so a deferred
+    // `before_proxy` short circuit (a `fault_injection` abort) that answers
+    // before the final request-body hook still leaves its record.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("boundary-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    let mut headers = grpc_headers();
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the client path is not enrolled"
+    );
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the enrolled backend-effective method stages at the boundary"
+    );
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(
+        &mut ctx,
+        "/test.Greeter/SayHello",
+    );
+
+    // The deferred abort: no final request-body hook, then the reject-path
+    // refresh and the transaction-log fallback.
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 503, &mut response_headers)
+        .await;
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 503;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("/test.Greeter/SayHello"),
+        "the record must name the backend-effective method: {request_body}"
+    );
+    assert!(request_body.contains("boundary-subject"), "{request_body}");
+
+    // A backend-effective method that is not enrolled stages nothing.
+    let mut other = grpc_ctx("/audit/SayHello");
+    other.request_body_bytes = Some(Bytes::from(req));
+    let resolved = plugin
+        .on_backend_path_resolved(&mut other, "/test.Greeter/Other")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        other
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+/// Drive a deferred `before_proxy` short circuit after the backend path was
+/// bound: no final request-body hook, then the reject-path refresh and the
+/// transaction-log fallback.
+async fn deferred_short_circuit_after_bind(
+    plugin: &AiTranscriptAudit,
+    ctx: &mut RequestContext,
+    backend_path: &str,
+) {
+    ferrum_edge::_test_support::bind_authorized_backend_path_for_test(ctx, backend_path);
+    let mut response_headers = HashMap::new();
+    plugin.after_proxy(ctx, 503, &mut response_headers).await;
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 503;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_boundary_staging_ignores_a_provisional_router_method() {
+    // PR6815-SOL-5: `grpc_method_router` publishes the CLIENT method in
+    // `on_request_received` and refreshes it only in its own backend-path
+    // callback, which may run after this one (priorities are configurable).
+    // The boundary decision must come from the authoritative `backend_path`.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, grpc_audit_overrides()),
+        loopback_http_client(),
+    )
+    .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let req = grpc_frame(&hello_request_bytes("provisional-router-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.metadata
+        .insert("grpc_full_method".to_string(), "audit/SayHello".to_string());
+    ctx.request_body_bytes = Some(Bytes::from(req.clone()));
+    let mut headers = grpc_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the provisional router value must not veto the enrolled backend path"
+    );
+    // The router's own (later) boundary callback refreshes the method.
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    deferred_short_circuit_after_bind(&plugin, &mut ctx, "/test.Greeter/SayHello").await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("provisional-router-subject"),
+        "{request_body}"
+    );
+
+    // And a provisional value cannot enroll an unenrolled backend path.
+    let mut other = grpc_ctx("/audit/SayHello");
+    other.metadata.insert(
+        "grpc_full_method".to_string(),
+        "test.Greeter/SayHello".to_string(),
+    );
+    other.request_body_bytes = Some(Bytes::from(req));
+    let resolved = plugin
+        .on_backend_path_resolved(&mut other, "/test.Greeter/Other")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    assert_ne!(
+        other
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_boundary_staging_uses_the_live_before_proxy_framing_witness() {
+    // PR6815-SOL-6: a `before_proxy` transform set `grpc-encoding: gzip` on
+    // the live header map while `ctx.headers` still holds the inbound map
+    // (no `grpc-encoding`). A call enrolled only at the backend-path boundary
+    // and then short-circuited must decode with the live witness.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = live_grpc_audit_plugin(&endpoint);
+
+    let request = gzip_grpc_frame(&hello_request_bytes("live-witness-subject"));
+    let mut ctx = grpc_ctx("/audit/SayHello");
+    ctx.headers.remove("grpc-encoding");
+    ctx.request_body_bytes = Some(Bytes::copy_from_slice(&request));
+    let mut proxy_headers = grpc_headers();
+    proxy_headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_ne!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "the client path is not enrolled"
+    );
+    let resolved = plugin
+        .on_backend_path_resolved(&mut ctx, "/test.Greeter/SayHello")
+        .await;
+    assert!(matches!(resolved, PluginResult::Continue));
+    deferred_short_circuit_after_bind(&plugin, &mut ctx, "/test.Greeter/SayHello").await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]
+            .get("request_body_omitted_reason")
+            .and_then(Value::as_str),
+        None,
+        "the live framing witness must decode the gzip request: {}",
+        records[0]
+    );
+    let request_body = records[0]["request_body"].as_str().unwrap_or_default();
+    assert!(
+        request_body.contains("live-witness-subject"),
+        "the inflated excerpt must carry the decoded field: {request_body}"
+    );
 }

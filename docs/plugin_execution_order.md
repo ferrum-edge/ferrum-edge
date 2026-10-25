@@ -234,7 +234,9 @@ segments used by the backend URL builder, including regex/exact/prefix match
 length, the canonical policy path, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
-backend wire. The selected target remains pinned across deferred external hooks,
+backend wire. A `grpc`-enrolled `ai_transcript_audit` joins it too, so the
+proxy binds the backend-effective path its enrollment decision reads when no
+`grpc_full_method` was published. The selected target remains pinned across deferred external hooks,
 so routing-header mutations cannot steer the request onto a different method.
 The gateway enforces the selected path, including stateful per-method rate
 limits, exactly once before invoking those hooks or a terminal final-request-
@@ -525,6 +527,9 @@ is part of the question: a `monitor`-mode WAF, a rule set whose applicable body
 rules only log, or a body the operator opted out of scanning with
 `on_body_too_large: skip` all lose an observation when a body is unscannable,
 which is not a protection-mechanism failure and does not become a `400`.
+`ai_transcript_audit` claims candidate-shaped `POST`s only under a fail-closed
+sink policy (`sink.on_buffer_full: reject` or `sink.on_sink_error: reject`),
+because only then can it refuse a request it cannot audit.
 
 - **Nothing claims the request, or the finalized bytes are identity-coded.**
   Nothing changes. Ordinary compressed uploads keep flowing to backends that
@@ -1007,8 +1012,10 @@ uses this boundary to echo generated and preserved IDs consistently,
 (replacing any backend-supplied copy), `oidc_relying_party` uses it to
 deliver the session cookie it rotated or slid while authenticating the
 handshake, so a refresh performed for a WebSocket never leaves the browser
-holding the spent refresh token, and `mesh_authz` uses it to apply an allowed
-CUSTOM check's `headersToDownstreamOnAllow` result.
+holding the spent refresh token, `mesh_authz` uses it to apply an allowed
+CUSTOM check's `headersToDownstreamOnAllow` result, and `rate_limiting` uses it
+to publish the charged handshake's `x-ratelimit-*` headers (under
+`expose_headers`) and strip `x-ratelimit-identity`.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -1719,7 +1726,7 @@ Given all built-in plugins enabled, the execution order is:
 | 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
 | 32 | `graphql` | 2850 | before_proxy, on_final_request_body |
-| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
+| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames, on_ws_disconnect |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |

@@ -375,7 +375,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "rate_limiting",
         classification: BuiltinPluginClassification::Public,
         priority: 2900,
-        active_phases: "on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect",
+        active_phases: "on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Connection/session rate applies everywhere",
     },

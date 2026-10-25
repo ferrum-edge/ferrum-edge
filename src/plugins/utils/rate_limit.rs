@@ -14,8 +14,8 @@ use tracing::{info, warn};
 
 use super::http_client::PluginHttpClient;
 use super::redis_rate_limiter::{
-    MAX_REDIS_ADMISSION_WINDOWS, RedisConfig, RedisRateLimitClient, RedisWindowCharges,
-    sub_bucket_charge_is_settled,
+    MAX_REDIS_ADMISSION_WINDOWS, REDIS_WINDOW_SUB_BUCKETS, RedisConfig, RedisRateLimitClient,
+    RedisWindowCharges, redis_sub_bucket_nanos, sub_bucket_charge_is_settled,
 };
 
 /// Transactions ONE Redis quota decision may spend before it fails closed.
@@ -297,6 +297,14 @@ pub struct RateLimitOutcome {
     pub enforcement_unavailable: bool,
     /// This decision used the per-process budget during a Redis outage.
     pub local_fallback: bool,
+    /// Whole seconds (at least one) after which the refusing window has freed
+    /// budget again, absent further traffic. Set only on request-quota
+    /// refusals (`check_http_windows` / `check_http_windows_redis`); every
+    /// other outcome leaves it `None`. An exact value where the algorithm
+    /// knows one (token bucket, local sliding aggregate) and a conservative
+    /// upper bound otherwise (the Redis sub-bucket ladder). With several
+    /// refusing windows it is the longest of their waits.
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl RateLimitOutcome {
@@ -360,6 +368,18 @@ impl RateLimitOutcome {
         self.reserved_window_index = Some(reserved_window_index);
         self
     }
+
+    pub fn with_retry_after(mut self, retry_after_seconds: u64) -> Self {
+        self.retry_after_seconds = Some(retry_after_seconds.max(1));
+        self
+    }
+}
+
+/// Round a wait in nanoseconds up to whole `Retry-After` seconds, at least one.
+fn retry_after_seconds_from_nanos(nanos: u128) -> u64 {
+    u64::try_from(nanos.div_ceil(1_000_000_000))
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 /// One admission decision, plus WHY it was served the way it was.
@@ -1997,6 +2017,42 @@ impl SlidingWindow {
         self.limit.saturating_sub(self.total)
     }
 
+    /// Whole seconds (at least one) until the oldest counted bucket leaves the
+    /// ring, which frees at least one admission. Call after
+    /// [`Self::would_allow`] refused at `now`, so the ring already reflects it.
+    ///
+    /// A refusal means `total == limit` (an increment only follows an allowed
+    /// check), so dropping any non-empty bucket brings the window back under
+    /// its limit. Bucket `j` is counted until the ring advances to `j + 64`,
+    /// i.e. until `elapsed >= (j + 64) * window / 63`. Falls back to the full
+    /// retention horizon (`ceil(window * 64 / 63)`) when there is no epoch or
+    /// the clock appears to run backwards.
+    pub fn retry_after_seconds(&self, now: Instant) -> u64 {
+        let horizon = retry_after_seconds_from_nanos(
+            sliding_window_retention(self.window_duration).as_nanos(),
+        );
+        let Some(epoch) = self.epoch else {
+            return horizon;
+        };
+        let Some(elapsed) = now.checked_duration_since(epoch) else {
+            return horizon;
+        };
+        let ring = SLIDING_WINDOW_BUCKET_COUNT as u64;
+        let oldest_live = self.current_bucket.saturating_sub(ring - 1);
+        let Some(oldest_counted) = (oldest_live..=self.current_bucket)
+            .find(|bucket| self.buckets[(bucket % ring) as usize] > 0)
+        else {
+            // Nothing is counted, so the refusal is already stale.
+            return 1;
+        };
+        let window_nanos = self.window_duration.as_nanos().max(1);
+        let freed_at_nanos = u128::from(oldest_counted.saturating_add(ring))
+            .saturating_mul(window_nanos)
+            .div_ceil(SLIDING_WINDOW_INTERVALS_PER_WINDOW);
+        retry_after_seconds_from_nanos(freed_at_nanos.saturating_sub(elapsed.as_nanos()))
+            .min(horizon)
+    }
+
     pub fn has_recent_activity(&self, now: Instant) -> bool {
         let Some(last) = self.last_activity else {
             return false;
@@ -2134,6 +2190,21 @@ impl TokenBucket {
     pub fn remaining(&self) -> u64 {
         self.tokens.max(0.0) as u64
     }
+
+    /// Whole seconds (at least one, at most `window_seconds`) until one more
+    /// token has refilled. Call after [`Self::would_allow`] refused, so the
+    /// bucket was just refilled to `now`.
+    pub fn retry_after_seconds(&self, window_seconds: u64) -> u64 {
+        let ceiling = window_seconds.max(1);
+        let missing = (1.0 - self.tokens).max(0.0);
+        let wait = missing / self.refill_rate;
+        if !wait.is_finite() {
+            return ceiling;
+        }
+        // `as` saturates; `wait` is finite and non-negative here.
+        (wait.ceil() as u64).clamp(1, ceiling)
+    }
+
     pub fn is_active(&self, now: Instant) -> bool {
         if self.refill_rate <= 0.0 || self.capacity <= 0.0 {
             return false;
@@ -2208,7 +2279,13 @@ fn check_http_windows(
     // window 0's counter is inflated — the request was never served but
     // the rate limit budget is consumed.
 
-    // First pass: check all windows without modifying counters.
+    // First pass: check all windows without modifying counters. A refusal
+    // still checks the remaining windows (checking only refills / advances,
+    // it never charges), so `Retry-After` can name the LONGEST wait over every
+    // refusing window: retrying when only the first refusing window has freed
+    // budget would be refused again by a longer one. The refusal still names
+    // the first refusing window in `limit` / `window_seconds`.
+    let mut refused: Option<(u64, u64, u64)> = None;
     for (idx, window) in state.iter_mut().enumerate() {
         let spec = &specs[idx];
         let allowed = match window {
@@ -2216,10 +2293,25 @@ fn check_http_windows(
             HttpWindowState::Bucket(bucket) => bucket.would_allow(now, 1),
         };
         if !allowed {
-            return RateLimitOutcome::deny()
-                .with_limit(spec.limit)
-                .with_window(spec.duration.as_secs());
+            let retry_after = match window {
+                HttpWindowState::Sliding(sliding) => sliding.retry_after_seconds(now),
+                HttpWindowState::Bucket(bucket) => {
+                    bucket.retry_after_seconds(spec.duration.as_secs())
+                }
+            };
+            refused = Some(match refused {
+                Some((limit, window_seconds, longest)) => {
+                    (limit, window_seconds, longest.max(retry_after))
+                }
+                None => (spec.limit, spec.duration.as_secs(), retry_after),
+            });
         }
+    }
+    if let Some((limit, window_seconds, retry_after)) = refused {
+        return RateLimitOutcome::deny()
+            .with_limit(limit)
+            .with_window(window_seconds)
+            .with_retry_after(retry_after);
     }
 
     // Second pass: all windows allow — now increment all counters.
@@ -2248,6 +2340,73 @@ fn check_http_windows(
             .with_window(window_seconds);
     }
     outcome
+}
+
+/// Run one request-quota admission ([`check_http_windows_redis`]) on its OWN
+/// task, so that cancelling the request future cannot cancel the decision.
+///
+/// The charge transaction increments every configured window before its reply
+/// is read, and only the code that reads the reply can decide that the charge
+/// was over the limit and must be handed back. Plugin hooks run under
+/// `tokio::time::timeout_at` (a gRPC deadline) and are dropped on a client
+/// disconnect or a reload, so awaiting the transaction inline let a dropped
+/// request strand an over-limit `INCR` with no compensation, no failure
+/// accounting, and no `redis_failure_policy` involvement — a short-deadline
+/// caller could keep re-arming a shared key's exhaustion for everyone else
+/// behind it. The spawned task owns the charge, the reply, the decision, and
+/// any hand-back, and the caller only awaits its result: dropping the
+/// `JoinHandle` detaches the task rather than aborting it.
+///
+/// The task is bounded exactly as the inline path was: every command it issues
+/// runs on a screened pooled connection with the per-command response deadline,
+/// a rebuild is limited to `MAX_REDIS_CHARGE_PASSES`, and the hand-back is
+/// itself a bounded detached transaction. A task that fails to complete (a
+/// panic) is reported as a failed Redis decision, which the caller routes
+/// through `redis_failure_policy`. Without a Tokio runtime (direct
+/// construction under a non-Tokio executor) the decision runs inline, as the
+/// compensation spawner already does; spawning would panic, and a proxy path
+/// never panics.
+async fn check_http_windows_redis_detached(
+    specs: &Arc<[RateLimitWindowSpec]>,
+    redis: &Arc<RedisRateLimitClient>,
+    key: &str,
+) -> Result<RateLimitOutcome, ()> {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return check_http_windows_redis(specs, redis, key).await;
+    };
+    let specs = Arc::clone(specs);
+    let redis = Arc::clone(redis);
+    let key = key.to_owned();
+    let decision =
+        runtime.spawn(async move { check_http_windows_redis(&specs, &redis, &key).await });
+    decision.await.unwrap_or(Err(()))
+}
+
+/// Conservative `Retry-After` for a refusal the Redis server settled at
+/// `settled_at` on a `window_seconds` ladder.
+///
+/// Settlement keeps every retained charge keyed at the server bucket it
+/// executed in or the one before it, so no charge counted against this
+/// request is keyed later than `server_bucket`. A reader that SELECTED bucket
+/// `r` counts `[r - K - 1, r + 1]`, and settlement admits a retrying reader
+/// whose selection lags its execution by one bucket (`r = exec - 1`, a
+/// gateway whose learned offset trails Redis by its reply latency). So the
+/// newest charge — and with it every older one — has left every settled
+/// reader's ladder only once readers EXECUTE in `server_bucket + K + 3`
+/// (selecting `server_bucket + K + 2`, whose ladder starts at
+/// `server_bucket + 1`). That is an upper bound on when the window has budget
+/// again (absent new traffic): `settled_at` lies inside `server_bucket`, so
+/// the wait is more than `K + 2` and at most `K + 3` sub-buckets — up to
+/// three sub-buckets (`3/16` of the window) longer than the window itself,
+/// the same three-sub-bucket over-count the ladder documents.
+fn redis_quota_retry_after_seconds(settled_at: Duration, window_seconds: u64) -> u64 {
+    let sub_bucket_nanos = redis_sub_bucket_nanos(window_seconds);
+    let settled_nanos = settled_at.as_nanos();
+    let server_bucket = settled_nanos / sub_bucket_nanos;
+    let freed_at_nanos = server_bucket
+        .saturating_add(REDIS_WINDOW_SUB_BUCKETS as u128 + 3)
+        .saturating_mul(sub_bucket_nanos);
+    retry_after_seconds_from_nanos(freed_at_nanos.saturating_sub(settled_nanos))
 }
 
 /// Distributed (Redis-backed) multi-window admission check.
@@ -2290,14 +2449,16 @@ fn check_http_windows(
 /// the window's TTL elapses and is reported as a Redis failure, so the
 /// configured `redis_failure_policy` governs the next decision.
 ///
-/// Cancelling this request does NOT strand a charge. The hand-back runs on its
-/// own task owning the client `Arc`
-/// ([`RedisRateLimitClient::spawn_uncharge_rate_limit_windows`]), so a dropped
-/// plugin future — a gRPC deadline elapsing under `timeout_at`, a client
-/// disconnect, a config reload retiring this instance — cannot take the
-/// compensation with it. The one remaining exception is a process exit between
-/// the charge and the compensation: the increment is already on the server and
-/// stays until its window's TTL elapses.
+/// Cancelling this request does NOT strand a charge. Production admission runs
+/// this whole function on its own task ([`check_http_windows_redis_detached`]),
+/// so a dropped plugin future — a gRPC deadline elapsing under `timeout_at`, a
+/// client disconnect, a config reload retiring this instance — cannot cancel
+/// the charge between its `INCR` and the decision that would hand it back, and
+/// the hand-back itself runs on another task owning the client `Arc`
+/// ([`RedisRateLimitClient::spawn_uncharge_rate_limit_windows`]). The one
+/// remaining exception is a process exit between the charge and the
+/// compensation: the increment is already on the server and stays until its
+/// window's TTL elapses.
 ///
 /// # Algorithm
 ///
@@ -2612,6 +2773,11 @@ async fn check_http_windows_redis(
 
     let mut tightest: Option<(u64, u64, u64)> = None;
     let mut refused: Option<&RateLimitWindowSpec> = None;
+    // The longest `Retry-After` bound over EVERY refusing window, not just the
+    // first: a client that waits only for the shortest refusing window to free
+    // budget is refused again by a longer one.
+    let settled_at = charged.settled_at();
+    let mut retry_after = 0_u64;
     for (index, spec) in specs.iter().enumerate() {
         // Already the full trailing-window sum, with each sub-bucket floored at
         // zero (a counter can only be negative when a compensation raced its
@@ -2619,8 +2785,15 @@ async fn check_http_windows_redis(
         // it must never be a rounded float.
         let usage = counts[index];
         if usage > spec.limit {
-            refused = Some(spec);
-            break;
+            if refused.is_none() {
+                refused = Some(spec);
+            }
+            let window_seconds = spec.duration.as_secs();
+            let bound = settled_at.map_or(window_seconds, |settled_at| {
+                redis_quota_retry_after_seconds(settled_at, window_seconds)
+            });
+            retry_after = retry_after.max(bound);
+            continue;
         }
 
         let remaining = spec.limit.saturating_sub(usage);
@@ -2648,7 +2821,8 @@ async fn check_http_windows_redis(
             .await;
         return Ok(RateLimitOutcome::deny()
             .with_limit(spec.limit)
-            .with_window(spec.duration.as_secs()));
+            .with_window(spec.duration.as_secs())
+            .with_retry_after(retry_after));
     }
 
     let mut outcome = RateLimitOutcome::allow();
@@ -2709,7 +2883,7 @@ impl RateLimitAlgorithm for HttpRateLimitAlgorithm {
         key: &str,
         _op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        check_http_windows_redis(&self.specs, redis, key).await
+        check_http_windows_redis_detached(&self.specs, redis, key).await
     }
 
     fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {
@@ -2805,7 +2979,7 @@ impl RateLimitAlgorithm for DynamicHttpRateLimitAlgorithm {
         key: &str,
         op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
-        check_http_windows_redis(op.specs(), redis, key).await
+        check_http_windows_redis_detached(&op.specs, redis, key).await
     }
 
     fn is_state_active(&self, state: &Self::State, now: Instant) -> bool {

@@ -94,6 +94,12 @@ const MAX_METADATA_FIELD_LEN: usize = 256;
 const MAX_LABEL_LEN: usize = MAX_FIELD_LEN;
 /// Conservative ceiling for one owned [`ChargeEvent`] after field bounding.
 const MAX_CHARGE_EVENT_BYTES: usize = 224 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
+/// Smallest admitted `spool.max_bytes` when spooling is enabled.
+///
+/// A policy floor, not a proof that every artifact fits: a quota much smaller
+/// than this refuses ordinary failed batches and snapshot chunks so often that
+/// spooling (and, in snapshot mode, finalization) cannot be relied on.
+const MIN_SPOOL_MAX_BYTES: u64 = 1024 * 1024;
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
 /// Bound refreshes when another process mutates the shared spool during quota eviction.
@@ -341,8 +347,42 @@ fn status_cache() -> &'static ArcSwap<Option<(Instant, String)>> {
     STATUS_CACHE.get_or_init(|| ArcSwap::from_pointee(None))
 }
 
+/// Drop the cached `/charges/sink/status` body.
+///
+/// Called on every per-event enqueue and settlement, so it must stay a
+/// read-mostly no-op while the cache is already empty: only a populated cache
+/// pays the `ArcSwap` store and its fresh `Arc` allocation. A render racing an
+/// invalidation can still publish a just-stale body, which the one-second
+/// [`STATUS_CACHE_TTL`] bounds exactly as before.
 fn invalidate_status_cache() {
-    status_cache().store(Arc::new(None));
+    invalidate_status_cache_in(status_cache());
+}
+
+/// Check-then-store invalidation of one status cache cell. Returns whether a
+/// store happened.
+fn invalidate_status_cache_in(cache: &ArcSwap<Option<(Instant, String)>>) -> bool {
+    if cache.load().is_none() {
+        return false;
+    }
+    cache.store(Arc::new(None));
+    true
+}
+
+/// Exercise status-cache invalidation against a test-owned cell, returning
+/// `(empty_cell_store_skipped, populated_cell_cleared)`. A test-owned cell keeps
+/// the assertion exact while other tests render the process-global cache.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn probe_status_cache_invalidation_for_tests() -> (bool, bool) {
+    let cache: ArcSwap<Option<(Instant, String)>> = ArcSwap::from_pointee(None);
+    let before = cache.load_full();
+    let stored_on_empty = invalidate_status_cache_in(&cache);
+    let empty_cell_store_skipped = !stored_on_empty && Arc::ptr_eq(&before, &cache.load_full());
+
+    cache.store(Arc::new(Some((Instant::now(), "{}".to_string()))));
+    let stored_on_populated = invalidate_status_cache_in(&cache);
+    let populated_cell_cleared = stored_on_populated && cache.load().is_none();
+    (empty_cell_store_skipped, populated_cell_cleared)
 }
 
 fn active_snapshot_finalizations() -> &'static Mutex<BTreeMap<u64, PendingSnapshotFinalization>> {
@@ -4657,10 +4697,94 @@ impl DeliveryOutcome {
 /// Bounded ClickHouse HTTP acknowledgement after headers arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClickHouseAckRead {
-    /// Full body drained within the byte/time caps.
-    Complete { byte_len: u64, has_exception: bool },
+    /// Full body drained within the byte/time caps. `exception` is set when the
+    /// body carries a ClickHouse exception marker.
+    Complete {
+        byte_len: u64,
+        exception: Option<ClickHouseException>,
+    },
     /// Drain did not finish cleanly; treat as ambiguous for durability.
     Incomplete { kind: ClickHouseAckIncomplete },
+}
+
+/// A ClickHouse exception signalled under a success HTTP status, either by the
+/// `X-ClickHouse-Exception-Code` header or by an exception marker in the
+/// acknowledgement body.
+///
+/// Only the bounded numeric code is retained — never the message text — so the
+/// classification can distinguish a transient server condition from a defect
+/// in the inserted rows without ever carrying response payload into
+/// diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClickHouseException {
+    /// Parsed ClickHouse error code, or `None` when none could be read.
+    code: Option<u32>,
+}
+
+/// ClickHouse error codes that describe a transient server or availability
+/// condition rather than a defect in the inserted rows. ClickHouse can report
+/// these after it has already committed HTTP 200, so they must stay retryable
+/// instead of dead-lettering otherwise valid billing rows once the server
+/// recovers.
+///
+/// The set is ClickHouse's own client retry classification
+/// (`clickhouse-java` client-v2 `ServerException::discoverIsRetryable`):
+/// `UNEXPECTED_END_OF_FILE` (3), `FILE_DOESNT_EXIST` (107), `READONLY` (164),
+/// `TOO_MANY_SIMULTANEOUS_QUERIES` (202), `NO_FREE_CONNECTION` (203),
+/// `SOCKET_TIMEOUT` (209), `NETWORK_ERROR` (210), `MEMORY_LIMIT_EXCEEDED`
+/// (241), `TABLE_IS_READ_ONLY` (242), `TOO_MANY_PARTS` (252),
+/// `TOO_FEW_LIVE_REPLICAS` (285), `UNKNOWN_STATUS_OF_INSERT` (319),
+/// `SYSTEM_ERROR` (425), and `KEEPER_EXCEPTION` (999) — plus four more
+/// transient execution/transport conditions: `ATTEMPT_TO_READ_AFTER_EOF` (32,
+/// a truncated request body), `TIMEOUT_EXCEEDED` (159),
+/// `QUERY_WAS_CANCELLED` (394, server-side cancellation such as shutdown), and
+/// `CANNOT_SCHEDULE_TASK` (439, thread-pool exhaustion). Every other code, and
+/// an exception whose code cannot be read, stays permanent.
+const CLICKHOUSE_TRANSIENT_EXCEPTION_CODES: &[u32] = &[
+    3, 32, 107, 159, 164, 202, 203, 209, 210, 241, 242, 252, 285, 319, 394, 425, 439, 999,
+];
+
+/// Longest decimal ClickHouse error code accepted. Real codes have at most four
+/// digits; the bound keeps parsing fixed-cost on hostile acknowledgement bytes.
+const CLICKHOUSE_EXCEPTION_CODE_MAX_DIGITS: usize = 6;
+
+impl ClickHouseException {
+    fn is_transient(self) -> bool {
+        self.code
+            .is_some_and(|code| CLICKHOUSE_TRANSIENT_EXCEPTION_CODES.contains(&code))
+    }
+}
+
+/// Parse the bounded decimal ClickHouse error code at the start of `bytes`.
+fn parse_clickhouse_exception_code(bytes: &[u8]) -> Option<u32> {
+    let digits = bytes
+        .iter()
+        .take(CLICKHOUSE_EXCEPTION_CODE_MAX_DIGITS + 1)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 || digits > CLICKHOUSE_EXCEPTION_CODE_MAX_DIGITS {
+        return None;
+    }
+    bytes.get(..digits)?.iter().try_fold(0u32, |code, byte| {
+        code.checked_mul(10)?
+            .checked_add(u32::from(byte.wrapping_sub(b'0')))
+    })
+}
+
+/// Read the `X-ClickHouse-Exception-Code` header, when present. The header is
+/// an exception signal even when its value cannot be parsed as a code.
+fn clickhouse_exception_header(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ClickHouseException> {
+    let value = headers.get("x-clickhouse-exception-code")?;
+    Some(clickhouse_exception_from_header_value(value.as_bytes()))
+}
+
+fn clickhouse_exception_from_header_value(value: &[u8]) -> ClickHouseException {
+    let trimmed = value.trim_ascii();
+    let code =
+        parse_clickhouse_exception_code(trimmed).filter(|_| trimmed.iter().all(u8::is_ascii_digit));
+    ClickHouseException { code }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4967,15 +5091,13 @@ async fn post_json_each_row_bytes(
     match result {
         Ok(response) => {
             let status = response.status();
-            let has_exception_header = response
-                .headers()
-                .contains_key("x-clickhouse-exception-code");
+            let exception_header = clickhouse_exception_header(response.headers());
             let ack = read_clickhouse_acknowledgement(response).await;
             classify_clickhouse_delivery(
                 cfg,
                 status,
                 ack,
-                has_exception_header,
+                exception_header,
                 event_count,
                 start.elapsed(),
             )
@@ -5014,7 +5136,7 @@ async fn read_clickhouse_acknowledgement(response: reqwest::Response) -> ClickHo
             tokio::task::yield_now().await;
             ClickHouseAckRead::Complete {
                 byte_len: bytes.len() as u64,
-                has_exception: body_has_clickhouse_exception(&bytes),
+                exception: body_clickhouse_exception(&bytes),
             }
         }
         Ok(Err(BoundedReadError::LimitExceeded { .. })) => ClickHouseAckRead::Incomplete {
@@ -5036,6 +5158,19 @@ fn body_has_clickhouse_exception(body: &[u8]) -> bool {
         .any(|marker| find_bytes_subslice(body, marker).is_some())
 }
 
+/// Classify a bounded acknowledgement body's ClickHouse exception, keeping only
+/// the numeric code that follows the `Code: ` marker.
+fn body_clickhouse_exception(body: &[u8]) -> Option<ClickHouseException> {
+    const CODE_MARKER: &[u8] = b"Code: ";
+    if !body_has_clickhouse_exception(body) {
+        return None;
+    }
+    let code = find_bytes_subslice(body, CODE_MARKER)
+        .and_then(|start| body.get(start.saturating_add(CODE_MARKER.len())..))
+        .and_then(parse_clickhouse_exception_code);
+    Some(ClickHouseException { code })
+}
+
 fn find_bytes_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -5049,7 +5184,7 @@ fn classify_clickhouse_delivery(
     cfg: &ClickHouseFlushConfig,
     status: StatusCode,
     ack: ClickHouseAckRead,
-    has_exception_header: bool,
+    exception_header: Option<ClickHouseException>,
     event_count: usize,
     elapsed: Duration,
 ) -> DeliveryOutcome {
@@ -5058,7 +5193,7 @@ fn classify_clickhouse_delivery(
             cfg,
             status,
             ack,
-            has_exception_header,
+            exception_header,
             event_count,
             elapsed,
         );
@@ -5097,45 +5232,51 @@ fn classify_success_status_acknowledgement(
     cfg: &ClickHouseFlushConfig,
     status: StatusCode,
     ack: ClickHouseAckRead,
-    has_exception_header: bool,
+    exception_header: Option<ClickHouseException>,
     event_count: usize,
     elapsed: Duration,
 ) -> DeliveryOutcome {
     let code = status.as_u16();
-    if has_exception_header {
-        let message = format!("clickhouse returned HTTP {code} with X-ClickHouse-Exception-Code");
-        cfg.metrics
-            .record_failure(FailureReason::Http4xx, message.clone());
-        return DeliveryOutcome::Permanent {
-            status: code,
-            message,
+    if let Some(header) = exception_header {
+        // The header is authoritative for the exception signal; an unreadable
+        // header code may still be recovered from a body marker.
+        let body_code = match ack {
+            ClickHouseAckRead::Complete {
+                exception: Some(body),
+                ..
+            } => body.code,
+            _ => None,
         };
+        let exception = ClickHouseException {
+            code: header.code.or(body_code),
+        };
+        return classify_success_status_exception(
+            cfg,
+            code,
+            exception,
+            "X-ClickHouse-Exception-Code",
+        );
     }
     match ack {
         ClickHouseAckRead::Complete {
             byte_len: 0,
-            has_exception: false,
+            exception: None,
         } => {
             cfg.metrics.record_success(event_count, elapsed);
             DeliveryOutcome::Delivered
         }
         ClickHouseAckRead::Complete {
-            has_exception: true,
+            exception: Some(exception),
             ..
-        } => {
-            let message = format!(
-                "clickhouse returned HTTP {code} with an exception in the acknowledgement body"
-            );
-            cfg.metrics
-                .record_failure(FailureReason::Http4xx, message.clone());
-            DeliveryOutcome::Permanent {
-                status: code,
-                message,
-            }
-        }
+        } => classify_success_status_exception(
+            cfg,
+            code,
+            exception,
+            "an exception in the acknowledgement body",
+        ),
         ClickHouseAckRead::Complete {
             byte_len,
-            has_exception: false,
+            exception: None,
         } => {
             // Non-empty success bodies are not a persistence-proof ACK for
             // INSERT JSONEachRow; keep the spool and retry idempotently.
@@ -5159,6 +5300,37 @@ fn classify_success_status_acknowledgement(
             cfg.metrics.record_failure(reason, message.clone());
             DeliveryOutcome::Retryable { message }
         }
+    }
+}
+
+/// Classify a ClickHouse exception reported under HTTP 200/204.
+///
+/// A known transient server condition (see
+/// [`CLICKHOUSE_TRANSIENT_EXCEPTION_CODES`]) is retryable: the spool keeps the
+/// rows and replays them with unchanged event IDs once ClickHouse recovers.
+/// Every other exception — including one whose code cannot be read — is a
+/// permanent row/schema defect. Diagnostics carry only the bounded numeric code.
+fn classify_success_status_exception(
+    cfg: &ClickHouseFlushConfig,
+    code: u16,
+    exception: ClickHouseException,
+    carrier: &'static str,
+) -> DeliveryOutcome {
+    if exception.is_transient() {
+        let exception_code = exception.code.unwrap_or_default();
+        let message = format!(
+            "clickhouse returned HTTP {code} with transient ClickHouse exception code {exception_code} in {carrier}"
+        );
+        cfg.metrics
+            .record_failure(FailureReason::Http5xx, message.clone());
+        return DeliveryOutcome::Retryable { message };
+    }
+    let message = format!("clickhouse returned HTTP {code} with {carrier}");
+    cfg.metrics
+        .record_failure(FailureReason::Http4xx, message.clone());
+    DeliveryOutcome::Permanent {
+        status: code,
+        message,
     }
 }
 
@@ -5341,8 +5513,8 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: `clickhouse.url` must not contain user-info; use `clickhouse.username`/`clickhouse.password_ref`"
         ));
     }
-    validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
-    validate_clickhouse_identifier(&config.clickhouse.table, "table")?;
+    validate_clickhouse_identifier(&config.clickhouse.database, "database", 1)?;
+    validate_clickhouse_identifier(&config.clickhouse.table, "table", 2)?;
     if config.clickhouse.timeout_ms == 0 || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
     {
         return Err(format!(
@@ -5407,9 +5579,9 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         ));
     }
     if config.spool.enabled {
-        if config.spool.max_bytes == 0 {
+        if config.spool.max_bytes < MIN_SPOOL_MAX_BYTES {
             return Err(format!(
-                "{PLUGIN_NAME}: `spool.max_bytes` must be at least 1"
+                "{PLUGIN_NAME}: `spool.max_bytes` must be at least {MIN_SPOOL_MAX_BYTES} bytes (policy floor for a usable durable spool)"
             ));
         }
         if config.spool.replay_interval_secs == 0 {
@@ -5497,6 +5669,26 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
         .filter(|value| !value.is_empty())
     {
         validate_plugin_secret_env_name(PASSWORD_REF_FIELD, reference)?;
+        // The password is only ever sent as the HTTP Basic password of
+        // `clickhouse.username`. Without a username the resolved secret would be
+        // silently discarded and every INSERT would go out unauthenticated.
+        if config.clickhouse.username.is_none() {
+            return Err(format!(
+                "{PLUGIN_NAME}: `clickhouse.password_ref` requires `clickhouse.username`; the password is sent as the HTTP Basic password of that user"
+            ));
+        }
+    }
+    // A blank username would send `Basic <":password">` (or an empty user),
+    // which never names the intended ClickHouse account.
+    if config
+        .clickhouse
+        .username
+        .as_deref()
+        .is_some_and(|username| username.trim().is_empty())
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: `clickhouse.username` must not be empty or whitespace when set"
+        ));
     }
     // Pair completeness is a pure Option shape, so it belongs in cold
     // admission rather than in client construction alone. Reading or parsing
@@ -5575,7 +5767,15 @@ fn parse_clickhouse_url(raw: &str) -> Result<Url, String> {
 /// so restrict them to a safe identifier charset (ASCII letters, digits,
 /// underscore, and a `.` db-qualifier) to keep operator config from injecting
 /// SQL into the export query.
-fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String> {
+///
+/// `max_parts` bounds the dot-separated qualification: `database` is a single
+/// identifier (1) and `table` is `table` or `database.table` (2), the only
+/// unquoted INSERT target shapes ClickHouse accepts.
+fn validate_clickhouse_identifier(
+    value: &str,
+    field: &str,
+    max_parts: usize,
+) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!(
             "{PLUGIN_NAME}: `clickhouse.{field}` must not be empty"
@@ -5588,6 +5788,29 @@ fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String
         return Err(format!(
             "{PLUGIN_NAME}: `clickhouse.{field}` may only contain ASCII letters, digits, underscores, and dots"
         ));
+    }
+    // The charset alone admits names ClickHouse can never parse unquoted
+    // (`123charges`, `.`, `ferrum.`, `a..b`), which would turn every INSERT
+    // into a syntax error and dead-letter every row. Each dot-separated part
+    // must be a plain identifier: nonempty and not starting with a digit.
+    if value
+        .split('.')
+        .any(|part| part.is_empty() || part.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: `clickhouse.{field}` must be a ClickHouse identifier: each dot-separated part must be nonempty and must not start with a digit"
+        ));
+    }
+    if value.split('.').count() > max_parts {
+        return Err(if max_parts == 1 {
+            format!(
+                "{PLUGIN_NAME}: `clickhouse.{field}` must be a single ClickHouse identifier without dots"
+            )
+        } else {
+            format!(
+                "{PLUGIN_NAME}: `clickhouse.{field}` must be `table` or `database.table` (at most one dot)"
+            )
+        });
     }
     Ok(())
 }
@@ -5622,6 +5845,14 @@ const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
     "token",
 ];
 
+/// INSERT URL parameters the sink itself sets from `clickhouse.database` and
+/// the fixed `INSERT INTO <table> FORMAT JSONEachRow` statement. A second
+/// occurrence from `insert_query_params` would leave the executed statement or
+/// database to ClickHouse's duplicate-parameter handling — escaping the
+/// identifier confinement on `database`/`table` — so these names are reserved.
+/// Exact-match and lowercase; compared case-insensitively.
+const RESERVED_QUERY_PARAM_NAMES: &[&str] = &["database", "query"];
+
 fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String> {
     for (key, value) in params {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
@@ -5644,6 +5875,13 @@ fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String>
                  ClickHouse credentials belong in `clickhouse.username` and \
                  `clickhouse.password_ref`, which are sent as an HTTP Basic header rather than \
                  appended to the INSERT URL"
+            ));
+        }
+        if RESERVED_QUERY_PARAM_NAMES.contains(&lowered.as_str()) {
+            return Err(format!(
+                "{PLUGIN_NAME}: `clickhouse.insert_query_params` key {key:?} is reserved; the sink \
+                 sets `database` from `clickhouse.database` and `query` to its fixed INSERT \
+                 statement for `clickhouse.table`"
             ));
         }
         if value.len() > 512 || value.chars().any(char::is_control) {
@@ -9070,6 +9308,45 @@ impl SpoolManager {
         self.require_live_claim(claim, artifact)?;
         self.release_claim_locked(claim)
             .map_err(ClaimMutationError::Retryable)
+    }
+
+    /// Release a claim whose replay was cancelled while it still owned the
+    /// pinned descriptor (for example a retiring generation aborting its replay
+    /// worker mid-delivery).
+    ///
+    /// Runs the same descriptor-bound release as a retryable delivery failure,
+    /// under the namespace mutation lock, so the complete original returns to
+    /// the replayable namespace with its stable event IDs. A refusal — the
+    /// pathname no longer resolves to the pinned artifact, or the lock could not
+    /// be taken — renames nothing and is reported; the claim then stays inert
+    /// exactly as any other descriptor-free claim does.
+    fn release_cancelled_claim(&self, claim: &SpoolClaimHandle) {
+        let released = self.lock_spool_mutation().and_then(|_guard| {
+            self.release_claim_bound(claim.path(), claim.artifact())
+                .map_err(ClaimMutationError::into_message)
+        });
+        match released {
+            Ok(Some(restored)) => {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    path = %restored.display(),
+                    generation = self.generation,
+                    "Chargeback sink replay was cancelled mid-delivery; released its spool claim back to the replayable namespace"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %error,
+                    path = %claim.path().display(),
+                    generation = self.generation,
+                    "Chargeback sink replay was cancelled mid-delivery and could not release its spool claim; it is left inert for operator reconciliation"
+                );
+            }
+        }
     }
 
     /// Remove a claim whose rows were fully delivered.
@@ -13238,11 +13515,30 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
     body: Option<&[u8]>,
     has_exception_code_header: bool,
 ) -> &'static str {
+    classify_clickhouse_acknowledgement_with_header_for_tests(
+        status,
+        body,
+        has_exception_code_header.then_some(""),
+    )
+}
+
+/// [`classify_clickhouse_acknowledgement_for_tests`] with an explicit
+/// `X-ClickHouse-Exception-Code` header value (`None` = header absent), so the
+/// transient/permanent exception-code split is covered for both carriers.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn classify_clickhouse_acknowledgement_with_header_for_tests(
+    status: u16,
+    body: Option<&[u8]>,
+    exception_code_header: Option<&str>,
+) -> &'static str {
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let exception_header =
+        exception_code_header.map(|value| clickhouse_exception_from_header_value(value.as_bytes()));
     let ack = match body {
         Some(bytes) => ClickHouseAckRead::Complete {
             byte_len: bytes.len() as u64,
-            has_exception: body_has_clickhouse_exception(bytes),
+            exception: body_clickhouse_exception(bytes),
         },
         None => ClickHouseAckRead::Incomplete {
             kind: ClickHouseAckIncomplete::TransportFailure,
@@ -13264,7 +13560,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
         &cfg,
         status,
         ack,
-        has_exception_code_header,
+        exception_header,
         1,
         Duration::from_millis(1),
     )
@@ -13637,6 +13933,58 @@ fn start_spool_replayer(
     })
 }
 
+/// Returns an in-flight replay claim to the replayable namespace when replay is
+/// cancelled mid-delivery.
+///
+/// A plugin generation aborts its replay worker when it retires (an ordinary
+/// reload). Without this guard the aborted future would drop the claim handle —
+/// and with it the only pinned descriptor that can authorize a release — leaving
+/// a descriptor-free `.inflight` artifact that is deliberately never replayed or
+/// reclaimed automatically, so its charges would leave automatic delivery for
+/// good.
+///
+/// While armed, dropping the guard takes the namespace mutation lock and runs
+/// the same descriptor-bound release the retryable-delivery branch uses. A
+/// pathname that no longer resolves to the pinned artifact is refused exactly as
+/// it is there, so cancellation can never promote a substitute into the
+/// replayable namespace. The guard is disarmed as soon as the delivery future
+/// completes, so every non-cancelled outcome keeps its explicit disposition. The
+/// release is one bounded rename under the namespace lock, so running it
+/// synchronously on whichever thread drops the cancelled task is acceptable.
+struct ReplayCancellationRelease<'a> {
+    spool: &'a SpoolManager,
+    claim: &'a mut SpoolClaimHandle,
+    armed: bool,
+}
+
+impl<'a> ReplayCancellationRelease<'a> {
+    fn arm(spool: &'a SpoolManager, claim: &'a mut SpoolClaimHandle) -> Self {
+        Self {
+            spool,
+            claim,
+            armed: true,
+        }
+    }
+
+    fn claim_mut(&mut self) -> &mut SpoolClaimHandle {
+        &mut *self.claim
+    }
+
+    /// The delivery future completed; its caller owns the claim's disposition.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReplayCancellationRelease<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.spool.release_cancelled_claim(&*self.claim);
+    }
+}
+
 /// Replay one tick of this owner's durable spool files.
 ///
 /// Each candidate is atomically claimed before it is read or delivered, so an
@@ -13812,7 +14160,25 @@ async fn replay_spool_once(
         if let Some(hook) = snapshot_spool_replay_hook_for_tests() {
             hook(SpoolReplayHookPoint::AfterMatchingReplayOpen, claim.path());
         }
-        match replay_spool_stream(spool, &mut claim, flush_config, &mut reader, batch_size).await {
+        // The streaming delivery below is the only await in this loop, so it is
+        // the only point at which a retiring generation's abort can cancel the
+        // replay. The guard keeps the claim's pinned descriptor authoritative
+        // across that cancellation and releases the claim back to its durable
+        // replayable name instead of stranding a descriptor-free `.inflight`.
+        let streamed = {
+            let mut cancellation = ReplayCancellationRelease::arm(spool, &mut claim);
+            let streamed = replay_spool_stream(
+                spool,
+                cancellation.claim_mut(),
+                flush_config,
+                &mut reader,
+                batch_size,
+            )
+            .await;
+            cancellation.disarm();
+            streamed
+        };
+        match streamed {
             Ok(completion) => {
                 if reader.row_count() != line_count {
                     drop(reader);
@@ -14922,10 +15288,10 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
         now: i64,
     ) -> SnapshotRecordOutcome {
-        let key = meta.clone();
-        // Fast path: refresh an already-published identity in place. No new
-        // admission is charged for a same-key refresh.
-        if let Some(entry) = self.entries.get(&key) {
+        // Fast path: refresh an already-published identity in place with a
+        // borrowed lookup. No new admission is charged and no key copy is made
+        // for a same-key refresh; the owned key is cloned only on a miss.
+        if let Some(entry) = self.entries.get(&meta) {
             entry.last_seen_at.store(now, Ordering::Relaxed);
             entry.revision.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = entry.totals.try_add(charge) {
@@ -14946,6 +15312,7 @@ impl SnapshotAccumulator {
             return SnapshotRecordOutcome::OverflowImmediate;
         }
 
+        let key = meta.clone();
         let mut created = false;
         let refresh_result = {
             let entry = self.entries.entry(key.clone()).or_insert_with(|| {
@@ -16322,16 +16689,72 @@ fn snapshot_event_extra_bytes(config: &ApiChargebackSinkConfig, node_id: &str) -
         .saturating_add(config.pricing_version.len())
 }
 
+/// Copies of one identity's strings the accumulator retains: the `entries`
+/// map key, the [`SnapshotEntry::meta`] copy, and the `last_emitted` key the
+/// first committed emission publishes.
+const SNAPSHOT_RETAINED_IDENTITY_COPIES: usize = 3;
+/// Hash-table control/bucket and allocator slack charged per identity across
+/// the `entries` and `last_emitted` maps.
+const SNAPSHOT_RETAINED_MAP_SLACK_BYTES: usize = 64;
+
+/// Retained bytes one snapshot identity is charged at admission.
+///
+/// Charges every copy that actually exists for the identity's lifetime rather
+/// than one: the inline `entries` key and [`SnapshotEntry`] (which itself
+/// carries a full [`SnapshotMetadata`]), the inline `last_emitted` key and
+/// [`LastEmitted`] baseline, each identity string once per retained copy, and
+/// fixed map slack. The baseline copy is charged up front so the first emission
+/// never grows retained state past the hard `max_retained_bytes` and process
+/// ceilings that admission already checked.
 fn snapshot_metadata_retained_bytes(meta: &SnapshotMetadata) -> usize {
-    let mut total = 128usize;
-    total = total.saturating_add(meta.namespace.len());
-    total = total.saturating_add(meta.consumer_id.len());
-    total = total.saturating_add(meta.consumer_name.as_ref().map(String::len).unwrap_or(0));
-    total = total.saturating_add(meta.proxy_id.len());
-    total = total.saturating_add(meta.proxy_name.len());
-    total = total.saturating_add(meta.route_id.as_ref().map(String::len).unwrap_or(0));
-    total = total.saturating_add(meta.protocol.len());
-    total
+    let mut field_bytes = 0usize;
+    field_bytes = field_bytes.saturating_add(meta.namespace.len());
+    field_bytes = field_bytes.saturating_add(meta.consumer_id.len());
+    field_bytes =
+        field_bytes.saturating_add(meta.consumer_name.as_ref().map(String::len).unwrap_or(0));
+    field_bytes = field_bytes.saturating_add(meta.proxy_id.len());
+    field_bytes = field_bytes.saturating_add(meta.proxy_name.len());
+    field_bytes = field_bytes.saturating_add(meta.route_id.as_ref().map(String::len).unwrap_or(0));
+    field_bytes = field_bytes.saturating_add(meta.protocol.len());
+    let fixed = std::mem::size_of::<SnapshotMetadata>()
+        .saturating_mul(2)
+        .saturating_add(std::mem::size_of::<SnapshotEntry>())
+        .saturating_add(std::mem::size_of::<LastEmitted>())
+        .saturating_add(SNAPSHOT_RETAINED_MAP_SLACK_BYTES);
+    fixed.saturating_add(field_bytes.saturating_mul(SNAPSHOT_RETAINED_IDENTITY_COPIES))
+}
+
+/// Retained bytes one snapshot identity is charged at admission, for external
+/// budget tests: `(charged, field_bytes)` for an identity built from the given
+/// string fields.
+#[doc(hidden)]
+#[allow(dead_code)] // external unit tests only
+pub fn snapshot_identity_retained_bytes_for_tests(
+    namespace: &str,
+    consumer: &str,
+    proxy_id: &str,
+    proxy_name: &str,
+    protocol: &str,
+) -> (usize, usize) {
+    let meta = SnapshotMetadata {
+        namespace: namespace.to_string(),
+        consumer_id: consumer.to_string(),
+        consumer_name: None,
+        proxy_id: proxy_id.to_string(),
+        proxy_name: proxy_name.to_string(),
+        route_id: None,
+        status_code: 200,
+        http_status_code: Some(200),
+        grpc_status: None,
+        protocol: protocol.to_string(),
+    };
+    let field_bytes = namespace
+        .len()
+        .saturating_add(consumer.len())
+        .saturating_add(proxy_id.len())
+        .saturating_add(proxy_name.len())
+        .saturating_add(protocol.len());
+    (snapshot_metadata_retained_bytes(&meta), field_bytes)
 }
 
 fn charge_event_retained_bytes(event: &ChargeEvent) -> usize {
