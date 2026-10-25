@@ -94,11 +94,15 @@ must admit before upgrading.
 Logical keys move from `v6:` to `v7:`, because the matched route's
 response-header policy left the key for the request fingerprint. Local state
 starts empty after a restart anyway; in `sync_mode: redis`, records written by
-the previous binary under `v6:` keys are not consulted, so an operation that
-completed (or is still in flight) on an old gateway within its TTL can execute
-once more on a new one during a mixed-version rollout. Drain or finish
-in-flight idempotent work, or accept that window, before cutting over; the old
-records expire on their own TTL.
+the previous binary under `v6:` keys are not consulted. Any cutover, including
+an atomic, fully drained replacement of every gateway, therefore loses
+coordination with every still-valid old record: a retry of an operation that
+completed under a `v6:` key within its replay TTL executes again on the new
+binary. Draining only settles in-flight work; it does not protect retries of
+completed operations. Deployments that need that protection must keep old-key
+retries on the old deployment until the longest replay TTL has elapsed, rely on
+backend idempotency for that window, or explicitly accept the re-execution
+window. The old records expire on their own TTL.
 
 ### `soap_ws_security`: `${...}` passwords, evicting shared Redis, SAML conditions (#6820)
 
@@ -517,9 +521,11 @@ yield to the native values under `on_collision: skip`. An existing schema
 `replay_max_entries` now accepts `1`–`10000000`, and it is refused on a
 `signing_profile: ferrum-hmac-v1` policy, where it never had an effect. Before
 upgrading, remove `replay_max_entries` from every `ferrum-hmac-v1` `hmac_auth`
-config, and lower any larger value to at most `10000000` (or move the policy
-to `replay_scope: shared` with `sync_mode: redis` when one process needs more
-replay state). A config that still carries either is rejected at admission
+config, and lower any larger value to at most `10000000`. When one process
+needs more replay state, move the policy to `replay_scope: shared` with
+`sync_mode: redis`, and still remove `replay_max_entries` (or keep it within
+the admitted range): it is validated in every scope, though shared scope
+ignores it. A config that still carries either is rejected at admission
 and at startup. No other `hmac_auth` setting changes: `signed_headers`,
 `required_components`, `max_body_bytes`, and `signing_profile: rfc9421` are
 new opt-ins, and a policy that sets none of them keeps its signing base
