@@ -3,6 +3,7 @@ use crate::plugins::utils::log_sampling::warn_sampled;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -23,9 +24,11 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::PluginHttpClient;
 use super::utils::auth_attempt::AuthenticationAttempt;
 use super::utils::auth_flow::{
-    ExtractedCredential, VerifyOutcome, commit_authentication_attempt,
+    ExtractedCredential, VerifyOutcome, commit_authentication_attempt, constant_time_eq,
     credential_deadline_from_unix_seconds, external_identity_realm_authority, nonblank_identity,
+    refine_external_identity_realm_authority,
 };
+use super::utils::cert_hash::sha256_base64url_no_pad;
 use super::utils::claim_header_fanout::{
     ClaimHeaderDestinations, ClaimHeaderMapping, apply_claim_headers_from_context,
     normalized_claim_header_values, parse_claim_headers,
@@ -56,19 +59,38 @@ const MAX_PROVIDERS: usize = 16;
 const MAX_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_INTROSPECTION_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = 128 * 1024;
-const MAX_PROVIDER_CONCURRENT_INTROSPECTIONS: usize = 32;
+/// Default `providers[].max_concurrent_introspections`.
+const DEFAULT_PROVIDER_CONCURRENT_INTROSPECTIONS: u64 = 32;
+/// Default plugin-level `max_concurrent_introspections` (every provider of one
+/// plugin instance together).
+const DEFAULT_INSTANCE_CONCURRENT_INTROSPECTIONS: u64 = 128;
+/// Largest value either `max_concurrent_introspections` knob accepts.
+const MAX_CONFIGURED_CONCURRENT_INTROSPECTIONS: u64 = 1_024;
+/// Fixed process-wide ceiling across every `oauth2_introspection` instance and
+/// reload generation. Not configurable: it is the outer guard that keeps the
+/// sum of many instances' configured budgets from becoming unbounded egress.
+const MAX_PROCESS_CONCURRENT_INTROSPECTIONS: usize = 1_024;
+/// Default `providers[].discovery_refresh_interval_secs`.
+const DEFAULT_DISCOVERY_REFRESH_INTERVAL_SECS: u64 = 900;
+const MIN_DISCOVERY_REFRESH_INTERVAL_SECS: u64 = 1;
+const MAX_DISCOVERY_REFRESH_INTERVAL_SECS: u64 = 86_400;
 /// Audience used only by the construction-time `private_key_jwt` signing probe.
 /// The assertion is discarded and never sent; the value affects nothing the
 /// signature backend checks.
 const PROBE_ASSERTION_AUDIENCE: &str = "urn:ferrum-edge:client-assertion-probe";
-const MAX_GLOBAL_CONCURRENT_INTROSPECTIONS: usize = 128;
+/// RFC 7800 confirmation member this plugin can verify: the SHA-256 thumbprint
+/// of the frontend client certificate a token is bound to (RFC 8705 §3.1).
+const CERTIFICATE_THUMBPRINT_CONFIRMATION: &str = "x5t#S256";
+const SENDER_CONSTRAINED_UNSUPPORTED_BODY: &str =
+    r#"{"error":"Sender-constrained tokens are not supported"}"#;
+const MTLS_BINDING_MISMATCH_BODY: &str = r#"{"error":"mTLS binding mismatch"}"#;
 
-static GLOBAL_INTROSPECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static PROCESS_INTROSPECTION_LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-fn global_introspection_limit() -> Arc<Semaphore> {
+fn process_introspection_limit() -> Arc<Semaphore> {
     Arc::clone(
-        GLOBAL_INTROSPECTION_LIMIT
-            .get_or_init(|| Arc::new(Semaphore::new(MAX_GLOBAL_CONCURRENT_INTROSPECTIONS))),
+        PROCESS_INTROSPECTION_LIMIT
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_PROCESS_CONCURRENT_INTROSPECTIONS))),
     )
 }
 
@@ -91,7 +113,11 @@ impl Drop for InFlightEntryGuard {
 pub struct Oauth2Introspection {
     providers: Vec<IntrospectionProvider>,
     http_client: PluginHttpClient,
-    global_introspection_limit: Arc<Semaphore>,
+    /// Plugin-level `max_concurrent_introspections` budget shared by every
+    /// provider of this instance.
+    instance_introspection_limit: Arc<Semaphore>,
+    /// Fixed process-wide ceiling shared by every instance and generation.
+    process_introspection_limit: Arc<Semaphore>,
     global_scope_claim: String,
     global_role_claim: String,
     consumer_identity_claim: String,
@@ -112,7 +138,16 @@ struct IntrospectionProvider {
     issuer: Option<String>,
     introspection_endpoint: Arc<ArcSwap<Option<ResolvedEndpoint>>>,
     discovery: Option<ResolvedEndpoint>,
-    assertion_audience: Option<String>,
+    /// How long a resolved discovery endpoint is used before the discovery
+    /// document is fetched again.
+    discovery_refresh_interval: Duration,
+    /// Discovery attempts (successful or failed) whose outcome the worker has
+    /// fully processed — published or kept the endpoint, or logged the
+    /// failure — before it sleeps. Observability for deterministic tests.
+    discovery_attempts_completed: Arc<AtomicU64>,
+    /// Admit RFC 8705 certificate-bound tokens (`cnf."x5t#S256"`) when the
+    /// frontend client certificate matches the bound thumbprint.
+    accept_mtls_bound_tokens: bool,
     audiences: Vec<String>,
     token_locations: Vec<TokenLocation>,
     required_scopes: Vec<String>,
@@ -132,8 +167,34 @@ struct IntrospectionProvider {
     in_flight: Arc<DashMap<TokenKey, Arc<InFlightCell>>>,
     /// Verifying-authority digest (pinned issuer, introspection or discovery
     /// endpoint, and the claim the identity is read from) committed with every
-    /// external principal this provider vouches for.
+    /// external principal this provider vouches for. A provider that pins no
+    /// issuer additionally binds each response's `iss`
+    /// ([`IntrospectionProvider::identity_realm_authority_for`]).
     identity_realm_authority: [u8; 32],
+}
+
+impl IntrospectionProvider {
+    /// Realm authority for one active introspection response.
+    ///
+    /// A provider that pins no `issuer` can front an introspection service
+    /// that answers for several issuers, and RFC 7662 §2.2 / RFC 7519 §4.1.2
+    /// make `sub` unique only within its issuer. Equal subjects asserted for
+    /// different issuers must therefore not collapse into one principal: the
+    /// response's `iss` joins the realm. A response without a string `iss`
+    /// keeps the provider's configured realm.
+    fn identity_realm_authority_for(&self, claims: &Value) -> [u8; 32] {
+        if self.issuer.is_some() {
+            return self.identity_realm_authority;
+        }
+        match claims.get("iss").and_then(Value::as_str) {
+            Some(issuer) => refine_external_identity_realm_authority(
+                &self.identity_realm_authority,
+                "response.iss",
+                Some(issuer),
+            ),
+            None => self.identity_realm_authority,
+        }
+    }
 }
 
 /// An introspection endpoint together with the only rendering of it that may
@@ -169,6 +230,9 @@ enum ClientAuth {
         encoding_key: EncodingKey,
         alg: Algorithm,
         kid: Option<String>,
+        /// Explicit `client_assertion_audience`; `None` uses the resolved
+        /// introspection endpoint URL.
+        audience: Option<String>,
     },
     None,
 }
@@ -246,12 +310,20 @@ impl Oauth2Introspection {
                 "consumer_identity_claim",
                 "consumer_header_claim",
                 "allow_provider_fanout",
+                "max_concurrent_introspections",
             ],
             "oauth2_introspection",
         )?;
         let allow_provider_fanout =
             optional_top_level_bool(config_obj, "allow_provider_fanout", "oauth2_introspection")?
                 .unwrap_or(false);
+        let instance_concurrent_introspections = ranged_top_level_usize(
+            config_obj,
+            "max_concurrent_introspections",
+            DEFAULT_INSTANCE_CONCURRENT_INTROSPECTIONS,
+            1,
+            MAX_CONFIGURED_CONCURRENT_INTROSPECTIONS,
+        )?;
         let global_scope_claim =
             optional_claim_path(config_obj, "scope_claim", "scope", "oauth2_introspection")?;
         let global_role_claim =
@@ -319,6 +391,9 @@ impl Oauth2Introspection {
                     "consumer_identity_claim",
                     "consumer_header_claim",
                     "claim_headers",
+                    "max_concurrent_introspections",
+                    "discovery_refresh_interval_secs",
+                    "accept_mtls_bound_tokens",
                 ],
                 &format!("oauth2_introspection: `provider[{idx}]`"),
             )?;
@@ -358,6 +433,29 @@ impl Oauth2Introspection {
                 ranged_provider_u64(prov_obj, "negative_cache_ttl_secs", idx, 10, 0, 300)?;
             let request_timeout_ms =
                 ranged_provider_u64(prov_obj, "request_timeout_ms", idx, 5_000, 100, 30_000)?;
+            let provider_concurrent_introspections = ranged_provider_usize(
+                prov_obj,
+                "max_concurrent_introspections",
+                idx,
+                DEFAULT_PROVIDER_CONCURRENT_INTROSPECTIONS as usize,
+                1,
+                MAX_CONFIGURED_CONCURRENT_INTROSPECTIONS as usize,
+            )?;
+            if discovery.is_none() && prov_obj.contains_key("discovery_refresh_interval_secs") {
+                return Err(format!(
+                    "oauth2_introspection: `provider[{idx}].discovery_refresh_interval_secs` is only meaningful with `discovery_url`"
+                ));
+            }
+            let discovery_refresh_interval_secs = ranged_provider_u64(
+                prov_obj,
+                "discovery_refresh_interval_secs",
+                idx,
+                DEFAULT_DISCOVERY_REFRESH_INTERVAL_SECS,
+                MIN_DISCOVERY_REFRESH_INTERVAL_SECS,
+                MAX_DISCOVERY_REFRESH_INTERVAL_SECS,
+            )?;
+            let accept_mtls_bound_tokens =
+                optional_provider_bool(prov_obj, "accept_mtls_bound_tokens", idx)?.unwrap_or(false);
             let max_cache_entries = ranged_provider_usize(
                 prov_obj,
                 "max_cache_entries",
@@ -444,12 +542,14 @@ impl Oauth2Introspection {
             );
 
             providers.push(IntrospectionProvider {
-                assertion_audience: issuer.clone(),
                 issuer,
                 introspection_endpoint: endpoint_slot,
                 discovery: discovery
                     .as_ref()
                     .map(|parsed| ResolvedEndpoint::new(parsed.url.clone())),
+                discovery_refresh_interval: Duration::from_secs(discovery_refresh_interval_secs),
+                discovery_attempts_completed: Arc::new(AtomicU64::new(0)),
+                accept_mtls_bound_tokens,
                 audiences,
                 token_locations,
                 required_scopes,
@@ -465,9 +565,7 @@ impl Oauth2Introspection {
                 token_hint_param,
                 claim_headers,
                 warmup_hostnames,
-                introspection_limit: Arc::new(Semaphore::new(
-                    MAX_PROVIDER_CONCURRENT_INTROSPECTIONS,
-                )),
+                introspection_limit: Arc::new(Semaphore::new(provider_concurrent_introspections)),
                 in_flight: Arc::new(DashMap::with_shard_amount(shard_amount)),
                 identity_realm_authority,
             });
@@ -533,7 +631,10 @@ impl Oauth2Introspection {
         Ok(Self {
             providers,
             http_client,
-            global_introspection_limit: global_introspection_limit(),
+            instance_introspection_limit: Arc::new(Semaphore::new(
+                instance_concurrent_introspections,
+            )),
+            process_introspection_limit: process_introspection_limit(),
             global_scope_claim,
             global_role_claim,
             consumer_identity_claim,
@@ -545,6 +646,21 @@ impl Oauth2Introspection {
             claim_header_destinations,
             discovery_tasks: Mutex::new(None),
         })
+    }
+
+    /// Per provider, how many discovery attempts the background worker has
+    /// fully processed (`0` for a provider without `discovery_url`). Lets
+    /// external tests wait for a refresh outcome instead of sleeping.
+    #[allow(dead_code)] // exercised by external unit tests
+    pub fn completed_discovery_attempts(&self) -> Vec<u64> {
+        self.providers
+            .iter()
+            .map(|provider| {
+                provider
+                    .discovery_attempts_completed
+                    .load(Ordering::Acquire)
+            })
+            .collect()
     }
 
     async fn authenticate_request(
@@ -575,11 +691,25 @@ impl Oauth2Introspection {
                         Err(rejection) => return rejection.into_plugin_result(),
                     };
                 let provider = &self.providers[candidate.provider_idx];
+                // RFC 8705 §3: a certificate-bound token is usable only on a
+                // connection presenting the bound client certificate. Checked
+                // on every use — cache hits and coalesced lookups included —
+                // and before any cached scope/role verdict, so a token holder
+                // without the certificate learns nothing about its grants.
+                if let Some(expected) = authorization.certificate_thumbprint.as_deref()
+                    && !client_certificate_matches(ctx, expected)
+                {
+                    return reject_bearer(
+                        401,
+                        MTLS_BINDING_MISMATCH_BODY.to_string(),
+                        "invalid_token",
+                    );
+                }
                 if let Some(error) = &authorization.authorization_error {
                     return reject(error.status_code, error.body.to_string());
                 }
                 let mut attempt = AuthenticationAttempt::new();
-                attempt.stage_identity_realm_authority(provider.identity_realm_authority);
+                attempt.stage_identity_realm_authority(authorization.identity_realm_authority);
                 self.stage_claim_headers(&mut attempt, &authorization, provider);
                 if !provider.forward_original_token {
                     self.stage_original_token_stripping(&mut attempt, ctx, &token, candidate);
@@ -714,15 +844,27 @@ impl Oauth2Introspection {
                 );
                 IntrospectionDecision::Unavailable
             })?;
-        let _global_permit = self
-            .global_introspection_limit
+        let _instance_permit = self
+            .instance_introspection_limit
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
                 warn_sampled!(
                     plugin = "oauth2_introspection",
                     provider_idx,
-                    "global introspection concurrency limit reached"
+                    "plugin introspection concurrency limit reached"
+                );
+                IntrospectionDecision::Unavailable
+            })?;
+        let _process_permit = self
+            .process_introspection_limit
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                warn_sampled!(
+                    plugin = "oauth2_introspection",
+                    provider_idx,
+                    "process introspection concurrency limit reached"
                 );
                 IntrospectionDecision::Unavailable
             })?;
@@ -760,11 +902,12 @@ impl Oauth2Introspection {
                 encoding_key,
                 alg,
                 kid,
+                audience,
             } => {
-                let assertion_audience = provider
-                    .assertion_audience
-                    .as_deref()
-                    .unwrap_or(endpoint.as_str());
+                // The assertion audience is independent of the response
+                // `issuer` pin: many authorization servers require the
+                // endpoint the assertion is presented to (RFC 7523 §3).
+                let assertion_audience = audience.as_deref().unwrap_or(endpoint.as_str());
                 let assertion =
                     build_client_assertion(client_id, assertion_audience, encoding_key, *alg, kid)
                         .map_err(|_| IntrospectionDecision::Unavailable)?;
@@ -851,12 +994,12 @@ impl Oauth2Introspection {
                 return Err(IntrospectionDecision::Unavailable);
             }
         }
-        if claims.get("cnf").is_some() {
-            return Err(IntrospectionDecision::Unauthorized(
-                r#"{"error":"Sender-constrained tokens are not supported"}"#.to_string(),
-            ));
-        }
-        match claims.get("token_type") {
+        let certificate_thumbprint =
+            certificate_binding(&claims, provider.accept_mtls_bound_tokens)?;
+        // A JSON `null` is how many authorization servers serialize an optional
+        // member they did not set, so a null `token_type` reads as omitted,
+        // exactly like the null temporal members below.
+        match claims.get("token_type").filter(|value| !value.is_null()) {
             None => {}
             Some(Value::String(token_type)) if token_type.eq_ignore_ascii_case("bearer") => {}
             Some(Value::String(_)) => {
@@ -896,6 +1039,7 @@ impl Oauth2Introspection {
             provider,
             expires_at_unix,
             not_before_unix,
+            certificate_thumbprint,
         ));
         provider
             .cache
@@ -934,7 +1078,9 @@ impl Oauth2Introspection {
         provider: &IntrospectionProvider,
         expires_at_unix: Option<i64>,
         not_before_unix: Option<i64>,
+        certificate_thumbprint: Option<Box<str>>,
     ) -> CachedAuthorization {
+        let identity_realm_authority = provider.identity_realm_authority_for(claims);
         if let Err((status_code, body)) = self.check_claims_authorization(claims, provider) {
             return CachedAuthorization {
                 authorization_error: Some(CachedAuthorizationError {
@@ -946,6 +1092,8 @@ impl Oauth2Introspection {
                 claim_headers: Box::default(),
                 expires_at_unix,
                 not_before_unix,
+                identity_realm_authority,
+                certificate_thumbprint,
             };
         }
         let identity_claim = provider
@@ -978,6 +1126,8 @@ impl Oauth2Introspection {
             claim_headers,
             expires_at_unix,
             not_before_unix,
+            identity_realm_authority,
+            certificate_thumbprint,
         }
     }
 
@@ -1487,12 +1637,12 @@ impl super::Plugin for Oauth2Introspection {
             .providers
             .iter()
             .filter_map(|provider| {
-                provider.discovery.as_ref().map(|discovery| {
-                    (
-                        Arc::clone(&provider.introspection_endpoint),
-                        discovery.url.clone(),
-                        discovery.redacted.clone(),
-                    )
+                provider.discovery.as_ref().map(|discovery| DiscoveryTask {
+                    endpoint_slot: Arc::clone(&provider.introspection_endpoint),
+                    discovery_url: discovery.url.clone(),
+                    redacted_discovery_url: discovery.redacted.clone(),
+                    refresh_interval: provider.discovery_refresh_interval,
+                    attempts_completed: Arc::clone(&provider.discovery_attempts_completed),
                 })
             })
             .collect();
@@ -1506,15 +1656,7 @@ impl super::Plugin for Oauth2Introspection {
         })?;
         let tasks = discoveries
             .into_iter()
-            .map(|(endpoint_slot, discovery_url, redacted_discovery_url)| {
-                spawn_discovery_task(
-                    &runtime,
-                    endpoint_slot,
-                    self.http_client.clone(),
-                    discovery_url,
-                    redacted_discovery_url,
-                )
-            })
+            .map(|discovery| spawn_discovery_task(&runtime, self.http_client.clone(), discovery))
             .collect();
         *task_slot = Some(tasks);
         Ok(())
@@ -1646,15 +1788,16 @@ fn apply_verify_outcome(
     }
 }
 
-/// Every key `client_auth` accepts. All six are string-typed regardless of the
-/// selected `method`.
-const CLIENT_AUTH_STRING_FIELDS: [&str; 6] = [
+/// Every key `client_auth` accepts. All seven are string-typed regardless of
+/// the selected `method`.
+const CLIENT_AUTH_STRING_FIELDS: [&str; 7] = [
     "method",
     "client_id",
     "client_secret",
     "private_key_pem",
     "private_key_jwt_alg",
     "private_key_jwt_kid",
+    "client_assertion_audience",
 ];
 
 fn parse_client_auth(
@@ -1711,6 +1854,20 @@ fn parse_client_auth(
     }
     .filter(|value| !value.is_empty())
     .map(ToOwned::to_owned);
+    // Type-checked above; a present value must also be non-blank, whatever the
+    // method, so admission matches the published `\S` schema pattern.
+    let client_assertion_audience = match auth.get("client_assertion_audience") {
+        Some(value) => {
+            let trimmed = value.as_str().map(str::trim).unwrap_or_default();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "oauth2_introspection: `provider[{provider_idx}].client_auth.client_assertion_audience` must not be empty"
+                ));
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
 
     // Credentialed methods transmit client credentials to the provider:
     // `client_secret_basic` puts Base64(client_id:client_secret) in the
@@ -1819,6 +1976,7 @@ fn parse_client_auth(
                 encoding_key,
                 alg,
                 kid,
+                audience: client_assertion_audience,
             })
         }
         "none" => {
@@ -2055,6 +2213,30 @@ fn optional_top_level_bool(
                 .ok_or_else(|| format!("{plugin}: `{field}` must be a boolean"))
         })
         .transpose()
+}
+
+fn ranged_top_level_usize(
+    config: &Map<String, Value>,
+    field: &str,
+    default_value: u64,
+    min: u64,
+    max: u64,
+) -> Result<usize, String> {
+    let value = config
+        .get(field)
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                format!("oauth2_introspection: `{field}` must be an unsigned integer")
+            })
+        })
+        .transpose()?
+        .unwrap_or(default_value);
+    if value < min || value > max {
+        return Err(format!(
+            "oauth2_introspection: `{field}` must be between {min} and {max}"
+        ));
+    }
+    usize::try_from(value).map_err(|_| format!("oauth2_introspection: `{field}` is too large"))
 }
 
 fn optional_provider_claim_path(
@@ -2301,6 +2483,48 @@ fn audience_matches(claims: &Value, audiences: &[String]) -> bool {
     }
 }
 
+/// Classify an active response's RFC 7800 `cnf` confirmation.
+///
+/// An omitted or JSON-`null` `cnf` is an ordinary bearer token: a null is how
+/// many authorization servers serialize an unset optional member, and a token
+/// actually bound to a key or certificate carries an object. With
+/// `accept_mtls_bound_tokens`, a confirmation consisting of exactly one
+/// non-empty `x5t#S256` string returns that RFC 8705 certificate thumbprint for
+/// per-request verification. Every other confirmation (DPoP `jkt`, `jwk`,
+/// additional or unknown members, a malformed shape) stays fail-closed: this
+/// plugin cannot prove possession for it, and ignoring one member of a
+/// multi-member confirmation would accept a token whose other constraint was
+/// never checked.
+fn certificate_binding(
+    claims: &Value,
+    accept_mtls_bound_tokens: bool,
+) -> Result<Option<Box<str>>, IntrospectionDecision> {
+    let Some(confirmation) = claims.get("cnf").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if accept_mtls_bound_tokens
+        && let Some(members) = confirmation.as_object()
+        && members.len() == 1
+        && let Some(Value::String(thumbprint)) = members.get(CERTIFICATE_THUMBPRINT_CONFIRMATION)
+        && !thumbprint.is_empty()
+    {
+        return Ok(Some(Box::from(thumbprint.as_str())));
+    }
+    Err(IntrospectionDecision::Unauthorized(
+        SENDER_CONSTRAINED_UNSUPPORTED_BODY.to_string(),
+    ))
+}
+
+/// Whether the request's frontend client certificate has the bound RFC 8705
+/// `x5t#S256` thumbprint (base64url SHA-256 of the DER certificate). A request
+/// without a verified client certificate never matches.
+fn client_certificate_matches(ctx: &RequestContext, expected_thumbprint: &str) -> bool {
+    ctx.tls_client_cert_der.as_ref().is_some_and(|der| {
+        let actual = sha256_base64url_no_pad(der.as_slice());
+        constant_time_eq(actual.as_bytes(), expected_thumbprint.as_bytes())
+    })
+}
+
 fn stage_credential_source_stripping(
     attempt: &mut AuthenticationAttempt,
     provider: &IntrospectionProvider,
@@ -2391,26 +2615,41 @@ fn reject_bearer(status_code: u16, body: String, error: &'static str) -> PluginR
     }
 }
 
-fn spawn_discovery_task(
-    runtime: &tokio::runtime::Handle,
+/// One provider's discovery worker inputs.
+struct DiscoveryTask {
     endpoint_slot: Arc<ArcSwap<Option<ResolvedEndpoint>>>,
-    http_client: PluginHttpClient,
     discovery_url: String,
     redacted_discovery_url: String,
+    refresh_interval: Duration,
+    attempts_completed: Arc<AtomicU64>,
+}
+
+/// Resolve, then keep refreshing, one provider's introspection endpoint.
+///
+/// The first resolution retries with capped exponential backoff until it
+/// succeeds. After that the discovery document is re-fetched every
+/// `refresh_interval`, so an endpoint the authorization server moves is picked
+/// up without a reload. A failed refresh keeps serving the last known endpoint
+/// (it was validated against the same discovery origin) and retries with the
+/// same backoff; a successful refresh publishes a changed endpoint atomically,
+/// so an in-flight lookup sees either the old or the new endpoint.
+fn spawn_discovery_task(
+    runtime: &tokio::runtime::Handle,
+    http_client: PluginHttpClient,
+    task: DiscoveryTask,
 ) -> tokio::task::JoinHandle<()> {
     runtime.spawn(async move {
         const INITIAL_BACKOFF_SECS: u64 = 2;
         const MAX_BACKOFF_SECS: u64 = 300;
-        let mut attempt: u32 = 0;
+        let DiscoveryTask {
+            endpoint_slot,
+            discovery_url,
+            redacted_discovery_url,
+            refresh_interval,
+            attempts_completed,
+        } = task;
+        let mut failures: u32 = 0;
         loop {
-            if attempt > 0 {
-                let backoff = Duration::from_secs(
-                    INITIAL_BACKOFF_SECS
-                        .saturating_mul(1u64 << (attempt - 1).min(7))
-                        .min(MAX_BACKOFF_SECS),
-                );
-                tokio::time::sleep(backoff).await;
-            }
             match discover_introspection_endpoint(
                 &http_client,
                 &discovery_url,
@@ -2419,20 +2658,42 @@ fn spawn_discovery_task(
             .await
             {
                 Ok(endpoint) => {
-                    info!(
-                        plugin = "oauth2_introspection",
-                        "OIDC discovery resolved introspection endpoint"
-                    );
-                    endpoint_slot.store(Arc::new(Some(ResolvedEndpoint::new(endpoint))));
-                    return;
+                    failures = 0;
+                    let changed = match endpoint_slot.load().as_ref().as_ref() {
+                        Some(current) => current.url != endpoint,
+                        None => true,
+                    };
+                    if changed {
+                        info!(
+                            plugin = "oauth2_introspection",
+                            "OIDC discovery resolved introspection endpoint"
+                        );
+                        endpoint_slot.store(Arc::new(Some(ResolvedEndpoint::new(endpoint))));
+                    } else {
+                        debug!(
+                            plugin = "oauth2_introspection",
+                            "OIDC discovery refresh kept the introspection endpoint"
+                        );
+                    }
+                    attempts_completed.fetch_add(1, Ordering::Release);
+                    tokio::time::sleep(refresh_interval).await;
                 }
                 Err(error) => {
+                    let retained_last_known_endpoint = endpoint_slot.load().is_some();
                     warn!(
                         plugin = "oauth2_introspection",
                         error = %error,
+                        retained_last_known_endpoint,
                         "OIDC discovery failed"
                     );
-                    attempt = attempt.saturating_add(1);
+                    attempts_completed.fetch_add(1, Ordering::Release);
+                    failures = failures.saturating_add(1);
+                    let backoff = Duration::from_secs(
+                        INITIAL_BACKOFF_SECS
+                            .saturating_mul(1u64 << (failures - 1).min(7))
+                            .min(MAX_BACKOFF_SECS),
+                    );
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }

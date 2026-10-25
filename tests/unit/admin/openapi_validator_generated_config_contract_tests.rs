@@ -1263,3 +1263,293 @@ fn published_schema_enforces_request_body_shape_and_response_keys() {
         "non-canonical status keys must fail the published schema"
     );
 }
+
+#[test]
+fn published_parameter_descriptors_match_constructor_admission() {
+    let validator = openapi_validator_config_validator();
+    let string = json!({"type": "string"});
+    for (template, parameter, accepted) in [
+        (
+            "/contract",
+            json!({"name": "limit", "in": "query", "schema": {"type": "integer"}}),
+            true,
+        ),
+        (
+            "/contract",
+            json!({"name": "ids", "in": "query", "style": "form", "explode": false,
+                   "schema": {"type": "array", "items": {"type": "integer"}}}),
+            true,
+        ),
+        (
+            "/contract",
+            json!({"name": "X-Tenant", "in": "header", "required": true, "schema": string}),
+            true,
+        ),
+        (
+            "/contract",
+            json!({"name": "s", "in": "cookie", "schema": true}),
+            true,
+        ),
+        (
+            "/contract/{id}",
+            json!({"name": "id", "in": "path", "required": true, "schema": string}),
+            true,
+        ),
+        (
+            "/contract/{id}",
+            json!({"name": "id", "in": "path", "required": false, "schema": string}),
+            false,
+        ),
+        (
+            "/contract",
+            json!({"name": "f", "in": "query", "style": "deepObject", "schema": string}),
+            false,
+        ),
+        (
+            "/contract",
+            json!({"name": "h", "in": "header", "style": "form", "schema": string}),
+            false,
+        ),
+        (
+            "/contract",
+            json!({"name": "q", "in": "query", "style": "simple", "schema": string}),
+            false,
+        ),
+        (
+            "/contract",
+            json!({"name": "q", "in": "body", "schema": string}),
+            false,
+        ),
+        ("/contract", json!({"name": "q", "in": "query"}), false),
+        (
+            "/contract",
+            json!({"name": "", "in": "query", "schema": true}),
+            false,
+        ),
+        (
+            "/contract",
+            json!({"name": "q", "in": "query", "schema": true, "allowEmptyValue": true}),
+            false,
+        ),
+        (
+            "/contract",
+            json!({"name": "q", "in": "query", "schema": true, "explode": "yes"}),
+            false,
+        ),
+    ] {
+        let mut config = admission_contract_config();
+        config["operations"][0]["path_template"] = json!(template);
+        config["operations"][0]["path_regex"] = json!(template.replace("{id}", "[^/]+"));
+        config["operations"][0]["parameters"] = json!([parameter]);
+        assert_admission(&validator, &config, accepted);
+    }
+}
+
+#[test]
+fn published_content_type_scope_lists_reject_empty_lists_like_the_constructor() {
+    let validator = openapi_validator_config_validator();
+    for field in ["request_content_types", "response_content_types"] {
+        let mut config = admission_contract_config();
+        config[field] = json!([]);
+        assert_admission(&validator, &config, false);
+        config[field] = json!(["application/json"]);
+        assert_admission(&validator, &config, true);
+    }
+}
+
+#[test]
+fn importer_generates_parameter_descriptors_with_override_and_support_rules() {
+    let spec = r##"{
+  "openapi": "3.1.0",
+  "info": {"title": "Orders API", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "orders-api",
+    "listen_path": "/api",
+    "backend_host": "orders.internal",
+    "backend_port": 8080
+  },
+  "components": {
+    "parameters": {
+      "OrderId": {"name": "id", "in": "path", "required": true,
+                  "schema": {"type": "integer", "minimum": 1}}
+    }
+  },
+  "paths": {
+    "/orders/{id}": {
+      "parameters": [
+        {"$ref": "#/components/parameters/OrderId"},
+        {"name": "limit", "in": "query", "schema": {"type": "string"}}
+      ],
+      "get": {
+        "parameters": [
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "maximum": 100}},
+          {"name": "X-Tenant-Id", "in": "header", "required": true,
+           "schema": {"type": "string"}},
+          {"name": "Authorization", "in": "header", "schema": {"type": "string"}},
+          {"name": "filter", "in": "query", "style": "deepObject",
+           "schema": {"type": "object"}},
+          {"name": "q", "in": "query", "content": {"application/json": {"schema": {}}}}
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {"application/json": {"schema": {"type": "object"}}}
+          }
+        }
+      }
+    }
+  }
+}"##;
+    let config = extract_validator_config(spec);
+    assert_valid_against_admin_schema(&config, "parameter-bearing importer config");
+    assert!(OpenapiValidator::new(&config).is_ok());
+    let operation = &config["operations"][0];
+    assert_eq!(operation["path_template"], "/api/orders/{id}");
+    let parameters = operation["parameters"].as_array().expect("parameters");
+    // Path Item `limit` is overridden by the operation's; Authorization is
+    // ignored per OpenAPI; optional unsupported parameters are omitted.
+    assert_eq!(
+        parameters,
+        &[
+            json!({"name": "id", "in": "path", "required": true,
+                   "schema": {"type": "integer", "minimum": 1}}),
+            json!({"name": "limit", "in": "query", "required": false,
+                   "schema": {"type": "integer", "maximum": 100}}),
+            json!({"name": "X-Tenant-Id", "in": "header", "required": true,
+                   "schema": {"type": "string"}}),
+        ]
+    );
+
+    // A REQUIRED parameter the validator cannot deserialize refuses the import
+    // instead of being silently left unenforced.
+    let required_unsupported = spec.replace(
+        r#""name": "filter", "in": "query", "style": "deepObject","#,
+        r#""name": "filter", "in": "query", "required": true, "style": "deepObject","#,
+    );
+    assert_ne!(required_unsupported, spec);
+    let error = extract(
+        required_unsupported.as_bytes(),
+        Some(SpecFormat::Json),
+        "prod",
+    )
+    .expect_err("required unsupported parameter must refuse the import")
+    .to_string();
+    assert!(
+        error.contains("cannot be validated by openapi_validator"),
+        "{error}"
+    );
+}
+
+#[test]
+fn importer_maps_swagger_parameters_and_collection_formats() {
+    let spec = r##"{
+  "swagger": "2.0",
+  "info": {"title": "Pets", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "pets-api",
+    "backend_host": "pets.internal",
+    "backend_port": 8080
+  },
+  "paths": {
+    "/pets/{petId}": {
+      "get": {
+        "parameters": [
+          {"name": "petId", "in": "path", "required": true, "type": "integer",
+           "minimum": 1, "exclusiveMinimum": true},
+          {"name": "tags", "in": "query", "type": "array",
+           "collectionFormat": "multi", "items": {"type": "string"}},
+          {"name": "ids", "in": "query", "type": "array",
+           "items": {"type": "integer"}},
+          {"name": "fields", "in": "query", "type": "array",
+           "collectionFormat": "tsv", "items": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "ok", "schema": {"type": "object"}}}
+      }
+    }
+  }
+}"##;
+    let config = extract_validator_config(spec);
+    assert_valid_against_admin_schema(&config, "Swagger parameter importer config");
+    assert!(OpenapiValidator::new(&config).is_ok());
+    let parameters = config["operations"][0]["parameters"]
+        .as_array()
+        .expect("parameters");
+    assert_eq!(
+        parameters,
+        &[
+            json!({"name": "petId", "in": "path", "required": true,
+                   "schema": {"type": "integer", "exclusiveMinimum": 1}}),
+            json!({"name": "tags", "in": "query", "required": false, "explode": true,
+                   "schema": {"type": "array", "items": {"type": "string"}}}),
+            json!({"name": "ids", "in": "query", "required": false, "explode": false,
+                   "schema": {"type": "array", "items": {"type": "integer"}}}),
+        ],
+        "the optional tsv parameter is omitted"
+    );
+}
+
+#[test]
+fn importer_keeps_schemaless_event_stream_responses() {
+    let spec = r##"{
+  "openapi": "3.1.0",
+  "info": {"title": "Chat", "version": "1.0.0"},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {
+    "id": "chat-api",
+    "backend_host": "chat.internal",
+    "backend_port": 8080
+  },
+  "paths": {
+    "/chat": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "stream",
+            "content": {"text/event-stream": {}}
+          }
+        }
+      }
+    }
+  }
+}"##;
+    let config = extract_validator_config(spec);
+    assert_valid_against_admin_schema(&config, "event-stream importer config");
+    assert_eq!(
+        config["operations"][0]["responses"]["200"],
+        json!({"text/event-stream": {}})
+    );
+}
+
+#[test]
+fn published_plugin_config_requires_proxy_scope_for_openapi_validator() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfigCreate",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("PluginConfigCreate schema compiles");
+    // `enabled: false` skips plugin-specific construction constraints, so only
+    // the generic scope rule decides.
+    for (scope, proxy_id, accepted) in [
+        ("proxy", Some("orders-api"), true),
+        ("global", None, false),
+        ("proxy_group", None, false),
+    ] {
+        let mut body = json!({
+            "plugin_name": "openapi_validator",
+            "scope": scope,
+            "enabled": false,
+            "config": {}
+        });
+        if let Some(proxy_id) = proxy_id {
+            body["proxy_id"] = json!(proxy_id);
+        }
+        assert_eq!(validator.is_valid(&body), accepted, "{body}");
+    }
+}

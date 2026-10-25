@@ -1302,6 +1302,15 @@ pub mod _test_support {
         ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
     }
 
+    /// Model proxy core's typed marker for a route-rule total deadline that
+    /// expired while a backend held the request (the gateway-authored route
+    /// `504`), for direct plugin lifecycle tests.
+    pub fn mark_route_request_timeout_in_dispatch_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_route_request_timeout_exceeded(crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH);
+    }
+
     /// Attach a gateway diagnostic-reference slot to a request context, as
     /// the HTTP frontends do when `FERRUM_DIAGNOSTIC_REFS` is enabled, so
     /// external tests can observe what the rejection and attempt recording
@@ -3293,16 +3302,19 @@ pub mod _test_support {
 
     /// Resolve a live discovery document with optional operator-supplied
     /// `userinfo_endpoint` / `end_session_endpoint` overrides, returning the
-    /// effective optional endpoints as `(userinfo, end_session)`.
+    /// effective optional endpoints as `(userinfo, end_session)`. The
+    /// document's `issuer` must equal `expected_issuer`.
     pub async fn oidc_resolve_discovery_for_test(
         http_client: &crate::plugins::PluginHttpClient,
         discovery_url: &str,
+        expected_issuer: &str,
         explicit_userinfo_endpoint: Option<String>,
         explicit_end_session_endpoint: Option<String>,
     ) -> Result<(Option<String>, Option<String>), String> {
         let resolved = oidc_discovery_seams::resolve_discovery_for_test(
             http_client,
             discovery_url,
+            expected_issuer,
             explicit_userinfo_endpoint,
             explicit_end_session_endpoint,
         )
@@ -5977,6 +5989,20 @@ pub mod _test_support {
         plugin.admit_sealed_redis_hit_for_tests(redis_key, status_code, headers, body)
     }
 
+    /// Seal an authenticated envelope as a writer whose wall clock is
+    /// `seal_offset_seconds` ahead of (positive) or behind (negative) this
+    /// replica and classify it as a Redis lookup would: `"admit"`, `"miss"`
+    /// (authentic but not fresh, never quarantined), or `"quarantine"`.
+    pub fn ai_semantic_cache_redis_hit_verdict_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        redis_key: &str,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+        seal_offset_seconds: i64,
+    ) -> &'static str {
+        plugin.redis_hit_verdict_for_tests(redis_key, headers, body, seal_offset_seconds)
+    }
+
     pub fn ai_semantic_cache_instance_id_for_test(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
     ) -> u64 {
@@ -7155,6 +7181,43 @@ pub mod _test_support {
         connection_id: u64,
     ) -> bool {
         plugin.contains_connection_for_test(connection_id)
+    }
+
+    /// `ws_rate_limiting`'s production hard cap on resident local/fallback keys.
+    pub fn ws_rate_limiting_max_state_entries_for_test() -> usize {
+        crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test()
+    }
+
+    /// Seed one connection's local frame state at `now`, bypassing the cap.
+    pub fn ws_rate_limiting_seed_connection_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) {
+        plugin.seed_connection_at_for_test(connection_id, now);
+    }
+
+    /// Whether the production capacity gate admits `connection_id` at `now`.
+    /// Returns false only for a previously unseen key while the map is full.
+    pub fn ws_rate_limiting_admits_at_production_cap_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.seed_connection_at_with_cap_for_test(
+            connection_id,
+            now,
+            crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test(),
+        )
+    }
+
+    /// Run the production capacity/periodic eviction gate at `now`, as every
+    /// frame does before admission.
+    pub fn ws_rate_limiting_maybe_evict_at_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.maybe_evict_at_for_test(now)
     }
 
     /// Whether two `ws_rate_limiting` instances enforce on the same live state.
@@ -8438,27 +8501,29 @@ pub mod _test_support {
             .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
     }
 
-    /// The request trailers a gRPC dispatch would send, read back from
-    /// owner-scoped request staging exactly as the dispatch paths read them.
+    /// The request trailers a gRPC dispatch would send, read back from the
+    /// owner's typed request staging exactly as the dispatch paths read them.
     ///
     /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
     /// the sort is stable, so repeated values of one name keep wire order.
     pub fn staged_grpc_web_request_trailers(
-        metadata: &crate::plugins::MetadataMap,
+        ctx: &crate::plugins::RequestContext,
     ) -> Option<Vec<(String, String)>> {
-        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
-            let mut entries: Vec<(String, String)> = map
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_string(),
-                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                    )
-                })
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            entries
-        })
+        crate::plugins::grpc_web::staged_request_trailers(&ctx.grpc_web_request_trailers).map(
+            |map| {
+                let mut entries: Vec<(String, String)> = map
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_string(),
+                            String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries
+            },
+        )
     }
 
     pub fn response_content_type(original_ct: &str) -> String {
@@ -9895,6 +9960,45 @@ pub mod _test_support {
             plugins, None, None, headers, body_bytes,
         )
         .await
+    }
+
+    /// Model the H1/H2 buffered request-body hook round trip: clone the live
+    /// context into the compatibility hook context, run the transform chain and
+    /// the final request-body chain on that clone, then hand state back to the
+    /// live context exactly as the dispatcher does (typed terminals and staged
+    /// state first, then the metadata swap). Returns the backend-bound body and
+    /// the final chain's verdict.
+    pub async fn run_buffered_request_body_hook_round_trip_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        headers: &HashMap<String, String>,
+        body: Vec<u8>,
+    ) -> (Vec<u8>, crate::plugins::PluginResult) {
+        let mut hook_ctx = ctx.clone_for_final_request_body_hooks();
+        let transformed = crate::proxy::apply_request_body_plugins_with_context(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            body,
+        )
+        .await;
+        let result = crate::proxy::run_final_request_body_hooks(
+            plugins,
+            Some(&mut hook_ctx),
+            None,
+            headers,
+            &transformed,
+        )
+        .await;
+        ctx.adopt_final_request_body_hook_terminals(&hook_ctx);
+        ctx.adopt_final_request_body_hook_plugin_state(&mut hook_ctx);
+        let request_body = ctx.metadata.remove("request_body");
+        ctx.metadata = hook_ctx.metadata;
+        if let Some(body) = request_body {
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
+        (transformed, result)
     }
 
     pub async fn apply_buffered_request_body_normalization_before_before_proxy_for_test(
@@ -16055,6 +16159,28 @@ pub mod _test_support {
             Err(ChargedDecodeError::TooLarge) => ChargedCodingChainOutcome::TooLarge,
             Err(ChargedDecodeError::CapacityRefused) => ChargedCodingChainOutcome::CapacityRefused,
         }
+    }
+
+    /// Undo a body's `Content-Encoding` exactly as `openapi_validator` does
+    /// before schema validation, charged against an ISOLATED budget.
+    ///
+    /// On success returns the plaintext and the budget's available bytes
+    /// measured WHILE the decoded body is still held (as during inspection).
+    /// `Err(None)` is the decode-capacity refusal (the plugin's `503` capacity
+    /// terminal); `Err(Some(detail))` is the fixed violation detail.
+    pub fn openapi_validator_decode_body_in(
+        probe: &ResponseBufferBudgetProbe,
+        content_encoding: Option<&str>,
+        body: &[u8],
+        max_body_bytes: usize,
+    ) -> Result<(Vec<u8>, usize), Option<String>> {
+        crate::plugins::openapi_validator::decode_body_for_test(
+            content_encoding,
+            body,
+            max_body_bytes,
+            probe.0.handle(),
+            |plaintext| (plaintext.to_vec(), probe.available_bytes()),
+        )
     }
 
     /// The exact backend-request header filter the H3 cross-protocol bridge
