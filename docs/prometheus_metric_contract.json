@@ -334,6 +334,20 @@
     "emission": "when_plugin_enabled"
   },
   {
+    "name": "ferrum_adaptive_concurrency_decisions_total",
+    "type": "counter",
+    "help": "adaptive_concurrency admission decisions other than an ordinary within-limit admit, by proxy and decision.",
+    "labels": [
+      "proxy_id",
+      "decision",
+      "namespace"
+    ],
+    "subsystem": "adaptive_concurrency",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_admin_active_connections",
     "type": "gauge",
     "help": "Admin/management-plane connections currently in flight.",

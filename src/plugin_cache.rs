@@ -31,7 +31,7 @@ use tracing::{error, info, warn};
 
 use crate::adaptive_concurrency::{
     AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
-    AdaptiveConcurrencySnapshot, adaptive_concurrency_scope,
+    AdaptiveConcurrencySnapshot, AdaptiveConcurrencyTotals, adaptive_concurrency_scope,
 };
 use crate::config::types::PluginConfig;
 use crate::plugins::early_route_total::{
@@ -2632,6 +2632,10 @@ impl Plugin for PluginInstanceWrapper {
 ///   could start overlapping high-cost cohorts against one gateway without any
 ///   reload at all (GHSA-wmqm-6mxj-gm9p). Rejecting the composition at cache
 ///   construction is what makes the shared per-identity guard authoritative.
+/// * `otel_tracing` owns one gateway SERVER span per request: its trace
+///   identity, sampling decision, and per-attempt CLIENT span recorder are
+///   single request slots, so a second instance would overwrite the first's
+///   trust/sampling decision and attempt recorder and orphan its spans.
 const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
     ("api_chargeback", "shared /charges registry is exactly-once"),
     (
@@ -2641,6 +2645,10 @@ const EXCLUSIVE_EFFECTIVE_INSTANCE_PLUGINS: &[(&str, &str)] = &[
     (
         "load_testing",
         "one detached run cohort is admitted per policy",
+    ),
+    (
+        "otel_tracing",
+        "one gateway SERVER span and attempt recorder per request",
     ),
 ];
 
@@ -9095,6 +9103,24 @@ impl PluginCache {
         }
 
         result
+    }
+
+    /// Live `adaptive_concurrency` policy count and their tracked targets'
+    /// summed limits and in-flight admissions, for `GET /admin/metrics`.
+    /// Summed at read time from each policy's active tracking space; never
+    /// called on the request path.
+    pub fn adaptive_concurrency_totals(&self) -> (usize, AdaptiveConcurrencyTotals) {
+        let inner = self.inner.load();
+        let mut totals = AdaptiveConcurrencyTotals::default();
+        for instance in inner.adaptive_concurrency_instances.values() {
+            let policy = instance.limiter.totals();
+            totals.tracked_targets = totals
+                .tracked_targets
+                .saturating_add(policy.tracked_targets);
+            totals.limit = totals.limit.saturating_add(policy.limit);
+            totals.in_flight = totals.in_flight.saturating_add(policy.in_flight);
+        }
+        (inner.adaptive_concurrency_instances.len(), totals)
     }
 
     /// Total number of tracked rate-limiter keys across all plugin instances.

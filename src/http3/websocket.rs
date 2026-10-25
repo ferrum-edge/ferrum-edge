@@ -1597,6 +1597,17 @@ pub(crate) async fn handle_h3_websocket(
                     reason,
                     "H3 WS: rejecting upgrade: invalid backend permessage-deflate answer"
                 );
+                // A backend protocol fault, as on the H1/H2 WebSocket path:
+                // settle the admission permit as a failure before it drops so
+                // the adaptive limiter backs off.
+                if let Some(permits) = backend_admission_permits.as_ref() {
+                    permits.record_backend_outcome(BackendAdmissionOutcome {
+                        response_status: 502,
+                        connection_error: false,
+                        error_class: Some(retry::ErrorClass::ProtocolError),
+                        backend_elapsed: backend_admission_start.elapsed(),
+                    });
+                }
                 // Boxed: this future is polled inside `handle_h3_request`'s
                 // stack budget, so the reject ladder must not add inline slots.
                 Box::pin(async {
