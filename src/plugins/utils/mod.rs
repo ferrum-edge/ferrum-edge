@@ -10,6 +10,7 @@ pub mod ai_usage_stream;
 pub mod ambient_cloud_credentials;
 pub mod auth_attempt;
 pub mod auth_flow;
+pub mod aws_refreshing_credentials;
 pub mod aws_sigv4;
 pub mod batching_logger;
 pub mod body_transform;
