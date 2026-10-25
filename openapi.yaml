@@ -28936,7 +28936,12 @@ components:
             assertions), hop-by-hop, framing, representation (content-type,
             content-encoding, content-range), and credential-bearing names
             (the built-in redact_headers list and the shared sensitive-name
-            classifier). Empty disables allow obligations.
+            classifier). Effective-chain admission also refuses a destination
+            an authentication plugin on the same chain owns as a credential
+            location (ASCII case and `_`/`-` folded), and a request whose
+            route's active credential headers include a destination is refused
+            fail closed before the decision call, even under fail_open. Empty
+            disables allow obligations.
         decision_deny_response:
           type: boolean
           default: false

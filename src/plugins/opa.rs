@@ -362,6 +362,32 @@ impl Opa {
         })
     }
 
+    /// The upstream request headers allow obligations may set (lowercase).
+    /// Plugin-cache composition admission compares them against the credential
+    /// locations authentication plugins on the same chain own.
+    pub(crate) fn decision_request_header_destinations(&self) -> &[String] {
+        &self.decision_request_headers
+    }
+
+    /// Whether an obligation destination is one of this route's active
+    /// credential locations (any plugin's `request_headers_to_redact`, built
+    /// with the plugin cache), compared as backends read names. Admission
+    /// refuses the authentication-owned overlaps; this is the per-request
+    /// backstop that also covers credential names non-authentication plugins
+    /// publish.
+    fn obligation_destination_owns_a_credential(&self, ctx: &RequestContext) -> bool {
+        if self.decision_request_headers.is_empty() {
+            return false;
+        }
+        ctx.request_headers_requiring_redaction()
+            .iter()
+            .any(|credential| {
+                self.decision_request_headers
+                    .iter()
+                    .any(|destination| field_names_equivalent_for_backends(destination, credential))
+            })
+    }
+
     fn build_input(
         &self,
         ctx: &RequestContext,
@@ -924,6 +950,21 @@ impl Plugin for Opa {
         // map. A deliberately later request_transformer remains a separate
         // ordered operation (advisories GHSA-j2j6-f9c7-hh85,
         // GHSA-gr4p-3qw3-87r5).
+        // A destination that is also an active credential location would let
+        // the policy replace the client's credential, or be stripped after an
+        // allow by the owner's credential hiding. Refuse it fail closed before
+        // the decision call, independent of `fail_open`: this is an
+        // ownership conflict, not an availability failure.
+        if self.obligation_destination_owns_a_credential(ctx) {
+            warn_sampled!(
+                plugin = "opa",
+                reason = "obligation_credential_conflict",
+                "Refusing request: a decision_request_headers destination is an active credential location on this route"
+            );
+            record_outcome(ctx, "error_fail_closed", "obligation_credential_conflict");
+            return self.reject_fail_closed();
+        }
+
         let query = self.include_query.then(|| canonical_query_for_policy(ctx));
 
         if let Some(query) = query.as_ref()

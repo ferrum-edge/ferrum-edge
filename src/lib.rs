@@ -114,6 +114,16 @@ pub mod _test_support {
         ctx.authorization_connection_closer = Some(closer);
     }
 
+    /// Install a route's credential-header redaction set on a request
+    /// context, as the H1/H2/H3 handlers do from the plugin cache view
+    /// (`opa` obligation-destination conflict tests).
+    pub fn set_request_headers_to_redact_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_headers_to_redact(std::sync::Arc::new(headers));
+    }
+
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =

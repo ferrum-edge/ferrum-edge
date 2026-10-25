@@ -2449,21 +2449,65 @@ async fn opa_deny_obligation_shapes_the_rejection_when_enabled() {
     }
 }
 
+type GatedOpa = (
+    std::net::SocketAddr,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+);
+
+/// A decision service whose FIRST request is acknowledged on the returned
+/// receiver and then held until the returned sender fires. Later connections
+/// are answered at once. Every response closes its connection, so a request
+/// after the release can never be queued behind the held one.
+async fn spawn_gated_opa() -> GatedOpa {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut gate = Some((received_tx, release_rx));
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let held = gate.take();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+
+                const BODY: &[u8] = br#"{"result":true}"#;
+                if read_http11_request_body(&mut socket).await.is_none() {
+                    return;
+                }
+                if let Some((received, release)) = held {
+                    let _ = received.send(());
+                    let _ = release.await;
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    BODY.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(BODY).await;
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    (addr, received_rx, release_tx)
+}
+
 /// opa-claude-7: over the per-instance bound a request takes the failure
-/// posture immediately instead of queueing behind a slow policy service.
+/// posture immediately instead of queueing behind a slow policy service. The
+/// first decision is held by an explicit barrier, so the permit is provably
+/// occupied while the second request runs.
 #[tokio::test]
 async fn opa_concurrency_bulkhead_applies_the_failure_posture() {
     for fail_open in [false, true] {
-        let server = MockServer::start().await;
-        mount_opa_with_delay(&server, Duration::from_millis(1500)).await;
-        let plugin = Arc::new(plugin(
-            &server,
-            json!({
-                "max_concurrent_decisions": 1,
-                "timeout_ms": 5000,
-                "fail_open": fail_open,
-            }),
-        ));
+        let (addr, received, release) = spawn_gated_opa().await;
+        let mut config = base_config(&format!("http://{addr}"));
+        config["max_concurrent_decisions"] = json!(1);
+        config["timeout_ms"] = json!(10_000);
+        config["fail_open"] = json!(fail_open);
+        let plugin = Arc::new(Opa::new(&config, default_client()).expect("valid opa config"));
 
         let in_flight = {
             let plugin = Arc::clone(&plugin);
@@ -2472,47 +2516,38 @@ async fn opa_concurrency_bulkhead_applies_the_failure_posture() {
                 plugin.authorize(&mut ctx).await
             })
         };
-        for _ in 0..80 {
-            if server
-                .received_requests()
-                .await
-                .is_some_and(|requests| !requests.is_empty())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(10), received)
+            .await
+            .expect("the first decision call must reach OPA")
+            .expect("the gate acknowledges the held request");
 
+        // The first call holds the only permit until `release` fires.
         let mut ctx = make_ctx();
         let result = plugin.authorize(&mut ctx).await;
         if fail_open {
             assert_continue(result);
             assert_eq!(
-                ctx.metadata
-                    .get(ferrum_edge::plugins::opa::OPA_DECISION_METADATA_KEY)
-                    .map(String::as_str),
-                Some("error_fail_open")
+                outcome(&ctx),
+                (Some("error_fail_open"), Some("opa_concurrency_limit"))
             );
         } else {
             assert_reject(result, Some(503));
             assert_eq!(
-                ctx.metadata
-                    .get(ferrum_edge::plugins::opa::OPA_DECISION_METADATA_KEY)
-                    .map(String::as_str),
-                Some("error_fail_closed")
+                outcome(&ctx),
+                (Some("error_fail_closed"), Some("opa_concurrency_limit"))
             );
         }
-        assert_eq!(
-            ctx.metadata
-                .get(ferrum_edge::plugins::opa::OPA_REASON_METADATA_KEY)
-                .map(String::as_str),
-            Some("opa_concurrency_limit")
+        assert!(
+            !in_flight.is_finished(),
+            "the held decision is still in flight"
         );
 
+        release.send(()).expect("the held request is still waiting");
         assert_continue(in_flight.await.expect("in-flight decision task"));
         // The permit is released once the decision completes.
         let mut ctx = make_ctx();
         assert_continue(plugin.authorize(&mut ctx).await);
+        assert_eq!(outcome(&ctx), (Some("allow"), Some("policy_allowed")));
     }
 }
 
@@ -2644,4 +2679,74 @@ fn opa_new_config_keys_are_typed_and_closed() {
         config["header_ambiguity_policy"] = json!(policy);
         assert!(Opa::new(&config, default_client()).is_ok(), "{policy}");
     }
+}
+
+/// Per-request backstop: an obligation destination that is one of the route's
+/// active credential locations (any plugin's, any equivalent spelling) is
+/// refused fail closed before the decision call, even under `fail_open`
+/// (PR #6860 review).
+#[tokio::test]
+async fn opa_refuses_an_obligation_destination_that_is_an_active_credential() {
+    for fail_open in [false, true] {
+        let server = MockServer::start().await;
+        mount_opa(
+            &server,
+            200,
+            json!({"result": {"allow": true, "headers": {"x-account": "tenant-A"}}}),
+        )
+        .await;
+        let plugin = plugin(
+            &server,
+            json!({"decision_request_headers": ["x-account"], "fail_open": fail_open}),
+        );
+
+        let mut ctx = make_ctx();
+        ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
+            &mut ctx,
+            vec!["x_account".to_string()],
+        );
+        ctx.headers
+            .insert("x_account".to_string(), "client-credential".to_string());
+        assert_reject(plugin.authorize(&mut ctx).await, Some(503));
+        assert_eq!(
+            outcome(&ctx),
+            (
+                Some("error_fail_closed"),
+                Some("obligation_credential_conflict")
+            )
+        );
+        assert_eq!(
+            ctx.headers.get("x_account").map(String::as_str),
+            Some("client-credential"),
+            "the credential must not be stripped or replaced"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .is_empty(),
+            "the conflict is refused before the decision call"
+        );
+    }
+
+    // An unrelated active credential leaves obligations working.
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-account": "tenant-A"}}}),
+    )
+    .await;
+    let plugin = plugin(&server, json!({"decision_request_headers": ["x-account"]}));
+    let mut ctx = make_ctx();
+    ferrum_edge::_test_support::set_request_headers_to_redact_for_test(
+        &mut ctx,
+        vec!["x-tenant-credential".to_string()],
+    );
+    assert_continue(plugin.authorize(&mut ctx).await);
+    assert_eq!(
+        ctx.headers.get("x-account").map(String::as_str),
+        Some("tenant-A")
+    );
 }

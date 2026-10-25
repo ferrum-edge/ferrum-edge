@@ -566,6 +566,65 @@ fn is_builtin_named(plugin: &Arc<dyn Plugin>, name: &str) -> bool {
     plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())
 }
 
+/// The built-in `opa` instance behind `plugin`, looking through cache wrappers.
+/// Keyed on the concrete type, never the reported name.
+fn builtin_opa(plugin: &(dyn Plugin + 'static)) -> Option<&crate::plugins::opa::Opa> {
+    let any: &dyn std::any::Any = plugin;
+    if let Some(opa) = any.downcast_ref::<crate::plugins::opa::Opa>() {
+        return Some(opa);
+    }
+    match cache_owned_plugin(any) {
+        Some(CacheOwnedPlugin::Wraps(inner)) => builtin_opa(inner),
+        _ => None,
+    }
+}
+
+/// An `opa` allow obligation (`decision_request_headers`) must never author a
+/// header an authentication plugin on the same effective chain owns as a
+/// credential location: the policy would replace the client's credential on
+/// the upstream request, or the owner's `hide_credentials` strip would silently
+/// drop the obligation after OPA recorded an allow. Names are compared as
+/// backends read them (ASCII case, `_` and `-` equivalent). Credential names a
+/// non-authentication plugin publishes are refused per request by OPA itself.
+fn validate_opa_obligations_against_credential_owners(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    for plugin in plugins {
+        let Some(opa) = builtin_opa(plugin.as_ref()) else {
+            continue;
+        };
+        let destinations = opa.decision_request_header_destinations();
+        if destinations.is_empty() {
+            continue;
+        }
+        for owner in plugins.iter().filter(|owner| {
+            owner.is_auth_plugin()
+                && owner
+                    .supported_protocols()
+                    .iter()
+                    .any(|protocol| plugin.supported_protocols().contains(protocol))
+        }) {
+            if let Some(credential) = owner.request_headers_to_redact().iter().find(|credential| {
+                destinations.iter().any(|destination| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(
+                        destination,
+                        credential,
+                    )
+                })
+            }) {
+                return Err(format!(
+                    "opa `decision_request_headers` cannot name {credential:?}, which \
+                     authentication plugin {:?} on the same effective plugin chain owns as a \
+                     credential location; a policy decision must never author or replace a \
+                     credential",
+                    owner.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
 pub(crate) fn validate_plugin_security_composition(
@@ -590,6 +649,8 @@ pub(crate) fn validate_plugin_security_composition(
             plugin.name()
         ));
     }
+
+    validate_opa_obligations_against_credential_owners(plugins)?;
 
     for protocol in ALL_PROXY_PROTOCOLS {
         let identity_soap_count = plugins
@@ -4501,12 +4562,22 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "grpc_web",
     "hmac_auth",
     "jwks_auth",
+    // `jwt_auth` publishes its configured token header as a credential
+    // location, which the `opa` obligation-destination refusal reads; the
+    // candidate view must see it exactly as runtime construction does.
+    // Construction is pure config parsing.
+    "jwt_auth",
     "key_auth",
     "load_testing",
     "mcp_gateway",
     "mesh_route_dispatch",
     "oauth2_introspection",
     "oidc_relying_party",
+    // `opa` with `decision_request_headers` reports request-header mutation
+    // from `authorize`, so the `response_caching` / `request_deduplication`
+    // ordering gates must see the constructed instance in candidate admission
+    // too, not a capability-less shape. Construction is pure config parsing.
+    "opa",
     "otel_tracing",
     "rate_limiting",
     "request_deduplication",
