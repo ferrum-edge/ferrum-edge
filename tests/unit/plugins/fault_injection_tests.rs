@@ -1560,6 +1560,15 @@ mod udp_datagram_faults {
         payload: &'a [u8],
         sink: Option<UdpMetadataSink<'a>>,
     ) -> UdpDatagramContext<'a> {
+        datagram_ctx_with_admission(direction, payload, sink, false)
+    }
+
+    fn datagram_ctx_with_admission<'a>(
+        direction: UdpDatagramDirection,
+        payload: &'a [u8],
+        sink: Option<UdpMetadataSink<'a>>,
+        admission_datagram: bool,
+    ) -> UdpDatagramContext<'a> {
         UdpDatagramContext {
             client_ip: Arc::from("127.0.0.1"),
             proxy_id: Arc::from("udp-proxy"),
@@ -1570,6 +1579,7 @@ mod udp_datagram_faults {
             payload,
             payload_kind: StreamBytesKind::PlaintextWire,
             metadata_sink: sink,
+            admission_datagram,
         }
     }
 
@@ -1713,6 +1723,114 @@ mod udp_datagram_faults {
             "UDP stream connect must not park on delay"
         );
     }
+
+    /// The packet that opens a plain-UDP session already had its abort decided
+    /// by `on_stream_connect`; the setup-path datagram hook must not roll abort
+    /// a second time for it.
+    #[tokio::test]
+    async fn admission_datagram_does_not_reroll_abort() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let metadata = Mutex::new(ferrum_edge::plugins::MetadataMap::default());
+        let ctx = datagram_ctx_with_admission(
+            UdpDatagramDirection::ClientToBackend,
+            b"first",
+            Some(UdpMetadataSink::new(&metadata)),
+            true,
+        );
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+        assert!(metadata.lock().unwrap().is_empty());
+
+        // An established-session datagram still rolls abort.
+        let ctx = datagram_ctx(UdpDatagramDirection::ClientToBackend, b"next", None);
+        assert_eq!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop);
+    }
+
+    /// Delay is owned by the datagram hook, so the opening packet still gets
+    /// its single delay decision (stream connect skips delay for UDP).
+    #[tokio::test]
+    async fn admission_datagram_still_decides_delay() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 },
+            "delay": { "duration_ms": 1, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let metadata = Mutex::new(ferrum_edge::plugins::MetadataMap::default());
+        let ctx = datagram_ctx_with_admission(
+            UdpDatagramDirection::ClientToBackend,
+            b"first",
+            Some(UdpMetadataSink::new(&metadata)),
+            true,
+        );
+        assert_eq!(
+            plugin.on_udp_datagram(&ctx).await,
+            UdpDatagramVerdict::Forward
+        );
+        let map = metadata.lock().unwrap();
+        assert_eq!(map.get("fault_type").unwrap(), "delay");
+        assert_eq!(map.get("fault_delay_ms").unwrap(), "1");
+        assert!(!map.contains_key("fault_abort_status"));
+    }
+
+    /// Replays the plain-UDP setup sequence (stream connect, then the
+    /// first-datagram hook on the same packet) for many fresh sources. The
+    /// share of refused first contacts must track the configured 50%, not the
+    /// compounded `1-(1-p)^2` = 75% two independent abort rolls produce.
+    #[tokio::test]
+    async fn first_udp_datagram_abort_rate_matches_configured_percentage() {
+        use ferrum_edge::config::types::BackendScheme;
+        use ferrum_edge::consumer_index::ConsumerIndex;
+        use ferrum_edge::plugins::StreamConnectionContext;
+
+        const SOURCES: usize = 4_000;
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 50.0 }
+        }))
+        .unwrap();
+        let consumers = Arc::new(ConsumerIndex::new(&[]));
+
+        let mut refused = 0usize;
+        for _ in 0..SOURCES {
+            let mut stream_ctx = StreamConnectionContext::new(
+                "127.0.0.1".to_string(),
+                "127.0.0.1".to_string(),
+                "udp-proxy".to_string(),
+                None,
+                9000,
+                BackendScheme::Udp,
+                Arc::clone(&consumers),
+            );
+            if matches!(
+                plugin.on_stream_connect(&mut stream_ctx).await,
+                PluginResult::Reject { .. }
+            ) {
+                refused += 1;
+                continue;
+            }
+            let ctx = datagram_ctx_with_admission(
+                UdpDatagramDirection::ClientToBackend,
+                b"first",
+                None,
+                true,
+            );
+            if plugin.on_udp_datagram(&ctx).await == UdpDatagramVerdict::Drop {
+                refused += 1;
+            }
+        }
+
+        let rate = refused as f64 / SOURCES as f64;
+        assert!(
+            (0.45..=0.55).contains(&rate),
+            "first-contact refusal rate must match the configured 50%, got {rate}"
+        );
+    }
 }
 
 #[test]
@@ -1742,6 +1860,30 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "`delay.percentage`",
             "must be 0.0-100.0",
         ),
+        (
+            json!({
+                "abort": {"status_code": 503, "percentage": 50.0},
+                "match": {"headers": {token: "1"}}
+            }),
+            "`match.headers`",
+            "valid HTTP header names",
+        ),
+        (
+            json!({
+                "abort": {"status_code": 503, "percentage": 50.0},
+                "match": {"headers": {"x-chaos-test": {token: true}}}
+            }),
+            "`match.headers`",
+            "must be strings",
+        ),
+        (
+            json!({
+                "abort": {"status_code": 503, "percentage": 50.0},
+                "expires_at": token
+            }),
+            "`expires_at`",
+            "RFC 3339",
+        ),
     ] {
         let error = ferrum_edge::plugins::validate_plugin_config("fault_injection", &config)
             .expect_err("invalid configuration must still be rejected");
@@ -1751,5 +1893,256 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
+    }
+}
+
+// === Blast-radius bounds: `match.headers` and `expires_at` ===
+
+mod blast_radius {
+    use super::*;
+    use ferrum_edge::config::types::BackendScheme;
+    use ferrum_edge::consumer_index::ConsumerIndex;
+    use ferrum_edge::plugins::fault_injection::MAX_MATCH_HEADERS;
+    use ferrum_edge::plugins::{
+        StreamBytesKind, StreamConnectionContext, UdpDatagramContext, UdpDatagramDirection,
+        UdpDatagramVerdict,
+    };
+    use std::sync::Arc;
+
+    fn tcp_stream_ctx() -> StreamConnectionContext {
+        StreamConnectionContext::new(
+            "127.0.0.1".to_string(),
+            "127.0.0.1".to_string(),
+            "tcp-proxy".to_string(),
+            None,
+            9000,
+            BackendScheme::Tcp,
+            Arc::new(ConsumerIndex::new(&[])),
+        )
+    }
+
+    fn client_datagram(payload: &[u8]) -> UdpDatagramContext<'_> {
+        UdpDatagramContext {
+            client_ip: Arc::from("127.0.0.1"),
+            proxy_id: Arc::from("udp-proxy"),
+            proxy_name: None,
+            listen_port: 9000,
+            datagram_size: payload.len(),
+            direction: UdpDatagramDirection::ClientToBackend,
+            payload,
+            payload_kind: StreamBytesKind::PlaintextWire,
+            metadata_sink: None,
+            admission_datagram: false,
+        }
+    }
+
+    fn matched_abort_plugin() -> FaultInjectionPlugin {
+        FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 },
+            "match": { "headers": { "X-Chaos-Test": "1", "x-chaos-run": "checkout" } }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn accepts_match_and_expiry_and_null_equivalents() {
+        for config in [
+            json!({
+                "abort": { "status_code": 503, "percentage": 1.0 },
+                "match": { "headers": { "x-chaos-test": "1" } },
+                "expires_at": "2026-11-01T12:30:00Z"
+            }),
+            json!({
+                "delay": { "duration_ms": 1, "percentage": 1.0 },
+                "expires_at": "2026-11-01T12:30:00.250+02:00"
+            }),
+            json!({
+                "abort": { "status_code": 503, "percentage": 1.0 },
+                "match": null,
+                "expires_at": null
+            }),
+        ] {
+            assert!(
+                FaultInjectionPlugin::new(&config).is_ok(),
+                "must accept {config}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_match_and_expiry() {
+        let too_many: serde_json::Map<String, serde_json::Value> = (0..=MAX_MATCH_HEADERS)
+            .map(|i| (format!("x-chaos-{i}"), json!("1")))
+            .collect();
+        for (bad, expected) in [
+            (
+                json!({ "match": "x-chaos-test" }),
+                "`match` must be an object",
+            ),
+            (json!({ "match": {} }), "`match.headers` is required"),
+            (
+                json!({ "match": { "headers": ["x-chaos-test"] } }),
+                "`match.headers` is required",
+            ),
+            (
+                json!({ "match": { "headers": {} } }),
+                "must name at least one header",
+            ),
+            (
+                json!({ "match": { "headers": too_many } }),
+                "must name at most 16 headers",
+            ),
+            (
+                json!({ "match": { "headers": { "x-chaos-test": "1" }, "methods": ["GET"] } }),
+                "unknown `match` field",
+            ),
+            (
+                json!({ "match": { "headers": { "bad header": "1" } } }),
+                "valid HTTP header names",
+            ),
+            (
+                json!({ "match": { "headers": { "x-chaos-test": 1 } } }),
+                "values must be strings",
+            ),
+            (
+                json!({ "match": { "headers": { "x-chaos-test": "a\nb" } } }),
+                "valid HTTP header values",
+            ),
+            (
+                json!({ "match": { "headers": { "x-consumer-username": "alice" } } }),
+                "gateway-asserted headers",
+            ),
+            (
+                json!({ "match": { "headers": { "X-Chaos-Test": "1", "x-chaos-test": "1" } } }),
+                "unique ignoring case",
+            ),
+            (json!({ "expires_at": "tomorrow" }), "RFC 3339"),
+            (json!({ "expires_at": "2026-11-01T12:30:00" }), "RFC 3339"),
+            (json!({ "expires_at": 1_798_000_000 }), "RFC 3339"),
+        ] {
+            let mut config = bad.clone();
+            config["abort"] = json!({ "status_code": 503, "percentage": 1.0 });
+            let err = match FaultInjectionPlugin::new(&config) {
+                Ok(_) => panic!("must reject {bad}"),
+                Err(err) => err,
+            };
+            assert!(err.contains(expected), "{bad}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn matched_request_is_faulted() {
+        let plugin = matched_abort_plugin();
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("x-chaos-test".to_string(), "1".to_string());
+        ctx.headers
+            .insert("x-chaos-run".to_string(), "checkout".to_string());
+
+        match run_before_proxy(&plugin, &mut ctx).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 503),
+            other => panic!("matched request must be aborted, got {other:?}"),
+        }
+        assert_eq!(ctx.metadata.get("fault_type").unwrap(), "abort");
+    }
+
+    #[tokio::test]
+    async fn unmatched_requests_are_never_faulted() {
+        let plugin = matched_abort_plugin();
+        for headers in [
+            vec![],
+            vec![("x-chaos-test", "1")],
+            vec![("x-chaos-test", "0"), ("x-chaos-run", "checkout")],
+            vec![("x-chaos-test", "1"), ("x-chaos-run", "Checkout")],
+        ] {
+            let mut ctx = make_ctx();
+            for (name, value) in &headers {
+                ctx.headers
+                    .insert((*name).to_string(), (*value).to_string());
+            }
+            assert!(
+                matches!(
+                    run_before_proxy(&plugin, &mut ctx).await,
+                    PluginResult::Continue
+                ),
+                "headers {headers:?} must not match"
+            );
+            assert!(
+                !ctx.metadata.contains_key("fault_injected"),
+                "headers {headers:?} must leave no fault metadata"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn header_targeted_instance_never_faults_streams_or_datagrams() {
+        let plugin = matched_abort_plugin();
+
+        let mut stream_ctx = tcp_stream_ctx();
+        assert!(matches!(
+            plugin.on_stream_connect(&mut stream_ctx).await,
+            PluginResult::Continue
+        ));
+        let datagram = client_datagram(b"ping");
+        assert_eq!(
+            plugin.on_udp_datagram(&datagram).await,
+            UdpDatagramVerdict::Forward
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_experiment_is_inert_on_every_hook() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 },
+            "delay": { "duration_ms": 5_000, "percentage": 100.0 },
+            "expires_at": "2000-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let mut ctx = make_ctx();
+        assert!(matches!(
+            run_before_proxy(&plugin, &mut ctx).await,
+            PluginResult::Continue
+        ));
+        assert!(!ctx.metadata.contains_key("fault_injected"));
+
+        let mut stream_ctx = tcp_stream_ctx();
+        assert!(matches!(
+            plugin.on_stream_connect(&mut stream_ctx).await,
+            PluginResult::Continue
+        ));
+        let datagram = client_datagram(b"ping");
+        assert_eq!(
+            plugin.on_udp_datagram(&datagram).await,
+            UdpDatagramVerdict::Forward
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(1_000),
+            "an expired experiment must not delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpired_experiment_still_faults() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0 },
+            "expires_at": "2999-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        assert!(matches!(
+            run_before_proxy(&plugin, &mut ctx).await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ));
+        let mut stream_ctx = tcp_stream_ctx();
+        assert!(matches!(
+            plugin.on_stream_connect(&mut stream_ctx).await,
+            PluginResult::Reject { .. }
+        ));
     }
 }

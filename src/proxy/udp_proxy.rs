@@ -1212,6 +1212,7 @@ fn spawn_session_hook_ingress_worker(
                 session.datagram_payload_kind,
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&session.metadata)),
+                false,
                 ) => allowed,
                 _ = session.hook_ingress_stop_notify.notified() => break,
             };
@@ -2178,6 +2179,7 @@ async fn udp_datagram_allowed(
     payload_kind: StreamBytesKind,
     direction: UdpDatagramDirection,
     metadata_sink: Option<UdpMetadataSink<'_>>,
+    admission_datagram: bool,
 ) -> bool {
     if datagram_plugins.is_empty() {
         return true;
@@ -2193,6 +2195,7 @@ async fn udp_datagram_allowed(
         payload,
         payload_kind,
         metadata_sink,
+        admission_datagram,
     };
     for plugin in datagram_plugins {
         if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
@@ -5040,6 +5043,9 @@ async fn process_new_session_datagram(
                 },
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&first_datagram_metadata)),
+                // This packet opened the session; the `on_stream_connect`
+                // admission chain above already evaluated it.
+                true,
             )
         },
     )
@@ -5228,6 +5234,7 @@ async fn process_new_session_datagram(
                 session.datagram_payload_kind,
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&session.metadata)),
+                false,
             )
             .await
             {
@@ -7889,6 +7896,7 @@ async fn handle_dtls_client_inner(
                     payload: &data,
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_fwd.as_ref())),
+                    admission_datagram: false,
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {
@@ -8087,6 +8095,7 @@ async fn handle_dtls_client_inner(
                     payload: &data,
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_rev.as_ref())),
+                    admission_datagram: false,
                 };
                 match dtls_reply_commit_after_backend_hooks(
                     dgram_plugins_rev.as_ref(),
@@ -9138,6 +9147,7 @@ async fn create_session(
                     payload: send_data,
                     payload_kind: reply_session.datagram_payload_kind,
                     metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
+                    admission_datagram: false,
                 };
                 match udp_reply_commit_after_backend_hooks(
                     reply_datagram_plugins.as_ref(),
@@ -9392,6 +9402,7 @@ async fn create_session(
                                     metadata_sink: Some(UdpMetadataSink::new(
                                         &reply_session.metadata,
                                     )),
+                                    admission_datagram: false,
                                 };
                                 match udp_reply_commit_after_backend_hooks(
                                     reply_datagram_plugins.as_ref(),

@@ -1229,7 +1229,7 @@ Unlike HTTP plugins which return status codes and response bodies, UDP datagram 
 
 ### Direction Handling
 
-`UdpDatagramContext.direction` is `ClientToBackend` for inbound datagrams and `BackendToClient` for backend responses. Built-in `udp_rate_limiting` intentionally shares one per-client window across both directions; plugins that need asymmetric policy should branch on `ctx.direction`.
+`UdpDatagramContext.direction` is `ClientToBackend` for inbound datagrams and `BackendToClient` for backend responses. Built-in `udp_rate_limiting` intentionally shares one per-client window across both directions; plugins that need asymmetric policy should branch on `ctx.direction`. `UdpDatagramContext.admission_datagram` is `true` only for the client→backend datagram that opened a plain-UDP session: the proxy runs `on_stream_connect` and then the datagram hooks on that same packet during session setup, so a plugin that makes one per-event decision in both hooks (for example the `fault_injection` abort roll) must skip it there. It is `false` for every established-session datagram, every backend→client datagram, and DTLS, whose admission is the handshake.
 
 ### Zero-Overhead Opt-In
 

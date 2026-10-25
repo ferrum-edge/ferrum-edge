@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`fault_injection` blast-radius bounds.** Optional `match.headers` (1-16
+  header name → exact value pairs, matched against the client-sent field
+  lines) confines an HTTP-family experiment to marked traffic such as
+  `x-chaos-test: 1`; unmatched requests are never faulted and consume no
+  sampler roll, and a header-targeted instance never faults raw TCP or
+  UDP/DTLS traffic. Optional `expires_at` (RFC 3339) ends an experiment: from
+  that instant every hook is a no-op, so a forgotten fault cannot persist
+  across reloads and restarts. Past timestamps are accepted and leave the
+  instance inert. `match.headers` values are redacted in non-admin config
+  projections.
+
 ### Changed
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
@@ -139,6 +151,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`fault_injection` no longer rolls the UDP abort twice for a new source's
+  first datagram.** Plain-UDP session setup runs `on_stream_connect` and then
+  the datagram hook on the same opening packet, and both rolled
+  `abort.percentage`, so the effective first-contact failure rate was
+  `1-(1-p)^2` (75% at a configured 50%). Stream connect now owns the abort
+  decision for that packet and the first-datagram hook decides only the delay;
+  the proxy marks it with the new `UdpDatagramContext::admission_datagram`
+  field (`false` for established-session, backend→client, and DTLS
+  datagrams).
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
