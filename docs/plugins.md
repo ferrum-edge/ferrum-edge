@@ -6370,6 +6370,11 @@ declared. Every five-byte header and declared payload must be present, later
 frame flags are checked, and the buffer must be consumed exactly. Empty bodies,
 truncated frames, trailing bytes, unsupported flags, and compressed frames
 without a usable encoding fail closed with a gRPC-Web-shaped client error.
+A `grpc-web-text` body must be a total base64 parse (one run, or concatenated
+independently padded flush segments); a body that is not is refused with that
+same 400 before dispatch, even when its raw bytes happen to form valid native
+gRPC frames, so binary framing cannot reach the backend undecoded under a text
+media type.
 **Request trailer frames.** A gRPC-Web client cannot emit HTTP/2 trailers, so it
 encodes end-of-stream metadata as a final `0x80` frame in the request body.
 Ferrum splits that frame off the message frames, validates it, and re-emits it
@@ -6414,7 +6419,13 @@ client as a gRPC-Web terminal frame) before any backend dispatch:
 - The block is bounded at 8 KiB and 64 entries (names 128 bytes, values 4096
   bytes) inside the existing gRPC receive ceiling. The block does not stay body
   bytes — it becomes a header block the backend holds decoded — so it may not
-  consume the whole body budget.
+  consume the whole body budget. The 8 KiB bound is measured on the received
+  block, and dispatch re-checks the staged block against its minimal
+  `name:value` CRLF form, which an admitted block never exceeds, so every
+  admitted block — including one exactly at the bound with no space after its
+  colons — reaches the backend intact. If the staged block can no longer be
+  recovered by the time the final request-body hook runs, the request fails
+  closed with a 400 instead of being dispatched without its trailers.
 
 Duplicate names are preserved as repeated trailer entries. Retries replay the
 same complete request, trailers included. The validated block is staged as
@@ -6450,7 +6461,7 @@ Browser gRPC-Web request streaming and full-duplex transport remain subject to u
 
 **Malformed / non-gRPC backend responses:** When the backend or an intermediary returns a response without a present, numeric `grpc-status` (empty or non-numeric values count as absent), `grpc_web` synthesizes the trailer `grpc-status` from the official HTTP-to-gRPC client mapping ([http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)): `400→INTERNAL(13)`, `401→UNAUTHENTICATED(16)`, `403→PERMISSION_DENIED(7)`, `404→UNIMPLEMENTED(12)`, `429/502/503/504→UNAVAILABLE(14)`, and every other HTTP status (including `200`) → `UNKNOWN(2)`. A valid supplied `grpc-status` remains authoritative and is never overridden by the HTTP status. Existing `grpc-message` / `grpc-status-details-bin` metadata is preserved when present; synthesis does not invent a message. The client-visible HTTP status is left unchanged on this path (Ferrum does not force HTTP `200` for translated gRPC-Web backend responses), so wire observers still see the backend/intermediary HTTP failure while gRPC-Web clients read the mapped code from the body trailer frame. When such a non-`200` response also carries a **non-gRPC entity** — a `text/plain` or `text/html` error document written by the origin or an intermediary, or a body under no gRPC content-type at all — that entity is dropped instead of being framed. gRPC-Web bodies are a frame sequence, so prepending an HTTP error document to the synthesized trailer frame would make the whole response unparseable and put the mapped status out of the client's reach. The client receives a valid terminal-only gRPC-Web body carrying the mapped status, identically on the streaming and buffered paths, in binary and text mode, and on H1/H2/H3. Both conditions are required: an HTTP `200` reply is always forwarded verbatim, and a backend that genuinely framed its error under `application/grpc*` keeps its frames.
 
-**Multiple instances:** A proxy may carry several `grpc_web` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Body translation is not idempotent, so the first effective instance in configured order claims request-scoped ownership and performs content-type rewrite, text-mode request decode, response trailer-frame embedding, and text-mode base64 encode exactly once. Sibling instances keep namespaced per-instance staging and contribute only their `expose_headers` union into `Access-Control-Expose-Headers`. Missing or malformed owner staging fails closed (no second claim, no speculative body rewrite). Reload snapshots remain atomic: an in-flight request sees one plugin generation end-to-end on H1, H2, and H3.
+**Multiple instances:** A proxy may carry several `grpc_web` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Body translation is not idempotent, so the first effective instance in configured order claims request-scoped ownership and performs content-type rewrite, text-mode request decode, response trailer-frame embedding, and text-mode base64 encode exactly once. Sibling instances keep namespaced per-instance staging and contribute only their `expose_headers` union into `Access-Control-Expose-Headers`. Missing or malformed owner staging fails closed: there is no second claim and no speculative body rewrite, the claimed request is still buffered, and the owner's `before_proxy` and final request-body hooks refuse it with a gRPC-Web-shaped 400 (the request-body transform latches that refusal, so restoring the staging later cannot readmit the untranslated body) instead of dispatching an untranslated envelope. Reload snapshots remain atomic: an in-flight request sees one plugin generation end-to-end on H1, H2, and H3.
 
 **Priority:** 260 (runs before `grpc_method_router` at 275)
 **Protocols:** HTTP, gRPC
