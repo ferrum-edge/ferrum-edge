@@ -36274,18 +36274,42 @@ async fn handle_proxy_request_inner(
                 .await
                 {
                     Ok(buffered) => {
-                        if let ClientRequestBody::Buffered(buffered) = &buffered {
-                            store_request_body_metadata(
-                                &mut ctx,
-                                &buffered.body,
-                                authorize_body_requirements.needs_text,
-                                authorize_body_requirements.needs_bytes,
-                                authorize_body_requirements.needs_digests,
-                            );
-                            ctx.bytes_sent_observed.fetch_max(
-                                buffered.body.len() as u64,
-                                std::sync::atomic::Ordering::Release,
-                            );
+                        match &buffered {
+                            ClientRequestBody::Buffered(buffered) => {
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    &buffered.body,
+                                    authorize_body_requirements.needs_text,
+                                    authorize_body_requirements.needs_bytes,
+                                    authorize_body_requirements.needs_digests,
+                                );
+                                ctx.bytes_sent_observed.fetch_max(
+                                    buffered.body.len() as u64,
+                                    std::sync::atomic::Ordering::Release,
+                                );
+                            }
+                            // The no-collection fast path hands the request
+                            // back unread only once the transport has proven
+                            // the body empty (no CL/TE and END_STREAM).
+                            // Publish the same empty views a `Content-Length:
+                            // 0` collect and the native H3 drain publish, so
+                            // authorize-phase body policy (`opa`
+                            // `include_body`) sees one representation of an
+                            // empty upload on every frontend protocol. An
+                            // unread stream that may still carry DATA never
+                            // reaches this arm.
+                            ClientRequestBody::Streaming(request)
+                                if hyper::body::Body::is_end_stream(request.body()) =>
+                            {
+                                store_request_body_metadata(
+                                    &mut ctx,
+                                    &[],
+                                    authorize_body_requirements.needs_text,
+                                    authorize_body_requirements.needs_bytes,
+                                    authorize_body_requirements.needs_digests,
+                                );
+                            }
+                            ClientRequestBody::Streaming(_) => {}
                         }
                         buffered
                     }

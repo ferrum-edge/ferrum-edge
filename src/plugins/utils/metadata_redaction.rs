@@ -457,6 +457,8 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "mesh_request_auth.permissive_missing_token",
     "mirror_error",
     "namespace",
+    "opa.decision",
+    "opa.reason",
     "openapi_validator.action",
     "openapi_validator.matched_operation",
     "openapi_validator.mode",

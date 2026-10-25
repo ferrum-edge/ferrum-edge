@@ -5211,6 +5211,131 @@ fn streaming_ai_federation_deduplication_gate_fires_in_candidate_and_runtime() {
         .expect("buffered ai_federation must still compose with request_deduplication at runtime");
 }
 
+/// `opa` allow obligations (`decision_request_headers`) make it a request-header
+/// mutator. An untriggered instance must therefore be constructed in candidate
+/// admission, so a late OPA mutator ordered after `response_caching` is refused
+/// before an admin write is stored, exactly as runtime cache construction
+/// refuses it (PR #6860 review). Without obligations, or at OPA's default
+/// priority, both boundaries admit the composition.
+#[test]
+fn opa_obligation_header_mutation_gates_response_caching_in_candidate_and_runtime() {
+    let cache = || {
+        make_plugin_config(
+            "cache",
+            "response_caching",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+    let opa = |obligations: bool, priority_override: Option<u16>| {
+        let mut config = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow"
+        });
+        if obligations {
+            config["decision_request_headers"] = json!(["x-tenant"]);
+        }
+        let mut plugin =
+            make_plugin_config_with_json("opa", "opa", config, PluginScope::Proxy, Some("p1"));
+        plugin.priority_override = priority_override;
+        plugin
+    };
+    let config_with = |opa_config: PluginConfig| {
+        make_config(
+            vec![make_proxy("p1", "/api", vec!["cache", "opa"])],
+            vec![cache(), opa_config],
+        )
+    };
+
+    let late_mutator = config_with(opa(true, Some(4000)));
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&late_mutator, None)
+            .expect_err("candidate must reject a late OPA header mutator after response_caching");
+    assert!(
+        candidate_error.contains("must run before every response_caching"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&late_mutator)
+        .err()
+        .expect("runtime cache must repeat the fail-closed ordering refusal");
+    assert!(
+        runtime_error.contains("must run before every response_caching"),
+        "{runtime_error}"
+    );
+
+    for admitted in [
+        config_with(opa(false, Some(4000))),
+        config_with(opa(true, None)),
+    ] {
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&admitted, None)
+            .expect("candidate must admit OPA without a late header mutation");
+        PluginCache::new(&admitted).expect("runtime must admit OPA without a late header mutation");
+    }
+}
+
+/// An `opa` obligation destination that an authentication plugin on the same
+/// chain owns as a credential location is refused on both admission
+/// boundaries, whatever the owner's `hide_credentials` setting and whichever
+/// equivalent spelling (ASCII case, `_` or `-`) names it (PR #6860 review).
+#[test]
+fn opa_obligation_destination_cannot_be_an_active_credential_location() {
+    let key_auth = |hide_credentials: bool| {
+        make_plugin_config_with_json(
+            "keyauth",
+            "key_auth",
+            json!({"key_location": "header:X-Account", "hide_credentials": hide_credentials}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+    let opa = |destination: &str| {
+        make_plugin_config_with_json(
+            "opa",
+            "opa",
+            json!({
+                "opa_host": "http://127.0.0.1:8181",
+                "policy_path": "ferrum/authz/allow",
+                "decision_request_headers": [destination]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+    let config_with = |hide_credentials: bool, destination: &str| {
+        make_config(
+            vec![make_proxy("p1", "/api", vec!["keyauth", "opa"])],
+            vec![key_auth(hide_credentials), opa(destination)],
+        )
+    };
+
+    for hide_credentials in [true, false] {
+        for destination in ["x-account", "X-Account", "x_account"] {
+            let config = config_with(hide_credentials, destination);
+            let candidate_error =
+                validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                    .expect_err("candidate must refuse a credential-owned obligation destination");
+            assert!(
+                candidate_error.contains("decision_request_headers"),
+                "{destination} hide={hide_credentials}: {candidate_error}"
+            );
+            let runtime_error = PluginCache::new(&config)
+                .err()
+                .expect("runtime cache must repeat the refusal");
+            assert!(
+                runtime_error.contains("decision_request_headers"),
+                "{destination} hide={hide_credentials}: {runtime_error}"
+            );
+        }
+
+        let unrelated = config_with(hide_credentials, "x-tenant");
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&unrelated, None)
+            .expect("an unrelated obligation destination composes with key_auth");
+        PluginCache::new(&unrelated)
+            .expect("an unrelated obligation destination composes with key_auth at runtime");
+    }
+}
+
 /// `ai_semantic_cache` answers a HIT from its final-request-body hook and the
 /// final-body chain stops at the first `RejectBinary`, so a fail-closed
 /// final-request-body policy ordered at or after the cache — by a

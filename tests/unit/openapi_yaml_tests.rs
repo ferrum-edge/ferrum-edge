@@ -18832,6 +18832,56 @@ fn opa_schema_and_constructor_admit_the_same_configs() {
             base(json!({"decision_pointr": ["result"]})),
             false,
         ),
+        (
+            "delegated header ambiguity",
+            base(json!({"header_ambiguity_policy": "delegate"})),
+            true,
+        ),
+        (
+            "unknown header ambiguity policy",
+            base(json!({"header_ambiguity_policy": "allow"})),
+            false,
+        ),
+        (
+            "bounded decision concurrency",
+            base(json!({"max_concurrent_decisions": 64})),
+            true,
+        ),
+        (
+            "zero decision concurrency",
+            base(json!({"max_concurrent_decisions": 0})),
+            false,
+        ),
+        (
+            "decision concurrency above the cap",
+            base(json!({"max_concurrent_decisions": 1_000_001})),
+            false,
+        ),
+        (
+            "ordinary obligation destination",
+            base(json!({"decision_request_headers": ["x-tenant"]})),
+            true,
+        ),
+        (
+            "invalid obligation destination name",
+            base(json!({"decision_request_headers": ["Bad Header"]})),
+            false,
+        ),
+        (
+            "non-array obligation destinations",
+            base(json!({"decision_request_headers": "x-tenant"})),
+            false,
+        ),
+        (
+            "deny obligations enabled",
+            base(json!({"decision_deny_response": true})),
+            true,
+        ),
+        (
+            "non-boolean deny obligations",
+            base(json!({"decision_deny_response": "yes"})),
+            false,
+        ),
     ];
 
     for (label, config, expected_valid) in cases {
