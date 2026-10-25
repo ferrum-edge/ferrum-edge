@@ -4893,6 +4893,101 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
     );
 }
 
+/// Plugin-review parity: the provider timeout ceiling, the optional `weight`,
+/// and `${FERRUM_PLUGIN_SECRET_<NAME>}` credential references are published
+/// exactly as the constructor enforces them.
+#[test]
+fn ai_federation_schema_publishes_timeout_ceiling_weight_and_secret_references() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiFederationConfig")
+        .expect("missing AiFederationConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiFederationConfig schema compiles");
+    let provider_properties = schema
+        .pointer("/properties/providers/items/properties")
+        .expect("missing provider properties");
+    for field in ["connect_timeout_seconds", "read_timeout_seconds"] {
+        assert_eq!(provider_properties[field]["minimum"], 1, "{field}");
+        assert_eq!(provider_properties[field]["maximum"], 86_400, "{field}");
+    }
+    assert_eq!(provider_properties["weight"]["minimum"], 1);
+    assert_eq!(provider_properties["weight"]["maximum"], 1000);
+    for field in [
+        "api_key",
+        "google_service_account_json",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    ] {
+        let description = provider_properties[field]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            description.contains("FERRUM_PLUGIN_SECRET_"),
+            "{field} must document plugin-secret references"
+        );
+    }
+
+    let provider = |extra: serde_json::Value| {
+        let mut provider = json!({"name": "p", "provider_type": "openai", "api_key": "test"});
+        for (key, value) in extra.as_object().expect("object") {
+            provider[key] = value.clone();
+        }
+        json!({"providers": [provider]})
+    };
+    for accepted in [
+        json!({"weight": 1}),
+        json!({"weight": 1000}),
+        json!({"read_timeout_seconds": 86_400, "connect_timeout_seconds": 86_400}),
+    ] {
+        let config = provider(accepted.clone());
+        assert!(
+            validator.validate(&config).is_ok(),
+            "schema rejected {accepted}"
+        );
+        assert!(
+            ferrum_edge::plugins::ai_federation::AiFederation::new(
+                &config,
+                ferrum_edge::plugins::PluginHttpClient::default(),
+            )
+            .is_ok(),
+            "constructor rejected {accepted}"
+        );
+    }
+    // A reference is an ordinary non-empty string to the schema; resolution
+    // (and refusal outside the namespace) happens at construction.
+    assert!(
+        validator
+            .validate(&provider(
+                json!({"api_key": "${FERRUM_PLUGIN_SECRET_OPENAI_KEY}"})
+            ))
+            .is_ok()
+    );
+    for rejected in [
+        json!({"weight": 0}),
+        json!({"weight": 1001}),
+        json!({"read_timeout_seconds": 86_401}),
+        json!({"connect_timeout_seconds": 86_401}),
+    ] {
+        let config = provider(rejected.clone());
+        assert!(
+            validator.validate(&config).is_err(),
+            "schema accepted {rejected}"
+        );
+        assert!(
+            ferrum_edge::plugins::ai_federation::AiFederation::new(
+                &config,
+                ferrum_edge::plugins::PluginHttpClient::default(),
+            )
+            .is_err(),
+            "constructor accepted {rejected}"
+        );
+    }
+}
+
 #[test]
 fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
     use ferrum_edge::plugins::ai_stream_router::{

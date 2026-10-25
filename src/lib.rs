@@ -1302,6 +1302,15 @@ pub mod _test_support {
         ctx.record_backend_dispatch_outcome(error_class, request_on_wire);
     }
 
+    /// Model proxy core's typed marker for a route-rule total deadline that
+    /// expired while a backend held the request (the gateway-authored route
+    /// `504`), for direct plugin lifecycle tests.
+    pub fn mark_route_request_timeout_in_dispatch_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) {
+        ctx.mark_route_request_timeout_exceeded(crate::proxy::ROUTE_REQUEST_TIMEOUT_PHASE_DISPATCH);
+    }
+
     /// Attach a gateway diagnostic-reference slot to a request context, as
     /// the HTTP frontends do when `FERRUM_DIAGNOSTIC_REFS` is enabled, so
     /// external tests can observe what the rejection and attempt recording
