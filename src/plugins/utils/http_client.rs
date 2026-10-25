@@ -326,6 +326,11 @@ pub struct PluginHttpClient {
     /// `max_decompressed_request_size`. `0` means unlimited at the wire layer;
     /// the compression hard maximum still applies.
     max_request_body_size_bytes: usize,
+    /// Process-wide response body limit (`FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`)
+    /// on serving paths, so compression construction can state when that limit
+    /// puts it in its length-gated mode. `None` on clients that never resolved
+    /// it (validation and library paths), which stay silent.
+    max_response_body_size_bytes: Option<usize>,
 }
 
 impl std::fmt::Debug for PluginHttpClient {
@@ -355,6 +360,10 @@ impl std::fmt::Debug for PluginHttpClient {
             .field(
                 "max_request_body_size_bytes",
                 &self.max_request_body_size_bytes,
+            )
+            .field(
+                "max_response_body_size_bytes",
+                &self.max_response_body_size_bytes,
             )
             .finish()
     }
@@ -1486,6 +1495,7 @@ impl PluginHttpClient {
             compression_gzip_enabled: true,
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
+            max_response_body_size_bytes: None,
         }
     }
 
@@ -1560,6 +1570,7 @@ impl PluginHttpClient {
             compression_gzip_enabled: true,
             compression_brotli_enabled: true,
             max_request_body_size_bytes: 0,
+            max_response_body_size_bytes: None,
         }
     }
 
@@ -1643,6 +1654,14 @@ impl PluginHttpClient {
         self
     }
 
+    /// Carry the process-wide response body limit into compression plugin
+    /// construction (`0` means unlimited), so it can warn when that limit
+    /// length-gates response compression.
+    pub(crate) fn with_max_response_body_size_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_response_body_size_bytes = Some(max_bytes);
+        self
+    }
+
     /// Apply the typed process compression admission policy (codec gates and
     /// the gateway request-body ceiling).
     ///
@@ -1672,6 +1691,10 @@ impl PluginHttpClient {
 
     pub(crate) fn max_request_body_size_bytes(&self) -> usize {
         self.max_request_body_size_bytes
+    }
+
+    pub(crate) fn max_response_body_size_bytes(&self) -> Option<usize> {
+        self.max_response_body_size_bytes
     }
 
     /// Follow the gateway's live CRL list on plugin egress (issue #6621).

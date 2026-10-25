@@ -15640,6 +15640,15 @@ pub mod _test_support {
     pub const RESPONSE_DECODE_BROTLI_SCRATCH_BYTES: usize =
         crate::plugins::charged_decode::BROTLI_DECODER_SCRATCH_BYTES;
 
+    /// Conservative heap ceiling the charged content-coding chain reserves for
+    /// one `zstd` decode pass before it constructs the decoder.
+    pub const CHARGED_DECODE_ZSTD_SCRATCH_BYTES: usize =
+        crate::plugins::charged_decode::ZSTD_DECODER_SCRATCH_BYTES;
+
+    /// The `zstd` window cap (as a base-2 log) the charged chain enforces.
+    pub const CHARGED_DECODE_ZSTD_WINDOW_LOG_MAX: u32 =
+        crate::plugins::charged_decode::ZSTD_WINDOW_LOG_MAX;
+
     /// The output-buffer capacity the production decode ends up holding for a
     /// decoded body of `decoded_len` bytes under `limit`, computed with the
     /// production growth rule.

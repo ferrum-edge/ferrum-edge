@@ -9430,6 +9430,14 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         );
     }
 
+    let content_type_rules = |count: usize| -> Vec<String> {
+        (0..count)
+            .map(|index| format!("application/x-{index}"))
+            .collect()
+    };
+    let over_cap_content_types = content_type_rules(65);
+    let at_cap_content_types = content_type_rules(64);
+
     // Constructor admission is the source of truth; the schema previously
     // ACCEPTED each of these while `validate` exited 1 (issue #5095), and
     // accepted content-type rules the matcher can never equal (issue #5096).
@@ -9446,6 +9454,16 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         json!({"max_decompressed_request_size": 0}),
         json!({"max_decompressed_request_size": 33_554_433}),
         json!({"brotli_quality": 12}),
+        json!({"zstd_level": 0}),
+        json!({"zstd_level": 20}),
+        json!({"weaken_strong_etag": "yes"}),
+        json!({"algorithms": ["gzip", "gzip"]}),
+        json!({"algorithms": ["lz4"]}),
+        json!({"content_types": ["*/*"]}),
+        json!({"content_types": ["*/json"]}),
+        json!({"content_types": ["application/vnd.*+json"]}),
+        json!({"content_types": ["text/html", "text/html"]}),
+        json!({ "content_types": over_cap_content_types }),
     ] {
         assert_component_validity(&spec, "CompressionConfig", &config, false);
         assert!(
@@ -9478,6 +9496,8 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         "brotli_quality",
         "remove_accept_encoding",
         "decompress_request",
+        "zstd_level",
+        "weaken_strong_etag",
     ] {
         let mut object = serde_json::Map::new();
         object.insert(field.to_string(), serde_json::Value::Null);
@@ -9497,6 +9517,13 @@ async fn compression_schema_matches_strict_runtime_config_contract() {
         json!({"max_decompressed_request_size": 1}),
         json!({"max_decompressed_request_size": 33_554_432}),
         json!({"brotli_quality": 11}),
+        json!({"algorithms": ["zstd", "gzip", "br"]}),
+        json!({"algorithms": ["brotli"]}),
+        json!({"zstd_level": 1}),
+        json!({"zstd_level": 19}),
+        json!({"weaken_strong_etag": true}),
+        json!({"content_types": ["text/*", "application/json"]}),
+        json!({ "content_types": at_cap_content_types }),
     ] {
         assert_component_validity(&spec, "CompressionConfig", &config, true);
         assert!(

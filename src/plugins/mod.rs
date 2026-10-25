@@ -13529,6 +13529,12 @@ pub fn create_plugin_with_http_client_and_config_id(
                 brotli_enabled,
                 max_request_body_size_bytes,
             )?;
+            // Serving clients carry the process response limit; validation-only
+            // clients do not, and stay silent rather than warning about a
+            // limit they never resolved.
+            if let Some(max_response_body_size_bytes) = http_client.max_response_body_size_bytes() {
+                compression::warn_if_response_limit_gates_compression(max_response_body_size_bytes);
+            }
             Ok(Some(Arc::new(plugin)))
         }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
