@@ -120,6 +120,11 @@ pub struct MeshAuthz {
     /// Whether any bound provider declares `headersToDownstreamOnAllow`. Arms
     /// the `after_proxy` / WebSocket handshake response hooks.
     ext_authz_mutates_downstream: bool,
+    /// Body-inspecting CUSTOM rules that ONLY the NodeWaypoint capture
+    /// inventory carries, each kept inside its policy (scope + those rules).
+    /// Unlike `body_inspecting_custom_rules`, these request a prebuffer only
+    /// when the request's destination or source scope selects the policy.
+    capture_body_inspecting_custom_policies: Vec<MeshPolicy>,
     /// Unfiltered policy superset used for Ambient UDP CONNECTs carrying
     /// validated per-pod evidence and for ServiceWaypoint inbound relays whose
     /// destination workload differs from the waypoint identity. Ordinary
@@ -148,6 +153,10 @@ pub struct MeshAuthz {
     destination_same_namespace_backend_alias_by_backend:
         HashMap<NamespacedDestinationBackendKey, DestinationBackendKey>,
     destination_service_backend_hosts: HashSet<String>,
+    /// Capture-destination scopes for the synthesized inbound HBONE relay
+    /// (NodeWaypoint per-pod scoping only); see
+    /// [`NodeWaypointCaptureDestinationScopes`].
+    node_waypoint_capture_destination_scopes: NodeWaypointCaptureDestinationScopes,
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     destination_route_upstreams_requiring_scope: HashSet<String>,
     has_route_upstream_metadata: bool,
@@ -188,6 +197,13 @@ pub struct MeshAuthz {
     /// through to mesh-wide evaluation. Only meaningful when
     /// `per_pod_policy_scoping` is true.
     has_scoped_policies: bool,
+    /// Whether the NodeWaypoint capture-destination AuthorizationPolicy
+    /// inventory carries an enforcing namespace/selector-scoped policy. Those
+    /// policies select capture DESTINATIONS, so they extend the missing-scope
+    /// refusal only for the synthesized inbound HBONE relay, whose missing
+    /// scope is a destination scope; source-scoped paths keep
+    /// `has_scoped_policies`.
+    has_scoped_capture_destination_policies: bool,
     /// Precomputed set of Istio attribute keys referenced by `when:`
     /// conditions across the loaded policies. The request hot path only
     /// materializes attributes named here, so a policy set with no `when:`
@@ -394,6 +410,131 @@ enum NodeWaypointAuthorizedDestination {
         key: DestinationBackendKey,
         aliases: Vec<DestinationBackendKey>,
     },
+}
+
+/// Exact-destination policy scopes for the NodeWaypoint capture-destination
+/// inventory (`MeshSlice.node_waypoint_capture_destinations`).
+///
+/// The ordinary destination index is built from the subscription-namespace
+/// `services` / `workloads` views, so it cannot name an enrolled pod in another
+/// namespace — yet the inbound HBONE relay guard terminates for exactly those
+/// pods, and their own AuthorizationPolicy rides the capture inventory. This
+/// index lets the synthesized inbound relay evaluate that destination's
+/// policies against the destination's own scope instead of having no scope at
+/// all. It is a SEPARATE view: it never feeds routing, known destinations, or
+/// the ordinary service-derived index.
+///
+/// Resolution: the address is matched canonically (parsed and
+/// `IpAddr::to_canonical`, the same rule the inbound relay ownership guard and
+/// the transparent capture resolver apply; a non-IP declared name is matched
+/// ASCII-case-insensitively, as the relay guard matches it), a workload that
+/// declares ports
+/// admits only those ports (one that declares none does not constrain its
+/// address), and two matching records with divergent scopes resolve to NOTHING
+/// (fail closed) rather than picking whose policy applies. For the relay, an
+/// address this inventory names is AUTHORITATIVE: an undeclared port or an
+/// ambiguity refuses the scope instead of falling back to the ordinary
+/// service-derived index, whose record for the same address need not belong to
+/// the destination the relay guard admitted. Built once per plugin generation;
+/// lookup is one parse plus one hash probe over a tiny per-address list.
+#[derive(Default)]
+struct NodeWaypointCaptureDestinationScopes {
+    by_address: HashMap<std::net::IpAddr, Vec<NodeWaypointCaptureDestinationScope>>,
+    /// Non-IP declared addresses (hostnames, zone-qualified literals), keyed
+    /// lowercase exactly as the relay ownership guard declares them
+    /// (`MeshInboundRelayHost::Name`) and matched ASCII-case-insensitively as
+    /// it does, so a relay the guard admits under a capture-declared name is
+    /// scoped from the capture inventory too, never from an ordinary record.
+    by_name: HashMap<String, Vec<NodeWaypointCaptureDestinationScope>>,
+}
+
+struct NodeWaypointCaptureDestinationScope {
+    ports: Vec<u16>,
+    scope: crate::modes::mesh::runtime::PolicyScopeCache,
+}
+
+impl NodeWaypointCaptureDestinationScopes {
+    fn from_workloads(workloads: &[crate::modes::mesh::config::Workload]) -> Self {
+        let mut by_address: HashMap<std::net::IpAddr, Vec<NodeWaypointCaptureDestinationScope>> =
+            HashMap::new();
+        let mut by_name: HashMap<String, Vec<NodeWaypointCaptureDestinationScope>> = HashMap::new();
+        for workload in workloads {
+            let scope = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+            let ports: Vec<u16> = workload.ports.iter().map(|port| port.port).collect();
+            for address in &workload.addresses {
+                let entry = NodeWaypointCaptureDestinationScope {
+                    ports: ports.clone(),
+                    scope: scope.clone(),
+                };
+                match address.trim().parse::<std::net::IpAddr>() {
+                    Ok(address) => by_address
+                        .entry(address.to_canonical())
+                        .or_default()
+                        .push(entry),
+                    Err(_) => {
+                        let name = address.trim();
+                        if !name.is_empty() {
+                            by_name
+                                .entry(name.to_ascii_lowercase())
+                                .or_default()
+                                .push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            by_address,
+            by_name,
+        }
+    }
+
+    fn lookup(&self, host: &str, port: u16) -> NodeWaypointCaptureScopeLookup<'_> {
+        let entries = match host.trim().parse::<std::net::IpAddr>() {
+            Ok(address) => self.by_address.get(&address.to_canonical()),
+            // Name hosts are rare (pod relays use IP literals); only a name with
+            // uppercase letters pays for a lowercased copy.
+            Err(_) if host.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+                self.by_name.get(&host.to_ascii_lowercase())
+            }
+            Err(_) => self.by_name.get(host),
+        };
+        let Some(entries) = entries else {
+            return NodeWaypointCaptureScopeLookup::NotCaptured;
+        };
+        if port == 0 {
+            return NodeWaypointCaptureScopeLookup::Refused;
+        }
+        let mut resolved: Option<&crate::modes::mesh::runtime::PolicyScopeCache> = None;
+        for entry in entries {
+            if !entry.ports.is_empty() && !entry.ports.contains(&port) {
+                continue;
+            }
+            match resolved {
+                Some(existing) if existing != &entry.scope => {
+                    return NodeWaypointCaptureScopeLookup::Refused;
+                }
+                Some(_) => {}
+                None => resolved = Some(&entry.scope),
+            }
+        }
+        match resolved {
+            Some(scope) => NodeWaypointCaptureScopeLookup::Resolved(scope),
+            None => NodeWaypointCaptureScopeLookup::Refused,
+        }
+    }
+}
+
+/// Outcome of a capture-destination scope lookup.
+enum NodeWaypointCaptureScopeLookup<'a> {
+    /// The inventory does not name this address or hostname; the ordinary
+    /// destination index decides.
+    NotCaptured,
+    /// The inventory names this address and resolves exactly one scope.
+    Resolved(&'a crate::modes::mesh::runtime::PolicyScopeCache),
+    /// The inventory names this address but cannot resolve one scope for it
+    /// (undeclared port, divergent records): no scope, never a fallback.
+    Refused,
 }
 
 struct DestinationScopeMatch<'a> {
@@ -1857,11 +1998,45 @@ impl MeshAuthz {
             slice.labels_ambiguous = false;
         }
 
+        let per_pod_policy_scoping = parse_scoping_flag(config, "per_pod_policy_scoping")?;
+        // NodeWaypoint: a captured connection is authorized against the
+        // DESTINATION pod's exact policy scope, and that pod may live in a
+        // namespace other than this waypoint's subscription namespace. Its own
+        // AuthorizationPolicy therefore cannot be in the namespace-narrowed
+        // `mesh_policies`; the slice carries it on the dedicated capture
+        // inventory instead. Union the two BEFORE any validation or index
+        // below is computed, so the capture policies are validated and
+        // contribute their `when:` keys and CUSTOM providers. The per-request
+        // `policy_applies_to_pod` filter keeps each one confined to the scopes
+        // it actually selects. Outside per-pod scoping the inventory is unused.
+        //
+        // The missing-scope census is split by WHICH scope is missing (see
+        // `has_scoped_capture_destination_policies`): the capture inventory
+        // only governs connections to its own destinations, so it makes a
+        // missing DESTINATION scope on the synthesized inbound relay fail
+        // closed, but it does not turn an unresolved SOURCE scope (UDP/DTLS
+        // sessions, outbound capture) into a refusal that no supplied scope
+        // could ever satisfy.
+        let has_scoped_ordinary_policies =
+            per_pod_policy_scoping && policies_enforce_scoped_rules(&slice.mesh_policies);
+        let has_scoped_capture_destination_policies = per_pod_policy_scoping
+            && policies_enforce_scoped_rules(&slice.node_waypoint_capture_mesh_policies);
+        // The merge APPENDS capture-only policies and never reorders; later
+        // normalization is in place, and the construction-time `retain` (which
+        // can shrink the list) only runs without per-pod scoping, i.e. when
+        // nothing was appended. So the last `capture_only_policy_count` entries
+        // are exactly the capture-only policies.
+        let capture_only_policy_count = if per_pod_policy_scoping {
+            let before = slice.mesh_policies.len();
+            merge_node_waypoint_capture_mesh_policies(&mut slice);
+            slice.mesh_policies.len() - before
+        } else {
+            0
+        };
+
         validate_policy_ip_inputs(&slice.mesh_policies)?;
         validate_policy_request_matchers(&slice.mesh_policies)?;
         validate_waypoint_target_ref_evidence(&slice)?;
-
-        let per_pod_policy_scoping = parse_scoping_flag(config, "per_pod_policy_scoping")?;
         let ambient_udp_source_scoping = parse_scoping_flag(config, "ambient_udp_source_scoping")?;
         let mut relay_policy_superset = if ambient_udp_source_scoping {
             slice.mesh_policies.clone()
@@ -1924,21 +2099,21 @@ impl MeshAuthz {
         // Whether any namespace/selector-scoped (non-mesh-wide) policy is loaded.
         // The stream path fails closed on a missing per-pod scope only when such
         // policies exist; otherwise mesh-wide-only evaluation is complete.
-        let has_scoped_policies = per_pod_policy_scoping
-            && slice.mesh_policies.iter().any(|policy| {
-                // Only ENFORCING scoped policies justify failing closed on a
-                // missing per-pod scope. A scoped `Audit` rule only records
-                // `mesh_authz.audit_policy` and returns `Continue`, so an
-                // audit-only scoped policy must not 403 the request — let it
-                // fall through like any other non-enforcing case. Istio
-                // empty-rule ALLOW (allow-nothing) is translated to a
-                // never-matching `Allow` rule, so it is still counted here.
-                !matches!(policy.scope, PolicyScope::MeshWide)
-                    && policy.rules.iter().any(|rule| rule.action.is_enforcing())
-            });
+        // Computed BEFORE the capture merge above, over the ordinary set only;
+        // `has_scoped_capture_destination_policies` covers the capture inventory.
+        let has_scoped_policies = has_scoped_ordinary_policies;
         let service_waypoint_destination_scope_required =
             ambient_udp_source_scoping && slice.waypoint_name.is_some();
         let mut has_route_upstream_metadata = false;
+        // Only NodeWaypoint per-pod scoping consults the capture-destination
+        // scopes (for the synthesized inbound HBONE relay).
+        let node_waypoint_capture_destination_scopes = if per_pod_policy_scoping {
+            NodeWaypointCaptureDestinationScopes::from_workloads(
+                &slice.node_waypoint_capture_destinations,
+            )
+        } else {
+            NodeWaypointCaptureDestinationScopes::default()
+        };
         let destination_policy_scope_index =
             if per_pod_policy_scoping || service_waypoint_destination_scope_required {
                 let cluster_domains = normalized_cluster_domains(config);
@@ -2030,10 +2205,20 @@ impl MeshAuthz {
         // here so the per-request buffering predicate is a bounded scan of the
         // (usually empty) body-inspecting subset rather than a scan of every
         // policy.
+        //
+        // Capture-ONLY policies are kept apart, WITH their policy scope: the
+        // prebuffer (and its `maxRequestBytes` 413) runs before `authorize`, so
+        // a foreign destination's CUSTOM rule must not buffer or cap a request
+        // to a workload it cannot select. See
+        // `capture_custom_rules_may_apply_to_request`.
+        let ordinary_policy_count = slice
+            .mesh_policies
+            .len()
+            .saturating_sub(capture_only_policy_count);
         let body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule> =
             match ext_authz.as_ref() {
-                Some(executor) if executor.requires_request_body() => slice
-                    .mesh_policies
+                Some(executor) if executor.requires_request_body() => slice.mesh_policies
+                    [..ordinary_policy_count]
                     .iter()
                     .chain(relay_policy_superset.iter())
                     .flat_map(|policy| policy.rules.iter())
@@ -2046,6 +2231,29 @@ impl MeshAuthz {
                     .collect(),
                 _ => Vec::new(),
             };
+        let capture_body_inspecting_custom_policies: Vec<MeshPolicy> = match ext_authz.as_ref() {
+            Some(executor) if executor.requires_request_body() => slice.mesh_policies
+                [ordinary_policy_count..]
+                .iter()
+                .filter_map(|policy| {
+                    let rules: Vec<_> = policy
+                        .rules
+                        .iter()
+                        .filter(|rule| {
+                            rule.action.custom_provider().is_some_and(|provider| {
+                                executor.provider_requires_request_body(provider)
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    (!rules.is_empty()).then(|| MeshPolicy {
+                        rules,
+                        ..policy.clone()
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
 
         let ext_authz_upstream_allow_headers = ext_authz
             .as_ref()
@@ -2061,6 +2269,7 @@ impl MeshAuthz {
             body_inspecting_custom_rules,
             ext_authz_upstream_allow_headers,
             ext_authz_mutates_downstream,
+            capture_body_inspecting_custom_policies,
             relay_policy_superset,
             ambient_udp_source_scopes,
             ambient_udp_source_scoping,
@@ -2080,6 +2289,7 @@ impl MeshAuthz {
                 .namespaced_service_backend_hosts,
             destination_route_upstreams_requiring_scope: destination_policy_scope_index
                 .route_upstreams_requiring_scope,
+            node_waypoint_capture_destination_scopes,
             has_route_upstream_metadata,
             header_rule_names,
             relay_policy_superset_header_rule_names,
@@ -2087,6 +2297,7 @@ impl MeshAuthz {
             trusted_hbone_assertors,
             per_pod_policy_scoping,
             has_scoped_policies,
+            has_scoped_capture_destination_policies,
             condition_keys,
             relay_policy_superset_condition_keys,
             waypoint_namespace,
@@ -2461,6 +2672,50 @@ impl MeshAuthz {
             })
     }
 
+    /// NodeWaypoint per-pod destination scope for the matched proxy.
+    ///
+    /// For the exact synthesized inbound HBONE relay, the capture-destination
+    /// inventory is AUTHORITATIVE whenever it names the relayed address: the
+    /// relay guard admitted that destination FROM this inventory, so its scope
+    /// is the one whose policies must be evaluated. An ordinary
+    /// service-derived record for the same address (a stale or reused address
+    /// in the subscription-namespace view) never preempts it, and an
+    /// unresolvable capture lookup (undeclared port, divergent records) yields
+    /// no scope rather than falling back to that record. Every other proxy,
+    /// and a relayed address the inventory does not name, keeps the ordinary
+    /// index. The authorized-destination stamp names the exact relayed
+    /// backend, so route dispatch stays bound to the destination whose policies
+    /// were evaluated.
+    fn node_waypoint_destination_scope_match(
+        &self,
+        proxy: &Proxy,
+    ) -> Option<DestinationScopeMatch<'_>> {
+        if proxy.id != crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID
+            || proxy.upstream_id.is_some()
+        {
+            return self.destination_scope_match_for_proxy(proxy);
+        }
+        match self
+            .node_waypoint_capture_destination_scopes
+            .lookup(&proxy.backend_host, proxy.backend_port)
+        {
+            NodeWaypointCaptureScopeLookup::NotCaptured => {
+                self.destination_scope_match_for_proxy(proxy)
+            }
+            NodeWaypointCaptureScopeLookup::Refused => None,
+            NodeWaypointCaptureScopeLookup::Resolved(scope) => {
+                let key = DestinationBackendKey::new(&proxy.backend_host, proxy.backend_port)?;
+                Some(DestinationScopeMatch {
+                    authorized_destination: NodeWaypointAuthorizedDestination::Backend {
+                        aliases: vec![key.clone()],
+                        key,
+                    },
+                    scopes: std::slice::from_ref(scope),
+                })
+            }
+        }
+    }
+
     fn proxy_requires_destination_scope(&self, proxy: &Proxy) -> bool {
         if let Some(upstream_id) = proxy.upstream_id.as_deref() {
             if upstream_id.starts_with("__mesh-out-upstream-") {
@@ -2711,6 +2966,37 @@ impl MeshAuthz {
 /// — an unscopable audit-only selector policy is skipped, not rejected.
 fn policy_has_enforcing_rule(policy: &MeshPolicy) -> bool {
     policy.rules.iter().any(|rule| rule.action.is_enforcing())
+}
+
+/// Whether any policy in `policies` is namespace/selector-scoped and carries an
+/// ENFORCING rule. Only such policies justify failing closed on a missing
+/// per-pod scope: a scoped `Audit` rule only records `mesh_authz.audit_policy`
+/// and returns `Continue`, and Istio's empty-rule ALLOW (allow-nothing) is a
+/// never-matching `Allow` rule, so it is still counted.
+fn policies_enforce_scoped_rules(policies: &[MeshPolicy]) -> bool {
+    policies.iter().any(|policy| {
+        !matches!(policy.scope, PolicyScope::MeshWide)
+            && policy.rules.iter().any(|rule| rule.action.is_enforcing())
+    })
+}
+
+/// Union the NodeWaypoint capture-destination AuthorizationPolicy inventory
+/// into the per-pod candidate set (cold path, once per plugin generation).
+///
+/// The inventory already holds only policies applicable to a captured
+/// destination, and per-pod evaluation re-checks every candidate against the
+/// connection's own scope, so a union is exactly the destination's complete
+/// policy set without letting a foreign policy reach any other pod. A policy
+/// already present in `mesh_policies` (typically a root-namespace mesh-wide
+/// one, or a same-namespace destination's) is not duplicated. The inventory
+/// field is drained so nothing downstream evaluates it a second time.
+fn merge_node_waypoint_capture_mesh_policies(slice: &mut MeshSlice) {
+    let capture_policies = std::mem::take(&mut slice.node_waypoint_capture_mesh_policies);
+    for policy in capture_policies {
+        if !slice.mesh_policies.contains(&policy) {
+            slice.mesh_policies.push(policy);
+        }
+    }
 }
 
 /// Refuse a waypoint slice that carries an ENFORCING GatewayClass-targeted
@@ -3339,6 +3625,9 @@ impl Plugin for MeshAuthz {
         // services, destination_rules, etc. the authz engine never reads).
         let mut scope_missing = false;
         let mut authorized_destination = None;
+        // Missing-scope census for THIS request; the per-pod branch below
+        // widens it for the synthesized inbound relay.
+        let mut scoped_policy_census = self.has_scoped_policies;
         let evaluation = if relay_policy_superset_request {
             // Destination-aware inbound relay. ServiceWaypoint byte-stream and
             // UDP CONNECTs both resolve the exact destination workload scope;
@@ -3447,16 +3736,29 @@ impl Plugin for MeshAuthz {
                 )
             }
         } else if self.per_pod_policy_scoping {
-            if self.has_scoped_policies {
+            // The synthesized inbound relay's destination is a capture
+            // destination (the NodeWaypoint relay guard admits only those), so
+            // its own scoped policies count toward the missing-scope refusal.
+            if ctx.matched_proxy.as_ref().is_some_and(|proxy| {
+                proxy.id == crate::modes::mesh::MESH_INBOUND_HBONE_RELAY_PROXY_ID
+            }) {
+                scoped_policy_census |= self.has_scoped_capture_destination_policies;
+            }
+            if scoped_policy_census {
                 ctx.metadata.insert(
                     NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA.to_string(),
                     "true".to_string(),
                 );
             }
+            // For the exact synthesized inbound HBONE relay the capture
+            // destination inventory is authoritative for any address it names
+            // (see `node_waypoint_destination_scope_match`); every other proxy
+            // keeps the ordinary service-derived index. The source-assertion
+            // gate below is unchanged.
             let destination_scope_match = ctx
                 .matched_proxy
                 .as_ref()
-                .and_then(|proxy| self.destination_scope_match_for_proxy(proxy));
+                .and_then(|proxy| self.node_waypoint_destination_scope_match(proxy));
             let can_use_destination_scope = ctx.node_waypoint_policy_scope.is_some()
                 || can_use_inbound_relay_destination_scope_without_source_scope(
                     ctx,
@@ -3493,7 +3795,7 @@ impl Plugin for MeshAuthz {
                 // policies against the asserted source workload. Source-side
                 // HBONE-shaped traffic, untrusted relay baggage, and missing baggage
                 // keep the existing removed-workload fail-closed behavior.
-                if scope_missing && self.has_scoped_policies {
+                if scope_missing && scoped_policy_census {
                     ctx.metadata
                         .insert("mesh_authz.scope_missing".to_string(), "true".to_string());
                     ctx.metadata.insert(
@@ -3514,7 +3816,7 @@ impl Plugin for MeshAuthz {
                         headers: HashMap::new(),
                     };
                 }
-                if self.has_scoped_policies
+                if scoped_policy_census
                     && ctx
                         .matched_proxy
                         .as_ref()
@@ -3688,7 +3990,7 @@ impl Plugin for MeshAuthz {
         // per-pod scoping is disabled for that topology. In both cases, route
         // dispatch must remain bound to the destination whose policies were
         // authorized.
-        if (self.has_scoped_policies || self.service_waypoint_destination_scope_required)
+        if (scoped_policy_census || self.service_waypoint_destination_scope_required)
             && matches!(result, PluginResult::Continue)
             && let Some(destination) = authorized_destination
         {
@@ -3813,7 +4115,9 @@ impl Plugin for MeshAuthz {
         if mesh_authz_skips_outbound_capture_leg(self.per_pod_policy_scoping, ctx.mesh_direction) {
             return false;
         }
-        if self.body_inspecting_custom_rules.is_empty() {
+        if self.body_inspecting_custom_rules.is_empty()
+            && self.capture_body_inspecting_custom_policies.is_empty()
+        {
             return false;
         }
         let host = ctx
@@ -3838,7 +4142,7 @@ impl Plugin for MeshAuthz {
         let stripped = crate::policy_path::strip_path_parameters(path);
         let stripped_spelling = (stripped != path).then_some(&*stripped);
         let spellings = std::iter::once(path).chain(stripped_spelling);
-        self.body_inspecting_custom_rules.iter().any(|rule| {
+        let rule_may_apply = |rule: &crate::modes::mesh::config::MeshRule| {
             spellings.clone().any(|spelling| {
                 crate::modes::mesh::policy::mesh_rule_request_scope_may_apply(
                     rule,
@@ -3847,7 +4151,11 @@ impl Plugin for MeshAuthz {
                     host.as_deref(),
                 )
             })
-        })
+        };
+        self.body_inspecting_custom_rules
+            .iter()
+            .any(&rule_may_apply)
+            || self.capture_custom_rules_may_apply_to_request(ctx, &rule_may_apply)
     }
 
     /// Bound the buffer at the largest `maxRequestBytes` any provider declared,
@@ -4064,6 +4372,12 @@ impl Plugin for MeshAuthz {
                 // evaluation (matching the HTTP path) instead of rejecting all
                 // stream traffic. `Reject` is the variant the stream accept loops
                 // honor; `RejectBinary` would be silently dropped by them.
+                //
+                // A stream without a scope is a SOURCE-attributed one (the
+                // transparent capture relay always stamps its destination
+                // scope), so only the ordinary census applies: capture-inventory
+                // policies select capture destinations and are evaluated against
+                // the destination scope the capture relay stamps.
                 if self.has_scoped_policies {
                     metadata.insert(
                         "mesh_authz.deny_policy".to_string(),
@@ -4130,6 +4444,43 @@ impl Plugin for MeshAuthz {
 }
 
 impl MeshAuthz {
+    /// Whether a capture-ONLY body-inspecting CUSTOM rule could be checked for
+    /// this request. A policy contributes only when a scope `authorize` could
+    /// judge this request under selects it: the destination scope for the
+    /// matched proxy (the capture-destination scope on the synthesized inbound
+    /// relay, the ordinary index otherwise) or the request's source pod scope;
+    /// with neither, only a mesh-wide policy can apply. This is the same
+    /// applicability `authorize` uses, taken as a superset (either scope), so
+    /// it never skips a buffer a selected policy needs, while a foreign
+    /// destination's provider can no longer buffer or `413` a request to a
+    /// workload it does not select.
+    fn capture_custom_rules_may_apply_to_request(
+        &self,
+        ctx: &RequestContext,
+        rule_may_apply: &dyn Fn(&crate::modes::mesh::config::MeshRule) -> bool,
+    ) -> bool {
+        if self.capture_body_inspecting_custom_policies.is_empty() {
+            return false;
+        }
+        let destination = ctx
+            .matched_proxy
+            .as_ref()
+            .and_then(|proxy| self.node_waypoint_destination_scope_match(proxy));
+        let source = ctx.node_waypoint_policy_scope.as_deref();
+        let waypoint = self.waypoint_attachment();
+        self.capture_body_inspecting_custom_policies
+            .iter()
+            .any(|policy| {
+                let selected = destination.as_ref().is_some_and(|matched| {
+                    matched
+                        .scopes
+                        .iter()
+                        .any(|scope| scope.policy_applies_for_destination(policy, waypoint))
+                }) || Self::policy_applies_to_pod(policy, source);
+                selected && policy.rules.iter().any(rule_may_apply)
+            })
+    }
+
     fn ambient_udp_source_scope(
         &self,
         ctx: &RequestContext,
