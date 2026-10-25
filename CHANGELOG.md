@@ -157,26 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`grpc_web` refuses requests it cannot translate instead of forwarding
-  them.** A `grpc-web-text` request body that is not valid base64 is now
-  rejected with a gRPC-Web-shaped 400; previously it was left undecoded, so raw
-  binary frames sent under a text media type passed the native-framing check
-  and reached the backend. A translation owner whose request staging is
-  missing or malformed now rejects in `before_proxy` and the final
-  request-body hook (and is still buffered so that hook runs) instead of
-  logging "fail closed" and continuing. Dispatch re-measured the staged request
-  trailer block with a mandatory space after each colon, so an admitted block
-  at the 8 KiB bound written without that optional space was silently dropped;
-  the re-check now uses the minimal `name:value` form an admitted block never
-  exceeds. The split trailer block now lives in request-private typed state
-  that every dispatch path (HTTP/1.1, HTTP/2, HTTP/3, retry replay) reads,
-  instead of in plugin-writable metadata, so a later plugin deleting or
-  rewriting `grpc_web.request_trailers` can no longer make dispatch drop or
-  forge the trailers already stripped from the body. Text-mode request decoding no longer allocates once per
-  padded flush segment, final trailer reconciliation on buffered text responses
-  decodes only the trailer suffix when checking whether the frame changed, and
-  trailer-frame field selection and sorting runs once per frame instead of
-  once per counting/writing pass.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
