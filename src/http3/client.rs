@@ -2151,9 +2151,7 @@ impl Http3PoolManager {
     fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
         let effective_client_cert_path = proxy
             .resolved_tls
-            .client_cert_path
-            .as_deref()
-            .or(self.global_backend_client_cert_path.as_deref());
+            .effective_client_cert_path(self.global_backend_client_cert_path.as_deref());
         backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.workload_svid_cert_path.as_deref(),
@@ -2254,9 +2252,7 @@ impl Http3ConnectionPool {
     fn svid_generation_for_proxy(&self, proxy: &Proxy) -> Option<u64> {
         let effective_client_cert_path = proxy
             .resolved_tls
-            .client_cert_path
-            .as_deref()
-            .or(self.env_config.backend_tls_client_cert_path.as_deref());
+            .effective_client_cert_path(self.env_config.backend_tls_client_cert_path.as_deref());
         backend_svid_generation_for_client_cert(
             effective_client_cert_path,
             self.env_config.gateway_svid_cert_path.as_deref(),

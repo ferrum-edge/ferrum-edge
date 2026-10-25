@@ -2241,6 +2241,16 @@ pub(crate) struct A2aGatewayClaim {
     /// mutable header map. The ordinary transform path needs no such flag: the
     /// core already runs the shared invalidation for it.
     pub(crate) card_body_replaced: bool,
+    /// The exact JSON-RPC request bytes the arrival-time classification above
+    /// was decided over, when the context held them as [`bytes::Bytes`].
+    ///
+    /// A refcounted handle, not a copy. The final backend-visible request-body
+    /// hook compares the finalized body against it: byte-identical bytes are
+    /// provably classified exactly as they were at arrival, so the hook skips
+    /// re-parsing them, while any difference re-runs the full classification
+    /// and refuses a change of response-shaping operation class the response
+    /// phase above was not set up for.
+    pub(crate) classified_request_body: Option<bytes::Bytes>,
 }
 
 /// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path
@@ -2584,6 +2594,14 @@ pub struct RequestContext {
     /// Keep this source fact separate from the effective budget so an earlier
     /// default policy cannot satisfy a later `reject_no_deadline` policy.
     pub(crate) grpc_deadline_had_valid_client_timeout: bool,
+    /// Set by every enabled `request_transformer` with body rules that ran
+    /// `before_proxy` for this request. Proxy core then inspects the FINAL
+    /// outbound headers for content-integrity fields (`Content-Digest`,
+    /// `Repr-Digest`, `Digest`, `Content-MD5`) and retires them when the body
+    /// rules may rewrite the request
+    /// (`crate::proxy::retire_stale_request_integrity_headers`). A plain bool
+    /// so the enrollment itself never allocates.
+    pub(crate) request_body_integrity_retirement: bool,
     /// Monotonic receipt instant captured with the request context. Effective
     /// budgets are added to this exact anchor, independent of wall-clock jumps.
     pub(crate) grpc_deadline_received_at: tokio::time::Instant,
@@ -2595,6 +2613,18 @@ pub struct RequestContext {
     /// policy has applied its default/cap decision. Kept separate from the
     /// relative header forwarded upstream so retries never re-arm the budget.
     pub(crate) grpc_deadline_budget_ms: Option<u64>,
+    /// The policy budget BEFORE any `headroom_ms` reservation: the client
+    /// deadline (or injected default) after every cap applied so far. Each
+    /// `grpc_deadline` instance recomputes from this value, so the headroom is
+    /// reserved exactly once and composition does not depend on instance order.
+    pub(crate) grpc_deadline_policy_budget_ms: Option<u64>,
+    /// The tightest `max_deadline_ms` any `grpc_deadline` instance has applied
+    /// to this request. Kept in typed state so a default injected by a LATER
+    /// instance is still clamped by an earlier instance's ceiling.
+    pub(crate) grpc_deadline_ceiling_ms: Option<u64>,
+    /// The largest `headroom_ms` any `grpc_deadline` instance requested for
+    /// this request. Reserved once from a client-supplied deadline.
+    pub(crate) grpc_deadline_headroom_ms: u64,
     /// Single monotonic absolute deadline shared by request phases, backend
     /// attempts, retry backoff, and streaming response bodies.
     pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
@@ -2826,6 +2856,13 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
+    /// Set by the process-global `prometheus_metrics` request hook when it
+    /// observed this transaction. Gates the gRPC message scanners (see
+    /// [`crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages`]).
+    ///
+    /// A typed bit rather than a `metadata` marker so the per-request hook
+    /// allocates nothing; it never reaches transaction logs.
+    prometheus_metrics_observed: bool,
     /// Per-request memo of duplicate-object-member screens over governed JSON
     /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
     /// `body_validator`, and `ai_tool_governor` can all inspect the same
@@ -3739,6 +3776,23 @@ pub(crate) struct PluginRequestState {
     /// `metadata` so authorization-phase rejection logging can never serialize
     /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// `mesh_authz` CUSTOM `headersToUpstreamOnAllow` results, staged on an
+    /// allowed check and consumed by the SAME instance's `before_proxy`.
+    /// Keyed by the staging instance's process-unique id, so two effective
+    /// `mesh_authz` instances on one request (an operator global beside the
+    /// force-injected `__mesh_authz`, say) can never overwrite or consume each
+    /// other's provider-owned names. Each entry is one pair per provider-owned
+    /// name: `Some(value)` installs the provider's value, `None` only strips
+    /// the client's copy. Kept out of `metadata` so a provider-minted token can
+    /// never be serialized into a transaction log.
+    pub(crate) mesh_ext_authz_upstream_headers:
+        HashMap<u64, crate::plugins::mesh::ext_authz::StagedUpstreamHeaders>,
+    /// `mesh_authz` CUSTOM `headersToDownstreamOnAllow` results, keyed the same
+    /// way, applied to the client-visible response by the staging instance's
+    /// own `after_proxy` / WebSocket handshake hook. Same out-of-`metadata`
+    /// reasoning (it routinely carries `Set-Cookie`).
+    pub(crate) mesh_ext_authz_downstream_headers:
+        HashMap<u64, crate::plugins::mesh::ext_authz::StagedDownstreamHeaders>,
     /// Lowercase `claim_headers` destinations already sanitized for this
     /// request. Gateway-owned destinations are stripped exactly once, by the
     /// first plugin instance that owns them, so a later instance sharing a
@@ -3869,6 +3923,17 @@ pub(crate) struct PluginRequestState {
     /// Typed rather than `metadata`: a digest of a client query document must not
     /// enter a transaction log, and no plugin may forge one to skip the recheck.
     pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`body_validator`-instance digest of the `Content-Type` and request
+    /// body that instance validated and PASSED in `before_proxy`.
+    ///
+    /// The final request-body hook re-validates the exact backend-visible
+    /// bytes; when they (and the media type) are byte-identical to what the
+    /// early hook already accepted, the verdict is the same pure function of
+    /// the same input, so the second JSON parse and schema evaluation are
+    /// skipped. Any transform, relabel, or decode changes the digest and is
+    /// re-validated. Typed rather than `metadata` so no plugin can forge a
+    /// digest to skip the final check, and a body digest never reaches a log.
+    pub(crate) body_validator_early_request_digests: HashMap<u64, [u8; 32]>,
     /// Rate-limit buckets one `graphql` instance already charged for this
     /// request, as `(instance id, bucket key)`.
     ///
@@ -4441,9 +4506,13 @@ impl RequestContext {
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
+            request_body_integrity_retirement: false,
             grpc_deadline_received_at: tokio::time::Instant::now(),
             grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
+            grpc_deadline_policy_budget_ms: None,
+            grpc_deadline_ceiling_ms: None,
+            grpc_deadline_headroom_ms: 0,
             grpc_deadline_at: None,
             route_request_deadline_at: None,
             route_attempt_timeout: None,
@@ -4482,6 +4551,7 @@ impl RequestContext {
             h3_response_upstream_is_fallback: false,
             original_accept_encoding: None,
             websocket_response_boundary: false,
+            prometheus_metrics_observed: false,
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             governed_request_body_plaintext: None,
             finalized_response_replay: false,
@@ -4976,6 +5046,7 @@ impl RequestContext {
         }
         self.grpc_deadline_initialized = true;
         self.grpc_deadline_had_valid_client_timeout = budget_ms.is_some();
+        self.grpc_deadline_policy_budget_ms = budget_ms;
         self.set_grpc_deadline_budget(budget_ms);
     }
 
@@ -5981,9 +6052,13 @@ impl RequestContext {
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
+            request_body_integrity_retirement: self.request_body_integrity_retirement,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
+            grpc_deadline_policy_budget_ms: self.grpc_deadline_policy_budget_ms,
+            grpc_deadline_ceiling_ms: self.grpc_deadline_ceiling_ms,
+            grpc_deadline_headroom_ms: self.grpc_deadline_headroom_ms,
             grpc_deadline_at: self.grpc_deadline_at,
             route_request_deadline_at: self.route_request_deadline_at,
             route_attempt_timeout: self.route_attempt_timeout,
@@ -6060,6 +6135,11 @@ impl RequestContext {
                 // compatibility clone would extend their lifetime unnecessarily.
                 hook_state.pending_claim_headers = HashMap::new();
                 hook_state.sanitized_claim_header_destinations = HashSet::new();
+                // Same for the `mesh_authz` ext-authz allow-header staging: it
+                // is consumed only by `before_proxy` / `after_proxy` on the
+                // live context, and may carry a provider-minted credential.
+                hook_state.mesh_ext_authz_upstream_headers = HashMap::new();
+                hook_state.mesh_ext_authz_downstream_headers = HashMap::new();
                 // Response caching has no final request-body hook. Its private
                 // backend-header delta remains on the live donor context for the
                 // eventual response store rather than extending raw values into
@@ -6073,6 +6153,7 @@ impl RequestContext {
             h3_response_upstream_is_fallback: self.h3_response_upstream_is_fallback,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
+            prometheus_metrics_observed: self.prometheus_metrics_observed,
             json_scan_memo: self.json_scan_memo.clone(),
             // Deliberately NOT carried: the shared request representation gate
             // stages this view from the exact `(headers, body)` pair the final
@@ -6469,6 +6550,17 @@ impl RequestContext {
 
     pub(crate) fn has_websocket_response_boundary(&self) -> bool {
         self.websocket_response_boundary
+    }
+
+    /// Record that the `prometheus_metrics` request hook observed this
+    /// transaction. Idempotent and allocation-free.
+    pub fn mark_prometheus_metrics_observed(&mut self) {
+        self.prometheus_metrics_observed = true;
+    }
+
+    /// Whether the `prometheus_metrics` request hook observed this transaction.
+    pub fn prometheus_metrics_observed(&self) -> bool {
+        self.prometheus_metrics_observed
     }
 
     pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {
@@ -6931,6 +7023,15 @@ impl RequestContext {
     #[inline]
     pub fn has_raw_headers(&self) -> bool {
         self.raw_headers.is_some()
+    }
+
+    /// Whether [`Self::materialize_headers`] has populated `headers` from the
+    /// raw map. Once it has, `headers` is the AUTHORITATIVE request view: a
+    /// name absent from it was removed (or never sent), and policy readers
+    /// must not resurrect it from the retained raw block.
+    #[inline]
+    pub fn headers_are_materialized(&self) -> bool {
+        self.headers_materialized
     }
 
     /// Share the pristine request header block with a retry planner without
@@ -13684,6 +13785,12 @@ pub fn create_plugin_with_http_client_and_config_id(
                 brotli_enabled,
                 max_request_body_size_bytes,
             )?;
+            // Serving clients carry the process response limit; validation-only
+            // clients do not, and stay silent rather than warning about a
+            // limit they never resolved.
+            if let Some(max_response_body_size_bytes) = http_client.max_response_body_size_bytes() {
+                compression::warn_if_response_limit_gates_compression(max_response_body_size_bytes);
+            }
             Ok(Some(Arc::new(plugin)))
         }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
@@ -14640,6 +14747,7 @@ mod tests {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         };
 
         let canary: Upstream = serde_json::from_value(json!({

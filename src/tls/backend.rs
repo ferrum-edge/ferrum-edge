@@ -1198,6 +1198,14 @@ pub fn append_backend_tls_pool_key_fields(
     if tls.tls_refused {
         buf.push_str("|tlsrefused");
     }
+    // A provider-isolated destination resolves to no client identity even when
+    // a gateway-global pair exists. Its effective cert/key fields already say
+    // so, but the explicit segment keeps the isolation decision inspectable and
+    // independent of how a caller resolved those fields. Appended only when
+    // set, so every other key is unchanged.
+    if tls.suppress_global_client_identity {
+        buf.push_str("|noglobalid");
+    }
     append_backend_svid_generation_key_field(buf, svid_generation);
 }
 
@@ -1740,20 +1748,30 @@ impl<'a> BackendTlsConfigBuilder<'a> {
     }
 
     fn load_client_auth(&self) -> Result<BackendClientAuth, TlsError> {
+        // A provider-isolated destination never inherits the gateway-global
+        // backend client identity: an unset per-route cert/key means "present
+        // no client certificate", not "present Ferrum's internal one" (see
+        // `BackendTlsConfig::suppress_global_client_identity`).
+        let (global_client_cert, global_client_key) =
+            if self.proxy.resolved_tls.suppress_global_client_identity {
+                (None, None)
+            } else {
+                (self.global_client_cert, self.global_client_key)
+            };
         let cert_path = self
             .proxy
             .resolved_tls
             .client_cert_path
             .as_deref()
             .map(Path::new)
-            .or(self.global_client_cert);
+            .or(global_client_cert);
         let key_path = self
             .proxy
             .resolved_tls
             .client_key_path
             .as_deref()
             .map(Path::new)
-            .or(self.global_client_key);
+            .or(global_client_key);
 
         match (cert_path, key_path) {
             (Some(cert_path), None) => Err(TlsError::Pem {

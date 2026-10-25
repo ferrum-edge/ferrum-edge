@@ -9015,11 +9015,13 @@ fn gateway_response_compression_planned(
     let Some(encoding) = content_encoding_value(headers) else {
         return false;
     };
-    // A later header hook may rewrite one supported gateway encoding to the
-    // other. Compression follows that final header when transforming the body,
-    // so private ownership remains authoritative even when it differs from the
-    // algorithm originally selected.
-    (encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("br"))
+    // A later header hook may rewrite one supported gateway encoding to
+    // another. Compression follows that final header when transforming the
+    // body, so private ownership remains authoritative even when it differs
+    // from the algorithm originally selected.
+    (encoding.eq_ignore_ascii_case("gzip")
+        || encoding.eq_ignore_ascii_case("br")
+        || encoding.eq_ignore_ascii_case("zstd"))
         && ctx.gateway_response_compression_algorithm().is_some()
 }
 
@@ -9174,6 +9176,9 @@ fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
     let coding = match encoding.trim().to_ascii_lowercase().as_str() {
         "gzip" | "x-gzip" => "gzip",
         "br" => "br",
+        // `compression` can emit `zstd` when an instance opts in; the charged
+        // chain decodes it under the same bounds.
+        "zstd" => "zstd",
         _ => return None,
     };
     super::charged_decode::decode_charged_content_coding_chain(

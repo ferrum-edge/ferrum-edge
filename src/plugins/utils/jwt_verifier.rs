@@ -48,11 +48,95 @@ pub async fn verify_jwt_with_jwks(
         }
     };
     let validation = build_validation(cached_key.algorithm, params);
-    decode::<Value>(token, &cached_key.decoding_key, &validation)
+    decode_with_validation(token, cached_key, &validation, !params.audiences.is_empty())
+}
+
+/// Every asymmetric algorithm a [`JwksKeyStore`] key can bind verification
+/// to. [`CompiledJwtValidation`] precomputes one [`Validation`] per entry.
+pub const JWKS_VERIFICATION_ALGORITHMS: [Algorithm; 9] = [
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::EdDSA,
+];
+
+/// Immutable verification policy compiled once per provider.
+///
+/// [`verify_jwt_with_jwks`] rebuilds a [`Validation`] — including copies of
+/// the issuer, every configured audience, and the required-claim set — on
+/// each call. Those inputs are provider configuration, so a request-path
+/// caller that verifies against the same provider repeatedly compiles them
+/// here once (at construction / reload) and borrows the result. The policy is
+/// identical to [`verify_jwt_with_jwks`]: one [`Validation`] per admitted key
+/// algorithm, each built by the same `build_validation`, so verification
+/// stays bound to exactly the selected key's algorithm.
+#[derive(Clone)]
+pub struct CompiledJwtValidation {
+    validations: Vec<(Algorithm, Validation)>,
+    audiences_configured: bool,
+}
+
+impl CompiledJwtValidation {
+    pub fn new(params: &JwtVerifyParams<'_>) -> Self {
+        let validations = JWKS_VERIFICATION_ALGORITHMS
+            .iter()
+            .map(|algorithm| (*algorithm, build_validation(*algorithm, params)))
+            .collect();
+        Self {
+            validations,
+            audiences_configured: !params.audiences.is_empty(),
+        }
+    }
+
+    fn for_algorithm(&self, algorithm: Algorithm) -> Option<&Validation> {
+        self.validations
+            .iter()
+            .find(|(candidate, _)| *candidate == algorithm)
+            .map(|(_, validation)| validation)
+    }
+}
+
+/// [`verify_jwt_with_jwks`] against a precompiled provider policy.
+///
+/// Same `kid` binding, unknown-`kid` refresh trigger, algorithm binding, and
+/// registered-claim shape checks; the only difference is that no per-call
+/// [`Validation`] is built.
+pub fn verify_jwt_with_compiled_validation(
+    token: &str,
+    store: &JwksKeyStore,
+    compiled: &CompiledJwtValidation,
+) -> Option<Value> {
+    let all_keys = store.trusted_keys()?;
+    let header = decode_header(token).ok()?;
+    let cached_key = match key_for_header_kid(&header, &all_keys) {
+        Some(cached_key) => cached_key,
+        None => {
+            if header.kid.as_deref().is_some_and(|kid| !kid.is_empty()) {
+                store.request_refresh_on_kid_miss();
+            }
+            return None;
+        }
+    };
+    let validation = compiled.for_algorithm(cached_key.algorithm)?;
+    decode_with_validation(token, cached_key, validation, compiled.audiences_configured)
+}
+
+fn decode_with_validation(
+    token: &str,
+    cached_key: &CachedJwk,
+    validation: &Validation,
+    audiences_configured: bool,
+) -> Option<Value> {
+    decode::<Value>(token, &cached_key.decoding_key, validation)
         .ok()
         .map(|td| td.claims)
         .filter(issuer_claim_is_single_string)
-        .filter(|claims| audience_claim_is_acceptable(claims, !params.audiences.is_empty()))
+        .filter(|claims| audience_claim_is_acceptable(claims, audiences_configured))
 }
 
 /// Re-check the registered `aud` claim at Ferrum's verified-claims boundary.
