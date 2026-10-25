@@ -8,23 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **`mesh_authz` CUSTOM external authorization honours `headersToUpstreamOnAllow`
-  and `headersToDownstreamOnAllow`, carries the caller's identity, and is
-  attributed per provider.** On an allowed check the listed provider response
-  headers are applied to the backend request in `mesh_authz`'s own
-  `before_proxy` hook (priority 2075 — before `mesh_route_dispatch` and every
-  transformer, on every HTTP-family path) and to the backend response in its
-  `after_proxy` / WebSocket handshake hook (`Set-Cookie` appended). Upstream
-  names are provider-owned: the client's copy is removed in every
-  backend-folded spelling, including on a `failOpen` allow. Gateway identity
-  assertions (`x-consumer-*`, `x-path-param-*`, …), `content-*`, and (upstream)
-  `set-cookie` are refused in the allow lists. Every check now carries
-  `x-ferrum-source-principal`, `x-ferrum-source-namespace`,
-  `x-ferrum-source-service-account`, and `x-ferrum-request-principal`, which a
-  client cannot forge. New series
-  `ferrum_mesh_ext_authz_provider_checks_total{provider,outcome}` and
-  `ferrum_mesh_ext_authz_check_duration_seconds{provider}` attribute checks to
-  the admitted provider (at most 64 distinct names per process).
 - **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
   `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
   most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
@@ -174,23 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`mesh_authz` refuses never-matching matchers in direct config.** The flat
-  `mesh_policies` form and an embedded `mesh_slice` now get the same
-  per-policy matcher validation as a mesh document: a `to.headers`
-  pseudo-header DENY (which could never match, so `GET /admin` was allowed),
-  invalid host / port patterns, empty `from[{}]` / `to[{}]` entries, and an
-  empty policy name or namespace are rejected at construction.
-- **`mesh_authz` judges a repeated request header one way.** `to.headers`,
-  `when: request.headers[...]`, and the headers forwarded to a CUSTOM provider
-  all read every field line joined as the gateway materializes them; a `when:`
-  condition used to see only the first line when nothing had materialized the
-  headers, so `x-tenant: ok` + `x-tenant: banned` slipped past a DENY.
-- **`mesh_authz` CUSTOM denials keep every repeated provider header.** Two
-  `Set-Cookie` lines (or several `WWW-Authenticate` challenges) on a provider
-  denial named in `headersToDownstreamOnDeny` used to collapse to the first.
-- **`mesh_authz` no longer copies the whole request header map per request**
-  when a `to.headers` predicate is loaded; it resolves only the header names
-  the loaded policies reference.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
