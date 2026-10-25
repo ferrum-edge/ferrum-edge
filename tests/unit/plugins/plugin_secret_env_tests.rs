@@ -255,7 +255,7 @@ fn ai_tool_governor_approval_header_reference(name: &str) -> Value {
 /// `(plugin, config builder)`. A new env-reference field belongs here.
 type ConfigBuilder = fn(&str) -> Value;
 
-const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 7] = [
+const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 8] = [
     ("api_chargeback_sink", api_chargeback_sink_password_ref),
     ("ai_semantic_firewall", ai_semantic_firewall_api_key_env),
     ("ai_stream_router", ai_stream_router_api_key_reference),
