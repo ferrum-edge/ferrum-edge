@@ -157,42 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`mesh_outbound_registry` (mesh REGISTRY_ONLY) review hardening.**
-  - Mesh-derived registries drop slice hosts or names outside the registry
-    entry grammar (ServiceEntry host `*`, `foo.*.example.com`, underscore
-    names, port `0`) with one `warn` per resource per registry build giving
-    the schema path with ordinals (`service_entries[2].hosts[0]`), the
-    resource kind, the fixed grammar reason, and the namespace/name only when
-    they are DNS-1123 names (otherwise withheld). The rejected value itself is
-    never logged, so a pasted URL with userinfo cannot leak credentials.
-    The dropped destination stays denied and the rest of the registry
-    applies identically on the HTTP plugin, the stream lane, and the
-    egress-scope diagnostics; previously one such resource failed the whole
-    HTTP-lane config while the stream lane degraded to deny-all.
-    Operator-authored registries stay strict.
-  - Request `Host` / `:authority` ports use the registry port grammar
-    (decimal 1–65535), and port `0` never matches in the shared registry
-    lookup, so the outbound-capture route-miss gate and stream lane refuse it
-    too: `svc:0` no longer satisfies `svc:*`, and `svc:+8443`
-    no longer satisfies `svc:8443`. The admin `POST /mesh/egress-scope/test`
-    dry run shares this parser, so a `host` such as `svc:0` now reports a
-    deny instead of a 400 (an explicit `port: 0` is still a 400).
-  - New optional `wildcard_match` (`one_label` default, or `dns_suffix`).
-    `dns_suffix` gives operator-managed instances Envoy/Istio-style any-depth
-    suffix wildcards (`*.example.com` admits `a.b.example.com`). Suffix
-    probing is bounded: authorities over 253 bytes or with an empty label
-    never match a wildcard, and at most as many suffixes are probed as the
-    deepest configured wildcard has labels. Mesh
-    auto-injection keeps `one_label`, the wildcard contract shared with
-    Sidecar egress scoping, the mesh DNS proxy, and the stream lane.
-  - HTTP-lane denials (plugin hook and outbound-capture route miss) log a
-    process-wide rate-limited `warn` naming the denied `host`, `port`,
-    `listen_port`, `client`, and `source`. The host is echoed only when it is
-    authority-shaped (hostname characters or a bracketed IPv6 literal,
-    truncated to 256 bytes) and is otherwise withheld; the fixed-cardinality `<denied>`
-    metric bucket is unchanged.
-  - The request hook normalizes the host once per request and maps the match
-    kind straight to its metric bucket instead of re-normalizing twice.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
