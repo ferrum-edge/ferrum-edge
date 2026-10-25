@@ -1096,6 +1096,7 @@ impl MeshSlice {
     /// rejecting the whole config. Operator-authored registries stay strict.
     pub fn build_known_destinations(&self, cluster_domain: &str) -> Vec<String> {
         let mut entries: HashSet<String> = HashSet::new();
+        let mut warned: KnownDestinationWarned<'_> = HashSet::new();
         let cluster_domain = normalize_known_destination_host(cluster_domain).unwrap_or_default();
         let local_namespace = normalize_known_destination_host(&self.namespace);
         for service in &self.services {
@@ -1120,6 +1121,7 @@ impl MeshSlice {
             if local_namespace.as_deref() == Some(namespace.as_str()) {
                 insert_known_destination(
                     &mut entries,
+                    &mut warned,
                     source,
                     &service_name,
                     service.ports.iter().map(|p| p.port),
@@ -1128,6 +1130,7 @@ impl MeshSlice {
             for host in [&namespaced, &svc, &fqdn] {
                 insert_known_destination(
                     &mut entries,
+                    &mut warned,
                     source,
                     host,
                     service.ports.iter().map(|p| p.port),
@@ -1146,6 +1149,7 @@ impl MeshSlice {
                 };
                 insert_known_destination(
                     &mut entries,
+                    &mut warned,
                     source,
                     &host,
                     entry.ports.iter().map(|p| p.port),
@@ -1164,6 +1168,7 @@ impl MeshSlice {
                 };
                 insert_known_destination(
                     &mut entries,
+                    &mut warned,
                     source,
                     &addr,
                     workload.ports.iter().map(|p| p.port),
@@ -2771,16 +2776,20 @@ fn normalize_known_destination_host(value: &str) -> Option<String> {
 }
 
 /// Slice resource a known destination came from, for the skip warning.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct KnownDestinationSource<'a> {
     kind: &'static str,
     namespace: &'a str,
     name: &'a str,
 }
 
-fn insert_known_destination(
+/// Resources already warned about within one registry build.
+type KnownDestinationWarned<'a> = HashSet<KnownDestinationSource<'a>>;
+
+fn insert_known_destination<'a>(
     entries: &mut HashSet<String>,
-    source: KnownDestinationSource<'_>,
+    warned: &mut KnownDestinationWarned<'a>,
+    source: KnownDestinationSource<'a>,
     host: &str,
     ports: impl Iterator<Item = u16>,
 ) {
@@ -2809,9 +2818,12 @@ fn insert_known_destination(
     if !inserted_port {
         admit(format!("{host}:*"));
     }
-    if let Some((entry, error)) = first_error {
-        // One line per resource host, not per derived entry. The dropped
-        // destination stays denied (REGISTRY_ONLY fails closed for it).
+    // One line per resource per registry build (its first offending entry),
+    // not per derived form. The dropped destination stays denied
+    // (REGISTRY_ONLY fails closed for it).
+    if let Some((entry, error)) = first_error
+        && warned.insert(source)
+    {
         warn!(
             resource_kind = source.kind,
             resource_namespace = ?source.namespace,

@@ -6675,6 +6675,27 @@ pub mod _test_support {
         crate::plugins::mesh::outbound_registry::reset_http_deny_warn_for_test();
     }
 
+    /// Emit the HTTP REGISTRY_ONLY denial warning against a caller-owned
+    /// limiter and clock (deterministic log-capture coverage).
+    pub fn mesh_outbound_registry_warn_http_deny_with_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+        host: Option<&str>,
+        port: Option<u16>,
+        listen_port: Option<u16>,
+        client_ip: &str,
+    ) {
+        crate::plugins::mesh::outbound_registry::warn_http_registry_deny_with(
+            limiter,
+            now_ms,
+            host,
+            port,
+            listen_port,
+            client_ip,
+            crate::plugins::mesh::outbound_registry::DENY_SOURCE_PLUGIN,
+        );
+    }
+
     /// Request-authority split used by `mesh_outbound_registry`.
     pub fn mesh_outbound_registry_split_host_header_for_test(value: &str) -> (&str, Option<u16>) {
         crate::plugins::mesh::outbound_registry::split_host_header(value)

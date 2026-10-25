@@ -198,6 +198,9 @@ pub struct OutboundRegistry {
     /// `*.example.com:*`.
     wildcard_any_port_suffixes: HashSet<String>,
     wildcard_match: WildcardMatch,
+    /// Most labels in any configured wildcard suffix. `dns_suffix` probing
+    /// never tries a candidate with more labels than this.
+    max_wildcard_suffix_labels: usize,
     outbound_listen_ports: Vec<u16>,
     reject_status: u16,
     namespace: String,
@@ -215,6 +218,7 @@ impl OutboundRegistry {
             wildcard_port_suffixes: HashMap::new(),
             wildcard_any_port_suffixes: HashSet::new(),
             wildcard_match: WildcardMatch::OneLabel,
+            max_wildcard_suffix_labels: 0,
             outbound_listen_ports: Vec::new(),
             reject_status: default_reject_status(),
             namespace: default_namespace_label(),
@@ -247,6 +251,10 @@ impl OutboundRegistry {
         let mut wildcard_suffixes: HashSet<String> = HashSet::new();
         let mut wildcard_port_suffixes: HashMap<u16, HashSet<String>> = HashMap::new();
         let mut wildcard_any_port_suffixes: HashSet<String> = HashSet::new();
+        let mut max_wildcard_suffix_labels = 0usize;
+        let mut note_suffix = |suffix: &str| {
+            max_wildcard_suffix_labels = max_wildcard_suffix_labels.max(suffix.split('.').count());
+        };
         for (index, entry) in parsed.registry.iter().enumerate() {
             let normalised = normalise_registry_entry(entry)
                 .map_err(|error| format!("mesh_outbound_registry: `registry[{index}]`: {error}"))?;
@@ -255,12 +263,14 @@ impl OutboundRegistry {
             };
             if let Some(host) = split_registry_host_any_port(&normalised) {
                 if let Some(suffix) = wildcard_suffix(host) {
+                    note_suffix(suffix);
                     wildcard_any_port_suffixes.insert(suffix.to_string());
                 } else {
                     any_port_hosts.insert(host.to_string());
                 }
             } else if let Some((host, port)) = split_registry_host_port(&normalised) {
                 if let Some(suffix) = wildcard_suffix(host) {
+                    note_suffix(suffix);
                     wildcard_port_suffixes
                         .entry(port)
                         .or_default()
@@ -269,6 +279,7 @@ impl OutboundRegistry {
                     host_ports.insert(format!("{host}:{port}"));
                 }
             } else if let Some(suffix) = wildcard_suffix(&normalised) {
+                note_suffix(suffix);
                 wildcard_suffixes.insert(suffix.to_string());
             } else {
                 hosts.insert(normalised);
@@ -285,6 +296,7 @@ impl OutboundRegistry {
             wildcard_port_suffixes,
             wildcard_any_port_suffixes,
             wildcard_match: parsed.wildcard_match,
+            max_wildcard_suffix_labels,
             outbound_listen_ports,
             reject_status: parsed.reject_status,
             namespace: parsed.namespace,
@@ -332,14 +344,24 @@ impl OutboundRegistry {
         if buf.is_empty() {
             return None;
         }
-        let mode = self.wildcard_match;
+        let wildcards = WildcardProbe {
+            mode: self.wildcard_match,
+            max_suffix_labels: self.max_wildcard_suffix_labels,
+        };
         let Some(port) = port else {
             if self.hosts.contains(buf.as_str()) {
                 return Some(RegistryMatch::Explicit);
             }
-            return wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_suffixes, mode)
+            return wildcards
+                .matches(buf.as_str(), &self.wildcard_suffixes)
                 .then_some(RegistryMatch::Wildcard);
         };
+        // Port 0 is never a destination port. Callers that split the
+        // authority themselves (the outbound route-miss gate, stream lane)
+        // must not let it satisfy `host:*` or `*.suffix:*` entries.
+        if port == 0 {
+            return None;
+        }
         if self.any_port_hosts.contains(buf.as_str()) {
             return Some(RegistryMatch::Explicit);
         }
@@ -357,14 +379,11 @@ impl OutboundRegistry {
                 return Some(RegistryMatch::Explicit);
             }
         }
-        let wildcard =
-            wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_any_port_suffixes, mode)
-                || self
-                    .wildcard_port_suffixes
-                    .get(&port)
-                    .is_some_and(|suffixes| {
-                        wildcard_suffix_set_matches(buf.as_str(), suffixes, mode)
-                    });
+        let wildcard = wildcards.matches(buf.as_str(), &self.wildcard_any_port_suffixes)
+            || self
+                .wildcard_port_suffixes
+                .get(&port)
+                .is_some_and(|suffixes| wildcards.matches(buf.as_str(), suffixes));
         wildcard.then_some(RegistryMatch::Wildcard)
     }
 
@@ -516,37 +535,65 @@ fn one_label_wildcard_candidate(host: &str) -> Option<&str> {
     Some(rest)
 }
 
-#[inline]
-fn wildcard_suffix_set_matches(
+/// Longest DNS textual name (RFC 1035 §2.3.4, without the trailing dot).
+/// `dns_suffix` matching treats longer authorities as non-DNS names that never
+/// match, which bounds probing work independently of HTTP header limits.
+const MAX_DNS_NAME_BYTES: usize = 253;
+
+/// Per-registry wildcard matching parameters.
+#[derive(Clone, Copy)]
+struct WildcardProbe {
+    mode: WildcardMatch,
+    max_suffix_labels: usize,
+}
+
+impl WildcardProbe {
+    #[inline]
+    fn matches(self, host: &str, suffixes: &HashSet<String>) -> bool {
+        if suffixes.is_empty() {
+            return false;
+        }
+        match self.mode {
+            // One-label semantics: the candidate after the first label must
+            // equal a configured suffix. Multi-label hosts produce a deeper
+            // candidate (e.g. `a.b.example.com` → `b.example.com`) that misses
+            // `example.com` without scanning the set. One probe per lookup.
+            WildcardMatch::OneLabel => one_label_wildcard_candidate(host)
+                .is_some_and(|candidate| suffixes.contains(candidate)),
+            WildcardMatch::DnsSuffix => {
+                dns_suffix_set_matches(host, suffixes, self.max_suffix_labels)
+            }
+        }
+    }
+}
+
+/// DNS-suffix semantics: `host` matches when some proper suffix of whole
+/// labels is configured and at least one non-empty label precedes it.
+///
+/// Work is bounded independently of attacker-supplied authority length: names
+/// over [`MAX_DNS_NAME_BYTES`] or with an empty label never match, and probes
+/// run right to left over at most `max_suffix_labels` candidates (the deepest
+/// configured suffix), each at most `MAX_DNS_NAME_BYTES` long. The base domain
+/// itself never matches `*.base`.
+fn dns_suffix_set_matches(
     host: &str,
     suffixes: &HashSet<String>,
-    mode: WildcardMatch,
+    max_suffix_labels: usize,
 ) -> bool {
-    if suffixes.is_empty() {
+    if host.len() > MAX_DNS_NAME_BYTES || host.split('.').any(str::is_empty) {
         return false;
     }
-    let Some(mut candidate) = one_label_wildcard_candidate(host) else {
-        return false;
-    };
-    // One-label semantics: the candidate after the first label must equal a
-    // configured suffix. Multi-label hosts produce a deeper candidate (e.g.
-    // `a.b.example.com` → `b.example.com`) that misses `example.com` without
-    // scanning the set.
-    if suffixes.contains(candidate) {
-        return true;
-    }
-    if mode == WildcardMatch::OneLabel {
-        return false;
-    }
-    // DNS-suffix semantics: probe each shorter suffix. The loop is bounded by
-    // the request host's label count, never by the registry size, and a
-    // candidate always keeps at least one label, so the base domain itself
-    // never matches `*.base`.
-    while let Some(rest) = one_label_wildcard_candidate(candidate) {
-        if suffixes.contains(rest) {
+    let mut end = host.len();
+    for _ in 0..max_suffix_labels {
+        // No empty labels, so whenever a dot exists `host[..dot]` holds at
+        // least one non-empty label in front of the candidate.
+        let Some(dot) = host[..end].rfind('.') else {
+            return false;
+        };
+        if suffixes.contains(&host[dot + 1..]) {
             return true;
         }
-        candidate = rest;
+        end = dot;
     }
     false
 }
@@ -735,7 +782,29 @@ pub(crate) fn warn_http_registry_deny(
     source: &'static str,
 ) {
     let now_ms = u64::try_from(HTTP_DENY_WARN_EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let Some(suppressed) = HTTP_DENY_WARN.on_event(now_ms) else {
+    warn_http_registry_deny_with(
+        &HTTP_DENY_WARN,
+        now_ms,
+        host,
+        port,
+        listen_port,
+        client_ip,
+        source,
+    );
+}
+
+/// [`warn_http_registry_deny`] against a caller-owned limiter and clock, so
+/// focused tests do not share the process-wide window with other denials.
+pub(crate) fn warn_http_registry_deny_with(
+    limiter: &AtomicLogRateLimiter,
+    now_ms: u64,
+    host: Option<&str>,
+    port: Option<u16>,
+    listen_port: Option<u16>,
+    client_ip: &str,
+    source: &'static str,
+) {
+    let Some(suppressed) = limiter.on_event(now_ms) else {
         return;
     };
     let host = host.filter(|host| !host.is_empty()).map(bounded_log_host);

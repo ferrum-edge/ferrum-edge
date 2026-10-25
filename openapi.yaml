@@ -3421,7 +3421,12 @@ paths:
               properties:
                 host:
                   type: string
-                  description: Destination host (FQDN or short name). Required, non-empty.
+                  description: |
+                    Destination host (FQDN or short name). Required, non-empty.
+                    May embed a port using the data-plane grammar (decimal
+                    1–65535); an explicit `port` overrides it. Any other
+                    suffix (`:0`, `:+8080`) stays part of the host and the
+                    candidate is reported as `deny`.
                 port:
                   type: integer
                   minimum: 1
@@ -26035,7 +26040,10 @@ components:
             mesh auto-injection always uses it. `dns_suffix` matches any DNS
             name below the suffix (`a.b.example.com` too), like Envoy
             virtual-host domains and Istio's host matcher. The base domain
-            never matches either mode.
+            never matches either mode. In `dns_suffix` mode an authority
+            over 253 bytes or with an empty label never matches a wildcard,
+            and probing stops at the deepest configured suffix's label
+            count.
 
     MeshRouteDispatchConfig:
       type: object
