@@ -1091,7 +1091,7 @@ impl AdaptiveConcurrencyLimiter {
         f: impl FnOnce(&str) -> R,
     ) -> R {
         match key_by {
-            AdaptiveConcurrencyKeyBy::Backend => f(&*self.backend_scope),
+            AdaptiveConcurrencyKeyBy::Backend => f(&self.backend_scope),
             AdaptiveConcurrencyKeyBy::Upstream => UPSTREAM_SCOPE_SCRATCH.with(|slot| {
                 let mut scope = slot.take();
                 write_adaptive_concurrency_scope(
