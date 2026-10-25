@@ -3,7 +3,7 @@
 //! Tracks active TCP connections per proxy and observed identity:
 //! - authenticated consumer identity when a prior stream auth plugin set one
 //! - otherwise the canonical client IP address; native IPv6 sources are
-//!   grouped to `ipv6_prefix_length` (default `/64`, `128` = per host), while
+//!   grouped to `ipv6_prefix` (default `/64`, `128` = per host), while
 //!   IPv4 (including IPv4-mapped IPv6) stays per address
 //!
 //! Accounting is process-local. Each admitted connection owns an opaque permit
@@ -26,18 +26,17 @@ const MAX_CLEANUP_INTERVAL_SECONDS: u64 = 86_400;
 const DEFAULT_CLEANUP_INTERVAL_SECONDS: u64 = 60;
 /// Default IPv6 grouping for anonymous (IP-keyed) budgets: one `/64` is the
 /// conventional single-site allocation, so a host cannot mint fresh budgets by
-/// rotating addresses inside its own subnet.
-const DEFAULT_IPV6_PREFIX_LENGTH: u8 = 64;
-/// Shortest accepted prefix (widest grouping). Anything shorter than `/32`
-/// would fold whole provider allocations into one budget.
-const MIN_IPV6_PREFIX_LENGTH: u64 = 32;
-const MAX_IPV6_PREFIX_LENGTH: u64 = 128;
+/// rotating addresses inside its own subnet. Matches `rate_limiting`.
+const DEFAULT_IPV6_PREFIX: u8 = 64;
+/// Same range and wording as `rate_limiting`'s `ipv6_prefix`.
+const IPV6_PREFIX_ERROR: &str =
+    "tcp_connection_throttle: `ipv6_prefix` must be an integer from 1 through 128";
 
 /// Effective configuration after parsing and defaulting.
 struct ParsedConfig {
     max_connections_per_key: u64,
     cleanup_interval_seconds: u64,
-    ipv6_prefix_length: u8,
+    ipv6_prefix: u8,
 }
 
 struct ConnectionCounter {
@@ -185,7 +184,7 @@ impl Drop for TcpConnectionThrottleState {
 pub struct TcpConnectionThrottle {
     max_connections_per_key: u64,
     cleanup_interval_seconds: u64,
-    ipv6_prefix_length: u8,
+    ipv6_prefix: u8,
     state: Arc<TcpConnectionThrottleState>,
 }
 
@@ -200,7 +199,7 @@ impl TcpConnectionThrottle {
         Ok(Self {
             max_connections_per_key: parsed.max_connections_per_key,
             cleanup_interval_seconds: parsed.cleanup_interval_seconds,
-            ipv6_prefix_length: parsed.ipv6_prefix_length,
+            ipv6_prefix: parsed.ipv6_prefix,
             state,
         })
     }
@@ -213,7 +212,7 @@ impl TcpConnectionThrottle {
         Ok(Self {
             max_connections_per_key: parsed.max_connections_per_key,
             cleanup_interval_seconds: parsed.cleanup_interval_seconds,
-            ipv6_prefix_length: parsed.ipv6_prefix_length,
+            ipv6_prefix: parsed.ipv6_prefix,
             state,
         })
     }
@@ -248,7 +247,7 @@ impl TcpConnectionThrottle {
             None => {
                 let canonical_ip = crate::util::client_identity::rate_limit_client_ip_string(
                     &ctx.client_ip,
-                    self.ipv6_prefix_length,
+                    self.ipv6_prefix,
                 )
                 .unwrap_or_else(|| ctx.client_ip.clone());
                 let mut key = String::with_capacity(
@@ -284,24 +283,19 @@ fn parse_config(config: &Value) -> Result<ParsedConfig, String> {
             "tcp_connection_throttle: `cleanup_interval_seconds` must be at most {MAX_CLEANUP_INTERVAL_SECONDS}"
         ));
     }
-    let ipv6_prefix_length = match parse_optional_u64(object, "ipv6_prefix_length")? {
-        None => DEFAULT_IPV6_PREFIX_LENGTH,
-        Some(value) => u8::try_from(value)
-            .ok()
-            .filter(|prefix| {
-                (MIN_IPV6_PREFIX_LENGTH..=MAX_IPV6_PREFIX_LENGTH).contains(&u64::from(*prefix))
-            })
-            .ok_or_else(|| {
-                format!(
-                    "tcp_connection_throttle: `ipv6_prefix_length` must be between {MIN_IPV6_PREFIX_LENGTH} and {MAX_IPV6_PREFIX_LENGTH}"
-                )
-            })?,
+    let ipv6_prefix = match object.get("ipv6_prefix") {
+        None => DEFAULT_IPV6_PREFIX,
+        Some(value) => value
+            .as_u64()
+            .and_then(|prefix| u8::try_from(prefix).ok())
+            .filter(|prefix| (1..=128).contains(prefix))
+            .ok_or_else(|| IPV6_PREFIX_ERROR.to_string())?,
     };
     reject_unknown_fields(object)?;
     Ok(ParsedConfig {
         max_connections_per_key,
         cleanup_interval_seconds,
-        ipv6_prefix_length,
+        ipv6_prefix,
     })
 }
 
@@ -312,7 +306,7 @@ fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), 
         .filter(|field| {
             !matches!(
                 *field,
-                "max_connections_per_key" | "cleanup_interval_seconds" | "ipv6_prefix_length"
+                "max_connections_per_key" | "cleanup_interval_seconds" | "ipv6_prefix"
             )
         })
         .collect();

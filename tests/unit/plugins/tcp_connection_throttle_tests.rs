@@ -562,20 +562,19 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
 }
 
 #[test]
-fn ipv6_prefix_length_is_validated_to_the_documented_range() {
-    for accepted in [32, 48, 64, 96, 128] {
+fn ipv6_prefix_is_validated_like_rate_limiting() {
+    for accepted in [1, 32, 48, 64, 96, 128] {
         assert!(
             make_plugin(&json!({
                 "max_connections_per_key": 1,
-                "ipv6_prefix_length": accepted
+                "ipv6_prefix": accepted
             }))
             .is_ok(),
-            "ipv6_prefix_length {accepted} must be admitted"
+            "ipv6_prefix {accepted} must be admitted"
         );
     }
     for rejected in [
         json!(0),
-        json!(31),
         json!(129),
         json!(256),
         json!(-1),
@@ -585,12 +584,17 @@ fn ipv6_prefix_length_is_validated_to_the_documented_range() {
     ] {
         let error = match make_plugin(&json!({
             "max_connections_per_key": 1,
-            "ipv6_prefix_length": rejected.clone()
+            "ipv6_prefix": rejected.clone()
         })) {
-            Ok(_) => panic!("ipv6_prefix_length {rejected} must be rejected"),
+            Ok(_) => panic!("ipv6_prefix {rejected} must be rejected"),
             Err(error) => error,
         };
-        assert!(error.contains("ipv6_prefix_length"), "{error}");
+        assert!(
+            error.contains(
+                "tcp_connection_throttle: `ipv6_prefix` must be an integer from 1 through 128"
+            ),
+            "{rejected}: same range and wording as rate_limiting, got {error}"
+        );
     }
 }
 
@@ -600,7 +604,7 @@ fn ipv6_prefix_length_is_validated_to_the_documented_range() {
 async fn same_slash_64_ipv6_hosts_share_by_default_and_split_at_128() {
     for config in [
         json!({"max_connections_per_key": 1}),
-        json!({"max_connections_per_key": 1, "ipv6_prefix_length": 64}),
+        json!({"max_connections_per_key": 1, "ipv6_prefix": 64}),
     ] {
         let plugin = make_plugin(&config).unwrap();
         let mut first = make_ctx("tcp-proxy", "2001:db8:abcd:12::1", None);
@@ -629,7 +633,7 @@ async fn same_slash_64_ipv6_hosts_share_by_default_and_split_at_128() {
 
     let per_host = make_plugin(&json!({
         "max_connections_per_key": 1,
-        "ipv6_prefix_length": 128
+        "ipv6_prefix": 128
     }))
     .unwrap();
     let mut first = make_ctx("tcp-proxy", "2001:db8:abcd:12::1", None);
@@ -671,7 +675,7 @@ async fn nat64_clients_follow_the_configured_ipv6_grouping() {
 
     let per_host = make_plugin(&json!({
         "max_connections_per_key": 1,
-        "ipv6_prefix_length": 128
+        "ipv6_prefix": 128
     }))
     .unwrap();
     let mut first = make_ctx("tcp-proxy", "64:ff9b::c000:201", None);
@@ -689,11 +693,11 @@ async fn nat64_clients_follow_the_configured_ipv6_grouping() {
 /// IPv4 stays per address and IPv4-mapped IPv6 still folds onto it, whatever
 /// the IPv6 grouping: the prefix applies to native IPv6 only.
 #[tokio::test]
-async fn ipv6_prefix_length_never_groups_ipv4_or_mapped_ipv4() {
-    for prefix in [32, 64, 128] {
+async fn ipv6_prefix_never_groups_ipv4_or_mapped_ipv4() {
+    for prefix in [1, 32, 64, 128] {
         let plugin = make_plugin(&json!({
             "max_connections_per_key": 1,
-            "ipv6_prefix_length": prefix
+            "ipv6_prefix": prefix
         }))
         .unwrap();
         let mut native = make_ctx("tcp-proxy", "192.0.2.10", None);
@@ -728,7 +732,7 @@ async fn ipv6_prefix_length_never_groups_ipv4_or_mapped_ipv4() {
 async fn ipv6_grouped_keys_release_exactly_the_admitted_slot() {
     let per_host = make_plugin(&json!({
         "max_connections_per_key": 1,
-        "ipv6_prefix_length": 128,
+        "ipv6_prefix": 128,
         "cleanup_interval_seconds": 0
     }))
     .unwrap();
