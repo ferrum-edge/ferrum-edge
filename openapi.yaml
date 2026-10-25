@@ -35873,7 +35873,9 @@ components:
             TGI `parameters.best_of`. `max_tokens_limit` bounds tokens per
             completion, so the worst case per request is `max_choices` ×
             `max_tokens_limit`. A larger or non-integer value is rejected with
-            HTTP 400. Unsigned 64-bit integer; `0` is accepted.
+            HTTP 400. A request that omits the count (or sends `0`) is
+            counted as the provider default of one completion, so `0` refuses
+            every request. Unsigned 64-bit integer.
         supported_schema:
           type: string
           enum: [chat_completions, responses, provider_native, bedrock_converse, auto]

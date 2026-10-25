@@ -4550,7 +4550,7 @@ async fn duplicate_members_are_rejected_before_policy_evaluation() {
         r#"{"model":"o3","model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#,
         r#"{"model":"gpt-4o-mini","max_tokens":64000,"max_tokens":100,"messages":[]}"#,
         // An escaped spelling of the same member name.
-        r#"{"model":"o3","model":"gpt-4o-mini","messages":[]}"#,
+        r#"{"model":"o3","mod\u0065l":"gpt-4o-mini","messages":[]}"#,
         // A duplicate under any nested object is ambiguous too.
         r#"{"model":"gpt-4o-mini","messages":[],"metadata":{"a":1,"a":2}}"#,
     ] {
@@ -5584,4 +5584,134 @@ fn review_config_additions_agree_with_the_published_component() {
     let refused = json!({"supported_schema": "bedrock", "max_messages": 1});
     assert!(AiRequestGuard::new(&refused).is_err());
     assert!(!validator.is_valid(&refused));
+}
+
+// ─── PR #6849 review round 1 ────────────────────────────────────────────
+
+/// PR6849-SOL-1: a ProtoJSON parser maps both spellings onto one proto field
+/// and clears it on a trailing `null`, so a `null` alias beside a numeric cap
+/// is ambiguous and must be refused rather than read as "absent".
+#[tokio::test]
+async fn null_protojson_alias_beside_a_cap_is_rejected_as_ambiguous() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 128,
+        "default_max_tokens": 128,
+        "supported_schema": "provider_native",
+        "strict_schema": true
+    }))
+    .unwrap();
+    let contents = r#""contents":[{"role":"user","parts":[{"text":"Write a long article"}]}]"#;
+    for config in [
+        r#""generationConfig":{"maxOutputTokens":128,"max_output_tokens":null}"#,
+        r#""generationConfig":{"max_output_tokens":null,"maxOutputTokens":128}"#,
+        r#""generation_config":{"max_output_tokens":128,"maxOutputTokens":null}"#,
+        r#""generation_config":{"maxOutputTokens":null,"max_output_tokens":128}"#,
+        r#""generationConfig":{"maxOutputTokens":128},"generation_config":null"#,
+        r#""generation_config":null,"generationConfig":{"maxOutputTokens":128}"#,
+        r#""generation_config":{"max_output_tokens":128},"generationConfig":null"#,
+    ] {
+        let raw = format!("{{{contents},{config}}}");
+        let (mut ctx, mut headers) = make_raw_post_ctx(&raw, Some("application/json"));
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Conflicting field spellings",
+        );
+        assert_eq!(decision(&ctx), (Some("reject"), Some("conflicting_fields")));
+
+        // A later transform that introduces the null alias is refused too.
+        let mut final_ctx = admitted_final_ctx(&plugin);
+        assert_reject_error(
+            plugin
+                .on_final_request_body_with_context(&mut final_ctx, &headers, raw.as_bytes())
+                .await,
+            400,
+            "Conflicting field spellings",
+        );
+    }
+
+    // The same request with one spelling is admitted with the cap intact.
+    let clean = format!("{{{contents},\"generationConfig\":{{\"maxOutputTokens\":128}}}}");
+    let (mut ctx, mut headers) = make_raw_post_ctx(&clean, Some("application/json"));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let mut final_ctx = admitted_final_ctx(&plugin);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut final_ctx, &headers, clean.as_bytes())
+            .await,
+    );
+
+    // A null completion-count alias is ambiguous in the same way.
+    let choices = AiRequestGuard::new(&json!({"max_choices": 4})).unwrap();
+    let raw = format!(
+        "{{{contents},\"generationConfig\":{{\"candidateCount\":1,\"candidate_count\":null}}}}"
+    );
+    let (mut ctx, mut headers) = make_raw_post_ctx(&raw, Some("application/json"));
+    assert_reject_error(
+        choices.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Conflicting field spellings",
+    );
+}
+
+/// A single `null` spelling is not ambiguous: it is "unset", and the default
+/// cap replaces it under the client's own spelling (never beside it).
+#[tokio::test]
+async fn single_null_cap_spelling_is_replaced_in_place_by_the_default() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 128})).unwrap();
+    let body = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"max_output_tokens":null}}"#;
+    let transformed = transform_post_json(&plugin, body)
+        .await
+        .expect("a null cap is replaced by the default");
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["generationConfig"]["max_output_tokens"], 128);
+    assert!(
+        transformed["generationConfig"]
+            .get("maxOutputTokens")
+            .is_none(),
+        "injecting the other spelling would make the null alias ambiguous"
+    );
+}
+
+/// PR6849-SOL-2: `max_choices: 0` refuses every request, including one that
+/// relies on the provider's implicit single completion.
+#[tokio::test]
+async fn zero_max_choices_refuses_implicit_and_explicit_single_completions() {
+    let plugin = AiRequestGuard::new(&json!({"max_choices": 0})).unwrap();
+    let user = json!([{"role": "user", "content": "hi"}]);
+    for body in [
+        json!({"model": "m", "messages": user}),
+        json!({"model": "m", "messages": user, "n": null}),
+        json!({"model": "m", "messages": user, "n": 0}),
+        json!({"model": "m", "messages": user, "n": 1}),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Too many completions requested",
+        );
+
+        let mut final_ctx = admitted_final_ctx(&plugin);
+        let encoded = serde_json::to_vec(&body).unwrap();
+        assert_reject_error(
+            plugin
+                .on_final_request_body_with_context(&mut final_ctx, &headers, &encoded)
+                .await,
+            400,
+            "Too many completions requested",
+        );
+    }
+
+    // `max_choices: 1` admits the implicit and explicit single completion.
+    let one = AiRequestGuard::new(&json!({"max_choices": 1})).unwrap();
+    for body in [
+        json!({"model": "m", "messages": user}),
+        json!({"model": "m", "messages": user, "n": 1}),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_continue(one.before_proxy(&mut ctx, &mut headers).await);
+    }
 }

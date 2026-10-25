@@ -460,10 +460,17 @@ fn max_integer_control(
 /// Gemini ProtoJSON fields that are spelled more than once. ProtoJSON maps both
 /// spellings onto one proto field, so a body that carries both is ambiguous: the
 /// guard cannot know which one the backend applies, and it fails closed.
+///
+/// Presence is key existence, deliberately including JSON `null`: a ProtoJSON
+/// parser that applies the spellings in order clears the field on a trailing
+/// `null` (`{"maxOutputTokens": 128, "max_output_tokens": null}`), so a null
+/// alias would silently remove the cap the guard evaluated or required. A
+/// single `null` spelling on its own is not ambiguous and stays eligible for
+/// ordinary default replacement.
 fn gemini_spelling_conflict(json: &Value) -> Option<&'static str> {
     if GEMINI_GENERATION_CONTAINERS
         .iter()
-        .all(|container| is_present_value(json.get(*container)))
+        .all(|container| json.get(*container).is_some())
     {
         return Some("generationConfig / generation_config");
     }
@@ -473,13 +480,13 @@ fn gemini_spelling_conflict(json: &Value) -> Option<&'static str> {
         };
         if GEMINI_MAX_OUTPUT_FIELDS
             .iter()
-            .all(|field| is_present_value(config.get(*field)))
+            .all(|field| config.get(*field).is_some())
         {
             return Some("maxOutputTokens / max_output_tokens");
         }
         if GEMINI_CANDIDATE_COUNT_FIELDS
             .iter()
-            .all(|field| is_present_value(config.get(*field)))
+            .all(|field| config.get(*field).is_some())
         {
             return Some("candidateCount / candidate_count");
         }
@@ -931,9 +938,14 @@ impl AiRequestGuard {
                         )
                     },
                 )?;
-            if let Some(requested) = requested
-                && requested > max_choices
-            {
+            // Every request that generates output asks for at least one
+            // completion: an omitted count is the provider default of one, and
+            // an explicit `0` is not a valid "no output" request (providers
+            // refuse or treat it as one). Counting both as one makes
+            // `max_choices: 0` refuse every request rather than admit an
+            // implicit single completion.
+            let requested = requested.unwrap_or(1).max(1);
+            if requested > max_choices {
                 return Err(PolicyRejection::new(
                     "max_choices_exceeded",
                     "Too many completions requested",
