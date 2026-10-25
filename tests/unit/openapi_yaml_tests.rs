@@ -14781,6 +14781,19 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     }
 }
 
+fn security_headers_set_of(count: usize) -> serde_json::Value {
+    let mut set = serde_json::Map::new();
+    for index in 0..count {
+        set.insert(format!("x-policy-{index}"), json!("on"));
+    }
+    json!({ "set": serde_json::Value::Object(set) })
+}
+
+fn security_headers_remove_of(count: usize) -> serde_json::Value {
+    let names: Vec<String> = (0..count).map(|index| format!("x-strip-{index}")).collect();
+    json!({ "remove": names })
+}
+
 #[test]
 fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
     use ferrum_edge::plugins::security_headers::SecurityHeaders;
@@ -14857,6 +14870,15 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({"set": {"x-content-type-options": "NOSNIFF"}}),
         json!({"set": {"REFERRER-POLICY": "no-referrer, same-origin"}}),
         json!({"frame_options": "DENY", "set": {"X-Frame-Options": "SAMEORIGIN"}}),
+        json!({"hsts": ""}),
+        json!({"hsts": "max-age=0"}),
+        json!({"hsts": " MAX-AGE = \"60\" ; includeSubDomains;preload; ext=\"a=b\" "}),
+        json!({"set": {"Strict-Transport-Security": "includeSubDomains; max-age=60"}}),
+        json!({"remove": ["vary", "server"]}),
+        json!({"content_security_policy": "a".repeat(8192)}),
+        json!({"set": {"X-Policy": "a".repeat(8192)}}),
+        security_headers_set_of(64),
+        security_headers_remove_of(64),
     ] {
         assert_component_validity(&spec, "SecurityHeadersConfig", &valid, true);
         SecurityHeaders::new(&valid).unwrap_or_else(|error| {
@@ -14874,6 +14896,28 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
         json!({"set": {"Trailer": "X-Checksum"}}),
         json!({"set": {"Transfer-Encoding": "chunked"}}),
         json!({"set": {"Upgrade": "websocket"}}),
+        json!({"set": {"Content-Type": "text/html"}}),
+        json!({"set": {"CONTENT-ENCODING": "gzip"}}),
+        json!({"set": {"content-range": "bytes 0-1/2"}}),
+        json!({"remove": ["Content-Type"]}),
+        json!({"remove": ["content-encoding"]}),
+        json!({"remove": ["Content-Length"]}),
+        json!({"remove": ["Transfer-Encoding"]}),
+        json!({"hsts": " "}),
+        json!({"hsts": "includeSubDomains; preload"}),
+        json!({"hsts": "maxage=31536000"}),
+        json!({"hsts": "max-age="}),
+        json!({"hsts": "max-age=1; max-age=2"}),
+        json!({"hsts": "max-age=60; includeSubDomains; includeSubDomains"}),
+        json!({"hsts": "max-age=60; includeSubDomains=1"}),
+        json!({"hsts": "max-age=60; ext=a=b"}),
+        json!({"set": {"strict-transport-security": "preload"}}),
+        json!({"set": {"Strict-Transport-Security": ""}}),
+        json!({"content_security_policy": "a".repeat(8193)}),
+        json!({"permissions_policy": "a".repeat(8193)}),
+        json!({"set": {"X-Policy": "a".repeat(8193)}}),
+        security_headers_set_of(65),
+        security_headers_remove_of(65),
         json!({"content_type_options": "nosnif"}),
         json!({"content_type_options": " "}),
         json!({"frame_options": "SAMEORGIN"}),

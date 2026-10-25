@@ -5509,7 +5509,13 @@ Post-routing gateway-generated initial HEADERS use the same precomputed policy
 slice: this includes plain HTTP method-filter responses and native-gRPC method,
 deadline, size-limit, backend-unavailable, and mesh fail-closed errors across
 H1/H2/H3 frontends. Protocol-owned gRPC status/message/content type and
-Content-Length/transfer framing remain authoritative. Pre-routing errors such
+Content-Length/transfer framing remain authoritative. The fixed H1/H2 `401`
+an authorization-lifetime expiry selects before the response head commits
+(including one selected after the response hooks already ran) is rebuilt with
+the same static policy; its JSON `Content-Type` is re-asserted afterwards, a
+policy that removes (or malforms) its `WWW-Authenticate` challenge gets the
+reauthentication challenge back, and no header from the protected response
+survives. Pre-routing errors such
 as overload, malformed request, 0-RTT, and route-miss responses have no resolved
 plugin configuration and do not apply route policy.
 
@@ -5523,18 +5529,32 @@ than horizontal tab, DEL, and non-ASCII characters are rejected. Invalid-name
 diagnostics identify the `set` or `remove` entry and render at most 96 escaped
 bytes of the hostile name before a truncation marker.
 
-`set` additionally **rejects protocol-managed hop-by-hop and framing
-destinations** at construction — `Connection`, `Content-Length`, `Keep-Alive`,
-`Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
-`Transfer-Encoding`, and `Upgrade`, case-insensitively, so `Content-Length`,
-`CONTENT-LENGTH`, and `content-length` all fail identically. This plugin
-writes in the response band, i.e. after the backend hop-by-hop strip and
-before the gateway's [final response framing](#final-response-framing)
-boundary, so a `Content-Length` configured here would be a length the gateway
-cannot verify against the bytes it is about to write. The diagnostic names the
-offending `set.<name>` entry using the canonical lowercase field name.
-`remove` of those same names remains allowed and is a no-op after the origin
-strip; use it when the intent is to drop the field rather than author one.
+`set` and `remove` **reject gateway-owned destinations** at construction,
+case-insensitively, so `Content-Length`, `CONTENT-LENGTH`, and
+`content-length` all fail identically:
+
+- protocol-managed hop-by-hop and framing fields — `Connection`,
+  `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`,
+  `TE`, `Trailer`, `Transfer-Encoding`, and `Upgrade`. This plugin writes in
+  the response band, i.e. after the backend hop-by-hop strip and before the
+  gateway's [final response framing](#final-response-framing) boundary, so a
+  `Content-Length` configured here would be a length the gateway cannot verify
+  against the bytes it is about to write, and removing one is a no-op that
+  boundary re-derives;
+- representation metadata — `Content-Type`, `Content-Encoding`, and
+  `Content-Range`. Content-type-selective body inspection (`waf`,
+  `body_validator`, AI response guards), compression, and range handling
+  decide from the backend's representation before this plugin runs, so a
+  relabel (or a removal that invites browser sniffing) would let a body those
+  decisions released under one type reach the client as another.
+
+The diagnostic names the offending `set.<name>` or `remove` entry using the
+canonical lowercase field name.
+
+`set` holds at most 64 entries and `remove` at most 64 names; every configured
+value (built-in strings, `hsts`, `content_security_policy`,
+`permissions_policy`, and `set` values) is at most 8192 bytes, because each one
+is emitted on every response the policy covers.
 
 **Priority:** 4080
 
@@ -5543,16 +5563,18 @@ strip; use it when the intent is to drop the field rather than author one.
 | `content_type_options` | bool/string/null | `true` | Sets `X-Content-Type-Options`; `true` uses `nosniff`, `false`/`null`/`""` disables it. A string must be `nosniff`. |
 | `frame_options` | bool/string/null | `true` | Sets `X-Frame-Options`; `true` uses `SAMEORIGIN`, `false`/`null`/`""` disables it. A string must be `DENY` or `SAMEORIGIN`. |
 | `referrer_policy` | bool/string/null | `true` | Sets `Referrer-Policy`; `true` uses `strict-origin-when-cross-origin`, `false`/`null`/`""` disables it. A string must be one Referrer-Policy token or a comma-separated list of them: `no-referrer`, `no-referrer-when-downgrade`, `origin`, `origin-when-cross-origin`, `same-origin`, `strict-origin`, `strict-origin-when-cross-origin`, `unsafe-url`. |
-| `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, `false`/`null`/`""` disables, or an object may set `max_age` (non-negative unsigned 64-bit integer, default `31536000`; `null` selects the default), `include_subdomains` (bool, default `true`; `null` selects the default), and `preload` (bool, default `false`; `null` selects the default). |
+| `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim and must be a value browsers honor (exactly one `max-age=<seconds>`, see below), `false`/`null`/`""` disables, or an object may set `max_age` (non-negative unsigned 64-bit integer, default `31536000`; `null` selects the default), `include_subdomains` (bool, default `true`; `null` selects the default), and `preload` (bool, default `false`; `null` selects the default). |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar except protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive), which are rejected at construction. Values must pass downstream HTTP header-value validation. A `set` entry for `X-Content-Type-Options`, `X-Frame-Options` or `Referrer-Policy` (any case) must use a value the matching built-in option accepts; an empty value is rejected. |
-| `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
-| `override_existing` | bool or null | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. `null` selects `true`. |
+| `set` | object/null | `{}` | Additional headers to set, at most 64. Names accept the complete HTTP field-name grammar except the gateway-owned destinations above (protocol-managed hop-by-hop / framing fields and `Content-Type` / `Content-Encoding` / `Content-Range`), which are rejected at construction. Values must pass downstream HTTP header-value validation and are at most 8192 bytes. A `set` entry for `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` or `Strict-Transport-Security` (any case) must use a value the matching built-in option accepts; an empty value is rejected. |
+| `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively, at most 64; the gateway-owned destinations above are rejected. `null` disables built-in removals. |
+| `override_existing` | bool or null | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added — except that a backend copy of a built-in security header (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Strict-Transport-Security`, `Content-Security-Policy`, `Permissions-Policy`) that browsers ignore entirely counts as missing, and every case variant is replaced by the configured value. The check follows browser processing, not the stricter admission rules: an empty value, a lone `ALLOW-FROM …` or `ALLOWALL`, an `X-Content-Type-Options` whose first value is not `nosniff`, a `Referrer-Policy` with no known token, or an HSTS value without exactly one valid `max-age` is replaced, while any value a browser acts on — comma-folded `DENY, DENY` or `DENY, SAMEORIGIN` (still blocks framing), `no-referrer, future-policy` (the known token wins), `max-age=60; preload; preload` — is kept even when it differs from the configured default. When several spellings are present, one effective copy keeps them all. Arbitrary `set` headers keep pure presence semantics. `null` selects `true`. |
 
 `config` must be an object. Disabling the three built-in headers (`false`/`null`/`""`) while leaving HSTS/CSP/Permissions-Policy unset, `set` empty, and `remove` `[]` or `null` is rejected — the plugin would set and remove nothing.
 
 Custom `content_type_options`, `frame_options` and `referrer_policy` strings, and `set` entries for the same three headers, are checked against the tokens browsers recognize (ASCII case-insensitive, surrounding spaces and tabs allowed). A browser ignores any other value, so a typo such as `SAMEORGIN` would otherwise drop the protection without any error.
+
+An `hsts` string, and a `set` entry for `Strict-Transport-Security`, must be a value browsers honor (RFC 6797 §6.1): exactly one `max-age=<delta-seconds>` directive (the digits may be quoted), at most one valueless `includeSubDomains`, and any other `;`-separated directive (`preload`, extensions) a token with an optional token or quoted value; quoted values may not contain `"`, `\`, or `;`. Directive names compare ASCII case-insensitively and may carry surrounding spaces or tabs. A user agent ignores the whole field otherwise, so `includeSubDomains; preload`, `maxage=31536000`, or a bare space used to load and then provide no downgrade protection; they now fail config admission.
 
 ```yaml
 config:
