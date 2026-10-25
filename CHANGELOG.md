@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `serverless_function` tightens Lambda error handling, AWS
+  credential admission, and its timeout/response ceilings** (issue/PR #6843). A
+  non-2xx AWS Lambda Invoke API status (throttling, access denied, a missing
+  function, an oversized payload, a service fault) is now an invocation
+  failure with the fixed class `lambda_service_error` in every mode, so
+  `on_error` / `error_status_code` apply and the AWS error body — which names
+  ARNs and account ids — is never returned; terminate mode previously passed
+  it to the client verbatim and native gRPC terminate refused it as malformed
+  output. `aws_access_key_id` and `aws_session_token` (config or environment)
+  must be HTTP field values, `timeout_ms` is limited to 1–900000 and
+  `max_response_body_bytes` to 1–67108864 (64 MiB), and a repeated
+  `forward_headers` name is forwarded once.
+- **`serverless_function` can sign with the workload identity and speak the
+  API Gateway proxy contract** (issue/PR #6843). `aws_credentials: default_chain`
+  (builds with `secrets-aws` / `cloud-secrets`) signs Lambda invocations with
+  the AWS SDK default chain — EKS IRSA, ECS task roles, EC2 instance profiles,
+  profiles, environment — cached lock-free and refreshed in the background
+  before expiry, under the same official-endpoint scope as process-environment
+  credentials. `payload_format: aws_api_gateway_v2` (terminate mode) sends an
+  API Gateway HTTP API payload format 2.0 event and maps the
+  proxy-integration result (`statusCode`, `headers`, `multiValueHeaders`,
+  `cookies`, `body`, `isBase64Encoded`). The invocation payload is now
+  serialized directly from the request without intermediate copies.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
