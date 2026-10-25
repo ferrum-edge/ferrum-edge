@@ -5989,6 +5989,25 @@ fn is_global_plugin_instance(plugin: &Arc<dyn Plugin>, globals: &[Arc<dyn Plugin
         .any(|global| std::ptr::eq(Arc::as_ptr(global) as *const (), instance))
 }
 
+/// Global `stdout_logging` instances a route-miss summary is delivered to.
+///
+/// Keyed on the registered built-in type, never the reported name, so a custom
+/// plugin reporting `stdout_logging` is not handed proxy-less summaries. An
+/// instance with an execution trigger is skipped: nothing evaluated its
+/// trigger for a request that never reached a plugin phase.
+fn collect_unrouted_transaction_log_plugins(globals: &[Arc<dyn Plugin>]) -> Option<PluginList> {
+    let sinks: Vec<Arc<dyn Plugin>> = globals
+        .iter()
+        .filter(|plugin| {
+            is_builtin_named(plugin, "stdout_logging")
+                && !plugin.has_execution_trigger()
+                && plugin.supported_protocols().contains(&ProxyProtocol::Http)
+        })
+        .cloned()
+        .collect();
+    (!sinks.is_empty()).then(|| Arc::new(sinks))
+}
+
 fn build_protocol_entry(
     plugins: &[Arc<dyn Plugin>],
     globals: &[Arc<dyn Plugin>],
@@ -6344,6 +6363,12 @@ pub(crate) struct PluginCacheInner {
     pub(crate) proxy_plugins: ProxyPluginMap,
     /// Fallback: global plugins only (for proxies with no scoped overrides).
     global_plugins: PluginList,
+    /// Global `stdout_logging` instances without an execution trigger, in
+    /// configured order: the access logs a request that matched no proxy
+    /// (route-miss `404`) is delivered to. `None` when there are none, so the
+    /// route-miss arm pays one pointer check and nothing else. Trigger-gated
+    /// instances are excluded because no request hook evaluated their trigger.
+    unrouted_transaction_log_plugins: Option<PluginList>,
     /// Pre-computed: does any plugin for this proxy require response body buffering?
     requires_buffering: BufferingMap,
     /// Whether global-only plugins require response body buffering (fallback).
@@ -6546,9 +6571,12 @@ impl PluginCacheInner {
             crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter,
         >,
     ) -> Self {
+        let unrouted_transaction_log_plugins =
+            collect_unrouted_transaction_log_plugins(global_plugins.as_slice());
         Self {
             proxy_plugins,
             global_plugins,
+            unrouted_transaction_log_plugins,
             requires_buffering,
             global_requires_buffering,
             requires_request_buffering,
@@ -6659,6 +6687,14 @@ impl PluginCacheInner {
     #[inline]
     pub(crate) fn node_waypoint_destination_authz_ready(&self) -> bool {
         self.protocol_snapshot.node_waypoint_destination_authz_ready
+    }
+
+    /// Global access logs for a request that matched no proxy, or `None` when
+    /// this generation has none. Precomputed at cache construction; an
+    /// `Arc` clone on a route miss, nothing when no global logger exists.
+    #[inline]
+    pub(crate) fn unrouted_transaction_log_plugins(&self) -> Option<Arc<Vec<Arc<dyn Plugin>>>> {
+        self.unrouted_transaction_log_plugins.clone()
     }
 
     fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
@@ -7642,6 +7678,18 @@ impl PluginCache {
     pub fn grpc_web_request_view(&self, namespace: &str, proxy_id: &str) -> PluginCacheRequestView {
         let inner = self.inner.load();
         inner.grpc_web_request_view(namespace, proxy_id)
+    }
+
+    /// Global access logs a request that matched no proxy is delivered to
+    /// (route-miss `404`), in configured order; empty when the published
+    /// generation has none.
+    #[allow(dead_code)] // Inspection API for external tests; the proxy reads the epoch's inner cache.
+    pub fn unrouted_transaction_log_plugins(&self) -> Vec<Arc<dyn Plugin>> {
+        self.inner
+            .load()
+            .unrouted_transaction_log_plugins()
+            .map(|plugins| plugins.to_vec())
+            .unwrap_or_default()
     }
 
     /// Atomically rebuild the cache when config changes. Most old plugin

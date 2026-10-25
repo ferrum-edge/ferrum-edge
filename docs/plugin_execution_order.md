@@ -186,8 +186,14 @@ Request In
 `on_request_received` is therefore a post-route, post-allowed-method hook, not
 a pre-routing receipt hook. Once it runs, `ctx.matched_proxy` is populated and
 the plugin list is the resolved view for that proxy: applicable global plugins
-plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run neither
-global nor scoped hooks because there is no proxy view to select. Matched 405
+plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run no
+ordinary request hook, global or scoped, because there is no proxy view to
+select. They do emit one terminal transaction summary to every global
+`stdout_logging` instance that carries no execution trigger (no proxy,
+backend, or consumer; `metadata.rejection_phase = "route_not_found"`), on
+HTTP/1.1, HTTP/2, and HTTP/3 alike, so scanner and stale-route traffic reaches
+the access log. Other sinks and trigger-gated instances do not receive it, and a
+generation with no such logger keeps the allocation-free route-miss path. Matched 405
 responses also return before either kind of ordinary request hook runs, but
 they still emit one terminal transaction summary from the protocol-filtered
 plugin-cache view (`metadata.rejection_phase = "allowed_methods"`) without
@@ -205,10 +211,12 @@ A matched request using a different method is rejected at its protocol
 admission gate before either kind of hook, even if `allowed_methods` permits
 that method. H1, H2, and H3 share the ordinary-hook blind spots for unmatched
 404 and gRPC non-POST admission; matched-proxy `allowed_methods` 405 responses
-are included in transaction logs. Unmatched-route 404s (and mesh
-`REGISTRY_ONLY` route-miss refusals) are still counted on `/metrics` by the
-shared route-miss path as `ferrum_unmatched_requests_total`, independent of any
-plugin. Terminal transaction logging is separate from
+are included in transaction logs, unmatched 404 responses reach global
+`stdout_logging` as described above, and gRPC non-POST refusals are not yet
+logged. Unmatched-route 404s (and mesh `REGISTRY_ONLY` route-miss refusals) are
+also counted on `/metrics` by the shared route-miss path as
+`ferrum_unmatched_requests_total`, independent of any plugin. Terminal
+transaction logging is separate from
 ordinary request hooks; whether a terminal summary exists must not be inferred
 from whether `on_request_received` ran.
 

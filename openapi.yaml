@@ -21024,10 +21024,13 @@ components:
     AccessLogFilterExpression:
       description: >-
         Bounded boolean predicate tree for stdout logging. Runtime validation
-        rejects trees larger than 32 nodes. This form is mutually exclusive
-        with the flat stdout filter predicates. Status-code nodes evaluate
-        false for stream summaries, which do not carry an HTTP status; duration
-        and error nodes continue to evaluate against stream fields.
+        rejects trees larger than 32 nodes, and any `and` conjunction whose own
+        status atoms can never all hold (a `status_code_min` above a
+        `status_code_max`), wherever it appears in the tree. This form is
+        mutually exclusive with the flat stdout filter predicates. Status-code
+        nodes evaluate false for stream summaries, which do not carry an HTTP
+        status; duration and error nodes continue to evaluate against stream
+        fields.
       oneOf:
         - type: object
           additionalProperties: false
@@ -21050,7 +21053,7 @@ components:
             value:
               type: integer
               minimum: 0
-              maximum: 65535
+              maximum: 999
         - type: object
           additionalProperties: false
           required: [op, value]
@@ -21072,7 +21075,7 @@ components:
     StdoutLoggingConfig:
       type: [object, "null"]
       additionalProperties: false
-      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application. `schema` and `schema_ref` are mutually exclusive. `filter.expression` is mutually exclusive with the flat filter keys (status_code_min, status_code_max, min_latency_ms, errors_only) by key presence, including `errors_only: false`."
+      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, sampling, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before sampling and schema application. `schema` and `schema_ref` are mutually exclusive. `filter.expression` is mutually exclusive with the flat filter keys (status_code_min, status_code_max, min_latency_ms, errors_only) by key presence, including `errors_only: false`. Registered KeepLastKnownGood: an invalid enabled config fails file-mode startup and is refused on reload (the previous generation keeps serving) rather than being omitted. A global instance without an execution trigger also logs route-miss 404s (no proxy; metadata.rejection_phase = route_not_found)."
       if:
         type: object
       then:
@@ -21100,12 +21103,12 @@ components:
             status_code_min:
               type: integer
               minimum: 0
-              maximum: 65535
+              maximum: 999
               description: HTTP responses with status < this value are skipped. Stream summaries (no HTTP status) are always skipped when any status_code_* bound is set.
             status_code_max:
               type: integer
               minimum: 0
-              maximum: 65535
+              maximum: 999
               description: HTTP responses with status > this value are skipped. Must be greater than or equal to status_code_min when both are set, otherwise plugin validation rejects the config.
             min_latency_ms:
               type: integer
@@ -21123,6 +21126,32 @@ components:
                 independent and must also match.
             expression:
               $ref: "#/components/schemas/AccessLogFilterExpression"
+        sampling:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [rate]
+          description: >-
+            Keep a deterministic, evenly spaced fraction of the records the
+            filter admits: exactly `rate` x 1,000,000 of every 1,000,000
+            candidate records per instance, counted across HTTP, stream, and
+            WebSocket session-end records. Skipped records are never
+            serialized. `null` disables sampling.
+          properties:
+            rate:
+              type: number
+              exclusiveMinimum: 0
+              maximum: 1
+              description: >-
+                Fraction of records to keep, resolved to whole records per
+                million; values that round to zero (below 0.0000005) are
+                rejected. `1` keeps every record.
+            always_log_errors:
+              type: boolean
+              default: false
+              description: >-
+                When true, terminal failures (the `errors_only` predicate for
+                HTTP-family records; `error_class` or `connection_error` for
+                streams) are always logged and do not consume a sample.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:

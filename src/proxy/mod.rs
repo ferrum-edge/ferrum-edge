@@ -25188,6 +25188,54 @@ pub async fn log_rejected_request(
     .await;
 }
 
+/// Deliver the terminal summary of a request that matched no proxy (the
+/// route-miss `404`) to the generation's global access logs
+/// (`PluginCacheInner::unrouted_transaction_log_plugins`).
+///
+/// Callers reach this only when such a logger exists, so the no-logger route
+/// miss keeps its allocation-free fast path. No request hook ran, so the
+/// summary has no proxy, backend, consumer, or plugin time; it carries
+/// `metadata.rejection_phase = "route_not_found"`. The routing diagnostic was
+/// already recorded by `record_route_miss`, so this does not record another.
+///
+/// `namespace` is the gateway's serving namespace (`FERRUM_NAMESPACE`), the
+/// only namespace a request that matched no proxy can be attributed to; never
+/// the resource-deserialization default.
+pub async fn log_unrouted_request(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    namespace: &str,
+    status_code: u16,
+    start_time: Instant,
+) {
+    let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+    let mut metadata = clone_log_metadata(ctx);
+    metadata.insert(
+        "rejection_phase".to_string(),
+        crate::diagnostic_ref::ROUTE_NOT_FOUND_PHASE.to_string(),
+    );
+    let summary = TransactionSummary {
+        namespace: namespace.to_owned(),
+        timestamp_received: ctx.timestamp_received.to_rfc3339(),
+        client_ip: ctx.client_ip.clone(),
+        http_method: ctx.method.clone(),
+        request_path: ctx.path.clone(),
+        response_status_code: status_code,
+        latency_total_ms: total_ms,
+        latency_gateway_processing_ms: total_ms,
+        latency_backend_ttfb_ms: -1.0,
+        latency_backend_total_ms: -1.0,
+        latency_gateway_overhead_ms: total_ms,
+        request_user_agent: ctx.headers.get("user-agent").cloned(),
+        bytes_sent: ctx
+            .bytes_sent_observed
+            .load(std::sync::atomic::Ordering::Acquire),
+        metadata,
+        ..TransactionSummary::default()
+    };
+    crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
+}
+
 /// Run logging plugins for a rejection that occurred before backend contact.
 ///
 /// The summary retains matched-proxy attribution but deliberately omits
@@ -35614,6 +35662,26 @@ async fn handle_proxy_request_inner(
                         response.status().as_u16(),
                     );
                     record_status(&state, response.status().as_u16());
+                    // Global access logs still record the miss (scanner and
+                    // stale-route traffic). Without one this stays the
+                    // allocation-free fast path: one pointer check. The
+                    // summary keeps the routing status (404) even when native
+                    // gRPC reshapes the head to trailers-only 200.
+                    if let Some(unrouted_log_plugins) =
+                        epoch.plugin_cache.unrouted_transaction_log_plugins()
+                    {
+                        ctx.materialize_headers();
+                        // Boxed: keep the logging future's state off the
+                        // request handler's (worker-stack) state machine.
+                        Box::pin(log_unrouted_request(
+                            &unrouted_log_plugins,
+                            &ctx,
+                            &state.env_config.namespace,
+                            StatusCode::NOT_FOUND.as_u16(),
+                            start_time,
+                        ))
+                        .await;
+                    }
                     return Ok(response);
                 }
             }

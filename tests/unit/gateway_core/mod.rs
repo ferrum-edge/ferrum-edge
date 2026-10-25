@@ -209,6 +209,7 @@ mod response_trailer_policy_tests;
 mod retry_tests;
 mod route_attempt_budget_tests;
 mod route_body_size_ceiling_tests;
+mod route_miss_logging_tests;
 mod route_request_deadline_tests;
 mod router_cache_tests;
 mod runtime_metrics_tests;

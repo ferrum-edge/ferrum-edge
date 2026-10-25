@@ -16,6 +16,10 @@ pub const MAX_ACCESS_LOG_FILTER_TOKENS: usize = 64;
 pub const MAX_ACCESS_LOG_FILTER_NESTING: usize = 16;
 /// Maximum AST nodes after canonicalization.
 pub const MAX_ACCESS_LOG_FILTER_AST_NODES: usize = 32;
+/// Largest status-code bound a filter accepts. A logged response status is a
+/// three-digit HTTP status or `0` (no response), so a larger bound could never
+/// match and is refused instead of silently disabling the access log.
+pub const MAX_ACCESS_LOG_FILTER_STATUS_CODE: u16 = 999;
 
 /// Canonical, serde-stable access-log filter expression tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +125,13 @@ pub fn evaluate_access_log_filter_expr_for_stream(
 /// configure `stdout_logging.filter.expression` directly. Keep that path under
 /// the same node ceiling so the recursive hot-path evaluator has a proven
 /// bound regardless of where the configuration originated.
+///
+/// Also refuses predicates no transaction can satisfy: a status-code bound
+/// above [`MAX_ACCESS_LOG_FILTER_STATUS_CODE`], and any `and` conjunction whose
+/// own status atoms require a lower bound above the upper bound (for example
+/// `status_code_min: 500 && status_code_max: 400`). Such a conjunction is dead
+/// wherever it appears, including under an `or`, so it is always a
+/// configuration error rather than an intentional "log nothing".
 pub fn validate_access_log_filter_expr(expr: &AccessLogFilterExpr) -> Result<(), String> {
     let mut pending = vec![expr];
     let mut node_count = 0usize;
@@ -137,13 +148,81 @@ pub fn validate_access_log_filter_expr(expr: &AccessLogFilterExpr) -> Result<(),
                 pending.push(right);
                 pending.push(left);
             }
-            AccessLogFilterExpr::StatusCodeMin { .. }
-            | AccessLogFilterExpr::StatusCodeMax { .. }
-            | AccessLogFilterExpr::MinLatencyMs { .. }
-            | AccessLogFilterExpr::ErrorsOnly {} => {}
+            AccessLogFilterExpr::StatusCodeMin { value }
+            | AccessLogFilterExpr::StatusCodeMax { value } => {
+                if *value > MAX_ACCESS_LOG_FILTER_STATUS_CODE {
+                    return Err(format!(
+                        "access log filter status-code bound must be between 0 and \
+                         {MAX_ACCESS_LOG_FILTER_STATUS_CODE}"
+                    ));
+                }
+            }
+            AccessLogFilterExpr::MinLatencyMs { .. } | AccessLogFilterExpr::ErrorsOnly {} => {}
         }
     }
-    Ok(())
+    // The node ceiling above bounds this recursion's depth.
+    reject_unsatisfiable_status_conjunctions(expr, false)
+}
+
+/// Refuse every maximal `and` chain whose direct status atoms cannot all hold.
+///
+/// `or` children of a chain are opaque here (they may still match), so only a
+/// provably dead conjunction is refused.
+fn reject_unsatisfiable_status_conjunctions(
+    expr: &AccessLogFilterExpr,
+    parent_is_and: bool,
+) -> Result<(), String> {
+    match expr {
+        AccessLogFilterExpr::And { left, right } => {
+            if !parent_is_and {
+                let mut min = None;
+                let mut max = None;
+                collect_conjunction_status_bounds(expr, &mut min, &mut max);
+                if let (Some(min), Some(max)) = (min, max)
+                    && min > max
+                {
+                    return Err(
+                        "access log filter conjunction can never match: its status_code_min \
+                         is greater than its status_code_max"
+                            .to_string(),
+                    );
+                }
+            }
+            reject_unsatisfiable_status_conjunctions(left, true)?;
+            reject_unsatisfiable_status_conjunctions(right, true)
+        }
+        AccessLogFilterExpr::Or { left, right } => {
+            reject_unsatisfiable_status_conjunctions(left, false)?;
+            reject_unsatisfiable_status_conjunctions(right, false)
+        }
+        AccessLogFilterExpr::StatusCodeMin { .. }
+        | AccessLogFilterExpr::StatusCodeMax { .. }
+        | AccessLogFilterExpr::MinLatencyMs { .. }
+        | AccessLogFilterExpr::ErrorsOnly {} => Ok(()),
+    }
+}
+
+/// Fold the status atoms reachable from `expr` through `and` nodes only.
+fn collect_conjunction_status_bounds(
+    expr: &AccessLogFilterExpr,
+    min: &mut Option<u16>,
+    max: &mut Option<u16>,
+) {
+    match expr {
+        AccessLogFilterExpr::And { left, right } => {
+            collect_conjunction_status_bounds(left, min, max);
+            collect_conjunction_status_bounds(right, min, max);
+        }
+        AccessLogFilterExpr::StatusCodeMin { value } => {
+            *min = Some(min.map_or(*value, |current| current.max(*value)));
+        }
+        AccessLogFilterExpr::StatusCodeMax { value } => {
+            *max = Some(max.map_or(*value, |current| current.min(*value)));
+        }
+        AccessLogFilterExpr::Or { .. }
+        | AccessLogFilterExpr::MinLatencyMs { .. }
+        | AccessLogFilterExpr::ErrorsOnly {} => {}
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +611,18 @@ fn flatten_and_only(expr: &AccessLogFilterExpr) -> Result<Option<AccessLogFilter
     for atom in atoms {
         apply_atom_to_filter(&mut filter, atom)?;
     }
+    // The flat fields are a conjunction too: the same dead-predicate refusal
+    // as `validate_access_log_filter_expr`, and the `stdout_logging` sink
+    // refuses the same shape, so no translated filter can fail its constructor.
+    if let (Some(min), Some(max)) = (filter.status_code_min, filter.status_code_max)
+        && min > max
+    {
+        return Err(
+            "Telemetry access log filter can never match: its response.code lower bound is \
+             greater than its upper bound"
+                .to_string(),
+        );
+    }
     Ok(Some(filter))
 }
 
@@ -646,9 +737,15 @@ fn merge_min_latency_ms(current: &mut Option<u64>, value: i64) -> Result<(), Str
 }
 
 fn status_code_value(value: i64) -> Result<u16, String> {
-    u16::try_from(value).map_err(|_| {
-        format!("Telemetry access log response code filter value \"{value}\" is outside 0..=65535")
-    })
+    u16::try_from(value)
+        .ok()
+        .filter(|code| *code <= MAX_ACCESS_LOG_FILTER_STATUS_CODE)
+        .ok_or_else(|| {
+            format!(
+                "Telemetry access log response code filter value \"{value}\" is outside \
+                 0..={MAX_ACCESS_LOG_FILTER_STATUS_CODE}"
+            )
+        })
 }
 
 fn duration_value(value: i64) -> Result<u64, String> {
