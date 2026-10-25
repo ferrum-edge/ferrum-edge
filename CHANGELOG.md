@@ -8,20 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `request_deduplication` caps live in-flight markers and moves
-  logical keys to `v7`** (issue #6818). New `max_inflight_entries` (default
-  `max_entries`) is a hard ceiling on live local in-flight markers, counted
-  exactly and reserved by one atomic compare-and-swap. Interrupted streamed
-  responses keep their marker until `inflight_ttl_seconds`, so a client
-  resetting fresh-key requests could previously grow retained markers without
-  bound. A new key past the cap now gets `503` (`Idempotency in-flight
-  capacity is saturated`) and any Redis ownership it acquired is released;
-  tracked keys still replay or conflict, live ownership is never evicted, and
-  execution barriers keep their own `max_entries` budget. A deployment that
-  set a small `max_entries` for completed retention but runs more concurrent
-  idempotent requests than that must raise `max_inflight_entries`. Logical
-  keys move from `v6:` to `v7:` (`ferrum-dedup-logical-v7`): entries keyed
-  under `v6` are not reachable after the upgrade.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -153,30 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`request_deduplication` hardening from the production-launch review.**
-  - A route response-header policy (a `mesh_route_dispatch`
-    `response_transform`) is no longer part of the logical key. Reloading only
-    that policy used to address a fresh key, so an identical retry of a
-    completed payment executed again within its TTL. The policy is now bound
-    into the request fingerprint: an unchanged policy replays, a changed one
-    returns `409`. The logical-key version change is listed under Changed.
-  - New opt-in `caller_partition: authenticated_identity`. When the gateway
-    verified a principal (a Consumer, a peer SPIFFE identity, or an external
-    identity committed with its realm), the key binds that principal instead
-    of credential digests and the peer address. The fingerprint binds only the
-    presence, not the value, of credential headers, gateway-captured
-    credential query parameters, and exactly these signature-context headers:
-    `date`, `x-amz-date`, `x-amz-content-sha256`, `amz-sdk-invocation-id`,
-    `amz-sdk-request`, `digest` and `content-digest`. A retry after a token
-    refresh, an address change, or a re-signature that changes only those
-    fields then replays; a retry that changes any other header still returns
-    `409`. The default `credential` partition is
-    unchanged.
-  - Case-variant spellings of the idempotency header with different values,
-    or of the authority/framing/coding headers the fingerprint reads, are
-    refused with `400` instead of being resolved by map iteration order.
-  - The retained response body is copied before the shared accounting lock
-    is taken rather than while it is held.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

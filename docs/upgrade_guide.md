@@ -28,25 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `request_deduplication`: live in-flight ceiling and `v7` logical keys (#6818)
+### `cors` method and header lists are bounded (#6844)
 
-`request_deduplication` now hard-caps live local in-flight markers with the new
-`max_inflight_entries`, which defaults to `max_entries`. When the ceiling is
-reached, a request with a **new** idempotency key is refused with `503`
-(`Idempotency in-flight capacity is saturated`); keys already tracked still
-replay or conflict. If an instance sets a small `max_entries` to bound
-completed-response retention while serving more concurrent idempotent requests
-than that, set `max_inflight_entries` explicitly to the concurrency the route
-must admit before upgrading.
-
-Logical keys move from `v6:` to `v7:`, because the matched route's
-response-header policy left the key for the request fingerprint. Local state
-starts empty after a restart anyway; in `sync_mode: redis`, records written by
-the previous binary under `v6:` keys are not consulted, so an operation that
-completed (or is still in flight) on an old gateway within its TTL can execute
-once more on a new one during a mixed-version rollout. Drain or finish
-in-flight idempotent work, or accept that window, before cutting over; the old
-records expire on their own TTL.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
