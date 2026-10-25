@@ -329,6 +329,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `ai_semantic_cache` hardening from the production-launch
+  review.** Exact keys and semantic scopes now bind the request's complete
+  response-side policy provenance (RTDS gate content plus the static
+  response-presentation digest), so an entry retained under an earlier
+  `response_transformer` rule — locally or by another replica in Redis — can no
+  longer replay past a new field-removal rule; a request whose presentation
+  policy is unprovable bypasses. Instruction state (`system`/`developer`
+  messages, Anthropic `system`, Responses `instructions` and
+  `system`/`developer` `input` items, Gemini `systemInstruction`, Cohere
+  `preamble`) is bound byte-exactly in semantic scopes and Responses
+  instruction items leave the embedding input. Cohere v1 `conversation_id`
+  requests, request bodies with duplicate JSON members, and requests carrying
+  `Cache-Control: no-store`/`no-cache` bypass lookup and storage; responses
+  with `Cache-Control: no-store`/`private` or `Set-Cookie` are never stored.
+  Composition admission refuses any final-request-body policy plugin ordered at
+  or after an `ai_semantic_cache` instance by `priority_override`. Key domains
+  move to v4, so previously retained entries are unreachable.
+- **`ai_semantic_cache` populates from `ai_federation` and tolerates replica
+  clock skew.** A provider-backed `ai_federation` 2xx answer (proven by
+  federation's internal external-operation provenance) is now stored, so the
+  documented cache-before-federation chain hits on repeats; fabricated
+  synthetic bodies remain ineligible. An authenticated Redis envelope sealed up
+  to 60 seconds in the reader's future is admitted, and an authentic envelope
+  that is expired or further in the future is a plain miss instead of being
+  quarantined and deleted. Canonical `"stream": true` requests skip the
+  embedding call.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

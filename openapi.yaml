@@ -35469,12 +35469,20 @@ components:
         max_total_size_bytes (including omitted defaults), the 32 UTF-8 byte
         redis_integrity_key minimum, platform-sized integer limits, URL parsing,
         and the deployment backend egress policy. These residual checks are not
-        fully expressible in this schema. Provider-managed Responses conversations
-        and Gemini retained contexts bypass replay; other unmodeled root context
-        is canonically bound to exact and semantic identities. Cohere SYSTEM
-        history is retained as exact instruction state in semantic scopes.
-        Cache hits preserve finalized application bodies while current response
-        enforcement, live header rules, and negotiated compression still run.
+        fully expressible in this schema. Provider-managed Responses conversations,
+        Gemini retained contexts, and Cohere conversation_id requests bypass
+        replay; other unmodeled root context is canonically bound to exact and
+        semantic identities. Request bodies with duplicate JSON members, a
+        request Cache-Control no-store/no-cache, or an unprovable
+        response-presentation policy also bypass. Instruction state (system,
+        developer, instructions, systemInstruction, preamble, Cohere SYSTEM
+        history) is bound byte-exactly in semantic scopes. Exact keys and
+        semantic scopes bind the request's response-policy provenance (RTDS
+        gate content and static presentation-policy digest). Responses with
+        Cache-Control no-store/private or Set-Cookie are not stored;
+        provider-backed ai_federation answers are. Cache hits preserve
+        finalized application bodies while current response enforcement, live
+        header rules, and negotiated compression still run.
       allOf:
         - if:
             required: [semantic_similarity_enabled]
