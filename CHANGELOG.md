@@ -7,48 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **`ai_federation` credentials can be `${FERRUM_PLUGIN_SECRET_<NAME>}`
-  references.** `api_key`, `google_service_account_json`,
-  `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token`
-  accept a whole-value reference resolved at construction through the shared
-  plugin-secret namespace (and its `_FILE` / `_VAULT` / `_AWS` / `_AZURE` /
-  `_GCP` startup materialization), like `ai_stream_router`'s `api_key`.
-  References outside the namespace are refused without being echoed.
-- **`ai_federation` per-provider `weight`.** When a provider in the leading
-  equal-`priority` group sets `weight` (1–1000), the first attempt is chosen
-  by weighted random selection among admitting providers; later attempts keep
-  the deterministic order. Configs without `weight` are unchanged.
-- **Per-provider `ai_federation` circuit metrics.**
-  `ferrum_ai_federation_provider_circuits_open{provider}` and
-  `ferrum_ai_federation_provider_circuits_{opened,closed}_total{provider}`
-  label circuit transitions with the configured provider name (bounded by
-  configuration) next to the existing aggregate series.
-
 ### Changed
-- **BREAKING — `ai_federation` refuses generation controls a translating
-  provider cannot represent, and maps them for Gemini/Vertex** (issue/PR #6816).
-  `anthropic`, `google_gemini`,
-  `google_vertex`, and `aws_bedrock` rebuild the provider request from a fixed
-  field set and used to drop `response_format`, `n`, `seed`, penalties,
-  `logprobs`, `tools[].function.strict`, and similar fields silently, so a
-  JSON-schema request could return unconstrained prose as a `200`. Gemini and
-  Vertex now map `response_format` `json_object` / `json_schema`
-  (`responseMimeType: application/json` plus `responseJsonSchema`), `n > 1`
-  (`candidateCount`), `seed`, and non-zero penalties; Anthropic maps
-  `parallel_tool_calls: false`. A `json_schema` must carry a `schema` object,
-  and a `strict: true` schema sent to Gemini/Vertex may use only the keyword
-  subset Google enforces. Every other non-neutral control (including
-  `reasoning_effort`, `reasoning`, `verbosity`, and legacy `functions`) is refused
-  during translation, before provider I/O, so fallback can reach a provider
-  that represents it and otherwise the request fails `400`
-  (`provider_translation_failed`). See the support matrix in
-  `docs/plugins.md`.
-- **BREAKING — `ai_federation` provider `connect_timeout_seconds` /
-  `read_timeout_seconds` are capped at 86400** (issue/PR #6816). An unbounded
-  per-call budget let one hanging provider hold a non-queuing
-  `max_concurrent_requests` permit indefinitely; a larger value now fails
-  configuration admission.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -180,29 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`ai_federation` preserves Gemini/Vertex thought signatures across tool
-  calls.** Gemini 3 thinking models require the `thoughtSignature` of a
-  `functionCall` part back on the next turn and answer `400` without it. The
-  signature is now exported as `tool_calls[i].extra_content.google.thought_signature`
-  (Google's OpenAI-compatibility convention, bounded at 64 KiB, never logged)
-  and restored on the reconstructed native part.
-- **Streaming `ai_federation` provider transport faults now trip the provider
-  circuit.** A claimed stream whose provider dispatch timed out or was reset
-  before headers (answered by a gateway-authored `502`/`504`, previously scored
-  a success under the default fallback statuses, so a timed-out half-open
-  probe could close the circuit) or whose body died on a read timeout or reset
-  after headers (previously a neutral release) is now scored a circuit failure
-  from trusted dispatch/body provenance, using proxy core's post-wire
-  backend-failure classes. Client disconnects, authorization-lifetime
-  terminations, and gateway-local refusals stay neutral, route deadlines are
-  settled exactly as proxy core settles them (a body cut by the route
-  deadline is neutral via a new typed `BodyOutcome::route_policy_cut` flag; a
-  pre-header expiry is charged only when the provider held the attempt), and
-  scoring stays exactly-once.
-- **`ai_federation` documents the buffered provider-error envelope.** A buffered
-  provider non-2xx body is replaced by a fixed `upstream_error` envelope with the
-  provider's status and safe headers; this is now stated in `docs/plugins.md`
-  and the OpenAPI schema.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
