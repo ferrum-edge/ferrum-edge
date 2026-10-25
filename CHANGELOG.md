@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `load_testing` refuses cleartext fan-out off loopback and
+  requires correlated peer acknowledgments** (issue n/a, PR #6856). Fan-out sends the
+  trigger key and the triggering request's credentials and body, so an
+  `http://` `gateway_addresses` entry is now admitted only to a `127.d.d.d` or
+  `[::1]` literal; any other host, `localhost` included, needs the new
+  `allow_plaintext: true`. Fan-out requests carry `X-Loadtesting-Run-Id`, and
+  the controller counts a peer as started only when it answers `204` with
+  `X-Loadtesting-Ack` echoing that id, so every node of a fleet must run this
+  release (a peer on an older build answers a bare `204`, which is now
+  reported as not acknowledged).
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +149,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`load_testing` fan-out and oversized triggers** (PR #6856). A request
+  carrying `X-Loadtesting-Fanout` whose key fails is refused with `403` before
+  backend dispatch instead of executing as an application request. Each
+  fan-out call is a single attempt (never replayed by
+  `FERRUM_PLUGIN_HTTP_MAX_RETRIES`), bounded by `duration_seconds`, and
+  cancelled with the local run when the last plugin owner is removed. A
+  matching trigger that declares a body above the 10 MiB replay ceiling now
+  streams to the backend normally and starts no run instead of being refused
+  with `413`. Start/finish records carry a `run_id` shared with fan-out
+  peers, a `key_fingerprint`, and the cohort size, plus the triggering client
+  and consumer on start.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
@@ -360,6 +381,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. EastWestGateway keeps the unscoped fail-closed fallback.
 
 ### Security
+- **`load_testing` strips underscore spellings of its control headers**
+  (PR #6856). `X_Loadtesting_Key` and similar spellings, which CGI-style
+  backends fold onto the same variable, are stripped from the forwarded
+  request and every synthetic/fan-out replay and redacted from logs; they
+  never authenticate a trigger.
 
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to

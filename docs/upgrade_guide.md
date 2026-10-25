@@ -28,6 +28,21 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `load_testing` cleartext fan-out peers and acknowledgments (PR #6856)
+
+`load_testing` now refuses an `http://` `gateway_addresses` entry at load time
+unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`,
+because fan-out carries the trigger key and the triggering request's
+credentials. Before upgrading, for each such peer either switch it to
+`https://`, or set `allow_plaintext: true` on the plugin when cleartext to that
+peer is intended.
+
+Fan-out peers now acknowledge an admitted trigger with `204` plus
+`X-Loadtesting-Ack` echoing the controller's `X-Loadtesting-Run-Id`, and a
+fan-out request whose key fails is refused with `403` instead of reaching the
+peer's backend. Upgrade every node that takes part in fan-out together: a
+controller reports a peer on an older build as not acknowledged.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
