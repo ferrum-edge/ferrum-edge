@@ -164,7 +164,7 @@ impl UsageAccumulator {
             return;
         }
         let carrier = match json.get("type").and_then(Value::as_str) {
-            Some("response.completed") => json.get("response"),
+            Some("response.completed" | "response.incomplete") => json.get("response"),
             Some("message_start") => json.get("message"),
             _ => Some(json),
         };

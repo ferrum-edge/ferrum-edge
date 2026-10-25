@@ -1504,6 +1504,7 @@ async fn non_terminal_or_malformed_openai_responses_do_not_invent_usage() {
             .await;
         assert!(!ctx.metadata.contains_key("ai_provider"));
         assert!(!ctx.metadata.contains_key("ai_estimated_cost"));
+        assert_eq!(ctx.metadata["ai_unmetered_reason"], "no_usage");
     }
 
     // `response.incomplete` is TERMINAL: a finished response that stopped early
@@ -1546,7 +1547,16 @@ async fn non_terminal_or_malformed_openai_responses_do_not_invent_usage() {
     plugin
         .on_response_body(&mut ctx, 200, &mut json_headers(), &malformed)
         .await;
-    assert!(ctx.metadata.is_empty());
+    // No usage is invented: the only key written is the bounded diagnostic
+    // that labels this 2xx response as unmetered rather than zero usage.
+    assert_eq!(
+        ctx.metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("ai_unmetered_reason", "no_usage")]
+    );
+    assert!(ctx.authoritative_ai_usage_export().is_none());
 }
 
 #[tokio::test]
