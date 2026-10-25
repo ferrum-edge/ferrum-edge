@@ -11299,8 +11299,9 @@ components:
               gateway WebSocket frame and fragment limits do not apply to it.
               Refused (400) on a proxy with any plugin that requires the parsed
               WebSocket relay (`waf`, `ws_frame_logging`,
-              `ws_message_size_limiting`, `ws_rate_limiting`, or a custom plugin
-              whose `requires_websocket_framing()` is true), whether attached
+              `ws_message_size_limiting`, `ws_rate_limiting`, an `api_chargeback`
+              that prices bandwidth, or a custom plugin whose
+              `requires_websocket_framing()` is true), whether attached
               directly, through a proxy group, or inherited from a global plugin.
             - `terminate`: the gateway negotiates `permessage-deflate` with the
               client and with the backend independently (the backend receives
@@ -39736,7 +39737,12 @@ components:
         Ordinary HTTP uses the wire status. Native gRPC and translated
         gRPC-Web use the final client-visible grpc-status mapped to the
         canonical effective HTTP status; missing/malformed/unknown terminal
-        status fails closed to 500. Explicitly zero-priced tiers still meter calls.
+        status, and a terminal status present on the wire but unreadable by the
+        gateway, fail closed to 500. Explicitly zero-priced tiers still meter calls.
+        Bandwidth pricing bills WebSocket sessions from the parsed relay's
+        payload byte counters, so a bandwidth-priced instance keeps its proxy's
+        WebSocket sessions off the raw tunnel relay and is refused on a
+        `websocket_permessage_deflate: passthrough` proxy.
         Successful H1/H2/H3 WebSocket handshakes share the 101 pricing tier;
         rejected handshakes retain their error status.
         At least one of `pricing_tiers`, `bandwidth_pricing`, or
@@ -39763,6 +39769,11 @@ components:
         `consumer` label is the internal sentinel
         `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`,
         preserving billable totals while losing only per-identity attribution.
+        The aggregate overflow rows the configured proxies and pricing tiers can
+        create are reserved up front (one per priced status, one shared
+        status-0 bandwidth row when bandwidth is priced, or one row per stream
+        proxy), plus as much headroom again for a pricing reload's next
+        generation, so ordinary rows can never take the bytes the fallback needs.
         That sentinel lives in the digest-form billing-identity class, so a real
         authenticated or configured identity can never share its registry key.
         Billing identities are never prefix-truncated: an external identity
@@ -39773,7 +39784,11 @@ components:
         must resolve to the same shared tunables and the same projection; a
         `schema_ref` must name a definition a `transaction_log_schema` plugin
         registered; a status code must not appear in more than one tier across
-        the whole `pricing_tiers` array; and `stale_entry_ttl_seconds` /
+        the whole `pricing_tiers` array; `max_retained_bytes` must hold twice
+        the configured overflow-row matrix, and a reload whose not-yet-created
+        overflow rows do not fit beside the billing state the live registry
+        retains is refused when a node builds that generation (not by offline
+        validation); and `stale_entry_ttl_seconds` /
         `cleanup_interval_seconds` interact with the collection contract
         described in docs/plugins.md.
       allOf:
@@ -39845,7 +39860,7 @@ components:
                   type: integer
                   minimum: 100
                   maximum: 599
-                description: Billable status codes that trigger this tier's charge. Must be real HTTP status codes in 100–599 and distinct within the tier. Ordinary HTTP uses the wire status. Native gRPC and translated gRPC-Web map final terminal codes as 0→200, 1→499, 2→500, 3→400, 4→504, 5→404, 6→409, 7→403, 8→429, 9→400, 10→409, 11→400, 12→501, 13→500, 14→503, 15→500, and 16→401; missing, malformed, or unknown terminal codes map to 500. A status code must appear in exactly one tier; cross-tier duplication is rejected at construction.
+                description: Billable status codes that trigger this tier's charge. Must be real HTTP status codes in 100–599 and distinct within the tier. Ordinary HTTP uses the wire status. Native gRPC and translated gRPC-Web map final terminal codes as 0→200, 1→499, 2→500, 3→400, 4→504, 5→404, 6→409, 7→403, 8→429, 9→400, 10→409, 11→400, 12→501, 13→500, 14→503, 15→500, and 16→401; missing, malformed, unknown, or present-but-unreadable terminal codes map to 500. A status code must appear in exactly one tier; cross-tier duplication is rejected at construction.
               price_per_call:
                 type: number
                 minimum: 0
@@ -39871,6 +39886,10 @@ components:
             Optional bandwidth pricing applied to both HTTP-family and stream
             transactions, using the gateway-perspective `bytes_sent` /
             `bytes_received` counters from the transaction-summary schema.
+            WebSocket sessions are billed from the parsed relay's payload byte
+            counters; any nonzero price keeps the proxy's WebSocket sessions on
+            the parsed relay (no raw tunnel copy) and is refused on a
+            `websocket_permessage_deflate: passthrough` proxy.
           properties:
             price_per_byte_sent:
               type: number
@@ -39926,9 +39945,12 @@ components:
           description: |
             How long an idle chargeback entry may live before it becomes
             eligible for eviction. Eligibility is not deletion: an idle entry is
-            removed only once a completed GET /charges export has collected its
-            current counters, so uncollected billing state is never discarded on
-            age alone. Unsigned 64-bit. Process-global: every enabled
+            removed only once two delivered GET /charges exports (the admin
+            connection took the complete document) have collected its current
+            counters, and only together with every row sharing its consumer,
+            proxy, and currency, so uncollected billing state is never discarded
+            on age alone and a live cumulative series never shrinks. Unsigned
+            64-bit. Process-global: every enabled
             api_chargeback instance must use the same value.
         cache_invalidation_min_age_ms:
           type: integer
@@ -39944,14 +39966,15 @@ components:
         cleanup_interval_seconds:
           type: integer
           minimum: 0
-          maximum: 18446744073709551615
+          maximum: 31536000
           default: 300
           description: |
             How often (seconds) the background task evicts entries that have
             been idle longer than stale_entry_ttl_seconds AND have already been
-            collected by a completed export. Set to 0 to disable. Unsigned
-            64-bit. Process-global: every enabled api_chargeback instance must
-            use the same value.
+            confirmed collected by two delivered exports. Set to 0 to disable. At most
+            31536000 (one year); larger values are rejected because the task's
+            sleep deadline would overflow. Process-global: every enabled
+            api_chargeback instance must use the same value.
         max_entries:
           type: integer
           minimum: 1
@@ -39975,7 +39998,11 @@ components:
           default: 67108864
           description: |
             Hard ceiling on estimated retained registry bytes, covering ordinary
-            billing rows and aggregate overflow rows together. 0 is rejected.
+            billing rows and aggregate overflow rows together. The overflow rows
+            the configured proxies and pricing tiers can create are reserved
+            (plus equal headroom for a pricing reload), so refused identities
+            always fold into an overflow row instead of being dropped; admission
+            refuses a budget that cannot hold twice that matrix. 0 is rejected.
             Process-global: every enabled api_chargeback instance must use the
             same value.
         schema:
@@ -40747,8 +40774,10 @@ components:
             overflow row after a new row could not be admitted under
             `max_entries` (billable totals preserved, per-identity attribution
             lost); `dropped_charges_total` counts charges that could not be
-            retained at all, which is only reachable when `max_retained_bytes`
-            is too small for the configured proxy/status matrix.
+            retained at all. The configured overflow-row matrix is reserved, so
+            this is reachable only for charges outside it (traffic attributed to
+            no configured proxy, or a retired pricing generation late enough to
+            need a new overflow row once the reload headroom is spent).
             `uncollected_retained_entries` reports rows held past
             `stale_entry_ttl_seconds` awaiting collection.
           properties:
@@ -40778,8 +40807,8 @@ components:
               type: integer
               description: |
                 Billing rows the last eviction pass kept past
-                `stale_entry_ttl_seconds` because no completed `/charges` export
-                has collected their current counters. Idle age alone never
+                `stale_entry_ttl_seconds` because two delivered `/charges`
+                exports have not yet collected their current counters. Idle age alone never
                 deletes uncollected billing state; a sustained nonzero value
                 means rows are ageing out faster than they are being scraped.
             overflow_consumer_id:

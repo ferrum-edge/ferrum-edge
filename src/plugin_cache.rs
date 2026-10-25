@@ -2475,7 +2475,9 @@ pub(crate) fn validate_tcp_connection_throttle_attachments(
 /// Whether an effective plugin config can require the parsed WebSocket relay.
 ///
 /// Built-ins answer from the config-independent
-/// [`crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS`] declaration. An
+/// [`crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS`] declaration, except
+/// `api_chargeback`, which needs the parsed relay only when it prices
+/// bandwidth and answers from its parsed pricing without being constructed. An
 /// out-of-tree plugin is constructed and asked through
 /// [`Plugin::requires_websocket_framing`]; a plugin that cannot be constructed
 /// is reported as an error so the caller fails closed.
@@ -2486,6 +2488,13 @@ fn plugin_config_may_require_websocket_framing(
     let name = pc.plugin_name.as_str();
     if crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS.contains(&name) {
         return Ok(true);
+    }
+    // The one built-in whose framing need depends on its config: a
+    // bandwidth-priced `api_chargeback` bills WebSocket sessions from the
+    // parsed relay's payload counters, which a compressed passthrough session
+    // relayed as raw bytes would not provide.
+    if name == "api_chargeback" {
+        return crate::plugins::api_chargeback::config_requires_websocket_framing(&pc.config);
     }
     if crate::plugins::builtin_plugin_parity_meta(name).is_some() {
         return Ok(false);
@@ -7001,6 +7010,7 @@ impl PluginCache {
         previous_lifecycle_generation_high_water: u64,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
+        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -7449,6 +7459,7 @@ impl PluginCache {
         country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
+        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);

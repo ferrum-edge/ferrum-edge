@@ -2565,6 +2565,22 @@ pub mod _test_support {
         crate::admin::admin_builder_failure_response()
     }
 
+    /// Collect an admin response through the connection body wrapper exactly
+    /// as the admin listener does (`/charges` delivery acknowledgement tests).
+    pub async fn collect_guarded_admin_response_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) -> bytes::Bytes {
+        crate::admin::collect_guarded_admin_response_for_test(response).await
+    }
+
+    /// Wrap an admin response as the admin listener does, then drop it
+    /// without writing its body (`/charges` delivery acknowledgement tests).
+    pub fn drop_guarded_admin_response_unpolled_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) {
+        crate::admin::drop_guarded_admin_response_unpolled_for_test(response)
+    }
+
     pub fn x_gateway_error_for_backend_failure_for_test(
         connection_error: bool,
         status: u16,

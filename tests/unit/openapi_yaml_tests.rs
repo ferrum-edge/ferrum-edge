@@ -19338,6 +19338,8 @@ fn api_chargeback_schema_admits_only_constructible_configs() {
         json!({"schema": {"rename": {"total_calls": "calls"}}}),
     ));
     accept(with(supported_derived));
+    // The cleanup interval is admitted at its bound.
+    accept(with(json!({"cleanup_interval_seconds": 31_536_000})));
 
     let unrepresentable_derived = json!({
         "schema": {"derived_fields": [{"name": "host", "kind": "backend_host"}]}
@@ -19363,6 +19365,9 @@ fn api_chargeback_schema_admits_only_constructible_configs() {
     reject(with(json!({"cleanup_interval_seconds": -1})));
     reject(with(json!({"max_entries": 0})));
     reject(with(json!({"max_retained_bytes": 0})));
+    // A cleanup interval whose sleep deadline could overflow is refused.
+    reject(with(json!({"cleanup_interval_seconds": 31_536_001})));
+    reject(with(json!({"cleanup_interval_seconds": u64::MAX})));
     // Projection surface: mutually exclusive, and narrowed to the billing row.
     reject(with(json!({"schema": {}, "schema_ref": "missing"})));
     reject(with(json!({"schema": {"order": ["proxy_id"]}})));
