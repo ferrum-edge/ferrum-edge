@@ -2220,6 +2220,65 @@ content-length: 0\r\n\r\n";
         );
     }
 
+    /// A vetted value an earlier plugin published under an operator-cased key
+    /// reaches the provider, read the same way the policy matchers read it.
+    #[tokio::test]
+    async fn a_plugin_inserted_mixed_case_header_is_forwarded_to_the_provider() {
+        let stub = start_stub(StubBehavior::Allow).await;
+        let slice = json!({
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": [{
+                "name": "delegate-admin",
+                "namespace": "default",
+                "scope": { "kind": "mesh_wide" },
+                "rules": [{
+                    "to": [{ "paths": ["/admin/*"] }],
+                    "action": { "custom": { "provider": "mixed-case-ext-authz" } },
+                }],
+            }],
+            "ext_authz_providers": [{
+                "name": "mixed-case-ext-authz",
+                "service": "127.0.0.1",
+                "port": stub.port,
+                "timeout_ms": 500,
+                "status_on_error": 403,
+                "include_request_headers_in_check": ["x-tenant"],
+            }],
+        });
+        let plugin = match MeshAuthz::new_with_http_client(
+            &json!({ "mesh_slice": slice }),
+            Some(PluginHttpClient::default()),
+        ) {
+            Ok(plugin) => plugin,
+            Err(error) => panic!("generation builds: {error}"),
+        };
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/admin/reports".to_string(),
+        );
+        let mut raw = http::HeaderMap::new();
+        raw.insert("host", "api.example.com".parse().expect("header value"));
+        raw.insert("x-tenant", "client-forged".parse().expect("header value"));
+        ctx.set_raw_headers(raw);
+        ctx.materialize_headers();
+        ctx.headers.remove("x-tenant");
+        ctx.headers
+            .insert("X-Tenant".to_string(), "blocked".to_string());
+        assert!(matches!(
+            plugin.authorize(&mut ctx).await,
+            PluginResult::Continue
+        ));
+        let seen = stub.last_request.lock().expect("stub request").clone();
+        assert_eq!(
+            seen_header_lines(&seen, "x-tenant"),
+            vec!["blocked".to_string()],
+            "the provider sees the plugin-published value, not the removed client one"
+        );
+    }
+
     #[tokio::test]
     async fn the_live_datapath_stamps_the_peer_identity_and_merges_denial_cookies() {
         let stub = start_stub(StubBehavior::Raw(MULTI_LINE_DENIAL)).await;

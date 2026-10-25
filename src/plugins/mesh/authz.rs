@@ -1253,16 +1253,9 @@ fn http_header_attribute(ctx: &RequestContext, name: &str) -> Option<String> {
         return Some(scheme.to_string());
     }
 
-    let lower = name.to_ascii_lowercase();
-    if let Some(value) = http_request_header_value(ctx, &lower) {
-        return Some(value);
-    }
-    // A plugin-inserted, operator-cased key (the materialized map's wire keys
-    // are always lowercase).
-    if lower != name {
-        return ctx.headers.get(name).cloned();
-    }
-    None
+    // Plugin-inserted operator-cased keys are resolved case-insensitively by
+    // the shared resolver, so `when:` and `to.headers` cannot disagree.
+    http_request_header_value(ctx, &name.to_ascii_lowercase())
 }
 
 /// The single value mesh authorization judges for an ordinary request header
@@ -1293,9 +1286,26 @@ fn http_header_attribute(ctx: &RequestContext, name: &str) -> Option<String> {
 ///   way materialization would fold them, skipping a non-UTF-8 line as
 ///   materialization does.
 ///
+/// Header names are matched case-insensitively over `ctx.headers` too. Wire
+/// keys are always lowercase, so the exact lowercase probe is the hot path;
+/// only on a miss is the map scanned for a key an earlier plugin inserted in
+/// operator case (`X-Tenant: blocked`) — the egress builders parse such a key
+/// as the ordinary `x-tenant` field, so a `to.headers` DENY must see it. The
+/// scan compares in place and allocates nothing. When several case variants
+/// coexist without a lowercase key, the byte-wise smallest key wins, so the
+/// reading is deterministic rather than hash-order dependent.
+///
 /// Reserved gateway assertion headers are never read from the raw client block.
 fn http_request_header_value(ctx: &RequestContext, lower: &str) -> Option<String> {
     if let Some(value) = ctx.headers.get(lower) {
+        return Some(value.clone());
+    }
+    if let Some((_, value)) = ctx
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(lower))
+        .min_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()))
+    {
         return Some(value.clone());
     }
     if ctx.headers_are_materialized() || RequestContext::is_reserved_gateway_assertion_header(lower)

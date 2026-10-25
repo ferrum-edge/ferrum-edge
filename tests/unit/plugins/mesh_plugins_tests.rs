@@ -11098,3 +11098,41 @@ async fn mesh_authz_does_not_resurrect_a_header_removed_after_materialization() 
         }
     }
 }
+
+#[tokio::test]
+async fn mesh_authz_matches_a_plugin_inserted_mixed_case_header_on_every_surface() {
+    // An earlier plugin materializes the request, removes the untrusted client
+    // `x-tenant`, and publishes a vetted value under an operator-cased key. The
+    // egress builders forward it as the ordinary `x-tenant` field, so both a
+    // `to.headers` DENY and a `when:` DENY must see it.
+    let mut header_deny = allow_client_policy(PolicyAction::Deny);
+    header_deny.rules[0].to = vec![RequestMatch {
+        headers: HashMap::from([("x-tenant".to_string(), "blocked".to_string())]),
+        ..RequestMatch::default()
+    }];
+    let mut condition_deny = allow_client_policy(PolicyAction::Deny);
+    condition_deny.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-tenant]".to_string(),
+        values: vec!["blocked".to_string()],
+        not_values: Vec::new(),
+    }];
+    for (label, policy) in [("to.headers", header_deny), ("when", condition_deny)] {
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+        for (published, expect_denied) in [("blocked", true), ("allowed", false)] {
+            let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-tenant", "client-forged".parse().expect("header value"));
+            ctx.set_raw_headers(headers);
+            ctx.materialize_headers();
+            ctx.headers.remove("x-tenant");
+            ctx.headers
+                .insert("X-Tenant".to_string(), published.to_string());
+            let result = plugin.authorize(&mut ctx).await;
+            assert_eq!(
+                matches!(result, PluginResult::Reject { .. }),
+                expect_denied,
+                "{label}, published={published}: unexpected verdict {result:?}"
+            );
+        }
+    }
+}
