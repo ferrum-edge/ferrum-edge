@@ -28,6 +28,30 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ai_request_guard` evaluates more request shapes (PR #6849)
+
+- Duplicate JSON object members are rejected (HTTP 400, reason
+  `ambiguous_json`). Clients must send each member once.
+- `POST` bodies with a missing, non-JSON (`text/plain`, form), or joined
+  `Content-Type` are now buffered. If the body opens a JSON object it is
+  evaluated (and malformed JSON fails closed). Uploads that must keep streaming
+  should use `multipart/*`, `application/octet-stream`, or an
+  `audio/` / `image/` / `video/` type.
+- An output cap that is not a non-negative integer (negative, fractional,
+  boolean, unparseable string) is rejected whenever `max_tokens_limit` or
+  `default_max_tokens` is set. Quoted or float integers are now evaluated by
+  value, so an over-limit `"8192"` is rejected or clamped instead of passing.
+- `require_user_field` needs a non-empty string `user`. `required_metadata_fields`
+  rejects `null` and blank strings.
+- Model policy also checks models named in Gemini/Vertex
+  (`models/{model}:{method}`), Bedrock (`model/{id}/converse|invoke`), and Azure
+  (`openai/deployments/{deployment}`) paths. Every path and body model must
+  pass. List Azure deployment names in `allowed_models` / `blocked_models`.
+- Bedrock Converse deployments that want `default_max_tokens` without a
+  top-level cap should set `supported_schema: bedrock_converse`.
+- Log pipelines with closed metadata columns must accept
+  `ai_request_guard.action` and `ai_request_guard.reason`.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

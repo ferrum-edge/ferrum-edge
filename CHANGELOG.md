@@ -81,6 +81,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Metric labels, service-graph edges and every serialized output are
   unchanged. New `Plugin::observes_mesh_label_metadata()` (default `true`)
   declares whether a plugin can see the labels; custom plugins need no change.
+- **BREAKING — `ai_request_guard` evaluates more of what the backend reads**
+  (PR #6849). Bodies with duplicate object members (including escaped spellings)
+  are rejected as uninspectable (`ambiguous_json`). `POST` bodies whose
+  `Content-Type` is missing, non-JSON, or joined are now buffered, and those that
+  open a JSON object are evaluated. Output caps written as integral floats,
+  exponents, or quoted integers are evaluated and clamped by value, and an
+  unreadable cap is rejected (`Invalid max_tokens field`). Gemini
+  `generation_config` / `max_output_tokens` spellings are read, and a body using
+  both spellings of one field is rejected. `require_user_field` and
+  `required_metadata_fields` reject `null` and blank values. Model policy also
+  checks models in Gemini/Vertex, Bedrock, and Azure deployment paths.
+  Anthropic Message Batches entries are each governed. Bedrock Converse
+  `toolConfig.tools` and Gemini `functionResponse` text now count toward
+  `max_prompt_characters`. New: `max_choices` (caps `n` / `best_of` /
+  `candidateCount`), `supported_schema: bedrock_converse` (creates
+  `inferenceConfig.maxTokens` for `default_max_tokens`), and
+  `ai_request_guard.action` / `ai_request_guard.reason` decision metadata.
 - **BREAKING (custom plugins) — request metadata maps use a faster hasher**
   (issue/PR #6787). `RequestContext.metadata`, `TransactionSummary.metadata`,
   `StreamTransactionSummary.metadata`, `WsDisconnectContext.metadata`, the
