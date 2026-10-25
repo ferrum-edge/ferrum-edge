@@ -240,7 +240,9 @@ async fn grpc_web_text_bodies_are_decoded_before_message_inspection() {
 async fn a_compressed_grpc_message_fails_closed_under_an_enforcing_body_policy() {
     let plugin = waf(enforcing_body_text_rule("enforce")).unwrap();
     // The payload bytes are opaque to the WAF; it never decodes grpc-encoding.
-    let body = grpc_frame(1, b"\x1f\x8b\x08\x00compressed-needle");
+    // They hold no enforcing signature on the wire either, so the refusal is
+    // the compressed message's own (the raw-hit precedence is pinned below).
+    let body = grpc_frame(1, b"\x1f\x8b\x08\x00opaque");
 
     let (result, request) = final_request_body(
         &plugin,
@@ -266,6 +268,31 @@ async fn a_compressed_grpc_message_fails_closed_under_an_enforcing_body_policy()
         meta(&request, "waf.body_uninspected_target"),
         Some("request_body")
     );
+}
+
+#[tokio::test]
+async fn a_raw_wire_hit_decides_before_the_compressed_message_refusal() {
+    // The complete wire body is scanned too, and hits decide first: when the
+    // raw bytes of a compressed frame carry an enforcing signature, the
+    // refusal is the rule's own. Either way the message does not reach the
+    // backend.
+    let plugin = waf(enforcing_body_text_rule("enforce")).unwrap();
+    let body = grpc_frame(1, b"\x1f\x8b\x08\x00compressed-needle");
+
+    let (result, request) = final_request_body(
+        &plugin,
+        "POST",
+        &[
+            ("content-type", "application/grpc+json"),
+            ("grpc-encoding", "gzip"),
+        ],
+        &body,
+    )
+    .await;
+
+    assert!(is_reject(&result));
+    assert_eq!(meta(&request, "waf.block_reason"), Some("rule"));
+    assert_eq!(meta(&request, "waf.rule_hits"), Some("BODY-NEEDLE"));
 }
 
 #[tokio::test]
@@ -860,7 +887,7 @@ async fn matched_field_names_are_encoded_and_bounded() {
     );
     let truncated = format!("query:{}*", "k".repeat(128));
     assert!(
-        fields.iter().any(|field| *field == truncated),
+        fields.contains(&truncated),
         "an over-long name is cut and marked: {fields:?}"
     );
 }

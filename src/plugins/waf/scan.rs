@@ -291,6 +291,13 @@ impl ScanOutcome {
     }
 }
 
+/// The UTF-16 / UTF-32 readings of one body or framed message. The single
+/// decode site of the shared body engine, used for both directions (and for
+/// each message of a framed body), so no direction can grow a private copy.
+fn wide_charset_views(body: &[u8], content_type: Option<&str>) -> normalize::WideCharsetViews {
+    normalize::decode_wide_charset_body_views(body, content_type)
+}
+
 /// `<kind>:<name>` with every byte of `name` outside the RFC 3986 unreserved
 /// set (`A-Z a-z 0-9 - . _ ~`) percent-encoded, so an attacker-chosen name can
 /// neither inject a delimiter (`,`), a control character, nor a log-format
@@ -625,7 +632,7 @@ impl Waf {
         // The whole body's wide-charset readings, decoded once and shared by
         // the JSON-path pass and the whole-body text pass.
         let body_views = if json_paths_active || text_views_active {
-            normalize::decode_wide_charset_body_views(body, content_type)
+            wide_charset_views(body, content_type)
         } else {
             normalize::WideCharsetViews::empty()
         };
@@ -657,7 +664,7 @@ impl Waf {
         self.scan_body_text_rules(&mut outcome, subject, body, &body_views, direction);
         if let Some(messages) = grpc {
             for payload in messages.payloads() {
-                let views = normalize::decode_wide_charset_body_views(payload.bytes, content_type);
+                let views = wide_charset_views(payload.bytes, content_type);
                 self.scan_body_text_rules(&mut outcome, subject, payload.bytes, &views, direction);
             }
         }
