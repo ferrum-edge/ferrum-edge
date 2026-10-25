@@ -139,6 +139,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`security_headers` decorates the H1/H2 authorization-expiry `401` and
+  replaces backend values browsers ignore** (PR #6864). The fixed `401` the
+  pre-commit authorization gate selects (including after the response hooks
+  ran) and the buffered plain-HTTP authorization terminal now carry the
+  route's static `security_headers` policy, with the JSON `Content-Type`
+  re-asserted and the reauthentication challenge restored when policy removes
+  it; no protected-response header survives. With `override_existing: false`,
+  a backend copy of a built-in security header that browsers ignore (empty,
+  `ALLOW-FROM …`, `DENY, SAMEORIGIN`, an HSTS value without `max-age`, an empty
+  CSP / Permissions-Policy) is replaced instead of satisfying the policy.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -390,6 +400,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. EastWestGateway keeps the unscoped fail-closed fallback.
 
 ### Security
+
+- **BREAKING: `security_headers` refuses gateway-owned names, HSTS values
+  browsers ignore, and oversized policies** (issue #6864). `set` and `remove`
+  reject protocol-managed hop-by-hop / framing fields (now also on `remove`,
+  where they were a no-op) and representation metadata — `Content-Type`,
+  `Content-Encoding`, `Content-Range`, case-insensitive. A `Content-Type`
+  rewrite could relabel a body that content-type-selective inspection (`waf`,
+  `body_validator`, AI response guards) had already released to streaming
+  under the backend's label. An `hsts` string and a `set` entry for
+  `Strict-Transport-Security` must carry exactly one well-formed `max-age`
+  (RFC 6797 §6.1); `includeSubDomains; preload`, `maxage=…`, a bare space, and
+  duplicate `max-age` or `includeSubDomains` directives used to load and give
+  no downgrade protection. `set` holds at most 64 entries, `remove` at most 64
+  names, and every configured value at most 8192 bytes. Each refusal fails
+  config admission.
 
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New

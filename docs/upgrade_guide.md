@@ -28,6 +28,26 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `security_headers`: gateway-owned names, HSTS grammar, and size caps (#6864)
+
+`set` and `remove` now refuse `Content-Type`, `Content-Encoding`,
+`Content-Range`, and the protocol-managed framing names (`Connection`,
+`Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`,
+`TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), case-insensitively. Before
+upgrading, delete such entries. Use `response_transformer` if a backend's
+content type really must change, and remove `remove` entries for framing
+names, which never had an effect. An `hsts` string or a
+`Strict-Transport-Security` `set` value must contain exactly one
+`max-age=<seconds>` directive, at most one valueless `includeSubDomains`, and
+no duplicate directives. Replace a value such as `includeSubDomains; preload`
+with `max-age=31536000; includeSubDomains; preload`, or use the `hsts` object
+form. A policy with more than 64 `set` entries, more than 64 `remove` names,
+or a value longer than 8192 bytes is refused: split it across instances or
+shorten it. Validate the edited configuration with `ferrum-edge validate`
+before rollout. With `override_existing: false`, a backend's empty or
+browser-ignored value for a built-in security header is now replaced by the
+configured value.
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now
