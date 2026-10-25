@@ -425,3 +425,29 @@ pub fn check_jwk_ec_public_key_enforced(
     }
     Ok(())
 }
+
+/// Admit an OKP (Ed25519 / `EdDSA`) JWK, when FIPS mode is enforced.
+///
+/// JWKS stores and DPoP proofs accept Ed25519 keys on the default profile.
+/// While FIPS mode is enforced the decision follows
+/// [`super::policy::APPROVED_JWT_ALGORITHMS`], which deliberately omits
+/// `EdDSA` — see that constant for why — so admitting the key would only move
+/// the refusal to first use.
+pub fn check_jwk_okp_public_key() -> Result<(), String> {
+    if !super::is_enforcing() {
+        return Ok(());
+    }
+    check_jwk_okp_public_key_enforced()
+}
+
+/// The enforced half of [`check_jwk_okp_public_key`].
+pub fn check_jwk_okp_public_key_enforced() -> Result<(), String> {
+    if super::policy::is_approved_jwt_algorithm("EdDSA") {
+        return Ok(());
+    }
+    Err(format!(
+        "JWKS OKP signing key (Ed25519 / EdDSA) is not admitted while FIPS mode is enforced. \
+         Approved JWT algorithms: {}.",
+        super::policy::APPROVED_JWT_ALGORITHMS.join(", ")
+    ))
+}

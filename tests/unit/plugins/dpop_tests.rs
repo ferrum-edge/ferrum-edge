@@ -582,3 +582,218 @@ fn rsa_proof_keys_outside_the_jwt_backend_window_are_refused_by_size() {
         "a 2048-bit key must not be refused for its size"
     );
 }
+
+// ── htu path canonicalization matches the frontend (jwks_auth-SOL-2) ────────
+
+/// The frontend rewrites `RequestContext::path` to the canonical policy path
+/// (`/v1/items/a%3Ab` becomes `/v1/items/a:b`) before any plugin runs, while
+/// the `url` crate keeps a proof's escapes verbatim. A proof bound to the
+/// exact URI the client sent must still match the canonical server reference.
+#[test]
+fn canonical_htu_from_url_canonicalizes_percent_encoded_paths_like_the_frontend() {
+    for (raw, canonical_path) in [
+        ("https://api.example.com/v1/items/a%3Ab", "/v1/items/a:b"),
+        ("https://api.example.com/v1/items/a%3ab", "/v1/items/a:b"),
+        ("https://api.example.com/res%6Furce", "/resource"),
+        ("https://api.example.com/%61dmin/users", "/admin/users"),
+    ] {
+        assert_eq!(
+            canonical_htu_from_url(raw),
+            canonical_htu("https", "api.example.com", canonical_path),
+            "`{raw}` must canonicalize to the frontend's policy path"
+        );
+    }
+}
+
+/// A proof path the frontend itself would refuse has no canonical form, so it
+/// can never match a request the gateway admitted.
+#[test]
+fn canonical_htu_from_url_refuses_paths_the_frontend_refuses() {
+    for raw in [
+        "https://api.example.com/a%2Fb",
+        "https://api.example.com/a%252Fb",
+        "https://api.example.com/a%00b",
+    ] {
+        assert_eq!(
+            canonical_htu_from_url(raw),
+            None,
+            "`{raw}` must not normalize"
+        );
+    }
+}
+
+#[test]
+fn proof_bound_to_percent_encoded_target_matches_canonical_request_path() {
+    let server_htu =
+        canonical_htu("https", "api.example.com", "/v1/items/a:b").expect("canonical server htu");
+    let token = "access-token-abc";
+
+    let h = Harness::new();
+    let mut claims = base_proof_claims();
+    claims["htu"] = json!("https://api.example.com/v1/items/a%3Ab");
+    claims["ath"] = json!(access_token_hash(token));
+    assert!(
+        h.verify(&claims, &server_htu, token).is_ok(),
+        "a proof for the exact encoded target must match the canonical path"
+    );
+
+    let h = Harness::new();
+    let mut claims = base_proof_claims();
+    claims["htu"] = json!("https://api.example.com/v1/items/a%3Ac");
+    claims["ath"] = json!(access_token_hash(token));
+    assert_eq!(
+        h.verify(&claims, &server_htu, token),
+        Err("DPoP URL mismatch"),
+        "canonicalization must not accept a genuinely different target"
+    );
+}
+
+// ── proof algorithms beyond ES256/RS256 (jwks_auth-M3) ──────────────────────
+
+/// Verify a pre-signed proof whose embedded key has thumbprint `jkt`.
+fn verify_signed_proof(
+    proof: &str,
+    jkt: &str,
+    access_token: &str,
+) -> Result<[u8; 32], &'static str> {
+    let token_claims = token_claims_for(jkt);
+    let domain = ReplayDomain::new(
+        DPOP_REPLAY_PROFILE,
+        "ferrum",
+        "jwks_auth",
+        "dpop-tests",
+        "0",
+    );
+    dpop::verify(DpopVerifyInput {
+        proof,
+        access_token,
+        access_token_claims: &token_claims,
+        token_principal: &[b"issuer".as_slice(), b"user".as_slice()],
+        method: "GET",
+        htu: "https://api.example.com/resource",
+        clock_skew: Duration::from_secs(30),
+        domain: &domain,
+    })
+    .map(|marker| marker.digest())
+}
+
+fn proof_claims_for(access_token: &str) -> Value {
+    let mut claims = base_proof_claims();
+    claims["ath"] = json!(access_token_hash(access_token));
+    claims
+}
+
+fn sign_proof_with(alg: Algorithm, jwk: &Jwk, key: &EncodingKey, claims: &Value) -> String {
+    let mut header = Header::new(alg);
+    header.typ = Some("dpop+jwt".to_string());
+    header.jwk = Some(jwk.clone());
+    encode(&header, claims, key).expect("sign proof")
+}
+
+fn rsa_jwk_without_alg() -> Jwk {
+    let mut value = serde_json::to_value(rsa_jwk()).expect("jwk serializes");
+    value.as_object_mut().expect("jwk object").remove("alg");
+    serde_json::from_value(value).expect("rsa jwk should parse")
+}
+
+#[test]
+fn rsassa_pss_proofs_are_accepted() {
+    let token = "access-token-pss";
+    let jwk = rsa_jwk_without_alg();
+    let jkt = jwk_thumbprint_sha256(&jwk).expect("thumbprint");
+    let key = EncodingKey::from_rsa_pem(RSA_PRIVATE_PEM).expect("rsa key");
+    for alg in [
+        Algorithm::PS256,
+        Algorithm::PS384,
+        Algorithm::PS512,
+        Algorithm::RS384,
+        Algorithm::RS512,
+    ] {
+        let proof = sign_proof_with(alg, &jwk, &key, &proof_claims_for(token));
+        assert!(
+            verify_signed_proof(&proof, &jkt, token).is_ok(),
+            "{alg:?} DPoP proof must verify"
+        );
+    }
+}
+
+#[test]
+fn es384_proof_is_accepted() {
+    let token = "access-token-es384";
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).expect("P-384");
+    let point = key_pair.public_key_raw();
+    assert_eq!(point.len(), 97, "uncompressed P-384 point");
+    let jwk: Jwk = serde_json::from_value(json!({
+        "kty": "EC",
+        "crv": "P-384",
+        "x": URL_SAFE_NO_PAD.encode(&point[1..49]),
+        "y": URL_SAFE_NO_PAD.encode(&point[49..]),
+    }))
+    .expect("ec jwk");
+    let jkt = jwk_thumbprint_sha256(&jwk).expect("thumbprint");
+    let key = EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).expect("ec key");
+    let proof = sign_proof_with(Algorithm::ES384, &jwk, &key, &proof_claims_for(token));
+    assert!(verify_signed_proof(&proof, &jkt, token).is_ok());
+}
+
+fn ed25519_proof_key() -> (Jwk, EncodingKey) {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("Ed25519");
+    let jwk: Jwk = serde_json::from_value(json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": URL_SAFE_NO_PAD.encode(key_pair.public_key_raw()),
+    }))
+    .expect("okp jwk");
+    let key = EncodingKey::from_ed_pem(key_pair.serialize_pem().as_bytes()).expect("ed key");
+    (jwk, key)
+}
+
+#[test]
+fn eddsa_proof_is_accepted_with_rfc8037_thumbprint() {
+    let token = "access-token-eddsa";
+    let (jwk, key) = ed25519_proof_key();
+    let jkt = jwk_thumbprint_sha256(&jwk).expect("OKP thumbprint");
+
+    // RFC 8037 §2 / RFC 7638: the thumbprint input is exactly crv, kty, x.
+    let x = serde_json::to_value(&jwk).expect("jwk serializes")["x"]
+        .as_str()
+        .expect("x member")
+        .to_string();
+    let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(
+        format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x}"}}"#).as_bytes(),
+    ));
+    assert_eq!(jkt, expected);
+
+    let proof = sign_proof_with(Algorithm::EdDSA, &jwk, &key, &proof_claims_for(token));
+    assert!(verify_signed_proof(&proof, &jkt, token).is_ok());
+}
+
+#[test]
+fn eddsa_proof_signed_by_another_key_is_rejected() {
+    let token = "access-token-eddsa";
+    let (jwk, _) = ed25519_proof_key();
+    let (_, other_key) = ed25519_proof_key();
+    let jkt = jwk_thumbprint_sha256(&jwk).expect("OKP thumbprint");
+    let proof = sign_proof_with(Algorithm::EdDSA, &jwk, &other_key, &proof_claims_for(token));
+    assert_eq!(
+        verify_signed_proof(&proof, &jkt, token),
+        Err("Invalid DPoP proof")
+    );
+}
+
+#[test]
+fn symmetric_proof_algorithm_is_rejected() {
+    let token = "access-token-hs256";
+    let jwk = rsa_jwk_without_alg();
+    let jkt = jwk_thumbprint_sha256(&jwk).expect("thumbprint");
+    let proof = sign_proof_with(
+        Algorithm::HS256,
+        &jwk,
+        &EncodingKey::from_secret(b"a-shared-secret-of-sufficient-length"),
+        &proof_claims_for(token),
+    );
+    assert_eq!(
+        verify_signed_proof(&proof, &jkt, token),
+        Err(dpop::DPOP_UNSUPPORTED_ALGORITHM)
+    );
+}

@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`jwks_auth` verifies RSASSA-PSS and Ed25519 tokens, follows OIDC
+  `jwks_uri` migrations, and adds a bounded JWT clock leeway.** The shared
+  JWKS store (also used by `oidc_relying_party` ID-token verification) now
+  admits RSA keys declaring `PS256`/`PS384`/`PS512` and `OKP` Ed25519 keys
+  (`EdDSA`), still binding verification to exactly the JWK's `alg`; `OKP`
+  keys are refused while FIPS mode is enforced, and `ES512` stays
+  unsupported. DPoP proofs may now be signed with `ES384`, `RS384`/`RS512`,
+  `PS256`/`PS384`/`PS512`, or `EdDSA` as well as `ES256`/`RS256`. A
+  `discovery_url` provider re-runs discovery every
+  `jwks_refresh_interval_secs` instead of resolving once per plugin
+  generation. New plugin-level and per-provider `clock_skew_seconds`
+  (default `0`, max `300`) widens `exp`/`nbf` validation and the
+  authenticated-stream deadline equally. Each provider's validation policy is
+  compiled once at construction instead of per verification. The
+  `consumer_identity_claim` schema/rustdoc now state that the identity is
+  never resolved to a gateway Consumer.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +155,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`jwks_auth` no longer lets an issuer-less provider strip a realm's DPoP
+  or mTLS binding.** A provider without an `issuer` that shared key material
+  with a `require_dpop`/`require_mtls_binding` provider accepted that realm's
+  token as a plain bearer token whenever the realm's own provider rejected it
+  on an `aud`/`exp` difference. It now refuses any token whose verified `iss`
+  is a sender-constrained provider's issuer.
+- **`jwks_auth` DPoP proofs bound to percent-encoded targets are accepted.**
+  The proof `htu` path is now canonicalized like the request path, so a proof
+  for `/v1/items/a%3Ab` matches the frontend's canonical `/v1/items/a:b`
+  instead of failing with `DPoP URL mismatch`.
+- **`jwks_auth` explicit `Authorization` locations no longer hide
+  default-location providers.** A token read through
+  `from_headers: [{name: Authorization}]` on one provider is now also
+  eligible for providers using the default `Authorization: Bearer` location.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

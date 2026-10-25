@@ -2572,8 +2572,11 @@ async fn test_jwks_auth_consumer_header_claim_separate_from_identity() {
     );
 }
 
+/// External identities are scoped to the provider that verified them, so a
+/// verified `sub` is never resolved to a gateway Consumer — not even one whose
+/// `custom_id` equals it (jwks_auth-MUSE-5 documents this contract).
 #[tokio::test]
-async fn test_jwks_auth_maps_subject_to_custom_id() {
+async fn test_jwks_auth_never_maps_subject_to_a_custom_id_consumer() {
     let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
     let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
 
@@ -3826,6 +3829,22 @@ fn build_dpop_fixture_for_subject_with_times(
     iat: i64,
     exp: Option<i64>,
 ) -> (DpopFixture, serde_json::Value) {
+    build_dpop_fixture_with(jti, sub, iat, exp, "http://example.com/test")
+}
+
+/// Build a DPoP fixture whose proof is bound to an explicit `htu`.
+fn build_dpop_fixture_for_htu(jti: &str, htu: &str) -> (DpopFixture, serde_json::Value) {
+    let now = chrono::Utc::now().timestamp();
+    build_dpop_fixture_with(jti, "idp-user", now, Some(now + 60), htu)
+}
+
+fn build_dpop_fixture_with(
+    jti: &str,
+    sub: &str,
+    iat: i64,
+    exp: Option<i64>,
+    htu: &str,
+) -> (DpopFixture, serde_json::Value) {
     use base64::Engine;
     use ferrum_edge::plugins::utils::dpop::jwk_thumbprint_sha256;
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -3850,7 +3869,7 @@ fn build_dpop_fixture_for_subject_with_times(
     dpop_header.jwk = Some(jwk);
     let mut proof_claims = json!({
         "htm": "GET",
-        "htu": "http://example.com/test",
+        "htu": htu,
         "iat": iat,
         "jti": jti,
         "ath": ath
@@ -6112,4 +6131,365 @@ async fn jwks_dpop_principal_reauthenticates_under_the_dpop_scheme() {
         reauthentication_challenge(&ctx),
         BEARER_INVALID_TOKEN_CHALLENGE
     );
+}
+
+// ─── Production-review fixes ───────────────────────────────────────────
+
+/// jwks_auth-MUSE-1: an issuer-less provider sharing a sender-constrained
+/// realm's key set must not authenticate that realm's token as a plain bearer
+/// when the realm's own provider rejects it on an `aud` difference. Before the
+/// fix the token fell through to the issuer-less sibling and the DPoP proof
+/// was never demanded — in either provider order.
+#[tokio::test]
+async fn issuer_less_sibling_cannot_strip_dpop_on_audience_divergence() {
+    let (fixture, jwks) = build_dpop_fixture("dpop-open-sibling-aud");
+    let mut constrained = dpop_provider(&jwks);
+    constrained["audiences"] = json!(["api"]);
+    let open = json!({ "jwks": jwks });
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    for providers in [
+        json!([constrained.clone(), open.clone()]),
+        json!([open.clone(), constrained.clone()]),
+    ] {
+        let plugin = dpop_plugin_with_providers(providers.clone(), "dpop-open-sibling-aud");
+        let mut ctx = make_ctx();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            format!("Bearer {}", fixture.access_token),
+        );
+        // No DPoP proof: the caller holds a stolen token, not the key.
+        let result = plugin.authenticate(&mut ctx, &consumer_index).await;
+        assert_reject(result, Some(401));
+        assert!(ctx.authenticated_identity.is_none(), "{providers}");
+
+        // The issuer-less provider still serves its other tenants.
+        let other_tenant = create_rs256_token(
+            &json!({"sub": "tenant-b-user", "iss": "https://tenant-b.example.com"}),
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        );
+        let mut ctx = make_ctx();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            format!("Bearer {other_tenant}"),
+        );
+        assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+        assert_eq!(ctx.authenticated_identity.as_deref(), Some("tenant-b-user"));
+    }
+}
+
+/// jwks_auth-MUSE-1, `exp` divergence: the constrained realm requires `exp`
+/// while the issuer-less sibling does not.
+#[tokio::test]
+async fn issuer_less_sibling_cannot_strip_dpop_on_exp_divergence() {
+    let (_, jwks) = build_dpop_fixture("dpop-open-sibling-exp");
+    let open = json!({ "jwks": jwks, "require_exp": false });
+    let token_without_exp = create_rs256_token_exact(
+        &json!({"sub": "idp-user", "iss": DPOP_TEST_ISSUER, "cnf": {"jkt": "bound-key"}}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    let consumer_index = ConsumerIndex::new(&[]);
+
+    for providers in [
+        json!([dpop_provider(&jwks), open.clone()]),
+        json!([open.clone(), dpop_provider(&jwks)]),
+    ] {
+        let plugin = dpop_plugin_with_providers(providers.clone(), "dpop-open-sibling-exp");
+        let mut ctx = make_ctx();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            format!("Bearer {token_without_exp}"),
+        );
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+        assert!(ctx.authenticated_identity.is_none(), "{providers}");
+    }
+}
+
+/// jwks_auth-MUSE-1, mTLS variant: the issuer-less sibling must not strip a
+/// realm's certificate binding either.
+#[tokio::test]
+async fn issuer_less_sibling_cannot_strip_mtls_binding() {
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ));
+    let constrained = json!({
+        "jwks": jwks,
+        "issuer": "https://mtls.example.com",
+        "audiences": ["api"],
+        "require_mtls_binding": true
+    });
+    let open = json!({ "jwks": jwks });
+    let token = create_rs256_token(
+        &json!({
+            "sub": "mtls-user",
+            "iss": "https://mtls.example.com",
+            "cnf": {"x5t#S256": "certificate-thumbprint"}
+        }),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+    );
+    for providers in [
+        json!([constrained.clone(), open.clone()]),
+        json!([open.clone(), constrained.clone()]),
+    ] {
+        let plugin = JwksAuth::new(&json!({ "providers": providers }), default_client()).unwrap();
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        assert_reject(
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await,
+            Some(401),
+        );
+        assert!(ctx.authenticated_identity.is_none(), "{providers}");
+    }
+}
+
+/// jwks_auth-SOL-2: the frontend rewrites `/v1/items/a%3Ab` to the canonical
+/// policy path `/v1/items/a:b` before authentication. A DPoP proof bound to
+/// the exact URI the client sent must still be accepted, and a proof for a
+/// different target must still be refused.
+#[tokio::test]
+async fn dpop_proof_for_percent_encoded_target_matches_canonical_request_path() {
+    let consumer_index = ConsumerIndex::new(&[create_consumer("idp-user")]);
+
+    let (fixture, jwks) =
+        build_dpop_fixture_for_htu("dpop-encoded-target", "http://example.com/v1/items/a%3Ab");
+    let plugin = dpop_plugin(&jwks, "dpop-encoded-target");
+    let mut ctx = dpop_ctx(&fixture);
+    ctx.path = "/v1/items/a:b".to_string();
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+
+    let (fixture, jwks) = build_dpop_fixture_for_htu(
+        "dpop-encoded-other-target",
+        "http://example.com/v1/items/a%3Ac",
+    );
+    let plugin = dpop_plugin(&jwks, "dpop-encoded-other-target");
+    let mut ctx = dpop_ctx(&fixture);
+    ctx.path = "/v1/items/a:b".to_string();
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+}
+
+/// jwks_auth-SOL-3: the verification policy is compiled per provider at
+/// construction, so a reloaded generation enforces its own audiences while
+/// the previous generation keeps its own.
+#[tokio::test]
+async fn each_generation_enforces_its_own_compiled_audience_policy() {
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ));
+    let generation = |audiences: Value| {
+        JwksAuth::new(
+            &json!({"providers": [{"jwks": jwks, "audiences": audiences}]}),
+            default_client(),
+        )
+        .unwrap()
+    };
+    let before = generation(json!(["service-a"]));
+    let after = generation(json!(["service-a", "service-b"]));
+    let token = create_rs256_token(
+        &json!({"sub": "audience-user", "aud": "service-b"}),
+        private_key_pem,
+    );
+    let authenticate = |plugin: JwksAuth| {
+        let token = token.clone();
+        async move {
+            let mut ctx = make_ctx();
+            ctx.headers
+                .insert("authorization".to_string(), format!("Bearer {token}"));
+            plugin
+                .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                .await
+        }
+    };
+    assert_reject(authenticate(before).await, Some(401));
+    assert_continue(authenticate(after).await);
+}
+
+/// jwks_auth-MUSE-4: `clock_skew_seconds` widens JWT `exp`/`nbf` validation
+/// (default `0` unchanged), a provider override wins over the plugin default,
+/// and the authenticated-stream deadline is `exp + leeway`, never beyond.
+#[tokio::test]
+async fn clock_skew_seconds_widens_exp_and_nbf_validation() {
+    use ferrum_edge::_test_support::request_credential_deadline_remaining;
+
+    let private_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_private.pem");
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ));
+    let now = chrono::Utc::now().timestamp();
+    let recently_expired = create_rs256_token_exact(
+        &json!({"sub": "skew-user", "exp": now - 20}),
+        private_key_pem,
+    );
+    let not_yet_valid = create_rs256_token_exact(
+        &json!({"sub": "skew-user", "exp": now + 3600, "nbf": now + 20}),
+        private_key_pem,
+    );
+    let plugin = |config: Value| JwksAuth::new(&config, default_client()).unwrap();
+    let ctx_with = |token: &str| {
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        ctx
+    };
+
+    let strict = plugin(json!({"providers": [{"jwks": jwks}]}));
+    let root = plugin(json!({"providers": [{"jwks": jwks}], "clock_skew_seconds": 60}));
+    let provider = plugin(json!({"providers": [{"jwks": jwks, "clock_skew_seconds": 60}]}));
+    let overridden = plugin(json!({
+        "providers": [{"jwks": jwks, "clock_skew_seconds": 0}],
+        "clock_skew_seconds": 60
+    }));
+
+    for token in [recently_expired.as_str(), not_yet_valid.as_str()] {
+        for rejecting in [&strict, &overridden] {
+            let mut ctx = ctx_with(token);
+            assert_reject(
+                rejecting
+                    .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                    .await,
+                Some(401),
+            );
+        }
+        for accepting in [&root, &provider] {
+            let mut ctx = ctx_with(token);
+            assert_continue(
+                accepting
+                    .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+                    .await,
+            );
+            assert_eq!(ctx.authenticated_identity.as_deref(), Some("skew-user"));
+        }
+    }
+
+    let mut ctx = ctx_with(recently_expired.as_str());
+    assert_continue(root.authenticate(&mut ctx, &ConsumerIndex::new(&[])).await);
+    let remaining = request_credential_deadline_remaining(&ctx)
+        .expect("the leeway-extended expiry must bound the stream");
+    assert!(
+        remaining <= std::time::Duration::from_secs(40)
+            && remaining >= std::time::Duration::from_secs(30),
+        "deadline must be exp + leeway (about 40s away), got {remaining:?}"
+    );
+}
+
+#[test]
+fn clock_skew_seconds_is_bounded_at_admission() {
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ));
+    for config in [
+        json!({"providers": [{"jwks": jwks}], "clock_skew_seconds": 300}),
+        json!({"providers": [{"jwks": jwks, "clock_skew_seconds": 300}]}),
+    ] {
+        JwksAuth::new(&config, default_client()).expect("300 seconds is the documented ceiling");
+    }
+    for config in [
+        json!({"providers": [{"jwks": jwks}], "clock_skew_seconds": 301}),
+        json!({"providers": [{"jwks": jwks, "clock_skew_seconds": 301}]}),
+        json!({"providers": [{"jwks": jwks}], "clock_skew_seconds": -1}),
+        json!({"providers": [{"jwks": jwks}], "clock_skew_seconds": "30"}),
+    ] {
+        let error = match JwksAuth::new(&config, default_client()) {
+            Ok(_) => panic!("out-of-range clock skew must be refused: {config}"),
+            Err(error) => error,
+        };
+        assert!(error.contains("clock_skew_seconds"), "{error}");
+    }
+}
+
+/// jwks_auth-MUSE-2: discovery keeps running after its first success, so an
+/// IdP that moves its `jwks_uri` (same origin, new path, new signing key) is
+/// followed without a reload or restart.
+#[serial_test::serial(jwks_remote_global_cache)]
+#[tokio::test]
+async fn discovery_follows_a_jwks_uri_migration_without_reload() {
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let original_public = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let migrated_private = include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem");
+    let migrated_public = include_bytes!("../../../tests/fixtures/test_rsa_public_other.pem");
+    let server = wiremock::MockServer::start().await;
+    let original_path = unique_jwks_path("migrating-original-jwks");
+    let migrated_path = unique_jwks_path("migrating-new-jwks");
+    let original_uri = format!("{}{}", server.uri(), original_path);
+    let migrated_uri = format!("{}{}", server.uri(), migrated_path);
+    let discovery_path = unique_jwks_path("oidc-discovery");
+    let discovery_url = format!("{}{discovery_path}", server.uri());
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(original_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(original_public)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(migrated_path))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            build_rsa_jwks_from_pem_with_kid(migrated_public, "migrated-key"),
+        ))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path.clone()))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": original_uri.clone()})),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": migrated_uri.clone()})),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [{"discovery_url": discovery_url}],
+            "jwks_refresh_interval_secs": 1
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_background_tasks(&plugin);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while plugin.active_jwks_uris() != vec![migrated_uri.clone()] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rediscovery must adopt the migrated jwks_uri without a reload"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    let token = create_rs256_token_with_kid(
+        &json!({"sub": "migrated-user"}),
+        migrated_private,
+        "migrated-key",
+    );
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    assert_continue(
+        plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await,
+    );
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("migrated-user"));
 }
