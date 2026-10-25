@@ -137,7 +137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mongo:9` with the same override. A compose volume created by MongoDB 7.0
   cannot be opened by 9.0, so remove the old volume (`docker compose down -v`)
   before upgrading a compose stack.
-
 - **BREAKING — `stdout_logging` is `KeepLastKnownGood` and refuses filters
   that can never match** (#6863). An invalid enabled `stdout_logging` config
   now fails file-mode startup and `validate`, and a reload that cannot
@@ -166,6 +165,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ferrum_plugin_log_sink_records_accepted_total{plugin="stdout_logging"}`
     and `ferrum_plugin_log_sink_records_dropped_total{plugin="stdout_logging",reason}`,
     separately from runtime tracing records that share the stdout queue.
+
 ### Fixed
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
