@@ -69,6 +69,14 @@ pub struct BodyOutcome {
     /// `auth_lifetime::StreamAuthTermination`; never a token, claim, identity,
     /// provider name, or absolute expiry.
     pub authorization_termination: Option<&'static str>,
+    /// True when the matched route rule's deadline — the earlier of its total
+    /// request deadline and the committed attempt's budget — cut this body:
+    /// the exact fired flag proxy core itself uses to settle the cut
+    /// health-neutrally (H1/H2 body wrapper, native HTTP/3 relays, and the
+    /// HTTP/3 cross-protocol bridge). The cut keeps its `read_write_timeout`
+    /// class in the log, so this typed bit is the only provenance that tells
+    /// it apart from a backend read timeout.
+    pub route_policy_cut: bool,
 }
 
 impl BodyOutcome {
@@ -82,6 +90,7 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
         }
     }
 
@@ -96,6 +105,7 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
         }
     }
 
@@ -110,7 +120,15 @@ impl BodyOutcome {
             grpc_status: None,
             grpc_status_unreadable: None,
             authorization_termination: None,
+            route_policy_cut: false,
         }
+    }
+
+    /// Record that the route rule's total request deadline cut this body
+    /// (see [`Self::route_policy_cut`]).
+    pub fn with_route_policy_cut(mut self, route_policy_cut: bool) -> Self {
+        self.route_policy_cut = route_policy_cut;
+        self
     }
 
     pub fn with_grpc_status(mut self, grpc_status: Option<u32>) -> Self {

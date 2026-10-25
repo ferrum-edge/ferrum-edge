@@ -43,6 +43,7 @@ mod unit {
         mod auth_challenge_tests;
         mod auth_flow_credential_deadline_tests;
         mod authenticated_identity_bounds_tests;
+        mod aws_refreshing_credentials_tests;
         mod basic_auth_tests;
         mod batching_logger_tests;
         mod body_transform_tests;
