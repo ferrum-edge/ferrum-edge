@@ -10161,7 +10161,7 @@ fn mesh_outbound_registry_deny_warning_fields_and_rate_limit() {
         .collect();
     assert_eq!(lines.len(), 3, "{logs}");
     for field in [
-        r#"host="Evil\nforged=1.example""#,
+        r#"host="<redacted scalar>""#,
         "port=Some(8443)",
         "listen_port=Some(15001)",
         "client=192.0.2.10",
@@ -10175,6 +10175,7 @@ fn mesh_outbound_registry_deny_warning_fields_and_rate_limit() {
         );
     }
     assert!(!logs.contains("suppressed.example"), "{logs}");
+    assert!(!logs.contains("forged"), "{logs}");
     assert!(lines[1].contains(r#"host="<missing>""#), "{}", lines[1]);
     assert!(lines[1].contains("suppressed_since_last=1"), "{}", lines[1]);
     assert!(
@@ -10183,6 +10184,52 @@ fn mesh_outbound_registry_deny_warning_fields_and_rate_limit() {
         lines[2]
     );
     assert!(!lines[2].contains(&"h".repeat(257)), "{}", lines[2]);
+}
+
+#[test]
+fn mesh_outbound_registry_deny_warning_withholds_non_authority_hosts() {
+    use ferrum_edge::_test_support::{
+        atomic_log_rate_limiter_with_window_for_test,
+        mesh_outbound_registry_warn_http_deny_with_for_test as warn_deny,
+    };
+
+    // A zero-length window admits every line so each host is observed.
+    let limiter = atomic_log_rate_limiter_with_window_for_test(0);
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    for host in [
+        "client:launchsecret@api.example.com",
+        "https://client:launchsecret@api.example.com/path",
+        "api.example.com:0",
+        "api%2eexample.com",
+        "[::1]launchsecret",
+        "Bücher.example",
+    ] {
+        warn_deny(&limiter, 10, Some(host), None, None, "192.0.2.10");
+    }
+    for host in ["Api.Example.com", "[2001:DB8::1]", "svc_internal.local"] {
+        warn_deny(&limiter, 10, Some(host), None, None, "192.0.2.10");
+    }
+    drop(guard);
+    let logs = logs.contents();
+
+    let lines: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("rejecting HTTP egress to unadmitted destination"))
+        .collect();
+    assert_eq!(lines.len(), 9, "{logs}");
+    for line in &lines[..6] {
+        assert!(line.contains(r#"host="<redacted scalar>""#), "{line}");
+    }
+    for withheld in ["launchsecret", "https://", "%2e", ":0", "Bücher"] {
+        assert!(!logs.contains(withheld), "{withheld} leaked into: {logs}");
+    }
+    for echoed in [
+        r#"host="Api.Example.com""#,
+        r#"host="[2001:DB8::1]""#,
+        r#"host="svc_internal.local""#,
+    ] {
+        assert!(logs.contains(echoed), "expected {echoed} in: {logs}");
+    }
 }
 
 #[test]
@@ -10203,6 +10250,14 @@ fn mesh_known_destinations_drop_entries_outside_registry_grammar() {
         "ports": [{"port": 0}],
     }))
     .unwrap();
+    // A pasted URL with userinfo credentials and a hostile resource identity:
+    // neither the credential nor the raw rejected value may reach the log.
+    let credential_entry: ServiceEntry = serde_json::from_value(json!({
+        "name": "partner:launchsecret",
+        "namespace": "default",
+        "hosts": ["https://client:launchsecret@api.example.com"],
+    }))
+    .unwrap();
     let slice = MeshSlice {
         namespace: "default".into(),
         services: vec![MeshService {
@@ -10215,7 +10270,7 @@ fn mesh_known_destinations_drop_entries_outside_registry_grammar() {
             uid: None,
             allow_path_parameters: false,
         }],
-        service_entries: vec![service_entry, zero_port_entry],
+        service_entries: vec![service_entry, zero_port_entry, credential_entry],
         ..MeshSlice::default()
     };
 
@@ -10250,17 +10305,32 @@ fn mesh_known_destinations_drop_entries_outside_registry_grammar() {
     for field in [
         "skipping destination outside the outbound registry grammar",
         r#"resource_kind="ServiceEntry""#,
-        r#"resource_name="bad-hosts""#,
-        r#"entry="*""#,
-        r#"resource_name="bad-port""#,
-        r#"entry="port0.example:0""#,
+        "resource=service_entries[0].hosts[0]",
+        "resource_namespace=default",
+        "resource_name=bad-hosts",
+        "resource=service_entries[1].hosts[0]",
+        "resource_name=bad-port",
+        "resource=service_entries[2].hosts[0]",
+        "resource_name=<redacted scalar>",
+        "expected an ASCII hostname",
     ] {
         assert!(logs.contains(field), "expected {field} in: {logs}");
     }
+    // The rejected values themselves are never echoed.
+    for withheld in [
+        "launchsecret",
+        "https://",
+        "client:",
+        "foo.*.example.com",
+        "port0.example",
+        r#"entry="#,
+    ] {
+        assert!(!logs.contains(withheld), "{withheld} leaked into: {logs}");
+    }
     // One warning per resource per build: the three bad hosts of
-    // `bad-hosts` report its first offending entry once.
+    // `bad-hosts` report its first offending member once.
     let warnings = |name: &str| {
-        let resource = format!("resource_name=\"{name}\"");
+        let resource = format!("resource_name={name} ");
         logs.lines()
             .filter(|line| {
                 line.contains("skipping destination outside the outbound registry grammar")
@@ -10270,6 +10340,7 @@ fn mesh_known_destinations_drop_entries_outside_registry_grammar() {
     };
     assert_eq!(warnings("bad-hosts"), 1, "{logs}");
     assert_eq!(warnings("bad-port"), 1, "{logs}");
+    assert_eq!(warnings("<redacted scalar>"), 1, "{logs}");
     assert!(!logs.contains("my_service.internal"), "{logs}");
 
     // The HTTP lane builds exactly this registry; it must construct instead

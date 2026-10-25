@@ -1099,7 +1099,7 @@ impl MeshSlice {
         let mut warned: KnownDestinationWarned<'_> = HashSet::new();
         let cluster_domain = normalize_known_destination_host(cluster_domain).unwrap_or_default();
         let local_namespace = normalize_known_destination_host(&self.namespace);
-        for service in &self.services {
+        for (resource_index, service) in self.services.iter().enumerate() {
             let Some(service_name) = normalize_known_destination_host(&service.name) else {
                 continue;
             };
@@ -1115,6 +1115,8 @@ impl MeshSlice {
             };
             let source = KnownDestinationSource {
                 kind: "Service",
+                collection: "services",
+                index: resource_index,
                 namespace: &service.namespace,
                 name: &service.name,
             };
@@ -1123,6 +1125,7 @@ impl MeshSlice {
                     &mut entries,
                     &mut warned,
                     source,
+                    None,
                     &service_name,
                     service.ports.iter().map(|p| p.port),
                 );
@@ -1132,18 +1135,21 @@ impl MeshSlice {
                     &mut entries,
                     &mut warned,
                     source,
+                    None,
                     host,
                     service.ports.iter().map(|p| p.port),
                 );
             }
         }
-        for entry in &self.service_entries {
+        for (resource_index, entry) in self.service_entries.iter().enumerate() {
             let source = KnownDestinationSource {
                 kind: "ServiceEntry",
+                collection: "service_entries",
+                index: resource_index,
                 namespace: &entry.namespace,
                 name: &entry.name,
             };
-            for host in &entry.hosts {
+            for (host_index, host) in entry.hosts.iter().enumerate() {
                 let Some(host) = normalize_known_destination_host(host) else {
                     continue;
                 };
@@ -1151,18 +1157,21 @@ impl MeshSlice {
                     &mut entries,
                     &mut warned,
                     source,
+                    Some(("hosts", host_index)),
                     &host,
                     entry.ports.iter().map(|p| p.port),
                 );
             }
         }
-        for workload in &self.workloads {
+        for (resource_index, workload) in self.workloads.iter().enumerate() {
             let source = KnownDestinationSource {
                 kind: "Workload",
+                collection: "workloads",
+                index: resource_index,
                 namespace: &workload.namespace,
                 name: &workload.service_name,
             };
-            for addr in &workload.addresses {
+            for (address_index, addr) in workload.addresses.iter().enumerate() {
                 let Some(addr) = normalize_known_destination_host(addr) else {
                     continue;
                 };
@@ -1170,6 +1179,7 @@ impl MeshSlice {
                     &mut entries,
                     &mut warned,
                     source,
+                    Some(("addresses", address_index)),
                     &addr,
                     workload.ports.iter().map(|p| p.port),
                 );
@@ -2776,11 +2786,38 @@ fn normalize_known_destination_host(value: &str) -> Option<String> {
 }
 
 /// Slice resource a known destination came from, for the skip warning.
+/// `collection` + `index` form a fixed schema path; `namespace` / `name` are
+/// document values and are only emitted through
+/// [`diagnostic_resource_identity`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct KnownDestinationSource<'a> {
     kind: &'static str,
+    collection: &'static str,
+    index: usize,
     namespace: &'a str,
     name: &'a str,
+}
+
+/// Emit a resource namespace/name only when it is a DNS-1123 subdomain
+/// (lowercase alphanumerics, `-`, `.`; at most 253 bytes), which cannot carry
+/// userinfo, URLs, quotes, or control characters. Anything else is withheld
+/// through the startup diagnostic sanitizer.
+fn diagnostic_resource_identity(value: &str) -> String {
+    let is_dns1123_subdomain = !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|component| {
+            let bytes = component.as_bytes();
+            let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+            !bytes.is_empty()
+                && alnum(bytes[0])
+                && alnum(bytes[bytes.len() - 1])
+                && bytes.iter().all(|b| alnum(*b) || *b == b'-')
+        });
+    if is_dns1123_subdomain {
+        value.to_string()
+    } else {
+        sanitize_startup_cause(format!("{:?}", value.to_string()), &[])
+    }
 }
 
 /// Resources already warned about within one registry build.
@@ -2790,11 +2827,12 @@ fn insert_known_destination<'a>(
     entries: &mut HashSet<String>,
     warned: &mut KnownDestinationWarned<'a>,
     source: KnownDestinationSource<'a>,
+    member: Option<(&'static str, usize)>,
     host: &str,
     ports: impl Iterator<Item = u16>,
 ) {
     let mut skipped = 0usize;
-    let mut first_error: Option<(String, &'static str)> = None;
+    let mut first_error: Option<&'static str> = None;
     let mut admit =
         |entry: String| match crate::plugins::mesh::outbound_registry::validate_registry_entry(
             &entry,
@@ -2805,7 +2843,7 @@ fn insert_known_destination<'a>(
             Err(error) => {
                 skipped += 1;
                 if first_error.is_none() {
-                    first_error = Some((entry, error));
+                    first_error = Some(error);
                 }
             }
         };
@@ -2818,17 +2856,24 @@ fn insert_known_destination<'a>(
     if !inserted_port {
         admit(format!("{host}:*"));
     }
-    // One line per resource per registry build (its first offending entry),
+    // One line per resource per registry build (its first offending member),
     // not per derived form. The dropped destination stays denied
-    // (REGISTRY_ONLY fails closed for it).
-    if let Some((entry, error)) = first_error
+    // (REGISTRY_ONLY fails closed for it). The rejected value itself is never
+    // logged: it failed the hostname grammar, so it may be a pasted URL with
+    // userinfo credentials. Only the fixed schema path with ordinals, the
+    // fixed grammar reason, and grammar-checked resource identities appear.
+    if let Some(error) = first_error
         && warned.insert(source)
     {
+        let mut resource = format!("{}[{}]", source.collection, source.index);
+        if let Some((field, index)) = member {
+            resource.push_str(&format!(".{field}[{index}]"));
+        }
         warn!(
             resource_kind = source.kind,
-            resource_namespace = ?source.namespace,
-            resource_name = ?source.name,
-            entry = ?entry,
+            resource = %resource,
+            resource_namespace = %diagnostic_resource_identity(source.namespace),
+            resource_name = %diagnostic_resource_identity(source.name),
             skipped_entries = skipped,
             error,
             "Mesh REGISTRY_ONLY: skipping destination outside the outbound registry grammar; \

@@ -142,8 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`mesh_outbound_registry` (mesh REGISTRY_ONLY) review hardening.**
   - Mesh-derived registries drop slice hosts or names outside the registry
     entry grammar (ServiceEntry host `*`, `foo.*.example.com`, underscore
-    names, port `0`) with one `warn` per resource per registry build naming
-    the resource and its first offending entry.
+    names, port `0`) with one `warn` per resource per registry build giving
+    the schema path with ordinals (`service_entries[2].hosts[0]`), the
+    resource kind, the fixed grammar reason, and the namespace/name only when
+    they are DNS-1123 names (otherwise withheld). The rejected value itself is
+    never logged, so a pasted URL with userinfo cannot leak credentials.
     The dropped destination stays denied and the rest of the registry
     applies identically on the HTTP plugin, the stream lane, and the
     egress-scope diagnostics; previously one such resource failed the whole
@@ -166,7 +169,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Sidecar egress scoping, the mesh DNS proxy, and the stream lane.
   - HTTP-lane denials (plugin hook and outbound-capture route miss) log a
     process-wide rate-limited `warn` naming the denied `host`, `port`,
-    `listen_port`, `client`, and `source`; the fixed-cardinality `<denied>`
+    `listen_port`, `client`, and `source`. The host is echoed only when it is
+    authority-shaped (hostname characters or a bracketed IPv6 literal,
+    truncated to 256 bytes) and is otherwise withheld; the fixed-cardinality `<denied>`
     metric bucket is unchanged.
   - The request hook normalizes the host once per request and maps the match
     kind straight to its metric bucket instead of re-normalizing twice.

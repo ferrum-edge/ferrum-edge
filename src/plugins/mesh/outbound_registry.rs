@@ -807,9 +807,12 @@ pub(crate) fn warn_http_registry_deny_with(
     let Some(suppressed) = limiter.on_event(now_ms) else {
         return;
     };
-    let host = host.filter(|host| !host.is_empty()).map(bounded_log_host);
+    let host = match host.filter(|host| !host.is_empty()) {
+        None => "<missing>".to_string(),
+        Some(host) => diagnostic_log_host(host),
+    };
     tracing::warn!(
-        host = ?host.unwrap_or("<missing>"),
+        host = ?host,
         port = ?port,
         listen_port = ?listen_port,
         client = %client_ip,
@@ -824,16 +827,29 @@ pub(crate) fn reset_http_deny_warn_for_test() {
     HTTP_DENY_WARN.reset_for_test();
 }
 
-/// Truncate `host` to at most [`DENY_LOG_HOST_MAX_BYTES`] on a char boundary.
-fn bounded_log_host(host: &str) -> &str {
-    if host.len() <= DENY_LOG_HOST_MAX_BYTES {
-        return host;
+/// Render a denied request host for the log line. Only authority-shaped
+/// values are echoed: hostname characters (ASCII alphanumerics, `-`, `.`, `_`)
+/// or a bracketed IPv6 literal (hex digits, `:`, `.`), truncated to
+/// [`DENY_LOG_HOST_MAX_BYTES`]. Anything else (userinfo, ports that failed the
+/// port grammar, percent-escapes, quotes, control bytes) is withheld through
+/// the startup diagnostic sanitizer, so a credential-bearing value never
+/// reaches the log.
+fn diagnostic_log_host(host: &str) -> String {
+    let hostname = host
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'));
+    let bracketed_ip = host.len() > 2
+        && host.starts_with('[')
+        && host.ends_with(']')
+        && host[1..host.len() - 1]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'));
+    if hostname || bracketed_ip {
+        // ASCII-only, so every byte offset is a char boundary.
+        host[..host.len().min(DENY_LOG_HOST_MAX_BYTES)].to_string()
+    } else {
+        crate::startup::sanitize_startup_cause(format!("{:?}", host.to_string()), &[])
     }
-    let mut end = DENY_LOG_HOST_MAX_BYTES;
-    while !host.is_char_boundary(end) {
-        end -= 1;
-    }
-    &host[..end]
 }
 
 fn reject(status: u16, message: &str) -> PluginResult {
