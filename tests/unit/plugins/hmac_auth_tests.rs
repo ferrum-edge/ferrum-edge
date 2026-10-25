@@ -3551,3 +3551,1232 @@ async fn hmac_v2_replay_401_carries_the_hmac_challenge() {
         ferrum_edge::plugins::utils::auth_flow::HMAC_AUTHENTICATION_CHALLENGE,
     );
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Production-launch review hardening: bounded config, signed headers,
+// replay attribution, selective body hashing, and the RFC 9421 profile.
+// ────────────────────────────────────────────────────────────────────
+
+fn plugin_named(config: Value, config_id: &str) -> HmacAuth {
+    HmacAuth::new_with_http_client_and_config_id(
+        &config,
+        ferrum_edge::plugins::utils::PluginHttpClient::default(),
+        Some(config_id),
+    )
+    .expect("hmac_auth config should be accepted")
+}
+
+#[test]
+fn replay_max_entries_is_bounded_and_refused_without_replay_state() {
+    use ferrum_edge::plugins::hmac_auth::MAX_HMAC_REPLAY_MAX_ENTRIES;
+
+    assert!(
+        HmacAuth::new(&json!({
+            "replay_scope": "process",
+            "replay_max_entries": MAX_HMAC_REPLAY_MAX_ENTRIES
+        }))
+        .is_ok(),
+        "the ceiling itself is admissible"
+    );
+    for config in [
+        json!({"replay_scope": "process", "replay_max_entries": MAX_HMAC_REPLAY_MAX_ENTRIES + 1}),
+        json!({"replay_scope": "process", "replay_max_entries": 999_999_999_999u64}),
+        // v1 has no replay state, so a cap there would be silently inert.
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_max_entries": 1000
+        }),
+    ] {
+        assert!(
+            HmacAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
+}
+
+#[test]
+fn max_body_bytes_sets_the_pre_authentication_ceiling_within_bounds() {
+    use ferrum_edge::plugins::hmac_auth::{DEFAULT_HMAC_MAX_BODY_BYTES, MAX_HMAC_MAX_BODY_BYTES};
+
+    let default = HmacAuth::new(&v2_config()).unwrap();
+    assert_eq!(
+        default.request_body_buffer_limit(),
+        Some(DEFAULT_HMAC_MAX_BODY_BYTES)
+    );
+
+    let raised = HmacAuth::new(&json!({
+        "replay_scope": "process",
+        "max_body_bytes": 64 * 1024 * 1024
+    }))
+    .unwrap();
+    assert_eq!(raised.request_body_buffer_limit(), Some(64 * 1024 * 1024));
+
+    for value in [
+        json!(0),
+        json!(MAX_HMAC_MAX_BODY_BYTES + 1),
+        json!("1024"),
+        json!(-1),
+    ] {
+        let config = json!({"replay_scope": "process", "max_body_bytes": value});
+        assert!(
+            HmacAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
+}
+
+#[test]
+fn signed_headers_and_required_components_are_validated() {
+    assert!(
+        HmacAuth::new(&json!({
+            "replay_scope": "process",
+            "signed_headers": ["x-tenant-id", "content-type", "idempotency-key"]
+        }))
+        .is_ok()
+    );
+    let too_many: Vec<String> = (0..33).map(|idx| format!("x-h{idx}")).collect();
+    for signed_headers in [
+        json!("x-tenant-id"),
+        json!([1]),
+        json!(["X-Tenant-Id"]),
+        json!(["x tenant"]),
+        json!([""]),
+        json!(["authorization"]),
+        json!(["signature-input"]),
+        json!(["host"]),
+        json!(["transfer-encoding"]),
+        json!(["x-tenant-id", "x-tenant-id"]),
+        json!(too_many),
+    ] {
+        let config = json!({"replay_scope": "process", "signed_headers": signed_headers});
+        assert!(
+            HmacAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
+
+    // `required_components` is RFC 9421-only and names derived components.
+    assert!(
+        HmacAuth::new(&json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "required_components": ["@request-target"]
+        }))
+        .is_ok()
+    );
+    for config in [
+        json!({"replay_scope": "process", "required_components": ["@method"]}),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "required_components": ["@scheme"]
+        }),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "required_components": ["content-type"]
+        }),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "required_components": ["@path", "@path"]
+        }),
+        // RFC 9421 is single-use: it needs a declared scope and refuses the
+        // unsafe acknowledgement.
+        json!({"signing_profile": "rfc9421"}),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "allow_unsafe_replayable_v1": true
+        }),
+    ] {
+        assert!(
+            HmacAuth::new(&config).is_err(),
+            "config should be rejected: {config}"
+        );
+    }
+}
+
+/// v2 signing base plus the configured `signed_headers` lines.
+fn sign_v2_with_signed_headers(
+    input: HmacSigningInput<'_>,
+    nonce: &str,
+    headers: &[(&str, &str)],
+) -> String {
+    let mut base = build_v2_signing_string(input, nonce);
+    for (name, value) in headers {
+        base.push_str(&format!("\n{name}:{value}"));
+    }
+    let mut mac = HmacSha256::new_from_slice(TEST_SECRET.as_bytes()).unwrap();
+    mac.update(base.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn signed_header_request(nonce: &str, tenant_signed: Option<&str>) -> RequestContext {
+    let request = V2Request::new(nonce);
+    let input = HmacSigningInput {
+        namespace: ferrum_edge::config::types::DEFAULT_NAMESPACE,
+        username: TEST_USERNAME,
+        authority: TEST_AUTHORITY,
+        method: &request.method,
+        path: &request.path,
+        query: "",
+        date: &request.date,
+        digest_header: &request.digest,
+    };
+    let headers: Vec<(&str, &str)> = tenant_signed
+        .map(|tenant| vec![("x-tenant-id", tenant)])
+        .unwrap_or_default();
+    let signature = sign_v2_with_signed_headers(input, nonce, &headers);
+    let mut ctx = request.context();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, nonce, &signature),
+    );
+    ctx.headers
+        .insert("x-tenant-id".to_string(), "tenant-a".to_string());
+    ctx
+}
+
+#[tokio::test]
+async fn signed_headers_bind_the_configured_header_into_the_v2_signature() {
+    let config = json!({"replay_scope": "process", "signed_headers": ["x-tenant-id"]});
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    // Signed and unchanged.
+    let plugin = plugin_named(config.clone(), "signed-headers-ok");
+    let mut ctx = signed_header_request(&test_nonce(0x6001), Some("tenant-a"));
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        TEST_USERNAME
+    );
+
+    // Altered before first presentation: every other field still verifies.
+    let plugin = plugin_named(config.clone(), "signed-headers-altered");
+    let mut ctx = signed_header_request(&test_nonce(0x6002), Some("tenant-a"));
+    ctx.headers
+        .insert("x-tenant-id".to_string(), "tenant-b".to_string());
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+    assert!(ctx.identified_consumer.is_none());
+
+    // Removed.
+    let plugin = plugin_named(config.clone(), "signed-headers-removed");
+    let mut ctx = signed_header_request(&test_nonce(0x6003), Some("tenant-a"));
+    ctx.headers.remove("x-tenant-id");
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Missing required signed header",
+    );
+
+    // A signature over the base without the header line does not verify.
+    let plugin = plugin_named(config, "signed-headers-unsigned");
+    let mut ctx = signed_header_request(&test_nonce(0x6004), None);
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+
+    // Without `signed_headers` the base is unchanged, so existing clients keep
+    // verifying.
+    let plugin = plugin_named(v2_config(), "signed-headers-unconfigured");
+    let mut ctx = signed_header_request(&test_nonce(0x6005), None);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+}
+
+#[tokio::test]
+async fn a_staged_record_is_discarded_when_a_signed_header_changes() {
+    let config = json!({"replay_scope": "process", "signed_headers": ["x-tenant-id"]});
+    let plugin = plugin_named(config, "signed-headers-prebuffer");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let mut ctx = signed_header_request(&test_nonce(0x6010), Some("tenant-a"));
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    assert!(plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index));
+
+    ctx.headers
+        .insert("x-tenant-id".to_string(), "tenant-b".to_string());
+    set_request_body(&mut ctx, b"");
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn a_replayed_request_is_attributed_to_its_verified_consumer() {
+    use ferrum_edge::plugins::hmac_auth::REPLAY_CONSUMER_METADATA_KEY;
+
+    let plugin = v2_plugin_named("v2-replay-attribution");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let request = V2Request::new(&test_nonce(0x6020));
+
+    let mut first = request.context();
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+    assert!(
+        !first.metadata.contains_key(REPLAY_CONSUMER_METADATA_KEY),
+        "an admitted request is not a replay"
+    );
+
+    let mut replay = request.context();
+    assert_reject_error(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        401,
+        "already been used",
+    );
+    assert_eq!(
+        replay
+            .metadata
+            .get(REPLAY_CONSUMER_METADATA_KEY)
+            .map(String::as_str),
+        Some(TEST_USERNAME)
+    );
+    assert!(
+        replay.identified_consumer.is_none(),
+        "attribution must not publish an identity"
+    );
+    assert!(replay.auth_method.is_none());
+
+    // An unverified request never names a Consumer.
+    let mut forged = request.context();
+    forged.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &test_nonce(0x6021), &request.signature),
+    );
+    assert_reject(
+        plugin.authenticate(&mut forged, &consumer_index).await,
+        Some(401),
+    );
+    assert!(!forged.metadata.contains_key(REPLAY_CONSUMER_METADATA_KEY));
+}
+
+#[test]
+fn replay_attribution_metadata_is_log_visible() {
+    use ferrum_edge::plugins::hmac_auth::REPLAY_CONSUMER_METADATA_KEY;
+    use ferrum_edge::plugins::utils::metadata_redaction::{
+        is_builtin_safe_metadata_name, is_sensitive_metadata_key,
+    };
+
+    assert!(is_builtin_safe_metadata_name(REPLAY_CONSUMER_METADATA_KEY));
+    assert!(!is_sensitive_metadata_key(REPLAY_CONSUMER_METADATA_KEY));
+}
+
+#[test]
+fn only_the_presented_digest_algorithms_are_hashed() {
+    use ferrum_edge::_test_support::store_request_body_metadata_for_test;
+    use ferrum_edge::plugins::hmac_auth::presented_body_digest_algorithms;
+
+    let body = br#"{"amount":1}"#;
+
+    let mut sha256_only = make_ctx("POST", "/upload");
+    sha256_only.request_body_sha256 = None;
+    sha256_only.request_body_sha512 = None;
+    set_content_digest(&mut sha256_only, sha256_content_digest_header(body));
+    assert_eq!(
+        presented_body_digest_algorithms(&sha256_only),
+        (true, false)
+    );
+    store_request_body_metadata_for_test(&mut sha256_only, body, false, false, true);
+    let expected: [u8; 32] = Sha256::digest(body).into();
+    assert_eq!(sha256_only.request_body_sha256, Some(expected));
+    assert!(sha256_only.request_body_sha512.is_none());
+
+    let mut sha512_only = make_ctx("POST", "/upload");
+    sha512_only.request_body_sha256 = None;
+    sha512_only.request_body_sha512 = None;
+    set_legacy_digest(&mut sha512_only, sha512_digest_header(body));
+    assert_eq!(
+        presented_body_digest_algorithms(&sha512_only),
+        (false, true)
+    );
+    store_request_body_metadata_for_test(&mut sha512_only, body, false, false, true);
+    assert!(sha512_only.request_body_sha256.is_none());
+    assert!(sha512_only.request_body_sha512.is_some());
+
+    // Nothing recognizable asks for both, so a mis-scan never starves a check.
+    let mut unknown = make_ctx("POST", "/upload");
+    unknown.headers.remove("digest");
+    assert_eq!(presented_body_digest_algorithms(&unknown), (true, true));
+}
+
+#[tokio::test]
+async fn a_sha256_only_request_authenticates_without_a_sha512_snapshot() {
+    let body = br#"{"amount":1}"#;
+    let digest = sha256_content_digest_header(body);
+    let plugin = v2_plugin_named("v2-sha256-only-snapshot");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let date = current_date();
+    let nonce = test_nonce(0x6030);
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &digest, &nonce);
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut ctx, digest);
+    ctx.request_body_sha256 = Some(Sha256::digest(body).into());
+    ctx.request_body_sha512 = None;
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+}
+
+#[tokio::test]
+async fn a_presented_sha512_member_without_its_snapshot_fails_closed() {
+    let body = br#"{"amount":1}"#;
+    let digest = sha512_content_digest_header(body);
+    let plugin = v2_plugin_named("v2-sha512-missing-snapshot");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let date = current_date();
+    let nonce = test_nonce(0x6031);
+    let signature = sign_v2_with_digest(TEST_SECRET, "POST", "/api/orders", &date, &digest, &nonce);
+    let mut ctx = make_ctx("POST", "/api/orders");
+    ctx.headers.insert(
+        "authorization".to_string(),
+        v2_auth_header(TEST_USERNAME, &nonce, &signature),
+    );
+    ctx.headers.insert("date".to_string(), date);
+    set_content_digest(&mut ctx, digest);
+    ctx.request_body_sha256 = Some(Sha256::digest(body).into());
+    ctx.request_body_sha512 = None;
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Digest header does not match request body",
+    );
+    assert!(ctx.identified_consumer.is_none());
+}
+
+// ── RFC 9421 HTTP Message Signatures (`signing_profile: rfc9421`) ───
+
+const RFC9421_BASELINE: &[&str] = &["@method", "@authority", "@path", "@query", "content-digest"];
+
+fn rfc9421_config() -> Value {
+    json!({"signing_profile": "rfc9421", "replay_scope": "process"})
+}
+
+/// `POST /api/orders?x=1` with an empty-body `Content-Digest` and its hashes.
+fn rfc9421_ctx() -> RequestContext {
+    let mut ctx = make_ctx_with_query("POST", "/api/orders", "x=1");
+    set_content_digest(&mut ctx, sha256_content_digest_header(b""));
+    ctx
+}
+
+/// Independent test-side derivation of an RFC 9421 §2 component value.
+fn test_component_value(ctx: &RequestContext, name: &str) -> String {
+    match name {
+        "@method" => ctx.method.clone(),
+        "@authority" => ctx.request_authority.clone().unwrap(),
+        "@path" => ctx.path.clone(),
+        "@query" => format!("?{}", ctx.raw_query_string().unwrap_or_default()),
+        "@request-target" => match ctx.raw_query_string() {
+            Some(query) => format!("{}?{query}", ctx.path),
+            None => ctx.path.clone(),
+        },
+        header => ctx.headers.get(header).unwrap().trim().to_string(),
+    }
+}
+
+fn rfc9421_params(nonce: &str) -> String {
+    format!(
+        r#";created={};keyid="{TEST_USERNAME}";nonce="{nonce}""#,
+        Utc::now().timestamp()
+    )
+}
+
+/// Sign `ctx` as an RFC 9421 client would, under label `sig1`.
+fn sign_rfc9421(ctx: &mut RequestContext, secret: &[u8], covered: &[&str], params: &str) {
+    let list = format!(
+        "({}){params}",
+        covered
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let mut base = String::new();
+    for name in covered {
+        base.push_str(&format!(
+            "\"{name}\": {}\n",
+            test_component_value(ctx, name)
+        ));
+    }
+    base.push_str(&format!("\"@signature-params\": {list}"));
+    let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+    mac.update(base.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    ctx.headers
+        .insert("signature-input".to_string(), format!("sig1={list}"));
+    ctx.headers
+        .insert("signature".to_string(), format!("sig1=:{signature}:"));
+}
+
+fn signed_rfc9421_ctx(nonce: &str) -> RequestContext {
+    let mut ctx = rfc9421_ctx();
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        RFC9421_BASELINE,
+        &rfc9421_params(nonce),
+    );
+    ctx
+}
+
+/// RFC 9421 Appendix B.2.5 (`hmac-sha256`, key `test-shared-secret` from
+/// B.1.5) over the Appendix B.2 test request: the parsed `Signature-Input`
+/// must derive exactly the published signature base, and the published
+/// signature must verify over it.
+#[test]
+fn rfc9421_appendix_b_2_5_hmac_sha256_vector_verifies() {
+    let mut ctx = make_ctx_with_query("POST", "/foo", "param=Value&Pet=dog");
+    ctx.request_authority = Some("example.com".to_string());
+    ctx.headers.remove("digest");
+    for (name, value) in [
+        ("host", "example.com"),
+        ("date", "Tue, 20 Apr 2021 02:07:55 GMT"),
+        ("content-type", "application/json"),
+        (
+            "content-digest",
+            "sha-512=:WZDPaVn/7XgHaAy8pmojAkGWoRx2UFChF41A2svX+TaPm+AbwAgBWnrIiYllu7BNNyealdVLvRwEmTHWXvJwew==:",
+        ),
+        ("content-length", "18"),
+        (
+            "signature-input",
+            r#"sig-b25=("date" "@authority" "content-type");created=1618884473;keyid="test-shared-secret""#,
+        ),
+        (
+            "signature",
+            "sig-b25=:pxcQw6G3AjtMBQjwo8XzkZf/bws5LelbaMk5rGIGtE8=:",
+        ),
+    ] {
+        ctx.headers.insert(name.to_string(), value.to_string());
+    }
+
+    let base = HmacAuth::rfc9421_signature_base_for_test(&ctx).expect("vector parses");
+    assert_eq!(
+        base,
+        "\"date\": Tue, 20 Apr 2021 02:07:55 GMT\n\
+         \"@authority\": example.com\n\
+         \"content-type\": application/json\n\
+         \"@signature-params\": (\"date\" \"@authority\" \"content-type\");created=1618884473;keyid=\"test-shared-secret\""
+    );
+
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(
+            "uzvJfB4u3N0Jy4T7NZ75MDVcr8zSTInedJtkgcu46YW4XByzNJjxBdtjUkdJPBtbmHhIDi6pcl8jsasjlTMtDQ==",
+        )
+        .unwrap();
+    let mut mac = HmacSha256::new_from_slice(&key).unwrap();
+    mac.update(base.as_bytes());
+    mac.verify_slice(
+        &base64::engine::general_purpose::STANDARD
+            .decode("pxcQw6G3AjtMBQjwo8XzkZf/bws5LelbaMk5rGIGtE8=")
+            .unwrap(),
+    )
+    .expect("the RFC 9421 B.2.5 signature verifies over the derived base");
+}
+
+/// The B.2.5 signature is valid HTTP Message Signatures, but it covers neither
+/// the method, path, query, nor body digest and carries no nonce, so the
+/// policy refuses it before any key lookup.
+#[tokio::test]
+async fn rfc9421_policy_refuses_a_signature_that_skips_required_components() {
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-b25-policy");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let mut ctx = rfc9421_ctx();
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        &["@authority", "content-digest"],
+        &rfc9421_params(&test_nonce(0x7000)),
+    );
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "does not cover a required component",
+    );
+}
+
+#[tokio::test]
+async fn rfc9421_valid_signature_authenticates_and_replay_is_rejected() {
+    use ferrum_edge::plugins::hmac_auth::REPLAY_CONSUMER_METADATA_KEY;
+
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-accept");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let nonce = test_nonce(0x7001);
+
+    let mut first = signed_rfc9421_ctx(&nonce);
+    assert_continue(plugin.authenticate(&mut first, &consumer_index).await);
+    assert_eq!(
+        first.identified_consumer.as_ref().unwrap().username,
+        TEST_USERNAME
+    );
+    assert_eq!(first.auth_method, Some("hmac_auth"));
+
+    // The same signed nonce presented again (a fresh `created` re-signs the
+    // request but cannot make the nonce new).
+    let mut replay = signed_rfc9421_ctx(&nonce);
+    assert_reject_error(
+        plugin.authenticate(&mut replay, &consumer_index).await,
+        401,
+        "already been used",
+    );
+    assert!(replay.identified_consumer.is_none());
+    assert_eq!(
+        replay
+            .metadata
+            .get(REPLAY_CONSUMER_METADATA_KEY)
+            .map(String::as_str),
+        Some(TEST_USERNAME)
+    );
+}
+
+#[tokio::test]
+async fn rfc9421_binds_every_covered_component() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    type ContextMutation = (&'static str, fn(&mut RequestContext));
+    let mutations: [ContextMutation; 5] = [
+        ("method", |ctx: &mut RequestContext| {
+            ctx.method = "PUT".to_string()
+        }),
+        ("path", |ctx: &mut RequestContext| {
+            ctx.path = "/api/other".to_string()
+        }),
+        ("query", |ctx: &mut RequestContext| {
+            ctx.set_raw_query_string("x=2".to_string())
+        }),
+        ("authority", |ctx: &mut RequestContext| {
+            ctx.request_authority = Some("evil.example.com".to_string())
+        }),
+        ("content-digest", |ctx: &mut RequestContext| {
+            set_content_digest(ctx, sha256_content_digest_header(b"tampered"))
+        }),
+    ];
+    for (index, (label, mutate)) in mutations.into_iter().enumerate() {
+        let plugin = plugin_named(rfc9421_config(), &format!("rfc9421-bind-{label}"));
+        let mut ctx = signed_rfc9421_ctx(&test_nonce(0x7100 + index as u64));
+        mutate(&mut ctx);
+        assert_reject(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            Some(401),
+        );
+        assert!(
+            ctx.identified_consumer.is_none(),
+            "{label} must be bound by the signature"
+        );
+    }
+
+    // The body itself, through the verified Content-Digest.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-bind-body");
+    let mut ctx = signed_rfc9421_ctx(&test_nonce(0x7110));
+    set_request_body(&mut ctx, b"not the signed body");
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Digest header does not match request body",
+    );
+}
+
+#[tokio::test]
+async fn rfc9421_enforces_created_and_expires() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let now = Utc::now().timestamp();
+    let cases = [
+        (
+            "stale-created",
+            format!(
+                r#";created={};keyid="{TEST_USERNAME}";nonce="{}""#,
+                now - 400,
+                test_nonce(0x7200)
+            ),
+            "outside its validity window",
+        ),
+        (
+            "future-created",
+            format!(
+                r#";created={};keyid="{TEST_USERNAME}";nonce="{}""#,
+                now + 400,
+                test_nonce(0x7201)
+            ),
+            "outside its validity window",
+        ),
+        (
+            "expired",
+            format!(
+                r#";created={};expires={};keyid="{TEST_USERNAME}";nonce="{}""#,
+                now - 20,
+                now - 10,
+                test_nonce(0x7202)
+            ),
+            "outside its validity window",
+        ),
+        (
+            "expires-before-created",
+            format!(
+                r#";created={now};expires={};keyid="{TEST_USERNAME}";nonce="{}""#,
+                now - 1,
+                test_nonce(0x7203)
+            ),
+            "Malformed Signature-Input",
+        ),
+        (
+            "missing-created",
+            format!(r#";keyid="{TEST_USERNAME}";nonce="{}""#, test_nonce(0x7204)),
+            "Missing created",
+        ),
+    ];
+    for (label, params, needle) in cases {
+        let plugin = plugin_named(rfc9421_config(), &format!("rfc9421-window-{label}"));
+        let mut ctx = rfc9421_ctx();
+        sign_rfc9421(&mut ctx, TEST_SECRET.as_bytes(), RFC9421_BASELINE, &params);
+        assert_reject_error(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            401,
+            needle,
+        );
+    }
+
+    // A future `expires` inside the window is accepted.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-window-ok");
+    let mut ctx = rfc9421_ctx();
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        RFC9421_BASELINE,
+        &format!(
+            r#";created={now};expires={};keyid="{TEST_USERNAME}";nonce="{}""#,
+            now + 60,
+            test_nonce(0x7205)
+        ),
+    );
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+}
+
+#[tokio::test]
+async fn rfc9421_refuses_unknown_algorithms_components_and_parameters() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let nonce = test_nonce(0x7300);
+    let now = Utc::now().timestamp();
+    let base_params = format!(r#";created={now};keyid="{TEST_USERNAME}";nonce="{nonce}""#);
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "alg",
+            format!(r#"{base_params};alg="rsa-pss-sha512""#),
+            "Unsupported signature algorithm",
+        ),
+        (
+            "unknown-param",
+            format!("{base_params};foo=1"),
+            "Unsupported signature parameter",
+        ),
+        (
+            "missing-nonce",
+            format!(r#";created={now};keyid="{TEST_USERNAME}""#),
+            "Missing nonce in Signature-Input",
+        ),
+        (
+            "weak-nonce",
+            format!(r#";created={now};keyid="{TEST_USERNAME}";nonce="abc""#),
+            "Malformed nonce in Signature-Input",
+        ),
+        (
+            "missing-keyid",
+            format!(r#";created={now};nonce="{nonce}""#),
+            "keyid",
+        ),
+        (
+            "decimal-created",
+            format!(r#";created=1.5;keyid="{TEST_USERNAME}";nonce="{nonce}""#),
+            "Malformed Signature-Input",
+        ),
+    ];
+    for (label, params, needle) in cases {
+        let plugin = plugin_named(rfc9421_config(), &format!("rfc9421-refuse-{label}"));
+        let mut ctx = rfc9421_ctx();
+        sign_rfc9421(&mut ctx, TEST_SECRET.as_bytes(), RFC9421_BASELINE, &params);
+        assert_reject_error(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            401,
+            needle,
+        );
+    }
+
+    // Unsupported derived components and component parameters.
+    for (label, input) in [
+        (
+            "scheme",
+            format!(
+                "sig1=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\" \"@scheme\"){base_params}"
+            ),
+        ),
+        (
+            "query-param",
+            format!(
+                "sig1=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\" \"@query-param\";name=\"x\"){base_params}"
+            ),
+        ),
+        (
+            "header-sf-flag",
+            format!(
+                "sig1=(\"@method\" \"@authority\" \"@path\" \"@query\" \"content-digest\";sf){base_params}"
+            ),
+        ),
+    ] {
+        let plugin = plugin_named(rfc9421_config(), &format!("rfc9421-component-{label}"));
+        let mut ctx = signed_rfc9421_ctx(&test_nonce(0x7310));
+        ctx.headers.insert("signature-input".to_string(), input);
+        assert_reject_error(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            401,
+            "Unsupported covered component",
+        );
+    }
+}
+
+#[tokio::test]
+async fn rfc9421_refuses_ambiguous_or_incomplete_signature_fields() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    // Two signatures.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-two-signatures");
+    let mut ctx = signed_rfc9421_ctx(&test_nonce(0x7400));
+    let input = ctx.headers.get("signature-input").unwrap().clone();
+    let signature = ctx.headers.get("signature").unwrap().clone();
+    ctx.headers.insert(
+        "signature-input".to_string(),
+        format!("{input}, {}", input.replacen("sig1=", "sig2=", 1)),
+    );
+    ctx.headers.insert(
+        "signature".to_string(),
+        format!("{signature}, {}", signature.replacen("sig1=", "sig2=", 1)),
+    );
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Exactly one HTTP message signature",
+    );
+
+    // Mismatched labels.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-label-mismatch");
+    let mut ctx = signed_rfc9421_ctx(&test_nonce(0x7401));
+    let signature = ctx
+        .headers
+        .get("signature")
+        .unwrap()
+        .replacen("sig1=", "other=", 1);
+    ctx.headers.insert("signature".to_string(), signature);
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Malformed Signature-Input or Signature",
+    );
+
+    // One field without the other.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-incomplete");
+    let mut ctx = signed_rfc9421_ctx(&test_nonce(0x7402));
+    ctx.headers.remove("signature-input");
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "must be sent together",
+    );
+
+    // Legacy `Digest` cannot stand in for the covered `Content-Digest`.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-legacy-digest");
+    let mut ctx = rfc9421_ctx();
+    set_legacy_digest(&mut ctx, sha256_digest_header(b""));
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        &["@method", "@authority", "@path", "@query", "digest"],
+        &rfc9421_params(&test_nonce(0x7403)),
+    );
+    assert_reject(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        Some(401),
+    );
+    assert!(ctx.identified_consumer.is_none());
+
+    // No signature at all is a missing credential, not a rejection.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-missing");
+    let mut ctx = rfc9421_ctx();
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert!(ctx.identified_consumer.is_none());
+}
+
+#[tokio::test]
+async fn rfc9421_requires_configured_headers_and_components_to_be_covered() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let config = json!({
+        "signing_profile": "rfc9421",
+        "replay_scope": "process",
+        "signed_headers": ["x-tenant-id"],
+        "required_components": ["@request-target"]
+    });
+    let full: Vec<&str> = RFC9421_BASELINE
+        .iter()
+        .copied()
+        .chain(["x-tenant-id", "@request-target"])
+        .collect();
+
+    let plugin = plugin_named(config.clone(), "rfc9421-required-ok");
+    let mut ctx = rfc9421_ctx();
+    ctx.headers
+        .insert("x-tenant-id".to_string(), "tenant-a".to_string());
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        &full,
+        &rfc9421_params(&test_nonce(0x7500)),
+    );
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+
+    // Altered tenant header.
+    let plugin = plugin_named(config.clone(), "rfc9421-required-altered");
+    let mut ctx = rfc9421_ctx();
+    ctx.headers
+        .insert("x-tenant-id".to_string(), "tenant-a".to_string());
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        &full,
+        &rfc9421_params(&test_nonce(0x7501)),
+    );
+    ctx.headers
+        .insert("x-tenant-id".to_string(), "tenant-b".to_string());
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+
+    // Not covering the configured header.
+    let plugin = plugin_named(config, "rfc9421-required-uncovered");
+    let mut ctx = rfc9421_ctx();
+    ctx.headers
+        .insert("x-tenant-id".to_string(), "tenant-a".to_string());
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        &RFC9421_BASELINE
+            .iter()
+            .copied()
+            .chain(["@request-target"])
+            .collect::<Vec<_>>(),
+        &rfc9421_params(&test_nonce(0x7502)),
+    );
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "does not cover a required component",
+    );
+}
+
+#[tokio::test]
+async fn rfc9421_wrong_key_or_unknown_keyid_is_invalid_credentials() {
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-wrong-key");
+    let mut ctx = rfc9421_ctx();
+    sign_rfc9421(
+        &mut ctx,
+        b"some-other-secret-that-is-long-enough",
+        RFC9421_BASELINE,
+        &rfc9421_params(&test_nonce(0x7600)),
+    );
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-unknown-keyid");
+    let mut ctx = rfc9421_ctx();
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        RFC9421_BASELINE,
+        &format!(
+            r#";created={};keyid="nobody";nonce="{}""#,
+            Utc::now().timestamp(),
+            test_nonce(0x7601)
+        ),
+    );
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+}
+
+#[tokio::test]
+async fn rfc9421_verify_before_buffer_path_stages_and_authenticates() {
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-prebuffer");
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let body = br#"{"amount":1}"#;
+    let mut ctx = rfc9421_ctx();
+    set_content_digest(&mut ctx, sha256_content_digest_header(body));
+    ctx.request_body_sha256 = None;
+    ctx.request_body_sha512 = None;
+    sign_rfc9421(
+        &mut ctx,
+        TEST_SECRET.as_bytes(),
+        RFC9421_BASELINE,
+        &rfc9421_params(&test_nonce(0x7700)),
+    );
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert!(
+        plugin.should_buffer_request_body_before_authenticate(&ctx, &consumer_index),
+        "a verified RFC 9421 signature admits body collection"
+    );
+    set_request_body(&mut ctx, body);
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        TEST_USERNAME
+    );
+
+    // An invalid signature never admits collection.
+    let mut forged = rfc9421_ctx();
+    forged.request_body_sha256 = None;
+    forged.request_body_sha512 = None;
+    sign_rfc9421(
+        &mut forged,
+        b"some-other-secret-that-is-long-enough",
+        RFC9421_BASELINE,
+        &rfc9421_params(&test_nonce(0x7701)),
+    );
+    assert!(!plugin.should_buffer_request_body_before_authenticate(&forged, &consumer_index));
+}
+
+#[test]
+fn structured_field_dictionaries_are_parsed_strictly() {
+    use ferrum_edge::plugins::utils::structured_fields::{
+        BareItem, MemberValue, StructuredFieldError, parse_dictionary, serialize_inner_list,
+    };
+
+    let parsed = parse_dictionary(r#"sig1=("@method" "x-a");created=1;keyid="k\"q""#).unwrap();
+    assert_eq!(parsed.len(), 1);
+    let MemberValue::InnerList(list) = &parsed[0].1 else {
+        panic!("inner list expected");
+    };
+    assert_eq!(list.items.len(), 2);
+    assert_eq!(
+        list.params[0],
+        ("created".to_string(), BareItem::Integer(1))
+    );
+    let mut serialized = String::new();
+    serialize_inner_list(list, &mut serialized);
+    assert_eq!(serialized, r#"("@method" "x-a");created=1;keyid="k\"q""#);
+
+    for (input, expected) in [
+        ("", StructuredFieldError::Malformed),
+        ("a=1,", StructuredFieldError::Malformed),
+        ("a=1.5", StructuredFieldError::Malformed),
+        ("A=1", StructuredFieldError::Malformed),
+        ("a=1, a=2", StructuredFieldError::Duplicate),
+        ("a=(1);p=1;p=2", StructuredFieldError::Duplicate),
+        ("a=:not base64!:", StructuredFieldError::Malformed),
+        ("a=\"unterminated", StructuredFieldError::Malformed),
+        ("a=1234567890123456", StructuredFieldError::Malformed),
+        ("a=(1 2", StructuredFieldError::Malformed),
+        ("a=\"caf\u{e9}\"", StructuredFieldError::Malformed),
+    ] {
+        assert_eq!(parse_dictionary(input), Err(expected), "input: {input:?}");
+    }
+    let oversized = format!("a=\"{}\"", "x".repeat(9 * 1024));
+    assert_eq!(
+        parse_dictionary(&oversized),
+        Err(StructuredFieldError::TooLarge)
+    );
+    let many_members = (0..17)
+        .map(|idx| format!("k{idx}=1"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(
+        parse_dictionary(&many_members),
+        Err(StructuredFieldError::TooMany)
+    );
+}
+
+// ── PR #6853 review round 1 ─────────────────────────────────────────
+
+/// HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) WebSocket handshakes are Extended
+/// CONNECT on the wire; the frontends rewrite the policy method to `GET`. The
+/// RFC 9421 `@method` component must still be the `CONNECT` the client signed.
+#[tokio::test]
+async fn rfc9421_extended_connect_websocket_signs_the_wire_method() {
+    use ferrum_edge::_test_support::record_wire_request_line_for_hmac_for_test;
+
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let uri: http::Uri = "https://api.example.com/socket".parse().unwrap();
+    let handshake = |method_signed: &str, nonce: &str| {
+        // The frontend: wire method CONNECT, policy method rewritten to GET.
+        let mut ctx = make_ctx("CONNECT", "/socket");
+        set_content_digest(&mut ctx, sha256_content_digest_header(b""));
+        let mut signed = ctx.clone();
+        signed.method = method_signed.to_string();
+        sign_rfc9421(
+            &mut signed,
+            TEST_SECRET.as_bytes(),
+            RFC9421_BASELINE,
+            &rfc9421_params(nonce),
+        );
+        for name in ["signature-input", "signature"] {
+            ctx.headers
+                .insert(name.to_string(), signed.headers.get(name).unwrap().clone());
+        }
+        ctx.method = "GET".to_string();
+        record_wire_request_line_for_hmac_for_test(
+            &mut ctx,
+            "CONNECT",
+            http::Version::HTTP_2,
+            &uri,
+        );
+        ctx
+    };
+
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-ws-connect");
+    let mut ctx = handshake("CONNECT", &test_nonce(0x7800));
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        TEST_USERNAME
+    );
+    assert_eq!(
+        ctx.method, "GET",
+        "policy and backend keep the rewritten method"
+    );
+
+    // A signature over the rewritten method is not the client's signature.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-ws-get");
+    let mut ctx = handshake("GET", &test_nonce(0x7801));
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+}
+
+/// Both frontends must record the wire request line before authentication:
+/// the H1/H2 handler at context creation, and HTTP/3 at creation plus its
+/// WebSocket method rewrite.
+#[test]
+fn both_frontends_record_the_wire_request_line_for_rfc9421() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy.contains(
+            "ctx.record_wire_request_line_for_hmac(req.method().as_str(), inbound_version, req.uri());"
+        ),
+        "the H1/H2 handler must record the wire request line"
+    );
+    let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        h3.contains("ctx.record_wire_request_line_for_hmac(req.method().as_str(), req.version(), req.uri());"),
+        "the HTTP/3 handler must record the wire request line"
+    );
+    let rewrite = h3
+        .find("if http_flavor == HttpFlavor::WebSocket {")
+        .expect("HTTP/3 WebSocket method rewrite");
+    let rewrite_body = &h3[rewrite..rewrite + 400];
+    let recorded = rewrite_body
+        .find("ctx.set_wire_method_for_hmac(ctx.method.clone());")
+        .expect("HTTP/3 must retain the wire method before rewriting it");
+    let rewritten = rewrite_body
+        .find("ctx.method = method.clone();")
+        .expect("HTTP/3 rewrite");
+    assert!(
+        recorded < rewritten,
+        "the wire method is captured before the rewrite"
+    );
+}
+
+/// `@request-target` is the target as sent: an HTTP/1.1 absolute-form target
+/// and a present-but-empty query are not reproducible from path + query.
+#[tokio::test]
+async fn rfc9421_request_target_covers_absolute_form_and_empty_query() {
+    use ferrum_edge::_test_support::record_wire_request_line_for_hmac_for_test;
+    use ferrum_edge::plugins::hmac_auth::unreconstructible_request_target;
+
+    let absolute: http::Uri = "https://api.example.com/api/orders?x=1".parse().unwrap();
+    let empty_query: http::Uri = "/api/orders?".parse().unwrap();
+    let origin: http::Uri = "/api/orders?x=1".parse().unwrap();
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_11, &absolute).as_deref(),
+        Some("https://api.example.com/api/orders?x=1")
+    );
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_2, &empty_query).as_deref(),
+        Some("/api/orders?")
+    );
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_11, &origin),
+        None,
+        "an ordinary origin-form request allocates nothing"
+    );
+    // HTTP/2 URIs always carry scheme and authority; the target is `:path`.
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_2, &absolute),
+        None
+    );
+
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let covered: Vec<&str> = RFC9421_BASELINE
+        .iter()
+        .copied()
+        .chain(["@request-target"])
+        .collect();
+    for (index, (uri, signed_target)) in [
+        (&absolute, "https://api.example.com/api/orders?x=1"),
+        (&empty_query, "/api/orders?"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut ctx = rfc9421_ctx();
+        if uri.query() == Some("") {
+            ctx.set_raw_query_string(String::new());
+        }
+        record_wire_request_line_for_hmac_for_test(&mut ctx, "POST", http::Version::HTTP_11, uri);
+        // Sign with an independent base that uses the wire target.
+        let params = rfc9421_params(&test_nonce(0x7900 + index as u64));
+        let list = format!(
+            "({}){params}",
+            covered
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut base = String::new();
+        for name in &covered {
+            let value = if *name == "@request-target" {
+                signed_target.to_string()
+            } else {
+                test_component_value(&ctx, name)
+            };
+            base.push_str(&format!("\"{name}\": {value}\n"));
+        }
+        base.push_str(&format!("\"@signature-params\": {list}"));
+        let mut mac = HmacSha256::new_from_slice(TEST_SECRET.as_bytes()).unwrap();
+        mac.update(base.as_bytes());
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        ctx.headers
+            .insert("signature-input".to_string(), format!("sig1={list}"));
+        ctx.headers
+            .insert("signature".to_string(), format!("sig1=:{signature}:"));
+
+        let plugin = plugin_named(rfc9421_config(), &format!("rfc9421-target-{index}"));
+        assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    }
+}

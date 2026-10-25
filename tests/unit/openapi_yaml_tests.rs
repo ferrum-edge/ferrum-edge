@@ -5634,6 +5634,26 @@ fn hmac_auth_config_root_is_closed_and_matches_openapi() {
         schema["properties"]["replay_max_entries"]["default"],
         json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_REPLAY_MAX_ENTRIES)
     );
+    assert_eq!(
+        schema["properties"]["replay_max_entries"]["maximum"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_REPLAY_MAX_ENTRIES)
+    );
+    assert_eq!(
+        schema["properties"]["max_body_bytes"]["default"],
+        json!(ferrum_edge::plugins::hmac_auth::DEFAULT_HMAC_MAX_BODY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["max_body_bytes"]["maximum"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_MAX_BODY_BYTES)
+    );
+    assert_eq!(
+        schema["properties"]["signed_headers"]["maxItems"],
+        json!(ferrum_edge::plugins::hmac_auth::MAX_HMAC_SIGNED_HEADERS)
+    );
+    assert_eq!(
+        schema["properties"]["required_components"]["items"]["enum"],
+        json!(ferrum_edge::plugins::hmac_auth::RFC9421_SUPPORTED_DERIVED_COMPONENTS)
+    );
 }
 
 /// Issue #5001: key-set parity is not acceptance parity. `HmacAuthConfig` had
@@ -5674,6 +5694,24 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
             "replay_scope": "shared",
             "sync_mode": "redis",
             "redis_url": redis_url
+        }),
+        // Production-launch review hardening: bounded capacity, signed
+        // headers, a configurable body ceiling, and the RFC 9421 profile.
+        json!({"replay_scope": "process", "replay_max_entries": 10_000_000}),
+        json!({"replay_scope": "process", "signed_headers": ["x-tenant-id", "content-type"]}),
+        json!({"replay_scope": "process", "signed_headers": []}),
+        json!({"replay_scope": "process", "max_body_bytes": 268_435_456}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "signed_headers": ["idempotency-key"]
+        }),
+        json!({"signing_profile": "rfc9421", "replay_scope": "process"}),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "signed_headers": ["x-tenant-id"],
+            "required_components": ["@request-target"]
         }),
     ];
     for config in &accepted {
@@ -5725,6 +5763,28 @@ fn hmac_auth_schema_acceptance_matches_runtime_admission() {
         json!({"replay_scope": true}),
         json!({"replay_scope": "process", "replay_scop": "shared"}),
         json!({"replay_scope": "process", "require_digest": true}),
+        // Replay capacity is bounded and meaningless without replay state.
+        json!({"replay_scope": "process", "replay_max_entries": 10_000_001}),
+        json!({
+            "signing_profile": "ferrum-hmac-v1",
+            "allow_unsafe_replayable_v1": true,
+            "replay_max_entries": 1000
+        }),
+        // Signed headers, body ceiling, and RFC 9421 policy bounds.
+        json!({"replay_scope": "process", "signed_headers": ["X-Tenant-Id"]}),
+        json!({"replay_scope": "process", "signed_headers": ["authorization"]}),
+        json!({"replay_scope": "process", "signed_headers": ["host"]}),
+        json!({"replay_scope": "process", "signed_headers": ["a", "a"]}),
+        json!({"replay_scope": "process", "max_body_bytes": 0}),
+        json!({"replay_scope": "process", "max_body_bytes": 268_435_457}),
+        json!({"signing_profile": "rfc9421"}),
+        json!({"replay_scope": "process", "required_components": ["@method"]}),
+        json!({
+            "signing_profile": "rfc9421",
+            "replay_scope": "process",
+            "required_components": ["@scheme"]
+        }),
+        json!({"signing_profile": "RFC9421", "replay_scope": "process"}),
     ];
     for config in &rejected {
         assert!(

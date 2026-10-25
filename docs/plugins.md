@@ -3284,21 +3284,24 @@ other credential types is unaffected.
 
 ### `hmac_auth`
 
-Authenticates requests using Ferrum's versioned HMAC authorization scheme with mandatory request-body integrity protection. RFC 9530 defines the accepted `Content-Digest` representation; Ferrum's `Authorization: hmac` field and signing base are not RFC 9421 HTTP Message Signatures.
+Authenticates requests using Ferrum's versioned HMAC authorization scheme, or RFC 9421 HTTP Message Signatures (`signing_profile: rfc9421`, see [RFC 9421 profile](#rfc-9421-profile-rfc9421)), with mandatory request-body integrity protection. RFC 9530 defines the accepted `Content-Digest` representation; Ferrum's `Authorization: hmac` field and signing base are not RFC 9421 HTTP Message Signatures.
 
 **Priority:** 1400
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `clock_skew_seconds` | u64 | `300` | Maximum allowed skew for the `Date` header freshness window (min `1`, max `300`) |
-| `signing_profile` | String | `ferrum-hmac-v2` | `ferrum-hmac-v2` (single-use) or `ferrum-hmac-v1` (freshness-only, unsafe) |
-| `allow_unsafe_replayable_v1` | Boolean | `false` | Required acknowledgement for `ferrum-hmac-v1`; rejected with `ferrum-hmac-v2` |
-| `replay_scope` | String | (**required** for v2) | `process` or `shared`. No default; rejected under v1 |
-| `replay_max_entries` | usize | `100000` | Capacity this `process` authority enforces against the shared replay lane. At capacity only expired markers are reclaimed; if none can be, the request is refused. Repeated full-live refusals are O(1) until an expiry is actually due. An equivalent reload applies the new cap without forgetting live markers |
+| `signing_profile` | String | `ferrum-hmac-v2` | `ferrum-hmac-v2` (single-use), `rfc9421` (RFC 9421 HTTP Message Signatures, single-use), or `ferrum-hmac-v1` (freshness-only, unsafe) |
+| `allow_unsafe_replayable_v1` | Boolean | `false` | Required acknowledgement for `ferrum-hmac-v1`; rejected with `ferrum-hmac-v2` and `rfc9421` |
+| `replay_scope` | String | (**required** for v2 and `rfc9421`) | `process` or `shared`. No default; rejected under v1 |
+| `replay_max_entries` | usize | `100000` | Capacity this `process` authority enforces against the shared replay lane (`1`–`10000000`; use `shared` for more). At capacity only expired markers are reclaimed; if none can be, the request is refused. Repeated full-live refusals are O(1) until an expiry is actually due, and a due reclamation pops only markers whose expiry has passed from an ordered expiry index, never rescanning live markers. An equivalent reload applies the new cap without forgetting live markers. Rejected under v1, which has no replay state |
+| `signed_headers` | String array | `[]` | Lowercase request header names every signature must cover (at most 32), for every profile. See [Signed headers](#signed-headers). `authorization`, `signature`, `signature-input`, `host`, and connection-specific fields (`connection`, `keep-alive`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`) are refused |
+| `required_components` | String array | `[]` | `rfc9421` only: extra derived components every signature must cover beyond the mandatory set — any of `@method`, `@authority`, `@path`, `@query`, `@request-target`. Header fields go in `signed_headers` |
+| `max_body_bytes` | usize | `10485760` | Pre-authentication request-body ceiling (`1`–`268435456`, 256 MiB). Only a request whose signature already verified is buffered; the stricter of this, the route, and the global request-body limits applies, and a larger signed body is refused with `413` |
 | `sync_mode` | String | `local` | `redis` is required by, and only valid with, `replay_scope: shared` |
 | `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password` | — | — | Shared Redis connectivity for the replay authority. Same semantics as every other Redis-backed plugin. The default key prefix is `{FERRUM_NAMESPACE}:hmac_auth:{plugin-config-id}` |
 
-The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote. The enumerated values are matched **exactly** — `signing_profile`, `replay_scope`, and `sync_mode` accept only the canonical lowercase spellings listed above, with no surrounding whitespace — so the published OpenAPI schema and the gateway admit exactly the same configurations. `replay_scope` is required with `ferrum-hmac-v2` and rejected with `ferrum-hmac-v1`; `allow_unsafe_replayable_v1: true` is required with v1 and rejected with v2; `sync_mode: redis` is required by, and only valid with, `replay_scope: shared`, and needs a `redis_url`.
+The root key set is closed: a misspelled `replay_scope` or `signing_profile` fails admission rather than leaving the policy on a weaker posture than the operator wrote. The enumerated values are matched **exactly** — `signing_profile`, `replay_scope`, and `sync_mode` accept only the canonical lowercase spellings listed above, with no surrounding whitespace — so the published OpenAPI schema and the gateway admit exactly the same configurations. `replay_scope` is required with `ferrum-hmac-v2` and `rfc9421` and rejected with `ferrum-hmac-v1`; `allow_unsafe_replayable_v1: true` is required with v1 and rejected otherwise; `sync_mode: redis` is required by, and only valid with, `replay_scope: shared`, and needs a `redis_url`.
 
 Expected `Authorization` header format (`ferrum-hmac-v2`):
 
@@ -3320,7 +3323,7 @@ Under `ferrum-hmac-v1` the `nonce` parameter is **rejected**, not ignored: a cli
 ferrum-hmac-v2\n{NAMESPACE}\n{USERNAME}\n{AUTHORITY}\n{METHOD}\n{PATH}\n{QUERY}\n{DATE}\n{DIGEST_HEADER_VALUE}\n{NONCE}
 ```
 
-`ferrum-hmac-v1` is the same base without the trailing `{NONCE}` field. The profile version is the **first** field, so a v1 signature can never verify as v2 (or the reverse) even when every other field matches: downgrading the profile does not downgrade the signature.
+`ferrum-hmac-v1` is the same base without the trailing `{NONCE}` field. With `signed_headers` configured, one `\n{name}:{value}` line per configured header follows, in configuration order (see [Signed headers](#signed-headers)). The profile version is the **first** field, so a v1 signature can never verify as v2 (or the reverse) even when every other field matches: downgrading the profile does not downgrade the signature.
 
 `{NAMESPACE}` is the namespace of the matched proxy (the default is `ferrum`) and HMAC Consumer identity lookup is restricted to that namespace. `{USERNAME}` is the decoded username auth-param. `{AUTHORITY}` is the validated request authority with an ASCII-lowercased hostname, no trailing DNS dot, no default `:80`/`:443` port, and any explicit non-default port retained; bracketed IPv6 remains bracketed. `{PATH}` is the request path component exactly as the client sent it on the wire — the raw target, *before* canonicalization — because the client signed those bytes; it is the only surface that reads the raw path, and it never influences routing or policy (see [docs/request_path_canonicalization.md](request_path_canonicalization.md)). `{QUERY}` is the raw query string as received (percent-encoded, without the leading `?`, empty when there is no query). `DIGEST_HEADER_VALUE` is the literal value of the selected digest field. Binding namespace, username, and authority prevents a captured signature from being relabeled to another Consumer, namespace, or virtual host; binding the raw query prevents query alteration.
 
@@ -3332,6 +3335,50 @@ Send **exactly one** body-integrity field:
 Do not send both headers. Mixed RFC 9530 / legacy spellings on one field, duplicate algorithm keys, empty members, unsupported algorithms (`md5`, `sha-1`), and non-standard Base64 fail closed. When both `sha-256` and `sha-512` are present, **both** must match. Ferrum hashes the exact client bytes from the single forwarding buffer after a valid signature admits collection; it never invents an empty-body digest when the body was not collected. `{DIGEST_HEADER_VALUE}` is that field's literal header value, not a canonicalized rewrite.
 
 **WebSocket handshakes.** A WebSocket upgrade (HTTP/1.1 `Upgrade`, HTTP/2 and HTTP/3 Extended CONNECT) is signed like any other request, over the **empty** body: sign `sha-256=:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=:` and send it as `Content-Digest` (or the legacy `Digest` spelling) with the usual `Date` and `Authorization: hmac` fields. The gateway never drains WebSocket DATA as a request body — after the upgrade those bytes are the tunnel — so the empty representation here is the transport's own proof from the handshake's wire framing, not a substitution for an uncollected body. A handshake that actually declares a body (`Content-Length` other than a parseable zero, or any `Transfer-Encoding`) keeps the absent snapshots and is rejected. Once the handshake authenticates, frames stream normally; the plugin does not inspect them.
+
+#### Signed headers
+
+The Ferrum signing base covers the request line, authority, `Date`, and body digest, not application headers. When the backend's interpretation of a signed request depends on a header — a tenant id, an idempotency key, `Content-Type` — list it in `signed_headers` so an intermediary cannot change it before the request's first presentation:
+
+```yaml
+config:
+  replay_scope: process
+  signed_headers: [x-tenant-id, idempotency-key, content-type]
+```
+
+Under `ferrum-hmac-v2` / `ferrum-hmac-v1` each configured header is appended to the signing base, in configuration order, as `\n{name}:{value}` after `{NONCE}` (v2) or `{DIGEST_HEADER_VALUE}` (v1). `{name}` is the configured lowercase name; `{value}` is the RFC 9421 §2.1 canonical value — every field line of that header trimmed of leading and trailing spaces and tabs, joined with `", "`. A configured header that is absent is refused (`401 Missing required signed header`); a field line that is not visible ASCII is refused rather than skipped. Under `rfc9421` every configured header must instead appear among the signature's covered components. A policy with no `signed_headers` keeps the base above byte-for-byte, so existing clients are unaffected.
+
+#### RFC 9421 profile (`rfc9421`)
+
+`signing_profile: rfc9421` verifies RFC 9421 HTTP Message Signatures. The gateway only verifies; it never signs. It accepts **exactly one** signature: one `Signature-Input` member and one `Signature` member with the same label, both parsed as strict RFC 8941 dictionaries (bounded to 8 KiB per field, 16 members, 64 covered components, and 16 parameters; duplicate keys, decimals, and non-canonical base64 are refused).
+
+- **Algorithm:** `hmac-sha256`. An absent `alg` parameter means `hmac-sha256`; any other `alg` is refused. The key is the Consumer's existing `hmac_auth` secret (its UTF-8 bytes), and `keyid` is the Consumer identity HMAC lookup already uses within the matched proxy's namespace. Every rotated secret is tried in the same constant number of rounds as the Ferrum profiles.
+- **Covered components:** must include `@method`, `@authority`, `@path`, `@query`, and `content-digest`, plus every `signed_headers` entry and every `required_components` entry. Supported derived components are `@method` (the method the client sent: `CONNECT` for an HTTP/2 or HTTP/3 WebSocket Extended CONNECT, even though routing and the backend see `GET`), `@authority` (the gateway's normalized request authority, as for the Ferrum profiles), `@path` (the raw wire path, `/` when empty), `@query` (`?` plus the raw query, the lone `?` when absent), and `@request-target` (the target as sent: origin-form path and query, the HTTP/1.1 absolute-form URI when the client used one, and a trailing `?` when the query is present but empty). Header components are lowercase field names whose value is the §2.1 canonical value. `@scheme`, `@target-uri`, `@status`, `@query-param`, `signature`, `signature-input`, and any component parameter (`;sf`, `;key`, `;bs`, `;req`, `;tr`, `;name`) are refused.
+- **Body:** `Content-Digest` (RFC 9530) is required and verified against the collected body exactly as for the Ferrum profiles; the legacy `Digest` field is not accepted under this profile.
+- **Parameters:** `created`, `keyid`, and `nonce` are required; `expires` and `tag` are optional; anything else is refused. `created` must be within `now ± clock_skew_seconds` and, when sent, `expires` must not be before `created` or in the past. The signature base's `@signature-params` line is the canonical RFC 8941 serialization of the received inner list and its parameters.
+- **Nonce:** base64, base64url, or hex, at most 128 characters, held to the same ≥128-bit floors as the v2 nonce (an all-hex value needs 32 characters; otherwise 22 non-padding characters). It is claimed single-use against the configured replay authority exactly like v2, in its own replay domain, so an RFC 9421 nonce and a v2 nonce never collide.
+
+The namespace and profile version are not part of an RFC 9421 signature base (that is what keeps it interoperable); identity lookup and replay state are still scoped to the matched proxy's namespace and this policy. RFC 9421 Appendix B.2.5 (`hmac-sha256`) is pinned as a test vector.
+
+```yaml
+config:
+  signing_profile: rfc9421
+  replay_scope: shared
+  sync_mode: redis
+  redis_url: redis://redis:6379/0
+  signed_headers: [content-type]
+```
+
+```http
+POST /api/orders?x=1 HTTP/1.1
+Host: api.example.com
+Content-Type: application/json
+Content-Digest: sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:
+Signature-Input: sig1=("@method" "@authority" "@path" "@query" "content-digest" "content-type");created=1761350400;keyid="alice";nonce="b2f5ff47436671b6e533d8dc3614845d"
+Signature: sig1=:<base64 HMAC-SHA256 over the signature base>:
+
+{"hello": "world"}
+```
 
 #### Example — RFC 9530 `Content-Digest` + `ferrum-hmac-v2`
 
@@ -3492,7 +3539,7 @@ python3 sign_hmac_v2.py 'http://127.0.0.1:8080/p/hmac' alice
 # copy and run the printed curl; it sends Content-Digest only, never Digest
 ```
 
-`hmac_auth` authenticates the client-to-gateway representation. It cannot be combined on one proxy with a plugin that transforms the request body: configuration fails closed instead of forwarding an Authorization signature and digest that describe different bytes. The HMAC pre-authentication path verifies the original client bytes, then reuses that same bounded buffer for native gRPC primary dispatch on H1/H2 and H3; it never re-reads the upload or recomputes the client signature over a transformed representation. The stricter of the gRPC receive ceiling and HMAC's 10 MiB hard body ceiling applies even when the general request-body limit is unlimited.
+`hmac_auth` authenticates the client-to-gateway representation. It cannot be combined on one proxy with a plugin that transforms the request body: configuration fails closed instead of forwarding an Authorization signature and digest that describe different bytes. The HMAC pre-authentication path verifies the original client bytes, then reuses that same bounded buffer for native gRPC primary dispatch on H1/H2 and H3; it never re-reads the upload or recomputes the client signature over a transformed representation. The stricter of the gRPC receive ceiling and HMAC's `max_body_bytes` ceiling (default 10 MiB, at most 256 MiB) applies even when the general request-body limit is unlimited. The body is hashed only with the algorithms the client's digest field presents (`sha-256`, `sha-512`, or both); a presented algorithm whose hash was not computed fails closed.
 
 > **HBONE limitation:** `hmac_auth` is incompatible with HBONE CONNECT and rejects it with 401. Ferrum must preserve CONNECT DATA for tunnel relay and cannot buffer it for digest verification.
 
@@ -3515,6 +3562,8 @@ A signed `Date` bounds *freshness*; it can never bound *uniqueness*. `ferrum-hma
 **Retention** is not configurable: every marker is retained for a fixed 601-second horizon (`2 × 300`, the `clock_skew_seconds` ceiling, plus one second), so a reload that widens `clock_skew_seconds` cannot make an already-admitted request acceptable again.
 
 The marker is a fixed-size digest of `{profile version, namespace, plugin-config id}` plus the Consumer's stable resource id and the nonce. No nonce, signature, secret, username, body digest, or raw query is stored, keyed, logged, or exposed in a client error.
+
+**Replay attribution.** A rejected replay has, by construction, already passed signature and body verification, so the Consumer it names is not an attacker claim. The rejected request carries the transaction metadata `replay_rejected_consumer` (the Consumer username; log-visible by default), and the plugin emits a rate-limited `warn` naming the Consumer username and id. No identity, `auth_method`, or backend-visible header is published for the rejected request, and neither signal carries the nonce, signature, or marker.
 
 > **`ferrum-hmac-v1` is freshness-only and unsafe.** It has no nonce and no replay store: a captured valid request can be replayed verbatim until the `Date` window elapses. It is not the default, cannot be selected by accident (it needs both `signing_profile: "ferrum-hmac-v1"` and `allow_unsafe_replayable_v1: true`), and every acceptance under it increments the unlabeled `legacy_unsafe_profile_accepted` counter on `/metrics/runtime`. Do not use it on non-idempotent routes.
 
