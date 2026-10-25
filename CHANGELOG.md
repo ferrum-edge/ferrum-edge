@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `request_termination` refuses trigger and content-type values
+  that can never match or that the admin schema rejects** (issue #6866).
+  `content_type` must be visible ASCII, space, or tab. Before, obs-text bytes
+  were admitted at runtime even though the OpenAPI schema refused them.
+  `trigger.header_value` must be a legal HTTP field value (no control
+  character other than tab) and not only whitespace. `trigger.path_prefix`
+  refuses `<`, `>`, and backtick, which no parsed request path can contain.
+  The schema pattern now also excludes the C1 controls that the runtime
+  already refused. A non-empty `header_value` now matches a field line's
+  RFC 9110 field value (surrounding spaces/tabs stripped), so HTTP/2 and
+  HTTP/3 clients that send padded values match the same way HTTP/1.1 clients
+  always have.
+- **`request_termination` canned responses can carry headers and share their
+  body** (#6866). A new optional `headers` object (at most 32 entries, values
+  up to 4096 bytes) adds headers such as `Retry-After` or
+  `Cache-Control: no-store` to the canned response. Hop-by-hop and framing
+  fields, `Content-Type`, credential and challenge fields, and gateway-owned
+  `X-Gateway-*`, `X-Ferrum-*`, and `grpc-*` names are refused. The
+  pre-rendered body is shared bytes, so each terminated request (HEAD
+  included) no longer copies it. The docs now state that termination runs
+  before authentication, authorization, IP restriction, rate limiting, and
+  the WAF; use `response_mock` for authenticated mocking.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

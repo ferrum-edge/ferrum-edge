@@ -28,6 +28,27 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `request_termination`: stricter trigger and content-type admission (#6866)
+
+A `request_termination` config is now rejected at load, reload, or admin
+write when:
+
+- `content_type` contains a character other than visible ASCII, space, or
+  tab (for example `text/pläin` or a leading newline);
+- `trigger.header_value` contains a control character other than tab, or is
+  made only of spaces/tabs;
+- `trigger.path_prefix` contains `<`, `>`, or a backtick.
+
+None of these could ever match a live request, apart from the `content_type`
+case, which the admin API schema already refused. Fix each value: spell the
+media type in ASCII, omit `header_value` (or set it to `""`) for a presence
+match, and drop the unreachable character from the prefix. A non-empty
+`header_value` now matches after surrounding spaces/tabs are stripped from
+each field line. A client that previously slipped past an exact-value
+trigger on HTTP/2 or HTTP/3 by padding the value is now terminated, as it
+always was on HTTP/1.1. The new optional `headers` object needs no
+migration. See [plugins.md](plugins.md#request_termination).
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now
