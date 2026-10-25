@@ -1358,6 +1358,11 @@ pub struct UdpDatagramContext<'a> {
     /// Canonical client IP identity. IPv4-mapped IPv6 is normalized once when
     /// the UDP/DTLS session is created so per-datagram hooks only clone this Arc.
     pub client_ip: Arc<str>,
+    /// The same canonical client identity as a typed address, computed once
+    /// per session alongside [`Self::client_ip`], so a hook that keys or masks
+    /// by address (for example `udp_rate_limiting`'s IPv6 prefix grouping)
+    /// never re-parses or re-allocates per datagram.
+    pub client_ip_addr: std::net::IpAddr,
     pub proxy_id: Arc<str>,
     pub proxy_name: Option<Arc<str>>,
     pub listen_port: u16,
@@ -3457,7 +3462,13 @@ pub struct RequestContext {
     /// re-resolves this from the upstream snapshot automatically. Plugins that
     /// override a direct backend host/port can set this field explicitly when
     /// the destination uses different mTLS materials.
-    pub route_override_resolved_tls: Option<BackendTlsConfig>,
+    ///
+    /// Shared (`Arc`) so a producer that precomputed its TLS policy at config
+    /// load (`mesh_route_dispatch` per-rule `backend_tls`) publishes it with a
+    /// refcount bump instead of deep-cloning the SAN allow-list and paths on
+    /// every matched request. Equality is by value, so claim witnesses that
+    /// compare it keep their exact-configuration semantics.
+    pub route_override_resolved_tls: Option<Arc<BackendTlsConfig>>,
     /// Plugin-set override for the proxy's backend response/read timeout.
     /// Used by mesh L7 route dispatch so route-local policy follows the
     /// matched predicate even when the hot router selected a later fallback
@@ -3504,8 +3515,9 @@ pub struct RequestContext {
     pub route_override_backend_connect_timeout_ms: Option<u64>,
     /// Plugin-set override for the proxy's retry policy. Outer `None` means
     /// no override; `Some(None)` intentionally clears the selected proxy's
-    /// retry policy for this route.
-    pub route_override_retry: Option<Option<RetryConfig>>,
+    /// retry policy for this route. Shared (`Arc`) so a route-local policy
+    /// compiled at config load is published without a per-request deep clone.
+    pub route_override_retry: Option<Option<Arc<RetryConfig>>>,
     /// Per-rule request header transforms published by `mesh_route_dispatch`
     /// when a matching rule carries `request_transform` rules (Istio
     /// `VirtualService.http[].headers.request.{set,add,remove}`). Enabled
@@ -4042,6 +4054,14 @@ pub(crate) struct PluginRequestState {
     /// isolation. Bounded by the number of attached WAF instances (operator
     /// configuration), never by request content.
     pub(crate) waf_instance_scores: HashMap<u64, WafInstanceScoreState>,
+    /// Forwarded `Host` value that was live immediately before the first
+    /// `mesh_route_dispatch` authority rewrite on this request. `Some` exactly
+    /// while a dispatcher-owned `Host` rewrite is in the shared header map;
+    /// the inner `None` records that no `Host` was present. A later matching
+    /// instance without an authority rewrite restores this value (undoing
+    /// only the dispatcher's own rewrite) and never touches a `Host` another
+    /// plugin set before the dispatch block.
+    pub(crate) mesh_route_dispatch_host_before_rewrite: Option<Option<String>>,
     /// `grpc-encoding` framing witness `ai_transcript_audit` records from the
     /// LIVE `before_proxy` header map for a native-gRPC request on a
     /// `grpc`-enrolled instance, before the backend-effective method is known.
@@ -6864,7 +6884,8 @@ impl RequestContext {
             };
         let resolved_tls_override = self
             .route_override_resolved_tls
-            .clone()
+            .as_deref()
+            .cloned()
             .or(upstream_tls_override)
             .or(direct_backend_tls_override);
         let resolved_tls_changed = resolved_tls_override
@@ -6943,7 +6964,7 @@ impl RequestContext {
         let retry_changed = self
             .route_override_retry
             .as_ref()
-            .is_some_and(|retry| proxy.retry != *retry);
+            .is_some_and(|retry| proxy.retry.as_ref() != retry.as_deref());
         // An Istio `rewrite.authority` rebases the `Host`/`:authority` forwarded
         // to the backend. The plugin already wrote the new authority into the
         // request `host` header; flipping `preserve_host_header` on the
@@ -7018,7 +7039,7 @@ impl RequestContext {
             overridden.backend_connect_timeout_ms = timeout;
         }
         if let Some(retry) = &self.route_override_retry {
-            overridden.retry = retry.clone();
+            overridden.retry = retry.as_deref().cloned();
         }
         if preserve_host_changed {
             overridden.preserve_host_header = true;
@@ -10694,7 +10715,7 @@ pub struct StreamTransactionSummary {
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), request_deduplication (3010), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_token_metrics (4070), ai_response_guard (4075), security_headers (4080), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
 pub mod priority {
@@ -10814,13 +10835,20 @@ pub mod priority {
     ///   hit short-circuits before that later external side effect.
     pub const AI_SEMANTIC_CACHE: u16 = 4057;
     pub const AI_FEDERATION: u16 = 4060;
+    /// `ai_token_metrics`: observability-only usage extraction. Pinned after
+    /// `ai_federation` (4060), which stages its typed usage first, and BEFORE
+    /// `ai_response_guard` (4075): a guard rejection breaks the
+    /// `on_response_body` loop and replaces a provider-consumed 2xx body, and
+    /// on a stream a guard cut stops later inspectors from seeing the terminal
+    /// usage event. Observing first keeps the billed generation's tokens and
+    /// cost in metadata and Prometheus even when policy then refuses it.
+    pub const AI_TOKEN_METRICS: u16 = 4070;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
     /// `security_headers`: injects response security headers and strips
     /// fingerprinting headers in `after_proxy`. Runs late in the response band
     /// so it is authoritative over `response_transformer` (4000) and
     /// `compression` (4050) header changes.
     pub const SECURITY_HEADERS: u16 = 4080;
-    pub const AI_TOKEN_METRICS: u16 = 4100;
     pub const AI_RATE_LIMITER: u16 = 4200;
     pub const STDOUT_LOGGING: u16 = 9000;
     pub const STATSD_LOGGING: u16 = 9075;
@@ -12011,6 +12039,43 @@ pub trait Plugin: Any + Send + Sync {
     /// for `response_transformer` and
     /// [`RequestContext::route_override_response_transform`].
     fn participates_in_route_response_header_finalization(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this instance may publish
+    /// [`RequestContext::route_override_request_transform`] from
+    /// `before_proxy` (a `mesh_route_dispatch` instance whose rules carry
+    /// `request_transform`).
+    ///
+    /// Plugin cache composition refuses such a producer with no configured
+    /// `request_transformer` on the same effective chain. Where the list is
+    /// applied is decided by [`Self::replaces_route_request_header_transforms`].
+    fn publishes_route_request_header_transforms(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this instance's `before_proxy` may replace (publish
+    /// OR clear) [`RequestContext::route_override_request_transform`] — every
+    /// `mesh_route_dispatch` instance, because a matching rule replaces the
+    /// whole route decision, including the staged request header list, even
+    /// when its own rules carry no `request_transform`.
+    ///
+    /// Proxy core applies the staged list after the LATER of the last
+    /// eligible consumer and the last such instance. A consumer that a
+    /// priority override placed before the dispatch block therefore neither
+    /// finalizes an empty slot (dropping a list published afterwards) nor
+    /// applies a list a later dispatch instance would have superseded — and
+    /// no later dispatch predicate observes route headers early.
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        false
+    }
+
+    /// Response-side counterpart to
+    /// [`Self::publishes_route_request_header_transforms`] for
+    /// [`RequestContext::route_override_response_transform`]. Plugin cache
+    /// composition refuses a producer with no configured
+    /// `response_transformer` on the same effective chain.
+    fn publishes_route_response_header_transforms(&self) -> bool {
         false
     }
 
@@ -13716,7 +13781,8 @@ pub fn create_plugin_with_http_client(
 /// instances publish accepted-generation
 /// status/metrics under that stable identity, `proxy_alerts` scopes its
 /// `${incident_key}` receiver correlation key to it, while `request_mirror`
-/// records attribute each shadow destination. Pass `None` for config-validation and
+/// records attribute each shadow destination, and `request_size_limiting` names
+/// the rejecting instance in its rejection metadata (a blank id is refused). Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
 /// (uses the plugin's standalone default id). Blank ids fail closed when
 /// supplied.
@@ -13936,7 +14002,10 @@ pub fn create_plugin_with_http_client_and_config_id(
             Ok(Some(Arc::new(plugin)))
         }
         "request_size_limiting" => Ok(Some(Arc::new(
-            request_size_limiting::RequestSizeLimiting::new(config)?,
+            request_size_limiting::RequestSizeLimiting::new_with_config_id(
+                config,
+                plugin_config_id,
+            )?,
         ))),
         "waf" => Ok(Some(Arc::new(waf::Waf::new_with_config_id(
             config,
@@ -14498,7 +14567,9 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
         "transaction_log_schema",
         PluginFailurePolicy::KeepLastKnownGood,
     ),
-    builtin_plugin("stdout_logging", PluginFailurePolicy::OptionalFailOpen),
+    // The access log is an audit trail: a reload that cannot construct it keeps
+    // the previous generation instead of publishing one without it.
+    builtin_plugin("stdout_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("tcp_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),

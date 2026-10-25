@@ -1345,7 +1345,7 @@ async fn transparent_post_sets_direct_route_override_and_metadata() {
     assert_eq!(ctx.route_override_backend_port, Some(8080));
     assert_eq!(
         ctx.route_override_resolved_tls,
-        Some(BackendTlsConfig::default_verify())
+        Some(Arc::new(BackendTlsConfig::default_verify()))
     );
     assert_eq!(ctx.route_override_path.as_deref(), Some("/mcp"));
     assert!(ctx.route_override_path_is_absolute);

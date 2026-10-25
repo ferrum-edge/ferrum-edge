@@ -307,8 +307,12 @@ that token covers is labelled `dispatch_policy_rejected` here). Access-log
 `ferrum_plugin_log_sink_records_accepted_total{plugin}` publish the record
 accounting of the per-plugin observability sinks (`http_logging`,
 `tcp_logging`, `udp_logging`, `ws_logging`, `statsd_logging`, `loki_logging`,
-`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`), so a
-truncated audit trail is visible on `/metrics` rather than only in logs.
+`kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`,
+`stdout_logging`), so a truncated audit trail is visible on `/metrics` rather
+than only in logs. `stdout_logging` counts its access records' outcomes at the
+shared process stdout queue (`queue_full` is that queue's saturation), so
+access-record loss is attributable apart from runtime tracing records;
+`ferrum_log_sink_*{sink="stdout"}` counts both together.
 
 These are **not** the same as `ferrum_log_sink_*{sink}`, which covers only the
 process-global stdout/stderr writers, and not the same as
@@ -318,7 +322,7 @@ batch-materialization layer for the process as a whole.
 Both label values come from fixed compile-time sets and never carry an
 endpoint, topic, namespace, policy id, or record content:
 
-| `plugin` | one of the nine sinks above, or `other` for a sink identity outside the closed set |
+| `plugin` | one of the ten sinks above, or `other` for a sink identity outside the closed set |
 | --- | --- |
 | `reason` | `batch_discard`, `byte_budget`, `queue_full`, `record_too_large`, `shutdown`, `sink_error` |
 
@@ -776,6 +780,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_stream_connections_total` | counter | `proxy_id`, `protocol`, `namespace` | `stream` | `dashboard` | `conditional` | Total stream connections (TCP/UDP). |
 | `ferrum_stream_disconnects_total` | counter | `proxy_id`, `protocol`, `cause`, `direction`, `error_class`, `namespace` | `stream` | `dashboard` | `conditional` | Stream disconnects (TCP/UDP) by cause, direction, and optional error_class. |
 | `ferrum_stream_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `stream` | `documented_only` | `conditional` | Stream connection duration in milliseconds. |
+| `ferrum_tcp_connection_throttle_rejections_total` | counter | `proxy_id`, `namespace` | `tcp_connection_throttle` | `documented_only` | `conditional` | TCP connections refused by tcp_connection_throttle because the connection's Consumer or client-IP key was at max_connections_per_key. |
 | `ferrum_tls_cert_expiry_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `alert` | `conditional` | Seconds until the certificate leaf not_after timestamp. Negative means expired. |
 | `ferrum_tls_cert_not_before_seconds` | gauge | `cert_id`, `surface`, `source_kind`, `namespace` | `tls` | `documented_only` | `conditional` | Certificate leaf not_before timestamp as Unix seconds. |
 | `ferrum_tls_cert_rotations_total` | counter | `cert_id`, `reason`, `outcome`, `namespace` | `tls` | `documented_only` | `conditional` | TLS certificate rotation outcomes by cert ID, reason, and outcome. |

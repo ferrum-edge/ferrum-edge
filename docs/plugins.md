@@ -486,8 +486,10 @@ logs and metrics for accounting. Explicit debug logging retains per-event volume
 > **Customizing transaction log output**: every logging plugin below
 > accepts an optional `schema:` block (or
 > `schema_ref:` against a named `transaction_log_schema` plugin) to
-> rename keys, drop fields, reorder output, add static stamping, and
-> emit a few derived fields. Metadata redaction always applies on every
+> rename keys, drop fields, reorder output, add static stamping,
+> emit a few derived fields, and minimize selected values (`transforms`:
+> truncate, IP-prefix anonymization, keyed HMAC pseudonyms). Metadata
+> redaction always applies on every
 > path. See **[docs/log_schema.md](log_schema.md)** for the full
 > reference, including the per-plugin caveats (statsd's tag-name
 > mapping, Kafka partition keys, Loki labels, WebSocket-disconnect
@@ -513,7 +515,7 @@ later full-config load.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `schemas` | Object | *(required)* | Map of schema name → schema definition. Must contain at least one entry; names must be non-empty and unique across every enabled `transaction_log_schema` in the namespace. Each value is the same schema object accepted by a logging plugin's inline `schema:` — see **[docs/log_schema.md](log_schema.md)** for the field reference (`summary_type`, `omit`, `rename`, `order`, `static_fields`, `derived_fields`, `metadata`, `timestamp_format`). |
+| `schemas` | Object | *(required)* | Map of schema name → schema definition. Must contain 1–256 entries; names must be non-empty, at most 128 bytes, and unique across every enabled `transaction_log_schema` in the namespace. Each value is the same schema object accepted by a logging plugin's inline `schema:` — see **[docs/log_schema.md](log_schema.md)** for the field reference (`summary_type`, `omit`, `rename`, `order`, `static_fields`, `derived_fields`, `metadata`, `timestamp_format`, `transforms`) and its size bounds. |
 
 Unknown outer config keys and unknown nested fixed-shape keys (schema,
 `derived_fields` entry, `metadata` policy) are rejected with their full path.
@@ -527,7 +529,11 @@ replaced wholesale on each config reload — renamed or removed schemas do not
 leak — and admin create/update/delete, batch, and restore validate the complete
 prospective namespace graph (definitions staged before referrers) without
 touching the live registry. A `schema_ref` naming a schema absent from the
-prospective namespace is rejected.
+prospective namespace is rejected. When a reload changes a named definition,
+every referrer is rebuilt against it — `proxy_group`-scoped loggers included,
+which are otherwise retained across incremental reloads while their own config
+row is unchanged — so the new output contract (for example an added `omit`)
+reaches every sink on that reload.
 
 ```yaml
 plugin_name: transaction_log_schema
@@ -552,14 +558,18 @@ config:
 
 ### `stdout_logging`
 
-Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same bounded non-blocking writer as runtime stdout events, so logging never waits for stdout on request-processing threads. Capacity is reserved before JSON serialization; saturation and oversize records are dropped with monotonic telemetry. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch.
+Writes one JSON transaction (or stream) summary per line to stdout for each request. Output goes through the same bounded non-blocking writer as runtime stdout events, so logging never waits for stdout on request-processing threads. Capacity is reserved before JSON serialization; saturation and oversize records are dropped with monotonic telemetry. Because runtime events share that queue, access records are also counted on their own series: `ferrum_plugin_log_sink_records_accepted_total{plugin="stdout_logging"}` and `ferrum_plugin_log_sink_records_dropped_total{plugin="stdout_logging",reason}` (`queue_full` for saturation, `record_too_large`, `shutdown` once the sink closed, `sink_error` for a serialization failure), so an alert can tell lost access records from lost runtime events. It is emitted independent of `FERRUM_LOG_LEVEL` — enabling the plugin is the on/off switch.
 
-After a WebSocket upgrade, `on_ws_disconnect` emits a second HTTP-family `TransactionSummary` line carrying the session-end `error_class`. Method, path, and status are the values captured at upgrade admission (`GET`/`101` for HTTP/1.1 and the wire method `CONNECT`/`200` for HTTP/2 and HTTP/3 Extended CONNECT), not a path inferred from the rewritten backend target, so in-session protocol violations and backend RSTs appear in the same access-log schema as handshake failures. Stream disconnects continue to use `on_stream_disconnect` / `StreamTransactionSummary`.
+After a WebSocket upgrade, `on_ws_disconnect` emits a second HTTP-family `TransactionSummary` line carrying the session-end `error_class`. Method, path, and status are the values captured at upgrade admission (`GET`/`101` for HTTP/1.1 and the wire method `CONNECT`/`200` for HTTP/2 and HTTP/3 Extended CONNECT), not a path inferred from the rewritten backend target, so in-session protocol violations and backend RSTs appear in the same access-log schema as handshake failures. On that session-end line `timestamp_received` is still the upgrade time and `latency_total_ms` is the session duration; every other `latency_*` field is the `-1.0` "not observed" sentinel (a session has no backend, plugin, or gateway-processing split), and `metadata["websocket.timestamp_disconnected"]` records when the session ended. `metadata["websocket.termination_reason"]` distinguishes it from the handshake line. Stream disconnects continue to use `on_stream_disconnect` / `StreamTransactionSummary`.
 
-Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, terminal outcome, or a compiled boolean `expression` tree. Flat filter keys are exactly `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`; mesh Telemetry `filter.expression` strings containing `||` compile into the optional `expression` field instead. Telemetry latency atoms accept `response.duration` or `duration`; thresholds are integer milliseconds unless suffixed with `ms` or `s`. For HTTP-family terminal summaries — including the projected WebSocket disconnect summary above — `errors_only` uses one final predicate: dispatch/error class, response-body error, incomplete streamed body, client disconnect, gateway rejection, or nonzero final gRPC status. TCP, UDP, and DTLS stream/disconnect summaries instead match `error_class` or `connection_error`; status-code atoms evaluate false because those stream summaries have no HTTP status, while duration and error atoms retain their normal meaning. Flat HTTP status and latency filters remain independent and all configured predicates must match; `expression` trees use short-circuit `&&` / `||` semantics with `&&` binding tighter than `||`. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
+Scope it to one or more proxies to log only those proxies' traffic, or attach it globally to log every proxy's transactions. A global instance without an execution trigger also receives the summary of a request that matched no proxy (the route-miss `404`, on HTTP/1.1, HTTP/2, and HTTP/3): it carries no proxy, backend, or consumer and `metadata.rejection_phase = "route_not_found"`, so scanner and stale-route traffic is visible in the access log. Use a `filter` such as `status_code_max: 403` or a `sampling` block if that volume is unwanted. An optional `filter` (evaluated before any `schema:`) suppresses entries by status code, latency, terminal outcome, or a compiled boolean `expression` tree. Flat filter keys are exactly `status_code_min`, `status_code_max`, `min_latency_ms`, and `errors_only`; mesh Telemetry `filter.expression` strings containing `||` compile into the optional `expression` field instead. Telemetry latency atoms accept `response.duration` or `duration`; thresholds are integer milliseconds unless suffixed with `ms` or `s`. For HTTP-family terminal summaries — including the projected WebSocket disconnect summary above — `errors_only` uses one final predicate: dispatch/error class, response-body error, incomplete streamed body, client disconnect, gateway rejection, or nonzero final gRPC status. TCP, UDP, and DTLS stream/disconnect summaries instead match `error_class` or `connection_error`; status-code atoms evaluate false because those stream summaries have no HTTP status, while duration and error atoms retain their normal meaning. Flat HTTP status and latency filters remain independent and all configured predicates must match; `expression` trees use short-circuit `&&` / `||` semantics with `&&` binding tighter than `||`. This is also the sink mesh mode injects to honor a Telemetry CRD's `accessLogging` configuration.
 
 **Priority:** 9000
-**Config**: The accepted outer keys are exactly `filter`, `schema`, and `schema_ref`; filter keys are exactly `status_code_min`, `status_code_max`, `min_latency_ms`, `errors_only`, and `expression`. `expression` is a bounded tree (maximum 32 nodes) and is mutually exclusive with the flat predicate keys so configured constraints cannot be silently ignored. Unknown keys are rejected with their full path. `null`, `{}`, and `filter: null` preserve the default of logging every transaction.
+**Config**: The accepted outer keys are exactly `filter`, `sampling`, `schema`, and `schema_ref`; filter keys are exactly `status_code_min`, `status_code_max`, `min_latency_ms`, `errors_only`, and `expression`. `expression` is a bounded tree (maximum 32 nodes) and is mutually exclusive with the flat predicate keys so configured constraints cannot be silently ignored. Status-code bounds accept `0`–`999` (a logged status is a three-digit code or `0`), and a filter that can never match is refused: flat `status_code_min` above `status_code_max`, or an `and` conjunction anywhere in an `expression` whose own status atoms do the same. Unknown keys are rejected with their full path. `null`, `{}`, `filter: null`, and `sampling: null` preserve the default of logging every transaction.
+
+`sampling` keeps a fraction of the records the filter admits: `rate` (required, greater than `0` and at most `1`, resolution `0.000001`) and `always_log_errors` (default `false`; when `true` a terminal failure — the same predicate `errors_only` uses, or `error_class` / `connection_error` for streams — is always logged and does not consume a sample). Sampling is deterministic and evenly spaced per instance: exactly `rate × 1,000,000` of every 1,000,000 candidate records are kept, counted across HTTP, stream, and WebSocket session-end records together, so a session's handshake and session-end lines are sampled independently. A skipped record is never serialized, so a low rate also saves the JSON encoding cost.
+
+**Failure policy:** `KeepLastKnownGood`. The Admin API refuses an invalid enabled config with HTTP 400; file-mode startup and `validate` fail; a reload whose `stdout_logging` config cannot be constructed is refused and the previous generation keeps serving; database mode does not quarantine the row. The access log is therefore never silently dropped by a typo.
 
 ```yaml
 plugin_name: stdout_logging
@@ -568,6 +578,15 @@ config:
     status_code_min: 500  # skip responses with status < 500
     min_latency_ms: 1000  # skip transactions/streams faster than 1s
     errors_only: true     # require an authoritative terminal failure
+```
+
+```yaml
+plugin_name: stdout_logging
+scope: global
+config:
+  sampling:
+    rate: 0.01               # keep 1% of records
+    always_log_errors: true  # but every terminal failure
 ```
 
 ### `http_logging`
@@ -2071,7 +2090,9 @@ UDP drop, and WebSocket policy close produced by `rate_limiting`,
 `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`; `rate_limiting`
 refusals and `ws_rate_limiting` closes caused by unavailable centralized enforcement under
 `redis_failure_policy: fail_closed` count in
-`ferrum_rate_limit_enforcement_unavailable_total` instead. Process-wide
+`ferrum_rate_limit_enforcement_unavailable_total` instead.
+`tcp_connection_throttle` refusals are not rate-limit rejections; they count on
+`ferrum_tcp_connection_throttle_rejections_total{proxy_id}` instead. Process-wide
 compression codec admission is exported as
 `ferrum_compression_codec_admitted_total`,
 `ferrum_compression_codec_saturated_total`,
@@ -3159,7 +3180,7 @@ who can read the database, a replica, or a backup file.
 |---|---|---|---|
 | `basicauth` | `hmac_sha256:<64 lowercase hex>`, derived under `FERRUM_BASIC_AUTH_HMAC_SECRET` | Verification only has to compare hashes | Nothing directly usable without the server-side HMAC secret |
 | `keyauth` | The API key verbatim | The presented key is matched against the stored key by indexed lookup | Every API key, immediately replayable against the gateway |
-| `jwt` | The HS256 shared secret verbatim | HS256 verification needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
+| `jwt` | The HMAC shared secret verbatim | HMAC verification (HS256/HS384/HS512) needs the signing key itself | Every shared secret; the reader can forge accepted tokens |
 | `hmac_auth` | The shared secret verbatim | The request HMAC is recomputed from the secret | Every shared secret; the reader can forge accepted signatures |
 | `mtls_auth` | The certificate identity string only | Matching is on identity, not on a secret | No private key material — none is ever stored |
 
@@ -3189,7 +3210,7 @@ contains. See [Consumer credential redaction](admin_api.md#consumers) and
 
 ### `jwt_auth`
 
-Authenticates requests using HS256 JWT Bearer tokens matched against consumer credentials.
+Authenticates requests using HMAC-signed (HS256 by default, or HS384 / HS512) JWT Bearer tokens matched against consumer credentials.
 
 **Priority:** 1100
 
@@ -3203,16 +3224,46 @@ Authenticates requests using HS256 JWT Bearer tokens matched against consumer cr
 | `require_exp` | Boolean | `true` | Require an `exp` claim; expiration is always validated when present |
 | `require_nbf` | Boolean | `false` | Require an `nbf` claim; when present, `nbf` is always validated |
 | `leeway_secs` | u64 | `0` | Clock leeway for time-based JWT claims; max `300` |
+| `algorithm` | String | `HS256` | HMAC algorithm every token on this instance must use: `HS256`, `HS384`, or `HS512`. Pinned by configuration and never taken from the token header; a token whose header names any other algorithm (another HMAC size, `none`, or an asymmetric algorithm) is rejected. RSA/EC/JWKS verification belongs to `jwks_auth` |
+| `hide_credentials` | Boolean | `false` | Remove the token-bearing location before proxying an authenticated request, including when another mechanism wins a multi-auth chain (the `key_auth` contract). For `header:Authorization` only a `Bearer` value is removed, so another scheme's credential on a shared route is left alone. Defaults to `false` so backends that re-verify the JWT keep receiving it; enable it whenever the backend does not need the token, and especially with a `query:<name>` lookup, where the token otherwise reaches backend access logs inside the URL |
 
 Registered claims are validated for shape as well as value. A present `iss` must be exactly one string (RFC 7519 §4.1.1): an array, object, number, boolean, or null `iss` is rejected with the generic `401` even when one array element matches a configured issuer, and even when no issuer is configured. `exp` is an RFC 7519 §2 NumericDate — a JSON number that may carry a fractional part — so a conforming fractional expiry bounds the authenticated stream exactly like an integer one; fractional `exp` seconds truncate toward the past, so the enforced expiry is never later than the one the token states. `nbf` presence and validation are delegated to the JWT validation layer, which decides them on its own terms; Ferrum does not normalize a fractional `nbf`.
 
-**Consumer credential** (`jwt`) — array. Secrets must be at least 32 characters:
+**Consumer credential** (`jwt`) — array. Each secret must contain at least 32 non-whitespace characters (and at most 4096):
 ```yaml
 credentials:
   jwt:
     - secret: "consumer-specific-hs256-secret-key-here"
     - secret: "new-secret-at-least-32-chars-long"
 ```
+
+Each Consumer needs its own JWT secret. The token's signer chooses the
+identity claim, so a secret configured on two Consumers would let a holder of
+it sign tokens as either one. Create, update, batch, restore, the credential
+endpoints, and file-mode config loading refuse a secret already configured on
+another Consumer in the same namespace (rotation entries within one Consumer
+may repeat, and separate namespaces may reuse a secret). A database-mode load,
+a CP snapshot or delta, and every runtime config swap quarantine stored JWT
+credentials that are weak, malformed, or shared: a shared secret is removed
+from **every** Consumer that holds it, because no holder is a trustworthy
+owner, and each quarantine is logged at `error`. Ownership counts every
+secret a Consumer stores, including one in an entry that is itself malformed
+or weak. A running gateway also remembers (as namespace-bound digests, at most
+4096 per namespace with the oldest forgotten first and a warning logged) every
+secret it has seen shared in an accepted configuration, including ones a
+database full load already stripped, so a later incremental change cannot
+reactivate it on one holder while the other holder is no longer visible. The
+memory is process-local: a restart, a control plane, and a data plane fed
+already-stripped snapshots judge only the current source, so give every
+Consumer that held a shared secret a new, distinct one. A changed Consumer carrying
+`jwt` makes database-mode and control-plane polling take a full reload. The verifier additionally
+never checks a signature against a stored secret below the 32 non-whitespace
+character floor. A token naming an unknown identity (or a Consumer with no
+usable secret) spends one discarded signature verification against a random,
+per-instance key, about the cost of one wrong-signature attempt against a
+real Consumer. This narrows, but does not fully remove, timing differences: a
+Consumer with several rotation secrets still costs one verification per
+secret.
 
 ### `key_auth`
 
@@ -4260,25 +4311,59 @@ UDP+DTLS streams via certificate-based consumer mapping.
 | `disallowed_consumers` | String[] | `[]` | Consumer usernames or, with `allow_authenticated_identity`, external principals explicitly denied. Takes precedence over every allow rule. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and may be up to 4096 characters so JWT/OIDC/SPIFFE-style principals are not constrained by the 255-character gateway Consumer username ceiling. An external principal above the 512-byte authenticated-principal limit is rejected during authentication, so entries longer than that can never match. |
 | `allowed_groups` | String[] | (omitted) | ACL group names explicitly allowed. Matches if any of the consumer's `acl_groups` appears in this list. Omit it for no group allow check; an explicitly empty array is rejected. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
 | `disallowed_groups` | String[] | `[]` | ACL group names explicitly denied. Rejects even when the username is in `allowed_consumers`. Entries match byte-for-byte (no trimming), must contain a non-whitespace value, and are at most 255 Unicode characters (`chars().count()`, matching JSON Schema `maxLength`). |
+| `allowed_external_identities` | Object[] | (omitted) | Exact unmapped external principals that are allowed: each entry is `{identity, mechanism?}`. `identity` matches the external identity string byte-for-byte (non-whitespace, at most 4096 characters); `mechanism`, when set, restricts the entry to identities committed by that built-in mechanism (`jwks_auth`, `ldap_auth`, `oauth2_introspection`, `oidc_relying_party`, or `soap_ws_security`). The narrow alternative to `allow_authenticated_identity`, and cannot be combined with it. Omit it for no external allow-list; an explicitly empty array is rejected. |
+| `disallowed_external_identities` | Object[] | `[]` | Exact unmapped external principals that are denied, same entry shape. A `mechanism`-scoped entry revokes the principal only as verified by that mechanism, so an equal subject string from another mechanism is unaffected. Takes precedence over every allow rule. |
 | `allow_authenticated_identity` | bool | `false` | Allows requests with a meaningful, non-whitespace `ctx.authenticated_identity` even when no Consumer was mapped. Cannot be combined with an allow-list (see below). |
 
 At least one of the above must be configured (non-empty list or `allow_authenticated_identity: true`). Unknown/misspelled config keys are rejected so a typo cannot silently weaken the policy.
-An allow-list that is present must name at least one entry: `allowed_consumers: []` or
-`allowed_groups: []` is rejected at config validation. An empty allow-list has nothing to
+An allow-list that is present must name at least one entry: `allowed_consumers: []`,
+`allowed_groups: []`, or `allowed_external_identities: []` is rejected at config validation. An empty allow-list has nothing to
 match, so it can mean neither "allow nobody" nor "no restriction" safely; omit the key
 when no allow restriction is intended. Empty deny-lists remain accepted and deny nothing.
 Whitespace-only rule admission follows Rust `str::trim` Unicode `White_Space`
 semantics; accepted rule values are still stored and matched byte-for-byte.
 
 `allow_authenticated_identity: true` cannot be combined with an allow-list
-(`allowed_consumers` or `allowed_groups`): the allow-list matches mapped Consumer
-usernames and `acl_groups`, which never apply to an unmapped external identity,
-so the combination would silently bypass the allow-list for every
-externally-authenticated-but-unmapped caller. The combination is rejected at
-config validation. The `disallowed_consumers` deny-list is still applied to the
-external identity string, so it may be combined with `allow_authenticated_identity`
-to revoke a compromised principal. External identities longer than the 4096-character
-exact-rule bound fail closed instead of bypassing the deny-list.
+(`allowed_consumers`, `allowed_groups`, or `allowed_external_identities`): the
+consumer allow-lists match mapped Consumer usernames and `acl_groups`, which never
+apply to an unmapped external identity, and the bypass would admit every external
+identity an external allow-list omits, so the combination would silently bypass
+the allow-list. The combination is rejected at config validation. The
+`disallowed_consumers` deny-list is still applied to the external identity string
+(from every mechanism), so it may be combined with `allow_authenticated_identity`
+or `allowed_external_identities` to revoke a compromised principal. External
+identities longer than the 4096-character exact-rule bound fail closed instead of
+bypassing the deny-list.
+
+**External identity realms.** An external subject names a user only within the
+authority that verified it, so `allowed_external_identities` and
+`disallowed_external_identities` entries can be scoped with `mechanism` to the
+authentication plugin that committed the identity. Scoping is by mechanism only:
+two providers of the same plugin (two `jwks_auth` issuers, say) share one
+mechanism, so an entry cannot tell them apart. An identity with no verified realm
+— every TCP/UDP stream identity, or one a custom plugin set without the
+authentication commit boundary — never matches a `mechanism`-scoped allow entry
+and always matches a `mechanism`-scoped deny entry, so scoping can only narrow
+admission. Entries without `mechanism` match the identity from every mechanism.
+
+**An allow-list means "only these principals".** Once any allow-list is configured,
+a principal that matches none of them is denied. In particular, a policy whose only
+allow-list is `allowed_external_identities` denies every mapped Consumer (`403`);
+add `allowed_consumers` / `allowed_groups` for the Consumers that should pass.
+
+**Consumer renames.** Rules match usernames byte-for-byte, so renaming a Consumer
+that a rule names would silently detach the rule. `PUT /consumers/{id}` that
+changes the username is refused with `409` while any `access_control` config in
+the namespace names the previous username in `allowed_consumers` or
+`disallowed_consumers`, and a file-mode reload that renames such a Consumer
+without also updating the rule is rejected (the previous configuration is kept).
+Update the rule first, then rename.
+
+**Live HBONE tunnels.** The mesh HBONE admission fence re-runs this plugin for live
+tunnels on every published generation, and re-reads the mapped Consumer's record
+from that generation first, so removing a Consumer from an allowed group (or
+deleting the Consumer) revokes its live tunnels rather than only refusing its next
+CONNECT.
 
 An authenticated external identity that is not enabled by this policy is an
 authorization denial: HTTP requests receive 403 and native gRPC requests receive
@@ -4286,6 +4371,7 @@ trailers-only `PERMISSION_DENIED` (status 7). Requests with no meaningful mapped
 or external identity receive HTTP 401 / gRPC `UNAUTHENTICATED` (status 16).
 
 **Evaluation order:** deny (consumer username → group) → allow (consumer username → group).
+For an unmapped external identity: deny (`disallowed_consumers` → `disallowed_external_identities`) → allow (`allowed_external_identities`, or the `allow_authenticated_identity` bypass).
 If both `allowed_consumers` and `allowed_groups` are set, matching _either_ grants access.
 Deny always takes precedence — a consumer whose username is in `allowed_consumers` is still
 rejected if any of their groups appear in `disallowed_groups`.
@@ -4309,6 +4395,17 @@ config:
 plugin_name: access_control
 config:
   allow_authenticated_identity: true
+
+# Allow only named external principals; revoke one subject only as LDAP asserts it
+plugin_name: access_control
+config:
+  allowed_external_identities:
+    - identity: "billing-admin@example.com"
+      mechanism: jwks_auth
+    - identity: "svc-reporting"
+  disallowed_external_identities:
+    - identity: "svc-reporting"
+      mechanism: ldap_auth
 ```
 
 ### `opa`
@@ -4496,17 +4593,22 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key in this ferrum-edge process |
+| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key in this ferrum-edge process. For IP keys the gateway-wide `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` accept-time bound (default `256`) also applies; see **Interaction with the core per-IP bound** below |
+| `ipv6_prefix` | integer (1–128) | `64` | Prefix length that groups native IPv6 client addresses into one IP key. With the default `64`, every host in one `/64` shares a budget; `128` keys each IPv6 address separately. IPv4 and IPv4-mapped IPv6 clients are always keyed per address, and Consumer keys are unaffected. Independent of `FERRUM_PER_IP_IPV6_PREFIX`, which only groups the gateway-wide `FERRUM_*_PER_IP` caps |
 | `cleanup_interval_seconds` | u64 (0–86400) | `60` | Defensive background sweep interval for residual zero-count entries. Normal completion and later plugin rejection release the exact connection permit and remove zero-count entries inline. The sweep never repairs a missed positive decrement. Set to `0` to disable only this residual sweep; inline release/removal remains enabled |
 
 **Key selection:**
 - If a prior stream auth plugin identified a Consumer, the key is `proxy:{namespace}|{proxy_id}:consumer:{username}`
-- Otherwise the key is `proxy:{namespace}|{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form
+- Otherwise the key is `proxy:{namespace}|{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form. IPv4 stays per address. A native IPv6 source is masked to `ipv6_prefix` (default `/64`), so `2001:db8:abcd:12::1` and `2001:db8:abcd:12::2` share one budget by default. NAT64 sources (`64:ff9b::/96`) are native IPv6 and are grouped the same way, so with the default `/64` a whole translated IPv4 population shares one budget. Set `ipv6_prefix: 128` when independently addressed IPv6 hosts (or NAT64 clients) must each get their own budget
 
 Proxy IDs are unique only within a namespace, so every key includes the namespace-qualified proxy identity (`namespace|proxy_id`). That keeps the same bare proxy id in two tenants on independent budgets and lets one identity hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners. Each successful admission owns an opaque permit for the exact plugin instance and counter entry it incremented. Multiple throttle instances, priority/authentication boundaries, later plugin rejection, and config reloads do not share mutable metadata or release one another's entries.
 IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once when the stream client identity is resolved, before plugin execution, so the two textual forms share one connection budget without per-plugin reparsing.
 
 Accounting is **process-local**. Each replica independently permits up to `max_connections_per_key`, so a deployment with _N_ replicas can collectively admit as many as _N × max_connections_per_key_ connections for one identity when traffic is distributed across them. There is no distributed synchronization mode. Compatible cache generations share accounting by plugin namespace and configuration ID, so reload does not reset live counts; removing a policy and later recreating it starts a new generation whose permits cannot be decremented by old connections.
+
+**Interaction with the core per-IP bound:** For IP keys, the gateway-wide `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` bound (default `256`, `0` disables it) runs first. It is enforced at accept time, before the frontend TLS handshake and before any `on_stream_connect` plugin, counts one source's connections across every TCP stream listener, and groups IPv6 sources by `FERRUM_PER_IP_IPV6_PREFIX`. An over-cap connection is closed there and never reaches this plugin or its rejection counter. The effective per-IP ceiling for one proxy is therefore the smaller of `max_connections_per_key` and what that source still has left under the core bound: a `max_connections_per_key` of `256` or more can never bind in a default deployment, and this plugin can only tighten the core bound, never raise it. Raise `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` when a larger per-IP plugin limit is intended. A Consumer-keyed budget is not capped by it directly, but each of that Consumer's connections still counts against its source address at accept time.
+
+**Observability:** Each refusal increments the Prometheus counter `ferrum_tcp_connection_throttle_rejections_total{proxy_id}` (exported on authenticated `/metrics`; no Consumer or IP label is emitted, so cardinality is bounded by the number of TCP proxies). The refusal's disconnect summary `connection_error` and the debug log name the rejecting plugin (for example `rejected by plugin tcp_connection_throttle (TCP)`, or `(TCP/TLS)` on a TLS listener), so throttle refusals are distinguishable from ACL, WAF, or other stream-policy refusals. Authenticated `GET /admin/metrics` reports `tcp_connection_throttle.active_connections`, the live connection count summed across every configured throttle policy and key in this process.
 
 This makes plaintext TCP listeners IP-scoped, while TCP+TLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 
@@ -4843,7 +4945,7 @@ Local mode's token bucket and 64-bucket sliding aggregate are deliberately **not
 
 > **Topology: Redis Cluster is not supported.** The shared Redis client is a single-endpoint client; it is not Cluster-aware and cannot follow `MOVED`/`ASK` redirections. Rather than degrading silently, it screens the endpoint: each new connection issues `INFO CLUSTER` and is refused when the server reports `cluster_enabled:1`, and any command answered with a Cluster-only error code (`MOVED`, `ASK`, `CROSSSLOT`, `CLUSTERDOWN`, `TRYAGAIN`) permanently marks the endpoint unusable. Servers that do not implement `INFO`, or that answer it with an ordinary command error (unknown command, restricted ACL), are not rejected by the proactive screen. The screen is bounded by the configured `redis_connect_timeout_seconds` — there is no separate knob — so an endpoint that accepts and authenticates a connection but never answers `INFO` cannot stall the first enforcement operation; a probe that does not complete is treated as an ordinary retryable outage (never as proof of Cluster topology), the unscreened connection is discarded rather than used, and `redis_failure_policy` governs that request. Rejection is terminal for that plugin generation — a Cluster node answers `PING` while still redirecting every key, so recovery pings never clear it and `redis_failure_policy` governs until the configuration changes. Terminal also means terminal under concurrency: once any task proves Cluster topology, a connection, command, or recovery probe that succeeds afterwards is neither published nor reported as a success (a command that already mutated Redis is failed conservatively, which can only over-count), and health observers cannot advertise a recovery for that endpoint. Independently, every key touched by one atomic operation carries a shared hash tag (`{escaped-prefix:escaped-rate-key}` followed by the suffix components — `:{window_seconds}:{sub_index}` for a request quota, `:{window_index}` elsewhere), so a multi-window charge or a multi-key datagram/byte transaction is slot-stable; `%`, braces, and `:` are percent-escaped inside the tag so caller-controlled identities cannot truncate it.
 
-> **Local counters survive a compatible reload.** Local (and Redis-fallback) enforcement state is owned by the policy — `namespace` + plugin type + plugin-config id — not by the plugin instance a config generation happened to construct. A full reload (file-mode `SIGHUP`, a data plane receiving a full control-plane snapshot, the database-mode fallback after a rejected delta), a change or deletion of *any* global plugin config in the namespace, an edit to the owning proxy's plugin associations, or a rebuilt shared HTTP client all reconstruct the plugin instance; none of them resets a consumed budget. Compatibility is decided on the **effective enforcement semantics after parsing**, never on raw configuration syntax: an omitted optional field and its explicit effective default, a spelling the parser normalizes (case, surrounding whitespace, a gRPC method path with or without its leading `/`, `spiffe` vs `spiffe_identity`, `requests_per_minute: 60` vs `window_seconds: 60` + `max_requests: 60`), and an omitted rate map vs an explicit empty one all describe one budget and keep one set of counters. A **semantic** change does start fresh state, so a retired generation can never charge against the replacement: for `rate_limiting` the parsed limit dimension, the default window list, and the per-consumer window lists; for `graphql` the limit dimension and the parsed type/operation rate maps; for `grpc_method_router` the limit dimension and the normalized per-method rate map; for `ai_rate_limiter` the effective `token_limit`, `window_seconds`, `count_mode`, `limit_by`, `provider`, and `on_unmetered_response`; for `ws_rate_limiting` the effective sustained frame rate, burst capacity, and `limit_by` dimension; for `udp_rate_limiting` the effective per-window datagram and byte budgets and the window length, where an unbounded axis is distinct from any bounded one. Whether a centralized store is enabled (`sync_mode`) is part of that set for every one of them, and when it *is* enabled so are the effective `redis_failure_policy` and the effective `redis_key_prefix`, because they decide whether the local map may admit at all during an outage and which counter domain it belongs to. With `sync_mode: local` there is no centralized store to lose, so changing `redis_failure_policy` alone changes nothing that is enforced and does **not** reset the local budget. Presentation-only fields (`expose_headers`, `close_reason`) and stateless checks (GraphQL depth/complexity/alias limits, gRPC `allow_methods`/`deny_methods`) are deliberately *not* part of the set — changing them must not hand every caller a fresh budget. Retention is bounded: state is held weakly and released as soon as the last plugin instance using it is dropped, so a removed policy is reclaimed and a policy re-added later starts fresh. Credentials, URLs, usernames, passwords, and TLS material are never part of this decision and never logged. This applies to `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`.
+> **Local counters survive a compatible reload.** Local (and Redis-fallback) enforcement state is owned by the policy — `namespace` + plugin type + plugin-config id — not by the plugin instance a config generation happened to construct. A full reload (file-mode `SIGHUP`, a data plane receiving a full control-plane snapshot, the database-mode fallback after a rejected delta), a change or deletion of *any* global plugin config in the namespace, an edit to the owning proxy's plugin associations, or a rebuilt shared HTTP client all reconstruct the plugin instance; none of them resets a consumed budget. Compatibility is decided on the **effective enforcement semantics after parsing**, never on raw configuration syntax: an omitted optional field and its explicit effective default, a spelling the parser normalizes (case, surrounding whitespace, a gRPC method path with or without its leading `/`, `spiffe` vs `spiffe_identity`, `requests_per_minute: 60` vs `window_seconds: 60` + `max_requests: 60`), and an omitted rate map vs an explicit empty one all describe one budget and keep one set of counters. A **semantic** change does start fresh state, so a retired generation can never charge against the replacement: for `rate_limiting` the parsed limit dimension, the default window list, and the per-consumer window lists; for `graphql` the limit dimension and the parsed type/operation rate maps; for `grpc_method_router` the limit dimension and the normalized per-method rate map; for `ai_rate_limiter` the effective `token_limit`, `window_seconds`, `count_mode`, `limit_by`, `provider`, and `on_unmetered_response`; for `ws_rate_limiting` the effective sustained frame rate, burst capacity, and `limit_by` dimension; for `udp_rate_limiting` the effective per-window datagram and byte budgets, the window length, the IPv6 grouping prefix, and the counted direction, where an unbounded axis is distinct from any bounded one. Whether a centralized store is enabled (`sync_mode`) is part of that set for every one of them, and when it *is* enabled so are the effective `redis_failure_policy` and the effective `redis_key_prefix`, because they decide whether the local map may admit at all during an outage and which counter domain it belongs to. With `sync_mode: local` there is no centralized store to lose, so changing `redis_failure_policy` alone changes nothing that is enforced and does **not** reset the local budget. Presentation-only fields (`expose_headers`, `close_reason`) and stateless checks (GraphQL depth/complexity/alias limits, gRPC `allow_methods`/`deny_methods`) are deliberately *not* part of the set — changing them must not hand every caller a fresh budget. Retention is bounded: state is held weakly and released as soon as the last plugin instance using it is dropped, so a removed policy is reclaimed and a policy re-added later starts fresh. Credentials, URLs, usernames, passwords, and TLS material are never part of this decision and never logged. This applies to `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`.
 
 The default Redis prefix is already determined by the stable policy identity, so it is not hashed again as a compatibility input; this keeps validation and runtime construction equivalent even when their shared HTTP clients carry different namespaces. An explicitly configured `redis_key_prefix` remains a compatibility input and isolates local fallback state. When a semantic change creates a fresh local generation alongside a live one, Ferrum emits one structured info log carrying only `namespace`, `plugin`, and `config_id`; the fingerprint is never logged.
 
@@ -5090,6 +5192,8 @@ See [cors_plugin.md](cors_plugin.md) for detailed configuration and troubleshoot
 
 Detects and blocks bot traffic based on the User-Agent header. `blocked_patterns` are case-insensitive substring matches; `allow_list` entries are case-insensitive word-boundary matches and are consulted before blocked patterns, so a User-Agent containing a blocked substring can still pass when it also matches an allow-list entry as a standalone token. The User-Agent is client-controlled and spoofable, so treat this as a coarse first filter rather than strong bot verification.
 
+A User-Agent whose every field line is empty or contains only spaces/tabs is treated exactly like a missing header. A present User-Agent field line that is not valid UTF-8 cannot be matched (the gateway's materialized header map omits such values), so the plugin inspects the raw request header block and rejects that request with `custom_response_code`, regardless of `allow_list` and `allow_missing_user_agent`; it is never treated as a missing header, and a valid sibling field line cannot hide it.
+
 **Priority:** 200
 **Supported protocols:** HTTP, gRPC, WebSocket
 
@@ -5097,7 +5201,7 @@ Detects and blocks bot traffic based on the User-Agent header. `blocked_patterns
 |---|---|---|---|
 | `blocked_patterns` | String[] \| null | `["curl","wget","python-requests","python-urllib","scrapy","httpclient","java/","libwww-perl","mechanize","php/"]` | User-Agent substrings to reject. Case-insensitive. Array entries are trimmed and must be nonblank. An array replaces the defaults; `null` or omission installs the defaults. Setting this field to `[]` is valid only when `allow_missing_user_agent: false` creates a missing-header reject path; an allow-list alone is not enforcement. |
 | `allow_list` | String[] \| null | `[]` | User-Agent tokens that always pass, evaluated before `blocked_patterns` (allow wins). Entries are trimmed, must be nonblank, and are matched case-insensitively with word-boundary anchors. `null` or omission installs an empty list. |
-| `allow_missing_user_agent` | bool \| null | `true` | Allow requests with no `User-Agent` header. Default keeps health checks and load-balancer probes working. `null` or omission selects `true`. |
+| `allow_missing_user_agent` | bool \| null | `true` | Allow requests with no `User-Agent` header, or only empty/whitespace-only `User-Agent` values. Default keeps health checks and load-balancer probes working. A non-UTF-8 `User-Agent` is not "missing" and is rejected either way. `null` or omission selects `true`. |
 | `custom_response_code` | u16 \| null | `403` | For non-gRPC requests, the final 4xx or 5xx HTTP status for blocked requests. Native gRPC maps it to `grpc-status` under HTTP 200. Only 400–599 is accepted; informational, no-body, out-of-range, and non-integer values are rejected. `null` or omission selects 403. |
 
 Configuration must be a top-level object. The only accepted keys are `blocked_patterns`, `allow_list`, `allow_missing_user_agent`, and `custom_response_code`; unknown keys are rejected instead of falling back to defaults. Pattern entry whitespace follows Rust `str::trim` Unicode `White_Space` semantics. Non-gRPC rejections use the fixed JSON body `{"error":"Forbidden"}` with `Content-Type: application/json`, and never reflect the client-controlled User-Agent. Native gRPC rejections instead use an empty-body HTTP 200 trailers-only response: the configured HTTP code is mapped through the gateway's standard HTTP-to-gRPC mapping into `grpc-status`, and the fixed error text becomes `grpc-message: Forbidden`.
@@ -6612,7 +6716,7 @@ Enforces per-proxy request body size limits. Rejects with HTTP 413.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_bytes` | u64 | — (required, > 0) | Maximum allowed request body size in bytes. The plugin errors at construction if absent or zero. |
+| `max_bytes` | u64 | — (required, > 0) | Maximum allowed request body size in bytes. The plugin errors at construction if it is absent or `null` (`is required`), `0` (`must be greater than zero`), negative (`must not be negative`), fractional or written in exponent form such as `1048576.0` (`must be written as an integer`), or a non-number such as `"1048576"` (`must be an integer, not a string`). Diagnostics name the field and the JSON type, never the supplied value. |
 
 Configuration must be a top-level object. The only accepted key is `max_bytes`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions instead of falling back to defaults, so a typo such as `max_bytez` cannot silently leave the route unbounded. Registration is `FailClosed`.
 
@@ -6621,6 +6725,65 @@ Enforcement happens in four places:
 - `on_request_received` rejects oversized `Content-Length` headers without reading the body.
 - `before_proxy` checks the buffered raw body when another plugin already needed early body access.
 - `on_final_request_body` re-checks the final buffered body after request transforms, so body-rewriting plugins cannot expand the request past the configured limit before it reaches the backend.
+
+The streaming ceiling applies to every method. An HTTP/2 client may send DATA
+on a `GET`, `HEAD`, or `OPTIONS` request without `Content-Length`; the
+HTTP/1.1 dispatchers (the direct HTTP/1.1 pool and the reqwest fallback) decide
+body presence from the request body itself, not only from the method and
+framing headers, so that body is forwarded through the size-limited adapter: a
+payload at or under `max_bytes` reaches the backend intact and a larger one is
+refused with `413`. Because hyper's HTTP/1.1 client would otherwise send an
+unknown-length `GET`/`HEAD` body as zero-length, such a request is sent upstream
+with an explicit `Transfer-Encoding: chunked` (only on a dispatch known to be
+HTTP/1.1; HTTP/2 and HTTP/3 requests never carry it, and an exact-length body
+keeps `Content-Length`). One residual case remains. When an HTTPS backend has
+HTTP/2 enabled but its target has no classified HTTP/2 capability yet, the
+reqwest dispatch is not known to be HTTP/1.1 and gets no explicit `chunked`.
+This happens, for example, when pool warmup is off, when a target was added
+dynamically, or on the first requests before the capability probe classifies
+the target. If that dispatch then negotiates HTTP/1.1 through ALPN, an
+unknown-length `GET`/`HEAD` upload can still be sent bodyless until the target
+is classified. `FERRUM_POOL_WARMUP_ENABLED=true` (the default) classifies
+configured targets up front with real capability probes at startup. Only a body
+the transport has already proven empty (no
+HTTP/1.1 framing, END_STREAM on the HTTP/2 HEADERS frame, or an empty buffered
+body) takes the empty-body fast path and reaches the backend with no framing.
+
+**One 413 body.** Every `413` for this policy carries the gateway's shared
+request-body-size body, `{"error":"Request body exceeds maximum size"}`, whether
+the plugin refused a declared `Content-Length`, a buffered body, or the final
+body, or the proxy core refused a chunked or unknown-length upload that overran
+the published ceiling while streaming (H1/H2, native H3, and the H3 bridge). The
+body does not disclose the limit, so clients see one contract regardless of how
+the upload was framed. gRPC callers get `RESOURCE_EXHAUSTED`.
+
+**Rejection metadata.** When the plugin refuses a request it records, in request
+metadata (and from there in the transaction log), fixed-cardinality fields that
+identify the refusal without echoing any body bytes:
+
+| Key | Value |
+|---|---|
+| `request_size_limiting.reason` | `content_length_over_limit`, `content_length_ambiguous`, `buffered_body_over_limit`, or `final_body_over_limit` |
+| `request_size_limiting.instance` | The rejecting instance's plugin-config id (`standalone` for an instance built without one) |
+| `request_size_limiting.limit_bytes` | The instance's `max_bytes` |
+| `request_size_limiting.observed_bytes` | The declared `Content-Length`, or the buffered/final body length; absent for an ambiguous `Content-Length` |
+
+The `Content-Length` and buffered-body refusals always record these fields. The
+final-body refusal (`final_body_over_limit`) records them only when its hook is
+handed a request context, on every protocol. The paths that always supply one are
+the native HTTP/3 preparation paths (request-body finalization ahead of dispatch)
+and the HTTP/3 cross-protocol bridge. Elsewhere, meaning the HTTP/1.1 and HTTP/2
+ladders and the native HTTP/3 buffered ladder, a context is supplied only when
+another plugin on the same route requests the final-body context
+(`needs_final_request_body_context`, for example a context-aware body transform
+or AI policy plugin). `request_size_limiting` does not request it, so that it
+never adds a per-request context clone. When no context is supplied, a
+post-transform overrun is still refused with the same `413` and is visible in
+the transaction log as status `413` with `rejection_phase` `on_final_request_body`,
+but it carries no `request_size_limiting.*` metadata. A streaming overrun refused by the proxy
+core is not a plugin decision and records no plugin metadata; it is identified by
+its `413` status and `request_body_too_large` error class. There is no
+monitor/dry-run mode.
 
 **Interaction with the global limit.** The effective ceiling is the strictest
 *active* (nonzero) bound of `max_bytes` and `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`.
@@ -6640,8 +6803,8 @@ those repeats with `", "`. Every folded member is parsed and must agree, so
 to parse and skipping the check. A declared length that cannot be reduced to one
 agreed value (disagreeing members, a non-`1*DIGIT` member such as `+2048`, an
 empty member, or a value wider than `u64`) is refused **fail-closed** with HTTP
-400 and `{"error":"Request Content-Length is ambiguous"}` instead of being treated
-as an absent length.
+400 and `{"error":"Request Content-Length is ambiguous"}` (no `limit` field)
+instead of being treated as an absent length.
 
 ### `response_size_limiting`
 
@@ -8586,9 +8749,9 @@ config:
 
 ### `ai_token_metrics`
 
-Extracts token usage from LLM HTTP JSON response bodies and writes it to request metadata for downstream logging and observability plugins. This plugin is observability-only: it never rejects requests and does not enforce a token budget. Use `ai_rate_limiter` for enforced budget controls. SSE (Server-Sent Events) usage extraction is available only when explicitly opted into because it requires buffering the full stream. Native gRPC protobuf responses are not supported: the plugin advertises only HTTP attachment rather than pretending arbitrary protobuf messages have a verifiable usage schema.
+Extracts token usage from LLM HTTP JSON response bodies and from streamed SSE / AWS event-stream responses, and writes it to request metadata for downstream logging and observability plugins. This plugin is observability-only: it never rejects requests and does not enforce a token budget. Use `ai_rate_limiter` for enforced budget controls. Streamed responses are metered incrementally by default, without buffering (see **Streaming token accounting** below). Native gRPC protobuf responses are not supported: the plugin advertises only HTTP attachment rather than pretending arbitrary protobuf messages have a verifiable usage schema.
 
-**Priority:** 4100
+**Priority:** 4070 — after `ai_federation` (4060) and before `ai_response_guard` (4075). A guard rejection stops the `on_response_body` loop and replaces a 2xx body the provider already generated, and a streaming guard cut stops later stream inspectors from seeing the terminal usage event. Running first keeps that consumed generation's tokens and estimated cost in metadata and Prometheus while the client still receives the guard's error.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -8596,11 +8759,20 @@ Extracts token usage from LLM HTTP JSON response bodies and writes it to request
 | `include_model` | Boolean | `true` | Extract model name into metadata |
 | `include_token_details` | Boolean | `true` | Extract prompt/completion tokens separately |
 | `metadata_prefix` | String | `"ai"` | Prefix for metadata keys (1–64 ASCII letters, digits, `.`, `_`, or `-`) |
-| `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses so final SSE usage events can be parsed; this disables streaming delivery for those responses |
+| `buffer_streaming_responses` | Boolean | `false` | Buffer `text/event-stream` responses and meter them after the full response is collected; this disables streaming delivery for those responses. Not required for SSE token accounting, which observes streams incrementally by default |
 | `cost_per_prompt_token` | Number or null | *(none)* | Prompt-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |
 | `cost_per_completion_token` | Number or null | *(none)* | Completion-token cost rate, from `0` through `18446744073709.55`; omission or `null` disables this rate |
+| `model_pricing` | Object[] | `[]` | Ordered per-model rate overrides (at most 128). Each entry has a `model` glob plus `cost_per_prompt_token` and/or `cost_per_completion_token` (same range as the flat rates; at least one must be a number). The first entry whose glob matches the response's model supplies the rates; when none matches, or the response reports no publishable model, the flat rates apply |
 
-**Note**: Requires response body buffering for JSON responses. `text/event-stream` responses are not buffered by default so LLM streaming remains live, including on retry-enabled routes without an `Accept` header: origin SSE headers release this plugin's buffering requirement. Other active body plugins or an explicitly buffered route may still require collection. Set `buffer_streaming_responses: true` only when buffered SSE token metrics are more important than streaming delivery; usage is extracted after the full response is collected.
+**Note**: Requires response body buffering for JSON responses. `text/event-stream` responses are not buffered by default so LLM streaming remains live, including on retry-enabled routes without an `Accept` header: origin SSE and AWS event-stream headers release this plugin's buffering requirement. Non-2xx responses are never collected for this plugin, since their bodies are not inspected. Other active body plugins or an explicitly buffered route may still require collection; a collected SSE body is then metered from the buffered body whether or not `buffer_streaming_responses` is set. Set `buffer_streaming_responses: true` only when an encoded (`gzip`/`br`) SSE origin must be metered — the incremental observer cannot read content-coded streams — and streaming delivery may be sacrificed for it.
+
+**Streaming token accounting:** A streamed 2xx `text/event-stream` or `application/vnd.amazon.eventstream` response is metered by a pass-through stream inspector on H1/H2 and native H3. Every chunk is forwarded unchanged and immediately while the shared bounded usage extractor (the same parser `ai_rate_limiter` uses, with 64 KiB line/event and AWS message caps and verified AWS prelude/message CRCs) reads it, so first-token latency and backpressure are unaffected. When the stream ends — normally, on a backend error, on a later inspector's cut, or by client disconnect — the terminal stream hook publishes the usage the provider reported (metadata, cost, and the typed Prometheus snapshot) exactly once before the transaction is logged; a stream cut short publishes what it reported so far. The provider label follows the stream's shape under `provider: auto` and the configured provider otherwise. At most 4,096 streams are observed concurrently per process; beyond that, and for content-coded origin streams or transports that cannot attach an inspector, the stream is delivered untouched and labelled `stream_not_inspected`. OpenAI-compatible providers report streamed usage only when the request sets `stream_options.include_usage: true`.
+
+**Model pricing:** `model_pricing` globs use the same anchored, `*`-only grammar as `ai_federation` / `ai_stream_router` `model_patterns`: 1–256 ASCII bytes of letters, digits, `.`, `_`, `-`, `:`, `/`, `+`, or `*`, without `..`; `*` never crosses `/ ? # & \` or whitespace. List more specific patterns first (for example `gpt-4o-mini*` before `gpt-4o*`). An entry's omitted rate leaves that side unpriced for matching models rather than falling back to the flat rate. Federation usage carries no trusted model, so it is priced at the flat rates.
+
+**Unmetered responses:** When a 2xx JSON or streamed response yields no usage, `{prefix}_unmetered_reason` names why, so dashboards and alerts can tell "unmetered" apart from "zero usage": `body_too_large` (a collected body, as received and before any decoding, above the 4 MiB inspection limit — this applies to plain JSON too), `decode_failed` (unsupported, malformed, or over-limit `Content-Encoding`), `malformed_body` (unparseable JSON), `provider_undetected` (`provider: auto` could not identify the shape), `no_usage` (empty body or no usage fields), `stream_not_inspected`, or `stream_without_usage` (the stream ended without a usable usage report, including one whose malformed counters invalidated it). Synthetic short-circuit bodies, non-2xx responses, and non-JSON/non-stream content types are not labelled. A successful extraction clears the key.
+
+**Model name bound:** The backend-reported model is published as `{prefix}_model` (and used to select `model_pricing`) only when it is 1–256 bytes without control characters; a longer or control-bearing value is omitted while token counts and the flat-rate cost are still recorded.
 
 `provider` must use one exact lowercase enum value: `auto`, `openai`, `anthropic`, `google`, `cohere`, `mistral`, `bedrock`, or `tgi` (Hugging Face TGI native `/generate` shapes, whose counter is `details.generated_tokens`). Surrounding whitespace and alternate casing are rejected. Every unknown root configuration key is rejected at startup with the allowed-key list, so misspellings cannot silently change accounting or cost behavior.
 
@@ -8618,11 +8790,11 @@ Categories merge field by field across a stream, so an event that restates only 
 
 **Status filtering**: Only 2xx responses are inspected for token usage. Error responses (4xx, 5xx) are typically not LLM-shaped JSON and would otherwise pollute token metrics and chargeback accounting.
 
-**Provider and streaming support:** OpenAI Chat Completions and the Responses API (`input_tokens`/`output_tokens`, including the terminal `response.completed` and `response.incomplete` events) are supported. Anthropic `message_start` and `message_delta` usage is merged without losing an earlier input count. Gemini/Vertex `usageMetadata`, Cohere token counts, Bedrock Converse usage, and Amazon Titan InvokeModel `inputTextTokenCount` plus a single `results[].tokenCount` are supported. TGI native JSON and terminal SSE use `details.generated_tokens`; prompt counts are available only with a non-empty `details.prefill` array, and missing prompt counts are not invented. AWS binary event-stream frames are not parsed. When `buffer_streaming_responses: true`, SSE events join multiple `data:` fields with newlines and accept LF, CRLF, or CR line endings; a blank line dispatches each event, and an unterminated final event is ignored. Cumulative and partial snapshots are merged field-by-field; repeated cumulative terminal events replace their fields instead of being summed, and `response.failed` and the progress `response.*` events are not treated as authoritative usage (`response.incomplete` is terminal — a finished response that stopped early, for example at `max_output_tokens` — and its reported usage is read like `response.completed`). Malformed, non-integer, ambiguous, or overflowing usage is ignored rather than saturated or invented. Model name is extracted from the first parseable event. Sets `{prefix}_streaming: true` metadata when processing an SSE response.
+**Provider and streaming support:** OpenAI Chat Completions and the Responses API (`input_tokens`/`output_tokens`, including the terminal `response.completed` and `response.incomplete` events) are supported. Anthropic `message_start` and `message_delta` usage is merged without losing an earlier input count. Gemini/Vertex `usageMetadata`, Cohere token counts, Bedrock Converse usage, and Amazon Titan InvokeModel `inputTextTokenCount` plus a single `results[].tokenCount` are supported. TGI native JSON and terminal SSE use `details.generated_tokens`; prompt counts are available only with a non-empty `details.prefill` array, and missing prompt counts are not invented. AWS binary event-stream frames are parsed by the same bounded extractor whether the response streams or was collected (for example by a sibling plugin). Buffered SSE events join multiple `data:` fields with newlines and accept LF, CRLF, or CR line endings; a blank line dispatches each event, leading BOMs are ignored, and a final event whose terminating blank line (or newline) is missing is still dispatched at end of body, as on the streaming path. Cumulative and partial snapshots are merged field-by-field; repeated cumulative terminal events replace their fields instead of being summed, and `response.failed` and the progress `response.*` events are not treated as authoritative usage (`response.incomplete` is terminal — a finished response that stopped early, for example at `max_output_tokens` — and its reported usage is read like `response.completed`). Malformed, non-integer, ambiguous, or overflowing usage is ignored rather than saturated or invented. Model name is extracted from the first parseable event that carries a publishable one. Sets `{prefix}_streaming: true` metadata when processing a streamed or buffered SSE / event-stream response.
 
 **Cohere accounting:** Counts come from `usage.tokens` (v2 JSON), `delta.usage.tokens` (v2 terminal SSE), or `meta.tokens` (v1), in that precedence order. Separate `billed_units` objects are not used; a billed-units-only response contributes no usage. Estimated cost multiplies the extracted token counts by the configured rates and does not represent provider billable-unit accounting.
 
-**Origin content encodings:** JSON and opted-in SSE inspection supports case-insensitive `gzip` and `br`, including correctly ordered coding chains. Inspection is bounded to four codings, 4 MiB for every decoded layer, and 8 MiB cumulative decoded work across the chain. Parameterized, unsupported, malformed, truncated, trailing/concatenated, or oversized encodings are skipped safely. Decoding is inspection-only: the original encoded response bytes and headers remain exactly client-visible.
+**Origin content encodings:** Buffered JSON and SSE inspection supports case-insensitive `gzip` and `br`, including correctly ordered coding chains. Inspection is bounded to four codings, 4 MiB for every decoded layer, and 8 MiB cumulative decoded work across the chain. Parameterized, unsupported, malformed, truncated, trailing/concatenated, or oversized encodings are skipped safely. Decoding is inspection-only: the original encoded response bytes and headers remain exactly client-visible.
 
 **Prometheus export:** A globally scoped `prometheus_metrics` plugin exports prompt, completion, and total token counters plus estimated cost from typed usage snapshots produced only by direct `ai_token_metrics` inspection or `ai_federation`. Public transaction metadata is never provenance for export. Labels are limited to `proxy_id`, the bounded provider family, and the configured metrics namespace—raw model names, metadata prefixes, federation provider aliases, and arbitrary request metadata are never labels. Multiple `ai_token_metrics` instances contribute one most-complete token snapshot and at most one independently selected trusted cost per request, so a detailed unpriced instance cannot discard configured pricing and overlapping prefixes cannot double count. Configured rates also price trusted federation usage when the instance provider matches the serving provider family. Estimated cost retains a sub-micro fixed-point remainder while accumulating, publishes rounded totals atomically, and is emitted in currency units with exactly six decimal places.
 
@@ -8633,6 +8805,13 @@ config:
   buffer_streaming_responses: false
   cost_per_prompt_token: 0.000003
   cost_per_completion_token: 0.000012
+  model_pricing:
+    - model: "gpt-4o-mini*"
+      cost_per_prompt_token: 0.00000015
+      cost_per_completion_token: 0.0000006
+    - model: "gpt-4o*"
+      cost_per_prompt_token: 0.0000025
+      cost_per_completion_token: 0.00001
 ```
 
 ### `ai_request_guard`
@@ -10022,21 +10201,23 @@ Privacy / retention: disconnect records carry endpoint identity and success-only
 
 ## UDP Plugins
 
-UDP plugins operate at the datagram level via the `on_udp_datagram` lifecycle hook. They fire on every datagram in both directions (client-to-backend and backend-to-client). Use `UdpDatagramContext.direction` to distinguish.
+UDP plugins operate at the datagram level via the `on_udp_datagram` lifecycle hook. They fire on every **application** datagram of a UDP or DTLS stream proxy in both directions (client-to-backend and backend-to-client): raw datagrams on plain UDP, every wire record on DTLS passthrough, and decrypted application datagrams on a DTLS-terminating frontend. On **DTLS passthrough** the gateway runs no DTLS stack, so the hook sees and counts every datagram on the wire — the opening ClientHello, the rest of the handshake, retransmits, and alerts as well as application records — and a passthrough budget must be sized for that traffic. On a **DTLS-terminating** frontend, handshake, retransmit, and alert records are consumed by the gateway's DTLS stack before the application relay and never reach the hook (pre-handshake work there is bounded by the per-source DTLS handshake admission, a concurrency cap rather than a rate). HTTP/3 CONNECT-UDP (RFC 9298) tunnels and HBONE UDP relays carry datagrams inside HTTP-family or mesh streams and do not invoke `on_udp_datagram`. Use `UdpDatagramContext.direction` to distinguish directions and `UdpDatagramContext.client_ip_addr` for the typed canonical client address (computed once per session).
 
 ### `udp_rate_limiting`
 
-Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm with atomic counters. Excess datagrams are silently dropped (standard UDP flood mitigation — there is no equivalent of an HTTP 429 response in plain UDP). Both client-to-backend and backend-to-client datagrams count toward the same per-client window.
+Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm with atomic counters. Excess datagrams are silently dropped (standard UDP flood mitigation — there is no equivalent of an HTTP 429 response in plain UDP). By default (`direction: both`) client-to-backend and backend-to-client datagrams count toward the same per-client window.
 
 **Priority:** 2915
 
-**Protocols:** UDP only
+**Protocols:** UDP only (UDP and DTLS stream proxies). A proxy- or proxy-group-scoped attachment whose effective targets include a TCP/TCP+TLS or HTTP-family proxy is refused during configuration admission and plugin-cache validation, the mirror of `tcp_connection_throttle`'s rule, instead of loading as protection that never runs. A global policy keeps per-protocol filtering, so in a mixed deployment it applies to the UDP/DTLS listeners only.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `datagrams_per_second` | u64 (optional) | — | Sustained datagram rate per second per client IP. The effective per-window cap is `datagrams_per_second × window_seconds`. Both client-to-backend and backend-to-client datagrams count against the same cap. |
-| `bytes_per_second` | u64 (optional) | — | Sustained payload-byte rate per second per client IP (sum of datagram payload sizes). The effective per-window cap is `bytes_per_second × window_seconds`. Both directions count against the same cap. |
+| `datagrams_per_second` | u64 (optional) | — | Sustained datagram rate per second per client IP. The effective per-window cap is `datagrams_per_second × window_seconds`. With the default `direction: both`, client-to-backend and backend-to-client datagrams count against the same cap. |
+| `bytes_per_second` | u64 (optional) | — | Sustained payload-byte rate per second per client IP (sum of datagram payload sizes). The effective per-window cap is `bytes_per_second × window_seconds`. With the default `direction: both`, both directions count against the same cap. |
 | `window_seconds` | u64 | `1` | Window length in seconds. Range 1–2678400 (31 days). The effective per-window cap is `datagrams_per_second × window_seconds` (and similarly for bytes). |
+| `ipv6_prefix` | u64 | `64` | IPv6 prefix length (1–128) that groups client addresses into one budget, the same contract as `rate_limiting`'s `ipv6_prefix`. Widen it (for example `56` or `48`) so a client rotating source addresses across a delegated prefix cannot multiply its budget or fill the state map. IPv4 and IPv4-mapped IPv6 clients stay host-specific. Part of the effective semantics: changing it starts fresh state. |
+| `direction` | String | `both` | Which datagrams are counted and limited: `both` (one combined budget for requests and responses), `client_to_backend`, or `backend_to_client`. A one-direction policy neither counts nor drops datagrams travelling the other way. Part of the effective semantics: changing it starts fresh state. |
 | `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized). Parsed case-insensitively (`LOCAL`, `Redis`); `redis` requires `redis_url`. |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must not carry a URL fragment (`#insecure` or otherwise); TLS skip-verify is only `FERRUM_TLS_NO_VERIFY`. The path, when present, is the database selector and is validated at plugin admission: a canonical decimal integer from `0` through `2147483647`, without a sign, zero-padding, or extra slashes (`redis://host:6379/0`). An absent path or bare slash selects database 0. Ferrum uses the portable signed-32-bit bound, stricter than redis-rs's `i64` representation. A non-numeric, multi-segment, negative, or out-of-range selector is refused at construction rather than failing at first use. |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
@@ -10051,11 +10232,17 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 > **Note:** When `redis_tls` is enabled, CA certificate verification and skip-verify behavior are controlled by the gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` environment variables, not per-plugin settings. A configured CA bundle is exclusive: if the path is set and verification is on, a load failure refuses plugin construction instead of falling back to system/public roots. `FERRUM_TLS_NO_VERIFY=true` remains the sanctioned skip-verify path and does not treat an unloadable CA as a construction error.
 
 At least one of `datagrams_per_second` or `bytes_per_second` must be set; if both are configured each is enforced independently and the first to trip drops the datagram. Unknown top-level keys are rejected. A configured rate times `window_seconds` that overflows an unsigned 64-bit integer is refused at construction (a residual the OpenAPI schema cannot express).
-IP-based keys group IPv6 addresses in the same `/64`; IPv4 and IPv4-mapped IPv6
-addresses share one per-address budget. IPv4 keys reuse the resolved address
-allocation on the per-datagram hot path.
+IP-based keys group IPv6 addresses by `ipv6_prefix` (default `/64`); IPv4 and
+IPv4-mapped IPv6 addresses share one per-address budget. The key is the masked
+client address itself, derived from the typed address the session computed once
+at admission, so no datagram parses, formats, or allocates a key on the local
+path (the `ip:<address>` text form is built only when Redis is consulted).
 
-**Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes; it uses the same `redis_failure_policy` and Cluster screening as `rate_limiting`. Counting is a **plain fixed window** (`{prefix:key}:datagrams|bytes:{window_index}`, one counter per configured window with no previous-window term at all) — neither the sub-bucketed trailing window nor the weighted approximation — so a datagram flood may straddle a window boundary and spend two consecutive windows' budgets back to back. While the centralized store is unavailable the default `fail_closed` policy drops the datagram (a datagram has no error channel, so failing closed *is* the drop), and `local_fallback` is the explicit opt-in to per-process counters. The datagram and byte keys of one client share a hash tag so their transaction is slot-stable.
+**Counter storage** (`sync_mode`): UDP rate-limit counters support `local` and `redis` only. Database-backed counters are intentionally unsupported. Redis mode centralizes datagram and byte counters across data planes; it uses the same `redis_failure_policy` and Cluster screening as `rate_limiting`. Counting is a **plain fixed window** (`{prefix:key}:datagrams|bytes:{window_index}`, one counter per configured window with no previous-window term at all) — neither the sub-bucketed trailing window nor the weighted approximation — so a datagram flood may straddle a window boundary and spend two consecutive windows' budgets back to back. While the centralized store is unavailable the default `fail_closed` policy drops the datagram (a datagram has no error channel, so failing closed *is* the drop) and counts each such drop in `ferrum_rate_limit_enforcement_unavailable_total` — not in `ferrum_rate_limit_exceeded_total`, so an outage is never silent traffic loss and never mistaken for clients over their limit. `local_fallback` is the explicit opt-in to per-process counters. The datagram and byte keys of one client share a hash tag so their transaction is slot-stable.
+
+> **Redis sizing and eviction policy.** In Redis mode every distinct client key (after `ipv6_prefix` grouping) creates its own counter keys, and UDP sources are unauthenticated and spoofable, so the *centralized* key population is driven by the traffic — the 100,000-entry cap below bounds only the local/fallback map. Every counter key is written with its TTL (`window_seconds + 1`) in the same `MULTI`/`EXEC` that increments it, so stale keys always expire, but a long window keeps keys for that long. Run these counters on a Redis whose `maxmemory-policy` is `noeviction` (ideally a dedicated database or instance, sized for the expected distinct-source count × windows in flight). Under an evicting policy (`allkeys-*` or `volatile-*`; every counter has a TTL, so `volatile-*` applies) memory pressure can evict a live counter mid-window and restart that client's budget — a silent fail-open. Under `noeviction` the same pressure surfaces as write errors, which the configured `redis_failure_policy` handles visibly. Ferrum does not probe the server's eviction policy for rate-limit clients; this is an operator requirement.
+
+> **Redis-mode throughput.** Each counted datagram awaits one Redis transaction (`INCR`/`INCRBY` + `EXPIRE`) before it is forwarded. Established plain-UDP sessions run client-to-backend hooks on one FIFO worker per session, and backend-to-client hooks on that session's reply task, so a single session is bounded near **one datagram per Redis round trip per direction** (for example about 1,000–2,000 datagrams per second at a 0.5–1 ms RTT) regardless of the configured rate, and every datagram gains that latency. Bursts beyond it fill the bounded per-session hook queue (256 datagrams / 256 KiB) and are dropped fail-closed as `hook_ingress_drops`, not as rate-limit drops. `redis_pool_size` parallelizes across sessions, not within one. Prefer `sync_mode: local` (per-gateway budgets) for high-rate single flows; use Redis mode where a shared cross-gateway budget matters more than per-flow throughput.
 
 ```yaml
 plugin_name: udp_rate_limiting
@@ -10067,11 +10254,13 @@ config:
 
 With `window_seconds: 4` this admits 4000 datagrams and 4194304 payload bytes per window, not 1000 datagrams / 1048576 bytes per window — the configured values are per-second rates.
 
-**Memory protection:** The plugin tracks per-client state in a `DashMap` capped at 100,000 entries. Resident entry count is maintained by an `AtomicUsize` coordinated with insert and remove (expiry prune), so steady per-datagram capacity checks never call `DashMap::len()` or take every state-shard read lock — including Redis mode, which still observes only the atomic local/fallback count. Hard cardinality is enforced by atomic reservation on admission: existing client IPs continue at capacity, and previously unseen local/fallback IPs are dropped fail-closed without inserting state. Cleanup never force-evicts still-active budgets (that would reset consumed windows). Stale entries (idle for `window_seconds × 2`, minimum 10 seconds) are pruned by a sampled periodic sweep (every 100,000 datagram hooks) even while the map is below the hard cap; over-cap observations may reclaim idle keys at most once per second after that prune. Both sweep paths share an atomic `compare_exchange` gate so concurrent scans cannot pile up under load, and Redis-fallback local maps use the same below-cap prune / atomic admission rules.
+**Memory protection:** The plugin tracks per-client state in a `DashMap` capped at 100,000 entries. Resident entry count is maintained by an `AtomicUsize` coordinated with insert and remove (expiry prune), so steady per-datagram capacity checks never call `DashMap::len()` or take every state-shard read lock — including Redis mode, which still observes only the atomic local/fallback count. Hard cardinality is enforced by atomic reservation on admission: existing client IPs continue at capacity, and previously unseen local/fallback IPs are dropped fail-closed without inserting state. Cleanup never force-evicts still-active budgets (that would reset consumed windows). Stale entries (idle for `window_seconds × 2`, minimum 10 seconds) are pruned by a sampled periodic sweep (every 100,000 datagram hooks) even while the map is below the hard cap. Once the map is **full** (at the cap — atomic admission never lets it grow past it), every datagram hook observes capacity pressure and reclaims idle keys at most once per second, before that datagram's own admission, so a map filled by clients that have since gone idle reopens to new clients within a second instead of waiting for the next sampled sweep. Both sweep paths share an atomic `compare_exchange` gate so concurrent scans cannot pile up under load, and Redis-fallback local maps use the same below-cap prune / atomic admission rules.
 
-**Hot-path contract:** Per-datagram bookkeeping is lock-free — counts, byte totals, window epoch, and last-activity timestamps are all `AtomicU64`, and capacity admission loads the coordinated entry-count atomic (not an all-shard `DashMap::len()`). The plugin opts in via `requires_udp_datagram_hooks() = true`, so when no UDP plugin is configured on a proxy the datagram forwarding loop pays zero overhead.
+**Hot-path contract:** Counts, byte totals, window epoch, and last-activity timestamps are all `AtomicU64`, and capacity admission loads the coordinated entry-count atomic (not an all-shard `DashMap::len()`). For a policy that bounds **one** axis (`datagrams_per_second` *or* `bytes_per_second`), a datagram from an existing client within its current window is decided through a **shared** read reference to its state shard, so concurrent datagrams of one client (many sessions behind one NAT address or one IPv6 prefix) and of other clients on the same shard do not serialize on an exclusive guard; the decision rests on one atomic read-modify-write, so concurrent decisions still match a serial order. A policy that bounds **both** axes keeps the per-key exclusive entry guard for every datagram: the count and byte totals are two separate atomics, and deciding both from a shared reference could refuse two datagrams where every serial order admits one. Inserting a new client, the once-per-window rollover (which resets several counters together and must not interleave with a concurrent charge), and cleanup always take the exclusive entry guard. The plugin opts in via `requires_udp_datagram_hooks() = true`, so when no UDP plugin is configured on a proxy the datagram forwarding loop pays zero overhead.
 
-**Direction handling:** The plugin examines `ctx.direction` only implicitly — both directions update the same per-client window. This is intentional: the goal is to cap total UDP traffic per client IP, not just inbound. Plugins that need direction-specific behavior should branch on `ctx.direction` themselves.
+**Direction handling:** With the default `direction: both`, both directions update the same per-client window, capping total UDP traffic per client IP (which also bounds reflected responses). For request-response protocols this means the effective request rate is roughly half the configured datagram rate, and response bytes consume the byte budget. Set `direction: client_to_backend` to budget only inbound traffic (or `backend_to_client` for responses only); the other direction is then neither counted nor dropped. To limit each direction separately, attach two instances with different `direction` values.
+
+**Established sessions and reloads:** A UDP/DTLS session binds its datagram-hook list once, at first-datagram admission. Before each later datagram's side effects (and again after its hooks await), the session compares the published configuration generation with the one it last verified (two atomic loads while nothing changed). When the generation moves, it compares a **policy digest** of the proxy's datagram-hook plugins — each plugin config's namespace, id, kind, scope and target, priority override, trigger, and config document, in chain order, computed once when the plugin cache builds the proxy's entry — with the digest it was admitted under. When a reload changes that policy — adding, removing, reordering, or reconfiguring `udp_rate_limiting` or any other datagram plugin — the session is **ended** and the datagram is dropped; the client's next datagram is admitted as a new session under the current policy (stream-connect chain, trigger decisions, and hook list), so a tightened limit applies to existing flows within one datagram. A plain-UDP client sees a new backend source port; a DTLS-terminating client must handshake again. Compatible reloads keep local counters (see **Local counters survive a compatible reload**), so a re-admitted client keeps its consumed budget. Reloads that leave the proxy's datagram-hook configs unchanged do not end sessions — including full reloads that reconstruct every plugin instance (file-mode `SIGHUP`, a data plane's full control-plane snapshot, a database-mode full reload). Changes to non-datagram plugins (for example stream-connect auth) are not re-applied to established sessions. A global `udp_rate_limiting` whose effective targets include no UDP/DTLS proxy logs a warning that it is inert.
 
 **Rejection diagnostics:** Count- and byte-limit drops still increment the existing per-rejection metrics/counters, but tracing warnings are bounded per plugin instance and process-wide. Each rejection first increments lock-free pending aggregates at both scopes. A warning is emitted only after both the instance and global monotonic one-second gates admit it, so each instance emits at most one summary per second and all configured instances together emit at most one. If the global gate denies an instance, neither pending aggregate is cleared; the counts carry into a later summary. Concurrent events may fall into the current or next summary depending on the counter-swap boundary, but they are not discarded, and counters saturate at `u64::MAX` rather than wrapping. Warnings identify only the configured `proxy_id` and a static `limit_kind` (`datagram_count` or `byte_count`) — never client addresses, payloads, or usage snapshots.
 
@@ -10182,6 +10371,7 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
+| `name` | String \| null | omitted | Optional operator label, 1–128 printable ASCII characters without whitespace. Published as `mesh_route_dispatch.rule_name` match metadata (see [Match observability](#match-observability)) |
 | `match` | Object | `{}` | Predicates, all-of across the fields below. An empty match is rejected **unless** the rule carries a route action (`request_transform`, `response_transform`, `fault`, `rewrite`, `redirect`, `timeout_ms`, `timeout_disabled: true`, `request_timeout_ms`, `attempt_timeout_ms`, `retry`, `retry_disabled: true`), which makes it the deliberate action-only catch-all; otherwise it would silently shadow every later rule |
 | `destination` | Object | `{}` | Route override applied on match. At least one field must be set unless the rule carries a `redirect` |
 | `timeout_ms` | u64 \| null | omitted | Route-local backend response/read timeout. `0` means "no timeout". Cannot be combined with `timeout_disabled: true` |
@@ -10202,11 +10392,13 @@ type column says so. Unknown keys are rejected at every level.
 |---|---|---|---|
 | `methods` | (String \| Object)[] | `[]` | Any-of. A bare string is an `exact` match; the object form is an Istio `StringMatch` with **exactly one** of `exact` / `prefix` / `regex`. `exact` and `prefix` operands must be non-empty RFC 9110 method tokens — an empty value or one containing a space (`"GET POST"`) is rejected at load, because it could never match. `exact` preserves operator casing (`"get"` matches only `get`); `prefix` is ASCII-uppercased at load; `regex` is compiled verbatim between full-input anchors. Empty array = no method restriction |
 | `headers` | Object | `{}` | All-of, keyed by header name. Names must be RFC 9110 tokens and are ASCII-lowercased at load; duplicates after normalization are rejected. Values take the same bare-string / `StringMatch` shapes as `methods`. An `exact: ""` predicate legitimately means "present and empty"; empty `prefix` / `regex` operands are rejected |
-| `query_params` | Object | `{}` | All-of equality on the canonical decoded query — see the fail-closed contract above |
+| `without_headers` | Object | `{}` | Negated header predicates (Istio `withoutHeaders`), keyed and normalized like `headers`, with the same value shapes. The rule fails when **any** listed header is present and its value satisfies the matcher; an absent header never vetoes it, so `{"x-legacy": {"regex": ".*"}}` requires the header to be absent (the translator's projection of Istio's presence-only `withoutHeaders: {x-legacy: {}}`) |
+| `query_params` | Object | `{}` | All-of, keyed by exact parameter name, on the canonical decoded query — see the fail-closed contract above. A value is a bare string (`exact`) or a `StringMatch` with exactly one of `exact` / `prefix` / `regex`; `regex` must match the full decoded value, and empty `prefix` / `regex` operands are rejected |
 | `authority` | String \| Object \| null | omitted | `Host` / `:authority` predicate, bare string or `StringMatch`. Case-sensitive for `exact` / `prefix`, including an explicit request port; write `(?i)` for a case-insensitive `regex`. All operands must be non-empty |
 | `source_namespace` | String \| null | omitted | Source workload namespace, read from the peer SPIFFE ID. Exact and case-sensitive; empty or whitespace-bearing values are rejected. Fails closed (no match) when there is no resolved peer identity |
 | `uri` | Object \| null | omitted | `StringMatch` on the request path. Normally omitted because the proxy's `listen_path` already gates URI selection; the translator emits it for `ignoreUriCase` routes and collapsed route-order fallbacks. `regex` must match the full path |
 | `ignore_uri_case` | bool | `false` | Fold ASCII case for `uri.exact` / `uri.prefix` only. Rejected without a `uri` predicate, and it never affects `uri.regex`, headers, methods, or authority |
+| `port` | 1–65535 \| null | omitted | Destination port the client addressed (Istio `match.port`), from trusted provenance only: the original destination when capture rewrote the accept socket, otherwise the frontend listener port — never `Host` or forwarding headers. A request with neither does not match |
 
 **`rules[].destination`**
 
@@ -10234,16 +10426,16 @@ type column says so. Unknown keys are rejected at every level.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `uri` | String \| null | omitted | Replacement path. Must be a canonical absolute path with no query or fragment; percent escapes, dot segments, backslashes, and CRLF are rejected at load, and the composed path is re-checked before publication |
-| `authority` | String \| null | omitted | Replacement `Host` / `:authority`. Non-empty, CRLF-free, no whitespace |
+| `authority` | String \| null | omitted | Replacement `Host` / `:authority`. Must be exactly `host` or `host:port`: a DNS name or IPv4 literal (letters, digits, `-`, `.`, `_`) or a bracketed IPv6 literal, optionally followed by a decimal port `1`–`65535`. A path, query, fragment, userinfo, whitespace, or a bare (unbracketed) IPv6 literal is rejected at load |
 | `match_prefix` | String \| null | omitted | The literal prefix to replace with `uri`. Replacement is literal: the unmatched suffix is appended **verbatim**, so `match_prefix: /prefix/old` + `uri: /new` forwards `/prefix/oldtail` as `/newtail`, never `/new/tail`. A doubled separator is collapsed when both sides carry a `/` (`match_prefix: /prefix` + `uri: /` forwards `/prefix/etc` as `/etc`). A suffix whose first complete segment is `.` or `..` keeps its boundary so the canonical-path check refuses it (`/prefix/old../admin` composes `/new/../admin` and returns `400`); other dot-leading suffixes remain literal (`/prefix/old.env` becomes `/new.env`, and `..hidden` becomes `/new..hidden`). An empty string strips nothing and prepends `uri` (`match_prefix: ""` + `uri: /v2` forwards `/users` as `/v2/users`); the Gateway API translator emits it for a `URLRewrite` / `RequestRedirect` `ReplacePrefixMatch` under the root `PathPrefix: /`. Omit the field for whole-path replacement. A `match_prefix` with no `uri` is inert and dropped |
 
 **`rules[].redirect`** — every field is optional; a status-only redirect preserves the request URL.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. Must be non-empty: a Gateway API `ReplacePrefixMatch` with an empty `replacePrefixMatch` (strip the matched prefix) is translated to `uri: /`, which composes `/old` → `/`, `/old/` → `/`, and `/old/child` → `/child` under `match_prefix: /old`. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
+| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. Must be an absolute path (leading `/`) whose path component is already canonical (no dot segments, backslashes, or escapes that decode differently), without a fragment, and printable ASCII only — query included, so a raw control byte or unencoded non-ASCII character is refused (percent-encode it); it may carry its own `?query` unless `match_prefix` is set, because the unmatched suffix is appended after `uri`. A relative value is rejected at load because it would be concatenated onto the authority (`uri: new` would have redirected `app.example.com` to the different host `app.example.comnew`). A Gateway API `ReplacePrefixMatch` with an empty `replacePrefixMatch` (strip the matched prefix) is translated to `uri: /`, which composes `/old` → `/`, `/old/` → `/`, and `/old/child` → `/child` under `match_prefix: /old`. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
 | `match_prefix` | String \| null | omitted | Prefix replaced by `uri`, with the same literal-substitution contract as `rewrite.match_prefix` |
-| `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset |
+| `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset. Same `host` / `host:port` grammar as `rewrite.authority` |
 | `port` | 1–65535 \| null | omitted | Replacement authority port. Mutually exclusive with `derive_port` |
 | `derive_port` | String \| null | omitted | `FROM_PROTOCOL_DEFAULT` (80/http, 443/https) or `FROM_REQUEST_PORT` (original-destination port under capture, otherwise the frontend listener port — never `X-Forwarded-Port` / `Forwarded`). Mutually exclusive with `port` |
 | `scheme` | String \| null | omitted | `http` or `https`, ASCII-lowercased before validation (so `HTTPS` is accepted). The request's frontend scheme is preserved when unset |
@@ -10302,6 +10494,10 @@ still rejected at admission.
 - **Whole-destination replacement.** A matching instance replaces all four
   override fields (`upstream_id`, `backend_host`, `backend_port`, `backend_tls`);
   a non-matching instance leaves an earlier instance's override intact.
+- **`Host` ownership.** A matching rule without `rewrite.authority` undoes only a
+  `Host` rewrite an earlier dispatch instance made, restoring the value that was
+  live just before that rewrite. A `Host` another plugin set before the dispatch
+  block is the forwarded authority the rule inherits and is left untouched.
 - **Protocol scope.** The plugin runs on HTTP, gRPC, and WebSocket at priority
   2995. A WebSocket override selects the upgrade backend only — frames are not
   re-routed after the upgrade — and an HBONE `CONNECT` is matched on the outer
@@ -10500,10 +10696,46 @@ and nothing is allocated for it.
 
 Route header transforms are published onto the request context and applied by
 proxy core after the last **eligible** (enabled) `request_transformer` /
-`response_transformer` in the chain. A proxy with no such instance forwards the
-request normally and applies neither transform. The VirtualService translator
-auto-emits an `apply_route_overrides: true` consumer; when configuring the plugin
-directly, add one yourself (see the third example below).
+`response_transformer` in the chain. The request list is applied after the
+LATER of that consumer and the last `mesh_route_dispatch` instance — every
+instance, including one whose rules carry no `request_transform`, because a
+matching rule replaces the whole route decision. A consumer that a
+`priority_override` moves ahead of the dispatch block therefore still has the
+winning rule's list applied once the block has decided, a superseded rule's
+list is never applied, and no later dispatch predicate sees route headers early.
+
+A WebSocket handshake gets the matched rule's route lists too, each applied
+exactly once. `request_transformer` itself runs on WebSocket handshakes, so it
+is the request list's consumer there exactly as on HTTP and the request list
+reaches the backend handshake. `response_transformer` runs on HTTP and gRPC
+only, so the WebSocket chain carries a cache-owned stand-in at its position
+(route-header finalization only — never the transformer's static header rules),
+and the response list decorates the successful upgrade response as well as a
+redirect / fault / rejection answer.
+
+A chain whose rules carry `request_transform` / `response_transform` but that has
+no configured `request_transformer` / `response_transformer` respectively is
+**refused** at plugin-cache construction and admin admission, naming the missing
+consumer; without one the list would be silently dropped and, for example, a
+route rule that strips a sensitive request header would forward it untouched.
+The VirtualService and Gateway API translators auto-emit an
+`apply_route_overrides: true` consumer; when configuring the plugin directly, add
+one yourself (see the third example below). The check counts a configured
+transformer whatever its RTDS gate: an instance an RTDS overlay disables is not
+eligible at runtime and leaves the route list unused, exactly as before, so the
+kill switch never wedges a reload.
+
+##### Match observability
+
+Every matching rule — including one that answers with its own `redirect` or an
+aborted `fault` — publishes transaction-log metadata
+`mesh_route_dispatch.rule_index` (the rule's zero-based position in its
+instance's `rules`) and, when the rule sets `name`, `mesh_route_dispatch.rule_name`.
+A later matching instance overwrites both and removes a stale name when its own
+rule is unnamed. A NodeWaypoint authorization `403` that refuses the matched
+destination withdraws both keys, since the vetoed rule served nothing. Both keys
+are on the built-in safe-metadata allowlist, so they are visible in every
+logging sink by default.
 
 ##### Examples
 

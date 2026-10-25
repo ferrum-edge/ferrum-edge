@@ -287,7 +287,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   },
   "tcp_connection_throttle": {
     "enforcement_scope": "process_local",
-    "replica_limit_behavior": "configured_limit_per_replica"
+    "replica_limit_behavior": "configured_limit_per_replica",
+    "active_connections": 37
   }
 }
 ```
@@ -457,12 +458,13 @@ Untracked admissions beyond `max_tracked_keys` and permits still finishing again
 
 ### `tcp_connection_throttle`
 
-Static description of how the `tcp_connection_throttle` plugin enforces limits.
+How the `tcp_connection_throttle` plugin enforces limits, plus its live occupancy.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `enforcement_scope` | string | Always `process_local`: connection counters live only in this process |
 | `replica_limit_behavior` | string | Always `configured_limit_per_replica`: each replica enforces the configured limit independently, so the deployment-wide allowance can reach the limit multiplied by the number of replicas receiving that client's connections |
+| `active_connections` | integer | Live TCP connections this process currently holds under every configured `tcp_connection_throttle` policy, summed across all Consumer/IP keys (`0` when none is configured). Computed when the endpoint is read; connections still held by a policy that was since removed are not counted. Per-proxy refusals are the Prometheus counter `ferrum_tcp_connection_throttle_rejections_total` |
 
 ### `database_polling`
 

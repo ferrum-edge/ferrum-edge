@@ -466,6 +466,7 @@ pub fn gateway_config_with_mesh(
 ) -> GatewayConfig {
     GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "test".to_string(),
         proxies,
         upstreams,

@@ -210,13 +210,17 @@ impl AdminMetricsAdaptiveConcurrency {
 pub struct AdminMetricsTcpConnectionThrottle {
     pub enforcement_scope: &'static str,
     pub replica_limit_behavior: &'static str,
+    /// Live TCP connections this process currently holds under every
+    /// configured `tcp_connection_throttle` policy, summed across keys.
+    pub active_connections: u64,
 }
 
 impl AdminMetricsTcpConnectionThrottle {
-    pub const fn process_local() -> Self {
+    pub const fn process_local(active_connections: u64) -> Self {
         Self {
             enforcement_scope: "process_local",
             replica_limit_behavior: "configured_limit_per_replica",
+            active_connections,
         }
     }
 }
@@ -406,7 +410,7 @@ pub fn empty_proxy_metrics(mode: &str) -> AdminMetrics {
             tracked_key_count: 0,
         },
         adaptive_concurrency: AdminMetricsAdaptiveConcurrency::empty(),
-        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(),
+        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(0),
         database_polling: None,
     }
 }
@@ -607,7 +611,9 @@ pub fn build_admin_metrics(
             limit_total: adaptive_totals.limit,
             in_flight_total: adaptive_totals.in_flight,
         },
-        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(),
+        tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(
+            ps.plugin_cache.tcp_connection_throttle_active_connections(),
+        ),
         database_polling: if mode == "database" || mode == "cp" {
             database_polling
         } else {

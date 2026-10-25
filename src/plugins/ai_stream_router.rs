@@ -642,7 +642,7 @@ pub(crate) struct AiStreamRouterClaim {
     /// is unambiguous: the committed destination is plaintext HTTP, which is
     /// also pinned by `scheme`, so a later plugin cannot satisfy the witness by
     /// clearing a committed HTTPS configuration.
-    resolved_tls: Option<BackendTlsConfig>,
+    resolved_tls: Option<Arc<BackendTlsConfig>>,
     /// The exact backend-visible query the dispatch layer may append. Empty
     /// when the committed `path` already carries every pair.
     committed_query: String,
@@ -786,7 +786,7 @@ pub(crate) struct ExternalProviderClaimParts {
     pub(crate) port: u16,
     pub(crate) path: String,
     pub(crate) authority: String,
-    pub(crate) resolved_tls: Option<BackendTlsConfig>,
+    pub(crate) resolved_tls: Option<Arc<BackendTlsConfig>>,
     pub(crate) committed_query: String,
     /// The exact `route_override_backend_connect_timeout_ms` the owner
     /// committed for this destination.
@@ -4191,7 +4191,7 @@ impl Plugin for AiStreamRouter {
             ctx.route_override_resolved_tls = if provider.inherit_backend_tls {
                 ctx.matched_proxy
                     .as_ref()
-                    .map(|proxy| proxy.resolved_tls.clone())
+                    .map(|proxy| Arc::new(proxy.resolved_tls.clone()))
             } else {
                 // Not `default_verify()`: its unset CA / client fields are
                 // filled from gateway-global settings by the backend TLS
@@ -4200,7 +4200,7 @@ impl Plugin for AiStreamRouter {
                 // certificate). A third-party provider gets public roots only,
                 // verification that no global opt-out can disable, and no
                 // gateway client identity.
-                Some(BackendTlsConfig::isolated_public_verify())
+                Some(Arc::new(BackendTlsConfig::isolated_public_verify()))
             };
         } else {
             // Plaintext HTTP provider: no committed TLS configuration at all.

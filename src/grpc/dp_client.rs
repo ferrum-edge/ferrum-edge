@@ -4011,6 +4011,7 @@ mod tests {
     fn filter_config_keeps_matching_namespace_only() {
         let mut cfg = GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies: vec![
                 proxy_in_namespace("p-prod", "production"),
@@ -4065,6 +4066,7 @@ mod tests {
     fn filter_config_strips_foreign_gateway_listener_tls_classification() {
         let mut cfg = GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies: vec![proxy_in_namespace("p-prod", "production")],
             consumers: Vec::new(),
@@ -4108,6 +4110,7 @@ mod tests {
     fn filter_config_returns_zero_when_clean() {
         let mut cfg = GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies: vec![proxy_in_namespace("p-prod", "production")],
             consumers: vec![],

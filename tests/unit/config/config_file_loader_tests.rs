@@ -1717,7 +1717,7 @@ proxies: []
 consumers: []
 plugin_configs:
   - id: "plugin-optional-bad-config"
-    plugin_name: "stdout_logging"
+    plugin_name: "transaction_debugger"
     config: "not-an-object"
     scope: global
     enabled: true
@@ -1734,7 +1734,38 @@ plugin_configs:
 
     assert_eq!(config.plugin_configs.len(), 1);
     assert_eq!(config.plugin_configs[0].id, "plugin-optional-bad-config");
-    assert_eq!(config.plugin_configs[0].plugin_name, "stdout_logging");
+    assert_eq!(config.plugin_configs[0].plugin_name, "transaction_debugger");
+}
+
+/// `stdout_logging` is the access log (an audit trail), registered
+/// `KeepLastKnownGood`: a typo'd config must fail file-mode load rather than
+/// start a gateway that silently logs nothing.
+#[test]
+fn test_invalid_stdout_logging_config_rejects_file_mode_load() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs:
+  - id: "access-log-typo"
+    plugin_name: "stdout_logging"
+    config:
+      filtr:
+        errors_only: true
+    scope: global
+    enabled: true
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let error = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("an unconstructible stdout_logging config must reject file-mode load");
+    let message = format!("{error:#}");
+    assert!(message.contains("1 plugin config error(s)"), "{message}");
 }
 
 #[test]

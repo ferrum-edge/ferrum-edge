@@ -94,6 +94,18 @@ use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
 };
 
+/// Request metadata key carrying the matched rule's position in its
+/// instance's rule list. Written on every match (including redirect and fault
+/// answers) and withdrawn when a node-waypoint authorization veto refuses the
+/// matched destination.
+pub const RULE_INDEX_METADATA_KEY: &str = "mesh_route_dispatch.rule_index";
+/// Request metadata key carrying the matched rule's optional `name`. Removed
+/// when the matched rule is unnamed so an earlier instance's label never
+/// describes a later instance's decision.
+pub const RULE_NAME_METADATA_KEY: &str = "mesh_route_dispatch.rule_name";
+/// Upper bound on a rule `name`, in bytes.
+const MAX_RULE_NAME_LENGTH: usize = 128;
+
 /// Top-level config for the plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,7 +152,18 @@ impl MeshRouteDispatchConfig {
             return Err("`mesh_route_dispatch.rules` cannot be empty".to_string());
         }
         for (idx, rule) in self.rules.iter_mut().enumerate() {
-            normalize_header_match_keys(idx, &mut rule.match_.headers)?;
+            validate_rule_name(idx, rule.name.as_deref())?;
+            normalize_header_match_keys(idx, "match.headers", &mut rule.match_.headers)?;
+            normalize_header_match_keys(
+                idx,
+                "match.without_headers",
+                &mut rule.match_.without_headers,
+            )?;
+            if rule.match_.port == Some(0) {
+                return Err(format!(
+                    "`mesh_route_dispatch.rules[{idx}].match.port` must be in the 1-65535 range"
+                ));
+            }
             // Empty match is normally rejected because it would silently
             // shadow later rules. The exception is a "route-action catch-all":
             // a rule emitted by the K8s VirtualService translator for a
@@ -164,7 +187,8 @@ impl MeshRouteDispatchConfig {
             if rule.match_.is_empty() && !has_route_actions {
                 return Err(format!(
                     "`mesh_route_dispatch.rules[{idx}].match` requires at least one of \
-                     `methods` / `headers` / `query_params` / `authority` / `source_namespace` / `uri` \
+                     `methods` / `headers` / `without_headers` / `query_params` / `authority` / \
+                     `source_namespace` / `uri` / `port` \
                      (an empty match would silently never fire, contradicting \
                      first-match-wins semantics)"
                 ));
@@ -274,6 +298,10 @@ impl MeshRouteDispatchConfig {
             if let Some(tls) = rule.destination.backend_tls.as_mut() {
                 normalize_and_validate_backend_tls(idx, tls)?;
             }
+            rule.destination.backend_tls_compiled =
+                rule.destination.backend_tls.clone().map(Arc::new);
+            rule.retry_compiled = rule.retry.clone().map(Arc::new);
+            rule.rule_index_label = idx.to_string();
             if let Some(fault) = rule.fault.as_ref() {
                 validate_fault_action(idx, fault)?;
             }
@@ -293,7 +321,15 @@ impl MeshRouteDispatchConfig {
             rule.response_transform_compiled =
                 compile_transform_field(idx, "response_transform", &rule.response_transform)?;
             rule.methods_compiled = compile_method_matchers(idx, &rule.match_.methods)?;
-            rule.headers_compiled = compile_header_matchers(idx, &rule.match_.headers)?;
+            rule.headers_compiled =
+                compile_header_matchers(idx, "match.headers", &rule.match_.headers)?;
+            rule.without_headers_compiled = compile_header_matchers(
+                idx,
+                "match.without_headers",
+                &rule.match_.without_headers,
+            )?;
+            rule.query_params_compiled =
+                compile_query_param_matchers(idx, &rule.match_.query_params)?;
             rule.authority_compiled =
                 compile_authority_matcher(idx, rule.match_.authority.as_ref())?;
             rule.uri_compiled =
@@ -475,6 +511,12 @@ fn validate_and_normalize_rewrite(
                 "`mesh_route_dispatch.rules[{rule_idx}].rewrite.authority` must not contain whitespace"
             ));
         }
+        if let Some(reason) = route_authority_operand_error(authority) {
+            return Err(format!(
+                "`mesh_route_dispatch.rules[{rule_idx}].rewrite.authority` must be `host` or \
+                 `host:port`: {reason}"
+            ));
+        }
     }
     if rewrite.match_prefix.is_some() && rewrite.uri.is_none() {
         // `match_prefix` only describes how `uri` rebases the path. Without a
@@ -502,6 +544,11 @@ fn validate_and_normalize_redirect(
             ));
         }
         reject_crlf(rule_idx, "redirect.uri", uri)?;
+        if let Some(reason) = redirect_uri_operand_error(uri, redirect.match_prefix.is_some()) {
+            return Err(format!(
+                "`mesh_route_dispatch.rules[{rule_idx}].redirect.uri` {reason}"
+            ));
+        }
     }
     // An explicitly empty `match_prefix` strips nothing and prepends `uri` —
     // the root `PathPrefix: /` case of the Gateway API rewrite table. It is
@@ -519,6 +566,12 @@ fn validate_and_normalize_redirect(
         if authority.chars().any(char::is_whitespace) {
             return Err(format!(
                 "`mesh_route_dispatch.rules[{rule_idx}].redirect.authority` must not contain whitespace"
+            ));
+        }
+        if let Some(reason) = route_authority_operand_error(authority) {
+            return Err(format!(
+                "`mesh_route_dispatch.rules[{rule_idx}].redirect.authority` must be `host` or \
+                 `host:port`: {reason}"
             ));
         }
     }
@@ -542,6 +595,121 @@ fn validate_and_normalize_redirect(
         }
     }
     Ok(())
+}
+
+/// Grammar check for a `rewrite.authority` / `redirect.authority` operand.
+///
+/// The value becomes the forwarded `Host` header or the authority of a
+/// redirect `Location` verbatim, so it must be exactly `host` or `host:port`:
+/// a DNS name or IPv4 literal (ASCII letters, digits, `-`, `.`, `_`) or a
+/// bracketed IPv6 literal, optionally followed by a non-zero decimal port.
+/// Anything else (`backend/internal`, `user@host`, `a?b`, a bare `::1`) would
+/// either change the request target or point a redirect at a different host.
+/// Returns the refusal reason; `None` means the operand is admissible.
+pub(crate) fn route_authority_operand_error(authority: &str) -> Option<&'static str> {
+    if authority.is_empty() {
+        return Some("it must not be empty");
+    }
+    if authority.contains(['/', '\\']) {
+        return Some("it must not contain a path");
+    }
+    if authority.contains(['?', '#']) {
+        return Some("it must not contain a query or fragment");
+    }
+    if authority.contains('@') {
+        return Some("it must not contain userinfo");
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else {
+            return Some("a bracketed IPv6 literal must be closed with `]`");
+        };
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return Some("the bracketed value is not a valid IPv6 literal");
+        }
+        let port = if after.is_empty() {
+            None
+        } else if let Some(port) = after.strip_prefix(':') {
+            Some(port)
+        } else {
+            return Some("only `:port` may follow a bracketed IPv6 literal");
+        };
+        (None, port)
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => (Some(host), Some(port)),
+            None => (Some(authority), None),
+        }
+    };
+    if let Some(host) = host {
+        if host.is_empty() {
+            return Some("the host must not be empty");
+        }
+        if !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+        {
+            return Some(
+                "the host must be a DNS name or IPv4 literal (letters, digits, `-`, `.`, `_`) \
+                 or a bracketed IPv6 literal",
+            );
+        }
+    }
+    if let Some(port) = port
+        && (port.is_empty()
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || !matches!(port.parse::<u16>(), Ok(port) if port != 0))
+    {
+        return Some("the port must be a decimal number in the 1-65535 range");
+    }
+    None
+}
+
+/// Grammar check for a `redirect.uri` operand, which becomes the path (and
+/// optional query) of the redirect `Location`.
+///
+/// It must be an absolute path: a relative value would be concatenated onto
+/// the authority (`http://app.example.comnew` names a different host). A
+/// fragment is refused because the original query, appended after it, would
+/// be swallowed into the fragment. The path component must already be
+/// canonical — the same admission `rewrite.uri` applies — so a value the
+/// per-request canonicalization would refuse with `400` fails validation
+/// instead. A prefix-rebasing redirect (`match_prefix` set) appends the
+/// unmatched request suffix after `uri`, so it may not carry its own query.
+/// Only printable ASCII is admitted anywhere in the operand, query included
+/// (raw control bytes and unencoded non-ASCII are refused); percent-encoded
+/// query text is kept verbatim and is never decoded here.
+pub(crate) fn redirect_uri_operand_error(uri: &str, rebases_prefix: bool) -> Option<String> {
+    if !uri.starts_with('/') {
+        return Some("must be an absolute path starting with `/`".to_string());
+    }
+    if uri.contains('#') {
+        return Some("must not contain a fragment".to_string());
+    }
+    if uri.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Some("must not contain whitespace".to_string());
+    }
+    // The whole operand — query included — becomes the `Location` header
+    // value, which carries visible ASCII only. A raw control byte (NUL, BEL,
+    // DEL, …) or an unencoded non-ASCII character would make the response
+    // silently drop `Location` and answer an empty 3xx.
+    if !uri.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Some(
+            "must contain only printable ASCII; raw control bytes are refused and other \
+             characters must be percent-encoded"
+                .to_string(),
+        );
+    }
+    let (path, has_query) = match uri.split_once('?') {
+        Some((path, _)) => (path, true),
+        None => (uri, false),
+    };
+    if has_query && rebases_prefix {
+        return Some(
+            "must not carry a query when `match_prefix` rebases the request path".to_string(),
+        );
+    }
+    crate::policy_path::non_canonical_policy_path_reason(path)
+        .map(|reason| format!("path is not canonical: {reason}"))
 }
 
 fn compile_transform_field(
@@ -848,6 +1016,12 @@ fn normalize_and_validate_backend_tls(
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRule {
+    /// Optional operator label for this rule. When set it is published as
+    /// `mesh_route_dispatch.rule_name` request metadata on a match (alongside
+    /// `mesh_route_dispatch.rule_index`), so transaction logs show which rule
+    /// served a request. 1-128 printable ASCII characters, no whitespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Match criteria — all configured fields must match for the rule to fire.
     #[serde(default, rename = "match")]
     #[serde(deserialize_with = "crate::util::json_object::deserialize_object")]
@@ -1006,6 +1180,22 @@ pub struct RouteRule {
     /// `ctx.path`.
     #[serde(skip)]
     uri_compiled: Option<UriMatcher>,
+    /// Pre-compiled `match.without_headers` matchers (same normalization and
+    /// compilation as `headers_compiled`). Empty when the field is empty.
+    #[serde(skip)]
+    without_headers_compiled: HashMap<String, HeaderMatcher>,
+    /// Pre-compiled `match.query_params` matchers keyed by parameter name.
+    #[serde(skip)]
+    query_params_compiled: HashMap<String, HeaderMatcher>,
+    /// `retry` shared behind an `Arc`, built during normalize so a match
+    /// publishes the route-local policy with a refcount bump rather than a
+    /// deep clone of its status-code and method lists.
+    #[serde(skip)]
+    retry_compiled: Option<Arc<RetryConfig>>,
+    /// This rule's position in its instance's rule list, rendered once at load
+    /// for the `mesh_route_dispatch.rule_index` match metadata.
+    #[serde(skip)]
+    rule_index_label: String,
 }
 
 impl RouteRule {
@@ -1056,12 +1246,23 @@ pub struct MatchCriteria {
     /// the pre-compiled `Regex` from the rule's `headers_compiled` slot.
     #[serde(default)]
     pub headers: HashMap<String, HeaderMatchOp>,
-    /// Query parameter equality matches (all-of). Names and values match
-    /// exactly after percent-decoding the backend-bound query representation
-    /// available at this dispatch hook, including authentication-owned
-    /// credential strips and any priority-overridden query transformer that
-    /// already ran. A later route/request transform remains an intentional,
-    /// separately ordered operation.
+    /// Negated header matches (Istio `HTTPMatchRequest.withoutHeaders`). The
+    /// rule fails when ANY listed header is present and its value satisfies
+    /// the listed `StringMatch` (same shapes and normalization as `headers`);
+    /// an absent header never vetoes the rule. `{"regex": ".*"}` therefore
+    /// requires the header to be absent, which is how the VirtualService
+    /// translator projects Istio's presence-only `withoutHeaders` entry.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub without_headers: HashMap<String, HeaderMatchOp>,
+    /// Query parameter matches (all-of). Each value is a bare string (exact
+    /// match, the original shape) or a `StringMatch` object with exactly one
+    /// of `exact` / `prefix` / `regex`; regexes must span the full value.
+    /// Names match exactly and values are compared after percent-decoding the
+    /// backend-bound query representation available at this dispatch hook,
+    /// including authentication-owned credential strips and any
+    /// priority-overridden query transformer that already ran. A later
+    /// route/request transform remains an intentional, separately ordered
+    /// operation.
     ///
     /// A request whose query cannot be decoded to one such value is rejected
     /// with 400 before any rule is evaluated: a repeated or percent-encoded
@@ -1069,7 +1270,7 @@ pub struct MatchCriteria {
     /// malformed percent-encoding, or a non-UTF-8 decoding. See
     /// [`crate::plugins::utils::query::CanonicalQuery`].
     #[serde(default)]
-    pub query_params: HashMap<String, String>,
+    pub query_params: HashMap<String, HeaderMatchOp>,
     /// Source workload Kubernetes namespace (exact match). Resolved from the
     /// peer's SPIFFE ID per the Istio convention
     /// `spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>` via
@@ -1129,16 +1330,25 @@ pub struct MatchCriteria {
     /// operator misconfiguration at config-load time).
     #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_uri_case: bool,
+    /// Destination port predicate (Istio `HTTPMatchRequest.port`): the port
+    /// the client addressed. Read from trusted provenance only — the
+    /// kernel/conntrack original destination when capture rewrote the accept
+    /// socket, otherwise the frontend listener port — never from `Host` or
+    /// forwarding headers. A request with neither does not match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 impl MatchCriteria {
     fn is_empty(&self) -> bool {
         self.methods.is_empty()
             && self.headers.is_empty()
+            && self.without_headers.is_empty()
             && self.query_params.is_empty()
             && self.source_namespace.is_none()
             && self.authority.is_none()
             && self.uri.is_none()
+            && self.port.is_none()
     }
 }
 
@@ -1433,6 +1643,11 @@ pub struct RouteDestination {
     /// borrow it without lowercasing or formatting on every match.
     #[serde(skip)]
     node_waypoint_backend_match_key: Option<String>,
+    /// Normalized `backend_tls` shared behind an `Arc`, built during
+    /// normalize so a match publishes it without deep-cloning the SAN
+    /// allow-list and material paths on every request.
+    #[serde(skip)]
+    backend_tls_compiled: Option<Arc<BackendTlsConfig>>,
 }
 
 impl RouteDestination {
@@ -1698,6 +1913,13 @@ pub struct MeshRouteDispatch {
     /// config load so the hot path never rescans the rule list, and so a
     /// dispatch config that does not route on the query costs nothing.
     has_query_predicates: bool,
+    /// Whether any rule carries `request_transform`. Precomputed because proxy
+    /// core asks on every request when placing the route request-header
+    /// finalization boundary.
+    publishes_request_transforms: bool,
+    /// Whether any rule carries `response_transform` (plugin-cache composition
+    /// requires a configured `response_transformer` for these).
+    publishes_response_transforms: bool,
 }
 
 impl MeshRouteDispatch {
@@ -1707,10 +1929,20 @@ impl MeshRouteDispatch {
             .rules
             .iter()
             .any(|rule| !rule.match_.query_params.is_empty());
+        let publishes_request_transforms = parsed
+            .rules
+            .iter()
+            .any(|rule| rule.request_transform_compiled.is_some());
+        let publishes_response_transforms = parsed
+            .rules
+            .iter()
+            .any(|rule| rule.response_transform_compiled.is_some());
         Ok(Self {
             config: parsed,
             aggregate_reject_unmatched: AtomicBool::new(false),
             has_query_predicates,
+            publishes_request_transforms,
+            publishes_response_transforms,
         })
     }
 
@@ -1809,11 +2041,15 @@ impl MeshRouteDispatch {
 /// after authentication and are never decided early.
 fn rule_reads_changing_input(rule: &RouteRule, facts: EarlyRouteTotalFacts<'_>) -> bool {
     let host_changes = facts.headers.may_change("host") || facts.host_unknown;
-    let reads_changing_header = rule.headers_compiled.keys().any(|name| {
-        crate::proxy::headers::is_gateway_assertion_header(name)
-            || facts.headers.may_change(name)
-            || (host_changes && name.eq_ignore_ascii_case("host"))
-    });
+    let reads_changing_header = rule
+        .headers_compiled
+        .keys()
+        .chain(rule.without_headers_compiled.keys())
+        .any(|name| {
+            crate::proxy::headers::is_gateway_assertion_header(name)
+                || facts.headers.may_change(name)
+                || (host_changes && name.eq_ignore_ascii_case("host"))
+        });
     reads_changing_header
         || (facts.destination_may_change && rule.uri_compiled.is_some())
         || (host_changes && rule.authority_compiled.is_some())
@@ -2032,6 +2268,7 @@ fn compile_uri_matcher(
 /// normalization this function used to do by hand.
 fn normalize_header_match_keys(
     rule_idx: usize,
+    field: &str,
     headers: &mut HashMap<String, HeaderMatchOp>,
 ) -> Result<(), String> {
     if headers.is_empty() {
@@ -2043,7 +2280,7 @@ fn normalize_header_match_keys(
         let key = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| {
                 format!(
-                    "`mesh_route_dispatch.rules[{rule_idx}].match.headers` contains {name:?}, \
+                    "`mesh_route_dispatch.rules[{rule_idx}].{field}` contains {name:?}, \
                      which is not a valid HTTP header name (RFC 9110 token) and can \
                      therefore never match a request"
                 )
@@ -2052,7 +2289,7 @@ fn normalize_header_match_keys(
             .to_string();
         if normalized.insert(key.clone(), expected).is_some() {
             return Err(format!(
-                "`mesh_route_dispatch.rules[{rule_idx}].match.headers` contains duplicate \
+                "`mesh_route_dispatch.rules[{rule_idx}].{field}` contains duplicate \
                  header {key:?} after ASCII case normalization"
             ));
         }
@@ -2158,6 +2395,7 @@ fn compile_method_matchers(
 /// plugin-config-validation rule.
 fn compile_header_matchers(
     rule_idx: usize,
+    field: &str,
     headers: &HashMap<String, HeaderMatchOp>,
 ) -> Result<HashMap<String, HeaderMatcher>, String> {
     let mut compiled = HashMap::with_capacity(headers.len());
@@ -2170,7 +2408,7 @@ fn compile_header_matchers(
             HeaderMatchOp::Tagged(HeaderStringMatch::Prefix(prefix)) => {
                 if prefix.is_empty() {
                     return Err(format!(
-                        "`mesh_route_dispatch.rules[{rule_idx}].match.headers` key {name:?} `prefix` \
+                        "`mesh_route_dispatch.rules[{rule_idx}].{field}` key {name:?} `prefix` \
                          must not be empty (every value would match — likely a misconfiguration)"
                     ));
                 }
@@ -2179,13 +2417,13 @@ fn compile_header_matchers(
             HeaderMatchOp::Tagged(HeaderStringMatch::Regex(pattern)) => {
                 if pattern.is_empty() {
                     return Err(format!(
-                        "`mesh_route_dispatch.rules[{rule_idx}].match.headers` key {name:?} `regex` \
+                        "`mesh_route_dispatch.rules[{rule_idx}].{field}` key {name:?} `regex` \
                          must not be empty"
                     ));
                 }
                 let re = compile_full_match_regex(pattern).map_err(|_| {
                     format!(
-                        "`mesh_route_dispatch.rules[{rule_idx}].match.headers` key {name:?} `regex` \
+                        "`mesh_route_dispatch.rules[{rule_idx}].{field}` key {name:?} `regex` \
                          is invalid (invalid regex or complexity limit exceeded)"
                     )
                 })?;
@@ -2195,6 +2433,38 @@ fn compile_header_matchers(
         compiled.insert(name.clone(), matcher);
     }
     Ok(compiled)
+}
+
+/// Compile `match.query_params` once, at config load. Values share the header
+/// `StringMatch` shape (bare string = exact) and compiler; names are kept
+/// verbatim because query parameter names are case-sensitive.
+fn compile_query_param_matchers(
+    rule_idx: usize,
+    params: &HashMap<String, HeaderMatchOp>,
+) -> Result<HashMap<String, HeaderMatcher>, String> {
+    compile_header_matchers(rule_idx, "match.query_params", params)
+}
+
+/// Validate the optional operator rule label published as match metadata.
+/// Bounded and printable so a transaction-log field stays a short, single
+/// token rather than an arbitrary operator-supplied blob.
+fn validate_rule_name(rule_idx: usize, name: Option<&str>) -> Result<(), String> {
+    let Some(name) = name else {
+        return Ok(());
+    };
+    if name.is_empty() || name.len() > MAX_RULE_NAME_LENGTH {
+        return Err(format!(
+            "`mesh_route_dispatch.rules[{rule_idx}].name` must be 1-{MAX_RULE_NAME_LENGTH} \
+             characters"
+        ));
+    }
+    if !name.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(format!(
+            "`mesh_route_dispatch.rules[{rule_idx}].name` must contain only printable ASCII \
+             characters without whitespace"
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -2240,6 +2510,20 @@ impl Plugin for MeshRouteDispatch {
 
     fn modifies_request_destination(&self) -> bool {
         true
+    }
+
+    fn publishes_route_request_header_transforms(&self) -> bool {
+        self.publishes_request_transforms
+    }
+
+    /// Every instance: a matching rule replaces the staged request list,
+    /// clearing it when the rule declares none.
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        true
+    }
+
+    fn publishes_route_response_header_transforms(&self) -> bool {
+        self.publishes_response_transforms
     }
 
     fn enable_deferred_unmatched_rejection(&self) {
@@ -2308,6 +2592,10 @@ impl Plugin for MeshRouteDispatch {
         for rule in &self.config.rules {
             if rule_matches(rule, ctx, headers, canonical_query.as_ref()) {
                 ctx.mesh_route_dispatch_matched = true;
+                // Observability: which rule served this request. Published
+                // before the route-owned terminals because a redirect or a
+                // fault abort is this rule's answer too.
+                publish_matched_rule_metadata(ctx, rule);
                 // Per-rule response header transforms: publish the
                 // pre-compiled Arc BEFORE any route-owned terminal. A redirect
                 // or an aborted fault is a response this rule generates, and
@@ -2349,9 +2637,12 @@ impl Plugin for MeshRouteDispatch {
                 {
                     // A security denial is not a response this rule
                     // generates: tenant route policy must never decorate
-                    // it, so withdraw the response list published above.
+                    // it, so withdraw the response list published above,
+                    // and the match metadata: the vetoed rule served nothing.
                     ctx.route_override_response_transform = None;
                     ctx.route_override_response_transform_published = false;
+                    ctx.metadata.remove(RULE_INDEX_METADATA_KEY);
+                    ctx.metadata.remove(RULE_NAME_METADATA_KEY);
                     return result;
                 }
                 // Route overrides are a whole-destination decision, not a
@@ -2362,7 +2653,14 @@ impl Plugin for MeshRouteDispatch {
                 ctx.route_override_upstream_id = rule.destination.upstream_id.clone();
                 ctx.route_override_backend_host = rule.destination.backend_host.clone();
                 ctx.route_override_backend_port = rule.destination.backend_port;
-                ctx.route_override_resolved_tls = rule.destination.backend_tls.clone();
+                // Precompiled `Arc`s: a refcount bump, not a deep clone of the
+                // SAN allow-list / retry lists. The fallback only serves a
+                // rule literal that bypassed `normalize_and_validate`.
+                ctx.route_override_resolved_tls = rule
+                    .destination
+                    .backend_tls_compiled
+                    .clone()
+                    .or_else(|| rule.destination.backend_tls.clone().map(Arc::new));
                 // `timeout_disabled: true` (with `timeout_ms = None`) maps to
                 // `Some(0)`: the proxy hot path interprets `backend_read_timeout_ms == 0`
                 // as "no timeout" (see `proxy/mod.rs` and `proxy/tcp_proxy.rs` —
@@ -2383,7 +2681,11 @@ impl Plugin for MeshRouteDispatch {
                 // proxy core for every attempt it dispatches for this rule.
                 ctx.route_override_attempt_timeout_ms = rule.attempt_timeout_ms;
                 ctx.route_override_retry = if rule.retry.is_some() || rule.retry_disabled {
-                    Some(rule.retry.clone())
+                    Some(
+                        rule.retry_compiled
+                            .clone()
+                            .or_else(|| rule.retry.clone().map(Arc::new)),
+                    )
                 } else {
                     None
                 };
@@ -2428,16 +2730,25 @@ impl Plugin for MeshRouteDispatch {
                     // `apply_route_overrides_inner`) makes every backend
                     // dispatch path forward the rewritten authority.
                     if let Some(authority) = rewrite.authority.as_deref() {
+                        // Remember the live `Host` the FIRST dispatcher rewrite
+                        // replaces, so a later instance can undo exactly this
+                        // rewrite without discarding another plugin's earlier
+                        // `Host` policy.
+                        let state = ctx.plugin_state_mut();
+                        if state.mesh_route_dispatch_host_before_rewrite.is_none() {
+                            state.mesh_route_dispatch_host_before_rewrite =
+                                Some(headers.get("host").cloned());
+                        }
                         headers.insert("host".to_string(), authority.to_string());
                         ctx.route_override_authority = Some(authority.to_string());
                     } else {
                         ctx.route_override_authority = None;
-                        restore_original_host(ctx, headers);
+                        restore_dispatcher_rewritten_host(ctx, headers);
                     }
                 } else {
                     ctx.route_override_path = None;
                     ctx.route_override_authority = None;
-                    restore_original_host(ctx, headers);
+                    restore_dispatcher_rewritten_host(ctx, headers);
                 }
                 return PluginResult::Continue;
             }
@@ -2566,35 +2877,56 @@ fn tail_opens_dot_segment(tail: &str) -> bool {
     crate::policy_path::is_literal_dot_segment(first_segment)
 }
 
-/// Re-sync the forwarded `Host` header to the original client value, undoing a
-/// `Host` rewrite that a PRIOR `mesh_route_dispatch` instance on this proxy may
-/// have written into the shared header map. A later rule that keeps the original
-/// authority must not let a previous instance's rewritten `Host` leak into
+/// Undo a `Host` rewrite that a PRIOR matching `mesh_route_dispatch` instance
+/// wrote into the shared header map, restoring the value that was live just
+/// before that first dispatcher rewrite. A later rule that keeps the authority
+/// must not let a previous instance's rewritten `Host` leak into
 /// `X-Forwarded-Host` / `Forwarded` (which backend dispatch builds from
 /// `headers["host"]`).
 ///
-/// The original `Host` is sourced from `ctx.headers`, NOT from the `headers`
-/// parameter: the handler threads ONE shared cloned map through every instance
-/// sequentially, so the `headers` param may already hold an earlier instance's
-/// rewritten value, whereas `ctx.headers` is untouched on this path. This is
-/// only reachable on the modify-headers (clone) path — `modifies_request_headers`
-/// is `true` iff some rule carries an authority rewrite, and that path clones
-/// `ctx.headers` rather than `mem::take`-ing it. When no instance rewrites, the
-/// handler `mem::take`s `ctx.headers` (leaving it empty) AND no `Host` rewrite
-/// ever happened, so the guard below skips the (unnecessary) restore.
-fn restore_original_host(ctx: &RequestContext, headers: &mut HashMap<String, String>) {
-    if ctx.headers.is_empty() {
-        // No-modify path: ctx.headers was mem::take'n empty and nothing rewrote
-        // Host. Touching `headers` here would wrongly drop the original Host.
+/// Ownership-scoped: only a rewrite this plugin recorded is undone. A `Host`
+/// that another plugin (for example a priority-overridden
+/// `request_transformer`) set before the dispatch block is the forwarded
+/// authority this rule inherits, so it is left exactly as it is — restoring
+/// the client's original `Host` there would discard that operator policy.
+/// With no recorded rewrite this is a no-op, which also covers the
+/// non-cloning `mem::take` header path (no instance there can rewrite `Host`).
+fn restore_dispatcher_rewritten_host(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    let Some(previous) = ctx
+        .plugin_state_opt_mut()
+        .and_then(|state| state.mesh_route_dispatch_host_before_rewrite.take())
+    else {
         return;
-    }
-    match ctx.headers.get("host") {
-        Some(original) => {
-            headers.insert("host".to_string(), original.clone());
+    };
+    match previous {
+        Some(host) => {
+            headers.insert("host".to_string(), host);
         }
         None => {
-            // Client sent no Host but a prior instance injected one — drop it.
+            // No `Host` was present before the dispatcher injected one.
             headers.remove("host");
+        }
+    }
+}
+
+/// Publish which rule of this instance matched, for transaction logs.
+/// Allocation is bounded to the two short values; the index label is rendered
+/// once at config load.
+fn publish_matched_rule_metadata(ctx: &mut RequestContext, rule: &RouteRule) {
+    ctx.metadata.insert(
+        RULE_INDEX_METADATA_KEY.to_string(),
+        rule.rule_index_label.clone(),
+    );
+    match rule.name.as_ref() {
+        Some(name) => {
+            ctx.metadata
+                .insert(RULE_NAME_METADATA_KEY.to_string(), name.clone());
+        }
+        None => {
+            ctx.metadata.remove(RULE_NAME_METADATA_KEY);
         }
     }
 }
@@ -2932,20 +3264,44 @@ fn rule_matches_with_host(
             _ => return false,
         }
     }
+    // Negated header predicates (Istio `withoutHeaders`): a present header
+    // whose value satisfies the matcher vetoes the rule; an absent header
+    // never does.
+    for (name, matcher) in &rule.without_headers_compiled {
+        let actual = if name == "host" {
+            host
+        } else {
+            headers.get(name.as_str()).map(String::as_str)
+        };
+        if actual.is_some_and(|actual| matcher.matches(actual)) {
+            return false;
+        }
+    }
     if !m.query_params.is_empty() {
         // The caller supplies the canonical query whenever any rule declares a
         // query predicate, and has already failed the request closed if that
         // decoding was ambiguous. An absent view here means no rule declared a
-        // predicate, so a rule that does declare one cannot match.
+        // predicate, so a rule that does declare one cannot match. A rule
+        // literal whose matchers were never compiled fails closed too.
         let Some(query) = canonical_query else {
             return false;
         };
-        for (name, expected) in &m.query_params {
+        if rule.query_params_compiled.len() != m.query_params.len() {
+            return false;
+        }
+        for (name, matcher) in &rule.query_params_compiled {
             match query.get(name.as_str()) {
-                Some(actual) if actual == expected => {}
+                Some(actual) if matcher.matches(actual) => {}
                 _ => return false,
             }
         }
+    }
+    if let Some(expected_port) = m.port
+        && trusted_request_port(ctx) != Some(expected_port)
+    {
+        // Same trusted provenance as redirect `FROM_REQUEST_PORT`: the
+        // original destination, else the frontend listener — never `Host`.
+        return false;
     }
     if let Some(expected_ns) = m.source_namespace.as_deref() {
         // Source workload namespace is encoded in the peer's SPIFFE ID via
@@ -6263,14 +6619,13 @@ mod tests {
     }
 
     #[test]
-    fn restore_original_host_is_noop_when_ctx_headers_empty() {
-        // No-modify (mem::take) path: ctx.headers is empty. The restore must NOT
-        // touch the header map — nothing rewrote Host on this path, so the
-        // `headers` param already holds the original.
+    fn restore_dispatcher_rewritten_host_is_noop_without_a_recorded_rewrite() {
+        // No dispatcher rewrite was recorded (the `mem::take` path, or a Host
+        // another plugin set): the restore must NOT touch the header map.
         let mut ctx = ctx_with("GET", "/api");
         ctx.headers.clear();
         let mut headers = host_headers("public.example.com");
-        restore_original_host(&ctx, &mut headers);
+        restore_dispatcher_rewritten_host(&mut ctx, &mut headers);
         assert_eq!(
             headers.get("host").map(String::as_str),
             Some("public.example.com")

@@ -1332,6 +1332,7 @@ fn make_upstream_with_active_probe(
 fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
     GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies: Vec::new(),
         consumers: Vec::new(),

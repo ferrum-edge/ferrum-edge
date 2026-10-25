@@ -415,6 +415,7 @@ mod tests {
     ) -> GatewayConfig {
         GatewayConfig {
             quarantined_plugin_configs: Vec::new(),
+            quarantined_jwt_shared_secrets: Default::default(),
             version: "1".to_string(),
             proxies,
             consumers: vec![],
@@ -1775,13 +1776,21 @@ pub(crate) struct StagedRequestEpoch {
 pub struct RequestEpochStore {
     current: ArcSwap<RequestEpoch>,
     write_lock: Mutex<()>,
+    /// `config_generation` of the most recently published epoch, mirrored
+    /// after each config publication so per-datagram fences can detect "no
+    /// configuration change since I last checked" with one atomic load and no
+    /// `ArcSwap` guard. It may briefly lag `current` (never lead it).
+    published_config_generation: std::sync::atomic::AtomicU64,
 }
 
 impl RequestEpochStore {
     pub fn new(initial: RequestEpoch) -> Self {
+        let published_config_generation =
+            std::sync::atomic::AtomicU64::new(initial.config_generation);
         Self {
             current: ArcSwap::new(Arc::new(initial)),
             write_lock: Mutex::new(()),
+            published_config_generation,
         }
     }
 
@@ -1860,6 +1869,28 @@ impl RequestEpochStore {
     #[inline]
     pub fn load(&self) -> Arc<RequestEpoch> {
         self.current.load_full()
+    }
+
+    /// The published configuration generation, as one atomic load.
+    ///
+    /// Lags the epoch by at most the instant between the epoch store and this
+    /// mirror, so a caller comparing against a generation it already verified
+    /// sees either "unchanged" or the new value — never a generation that is
+    /// not yet published.
+    #[inline]
+    pub(crate) fn published_config_generation(&self) -> u64 {
+        self.published_config_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Run `read` against the current epoch through an `ArcSwap` guard, without
+    /// cloning the epoch `Arc` (no shared refcount write). Keep `read` short
+    /// and synchronous: the guard pins this epoch for its duration.
+    #[inline]
+    pub(crate) fn with_current<R>(&self, read: impl FnOnce(&RequestEpoch) -> R) -> R {
+        let guard = self.current.load();
+        let epoch: &RequestEpoch = &guard;
+        read(epoch)
     }
 
     /// Allocation-free gateway-to-mesh admission read.
@@ -1960,6 +1991,8 @@ impl RequestEpochStore {
                 &next.load_balancer,
             );
         self.current.store(Arc::clone(&next));
+        self.published_config_generation
+            .store(next.config_generation, std::sync::atomic::Ordering::Release);
         next.plugin_cache.commit_adaptive_concurrency_generations();
         next.plugin_cache.commit_adaptive_concurrency_lb_generation(
             next.lb_generation,

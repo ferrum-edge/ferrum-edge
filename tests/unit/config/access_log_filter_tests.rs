@@ -156,3 +156,67 @@ fn invalid_identifier_diagnostics_do_not_reflect_hostile_input() {
         "numeric parse diagnostics must not reflect hostile literals"
     );
 }
+
+/// Telemetry filters compile into the injected `stdout_logging` sink, which is
+/// `KeepLastKnownGood`. A filter that sink would refuse must therefore be
+/// refused here, at translation, rather than freezing the mesh generation.
+#[test]
+fn telemetry_filters_that_can_never_match_are_refused_at_translation() {
+    for expression in [
+        // Flat conjunction with crossed bounds.
+        "response.code >= 500 && response.code <= 400",
+        "response.code > 499 && response.code < 500",
+        // Dead conjunction under `||` (compiles to an expression tree).
+        "response.duration >= 1000 || response.code >= 500 && response.code <= 499",
+    ] {
+        let error = parse_access_log_filter_expression(expression)
+            .expect_err("an unsatisfiable filter must be refused");
+        assert!(error.contains("can never match"), "{expression}: {error}");
+    }
+    for expression in [
+        "response.code >= 1000",
+        "response.code > 999",
+        "response.code == 1000 || response.duration >= 10",
+    ] {
+        let error = parse_access_log_filter_expression(expression)
+            .expect_err("a status bound no response can carry must be refused");
+        assert!(error.contains("0..=999"), "{expression}: {error}");
+    }
+
+    // The tightest satisfiable shapes stay valid.
+    let exact = parse_access_log_filter_expression("response.code >= 503 && response.code <= 503")
+        .expect("parses")
+        .expect("filter");
+    assert_eq!(exact.status_code_min, Some(503));
+    assert_eq!(exact.status_code_max, Some(503));
+    parse_access_log_filter_expression("response.code == 999 || response.code <= 0")
+        .expect("edge status codes parse")
+        .expect("filter");
+}
+
+#[test]
+fn direct_expression_validation_refuses_dead_conjunctions_and_unreachable_bounds() {
+    let dead = AccessLogFilterExpr::Or {
+        left: Box::new(AccessLogFilterExpr::ErrorsOnly {}),
+        right: Box::new(AccessLogFilterExpr::And {
+            left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
+            right: Box::new(AccessLogFilterExpr::StatusCodeMax { value: 400 }),
+        }),
+    };
+    let error = validate_access_log_filter_expr(&dead).expect_err("dead conjunction");
+    assert!(error.contains("can never match"), "{error}");
+
+    let unreachable = AccessLogFilterExpr::StatusCodeMax { value: 1000 };
+    let error = validate_access_log_filter_expr(&unreachable).expect_err("unreachable bound");
+    assert!(error.contains("between 0 and 999"), "{error}");
+
+    let split_across_or = AccessLogFilterExpr::And {
+        left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
+        right: Box::new(AccessLogFilterExpr::Or {
+            left: Box::new(AccessLogFilterExpr::StatusCodeMax { value: 400 }),
+            right: Box::new(AccessLogFilterExpr::ErrorsOnly {}),
+        }),
+    };
+    validate_access_log_filter_expr(&split_across_or)
+        .expect("an `or` branch may still match, so the conjunction is not provably dead");
+}

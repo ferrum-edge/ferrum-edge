@@ -3220,11 +3220,10 @@ pub(crate) struct MeshRouteDispatchPolicy<'a> {
 /// entry carries non-URI predicates, `reject_unmatched: true` is kept so
 /// e.g. a GET-only route does not silently serve POST traffic.
 ///
-/// Entries carrying predicates we cannot represent in the rule
-/// (`method.regex` / `.prefix`, `headers.X.regex` / `.prefix`,
-/// `queryParams.X.regex`, or fully-unsupported keys like `scheme`, `port`,
-/// `sourceLabels`, `gateways`, `withoutHeaders`) are skipped by the
-/// dispatch-rule extractor — they do NOT collapse onto the URI-only
+/// Entries carrying predicates we cannot represent in the rule (a malformed
+/// or uncompilable `StringMatch`, a presence-only `queryParams.X: {}`, or
+/// fully-unsupported keys like `scheme`, `sourceLabels`, `gateways`) are
+/// skipped by the dispatch-rule extractor — they do NOT collapse onto the URI-only
 /// catch-all branch. The VirtualService translator emits a separate
 /// proxy-scoped `request_termination` artifact for
 /// unsupported-only route candidates so later broader routes do not silently
@@ -3429,13 +3428,49 @@ pub(crate) fn mesh_route_dispatch_rules_for_proxy(
         if let Some(qp_obj) = entry.get("queryParams").and_then(Value::as_object) {
             let mut params = serde_json::Map::new();
             for (name, value) in qp_obj {
+                // `exact` keeps the bare-string wire shape; `prefix` / `regex`
+                // emit the tagged `StringMatch` form the plugin compiles at load.
                 if let Some(exact) = value.get("exact").and_then(Value::as_str) {
                     params.insert(name.to_string(), Value::String(exact.to_string()));
+                } else if let Some(prefix) = value.get("prefix").and_then(Value::as_str) {
+                    params.insert(name.to_string(), serde_json::json!({ "prefix": prefix }));
+                } else if let Some(regex) = value.get("regex").and_then(Value::as_str) {
+                    params.insert(name.to_string(), serde_json::json!({ "regex": regex }));
                 }
             }
             if !params.is_empty() {
                 match_criteria.insert("query_params".to_string(), Value::Object(params));
             }
+        }
+
+        // Istio `withoutHeaders`: a negated header predicate. Same operand
+        // shapes as `headers`; the presence-only `{}` entry becomes a
+        // full-match `.*`, so any present value vetoes the rule and the rule
+        // requires the header to be absent.
+        if let Some(without_obj) = entry.get("withoutHeaders").and_then(Value::as_object) {
+            let mut without = serde_json::Map::new();
+            for (name, value) in without_obj {
+                let projected = if let Some(exact) = value.get("exact").and_then(Value::as_str) {
+                    Value::String(exact.to_string())
+                } else if let Some(prefix) = value.get("prefix").and_then(Value::as_str) {
+                    serde_json::json!({ "prefix": prefix })
+                } else if let Some(regex) = value.get("regex").and_then(Value::as_str) {
+                    serde_json::json!({ "regex": regex })
+                } else if value.as_object().is_some_and(serde_json::Map::is_empty) {
+                    serde_json::json!({ "regex": ".*" })
+                } else {
+                    continue;
+                };
+                without.insert(name.to_ascii_lowercase(), projected);
+            }
+            if !without.is_empty() {
+                match_criteria.insert("without_headers".to_string(), Value::Object(without));
+            }
+        }
+
+        // Istio `port`: the destination port the client addressed.
+        if let Some(port) = entry.get("port").and_then(match_port_value) {
+            match_criteria.insert("port".to_string(), serde_json::json!(port));
         }
 
         // Istio `HTTPMatchRequest.sourceNamespace` is an exact-only string
@@ -3948,8 +3983,68 @@ fn authority_value_has_supported_predicate(value: &Value) -> bool {
     true
 }
 
+/// Query-param `StringMatch` supports `exact`, `prefix`, and `regex`, matched
+/// against the decoded backend-bound value. `prefix` / `regex` operands must be
+/// non-empty and a regex must compile under the plugin's full-match anchors, so
+/// a shape the plugin would refuse at construction fails closed here (scoped to
+/// this route) instead of rejecting the whole plugin chain. A presence-only
+/// `{}` entry stays unsupported.
 fn query_param_value_has_supported_predicate(value: &Value) -> bool {
-    string_match_has_exactly_one_supported_operator(value, &["exact"])
+    string_match_operand_is_compilable(value, false)
+}
+
+/// `withoutHeaders` entry support: the same `exact` / `prefix` / `regex`
+/// operands as `headers` (full-match regex), plus Istio's presence-only `{}`
+/// entry, which the translator projects as `{"regex": ".*"}` so the rule
+/// requires the header to be absent.
+fn without_header_value_has_supported_predicate(value: &Value) -> bool {
+    string_match_operand_is_compilable(value, true)
+}
+
+/// Whether `value` is a single-operator `StringMatch` the dispatch plugin
+/// compiles: `exact` (any string), or a non-empty `prefix` / `regex` whose
+/// regex compiles with the plugin's `\A(?:…)\z` anchoring. `allow_presence`
+/// also admits the empty `{}` object.
+fn string_match_operand_is_compilable(value: &Value, allow_presence: bool) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if obj.is_empty() {
+        return allow_presence;
+    }
+    if obj.len() != 1 {
+        return false;
+    }
+    let Some((key, operand)) = obj.iter().next() else {
+        return false;
+    };
+    let Some(operand) = operand.as_str() else {
+        return false;
+    };
+    match key.as_str() {
+        "exact" => true,
+        "prefix" => !operand.is_empty(),
+        "regex" => !operand.is_empty() && regex::Regex::new(&format!(r"\A(?:{operand})\z")).is_ok(),
+        _ => false,
+    }
+}
+
+/// `withoutHeaders` names must be RFC 9110 tokens that stay distinct after
+/// ASCII lowercasing; the plugin refuses anything else at construction.
+fn without_headers_names_are_supported(headers: &serde_json::Map<String, Value>) -> bool {
+    let mut seen = HashSet::with_capacity(headers.len());
+    headers.keys().all(|name| {
+        http::header::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && seen.insert(name.to_ascii_lowercase())
+    })
+}
+
+/// Istio `HTTPMatchRequest.port`: an integer destination port in `1..=65535`.
+fn match_port_value(value: &Value) -> Option<u16> {
+    value
+        .as_u64()
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
 }
 
 fn string_match_has_exactly_one_supported_operator(value: &Value, allowed: &[&str]) -> bool {
@@ -3979,6 +4074,16 @@ pub(crate) fn mesh_route_dispatch_has_supported_non_uri_predicate(entry: &Value)
     if let Some(qp) = entry.get("queryParams").and_then(Value::as_object)
         && qp.values().any(query_param_value_has_supported_predicate)
     {
+        return true;
+    }
+    if let Some(without) = entry.get("withoutHeaders").and_then(Value::as_object)
+        && without
+            .values()
+            .any(without_header_value_has_supported_predicate)
+    {
+        return true;
+    }
+    if entry.get("port").and_then(match_port_value).is_some() {
         return true;
     }
     // `sourceNamespace` is a string-typed exact predicate in the Istio CRD;
@@ -4086,13 +4191,34 @@ pub(crate) fn mesh_route_dispatch_has_unsupported_predicate(entry: &Value) -> bo
         }
     }
 
+    // `withoutHeaders` is a negated header predicate (first-class
+    // `match.without_headers`). Every entry must be a supported operand under
+    // a valid, case-distinct header name, or the whole entry fails closed.
+    if let Some(without) = entry.get("withoutHeaders") {
+        let Some(without) = without.as_object() else {
+            return true;
+        };
+        if without.is_empty()
+            || !without_headers_names_are_supported(without)
+            || without
+                .values()
+                .any(|v| !without_header_value_has_supported_predicate(v))
+        {
+            return true;
+        }
+    }
+
+    // `port` is the addressed destination port (first-class `match.port`);
+    // anything but an integer in 1..=65535 fails closed.
+    if let Some(port) = entry.get("port")
+        && match_port_value(port).is_none()
+    {
+        return true;
+    }
+
     entry.as_object().is_some_and(|obj| {
-        obj.keys().any(|key| {
-            matches!(
-                key.as_str(),
-                "scheme" | "port" | "sourceLabels" | "gateways" | "withoutHeaders"
-            )
-        })
+        obj.keys()
+            .any(|key| matches!(key.as_str(), "scheme" | "sourceLabels" | "gateways"))
     })
 }
 

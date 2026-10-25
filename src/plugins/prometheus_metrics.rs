@@ -1174,6 +1174,9 @@ pub struct MetricsRegistry {
     pub stream_connection_counter: DashMap<StreamCounterKey, TimestampedCounter>,
     /// Stream connection duration histogram by proxy_id
     pub stream_duration_buckets: DashMap<Arc<str>, HistogramBuckets>,
+    /// `tcp_connection_throttle` refusals by proxy_id. Written only on the
+    /// refusal path; admission never touches it.
+    tcp_connection_throttle_rejections: DashMap<Arc<str>, TimestampedCounter>,
     /// Completed WebSocket sessions by bounded terminal classification.
     pub ws_session_counter: DashMap<WsSessionKey, TimestampedCounter>,
     /// WebSocket session duration by the same bounded terminal classification.
@@ -1413,6 +1416,7 @@ impl MetricsRegistry {
             ai_federation_provider_circuits_closed: DashMap::with_shard_amount(shards),
             stream_connection_counter: DashMap::with_shard_amount(shards),
             stream_duration_buckets: DashMap::with_shard_amount(shards),
+            tcp_connection_throttle_rejections: DashMap::with_shard_amount(shards),
             ws_session_counter: DashMap::with_shard_amount(shards),
             ws_session_duration_buckets: DashMap::with_shard_amount(shards),
             ws_bytes_counter: DashMap::with_shard_amount(shards),
@@ -1969,6 +1973,35 @@ impl MetricsRegistry {
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Record one TCP connection refused by `tcp_connection_throttle` on
+    /// `proxy_id`. The key is allocated only for a proxy's first refusal.
+    pub fn record_tcp_connection_throttle_rejection(&self, proxy_id: &str) {
+        let recorded = match self.tcp_connection_throttle_rejections.get(proxy_id) {
+            Some(existing) => {
+                existing.increment(self.epoch);
+                true
+            }
+            None => false,
+        };
+        // The shared read guard above is released before the insert below
+        // takes the shard write lock.
+        if !recorded {
+            self.tcp_connection_throttle_rejections
+                .entry(Arc::from(proxy_id))
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+        }
+        self.maybe_invalidate_cache();
+    }
+
+    /// Current `tcp_connection_throttle` refusal count for `proxy_id` (0 when
+    /// none was recorded or the series was evicted as stale).
+    pub fn tcp_connection_throttle_rejections_for_proxy(&self, proxy_id: &str) -> u64 {
+        self.tcp_connection_throttle_rejections
+            .get(proxy_id)
+            .map_or(0, |counter| counter.value.load(Ordering::Relaxed))
     }
 
     /// Record one rate-limit decision taken on the per-process fallback budget
@@ -3552,6 +3585,7 @@ impl MetricsRegistry {
         for counters in [
             &self.request_body_bytes_counter,
             &self.response_body_bytes_counter,
+            &self.tcp_connection_throttle_rejections,
         ]
         .into_iter()
         .chain(self.adaptive_concurrency_decisions.iter())
@@ -4388,6 +4422,7 @@ impl MetricsRegistry {
             + self.mesh_grpc_response_messages_counter.len() * 600
             + self.stream_connection_counter.len() * 200
             + self.stream_duration_buckets.len() * 800
+            + self.tcp_connection_throttle_rejections.len() * 180
             + self.ws_session_counter.len() * 320
             + self.ws_session_duration_buckets.len() * 1000
             + self.ws_bytes_counter.len() * 180
@@ -5422,6 +5457,22 @@ impl MetricsRegistry {
                     entry.value(),
                     &ns_label,
                 );
+            }
+        }
+
+        // `tcp_connection_throttle` refusals. Emitted only once one occurred.
+        if !self.tcp_connection_throttle_rejections.is_empty() {
+            output.push_str(
+                "# HELP ferrum_tcp_connection_throttle_rejections_total TCP connections refused by tcp_connection_throttle because the connection's Consumer or client-IP key was at max_connections_per_key.\n",
+            );
+            output.push_str("# TYPE ferrum_tcp_connection_throttle_rejections_total counter\n");
+            for entry in self.tcp_connection_throttle_rejections.iter() {
+                let count = entry.value().value.load(Ordering::Relaxed);
+                let proxy_id = escape_label_value(entry.key());
+                output.push_str(&format!(
+                    "ferrum_tcp_connection_throttle_rejections_total{{proxy_id=\"{}\"{}}} {}\n",
+                    proxy_id, ns_label, count
+                ));
             }
         }
 

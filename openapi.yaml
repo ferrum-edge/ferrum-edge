@@ -6217,6 +6217,11 @@ paths:
         only in also accepting the exact `[REDACTED]` placeholder entries the
         ordinary `Consumer` response returns, so a read-modify-write round trip
         of that response validates against this schema.
+
+
+        Changing `username` is refused with `409` while any `access_control`
+        plugin config in the namespace still names the previous username in
+        `allowed_consumers` or `disallowed_consumers`; edit those configs first.
       tags: [Consumers]
       requestBody:
         required: true
@@ -6254,7 +6259,20 @@ paths:
         "408":
           $ref: "#/components/responses/RequestTimeout"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            Conflict — an identity or credential uniqueness conflict, an mTLS
+            DNS identity conflict, or a `username` change while an
+            `access_control` plugin_config in the same namespace still names
+            the previous username in `allowed_consumers` or
+            `disallowed_consumers` (matching is byte-for-byte, so the rename
+            would silently detach that allow or deny entry). Body for the
+            rename case:
+            `{"error":"Consumer is referenced by one or more access_control plugin_configs and cannot be renamed"}`.
+            The consumer and plugin configs are left unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "500":
@@ -11942,7 +11960,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredential"
           minItems: 1
-          description: Multiple HS256 JWT secrets for zero-downtime rotation. Each entry contains exactly one `secret` string of 32-4096 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
+          description: Multiple HMAC JWT secrets (verified with the algorithm the `jwt_auth` instance pins, HS256 by default) for zero-downtime rotation. Each entry contains exactly one `secret` string of 32-4096 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
         hmac_auth:
           type: array
           items:
@@ -11995,7 +12013,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialUpdate"
           minItems: 1
-          description: HS256 JWT entries. Each entry is a real 32-4096 character `secret` or the exact `[REDACTED]` round-trip placeholder.
+          description: HMAC JWT entries. Each entry is a real 32-4096 character `secret` or the exact `[REDACTED]` round-trip placeholder.
         hmac_auth:
           type: array
           items:
@@ -12043,7 +12061,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialRedacted"
           minItems: 1
-          description: HS256 JWT entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
+          description: HMAC JWT entries with each `secret` replaced by the exact `[REDACTED]` placeholder.
         hmac_auth:
           type: array
           items:
@@ -12084,7 +12102,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialBackup"
           minItems: 1
-          description: Multiple canonical HS256 JWT secrets for zero-downtime rotation, unredacted.
+          description: Multiple canonical HMAC JWT secrets for zero-downtime rotation, unredacted.
         hmac_auth:
           type: array
           items:
@@ -12131,7 +12149,7 @@ components:
           items:
             $ref: "#/components/schemas/JwtCredentialBackup"
           minItems: 1
-          description: Multiple canonical HS256 JWT secrets for zero-downtime rotation, unredacted.
+          description: Multiple canonical HMAC JWT secrets for zero-downtime rotation, unredacted.
         hmac_auth:
           type: array
           items:
@@ -12248,17 +12266,25 @@ components:
           type: string
           minLength: 32
           maxLength: 4096
-          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
+          allOf:
+            - pattern: '^(?:[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]){32}'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
-            JWT signing secret used to verify token signatures (HS256) for this
-            consumer. Must be 32-4096 characters and must not contain ASCII
-            control bytes other than horizontal tab, line feed, and carriage
-            return.
+            JWT signing secret used to verify token signatures (with the HMAC
+            algorithm the `jwt_auth` instance pins, HS256 by default) for this
+            consumer. Must contain 32-4096 characters, at least 32 of which
+            are non-whitespace, and must not contain ASCII control bytes other
+            than horizontal tab, line feed, and carriage return. Writes that
+            configure it on a different Consumer within one namespace are
+            refused: the token's signer chooses the identity claim, so a
+            shared secret lets either Consumer sign as the other. Separate
+            namespaces may reuse the same secret.
       description: >-
         JWT credential for the `jwt_auth` plugin. The only supported Consumer
-        JWT key form is exactly one HS256 `secret`; algorithm selectors,
-        public keys, and JWKS fields are not Consumer credential fields. Use
+        JWT key form is exactly one HMAC `secret`; algorithm selectors,
+        public keys, and JWKS fields are not Consumer credential fields (the
+        HMAC algorithm is the `jwt_auth` plugin's `algorithm` setting). Use
         the separate `jwks_auth` plugin configuration for RSA/EC/JWKS token
         verification. Consumer is looked up by `username`, `id`, or
         `custom_id` from the JWT claim; then all secrets are tried until one
@@ -12392,7 +12418,7 @@ components:
         - $ref: "#/components/schemas/JwtCredential"
         - $ref: "#/components/schemas/JwtCredentialRedacted"
       description: >-
-        `jwt` entry accepted by `PUT /consumers/{id}`: a real HS256 secret, or
+        `jwt` entry accepted by `PUT /consumers/{id}`: a real HMAC JWT secret, or
         the exact `[REDACTED]` placeholder, which is replaced with the stored
         entry's canonical `secret` at the same array index before validation.
 
@@ -12442,15 +12468,17 @@ components:
           type: string
           minLength: 32
           maxLength: 4096
-          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
+          allOf:
+            - pattern: '^(?:[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]){32}'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           description: >-
-            Canonical stored HS256 JWT secret (32-4096 characters), carried
-            unredacted in backup and restore payloads. It must not contain
-            ASCII control bytes other than horizontal tab, line feed, and
-            carriage return.
+            Canonical stored HMAC JWT secret (32-4096 characters, including at
+            least 32 non-whitespace characters), carried unredacted in backup
+            and restore payloads. It must not contain ASCII control bytes other
+            than horizontal tab, line feed, and carriage return.
       description: >-
         `jwt` entry in backup/restore payloads: the canonical unredacted
-        stored HS256 secret. Public-key and JWKS key forms belong to the
+        stored HMAC secret. Public-key and JWKS key forms belong to the
         separate `jwks_auth` plugin configuration and are rejected here.
 
     HmacAuthCredentialBackup:
@@ -14214,8 +14242,11 @@ components:
         Configuration for the `udp_rate_limiting` plugin. Rate limits UDP
         datagrams per resolved client IP using a fixed-window algorithm with
         atomic counters. Excess datagrams are silently dropped (standard UDP
-        flood mitigation). Operates on both client→backend and backend→client
-        datagrams within the same window per client IP. `datagrams_per_second`
+        flood mitigation). By default (`direction: both`) client→backend and
+        backend→client datagrams share the same window per client IP; IPv6
+        clients are grouped by `ipv6_prefix`. A proxy- or proxy-group-scoped
+        attachment must reach only UDP/DTLS proxies (a TCP or HTTP-family
+        target is refused at admission). `datagrams_per_second`
         and `bytes_per_second` are per-second rates; the effective per-window
         cap is `rate × window_seconds`. `sync_mode` is parsed case-insensitively
         (`LOCAL`, `Redis`); `redis` requires `redis_url`. Unknown top-level keys
@@ -14244,10 +14275,10 @@ components:
           maximum: 18446744073709551615
           description: >-
             Sustained datagram rate per second per client IP. The effective
-            per-window cap is `datagrams_per_second × window_seconds`. Both
-            client→backend and backend→client datagrams count against the same
-            cap. At least one of `datagrams_per_second` or `bytes_per_second` is
-            required.
+            per-window cap is `datagrams_per_second × window_seconds`. With the
+            default `direction: both`, client→backend and backend→client
+            datagrams count against the same cap. At least one of
+            `datagrams_per_second` or `bytes_per_second` is required.
         bytes_per_second:
           type: integer
           format: uint64
@@ -14256,9 +14287,10 @@ components:
           description: >-
             Sustained payload-byte rate per second per client IP (sum of datagram
             payload sizes). The effective per-window cap is
-            `bytes_per_second × window_seconds`. Both directions count against
-            the same cap. At least one of `datagrams_per_second` or
-            `bytes_per_second` is required.
+            `bytes_per_second × window_seconds`. With the default
+            `direction: both`, both directions count against the same cap. At
+            least one of `datagrams_per_second` or `bytes_per_second` is
+            required.
         window_seconds:
           type: integer
           format: uint64
@@ -14271,6 +14303,24 @@ components:
             activity-retention horizon (`window_seconds × 2`) cannot wrap. The
             effective per-window cap is `datagrams_per_second × window_seconds`
             (and similarly for bytes).
+        ipv6_prefix:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 64
+          description: >-
+            IPv6 prefix length used to group client addresses into one budget
+            (for example 56 or 48 to stop rotation across a delegated prefix).
+            IPv4 and IPv4-mapped IPv6 clients remain host-specific.
+        direction:
+          type: string
+          enum: [both, client_to_backend, backend_to_client]
+          default: both
+          description: >-
+            Which datagrams are counted and limited. `both` (default) charges
+            client→backend and backend→client datagrams to one combined budget;
+            `client_to_backend` or `backend_to_client` limits only that
+            direction and neither counts nor drops the other.
         sync_mode:
           type: string
           pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
@@ -19720,9 +19770,21 @@ components:
 
     AdminMetricsTcpConnectionThrottle:
       type: object
-      description: Runtime scope contract for TCP concurrent-connection throttling.
-      required: [enforcement_scope, replica_limit_behavior]
+      description: >-
+        Runtime scope contract and live occupancy for TCP concurrent-connection
+        throttling.
+      required: [enforcement_scope, replica_limit_behavior, active_connections]
       properties:
+        active_connections:
+          type: integer
+          minimum: 0
+          description: >-
+            Live TCP connections this process currently holds under every
+            configured tcp_connection_throttle policy, summed across all
+            Consumer/IP keys. Computed when the endpoint is read; connections
+            still held by a policy that was since removed are not counted.
+            Per-proxy refusals are exported as the Prometheus counter
+            ferrum_tcp_connection_throttle_rejections_total.
         enforcement_scope:
           type: string
           enum: [process_local]
@@ -20816,7 +20878,17 @@ components:
         sensitive-data substring or a credential-class name (for example
         `session_id`, `client_assertion`, `gpg_passphrase`, `private_rsa_key`;
         see docs/log_schema.md), while a `static_fields` string value that
-        looks like a literal HTTP auth credential is refused.
+        looks like a literal HTTP auth credential is refused. Under
+        `metadata.mode: flatten`, `omit` may not list `metadata` and `rename`
+        may not rename it; under `metadata.mode: omit`, `rename` may not rename
+        it (those directives would otherwise be silently ignored). The whole
+        `static_fields` object serialized as JSON (escaped keys and values,
+        quotes, separators, braces) must be at most 16384 bytes and a static
+        value may nest at most 8 objects/arrays deep.
+        `transforms` keys must be fields of the selected `summary_type`, may
+        not also be omitted, `ip_prefix` applies only to `client_ip` /
+        `backend_resolved_ip`, and a `hash` `secret_ref` must resolve to a set
+        `FERRUM_PLUGIN_SECRET_<NAME>` value of at least 32 bytes.
         See docs/log_schema.md.
       additionalProperties: false
       properties:
@@ -20830,15 +20902,19 @@ components:
             only customizes types it claims to handle).
         omit:
           type: array
+          maxItems: 256
           items: { type: string, minLength: 1 }
           description: Native field names to drop from output.
         rename:
           type: object
+          maxProperties: 256
           propertyNames: { minLength: 1 }
-          additionalProperties: { type: string, minLength: 1 }
-          description: Map of native field name -> output key.
+          additionalProperties: { type: string, minLength: 1, maxLength: 128 }
+          description: >-
+            Map of native field name -> output key (at most 128 bytes).
         order:
           type: array
+          maxItems: 256
           uniqueItems: true
           items: { type: string, minLength: 1 }
           description: >-
@@ -20848,16 +20924,23 @@ components:
             a repeated output key (or a second `"*"`) is rejected.
         static_fields:
           type: object
-          propertyNames: { minLength: 1 }
+          maxProperties: 64
+          propertyNames: { minLength: 1, maxLength: 128 }
           additionalProperties:
             not: { type: "null" }
           description: >-
             Literal JSON values injected at top level. Keys / nested
             keys matching sensitive substrings or credential-class names
             (for example `session_id`) are rejected at compile time. A `null` value is rejected — use `omit`
-            to drop a field.
+            to drop a field. At most 64 entries; keys are at most 128 bytes;
+            the whole object serialized as JSON (escaped keys and values
+            included) is at most 16384 bytes; a value nests at most 8
+            objects/arrays deep. Static fields
+            are stamped into every record, so these bounds are a per-record
+            cost cap.
         derived_fields:
           type: array
+          maxItems: 32
           description: Computed values; emitted alongside native fields.
           items:
             type: object
@@ -20867,6 +20950,7 @@ components:
               name:
                 type: string
                 minLength: 1
+                maxLength: 128
                 description: Output key for the derived value.
               kind:
                 type: string
@@ -20891,6 +20975,7 @@ components:
               default: nested
             prefix:
               type: string
+              maxLength: 64
               pattern: "^[^\\x00-\\x1F\\x7F-\\x9F]*$"
               description: >-
                 Prepended to each metadata key when promoted to top-level
@@ -20906,8 +20991,9 @@ components:
               description: >-
                 Behavior when a metadata key collides with an
                 already-emitted field; only `flatten` reads it. `skip` keeps
-                the existing value; `overwrite` emits a duplicate JSON key
-                (last value wins per parser convention). Validated in every
+                the existing value; `overwrite` replaces the colliding field's
+                value in place with the (redacted) metadata value, so every
+                key appears exactly once in the record. Validated in every
                 mode, like `prefix`.
         timestamp_format:
           type: string
@@ -20918,6 +21004,67 @@ components:
             (`timestamp_received`, `timestamp_connected`,
             `timestamp_disconnected`). Parse failures fall back to the
             raw RFC3339 string.
+        transforms:
+          type: object
+          propertyNames:
+            enum:
+              - client_ip
+              - consumer_username
+              - request_path
+              - request_user_agent
+              - backend_target
+              - backend_resolved_ip
+              - sni_hostname
+          additionalProperties:
+            oneOf:
+              - type: object
+                additionalProperties: false
+                required: [type, max_bytes]
+                properties:
+                  type: { const: truncate }
+                  max_bytes:
+                    type: integer
+                    minimum: 1
+                    maximum: 65536
+              - type: object
+                additionalProperties: false
+                required: [type]
+                properties:
+                  type: { const: ip_prefix }
+                  ipv4_bits:
+                    type: integer
+                    minimum: 0
+                    maximum: 32
+                    default: 24
+                  ipv6_bits:
+                    type: integer
+                    minimum: 0
+                    maximum: 128
+                    default: 48
+              - type: object
+                additionalProperties: false
+                required: [type, secret_ref]
+                properties:
+                  type: { const: hash }
+                  secret_ref:
+                    type: string
+                    pattern: "^\\$\\{FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*\\}$"
+          description: >-
+            Per-field value transforms, keyed by native source field name
+            (before `rename`), applied when the field is emitted:
+            `truncate` keeps at most `max_bytes` bytes (cut on a UTF-8
+            boundary); `ip_prefix` keeps the network prefix of an IP address
+            (`ipv4_bits` default 24, `ipv6_bits` default 48; IPv4-mapped IPv6
+            is masked as IPv4; a value that is not an address is emitted as
+            `null`); `hash` replaces the value with the lowercase-hex keyed
+            HMAC-SHA-256 under the secret named by `secret_ref`, which must be
+            a `${FERRUM_PLUGIN_SECRET_<NAME>}` reference resolved at
+            construction (literal secrets are refused; the value must be at
+            least 32 bytes). Only the transaction-summary loggers support
+            `transforms`; `api_chargeback`, `api_chargeback_sink`, and
+            `transaction_debugger` reject the key, and statsd ignores it.
+            Kafka partition keys and Loki labels read typed fields and are
+            not transformed.
 
     # ── Plugin Config Schemas ──────────────────────────────────────────
     # Per-plugin configuration schemas. The `config` field on PluginConfig
@@ -20926,10 +21073,13 @@ components:
     AccessLogFilterExpression:
       description: >-
         Bounded boolean predicate tree for stdout logging. Runtime validation
-        rejects trees larger than 32 nodes. This form is mutually exclusive
-        with the flat stdout filter predicates. Status-code nodes evaluate
-        false for stream summaries, which do not carry an HTTP status; duration
-        and error nodes continue to evaluate against stream fields.
+        rejects trees larger than 32 nodes, and any `and` conjunction whose own
+        status atoms can never all hold (a `status_code_min` above a
+        `status_code_max`), wherever it appears in the tree. This form is
+        mutually exclusive with the flat stdout filter predicates. Status-code
+        nodes evaluate false for stream summaries, which do not carry an HTTP
+        status; duration and error nodes continue to evaluate against stream
+        fields.
       oneOf:
         - type: object
           additionalProperties: false
@@ -20952,7 +21102,7 @@ components:
             value:
               type: integer
               minimum: 0
-              maximum: 65535
+              maximum: 999
         - type: object
           additionalProperties: false
           required: [op, value]
@@ -20974,7 +21124,7 @@ components:
     StdoutLoggingConfig:
       type: [object, "null"]
       additionalProperties: false
-      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before schema application. `schema` and `schema_ref` are mutually exclusive. `filter.expression` is mutually exclusive with the flat filter keys (status_code_min, status_code_max, min_latency_ms, errors_only) by key presence, including `errors_only: false`."
+      description: "Plugin: stdout_logging — Writes one JSON transaction/stream summary per line to the bounded non-blocking stdout writer. Independent of FERRUM_LOG_LEVEL. Accepted keys are filter, sampling, schema, and schema_ref; null or an empty object uses defaults. The optional filter runs before sampling and schema application. `schema` and `schema_ref` are mutually exclusive. `filter.expression` is mutually exclusive with the flat filter keys (status_code_min, status_code_max, min_latency_ms, errors_only) by key presence, including `errors_only: false`. Registered KeepLastKnownGood: an invalid enabled config fails file-mode startup and is refused on reload (the previous generation keeps serving) rather than being omitted. A global instance without an execution trigger also logs route-miss 404s (no proxy; metadata.rejection_phase = route_not_found)."
       if:
         type: object
       then:
@@ -21002,12 +21152,12 @@ components:
             status_code_min:
               type: integer
               minimum: 0
-              maximum: 65535
+              maximum: 999
               description: HTTP responses with status < this value are skipped. Stream summaries (no HTTP status) are always skipped when any status_code_* bound is set.
             status_code_max:
               type: integer
               minimum: 0
-              maximum: 65535
+              maximum: 999
               description: HTTP responses with status > this value are skipped. Must be greater than or equal to status_code_min when both are set, otherwise plugin validation rejects the config.
             min_latency_ms:
               type: integer
@@ -21025,6 +21175,32 @@ components:
                 independent and must also match.
             expression:
               $ref: "#/components/schemas/AccessLogFilterExpression"
+        sampling:
+          type: [object, "null"]
+          additionalProperties: false
+          required: [rate]
+          description: >-
+            Keep a deterministic, evenly spaced fraction of the records the
+            filter admits: exactly `rate` x 1,000,000 of every 1,000,000
+            candidate records per instance, counted across HTTP, stream, and
+            WebSocket session-end records. Skipped records are never
+            serialized. `null` disables sampling.
+          properties:
+            rate:
+              type: number
+              exclusiveMinimum: 0
+              maximum: 1
+              description: >-
+                Fraction of records to keep, resolved to whole records per
+                million; values that round to zero (below 0.0000005) are
+                rejected. `1` keeps every record.
+            always_log_errors:
+              type: boolean
+              default: false
+              description: >-
+                When true, terminal failures (the `errors_only` predicate for
+                HTTP-family records; `error_class` or `connection_error` for
+                streams) are always logged and do not consume a sample.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -22368,7 +22544,8 @@ components:
         schemas:
           type: object
           minProperties: 1
-          propertyNames: { minLength: 1 }
+          maxProperties: 256
+          propertyNames: { minLength: 1, maxLength: 128 }
           additionalProperties:
             $ref: "#/components/schemas/SummaryLogSchema"
           description: >-
@@ -22663,7 +22840,10 @@ components:
             cannot be declared safe. Requires log_request_body or
             log_response_body true when the array is nonempty.
         schema:
-          $ref: "#/components/schemas/SummaryLogSchema"
+          allOf:
+            - $ref: "#/components/schemas/SummaryLogSchema"
+            - properties:
+                transforms: false
         schema_ref:
           type: string
           description: >-
@@ -25289,7 +25469,7 @@ components:
 
     JwtAuthConfig:
       type: object
-      description: "Plugin: jwt_auth — HS256 JWT Bearer token authentication."
+      description: "Plugin: jwt_auth — HMAC (HS256/HS384/HS512) JWT Bearer token authentication."
       additionalProperties: false
       not:
         required: [expected_issuer, expected_issuers]
@@ -25361,6 +25541,24 @@ components:
           minimum: 0
           maximum: 300
           description: Clock leeway for time-based JWT claims
+        algorithm:
+          type: string
+          enum: [HS256, HS384, HS512]
+          default: HS256
+          description: >-
+            HMAC algorithm every token on this instance must use. Pinned by
+            configuration and never taken from the token header: a token whose
+            header names any other algorithm is rejected. RSA/EC/JWKS
+            verification belongs to `jwks_auth`.
+        hide_credentials:
+          type: boolean
+          default: false
+          description: >-
+            Remove the token-bearing header (for `header:Authorization`, only a
+            `Bearer` value) or query parameter before forwarding an
+            authenticated request upstream, including when another mechanism
+            wins a multi-auth chain. Defaults to false so backends that
+            re-verify the JWT keep receiving it.
 
     KeyAuthConfig:
       type: object
@@ -26895,6 +27093,10 @@ components:
                             properties: {methods: {type: array, minItems: 1}}
                           - required: [headers]
                             properties: {headers: {type: object, minProperties: 1}}
+                          - required: [without_headers]
+                            properties: {without_headers: {type: object, minProperties: 1}}
+                          - required: [port]
+                            properties: {port: {type: integer}}
                           - required: [query_params]
                             properties: {query_params: {type: object, minProperties: 1}}
                           - required: [authority]
@@ -26944,13 +27146,27 @@ components:
                     retry:
                       type: "null"
             properties:
+              name:
+                type: [string, "null"]
+                minLength: 1
+                maxLength: 128
+                pattern: '^[!-~]+$'
+                description: |
+                  Optional operator label for the rule: 1-128 printable ASCII
+                  characters without whitespace. A match publishes
+                  `mesh_route_dispatch.rule_index` (the rule's zero-based
+                  position) and, when set, `mesh_route_dispatch.rule_name`
+                  transaction-log metadata; both are withdrawn when a
+                  NodeWaypoint authorization veto refuses the matched
+                  destination.
               match:
                 type: object
                 additionalProperties: false
                 description: |
                   Match criteria — all configured fields must match for the
                   rule to fire. At least one of `methods`/`headers`/
-                  `query_params`/`authority`/`source_namespace`/`uri` must be
+                  `without_headers`/`query_params`/`authority`/
+                  `source_namespace`/`uri`/`port` must be
                   configured, UNLESS the rule carries a route action
                   (`request_transform`, `response_transform`, `fault`,
                   `rewrite`, `redirect`, `timeout_ms`,
@@ -27050,12 +27266,72 @@ components:
                               type: string
                               minLength: 1
                     description: Header matches (all-of). Header names are case-insensitive.
+                  without_headers:
+                    type: object
+                    propertyNames:
+                      pattern: '^[-!#$%&''*+.^_`|~0-9A-Za-z]+$'
+                    additionalProperties:
+                      oneOf:
+                        - type: string
+                          description: Bare-string form, interpreted as Exact.
+                        - type: object
+                          additionalProperties: false
+                          minProperties: 1
+                          maxProperties: 1
+                          properties:
+                            exact:
+                              type: string
+                            prefix:
+                              type: string
+                              minLength: 1
+                            regex:
+                              type: string
+                              minLength: 1
+                    description: |
+                      Negated header matches (Istio `withoutHeaders`), keyed
+                      and normalized exactly like `headers`. The rule fails
+                      when ANY listed header is present and its value
+                      satisfies the matcher; an absent header never vetoes
+                      the rule, so `{"x-legacy": {"regex": ".*"}}` requires
+                      the header to be absent.
+                  port:
+                    type: [integer, "null"]
+                    format: uint16
+                    minimum: 1
+                    maximum: 65535
+                    description: |
+                      Destination port the client addressed (Istio
+                      `HTTPMatchRequest.port`), read from trusted provenance
+                      only: the original destination when capture rewrote the
+                      accept socket, otherwise the frontend listener port —
+                      never `Host` or forwarding headers. A request with
+                      neither does not match.
                   query_params:
                     type: object
                     additionalProperties:
-                      type: string
+                      oneOf:
+                        - type: string
+                          description: Bare-string form, interpreted as Exact.
+                        - type: object
+                          description: |
+                            Istio StringMatch shape — EXACTLY one of `exact` /
+                            `prefix` / `regex`. `regex` must match the full
+                            decoded value; empty `prefix` / `regex` operands
+                            are rejected at config load.
+                          additionalProperties: false
+                          minProperties: 1
+                          maxProperties: 1
+                          properties:
+                            exact:
+                              type: string
+                            prefix:
+                              type: string
+                              minLength: 1
+                            regex:
+                              type: string
+                              minLength: 1
                     description: >-
-                      Query parameter equality matches (all-of), compared after
+                      Query parameter matches (all-of), compared after
                       percent-decoding the backend-bound query representation
                       available at the dispatch hook, including
                       authentication-owned credential strips and any
@@ -27360,7 +27636,15 @@ components:
                   unknown operations, and `add`/`update` destinations in the
                   gateway-owned `x-consumer-*` consumer assertion namespace or
                   the router's `x-path-param-*` route-capture namespace
-                  (case-insensitive, `_` or `-`) are rejected.
+                  (case-insensitive, `_` or `-`) are rejected. The request list
+                  is applied after the LATER of the last eligible consumer and
+                  the last dispatch instance, so a consumer a priority override
+                  moves ahead of the dispatcher still applies it. An effective
+                  chain whose rules carry `request_transform` but that has no
+                  configured `request_transformer` is refused at plugin-cache
+                  construction and admin admission (the list would otherwise be
+                  silently dropped); an RTDS-disabled transformer still counts
+                  as configured.
                 items:
                   type: object
                   additionalProperties: false
@@ -27417,7 +27701,10 @@ components:
                   `te`, `trailer`, `transfer-encoding`, `upgrade`,
                   case-insensitive) is rejected at construction. Remove of
                   those names remains allowed. `request_transform` keeps its
-                  existing contract.
+                  existing contract. An effective chain whose rules carry
+                  `response_transform` but that has no configured
+                  `response_transformer` is refused at plugin-cache
+                  construction and admin admission.
                 items:
                   type: object
                   additionalProperties: false
@@ -27563,10 +27850,16 @@ components:
                   authority:
                     type: [string, "null"]
                     minLength: 1
-                    pattern: '^\S+$'
+                    pattern: '^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$'
                     description: |
                       Replacement `Host` / `:authority` forwarded to the
-                      backend. CRLF / whitespace is rejected at load time.
+                      backend. Must be exactly `host` or `host:port`: a DNS
+                      name or IPv4 literal (letters, digits, `-`, `.`, `_`) or a
+                      bracketed IPv6 literal, optionally followed by a decimal
+                      port 1-65535. A path, query, fragment, userinfo,
+                      whitespace, or bare IPv6 literal is rejected at load. The
+                      runtime additionally parses the IPv6 literal and the port
+                      range, which the pattern only approximates.
                   match_prefix:
                     type: [string, "null"]
                     description: |
@@ -27618,7 +27911,19 @@ components:
                   uri:
                     type: [string, "null"]
                     minLength: 1
-                    description: Replacement path for the Location header; request path preserved when unset. Must be non-empty and CRLF-free.
+                    pattern: '^/[!"$-~]*$'
+                    description: |
+                      Replacement path for the Location header; request path
+                      preserved when unset. Must be an absolute path (leading
+                      `/`) of printable ASCII only — no fragment, whitespace,
+                      raw control byte, or unencoded non-ASCII, query included
+                      — whose path
+                      component is already canonical (dot segments,
+                      backslashes, and escapes that decode differently are
+                      rejected at load — a runtime check the pattern does not
+                      express). It may carry its own `?query` unless
+                      `match_prefix` is set, because the unmatched request
+                      suffix is appended after `uri`.
                   match_prefix:
                     type: [string, "null"]
                     description: |
@@ -27632,8 +27937,11 @@ components:
                   authority:
                     type: [string, "null"]
                     minLength: 1
-                    pattern: '^\S+$'
-                    description: Replacement authority (host[:port]) for the Location header; request authority preserved when unset.
+                    pattern: '^(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?$'
+                    description: |
+                      Replacement authority (`host` or `host:port`) for the
+                      Location header; request authority preserved when unset.
+                      Same grammar as `rewrite.authority`.
                   port:
                     type: [integer, "null"]
                     format: uint16
@@ -29916,17 +30224,27 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: access_control — consumer-based and group-based allow/deny for
-        HTTP-family and TCP/UDP stream proxies. Evaluation order: deny
-        (consumer username → group) then allow (consumer username → group).
-        Deny always overrides allow. At least one of `allowed_consumers`,
-        `disallowed_consumers`, `allowed_groups`, `disallowed_groups`, or
-        `allow_authenticated_identity=true` must be configured, and an allow-list
-        (`allowed_consumers`/`allowed_groups`) that is present must be non-empty:
-        omit it for no allow restriction. Unknown config keys are rejected.
-        `allow_authenticated_identity=true` cannot be combined
-        with an allow-list (`allowed_consumers`/`allowed_groups`) because the
-        allow-list is not applied to unmapped external identities. Use
+        Plugin: access_control — consumer-based, group-based, and exact
+        external-principal allow/deny for HTTP-family and TCP/UDP stream
+        proxies. Evaluation order: deny (consumer username → group) then allow
+        (consumer username → group); unmapped external identities are judged by
+        `disallowed_consumers`, `disallowed_external_identities`, then
+        `allowed_external_identities` or the `allow_authenticated_identity`
+        bypass. Deny always overrides allow. Once any allow-list is configured,
+        a principal matching none of them is denied — a mapped Consumer on a
+        policy whose only allow-list is `allowed_external_identities` included.
+        At least one of `allowed_consumers`, `disallowed_consumers`,
+        `allowed_groups`, `disallowed_groups`, `allowed_external_identities`,
+        `disallowed_external_identities`, or `allow_authenticated_identity=true`
+        must be configured, and an allow-list
+        (`allowed_consumers`/`allowed_groups`/`allowed_external_identities`)
+        that is present must be non-empty: omit it for no allow restriction.
+        Unknown config keys are rejected. `allow_authenticated_identity=true`
+        cannot be combined with an allow-list
+        (`allowed_consumers`/`allowed_groups`/`allowed_external_identities`):
+        the consumer allow-lists are not applied to unmapped external
+        identities, and the bypass would admit every external identity an
+        external allow-list omits. Use
         ip_restriction for IP/CIDR rules. Rule entries match principal values
         byte-for-byte (no trimming) and must contain at least one
         non-whitespace character. Whitespace admission follows Rust
@@ -29949,6 +30267,14 @@ components:
               properties:
                 disallowed_groups:
                   minItems: 1
+            - required: [allowed_external_identities]
+              properties:
+                allowed_external_identities:
+                  minItems: 1
+            - required: [disallowed_external_identities]
+              properties:
+                disallowed_external_identities:
+                  minItems: 1
             - required: [allow_authenticated_identity]
               properties:
                 allow_authenticated_identity:
@@ -29967,6 +30293,10 @@ components:
                   - required: [allowed_groups]
                     properties:
                       allowed_groups:
+                        minItems: 1
+                  - required: [allowed_external_identities]
+                    properties:
+                      allowed_external_identities:
                         minItems: 1
       properties:
         allowed_consumers:
@@ -30031,8 +30361,90 @@ components:
             external auth plugin (e.g. jwks_auth) even when no gateway Consumer
             was mapped. Empty or whitespace-only identities are unauthenticated.
             Cannot be combined with an allow-list
-            (`allowed_consumers`/`allowed_groups`); the deny-list
-            `disallowed_consumers` is still applied to the external identity.
+            (`allowed_consumers`/`allowed_groups`/`allowed_external_identities`);
+            the deny-lists `disallowed_consumers` and
+            `disallowed_external_identities` are still applied to the external
+            identity.
+        allowed_external_identities:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [identity]
+            description: >-
+              One exact external-principal rule for `access_control`.
+            properties:
+              identity:
+                type: string
+                minLength: 1
+                maxLength: 4096
+                pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                description: >-
+                  The external identity string, matched byte-for-byte (no trimming).
+                  Must contain a non-whitespace character; at most 4096 characters.
+              mechanism:
+                type: string
+                enum:
+                  - jwks_auth
+                  - ldap_auth
+                  - oauth2_introspection
+                  - oidc_relying_party
+                  - soap_ws_security
+                description: >-
+                  Restrict the rule to identities committed by this built-in
+                  authentication mechanism. Omit to match the identity from every
+                  mechanism.
+          description: >-
+            Exact unmapped external principals (for example a `jwks_auth` `sub`)
+            that are allowed when no gateway Consumer was mapped — the narrow
+            alternative to `allow_authenticated_identity`. An entry with
+            `mechanism` matches only an identity committed by that
+            authentication mechanism; an identity with no verified realm (stream
+            proxies, or an identity a custom plugin set directly) never matches a
+            mechanism-scoped allow entry. Omit the key for no external allow
+            list; an explicitly empty array is rejected. Mapped Consumers are not
+            judged by this list, but configuring it makes the policy an
+            allow-list, so a mapped Consumer must then match
+            `allowed_consumers`/`allowed_groups` to pass.
+        disallowed_external_identities:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [identity]
+            description: >-
+              One exact external-principal rule for `access_control`.
+            properties:
+              identity:
+                type: string
+                minLength: 1
+                maxLength: 4096
+                pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                description: >-
+                  The external identity string, matched byte-for-byte (no trimming).
+                  Must contain a non-whitespace character; at most 4096 characters.
+              mechanism:
+                type: string
+                enum:
+                  - jwks_auth
+                  - ldap_auth
+                  - oauth2_introspection
+                  - oidc_relying_party
+                  - soap_ws_security
+                description: >-
+                  Restrict the rule to identities committed by this built-in
+                  authentication mechanism. Omit to match the identity from every
+                  mechanism.
+          default: []
+          description: >-
+            Exact unmapped external principals that are denied, optionally
+            scoped to the authentication mechanism that verified them, so one
+            principal can be revoked without revoking an equal subject string
+            from a different mechanism. A mechanism-scoped entry also matches an
+            identity with no verified realm (it fails closed). Takes precedence
+            over every allow rule. `disallowed_consumers` remains a
+            realm-blind deny for external identities.
 
     TcpConnectionThrottleConfig:
       type: object
@@ -30049,6 +30461,16 @@ components:
         Enforcement is process-local, so each replica independently permits up
         to the configured limit and the deployment-wide allowance can be the
         limit multiplied by the number of replicas receiving the same identity.
+        IP keys use the canonical client IP: IPv4 (including IPv4-mapped IPv6)
+        is keyed per address, while native IPv6 sources are grouped to
+        ipv6_prefix (default /64), so hosts in one /64 share a budget
+        unless it is raised to 128. For IP keys the gateway-wide accept-time
+        bound FERRUM_TCP_MAX_CONNECTIONS_PER_IP (default 256, counted across
+        every TCP stream listener and grouped by FERRUM_PER_IP_IPV6_PREFIX)
+        applies first and closes over-cap connections before this plugin runs,
+        so a max_connections_per_key above that bound can never bind; this
+        plugin can only tighten it. Refusals are counted per proxy in the
+        Prometheus counter ferrum_tcp_connection_throttle_rejections_total.
       required: [max_connections_per_key]
       properties:
         max_connections_per_key:
@@ -30059,7 +30481,21 @@ components:
           description: >-
             Maximum active TCP connections allowed for one Consumer/IP key in
             this ferrum-edge process. Each replica enforces this limit
-            independently.
+            independently. For IP keys the effective limit is also bounded by
+            FERRUM_TCP_MAX_CONNECTIONS_PER_IP (default 256), which is enforced
+            at accept time before this plugin runs.
+        ipv6_prefix:
+          type: integer
+          default: 64
+          minimum: 1
+          maximum: 128
+          description: >-
+            Prefix length used to group native IPv6 client addresses into one
+            IP key. The default 64 makes every host in one /64 share a budget;
+            128 keys each IPv6 address separately. IPv4 and IPv4-mapped IPv6
+            clients are always keyed per address, and Consumer keys are
+            unaffected. Independent of FERRUM_PER_IP_IPV6_PREFIX, which only
+            groups the gateway-wide FERRUM_*_PER_IP caps.
         cleanup_interval_seconds:
           type: integer
           format: uint64
@@ -30288,7 +30724,11 @@ components:
         is rejected; an allow-list alone is not enforcement. The User-Agent is
         client-controlled and spoofable, so this is a coarse filter, not strong
         bot verification. Pattern entry whitespace follows Rust `str::trim`
-        Unicode `White_Space` semantics. HTTP-family only.
+        Unicode `White_Space` semantics. A User-Agent whose every field line is
+        empty or only spaces/tabs is treated as missing. A present User-Agent
+        field line that is not valid UTF-8 cannot be matched, so the request is
+        rejected with `custom_response_code` regardless of `allow_list` and
+        `allow_missing_user_agent`. HTTP-family only.
       properties:
         blocked_patterns:
           type: [array, "null"]
@@ -30333,10 +30773,12 @@ components:
           type: [boolean, "null"]
           default: true
           description: >-
-            When true (default), requests with no User-Agent header pass — this
-            keeps health-check and load-balancer probes working. Set to false
-            to reject them with `custom_response_code`. `null` is the same as
-            omission and selects `true`.
+            When true (default), requests with no User-Agent header, or only
+            empty/whitespace-only User-Agent values, pass — this keeps
+            health-check and load-balancer probes working. Set to false to
+            reject them with `custom_response_code`. A non-UTF-8 User-Agent is
+            not treated as missing and is rejected either way. `null` is the
+            same as omission and selects `true`.
         custom_response_code:
           type: [integer, "null"]
           format: uint16
@@ -31564,7 +32006,27 @@ components:
         Repeated identical Content-Length values (RFC 9110 §8.6, which arrive
         comma-folded in plugin-facing header maps) are parsed per member and
         compared against the limit. A declared length that cannot be reduced to
-        one agreed value fails closed with HTTP 400.
+        one agreed value fails closed with HTTP 400 and
+        `{"error":"Request Content-Length is ambiguous"}`.
+        The ceiling applies to every method: an HTTP/2 GET, HEAD, or OPTIONS
+        request carrying DATA without Content-Length is forwarded through the
+        size-limited adapter, not replaced by an empty backend body (residual:
+        an HTTPS backend with HTTP/2 enabled whose target is not yet
+        capability-classified can negotiate HTTP/1.1 via ALPN and send an
+        unknown-length GET/HEAD bodyless until classified; pool warmup,
+        FERRUM_POOL_WARMUP_ENABLED, classifies targets up front).
+        Every 413 for this policy, from any plugin hook or from the proxy core's
+        streaming overrun, carries the one shared body
+        `{"error":"Request body exceeds maximum size"}` without the limit. A
+        Content-Length or buffered-body refusal by the plugin records
+        `request_size_limiting.reason`, `request_size_limiting.instance` (the
+        plugin-config id), `request_size_limiting.limit_bytes`, and (except for
+        an ambiguous Content-Length) `request_size_limiting.observed_bytes` in
+        request metadata. A final-body refusal records them only when its hook
+        receives a request context, on any protocol: always on the native
+        HTTP/3 preparation and HTTP/3 bridge paths, and elsewhere only when
+        another plugin on the route requests the final-body context. A
+        streaming overrun refused by the proxy core records none of them.
       required:
         - max_bytes
       properties:
@@ -31575,8 +32037,10 @@ components:
           maximum: 18446744073709551615
           description: >-
             Maximum allowed request body size in bytes. Required and must be
-            greater than zero — the gateway rejects plugin creation when
-            missing or 0.
+            a positive JSON integer — the gateway rejects plugin creation when
+            it is missing or null, 0, negative, fractional or in exponent form
+            (for example 1048576.0), or not a number (for example "1048576"),
+            with a diagnostic naming that fault class.
 
     WafPluginConfig:
       type: object
@@ -37527,11 +37991,14 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: ai_token_metrics — Extracts token usage from HTTP JSON/SSE LLM
-        response bodies. Native gRPC protobuf messages are unsupported and the
-        plugin is not registered for the Grpc protocol view. Unknown keys are
-        rejected. SSE accounting requires explicit full-response buffering and
-        disables live delivery. Cohere counts come from usage.tokens,
+        Plugin: ai_token_metrics — Extracts token usage from HTTP JSON LLM
+        response bodies and from streamed SSE / AWS event-stream responses.
+        Native gRPC protobuf messages are unsupported and the plugin is not
+        registered for the Grpc protocol view. Unknown keys are rejected.
+        Streamed responses are metered incrementally without buffering;
+        buffer_streaming_responses instead collects SSE before inspection and
+        disables live delivery. A collected body above 4 MiB (before decoding)
+        is not inspected. Cohere counts come from usage.tokens,
         delta.usage.tokens, or meta.tokens, not billed_units; configured cost
         rates estimate cost from those token counts, not provider billing units.
       properties:
@@ -37558,7 +38025,7 @@ components:
         buffer_streaming_responses:
           type: boolean
           default: false
-          description: Buffer text/event-stream responses so final SSE usage events can be parsed; disables streaming delivery for those responses
+          description: Buffer text/event-stream responses and meter them after the full response is collected; disables streaming delivery for those responses. Not required for SSE token accounting, which observes streams incrementally by default.
         cost_per_prompt_token:
           type: [number, "null"]
           format: double
@@ -37571,6 +38038,44 @@ components:
           minimum: 0
           maximum: 18446744073709.55
           description: Calculate estimated cost per request from completion tokens; range 0 through 18446744073709.55. Omitted or null disables this rate.
+        model_pricing:
+          type: array
+          maxItems: 128
+          default: []
+          description: "Ordered per-model rate overrides. The first entry whose `model` glob matches the response's reported model supplies the rates (an omitted entry rate leaves that side unpriced); when none matches, or no publishable model is reported, the flat rates apply. Federation usage is priced at the flat rates."
+          items:
+            type: object
+            additionalProperties: false
+            required: [model]
+            anyOf:
+              - required: [cost_per_prompt_token]
+                properties:
+                  cost_per_prompt_token:
+                    type: number
+              - required: [cost_per_completion_token]
+                properties:
+                  cost_per_completion_token:
+                    type: number
+            properties:
+              model:
+                type: string
+                minLength: 1
+                maxLength: 256
+                pattern: '^[A-Za-z0-9._:/+*-]+$'
+                not: { pattern: '\.\.' }
+                description: "Anchored glob matched against the response's model; `*` is the only wildcard and never matches URL-structural separators (`/ ? # & \\`) or whitespace."
+              cost_per_prompt_token:
+                type: [number, "null"]
+                format: double
+                minimum: 0
+                maximum: 18446744073709.55
+                description: Prompt-token rate for matching models; null or omitted leaves the prompt side unpriced.
+              cost_per_completion_token:
+                type: [number, "null"]
+                format: double
+                minimum: 0
+                maximum: 18446744073709.55
+                description: Completion-token rate for matching models; null or omitted leaves the completion side unpriced.
 
     AiRequestGuardConfig:
       type: object
@@ -40369,6 +40874,7 @@ components:
               - required: [timestamp_format]
               - required: [metadata]
               - required: [order]
+              - required: [transforms]
           properties:
             omit:
               type: array
@@ -40751,6 +41257,7 @@ components:
             summary_type: false
             timestamp_format: false
             metadata: false
+            transforms: false
             omit:
               items:
                 $ref: "#/components/schemas/ApiChargebackSinkLogField"

@@ -709,7 +709,7 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         (
             json!({"max_bytes": false}),
             "`max_bytes`",
-            "must be greater than zero",
+            "must be an integer, not a boolean",
         ),
         (
             json!({"max_bytes": 1, "require_buffered_check": 918273641}),

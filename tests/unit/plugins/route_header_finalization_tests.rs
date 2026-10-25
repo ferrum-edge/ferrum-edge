@@ -687,3 +687,482 @@ fn route_transform_diagnostics_keep_indexes_and_withhold_supplied_values() {
         assert!(!rendered.contains("UNREGISTERED_ROUTE_TOKEN"), "{rendered}");
     }
 }
+
+fn route_dispatch_config(transform_field: &str) -> serde_json::Value {
+    json!({"rules": [{
+        "match": {"methods": ["GET"]},
+        "destination": {"backend_host": "backend.internal", "backend_port": 8080},
+        transform_field: [
+            {"operation": "remove", "target": "header", "key": "X-Internal-Role"},
+            {"operation": "update", "target": "header", "key": "X-Tenant", "value": "route-a"},
+            {"operation": "add", "target": "header", "key": "X-Route-Add", "value": "once"}
+        ]
+    }]})
+}
+
+#[tokio::test]
+async fn cache_backed_route_request_policy_applies_when_consumer_precedes_dispatch() {
+    // mesh_route_dispatch-SOL-1: a priority override places the sole consumer
+    // BEFORE the dispatcher publishes its list. Finalizing at the consumer
+    // took an empty slot and silently forwarded the attacker header.
+    let config = make_config(vec![
+        plugin_config(
+            "rt-early",
+            "request_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            Some(2990),
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            route_dispatch_config("request_transform"),
+            None,
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let consumer = plugins
+        .iter()
+        .position(|p| p.name() == "request_transformer")
+        .expect("consumer in chain");
+    let producer = plugins
+        .iter()
+        .position(|p| p.name() == "mesh_route_dispatch")
+        .expect("producer in chain");
+    assert!(
+        consumer < producer,
+        "the scenario requires the consumer to run before the dispatcher"
+    );
+    assert!(plugins[producer].publishes_route_request_header_transforms());
+
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::from([
+        ("x-internal-role".to_string(), "admin".to_string()),
+        ("x-tenant".to_string(), "client".to_string()),
+    ]);
+    run_request_chain(&plugins, &mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("backend.internal")
+    );
+    assert!(
+        !headers.contains_key("x-internal-role"),
+        "route remove must apply even though the consumer ran first; got {:?}",
+        headers.get("x-internal-role")
+    );
+    assert_eq!(headers.get("x-tenant").map(String::as_str), Some("route-a"));
+    assert_eq!(
+        headers.get("x-route-add").map(String::as_str),
+        Some("once"),
+        "non-idempotent route add must apply exactly once"
+    );
+    assert!(ctx.route_override_request_transform.is_none());
+}
+
+fn cache_build_error(config: &GatewayConfig) -> String {
+    match PluginCache::new(config) {
+        Ok(_) => panic!("cache construction must refuse the composition"),
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn cache_refuses_route_transforms_without_a_configured_consumer() {
+    // mesh_route_dispatch-CLAUDE-2: with no transformer on the chain the
+    // published lists were silently dropped (a strip rule forwarded the
+    // header untouched).
+    let request_only = make_config(vec![plugin_config(
+        "mrd",
+        "mesh_route_dispatch",
+        route_dispatch_config("request_transform"),
+        None,
+        None,
+    )]);
+    let error = cache_build_error(&request_only);
+    assert!(
+        error.contains("no request_transformer to apply them"),
+        "{error}"
+    );
+
+    let response_only = make_config(vec![plugin_config(
+        "mrd",
+        "mesh_route_dispatch",
+        route_dispatch_config("response_transform"),
+        None,
+        None,
+    )]);
+    let error = cache_build_error(&response_only);
+    assert!(
+        error.contains("no response_transformer to apply them"),
+        "{error}"
+    );
+
+    // The translator-shaped empty consumer satisfies each direction.
+    for (field, consumer) in [
+        ("request_transform", "request_transformer"),
+        ("response_transform", "response_transformer"),
+    ] {
+        let config = make_config(vec![
+            plugin_config(
+                "consumer",
+                consumer,
+                json!({"rules": [], "apply_route_overrides": true}),
+                None,
+                None,
+            ),
+            plugin_config(
+                "mrd",
+                "mesh_route_dispatch",
+                route_dispatch_config(field),
+                None,
+                None,
+            ),
+        ]);
+        assert!(PluginCache::new(&config).is_ok(), "{field} with {consumer}");
+    }
+
+    // An RTDS-disabled transformer is still the operator's configured
+    // consumer: its kill switch must not wedge the reload.
+    let rtds_disabled = make_config(vec![
+        plugin_config(
+            "rt-disabled",
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Disabled",
+                    "value": "no"
+                }],
+                "runtime_overlay_scope": "gate",
+                "runtime_overlay_resolved_enabled": false
+            }),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            route_dispatch_config("request_transform"),
+            None,
+            None,
+        ),
+    ]);
+    assert!(PluginCache::new(&rtds_disabled).is_ok());
+}
+
+#[tokio::test]
+async fn cache_backed_route_request_policy_waits_for_the_whole_dispatch_block() {
+    // PR6821-SOL-1: dispatcher B publishes no request transforms but still
+    // replaces the route decision. Finalizing right after dispatcher A applied
+    // A's credential before B won, and let B's predicates see it.
+    let config = make_config(vec![
+        plugin_config(
+            "rt-early",
+            "request_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            Some(2990),
+            None,
+        ),
+        plugin_config(
+            "mrd-a",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "backend-a.internal", "backend_port": 8080},
+                "request_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Backend-Key", "value": "backend-a-only"}
+                ]
+            }]}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd-b",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {
+                    "headers": {"x-route": "b"},
+                    "without_headers": {"x-backend-key": {"regex": ".*"}}
+                },
+                "destination": {"backend_host": "backend-b.internal", "backend_port": 8080}
+            }]}),
+            Some(2996),
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let consumer = plugins
+        .iter()
+        .position(|p| p.name() == "request_transformer")
+        .expect("consumer in chain");
+    let dispatchers: Vec<usize> = plugins
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.name() == "mesh_route_dispatch")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(dispatchers.len(), 2);
+    assert!(consumer < dispatchers[0] && dispatchers[0] < dispatchers[1]);
+    assert!(!plugins[dispatchers[1]].publishes_route_request_header_transforms());
+    assert!(plugins[dispatchers[1]].replaces_route_request_header_transforms());
+
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::from([("x-route".to_string(), "b".to_string())]);
+    run_request_chain(&plugins, &mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("backend-b.internal"),
+        "dispatcher B must not observe A's route header before the block ends"
+    );
+    assert!(
+        !headers.contains_key("x-backend-key"),
+        "the superseded rule's credential must never reach backend B; got {:?}",
+        headers.get("x-backend-key")
+    );
+    assert!(ctx.route_override_request_transform.is_none());
+}
+
+fn websocket_route_transform_config() -> GatewayConfig {
+    make_config(vec![
+        plugin_config(
+            "rt",
+            "request_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "resp",
+            "response_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "ws.internal", "backend_port": 8080},
+                "request_transform": [
+                    {"operation": "remove", "target": "header", "key": "X-Internal-Role"},
+                    {"operation": "add", "target": "header", "key": "X-Route-Add", "value": "once"}
+                ],
+                "response_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Route", "value": "ws"}
+                ]
+            }]}),
+            None,
+            None,
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn websocket_view_applies_route_request_policy_to_the_handshake() {
+    // PR6821-SOL-2: the WebSocket view used to lose the route consumers and
+    // forward the stripped header. `request_transformer` now runs on WebSocket
+    // handshakes itself (#6858), so it is the request list's only consumer
+    // there; only the HTTP/gRPC-only `response_transformer` needs a stand-in.
+    // The route request list must still apply exactly once, not once for the
+    // transformer and again for a stand-in.
+    let cache = PluginCache::new(&websocket_route_transform_config()).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::WebSocket);
+    assert!(
+        plugins.iter().any(|p| p.name() == "request_transformer"),
+        "request_transformer runs on WebSocket handshakes"
+    );
+    assert!(
+        plugins.iter().all(|p| p.name() != "response_transformer"),
+        "response_transformer never runs on WebSocket"
+    );
+    let request_consumers: Vec<&str> = plugins
+        .iter()
+        .filter(|p| p.participates_in_route_request_header_finalization())
+        .map(|p| p.name())
+        .collect();
+    assert_eq!(
+        request_consumers,
+        vec!["request_transformer"],
+        "request_transformer is the WebSocket view's only route request consumer; \
+         no request stand-in may be added beside it"
+    );
+    assert!(
+        plugins
+            .iter()
+            .any(|p| p.participates_in_route_response_header_finalization()),
+        "the WebSocket view keeps an eligible route response consumer"
+    );
+
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::from([("x-internal-role".to_string(), "admin".to_string())]);
+    run_request_chain(&plugins, &mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("ws.internal")
+    );
+    assert!(
+        !headers.contains_key("x-internal-role"),
+        "route remove must apply to the WebSocket handshake"
+    );
+    assert_eq!(
+        headers.get("x-route-add").map(String::as_str),
+        Some("once"),
+        "a non-idempotent route add must apply to the handshake exactly once"
+    );
+    assert!(ctx.route_override_request_transform.is_none());
+
+    let mut response_headers = HashMap::new();
+    ferrum_edge::_test_support::finalize_successful_websocket_response_headers_for_test(
+        &plugins,
+        &ctx,
+        101,
+        &mut response_headers,
+    );
+    assert_eq!(
+        response_headers.get("x-route").map(String::as_str),
+        Some("ws"),
+        "route response policy must decorate the successful upgrade"
+    );
+}
+
+#[tokio::test]
+async fn websocket_view_keeps_rtds_disabled_consumers_ineligible() {
+    // A disabled RTDS transformer is not eligible on HTTP, and it stays
+    // ineligible in the WebSocket view, where no stand-in replaces it either:
+    // the route list stays unused.
+    let config = make_config(vec![
+        plugin_config(
+            "rt-disabled",
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Disabled",
+                    "value": "no"
+                }],
+                "runtime_overlay_scope": "gate",
+                "runtime_overlay_resolved_enabled": false
+            }),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            route_dispatch_config("request_transform"),
+            None,
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::WebSocket);
+    assert!(
+        !plugins
+            .iter()
+            .any(|p| p.participates_in_route_request_header_finalization())
+    );
+}
+
+#[tokio::test]
+async fn websocket_rejection_finalizes_route_response_list_before_later_policy() {
+    // PR6821-SOL-4: the WebSocket stand-in for `response_transformer` must
+    // keep its chain position on rejection answers. Finalizing in the
+    // end-of-chain fallback ran the route list after `security_headers`
+    // (4080), so a later scrub lost to an earlier route write.
+    let config = make_config(vec![
+        plugin_config(
+            "resp",
+            "response_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "sec",
+            "security_headers",
+            json!({"remove": ["x-route-debug"]}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {"methods": ["GET"]},
+                "redirect": {"uri": "/new", "redirect_code": 302},
+                "response_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Route-Debug", "value": "internal-route-detail"},
+                    {"operation": "remove", "target": "header", "key": "X-Frame-Options"},
+                    {"operation": "add", "target": "header", "key": "X-Route-Add", "value": "once"}
+                ]
+            }]}),
+            None,
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::WebSocket);
+    assert!(plugins.iter().all(|p| p.name() != "response_transformer"));
+    let stand_in = plugins
+        .iter()
+        .position(|p| p.participates_in_route_response_header_finalization())
+        .expect("response consumer stand-in in the WebSocket view");
+    let scrub = plugins
+        .iter()
+        .position(|p| p.name() == "security_headers")
+        .expect("security_headers in the WebSocket view");
+    assert!(stand_in < scrub);
+    assert!(plugins[stand_in].applies_after_proxy_on_reject());
+
+    let mut ctx = make_ctx();
+    let mut request_headers = HashMap::new();
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers: mut response_headers,
+    } = run_before_proxy_hooks_for_test(&plugins, &mut ctx, &mut request_headers).await
+    else {
+        panic!("the redirect rule must answer the handshake");
+    };
+    assert_eq!(status_code, 302);
+    let mut status = status_code;
+    let mut body = bytes::Bytes::from(body);
+    apply_replaceable_after_proxy_hooks_to_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        &mut status,
+        &mut body,
+        &mut response_headers,
+    )
+    .await;
+
+    assert!(
+        !response_headers.contains_key("x-route-debug"),
+        "the later security_headers scrub must win over the earlier route write; got {:?}",
+        response_headers.get("x-route-debug")
+    );
+    assert_eq!(
+        response_headers.get("x-frame-options").map(String::as_str),
+        Some("SAMEORIGIN"),
+        "the later security_headers set must win over the earlier route remove"
+    );
+    assert_eq!(
+        response_headers.get("x-route-add").map(String::as_str),
+        Some("once"),
+        "a non-idempotent route add must apply exactly once"
+    );
+    assert!(ctx.route_override_response_transform.is_none());
+}

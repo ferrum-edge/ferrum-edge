@@ -186,6 +186,7 @@ fn generation(
 ) -> GatewayConfig {
     let mut config = GatewayConfig {
         quarantined_plugin_configs: Vec::new(),
+        quarantined_jwt_shared_secrets: Default::default(),
         version: "1".to_string(),
         proxies: vec![test_proxy("gated", &["gate"])],
         consumers: vec![],

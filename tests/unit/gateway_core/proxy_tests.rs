@@ -4575,6 +4575,39 @@ fn test_request_may_have_body_uses_method_and_body_headers() {
     }
 }
 
+/// Hyper's HTTP/1.1 client sends an unknown-length GET/HEAD body as zero-length
+/// unless framing is explicit, so the dispatchers must add `chunked` exactly
+/// there. A proven-empty body must stay bodyless with no `Transfer-Encoding`,
+/// an exact-length body keeps hyper's `Content-Length`, and methods hyper
+/// already chunks are left alone.
+#[test]
+fn test_h1_explicit_chunked_framing_only_for_unknown_length_get_and_head() {
+    use ferrum_edge::_test_support::h1_request_requires_explicit_chunked_framing as needs_chunked;
+
+    let unknown_length = || {
+        http_body_util::StreamBody::new(futures_util::stream::empty::<
+            Result<http_body::Frame<bytes::Bytes>, std::convert::Infallible>,
+        >())
+    };
+    for method in ["GET", "HEAD"] {
+        assert!(needs_chunked(method, &unknown_length()), "{method}");
+        assert!(
+            !needs_chunked(method, &http_body_util::Empty::<bytes::Bytes>::new()),
+            "{method}: a proven-empty body must stay bodyless"
+        );
+        assert!(
+            !needs_chunked(
+                method,
+                &http_body_util::Full::new(bytes::Bytes::from_static(b"1234"))
+            ),
+            "{method}: an exact-length body keeps Content-Length"
+        );
+    }
+    for method in ["OPTIONS", "POST", "PUT", "DELETE", "CONNECT"] {
+        assert!(!needs_chunked(method, &unknown_length()), "{method}");
+    }
+}
+
 #[tokio::test]
 async fn test_apply_request_body_plugins_preserves_plugin_order() {
     let first: Arc<dyn Plugin> = Arc::new(BodySuffixPlugin { suffix: "-first" });

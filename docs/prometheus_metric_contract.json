@@ -5162,6 +5162,19 @@
     "emission": "conditional"
   },
   {
+    "name": "ferrum_tcp_connection_throttle_rejections_total",
+    "type": "counter",
+    "help": "TCP connections refused by tcp_connection_throttle because the connection's Consumer or client-IP key was at max_connections_per_key.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "tcp_connection_throttle",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_tls_cert_expiry_seconds",
     "type": "gauge",
     "help": "Seconds until the certificate leaf not_after timestamp. Negative means expired.",

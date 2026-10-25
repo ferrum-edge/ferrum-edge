@@ -67,6 +67,21 @@ const EVENT_STREAM_MESSAGE_CRC_LEN: usize = 4;
 /// Smallest structurally valid event-stream message (prelude + message CRC).
 const EVENT_STREAM_MIN_MESSAGE_LEN: usize = EVENT_STREAM_PRELUDE_LEN + EVENT_STREAM_MESSAGE_CRC_LEN;
 
+/// Longest provider-reported model name a usage observer retains or
+/// publishes. The model string is backend-controlled and flows into every
+/// transaction-log sink, so an oversized (or control-character-bearing) value
+/// is dropped rather than copied: real model identifiers are far shorter.
+pub const MAX_USAGE_MODEL_BYTES: usize = 256;
+
+/// Whether a provider-reported model name may be retained and published:
+/// non-empty, at most [`MAX_USAGE_MODEL_BYTES`] bytes, and free of control
+/// characters.
+pub fn is_publishable_model_name(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_USAGE_MODEL_BYTES
+        && !model.chars().any(char::is_control)
+}
+
 /// Big-endian `u32` from the first four bytes of `bytes` (which must be at
 /// least four long — every caller slices an already-validated prelude).
 fn be_u32(bytes: &[u8]) -> u32 {
@@ -90,11 +105,13 @@ pub fn is_aws_event_stream_content_type(content_type: &str) -> bool {
 
 /// Accumulated provider usage counters.
 ///
-/// Fixed size (three `Option<u64>` plus a flag) regardless of how many events
-/// the stream carried. Later explicit values replace earlier ones; an absent
-/// field never erases a previously observed one, because supported providers
-/// report cumulative counters and split them across events (Anthropic reports
-/// input tokens on `message_start` and output tokens on `message_delta`).
+/// Bounded size (three `Option<u64>`, a flag, the provider family of the
+/// first observed usage, and at most one [`MAX_USAGE_MODEL_BYTES`] model name)
+/// regardless of how many events the stream carried. Later explicit values
+/// replace earlier ones; an absent field never erases a previously observed
+/// one, because supported providers report cumulative counters and split them
+/// across events (Anthropic reports input tokens on `message_start` and output
+/// tokens on `message_delta`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageAccumulator {
     prompt_tokens: Option<u64>,
@@ -104,6 +121,10 @@ pub struct UsageAccumulator {
     /// Raw provider categories seen so far, merged field by field, so an event
     /// that restates only some categories cannot erase the others.
     categories: UsageCategories,
+    /// Provider family of the first usage report that was observed.
+    provider: Option<AiProvider>,
+    /// First publishable provider-reported model name.
+    model: Option<String>,
 }
 
 impl UsageAccumulator {
@@ -111,6 +132,55 @@ impl UsageAccumulator {
     /// the caller must apply its unmetered policy, not charge zero.
     pub fn observed(&self) -> bool {
         self.observed
+    }
+
+    /// The accumulated counters, observed provider, and model in the shared
+    /// [`AiTokenUsage`] shape, for observers that publish individual counters
+    /// rather than resolve one `count_mode`.
+    pub fn token_usage(&self) -> AiTokenUsage {
+        AiTokenUsage {
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            total_tokens: self.total_tokens,
+            model: self.model.clone(),
+            provider: self.provider,
+            categories: UsageCategories::default(),
+        }
+    }
+
+    /// Mark a usage report as observed, remembering the first reporter's
+    /// provider family.
+    fn note_observed(&mut self, provider: Option<AiProvider>) {
+        self.observed = true;
+        if self.provider.is_none() {
+            self.provider = provider;
+        }
+    }
+
+    /// Retain the first publishable model name an event carries. The carrier
+    /// follows the same event shapes the usage arms below unwrap.
+    fn capture_model(&mut self, json: &Value) {
+        if self.model.is_some() {
+            return;
+        }
+        let carrier = match json.get("type").and_then(Value::as_str) {
+            Some("response.completed" | "response.incomplete") => json.get("response"),
+            Some("message_start") => json.get("message"),
+            _ => Some(json),
+        };
+        let Some(carrier) = carrier else {
+            return;
+        };
+        let Some(model) = carrier
+            .get("model")
+            .or_else(|| carrier.get("modelVersion"))
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        if is_publishable_model_name(model) {
+            self.model = Some(model.to_string());
+        }
     }
 
     /// These counters in the shared [`AiTokenUsage`] shape.
@@ -160,7 +230,7 @@ impl UsageAccumulator {
                 self.prompt_tokens = folded.prompt_tokens;
                 self.completion_tokens = folded.completion_tokens;
                 self.total_tokens = folded.total_tokens;
-                self.observed = true;
+                self.note_observed(usage.provider);
             }
             return;
         }
@@ -187,7 +257,7 @@ impl UsageAccumulator {
                 _ => self.total_tokens,
             };
         }
-        self.observed = true;
+        self.note_observed(usage.provider);
     }
 
     /// Apply one dispatched SSE event's assembled `data` payload.
@@ -240,6 +310,7 @@ impl UsageAccumulator {
     /// and an explicitly configured `provider` must not suppress the
     /// authoritative terminal signal of the format the backend actually sent.
     pub fn apply_event_json(&mut self, json: &Value, configured: Option<AiProvider>) {
+        self.capture_model(json);
         // OpenAI Responses streaming (`response.*` events). The authoritative
         // counters ride the TERMINAL event and live under `response.usage`, not
         // root `usage`, so without this arm a completed Responses stream

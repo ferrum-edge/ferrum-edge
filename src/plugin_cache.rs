@@ -382,6 +382,7 @@ pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwne
         return Some(CacheOwnedPlugin::Wraps(wrapper.inner.as_ref()));
     }
     let builtin = plugin.is::<MeshRouteDispatchFinalizer>()
+        || plugin.is::<RouteHeaderConsumerStandIn>()
         || plugin.is::<CompositionShapePlugin>()
         || plugin.is::<ServerlessSecurityCompositionPlugin>()
         || plugin.is::<FinalizedRequestPolicyCompositionPlugin>();
@@ -389,7 +390,10 @@ pub(crate) fn cache_owned_plugin(plugin: &dyn std::any::Any) -> Option<CacheOwne
 }
 
 const MESH_ROUTE_DISPATCH_NAME: &str = "mesh_route_dispatch";
+const REQUEST_TRANSFORMER_NAME: &str = "request_transformer";
+const RESPONSE_TRANSFORMER_NAME: &str = "response_transformer";
 const MESH_ROUTE_DISPATCH_FINALIZER_NAME: &str = "__mesh_route_dispatch_finalizer";
+const ROUTE_HEADER_CONSUMER_STAND_IN_NAME: &str = "__route_header_transform_consumer";
 const CORS_NAME: &str = "cors";
 
 /// Warn when a proxy expresses a strict HTTP/gRPC CORS origin policy but leaves
@@ -508,6 +512,182 @@ pub(crate) fn install_mesh_route_dispatch_finalizer(
         last_index + 1,
         Arc::new(MeshRouteDispatchFinalizer { priority }),
     );
+    Ok(())
+}
+
+/// Cache-internal stand-in for an eligible route-header consumer in a protocol
+/// view that consumer does not run on.
+///
+/// `response_transformer` runs on HTTP and gRPC only, while
+/// `mesh_route_dispatch` also routes WebSocket handshakes. Without a stand-in
+/// the WebSocket view has no eligible response consumer, so proxy core would
+/// leave a matched rule's route response list unused. `request_transformer`
+/// runs on WebSocket handshakes itself, so it stays the request list's sole
+/// consumer there and no request stand-in is synthesized (the slot logic only
+/// fills a direction the view has no eligible participant for, which keeps the
+/// request list applied exactly once). The stand-in carries only the
+/// route-header finalization participation of the consumer it replaces —
+/// never that transformer's static header, query, or body rules — and sits at
+/// that consumer's chain position.
+struct RouteHeaderConsumerStandIn {
+    priority: u16,
+    request: bool,
+    response: bool,
+}
+
+#[async_trait]
+impl Plugin for RouteHeaderConsumerStandIn {
+    fn name(&self) -> &str {
+        ROUTE_HEADER_CONSUMER_STAND_IN_NAME
+    }
+
+    fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    fn supported_protocols(&self) -> &'static [crate::plugins::ProxyProtocol] {
+        crate::plugins::HTTP_FAMILY_PROTOCOLS
+    }
+
+    /// Cache-internal sentinel: never replaces a response body. Declared
+    /// explicitly for the same reason as the dispatch finalizer sentinel.
+    fn response_body_production(&self) -> crate::plugins::ResponseBodyProduction {
+        crate::plugins::ResponseBodyProduction::Never
+    }
+
+    /// Cache-internal sentinel: its only request-input effect is the declared
+    /// header map the route finalization phase writes.
+    fn declares_request_input_mutations(&self) -> bool {
+        true
+    }
+
+    /// Route request writes must reach the backend request, so the dispatcher
+    /// takes the cloned-header path exactly as for the replaced transformer.
+    fn modifies_request_headers(&self) -> bool {
+        self.request
+    }
+
+    fn participates_in_route_request_header_finalization(&self) -> bool {
+        self.request
+    }
+
+    fn participates_in_route_response_header_finalization(&self) -> bool {
+        self.response
+    }
+
+    /// The replaced `response_transformer` opts into reject hooks, so the
+    /// stand-in must too: the rejection loop finalizes the route response
+    /// list at this chain position, before later decorators such as
+    /// `security_headers`, instead of in the end-of-chain fallback after
+    /// them (which would let an earlier route write override a later scrub).
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.response
+    }
+}
+
+/// Where `filter_for_protocol` inserts route-header consumer stand-ins: the
+/// full-chain index of the last eligible consumer for each direction that the
+/// protocol view would otherwise lose, when a dispatcher in that view publishes
+/// route lists for the direction.
+#[derive(Default)]
+struct RouteHeaderConsumerStandInSlots {
+    request: Option<usize>,
+    response: Option<usize>,
+}
+
+impl RouteHeaderConsumerStandInSlots {
+    fn for_view(plugins: &[Arc<dyn Plugin>], protocol: ProxyProtocol) -> Self {
+        Self {
+            request: route_header_consumer_stand_in_slot(
+                plugins,
+                protocol,
+                |plugin| plugin.publishes_route_request_header_transforms(),
+                |plugin| plugin.participates_in_route_request_header_finalization(),
+            ),
+            response: route_header_consumer_stand_in_slot(
+                plugins,
+                protocol,
+                |plugin| plugin.publishes_route_response_header_transforms(),
+                |plugin| plugin.participates_in_route_response_header_finalization(),
+            ),
+        }
+    }
+}
+
+/// The full-chain index of the last eligible consumer (`participates`) when a
+/// dispatcher in `protocol`'s view publishes route lists (`publishes`) but the
+/// view keeps no eligible consumer for them. `None` otherwise: an RTDS-disabled
+/// consumer stays ineligible and its stand-in is never synthesized.
+fn route_header_consumer_stand_in_slot(
+    plugins: &[Arc<dyn Plugin>],
+    protocol: ProxyProtocol,
+    publishes: impl Fn(&Arc<dyn Plugin>) -> bool,
+    participates: impl Fn(&Arc<dyn Plugin>) -> bool,
+) -> Option<usize> {
+    let in_view = |plugin: &Arc<dyn Plugin>| plugin.supported_protocols().contains(&protocol);
+    let view_publishes = plugins.iter().any(|plugin| {
+        in_view(plugin) && is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME) && publishes(plugin)
+    });
+    if !view_publishes
+        || plugins
+            .iter()
+            .any(|plugin| in_view(plugin) && participates(plugin))
+    {
+        return None;
+    }
+    plugins.iter().rposition(participates)
+}
+
+/// Refuse an effective chain whose `mesh_route_dispatch` rules publish
+/// route-level header transforms that no configured transformer on the same
+/// chain can apply.
+///
+/// Proxy core applies a matched rule's `request_transform` /
+/// `response_transform` only when the chain carries an eligible
+/// `request_transformer` / `response_transformer`; without one the published
+/// list is silently dropped, so a rule that strips a sensitive request header
+/// would forward it untouched. The translators auto-emit an empty
+/// `apply_route_overrides: true` consumer; a hand-authored chain must attach
+/// one too. Presence is judged by the configured built-in instance, not by its
+/// RTDS gate: a transformer an RTDS overlay disables is still the operator's
+/// configured consumer (its kill switch must not wedge every reload), and it
+/// keeps the documented "not eligible, route list unused" behavior at runtime.
+/// `request_transformer` runs in every view the dispatcher runs in; the
+/// WebSocket view, which drops the HTTP/gRPC-only `response_transformer`, keeps
+/// an eligible response consumer through [`RouteHeaderConsumerStandIn`], so
+/// presence on the effective chain is sufficient for every view.
+pub(crate) fn validate_mesh_route_transform_consumers(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    let dispatchers = || {
+        plugins
+            .iter()
+            .filter(|plugin| is_builtin_named(plugin, MESH_ROUTE_DISPATCH_NAME))
+    };
+    let publishes_request =
+        dispatchers().any(|plugin| plugin.publishes_route_request_header_transforms());
+    let publishes_response =
+        dispatchers().any(|plugin| plugin.publishes_route_response_header_transforms());
+    if publishes_request
+        && !plugins
+            .iter()
+            .any(|plugin| is_builtin_named(plugin, REQUEST_TRANSFORMER_NAME))
+    {
+        return Err(
+            "mesh_route_dispatch rules carry request_transform, but the effective plugin chain has no request_transformer to apply them, so the route-level request header policy would be silently dropped; attach a request_transformer to this proxy (`{\"rules\": [], \"apply_route_overrides\": true}` is enough) or remove the rules' request_transform"
+                .to_string(),
+        );
+    }
+    if publishes_response
+        && !plugins
+            .iter()
+            .any(|plugin| is_builtin_named(plugin, RESPONSE_TRANSFORMER_NAME))
+    {
+        return Err(
+            "mesh_route_dispatch rules carry response_transform, but the effective plugin chain has no response_transformer to apply them, so the route-level response header policy would be silently dropped; attach a response_transformer to this proxy (`{\"rules\": [], \"apply_route_overrides\": true}` is enough) or remove the rules' response_transform"
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -1400,6 +1580,15 @@ impl Plugin for PluginInstanceWrapper {
     fn participates_in_route_response_header_finalization(&self) -> bool {
         self.inner
             .participates_in_route_response_header_finalization()
+    }
+    fn publishes_route_request_header_transforms(&self) -> bool {
+        self.inner.publishes_route_request_header_transforms()
+    }
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        self.inner.replaces_route_request_header_transforms()
+    }
+    fn publishes_route_response_header_transforms(&self) -> bool {
+        self.inner.publishes_route_response_header_transforms()
     }
     fn modifies_request_query(&self) -> bool {
         self.inner.modifies_request_query()
@@ -2513,18 +2702,85 @@ fn validate_tcp_connection_throttle_attachment(
     }
 }
 
-/// Validate protocol attachment semantics for every enabled TCP throttle in a
+/// `udp_rate_limiting` runs only as a UDP/DTLS datagram hook. A proxy or
+/// proxy-group attachment that reaches a TCP or HTTP-family proxy would be
+/// filtered out of every protocol view that proxy runs — protection that
+/// looks configured but never enforces — so it fails visibly, the mirror of
+/// [`validate_tcp_connection_throttle_attachment`]. A global policy keeps the
+/// ordinary per-protocol filtering, so a mixed deployment applies it to its
+/// UDP/DTLS listeners only.
+fn validate_udp_rate_limiting_attachment(
+    pc: &PluginConfig,
+    gateway_config: &GatewayConfig,
+) -> Result<(), String> {
+    if !pc.enabled {
+        return Ok(());
+    }
+    if pc.scope == PluginScope::Global {
+        // Filter-only by design (a mixed deployment applies it to its UDP/DTLS
+        // listeners), but a global policy with no UDP/DTLS proxy at all
+        // enforces nothing; say so instead of loading silently.
+        let mut attached = gateway_config.proxies.iter().filter(|proxy| {
+            tcp_connection_throttle_effectively_applies_to_proxy(pc, proxy, gateway_config)
+        });
+        let mut any_attached = false;
+        let covers_udp = attached.any(|proxy| {
+            any_attached = true;
+            matches!(
+                proxy.effective_scheme(),
+                BackendScheme::Udp | BackendScheme::Dtls
+            )
+        });
+        if any_attached && !covers_udp {
+            warn!(
+                plugin = "udp_rate_limiting",
+                plugin_config_id = ?pc.id,
+                "Global udp_rate_limiting has no UDP/DTLS proxy to protect; it is inert until one is configured"
+            );
+        }
+        return Ok(());
+    }
+    let unsupported: Vec<String> = gateway_config
+        .proxies
+        .iter()
+        .filter(|proxy| scoped_plugin_config_applies_to_proxy(pc, proxy))
+        .filter(|proxy| {
+            !matches!(
+                proxy.effective_scheme(),
+                BackendScheme::Udp | BackendScheme::Dtls
+            )
+        })
+        .map(|proxy| format!("{:?} ({})", proxy.id, proxy.effective_scheme()))
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "udp_rate_limiting: plugin config {:?} is attached to unsupported TCP or HTTP-family proxy/proxies {}; only UDP/DTLS is supported (use tcp_connection_throttle for TCP connection admission or rate_limiting for HTTP-family requests)",
+        pc.id,
+        unsupported.join(", ")
+    ))
+}
+
+/// Validate protocol attachment semantics for every enabled stream-only
+/// protection — `tcp_connection_throttle` and `udp_rate_limiting` — in a
 /// complete candidate graph. Admin admission and config-source validation use
 /// this before persistence/publication so unsupported protection is never
-/// accepted only to be silently filtered from a UDP/DTLS or HTTP plugin list.
+/// accepted only to be silently filtered from another protocol's plugin list.
 pub(crate) fn validate_tcp_connection_throttle_attachments(
     gateway_config: &GatewayConfig,
 ) -> Result<(), Vec<String>> {
     let errors: Vec<String> = gateway_config
         .plugin_configs
         .iter()
-        .filter(|pc| pc.enabled && pc.plugin_name == "tcp_connection_throttle")
-        .filter_map(|pc| validate_tcp_connection_throttle_attachment(pc, gateway_config).err())
+        .filter(|pc| pc.enabled)
+        .filter_map(|pc| match pc.plugin_name.as_str() {
+            "tcp_connection_throttle" => {
+                validate_tcp_connection_throttle_attachment(pc, gateway_config).err()
+            }
+            "udp_rate_limiting" => validate_udp_rate_limiting_attachment(pc, gateway_config).err(),
+            _ => None,
+        })
         .collect();
     if errors.is_empty() {
         Ok(())
@@ -2857,6 +3113,126 @@ fn try_create_plugin(
     finalize_created_plugin(pc, created)
 }
 
+/// SHA-256 policy digest of a UDP datagram-hook plugin set.
+pub(crate) type UdpDatagramPolicyDigest = [u8; 32];
+
+/// Live datagram-hook plugin instance (keyed by its `Arc` data pointer) →
+/// digest of the plugin config it was built from.
+type UdpDatagramPolicyRegistry =
+    std::sync::RwLock<HashMap<usize, (std::sync::Weak<dyn Plugin>, UdpDatagramPolicyDigest)>>;
+
+/// Process registry of datagram-hook instance policy digests, filled once per
+/// constructed instance at the cache-construction funnel and read only while
+/// a protocol entry is built. Entries are `Weak`, pruned on every insert, so
+/// retention is bounded by the live plugin generations. Never touched on a
+/// datagram path.
+static UDP_DATAGRAM_POLICY_DIGESTS: std::sync::OnceLock<UdpDatagramPolicyRegistry> =
+    std::sync::OnceLock::new();
+
+fn plugin_instance_key(plugin: &Arc<dyn Plugin>) -> usize {
+    Arc::as_ptr(plugin) as *const () as usize
+}
+
+/// Digest of everything in one plugin config that decides how its instance
+/// treats datagrams: identity (namespace, id, kind), scope and target,
+/// priority override, execution trigger, and the full config document.
+/// Timestamps and labels are excluded, so a full reload that reconstructs an
+/// unchanged config yields the same digest. `None` (fall back to instance
+/// identity) only if a component cannot be serialized.
+fn udp_datagram_plugin_config_digest(pc: &PluginConfig) -> Option<UdpDatagramPolicyDigest> {
+    use crate::fips::approved::Sha256;
+
+    let scope = serde_json::to_vec(&pc.scope).ok()?;
+    let trigger = serde_json::to_vec(&pc.trigger).ok()?;
+    let config = serde_json::to_vec(&pc.config).ok()?;
+    let priority_override = pc.priority_override.map(u16::to_le_bytes);
+    let mut hasher = Sha256::new();
+    // Length-prefixed framing: no component can be re-read as part of another.
+    let mut absorb = |label: &str, value: &[u8]| {
+        hasher.update((label.len() as u64).to_le_bytes());
+        hasher.update(label.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    };
+    absorb("v", b"ferrum-edge/udp-datagram-plugin-policy/v1");
+    absorb("namespace", pc.namespace.as_bytes());
+    absorb("id", pc.id.as_bytes());
+    absorb("plugin_name", pc.plugin_name.as_bytes());
+    absorb("scope", &scope);
+    absorb("proxy_id", pc.proxy_id.as_deref().unwrap_or("").as_bytes());
+    absorb(
+        "priority_override",
+        priority_override
+            .as_ref()
+            .map_or(&[][..], |bytes| &bytes[..]),
+    );
+    absorb("trigger", &trigger);
+    absorb("config", &config);
+    Some(hasher.finalize())
+}
+
+fn register_udp_datagram_policy_digest(pc: &PluginConfig, plugin: &Arc<dyn Plugin>) {
+    let Some(digest) = udp_datagram_plugin_config_digest(pc) else {
+        return;
+    };
+    let registry = UDP_DATAGRAM_POLICY_DIGESTS.get_or_init(Default::default);
+    let mut guard = registry
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, (weak, _)| weak.strong_count() > 0);
+    guard.insert(
+        plugin_instance_key(plugin),
+        (Arc::downgrade(plugin), digest),
+    );
+}
+
+fn registered_udp_datagram_policy_digest(
+    plugin: &Arc<dyn Plugin>,
+) -> Option<UdpDatagramPolicyDigest> {
+    let registry = UDP_DATAGRAM_POLICY_DIGESTS.get()?;
+    let guard = registry
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (weak, digest) = guard.get(&plugin_instance_key(plugin))?;
+    let live = weak.upgrade()?;
+    Arc::ptr_eq(&live, plugin).then_some(*digest)
+}
+
+/// Stable policy digest of the datagram-hook plugins in `plugins`, in chain
+/// order (`udp_rate_limiting` and every other `requires_udp_datagram_hooks`
+/// plugin; the rest are ignored because an established session never re-runs
+/// them).
+///
+/// Each instance contributes the digest of the plugin config it was built
+/// from, so a full rebuild that reconstructs semantically identical instances
+/// (file-mode `SIGHUP`, a DP full snapshot, a DB-mode full reload) yields the
+/// SAME digest and established UDP/DTLS sessions continue, while any change to
+/// a datagram plugin's config, trigger, priority, presence, or order changes
+/// it. An instance that was not built through the cache funnel contributes its
+/// `Arc` identity instead, which is the conservative (session-ending) answer.
+pub(crate) fn udp_datagram_policy_digest(plugins: &[Arc<dyn Plugin>]) -> UdpDatagramPolicyDigest {
+    use crate::fips::approved::Sha256;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-edge/udp-datagram-policy/v1");
+    for plugin in plugins
+        .iter()
+        .filter(|plugin| plugin.requires_udp_datagram_hooks())
+    {
+        match registered_udp_datagram_policy_digest(plugin) {
+            Some(digest) => {
+                hasher.update(b"cfg");
+                hasher.update(digest);
+            }
+            None => {
+                hasher.update(b"ptr");
+                hasher.update((plugin_instance_key(plugin) as u64).to_le_bytes());
+            }
+        }
+    }
+    hasher.finalize()
+}
+
 /// Apply the shared post-construction contract to a plugin instance built for
 /// `pc`: compile and admit an execution trigger, wrap a priority override, and
 /// turn a construction failure into the configured failure-policy outcome.
@@ -2920,6 +3296,9 @@ fn finalize_created_plugin(
             } else {
                 plugin
             };
+            if plugin.requires_udp_datagram_hooks() {
+                register_udp_datagram_policy_digest(pc, &plugin);
+            }
             Ok(Some(plugin))
         }
         Ok(None) => {
@@ -4579,6 +4958,38 @@ fn create_adaptive_concurrency_plugin(
 struct ProxyGroupPluginInstance {
     plugin: Arc<dyn Plugin>,
     config: PluginConfig,
+    /// Raw named-schema definition the instance's `schema_ref` resolved to
+    /// when it was constructed (`None` when the config carries no
+    /// `schema_ref`, or the name was unresolved). Loggers compile `schema_ref`
+    /// once at construction, so the referenced definition is part of what the
+    /// shared instance IS: an incremental rebuild must not retain a group
+    /// instance whose own row is unchanged when the definition it resolved has
+    /// since changed.
+    schema_ref_definition: Option<Arc<serde_json::Value>>,
+}
+
+impl ProxyGroupPluginInstance {
+    /// Record a freshly constructed group instance together with the
+    /// named-schema definition its `schema_ref` resolves to right now. Called
+    /// on the same thread, inside the same reload bracket, as the
+    /// construction itself, so the captured definition is the one the
+    /// constructor compiled.
+    fn new(plugin: Arc<dyn Plugin>, config: PluginConfig) -> Self {
+        let schema_ref_definition = proxy_group_schema_ref_definition(&config);
+        Self {
+            plugin,
+            config,
+            schema_ref_definition,
+        }
+    }
+}
+
+/// The raw named-schema definition a plugin config's `schema_ref` resolves to
+/// in the registry view of the calling thread (the open reload staging map on
+/// the reload thread, the live map elsewhere).
+fn proxy_group_schema_ref_definition(config: &PluginConfig) -> Option<Arc<serde_json::Value>> {
+    let name = config.config.get("schema_ref")?.as_str()?;
+    crate::plugins::utils::log_schema::registry::lookup_named_raw(name)
 }
 
 /// Built-in plugin types whose constructed instance can participate in a
@@ -4753,6 +5164,7 @@ fn prepare_plugin_chain(
     for result in [
         install_cors_finalizer(plugins),
         install_mesh_route_dispatch_finalizer(plugins),
+        validate_mesh_route_transform_consumers(plugins),
         validate_plugin_security_composition(plugins),
         validate_correlation_id_composition(plugins, real_ip_header),
     ] {
@@ -5537,13 +5949,29 @@ fn filter_for_protocol(
     plugins: &[Arc<dyn Plugin>],
     protocol: ProxyProtocol,
 ) -> Arc<Vec<Arc<dyn Plugin>>> {
-    Arc::new(
-        plugins
-            .iter()
-            .filter(|p| p.supported_protocols().contains(&protocol))
-            .cloned()
-            .collect(),
-    )
+    // A WebSocket view drops the HTTP/gRPC-only `response_transformer` but
+    // keeps `mesh_route_dispatch`; stand in for a route-header consumer the
+    // view lost so the matched rule's route lists still apply to the
+    // handshake. A direction the view already has an eligible consumer for
+    // (the request side, via `request_transformer`) gets no stand-in, so each
+    // list is still applied exactly once.
+    let slots = RouteHeaderConsumerStandInSlots::for_view(plugins, protocol);
+    let mut filtered = Vec::with_capacity(plugins.len());
+    for (index, plugin) in plugins.iter().enumerate() {
+        if plugin.supported_protocols().contains(&protocol) {
+            filtered.push(Arc::clone(plugin));
+        }
+        let request = slots.request == Some(index);
+        let response = slots.response == Some(index);
+        if request || response {
+            filtered.push(Arc::new(RouteHeaderConsumerStandIn {
+                priority: plugin.priority(),
+                request,
+                response,
+            }) as Arc<dyn Plugin>);
+        }
+    }
+    Arc::new(filtered)
 }
 
 /// Config-side state of global `mesh_authz` rows for one generation.
@@ -5643,6 +6071,9 @@ pub(crate) fn node_waypoint_destination_authz_ready_over_globals_for_test(
 struct ProtocolEntry {
     plugins: PluginList,
     phase: PluginPhaseData,
+    /// [`udp_datagram_policy_digest`] of `plugins`, computed once when the
+    /// entry is built. `Some` only for the UDP view.
+    udp_datagram_policy_digest: Option<UdpDatagramPolicyDigest>,
 }
 
 /// All per-proxy protocol data, swapped atomically as one unit.
@@ -5764,6 +6195,25 @@ fn is_global_plugin_instance(plugin: &Arc<dyn Plugin>, globals: &[Arc<dyn Plugin
         .any(|global| std::ptr::eq(Arc::as_ptr(global) as *const (), instance))
 }
 
+/// Global `stdout_logging` instances a route-miss summary is delivered to.
+///
+/// Keyed on the registered built-in type, never the reported name, so a custom
+/// plugin reporting `stdout_logging` is not handed proxy-less summaries. An
+/// instance with an execution trigger is skipped: nothing evaluated its
+/// trigger for a request that never reached a plugin phase.
+fn collect_unrouted_transaction_log_plugins(globals: &[Arc<dyn Plugin>]) -> Option<PluginList> {
+    let sinks: Vec<Arc<dyn Plugin>> = globals
+        .iter()
+        .filter(|plugin| {
+            is_builtin_named(plugin, "stdout_logging")
+                && !plugin.has_execution_trigger()
+                && plugin.supported_protocols().contains(&ProxyProtocol::Http)
+        })
+        .cloned()
+        .collect();
+    (!sinks.is_empty()).then(|| Arc::new(sinks))
+}
+
 fn build_protocol_entry(
     plugins: &[Arc<dyn Plugin>],
     globals: &[Arc<dyn Plugin>],
@@ -5774,9 +6224,12 @@ fn build_protocol_entry(
     if view_omits_route_admission_policy(plugins, globals, proto) {
         phase.capabilities.0 |= PluginCapabilities::OMITS_ROUTE_ADMISSION_POLICY;
     }
+    let udp_datagram_policy_digest =
+        (proto == ProxyProtocol::Udp).then(|| udp_datagram_policy_digest(&filtered));
     ProtocolEntry {
         plugins: filtered,
         phase,
+        udp_datagram_policy_digest,
     }
 }
 
@@ -5815,6 +6268,7 @@ fn build_grpc_web_protocol_entry(plugins: &[Arc<dyn Plugin>]) -> ProtocolEntry {
     ProtocolEntry {
         plugins: composed,
         phase,
+        udp_datagram_policy_digest: None,
     }
 }
 
@@ -6115,6 +6569,12 @@ pub(crate) struct PluginCacheInner {
     pub(crate) proxy_plugins: ProxyPluginMap,
     /// Fallback: global plugins only (for proxies with no scoped overrides).
     global_plugins: PluginList,
+    /// Global `stdout_logging` instances without an execution trigger, in
+    /// configured order: the access logs a request that matched no proxy
+    /// (route-miss `404`) is delivered to. `None` when there are none, so the
+    /// route-miss arm pays one pointer check and nothing else. Trigger-gated
+    /// instances are excluded because no request hook evaluated their trigger.
+    unrouted_transaction_log_plugins: Option<PluginList>,
     /// Pre-computed: does any plugin for this proxy require response body buffering?
     requires_buffering: BufferingMap,
     /// Whether global-only plugins require response body buffering (fallback).
@@ -6317,9 +6777,12 @@ impl PluginCacheInner {
             crate::plugins::mesh::bpf_metrics::MeshBpfMetricsExporter,
         >,
     ) -> Self {
+        let unrouted_transaction_log_plugins =
+            collect_unrouted_transaction_log_plugins(global_plugins.as_slice());
         Self {
             proxy_plugins,
             global_plugins,
+            unrouted_transaction_log_plugins,
             requires_buffering,
             global_requires_buffering,
             requires_request_buffering,
@@ -6432,6 +6895,14 @@ impl PluginCacheInner {
         self.protocol_snapshot.node_waypoint_destination_authz_ready
     }
 
+    /// Global access logs for a request that matched no proxy, or `None` when
+    /// this generation has none. Precomputed at cache construction; an
+    /// `Arc` clone on a route miss, nothing when no global logger exists.
+    #[inline]
+    pub(crate) fn unrouted_transaction_log_plugins(&self) -> Option<Arc<Vec<Arc<dyn Plugin>>>> {
+        self.unrouted_transaction_log_plugins.clone()
+    }
+
     fn protocol_entry(&self, proxy_key: &str, protocol: ProxyProtocol) -> Option<&ProtocolEntry> {
         self.protocol_snapshot
             .proxy
@@ -6469,6 +6940,24 @@ impl PluginCacheInner {
             write_namespaced_runtime_key(&mut key, namespace, proxy_id);
             self.get_plugins_for_protocol(key.as_str(), protocol)
         })
+    }
+
+    /// Precomputed [`udp_datagram_policy_digest`] of the UDP plugin list
+    /// [`Self::plugins_for_protocol`] returns for `(namespace, proxy_id)`.
+    /// Lock-free and allocation-free when the entry exists (the digest was
+    /// computed when the entry was built); a missing entry is the empty set.
+    pub(crate) fn udp_datagram_policy_digest(
+        &self,
+        namespace: &str,
+        proxy_id: &str,
+    ) -> UdpDatagramPolicyDigest {
+        let precomputed = PROXY_KEY_BUF.with(|buf| {
+            let mut key = buf.borrow_mut();
+            write_namespaced_runtime_key(&mut key, namespace, proxy_id);
+            self.protocol_entry(key.as_str(), ProxyProtocol::Udp)
+                .and_then(|entry| entry.udp_datagram_policy_digest)
+        });
+        precomputed.unwrap_or_else(|| udp_datagram_policy_digest(&[]))
     }
 
     /// Authenticate-phase plugins for a composed `proxy_key` + protocol.
@@ -7397,6 +7886,18 @@ impl PluginCache {
         inner.grpc_web_request_view(namespace, proxy_id)
     }
 
+    /// Global access logs a request that matched no proxy is delivered to
+    /// (route-miss `404`), in configured order; empty when the published
+    /// generation has none.
+    #[allow(dead_code)] // Inspection API for external tests; the proxy reads the epoch's inner cache.
+    pub fn unrouted_transaction_log_plugins(&self) -> Vec<Arc<dyn Plugin>> {
+        self.inner
+            .load()
+            .unrouted_transaction_log_plugins()
+            .map(|plugins| plugins.to_vec())
+            .unwrap_or_default()
+    }
+
     /// Atomically rebuild the cache when config changes. Most old plugin
     /// instances are dropped only after in-flight requests release them;
     /// adaptive-concurrency and TCP-throttle policies additionally carry
@@ -7712,6 +8213,19 @@ impl PluginCache {
                 HashMap::new()
             };
 
+        // Unwind-safety net for the named-schema reload bracket opened below:
+        // the explicit commit/abort calls on every normal path disarm it, and
+        // its `Drop` discards the staging map if construction panics before
+        // either runs (see `registry::begin_reload_guarded`).
+        let _schema_reload_guard = if rebuild_globals {
+            Some(
+                crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                    .map_err(|error| format!("Config reload rejected: {error}"))?,
+            )
+        } else {
+            None
+        };
+
         // Rebuild globals if any global plugin config changed
         let mut new_globals = if rebuild_globals {
             let mut global_plugins: Vec<Arc<dyn Plugin>> = Vec::new();
@@ -7728,9 +8242,8 @@ impl PluginCache {
             // `transaction_log_schema` itself changed — the bracket is
             // cheap (one Mutex acquire + empty HashMap) and guarantees
             // the registry stays in sync even if a sibling global plugin
-            // was the trigger for the rebuild.
-            crate::plugins::utils::log_schema::registry::begin_reload()
-                .map_err(|error| format!("Config reload rejected: {error}"))?;
+            // was the trigger for the rebuild. The bracket itself was opened
+            // just above, guarded against unwinding.
             for pc in &config.plugin_configs {
                 if !pc.enabled || pc.scope != PluginScope::Global {
                     continue;
@@ -7894,6 +8407,16 @@ impl PluginCache {
         // instances that are still referenced in the post-delta config. This
         // keeps state shared with unchanged proxies but drops cascade-deleted
         // group state once the last proxy association is removed.
+        //
+        // A retained instance must also still resolve the same named-schema
+        // definition: loggers compile `schema_ref` at construction, so when a
+        // global `transaction_log_schema` change re-staged the registry
+        // (`rebuild_globals`) and the definition a group instance resolved has
+        // changed, retaining it would keep emitting the old output contract
+        // (for example a newly added privacy `omit`) indefinitely. Such groups
+        // are reconstructed against the staged registry below, and every proxy
+        // associated with them is rebuilt so they keep sharing one instance.
+        let mut schema_invalidated_groups: Vec<NamespacedResourceId> = Vec::new();
         let mut group_plugin_instances: ProxyGroupInstanceMap = current
             .proxy_group_plugins
             .iter()
@@ -7902,6 +8425,12 @@ impl PluginCache {
                     return None;
                 }
                 let pc = proxy_group_configs.get(identity)?;
+                if rebuild_globals
+                    && proxy_group_schema_ref_definition(pc) != existing.schema_ref_definition
+                {
+                    schema_invalidated_groups.push(identity.clone());
+                    return None;
+                }
                 if pc.plugin_name == "adaptive_concurrency"
                     && !adaptive_concurrency_instances
                         .contains_key(&adaptive_concurrency_policy_id(pc))
@@ -7921,6 +8450,22 @@ impl PluginCache {
                 }
             })
             .collect();
+        if !schema_invalidated_groups.is_empty() {
+            for proxy in &config.proxies {
+                let references_invalidated_group = proxy.plugins.iter().any(|assoc| {
+                    schema_invalidated_groups.iter().any(|identity| {
+                        *identity
+                            == NamespacedResourceId::new(
+                                proxy.namespace.as_str(),
+                                assoc.plugin_config_id.as_str(),
+                            )
+                    })
+                });
+                if references_invalidated_group {
+                    proxy_ids_to_rebuild.insert(proxy_namespaced_id(proxy));
+                }
+            }
+        }
         if let Some(forced) = forced_country_mmdb_instances {
             for (id, plugin_config) in &active_country_mmdb_configs {
                 if plugin_config.scope != PluginScope::ProxyGroup {
@@ -7932,10 +8477,7 @@ impl PluginCache {
                             plugin_config.namespace.as_str(),
                             plugin_config.id.as_str(),
                         ),
-                        ProxyGroupPluginInstance {
-                            plugin: Arc::clone(plugin),
-                            config: (*plugin_config).clone(),
-                        },
+                        ProxyGroupPluginInstance::new(Arc::clone(plugin), (*plugin_config).clone()),
                     );
                 }
             }
@@ -8050,10 +8592,10 @@ impl PluginCache {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
@@ -8604,6 +9146,23 @@ impl PluginCache {
         total
     }
 
+    /// Live TCP connections currently admitted by every `tcp_connection_throttle`
+    /// policy in the published generation, summed across keys.
+    ///
+    /// Read on demand for authenticated `/admin/metrics`: it walks each
+    /// policy's counter map and adds nothing to the stream admission path.
+    /// Connections still held by a policy that was since removed finish against
+    /// their detached state and are not counted here.
+    pub fn tcp_connection_throttle_active_connections(&self) -> u64 {
+        self.inner
+            .load()
+            .tcp_connection_throttle_instances
+            .values()
+            .fold(0u64, |total, instance| {
+                total.saturating_add(instance.state.active_connections())
+            })
+    }
+
     /// Deduplicated immutable country-MMDB bytes retained by the live cache
     /// generation. Exposed for diagnostics and admission regression tests.
     pub fn country_mmdb_snapshot_bytes(&self) -> u64 {
@@ -8676,8 +9235,11 @@ impl PluginCache {
         // the rest of the plugin-cache build succeeds; `abort_reload`
         // runs if any plugin fails validation, so the process-global
         // registry stays atomically tied to the cache.
-        crate::plugins::utils::log_schema::registry::begin_reload()
-            .map_err(|error| format!("Gateway startup aborted: {error}"))?;
+        // The guard is an unwind-safety net only: the explicit commit/abort
+        // calls below close the bracket on every normal path.
+        let _schema_reload_guard =
+            crate::plugins::utils::log_schema::registry::begin_reload_guarded()
+                .map_err(|error| format!("Gateway startup aborted: {error}"))?;
         for pc in &config.plugin_configs {
             if !pc.enabled || pc.scope != PluginScope::Global {
                 continue;
@@ -8857,10 +9419,10 @@ impl PluginCache {
                             Ok(Some(plugin)) => {
                                 group_plugin_instances.insert(
                                     group_identity.clone(),
-                                    ProxyGroupPluginInstance {
-                                        plugin: Arc::clone(&plugin),
-                                        config: (*pc).clone(),
-                                    },
+                                    ProxyGroupPluginInstance::new(
+                                        Arc::clone(&plugin),
+                                        (*pc).clone(),
+                                    ),
                                 );
                                 remove_shadowed_global_plugin(&mut merged, &global_ptrs, &plugin);
                                 merged.push(plugin);
