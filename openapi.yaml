@@ -33565,9 +33565,12 @@ components:
             function result like an API Gateway proxy integration: a JSON
             object with `statusCode` (integer 200-599) is a structured
             response with optional `headers`, `multiValueHeaders`, `cookies`
-            (one Set-Cookie each), `body`, and `isBase64Encoded`; any other
-            JSON value is returned with status 200 and content-type
-            application/json. Mapped headers are sanitized like provider
+            (one Set-Cookie each), `body`, and `isBase64Encoded`, with an
+            identical name/value pair in `headers` and `multiValueHeaders`
+            merged into one field line and at most 128 header field lines /
+            32 KiB of header names and values; a JSON string result is
+            returned as the decoded string and any other JSON value as its JSON
+            text, both with status 200 and content-type application/json. Mapped headers are sanitized like provider
             response headers. A duplicate-member or malformed result fails
             with `invalid_api_gateway_response` under `on_error`. Native gRPC
             terminate requests are refused before invocation with

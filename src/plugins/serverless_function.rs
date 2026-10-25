@@ -2267,23 +2267,82 @@ fn invalid_api_gateway_response(operator_detail: &'static str) -> InvocationFail
     InvocationFailure::function_output(INVALID_API_GATEWAY_RESPONSE, operator_detail)
 }
 
-fn append_api_gateway_header(
-    headers: &mut http::HeaderMap,
-    name: &str,
-    value: &str,
-) -> Result<(), InvocationFailure> {
-    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-        invalid_api_gateway_response(
-            "API Gateway response header name is not a valid HTTP field name",
-        )
-    })?;
-    let value = HeaderValue::from_str(value).map_err(|_| {
-        invalid_api_gateway_response(
-            "API Gateway response header value is not a valid HTTP field value",
-        )
-    })?;
-    headers.append(name, value);
-    Ok(())
+/// Most response header field lines one API Gateway result may author
+/// (`headers`, `multiValueHeaders`, and `cookies` together). Far above any
+/// real proxy-integration response, and far below the `http::HeaderMap`
+/// capacity whose overflow would panic.
+const MAX_API_GATEWAY_RESPONSE_HEADER_FIELDS: usize = 128;
+/// Aggregate name + value bytes across those field lines, matching the
+/// default `FERRUM_MAX_HEADER_SIZE_BYTES` header budget.
+const MAX_API_GATEWAY_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
+
+/// Function-authored response header field lines, bounded in count and bytes
+/// before any `HeaderMap` is built.
+#[derive(Default)]
+struct ApiGatewayResponseHeaders {
+    fields: Vec<(HeaderName, HeaderValue)>,
+    bytes: usize,
+}
+
+impl ApiGatewayResponseHeaders {
+    /// Add one field line. With `merge_identical`, a name/value pair already
+    /// present (names compared case-insensitively) is not added again: API
+    /// Gateway merges `headers` and `multiValueHeaders` that way, so the same
+    /// `Location` in both containers is one field line, not a repeated
+    /// singleton the sanitizer would have to drop.
+    fn push(
+        &mut self,
+        name: &str,
+        value: &str,
+        merge_identical: bool,
+    ) -> Result<(), InvocationFailure> {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            invalid_api_gateway_response(
+                "API Gateway response header name is not a valid HTTP field name",
+            )
+        })?;
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            invalid_api_gateway_response(
+                "API Gateway response header value is not a valid HTTP field value",
+            )
+        })?;
+        if merge_identical
+            && self.fields.iter().any(|(existing_name, existing_value)| {
+                *existing_name == name && *existing_value == value
+            })
+        {
+            return Ok(());
+        }
+        if self.fields.len() >= MAX_API_GATEWAY_RESPONSE_HEADER_FIELDS {
+            return Err(invalid_api_gateway_response(
+                "API Gateway response declares too many header field lines",
+            ));
+        }
+        self.bytes = self
+            .bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.len());
+        if self.bytes > MAX_API_GATEWAY_RESPONSE_HEADER_BYTES {
+            return Err(invalid_api_gateway_response(
+                "API Gateway response headers exceed the aggregate header budget",
+            ));
+        }
+        self.fields.push((name, value));
+        Ok(())
+    }
+
+    /// The bounded field lines as a `HeaderMap`, using only the non-panicking
+    /// capacity APIs.
+    fn into_header_map(self) -> Result<http::HeaderMap, InvocationFailure> {
+        let capacity_error =
+            || invalid_api_gateway_response("API Gateway response headers exceed header capacity");
+        let mut map =
+            http::HeaderMap::try_with_capacity(self.fields.len()).map_err(|_| capacity_error())?;
+        for (name, value) in self.fields {
+            map.try_append(name, value).map_err(|_| capacity_error())?;
+        }
+        Ok(map)
+    }
 }
 
 /// Map a Lambda result written for an API Gateway proxy integration to the
@@ -2291,10 +2350,14 @@ fn append_api_gateway_header(
 ///
 /// - A JSON object with `statusCode` is a structured response: `statusCode`
 ///   (an integer in 200-599, the statuses terminate mode returns), optional
-///   `headers` (string values), `multiValueHeaders` (arrays of strings),
-///   `cookies` (one `Set-Cookie` each), `body` (a string), and
-///   `isBase64Encoded` (decode `body` from standard base64). Other members are
-///   ignored, as API Gateway ignores them.
+///   `headers` (string values), `multiValueHeaders` (arrays of strings, merged
+///   with `headers` so an identical name/value pair counts once), `cookies`
+///   (one `Set-Cookie` each), `body` (a string), and `isBase64Encoded` (decode
+///   `body` from standard base64). Other members are ignored, as API Gateway
+///   ignores them. At most 128 header field lines and 32 KiB of header
+///   names and values are accepted.
+/// - A JSON string is the decoded string as the body, with status 200 and
+///   `content-type: application/json`, as API Gateway returns it.
 /// - Any other JSON value is returned as-is with status 200 and
 ///   `content-type: application/json`.
 ///
@@ -2314,13 +2377,21 @@ fn api_gateway_v2_terminate_response(
     }
     let parsed: Value = serde_json::from_slice(&body)
         .map_err(|_| invalid_api_gateway_response("API Gateway response is not valid JSON"))?;
-    let Some(object) = parsed
-        .as_object()
-        .filter(|object| object.contains_key("statusCode"))
-    else {
+    let inferred_headers = || {
         let mut headers = HashMap::with_capacity(1);
         headers.insert("content-type".to_string(), "application/json".to_string());
-        return Ok((200, headers, body));
+        headers
+    };
+    let object = match &parsed {
+        Value::Object(object) if object.contains_key("statusCode") => object,
+        Value::String(text) => {
+            return Ok((
+                200,
+                inferred_headers(),
+                Bytes::copy_from_slice(text.as_bytes()),
+            ));
+        }
+        _ => return Ok((200, inferred_headers(), body)),
     };
 
     let status = object
@@ -2335,7 +2406,7 @@ fn api_gateway_v2_terminate_response(
     // Lossless: the range check above bounds it to 599.
     let status = status as u16;
 
-    let mut header_map = http::HeaderMap::new();
+    let mut response_headers = ApiGatewayResponseHeaders::default();
     if let Some(headers) = object.get("headers") {
         let headers = headers.as_object().ok_or_else(|| {
             invalid_api_gateway_response("API Gateway `headers` must be an object")
@@ -2344,7 +2415,7 @@ fn api_gateway_v2_terminate_response(
             let value = value.as_str().ok_or_else(|| {
                 invalid_api_gateway_response("API Gateway `headers` values must be strings")
             })?;
-            append_api_gateway_header(&mut header_map, name, value)?;
+            response_headers.push(name, value, true)?;
         }
     }
     if let Some(headers) = object.get("multiValueHeaders") {
@@ -2363,7 +2434,7 @@ fn api_gateway_v2_terminate_response(
                         "API Gateway `multiValueHeaders` values must be arrays of strings",
                     )
                 })?;
-                append_api_gateway_header(&mut header_map, name, value)?;
+                response_headers.push(name, value, true)?;
             }
         }
     }
@@ -2375,9 +2446,10 @@ fn api_gateway_v2_terminate_response(
             let cookie = cookie.as_str().ok_or_else(|| {
                 invalid_api_gateway_response("API Gateway `cookies` must be an array of strings")
             })?;
-            append_api_gateway_header(&mut header_map, "set-cookie", cookie)?;
+            response_headers.push("set-cookie", cookie, false)?;
         }
     }
+    let header_map = response_headers.into_header_map()?;
 
     let is_base64_encoded = match object.get("isBase64Encoded") {
         None => false,

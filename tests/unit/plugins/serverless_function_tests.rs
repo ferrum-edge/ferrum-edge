@@ -8458,3 +8458,142 @@ async fn test_default_chain_without_credentials_fails_before_invocation() {
         "nothing is sent without a usable credential"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #6843 fix round 1: API Gateway response header bounds, merge, and
+// string inference
+// ---------------------------------------------------------------------------
+
+async fn api_gateway_v2_terminate(result: Value) -> PluginResult {
+    let server =
+        lambda_result_server(wiremock::ResponseTemplate::new(200).set_body_json(result)).await;
+    let plugin = api_gateway_v2_plugin(&server, json!({"error_status_code": 502}));
+    plugin
+        .finalized_egress(&mut create_test_context(), &mut HashMap::new())
+        .await
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_header_count_and_bytes_are_bounded_without_panicking() {
+    // 40,000 distinct names would exceed `http::HeaderMap` capacity, whose
+    // panicking `append` aborts a `panic = "abort"` gateway. 129 exceeds the
+    // field-line bound; two 20 KiB values exceed the aggregate byte budget.
+    let many: serde_json::Map<String, Value> = (0..40_000)
+        .map(|index| (format!("x-{index}"), json!("v")))
+        .collect();
+    let just_over: serde_json::Map<String, Value> = (0..129)
+        .map(|index| (format!("x-{index}"), json!("v")))
+        .collect();
+    let big = "a".repeat(20 * 1024);
+    for result in [
+        json!({"statusCode": 200, "headers": many}),
+        json!({"statusCode": 200, "headers": just_over}),
+        json!({"statusCode": 200, "multiValueHeaders": {"x-big": [big.clone(), big.clone() + "b"]}}),
+    ] {
+        match api_gateway_v2_terminate(result).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 502);
+                assert!(body.contains("invalid_api_gateway_response"), "{body}");
+            }
+            other => panic!("expected a bounded refusal, got {other:?}"),
+        }
+    }
+
+    let at_limit: serde_json::Map<String, Value> = (0..128)
+        .map(|index| (format!("x-{index}"), json!("v")))
+        .collect();
+    match api_gateway_v2_terminate(json!({"statusCode": 200, "headers": at_limit})).await {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert_eq!(headers.get("x-127").map(String::as_str), Some("v"));
+        }
+        other => panic!("128 field lines are accepted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_merges_identical_single_and_multi_value_headers() {
+    match api_gateway_v2_terminate(json!({
+        "statusCode": 302,
+        "headers": {
+            "Location": "https://public.example/login",
+            "Content-Type": "application/json"
+        },
+        "multiValueHeaders": {
+            "location": ["https://public.example/login"],
+            "CONTENT-TYPE": ["application/json"],
+            "x-list": ["a", "b"]
+        },
+        "body": ""
+    }))
+    .await
+    {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 302);
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://public.example/login"),
+                "an identical pair in both containers is one Location"
+            );
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert_eq!(headers.get("x-list").map(String::as_str), Some("a, b"));
+        }
+        other => panic!("expected the redirect, got {other:?}"),
+    }
+
+    // Genuinely conflicting singleton values still fail closed.
+    match api_gateway_v2_terminate(json!({
+        "statusCode": 302,
+        "headers": {"Location": "https://public.example/a"},
+        "multiValueHeaders": {"Location": ["https://public.example/b"]}
+    }))
+    .await
+    {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(!headers.contains_key("location"), "{headers:?}");
+        }
+        other => panic!("expected the response without Location, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[parallel(serverless_env)]
+async fn test_api_gateway_v2_string_result_is_the_decoded_body() {
+    for (result, expected) in [
+        (json!("Hello from Lambda!"), "Hello from Lambda!"),
+        (json!("line one\nsaid \"hi\""), "line one\nsaid \"hi\""),
+        (json!(""), ""),
+    ] {
+        match api_gateway_v2_terminate(result).await {
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, 200);
+                assert_eq!(body.as_ref(), expected.as_bytes());
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some("application/json")
+                );
+            }
+            other => panic!("expected the decoded string body, got {other:?}"),
+        }
+    }
+
+    // Non-string, non-structured values keep their JSON text.
+    match api_gateway_v2_terminate(json!([1, 2])).await {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(body.as_ref(), b"[1,2]"),
+        other => panic!("expected the JSON body, got {other:?}"),
+    }
+}

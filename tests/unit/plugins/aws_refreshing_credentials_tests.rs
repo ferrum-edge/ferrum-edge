@@ -104,11 +104,26 @@ async fn fresh_credentials_are_reused_without_refetching() {
 #[tokio::test]
 async fn credentials_inside_the_refresh_window_renew_in_the_background() {
     // Every credential expires in 30 minutes and the refresh window is one
-    // hour, so each one is due for renewal as soon as it is cached.
-    let (fetcher, calls) = counting_fetcher(
-        Duration::from_millis(50),
-        plan(|generation| Ok(snapshot(generation, Some(Duration::from_secs(1800))))),
-    );
+    // hour, so each one is due for renewal as soon as it is cached. Every
+    // renewal is held until the test releases it, so "the request did not
+    // wait" is proven by completing while the provider is still blocked, not
+    // by a wall-clock threshold.
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicU64::new(0));
+    let fetcher: AwsCredentialFetcher = {
+        let release = Arc::clone(&release);
+        let calls = Arc::clone(&calls);
+        Arc::new(move || -> AwsCredentialFetchFuture {
+            let generation = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let release = Arc::clone(&release);
+            Box::pin(async move {
+                if generation > 1 {
+                    release.notified().await;
+                }
+                Ok::<_, String>(snapshot(generation, Some(Duration::from_secs(1800))))
+            })
+        })
+    };
     let cache = RefreshingAwsCredentials::with_timing(
         fetcher,
         timing(Duration::from_secs(3600), Duration::from_secs(5)),
@@ -117,25 +132,25 @@ async fn credentials_inside_the_refresh_window_renew_in_the_background() {
     let first = cache.credentials().await.expect("first credential");
     assert_eq!(first.access_key_id(), "ASIAGENERATION0001");
 
-    // Still valid: returned immediately while the renewal runs, never waiting
-    // for the 50 ms fetch.
-    let started = tokio::time::Instant::now();
-    let second = cache.credentials().await.expect("still-valid credential");
+    // The renewal this starts stays blocked; the still-valid credential is
+    // returned anyway.
+    let second = tokio::time::timeout(Duration::from_secs(5), cache.credentials())
+        .await
+        .expect("a request inside the refresh window must not wait for the refresh")
+        .expect("still-valid credential");
     assert_eq!(second.access_key_id(), "ASIAGENERATION0001");
-    assert!(
-        started.elapsed() < Duration::from_millis(40),
-        "a request inside the refresh window must not wait for the refresh"
-    );
 
+    release.notify_one();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let current = cache.credentials().await.expect("credential");
-        if current.access_key_id() != "ASIAGENERATION0001" {
+        if current.access_key_id() == "ASIAGENERATION0002" {
             break;
         }
+        assert_eq!(current.access_key_id(), "ASIAGENERATION0001");
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the background refresh never published a renewed credential"
+            "the released refresh never published a renewed credential"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -148,7 +163,9 @@ async fn expired_credentials_are_refused_when_renewal_fails() {
         Duration::ZERO,
         plan(|generation| {
             if generation == 1 {
-                Ok(snapshot(generation, Some(Duration::from_millis(300))))
+                // Long enough that no scheduling stall makes the first answer
+                // look expired; the test then waits past it.
+                Ok(snapshot(generation, Some(Duration::from_secs(2))))
             } else {
                 Err("provider unavailable".to_string())
             }
@@ -162,7 +179,7 @@ async fn expired_credentials_are_refused_when_renewal_fails() {
         .credentials()
         .await
         .expect("the first credential is valid");
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
 
     let refused = cache
         .credentials()
