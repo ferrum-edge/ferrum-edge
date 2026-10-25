@@ -682,7 +682,13 @@ async fn later_instances_preserve_an_earlier_authoritative_assertion() {
     }))
     .unwrap();
 
-    for later in [&non_injecting, &fail_open] {
+    // (later instance, final geo.decision / geo.country pair). The metadata
+    // pair always describes the LAST evaluation, while the private assertion
+    // and its header keep the earlier authoritative value.
+    for (later, expected_metadata) in [
+        (&non_injecting, (Some("allowed"), Some("SE"))),
+        (&fail_open, (Some("db_not_loaded_allowed"), None)),
+    ] {
         let mut ctx = materialized_spoofed_context("89.160.20.112");
         assert!(matches!(
             authoritative.on_request_received(&mut ctx).await,
@@ -697,6 +703,62 @@ async fn later_instances_preserve_an_earlier_authoritative_assertion() {
             ctx.headers.get("x-geo-country").map(String::as_str),
             Some("SE"),
             "a later non-authoritative instance must not erase an earlier assertion"
+        );
+        assert_eq!(ctx.backend_geo_country(), Some("SE"));
+        let (decision, country) = request_geo_metadata(&ctx);
+        assert_eq!(
+            (decision.as_deref(), country.as_deref()),
+            expected_metadata,
+            "the final metadata pair must describe the last evaluation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn later_stream_instances_record_the_last_evaluation_metadata_pair() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let resolving = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let also_resolving = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let fail_open = GeoRestriction::new(&json!({
+        "db_path": "/nonexistent/path/to/test.mmdb",
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+
+    for (later, expected_metadata) in [
+        (&also_resolving, (Some("allowed"), Some("SE"))),
+        (&fail_open, (Some("db_not_loaded_allowed"), None)),
+    ] {
+        let mut stream = geo_stream_context("89.160.20.112");
+        assert!(matches!(
+            resolving.on_stream_connect(&mut stream).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            stream_geo_metadata(&stream),
+            (Some("allowed".to_string()), Some("SE".to_string()))
+        );
+        assert!(matches!(
+            later.on_stream_connect(&mut stream).await,
+            PluginResult::Continue
+        ));
+        let (decision, country) = stream_geo_metadata(&stream);
+        assert_eq!(
+            (decision.as_deref(), country.as_deref()),
+            expected_metadata,
+            "the final stream metadata pair must describe the last evaluation"
         );
     }
 }

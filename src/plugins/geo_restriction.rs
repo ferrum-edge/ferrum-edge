@@ -683,8 +683,17 @@ impl Plugin for GeoRestriction {
             GEO_DECISION_METADATA_KEY.to_string(),
             decision.as_str().to_string(),
         );
-        if let Some(code) = country {
-            ctx.insert_metadata(GEO_COUNTRY_METADATA_KEY.to_string(), code.into_string());
+        // The pair always describes THIS evaluation: an unresolved lookup
+        // removes a country an earlier instance recorded.
+        match country {
+            Some(code) => {
+                ctx.insert_metadata(GEO_COUNTRY_METADATA_KEY.to_string(), code.into_string())
+            }
+            None => {
+                if let Some(metadata) = ctx.metadata.as_mut() {
+                    metadata.remove(GEO_COUNTRY_METADATA_KEY);
+                }
+            }
         }
         result
     }
@@ -699,9 +708,17 @@ impl Plugin for GeoRestriction {
             GEO_DECISION_METADATA_KEY.to_string(),
             decision.as_str().to_string(),
         );
-        if let Some(code) = country {
-            ctx.metadata
-                .insert(GEO_COUNTRY_METADATA_KEY.to_string(), code.into_string());
+        // The pair always describes THIS evaluation: an unresolved lookup
+        // removes a country an earlier instance recorded. The private country
+        // assertion and its header are deliberately left alone below.
+        match country {
+            Some(code) => {
+                ctx.metadata
+                    .insert(GEO_COUNTRY_METADATA_KEY.to_string(), code.into_string());
+            }
+            None => {
+                ctx.metadata.remove(GEO_COUNTRY_METADATA_KEY);
+            }
         }
 
         // Header materialization centrally strips every client-supplied value
