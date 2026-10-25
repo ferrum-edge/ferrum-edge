@@ -139,6 +139,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`mesh_outbound_registry` (mesh REGISTRY_ONLY) review hardening.**
+  - Mesh-derived registries drop slice hosts or names outside the registry
+    entry grammar (ServiceEntry host `*`, `foo.*.example.com`, underscore
+    names, port `0`) with one `warn` per resource host naming the resource.
+    The dropped destination stays denied and the rest of the registry
+    applies identically on the HTTP plugin, the stream lane, and the
+    egress-scope diagnostics; previously one such resource failed the whole
+    HTTP-lane config while the stream lane degraded to deny-all.
+    Operator-authored registries stay strict.
+  - Request `Host` / `:authority` ports use the registry port grammar
+    (decimal 1–65535): `svc:0` no longer satisfies `svc:*`, and `svc:+8443`
+    no longer satisfies `svc:8443`. The admin `POST /mesh/egress-scope/test`
+    dry run shares this parser, so a `host` such as `svc:0` now reports a
+    deny instead of a 400 (an explicit `port: 0` is still a 400).
+  - New optional `wildcard_match` (`one_label` default, or `dns_suffix`).
+    `dns_suffix` gives operator-managed instances Envoy/Istio-style any-depth
+    suffix wildcards (`*.example.com` admits `a.b.example.com`). Mesh
+    auto-injection keeps `one_label`, the wildcard contract shared with
+    Sidecar egress scoping, the mesh DNS proxy, and the stream lane.
+  - HTTP-lane denials (plugin hook and outbound-capture route miss) log a
+    process-wide rate-limited `warn` naming the denied `host`, `port`,
+    `listen_port`, `client`, and `source`; the fixed-cardinality `<denied>`
+    metric bucket is unchanged.
+  - The request hook normalizes the host once per request and maps the match
+    kind straight to its metric bucket instead of re-normalizing twice.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

@@ -6668,6 +6668,18 @@ pub mod _test_support {
         plugin.reset_rate_limit_rejection_warn_for_test();
     }
 
+    // ── plugins/mesh/outbound_registry ───────────────────────────────────────
+    /// Reset the process-wide HTTP REGISTRY_ONLY denial-log limiter so a
+    /// capture test can observe the next denial line.
+    pub fn mesh_outbound_registry_reset_http_deny_warn_for_test() {
+        crate::plugins::mesh::outbound_registry::reset_http_deny_warn_for_test();
+    }
+
+    /// Request-authority split used by `mesh_outbound_registry`.
+    pub fn mesh_outbound_registry_split_host_header_for_test(value: &str) -> (&str, Option<u16>) {
+        crate::plugins::mesh::outbound_registry::split_host_header(value)
+    }
+
     // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
     pub fn atomic_log_rate_limiter_with_window_for_test(
         window_ms: u64,

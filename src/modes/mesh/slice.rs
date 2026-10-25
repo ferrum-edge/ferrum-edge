@@ -1086,6 +1086,14 @@ impl MeshSlice {
     /// Returned entries are alphabetically sorted so the plugin config is
     /// deterministic across reloads (preventing spurious slice-update
     /// re-broadcasts via `content_eq`).
+    ///
+    /// Every returned entry satisfies the `mesh_outbound_registry` entry
+    /// grammar. A slice host/name outside it (ServiceEntry `*`, an underscore
+    /// name, a zero port) is dropped with a structured warning naming the
+    /// resource, so it stays denied while the rest of the registry applies.
+    /// The HTTP plugin, the stream lane, and the egress-scope diagnostics all
+    /// read this builder, so they narrow identically instead of the HTTP lane
+    /// rejecting the whole config. Operator-authored registries stay strict.
     pub fn build_known_destinations(&self, cluster_domain: &str) -> Vec<String> {
         let mut entries: HashSet<String> = HashSet::new();
         let cluster_domain = normalize_known_destination_host(cluster_domain).unwrap_or_default();
@@ -1104,32 +1112,59 @@ impl MeshSlice {
             } else {
                 format!("{svc}.{cluster_domain}")
             };
+            let source = KnownDestinationSource {
+                kind: "Service",
+                namespace: &service.namespace,
+                name: &service.name,
+            };
             if local_namespace.as_deref() == Some(namespace.as_str()) {
                 insert_known_destination(
                     &mut entries,
+                    source,
                     &service_name,
                     service.ports.iter().map(|p| p.port),
                 );
             }
             for host in [&namespaced, &svc, &fqdn] {
-                insert_known_destination(&mut entries, host, service.ports.iter().map(|p| p.port));
+                insert_known_destination(
+                    &mut entries,
+                    source,
+                    host,
+                    service.ports.iter().map(|p| p.port),
+                );
             }
         }
         for entry in &self.service_entries {
+            let source = KnownDestinationSource {
+                kind: "ServiceEntry",
+                namespace: &entry.namespace,
+                name: &entry.name,
+            };
             for host in &entry.hosts {
                 let Some(host) = normalize_known_destination_host(host) else {
                     continue;
                 };
-                insert_known_destination(&mut entries, &host, entry.ports.iter().map(|p| p.port));
+                insert_known_destination(
+                    &mut entries,
+                    source,
+                    &host,
+                    entry.ports.iter().map(|p| p.port),
+                );
             }
         }
         for workload in &self.workloads {
+            let source = KnownDestinationSource {
+                kind: "Workload",
+                namespace: &workload.namespace,
+                name: &workload.service_name,
+            };
             for addr in &workload.addresses {
                 let Some(addr) = normalize_known_destination_host(addr) else {
                     continue;
                 };
                 insert_known_destination(
                     &mut entries,
+                    source,
                     &addr,
                     workload.ports.iter().map(|p| p.port),
                 );
@@ -2735,19 +2770,58 @@ fn normalize_known_destination_host(value: &str) -> Option<String> {
     Some(value)
 }
 
+/// Slice resource a known destination came from, for the skip warning.
+#[derive(Clone, Copy)]
+struct KnownDestinationSource<'a> {
+    kind: &'static str,
+    namespace: &'a str,
+    name: &'a str,
+}
+
 fn insert_known_destination(
     entries: &mut HashSet<String>,
+    source: KnownDestinationSource<'_>,
     host: &str,
     ports: impl Iterator<Item = u16>,
 ) {
-    entries.insert(host.to_string());
+    let mut skipped = 0usize;
+    let mut first_error: Option<(String, &'static str)> = None;
+    let mut admit =
+        |entry: String| match crate::plugins::mesh::outbound_registry::validate_registry_entry(
+            &entry,
+        ) {
+            Ok(()) => {
+                entries.insert(entry);
+            }
+            Err(error) => {
+                skipped += 1;
+                if first_error.is_none() {
+                    first_error = Some((entry, error));
+                }
+            }
+        };
+    admit(host.to_string());
     let mut inserted_port = false;
     for port in ports {
         inserted_port = true;
-        entries.insert(format!("{host}:{port}"));
+        admit(format!("{host}:{port}"));
     }
     if !inserted_port {
-        entries.insert(format!("{host}:*"));
+        admit(format!("{host}:*"));
+    }
+    if let Some((entry, error)) = first_error {
+        // One line per resource host, not per derived entry. The dropped
+        // destination stays denied (REGISTRY_ONLY fails closed for it).
+        warn!(
+            resource_kind = source.kind,
+            resource_namespace = ?source.namespace,
+            resource_name = ?source.name,
+            entry = ?entry,
+            skipped_entries = skipped,
+            error,
+            "Mesh REGISTRY_ONLY: skipping destination outside the outbound registry grammar; \
+             it stays denied"
+        );
     }
 }
 

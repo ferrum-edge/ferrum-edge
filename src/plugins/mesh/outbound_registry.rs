@@ -30,12 +30,17 @@
 //! - Mesh-internal service-cluster-local hostnames are matched as-is; the
 //!   registry-build helper records the short, namespace-qualified, `.svc`,
 //!   and FQDN forms.
-//! - Wildcard ServiceEntry hosts (`*.example.com`) match one DNS label below
-//!   the suffix, following Istio mesh registry semantics. Proxy listener host
-//!   routing uses broader DNS suffix wildcard semantics. Lookups extract the
-//!   candidate suffix after the request host's first label and probe a
-//!   precomputed `HashSet`, so cost does not grow with unrelated wildcard
-//!   count.
+//! - Wildcard hosts (`*.example.com`) match exactly one DNS label below the
+//!   suffix by default (`wildcard_match: one_label`). That is the Ferrum mesh
+//!   wildcard contract shared with Sidecar egress scoping, the mesh DNS proxy,
+//!   and the stream-family REGISTRY_ONLY lane, so mesh auto-injection always
+//!   uses it. Envoy virtual-host domains and Istio's host matcher treat
+//!   `*.example.com` as an any-depth DNS suffix; operator-managed instances
+//!   can opt into that with `wildcard_match: dns_suffix`. Lookups probe a
+//!   precomputed suffix `HashSet` with the candidate after the request host's
+//!   first label (and, in `dns_suffix` mode, each shorter candidate), so cost
+//!   is bounded by the request host's label count and does not grow with
+//!   unrelated wildcard count.
 //! - An empty registry is valid and fails closed: every enforced request is rejected,
 //!   but the plugin remains installed so REGISTRY_ONLY never silently falls
 //!   back to ALLOW_ANY.
@@ -65,6 +70,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::net::IpAddr;
+use std::sync::LazyLock;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -75,6 +82,7 @@ use crate::plugins::{
     HTTP_FAMILY_PROTOCOLS, HboneReuseContext, Plugin, PluginResult, ProxyProtocol, RequestContext,
     priority,
 };
+use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use crate::util::json_object::JsonObject;
 
 thread_local! {
@@ -96,7 +104,7 @@ pub struct OutboundRegistryConfig {
     /// Operator-supplied list of known destinations. Each entry is a bare
     /// hostname (`reviews.default.svc.cluster.local`), a `host:port` pair,
     /// or a `host:*` any-explicit-port pair, optionally with a leading `*.`
-    /// one-label wildcard. IPv6 literals are canonicalized; numeric ports
+    /// wildcard (see `wildcard_match`). IPv6 literals are canonicalized; numeric ports
     /// require brackets and must be 1..=65535. Hostnames use ASCII labels
     /// (punycode for IDNs). Empty entries are ignored; malformed entries fail
     /// construction. Matches are exact after ASCII-lowercase normalisation.
@@ -118,6 +126,43 @@ pub struct OutboundRegistryConfig {
     /// Mesh namespace label used by the Prometheus decision counter.
     #[serde(default = "default_namespace_label")]
     pub namespace: String,
+    /// How `*.suffix` registry entries match request hosts. Defaults to
+    /// `one_label`, the mesh wildcard contract mesh auto-injection relies on.
+    #[serde(default)]
+    pub wildcard_match: WildcardMatch,
+}
+
+/// Matching semantics for `*.suffix` registry entries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WildcardMatch {
+    /// `*.example.com` matches exactly one DNS label below the suffix
+    /// (`api.example.com`, not `a.b.example.com`). Shared with Sidecar egress
+    /// scoping, the mesh DNS proxy, and the stream-family lane.
+    #[default]
+    OneLabel,
+    /// `*.example.com` matches any DNS name below the suffix
+    /// (`api.example.com` and `a.b.example.com`), like Envoy virtual-host
+    /// domains and Istio's host matcher. The base domain never matches.
+    DnsSuffix,
+}
+
+/// How an admitted request matched the registry; maps to the fixed metric
+/// `host` bucket without re-deriving the match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryMatch {
+    Explicit,
+    Wildcard,
+}
+
+impl RegistryMatch {
+    #[inline]
+    fn metric_bucket(self) -> &'static str {
+        match self {
+            Self::Explicit => EXPLICIT_HOST_BUCKET,
+            Self::Wildcard => ADMITTED_WILDCARD_BUCKET,
+        }
+    }
 }
 
 fn default_reject_status() -> u16 {
@@ -152,6 +197,7 @@ pub struct OutboundRegistry {
     /// Any-explicit-port wildcard host suffixes from entries like
     /// `*.example.com:*`.
     wildcard_any_port_suffixes: HashSet<String>,
+    wildcard_match: WildcardMatch,
     outbound_listen_ports: Vec<u16>,
     reject_status: u16,
     namespace: String,
@@ -168,6 +214,7 @@ impl OutboundRegistry {
             wildcard_suffixes: HashSet::new(),
             wildcard_port_suffixes: HashMap::new(),
             wildcard_any_port_suffixes: HashSet::new(),
+            wildcard_match: WildcardMatch::OneLabel,
             outbound_listen_ports: Vec::new(),
             reject_status: default_reject_status(),
             namespace: default_namespace_label(),
@@ -237,6 +284,7 @@ impl OutboundRegistry {
             wildcard_suffixes,
             wildcard_port_suffixes,
             wildcard_any_port_suffixes,
+            wildcard_match: parsed.wildcard_match,
             outbound_listen_ports,
             reject_status: parsed.reject_status,
             namespace: parsed.namespace,
@@ -260,44 +308,64 @@ impl OutboundRegistry {
     /// Per-request hot-path lookup. Uses a thread-local scratch `String` so
     /// the steady-state cost is hash-set probes plus an in-place lowercase
     /// copy (no heap allocation after the first call on each worker thread).
-    /// Wildcard admission extracts the one-label candidate suffix and probes
-    /// the precomputed suffix set — cost is independent of unrelated
-    /// wildcard count.
+    /// Wildcard admission probes the precomputed suffix sets with candidates
+    /// derived from the request host — cost is bounded by the request host's
+    /// label count and independent of unrelated wildcard count.
     pub(crate) fn contains(&self, host: &str, port: Option<u16>) -> bool {
+        self.lookup(host, port).is_some()
+    }
+
+    /// Normalise `host` once and report how it matched, if at all.
+    fn lookup(&self, host: &str, port: Option<u16>) -> Option<RegistryMatch> {
         HOST_NORMALISE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             buf.clear();
             buf.reserve(host.len() + 6); // host + ':' + up to 5-digit port
             normalise_request_host_into(host, &mut buf);
-            if buf.is_empty() {
-                return false;
-            }
-            let Some(port) = port else {
-                return self.hosts.contains(buf.as_str())
-                    || wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_suffixes);
-            };
-            if self.any_port_hosts.contains(buf.as_str())
-                || wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_any_port_suffixes)
-            {
-                return true;
-            }
-            if self
-                .wildcard_port_suffixes
-                .get(&port)
-                .is_some_and(|suffixes| wildcard_suffix_set_matches(buf.as_str(), suffixes))
-            {
-                return true;
-            }
-            // Empty `host_ports` is common (operators register bare hosts
-            // most often). Skip the format!-equivalent write entirely.
-            if self.host_ports.is_empty() {
-                return false;
-            }
-            // Reuse the same scratch buffer to append `:port` — no second
-            // allocation. `write!` into `String` is infallible.
-            let _ = write!(buf, ":{port}");
-            self.host_ports.contains(buf.as_str())
+            self.lookup_normalised(&mut buf, port)
         })
+    }
+
+    /// Explicit entries are probed before wildcards so an admit that both
+    /// would satisfy is classified as explicit, matching the metric contract.
+    fn lookup_normalised(&self, buf: &mut String, port: Option<u16>) -> Option<RegistryMatch> {
+        if buf.is_empty() {
+            return None;
+        }
+        let mode = self.wildcard_match;
+        let Some(port) = port else {
+            if self.hosts.contains(buf.as_str()) {
+                return Some(RegistryMatch::Explicit);
+            }
+            return wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_suffixes, mode)
+                .then_some(RegistryMatch::Wildcard);
+        };
+        if self.any_port_hosts.contains(buf.as_str()) {
+            return Some(RegistryMatch::Explicit);
+        }
+        // Empty `host_ports` is common (operators register bare hosts
+        // most often). Skip the format!-equivalent write entirely.
+        if !self.host_ports.is_empty() {
+            // Reuse the same scratch buffer to append `:port` — no second
+            // allocation. `write!` into `String` is infallible. Truncate back
+            // so the wildcard probes below see the bare host.
+            let host_len = buf.len();
+            let _ = write!(buf, ":{port}");
+            let matched = self.host_ports.contains(buf.as_str());
+            buf.truncate(host_len);
+            if matched {
+                return Some(RegistryMatch::Explicit);
+            }
+        }
+        let wildcard =
+            wildcard_suffix_set_matches(buf.as_str(), &self.wildcard_any_port_suffixes, mode)
+                || self
+                    .wildcard_port_suffixes
+                    .get(&port)
+                    .is_some_and(|suffixes| {
+                        wildcard_suffix_set_matches(buf.as_str(), suffixes, mode)
+                    });
+        wildcard.then_some(RegistryMatch::Wildcard)
     }
 
     #[inline]
@@ -319,47 +387,23 @@ impl OutboundRegistry {
                 .is_some_and(|port| self.outbound_listen_ports.binary_search(&port).is_ok())
     }
 
-    fn record_decision(&self, host: &str, decision: &'static str) {
-        HOST_NORMALISE_BUF.with(|cell| {
-            let mut buf = cell.borrow_mut();
-            buf.clear();
-            buf.reserve(host.len());
-            normalise_request_host_into(host, &mut buf);
-            crate::plugins::prometheus_metrics::global_registry()
-                .record_mesh_outbound_registry_decision(&self.namespace, buf.as_str(), decision);
-        });
-    }
-
-    fn admit_decision_host_bucket(&self, host: &str, port: Option<u16>) -> &'static str {
-        HOST_NORMALISE_BUF.with(|cell| {
-            let mut buf = cell.borrow_mut();
-            buf.clear();
-            buf.reserve(host.len());
-            normalise_request_host_into(host, &mut buf);
-            if buf.is_empty() || (port.is_none() && self.hosts.contains(buf.as_str())) {
-                return EXPLICIT_HOST_BUCKET;
-            }
-            if let Some(port) = port {
-                if self.any_port_hosts.contains(buf.as_str()) {
-                    return EXPLICIT_HOST_BUCKET;
-                }
-                if !self.host_ports.is_empty() {
-                    let _ = write!(buf, ":{port}");
-                    if self.host_ports.contains(buf.as_str()) {
-                        return EXPLICIT_HOST_BUCKET;
-                    }
-                }
-            }
-            ADMITTED_WILDCARD_BUCKET
-        })
+    /// Record an admit under its precomputed fixed-cardinality bucket. The
+    /// bucket is a constant, so nothing is normalised here.
+    fn record_admit_decision(&self, matched: RegistryMatch) {
+        crate::plugins::prometheus_metrics::global_registry()
+            .record_mesh_outbound_registry_decision(
+                &self.namespace,
+                matched.metric_bucket(),
+                "admit",
+            );
     }
 
     /// Record a deny decision into the metrics registry under a fixed-
     /// cardinality `host` bucket. The Host header is attacker-controllable on
     /// the deny path; using the actual value as a Prometheus label exposes
     /// `/metrics` to memory-exhaustion / cardinality-DoS via curl loops with
-    /// distinct synthetic Host values. Operators that need the actual host of
-    /// denied traffic should consult application logs.
+    /// distinct synthetic Host values. The denied destination is reported by
+    /// the rate-limited [`warn_http_registry_deny`] log line instead.
     fn record_deny_decision(&self) {
         crate::plugins::prometheus_metrics::global_registry()
             .record_mesh_outbound_registry_decision(&self.namespace, DENIED_HOST_BUCKET, "deny");
@@ -369,7 +413,7 @@ impl OutboundRegistry {
 /// Constant Prometheus `host` label value used for every deny decision; see
 /// [`OutboundRegistry::record_deny_decision`].
 pub(crate) const DENIED_HOST_BUCKET: &str = "<denied>";
-/// Constant Prometheus `host` label for admits matched by a one-label wildcard
+/// Constant Prometheus `host` label for admits matched by a wildcard
 /// registry entry (`*.example.com`). Keeps admit cardinality bounded
 /// independently of registry size.
 pub(crate) const ADMITTED_WILDCARD_BUCKET: &str = "<admit_wildcard>";
@@ -377,6 +421,14 @@ pub(crate) const ADMITTED_WILDCARD_BUCKET: &str = "<admit_wildcard>";
 /// entry (bare host, `host:port`, or `host:*`). Keeps admit cardinality
 /// bounded independently of registry size.
 pub(crate) const EXPLICIT_HOST_BUCKET: &str = "<admit_explicit>";
+
+/// Validate one destination against the registry entry grammar without
+/// building a registry. Mesh-derived registries use this to drop entries the
+/// plugin would refuse, so one malformed slice resource narrows the registry
+/// identically on the HTTP and stream lanes instead of failing construction.
+pub(crate) fn validate_registry_entry(entry: &str) -> Result<(), &'static str> {
+    normalise_registry_entry(entry).map(|_| ())
+}
 
 fn normalise_registry_entry(entry: &str) -> Result<Option<String>, &'static str> {
     let entry = entry.trim().to_ascii_lowercase();
@@ -452,7 +504,7 @@ fn wildcard_suffix(host: &str) -> Option<&str> {
     Some(suffix)
 }
 
-/// One-label wildcard candidate: the portion of `host` after its first DNS
+/// Wildcard candidate: the portion of `host` after its first DNS
 /// label. Returns `None` when the host has fewer than two labels (so the base
 /// domain never matches `*.suffix`) or the first label is empty.
 #[inline]
@@ -465,15 +517,38 @@ fn one_label_wildcard_candidate(host: &str) -> Option<&str> {
 }
 
 #[inline]
-fn wildcard_suffix_set_matches(host: &str, suffixes: &HashSet<String>) -> bool {
-    let Some(candidate) = one_label_wildcard_candidate(host) else {
+fn wildcard_suffix_set_matches(
+    host: &str,
+    suffixes: &HashSet<String>,
+    mode: WildcardMatch,
+) -> bool {
+    if suffixes.is_empty() {
+        return false;
+    }
+    let Some(mut candidate) = one_label_wildcard_candidate(host) else {
         return false;
     };
-    // Preserve exact one-label semantics: the candidate after the first label
-    // must equal a configured suffix. Multi-label hosts produce a deeper
-    // candidate (e.g. `a.b.example.com` → `b.example.com`) that misses
-    // `example.com` without scanning the set.
-    suffixes.contains(candidate)
+    // One-label semantics: the candidate after the first label must equal a
+    // configured suffix. Multi-label hosts produce a deeper candidate (e.g.
+    // `a.b.example.com` → `b.example.com`) that misses `example.com` without
+    // scanning the set.
+    if suffixes.contains(candidate) {
+        return true;
+    }
+    if mode == WildcardMatch::OneLabel {
+        return false;
+    }
+    // DNS-suffix semantics: probe each shorter suffix. The loop is bounded by
+    // the request host's label count, never by the registry size, and a
+    // candidate always keeps at least one label, so the base domain itself
+    // never matches `*.base`.
+    while let Some(rest) = one_label_wildcard_candidate(candidate) {
+        if suffixes.contains(rest) {
+            return true;
+        }
+        candidate = rest;
+    }
+    false
 }
 
 fn split_registry_host_port(entry: &str) -> Option<(&str, u16)> {
@@ -559,16 +634,31 @@ impl Plugin for OutboundRegistry {
         let Some(host_header) = ctx.headers.get("host") else {
             // Use the fixed-cardinality bucket — see `record_deny_decision`.
             self.record_deny_decision();
+            warn_http_registry_deny(
+                None,
+                None,
+                ctx.frontend_listen_port,
+                &ctx.client_ip,
+                DENY_SOURCE_PLUGIN,
+            );
             return reject(self.reject_status, "host header required");
         };
         let (host, port) = split_host_header(host_header);
-        if self.contains(host, port) {
-            self.record_decision(self.admit_decision_host_bucket(host, port), "admit");
+        if let Some(matched) = self.lookup(host, port) {
+            self.record_admit_decision(matched);
         } else {
             // Deny path uses a constant bucket label so the Prometheus
             // `host` label remains bounded (the request Host header is
-            // attacker-controlled).
+            // attacker-controlled); the destination goes to the
+            // rate-limited log line instead.
             self.record_deny_decision();
+            warn_http_registry_deny(
+                Some(host),
+                port,
+                ctx.frontend_listen_port,
+                &ctx.client_ip,
+                DENY_SOURCE_PLUGIN,
+            );
             return reject(
                 self.reject_status,
                 "destination not in mesh registry (REGISTRY_ONLY policy)",
@@ -578,12 +668,16 @@ impl Plugin for OutboundRegistry {
     }
 }
 
+/// Split a request authority into host and optional port. The port uses the
+/// registry grammar: ASCII decimal digits only (leading zeros allowed) in
+/// 1..=65535. Anything else (`:0`, `:+443`, `:http`) leaves the whole value as
+/// the host so it falls into the normal deny path.
 pub(crate) fn split_host_header(value: &str) -> (&str, Option<u16>) {
     // IPv6-bracketed literals: `[::1]:8080` — split on `]:`.
     if value.starts_with('[')
         && let Some(end) = value.rfind("]:")
     {
-        if let Ok(port) = value[end + 2..].parse::<u16>() {
+        if let Some(port) = parse_authority_port(&value[end + 2..]) {
             return (&value[..end + 1], Some(port));
         }
         return (value, None);
@@ -595,11 +689,82 @@ pub(crate) fn split_host_header(value: &str) -> (&str, Option<u16>) {
         return (value, None);
     }
     if let Some((host, port_str)) = value.rsplit_once(':')
-        && let Ok(port) = port_str.parse::<u16>()
+        && let Some(port) = parse_authority_port(port_str)
     {
         return (host, Some(port));
     }
     (value, None)
+}
+
+/// Digits-only, non-zero `u16` port, mirroring `split_registry_host_port`.
+#[inline]
+fn parse_authority_port(port_str: &str) -> Option<u16> {
+    if port_str.is_empty() || !port_str.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let port = port_str.parse::<u16>().ok()?;
+    (port != 0).then_some(port)
+}
+
+/// `source` label on [`warn_http_registry_deny`] for plugin-hook denials.
+pub(crate) const DENY_SOURCE_PLUGIN: &str = "plugin";
+/// `source` label on [`warn_http_registry_deny`] for outbound-capture route
+/// misses denied before the plugin chain.
+pub(crate) const DENY_SOURCE_ROUTE_MISS: &str = "route_miss";
+
+/// Longest denied host echoed into the log line. A DNS name is at most 253
+/// bytes; anything longer is truncated rather than logged whole.
+const DENY_LOG_HOST_MAX_BYTES: usize = 256;
+
+/// Process-wide limiter for HTTP-lane REGISTRY_ONLY denial logs: the first
+/// denial logs immediately, then at most one line per second carrying the
+/// number suppressed since the previous line. Process-wide (not per plugin
+/// instance) so reloads and multiple instances cannot multiply the rate.
+static HTTP_DENY_WARN: AtomicLogRateLimiter = AtomicLogRateLimiter::new();
+static HTTP_DENY_WARN_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Emit the rate-limited structured warning for an HTTP-lane REGISTRY_ONLY
+/// denial, naming the denied destination like the stream lane does. The
+/// metric keeps its fixed `<denied>` bucket; this log line is the
+/// attribution channel operators use to find missing registry entries.
+pub(crate) fn warn_http_registry_deny(
+    host: Option<&str>,
+    port: Option<u16>,
+    listen_port: Option<u16>,
+    client_ip: &str,
+    source: &'static str,
+) {
+    let now_ms = u64::try_from(HTTP_DENY_WARN_EPOCH.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let Some(suppressed) = HTTP_DENY_WARN.on_event(now_ms) else {
+        return;
+    };
+    let host = host.filter(|host| !host.is_empty()).map(bounded_log_host);
+    tracing::warn!(
+        host = ?host.unwrap_or("<missing>"),
+        port = ?port,
+        listen_port = ?listen_port,
+        client = %client_ip,
+        source,
+        suppressed_since_last = suppressed,
+        "Mesh REGISTRY_ONLY: rejecting HTTP egress to unadmitted destination"
+    );
+}
+
+/// Clear the HTTP denial-log limiter. Test-only (via `_test_support`).
+pub(crate) fn reset_http_deny_warn_for_test() {
+    HTTP_DENY_WARN.reset_for_test();
+}
+
+/// Truncate `host` to at most [`DENY_LOG_HOST_MAX_BYTES`] on a char boundary.
+fn bounded_log_host(host: &str) -> &str {
+    if host.len() <= DENY_LOG_HOST_MAX_BYTES {
+        return host;
+    }
+    let mut end = DENY_LOG_HOST_MAX_BYTES;
+    while !host.is_char_boundary(end) {
+        end -= 1;
+    }
+    &host[..end]
 }
 
 fn reject(status: u16, message: &str) -> PluginResult {

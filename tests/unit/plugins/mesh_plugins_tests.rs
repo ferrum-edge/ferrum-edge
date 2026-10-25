@@ -9554,6 +9554,7 @@ fn mesh_outbound_registry_accepts_every_documented_key() {
             "outbound_listen_ports",
             "registry",
             "reject_status",
+            "wildcard_match",
         ])
     );
 }
@@ -9698,6 +9699,16 @@ fn mesh_outbound_registry_admission_matches_openapi() {
     ] {
         let _ = check(json!({"reject_status": status}), admitted);
     }
+    for (mode, admitted) in [
+        (json!("one_label"), true),
+        (json!("dns_suffix"), true),
+        (json!("suffix"), false),
+        (json!("DNS_SUFFIX"), false),
+        (json!(1), false),
+        (json!(null), false),
+    ] {
+        let _ = check(json!({"wildcard_match": mode}), admitted);
+    }
     let _ = check(json!({}), true);
     let _ = check(json!({"registry": []}), true);
 }
@@ -9789,6 +9800,315 @@ fn mesh_outbound_registry_invalid_slice_keeps_stream_and_route_miss_enforcement(
     assert_eq!(
         enforcement.http_route_miss_reject_status(15001, Some("known.test"), Some(443)),
         Some(404)
+    );
+}
+
+async fn mesh_outbound_registry_decision(plugin: &dyn Plugin, authority: &str) -> Result<(), u16> {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
+    ctx.headers.insert("host".into(), authority.into());
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Continue => Ok(()),
+        PluginResult::Reject { status_code, .. } => Err(status_code),
+        other => panic!("{authority}: unexpected plugin result {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_outbound_registry_dns_suffix_wildcards_match_any_depth() {
+    let bare = create_plugin(
+        "mesh_outbound_registry",
+        &json!({"registry": ["*.example.com"], "wildcard_match": "dns_suffix"}),
+    )
+    .unwrap()
+    .unwrap();
+    for authority in [
+        "api.example.com",
+        "tenant.region.example.com",
+        "A.B.C.Example.Com.",
+    ] {
+        assert_eq!(
+            mesh_outbound_registry_decision(bare.as_ref(), authority).await,
+            Ok(()),
+            "{authority}"
+        );
+    }
+    for authority in [
+        "example.com",
+        "badexample.com",
+        "a.badexample.com",
+        "a.b.example.org",
+        "a.b.example.com:443",
+        "a..example.com",
+    ] {
+        assert_eq!(
+            mesh_outbound_registry_decision(bare.as_ref(), authority).await,
+            Err(502),
+            "{authority}"
+        );
+    }
+
+    let ported = create_plugin(
+        "mesh_outbound_registry",
+        &json!({
+            "registry": ["*.example.com:443", "*.internal.example:*"],
+            "wildcard_match": "dns_suffix",
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    for (authority, admitted) in [
+        ("a.b.example.com:443", true),
+        ("a.b.example.com:80", false),
+        ("a.b.example.com", false),
+        ("example.com:443", false),
+        ("x.y.internal.example:8443", true),
+        ("x.y.internal.example", false),
+        ("internal.example:8443", false),
+    ] {
+        assert_eq!(
+            mesh_outbound_registry_decision(ported.as_ref(), authority)
+                .await
+                .is_ok(),
+            admitted,
+            "{authority}"
+        );
+    }
+
+    // The default (and every mesh-injected instance) keeps one-label
+    // semantics, shared with Sidecar egress scope and the stream lane.
+    for config in [
+        json!({"registry": ["*.example.com"]}),
+        json!({"registry": ["*.example.com"], "wildcard_match": "one_label"}),
+    ] {
+        let plugin = create_plugin("mesh_outbound_registry", &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            mesh_outbound_registry_decision(plugin.as_ref(), "api.example.com").await,
+            Ok(())
+        );
+        assert_eq!(
+            mesh_outbound_registry_decision(plugin.as_ref(), "a.b.example.com").await,
+            Err(502),
+            "{config}"
+        );
+    }
+
+    let error = create_plugin(
+        "mesh_outbound_registry",
+        &json!({"registry": ["*.example.com"], "wildcard_match": "suffix"}),
+    )
+    .err()
+    .expect("an unknown wildcard_match value must fail construction");
+    assert!(error.contains("mesh_outbound_registry:"), "{error}");
+    assert!(error.contains("wildcard_match"), "{error}");
+}
+
+#[tokio::test]
+async fn mesh_outbound_registry_wildcard_probe_ignores_explicit_port_suffix() {
+    // A populated `host_ports` set appends `:port` to the shared scratch
+    // buffer; the later wildcard probe must still see the bare host.
+    for mode in ["one_label", "dns_suffix"] {
+        let plugin = create_plugin(
+            "mesh_outbound_registry",
+            &json!({
+                "registry": ["other.example.com:443", "*.example.com:443"],
+                "wildcard_match": mode,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            mesh_outbound_registry_decision(plugin.as_ref(), "api.example.com:443").await,
+            Ok(()),
+            "{mode}"
+        );
+        assert_eq!(
+            mesh_outbound_registry_decision(plugin.as_ref(), "other.example.com:443").await,
+            Ok(()),
+            "{mode}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_outbound_registry_request_ports_use_registry_grammar() {
+    use ferrum_edge::_test_support::mesh_outbound_registry_split_host_header_for_test as split;
+
+    assert_eq!(split("reviews.svc:0"), ("reviews.svc:0", None));
+    assert_eq!(split("reviews.svc:+8443"), ("reviews.svc:+8443", None));
+    assert_eq!(split("reviews.svc:"), ("reviews.svc:", None));
+    assert_eq!(split("reviews.svc:08443"), ("reviews.svc", Some(8443)));
+    assert_eq!(split("[::1]:0"), ("[::1]:0", None));
+    assert_eq!(split("[::1]:+443"), ("[::1]:+443", None));
+    assert_eq!(split("[::1]:0443"), ("[::1]", Some(443)));
+
+    let any_port = create_plugin(
+        "mesh_outbound_registry",
+        &json!({"registry": ["reviews.svc:*", "[::1]:*"]}),
+    )
+    .unwrap()
+    .unwrap();
+    for authority in ["reviews.svc:0", "reviews.svc:+8443", "[::1]:0"] {
+        assert_eq!(
+            mesh_outbound_registry_decision(any_port.as_ref(), authority).await,
+            Err(502),
+            "{authority}"
+        );
+    }
+    assert_eq!(
+        mesh_outbound_registry_decision(any_port.as_ref(), "reviews.svc:8443").await,
+        Ok(())
+    );
+
+    let exact = create_plugin(
+        "mesh_outbound_registry",
+        &json!({"registry": ["reviews.svc:8443"]}),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        mesh_outbound_registry_decision(exact.as_ref(), "reviews.svc:+8443").await,
+        Err(502)
+    );
+    assert_eq!(
+        mesh_outbound_registry_decision(exact.as_ref(), "reviews.svc:08443").await,
+        Ok(())
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mesh_outbound_registry_logs_denied_destination() {
+    let plugin = create_plugin(
+        "mesh_outbound_registry",
+        &json!({"registry": ["known.test"]}),
+    )
+    .unwrap()
+    .unwrap();
+    const LINE: &str = "Mesh REGISTRY_ONLY: rejecting HTTP egress to unadmitted destination";
+    // The limiter is process-wide; a parallel test's denial can claim the
+    // window between the reset and this denial, so retry a bounded number of
+    // times rather than racing once.
+    let mut logged = String::new();
+    for _ in 0..50 {
+        let (logs, guard) = super::plugin_utils::capture_logs();
+        ferrum_edge::_test_support::mesh_outbound_registry_reset_http_deny_warn_for_test();
+        let mut ctx = RequestContext::new("192.0.2.10".into(), "GET".into(), "/".into());
+        ctx.frontend_listen_port = Some(15001);
+        ctx.headers
+            .insert("host".into(), "Missing-Entry.Example:8443".into());
+        assert!(matches!(
+            plugin.on_request_received(&mut ctx).await,
+            PluginResult::Reject {
+                status_code: 502,
+                ..
+            }
+        ));
+        drop(guard);
+        logged = logs.contents();
+        if logged.contains(LINE) {
+            break;
+        }
+    }
+    assert!(logged.contains(LINE), "the denial must be logged: {logged}");
+    for field in [
+        r#"host="Missing-Entry.Example""#,
+        "port=Some(8443)",
+        "listen_port=Some(15001)",
+        "client=192.0.2.10",
+        r#"source="plugin""#,
+    ] {
+        assert!(logged.contains(field), "expected {field} in: {logged}");
+    }
+}
+
+#[test]
+fn mesh_known_destinations_drop_entries_outside_registry_grammar() {
+    use ferrum_edge::modes::mesh::config::ServiceEntry;
+    use ferrum_edge::modes::mesh::outbound_enforcement::{Decision, MeshOutboundEnforcement};
+
+    let service_entry: ServiceEntry = serde_json::from_value(json!({
+        "name": "bad-hosts",
+        "namespace": "default",
+        "hosts": ["*", "foo.*.example.com", "my_service.internal", "api.example.com"],
+    }))
+    .unwrap();
+    let slice = MeshSlice {
+        namespace: "default".into(),
+        services: vec![MeshService {
+            name: "reviews".into(),
+            namespace: "default".into(),
+            cluster_ips: Vec::new(),
+            ports: Vec::new(),
+            workloads: Vec::new(),
+            protocol_overrides: HashMap::new(),
+            uid: None,
+            allow_path_parameters: false,
+        }],
+        service_entries: vec![service_entry],
+        ..MeshSlice::default()
+    };
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let entries = slice.build_known_destinations("cluster.local");
+    drop(guard);
+    let logs = logs.contents();
+
+    for kept in [
+        "reviews",
+        "reviews.default.svc.cluster.local:*",
+        "api.example.com",
+        "api.example.com:*",
+    ] {
+        assert!(
+            entries.iter().any(|entry| entry == kept),
+            "{kept}: {entries:?}"
+        );
+    }
+    for dropped in ["*", "foo.*.example.com", "my_service.internal"] {
+        assert!(
+            !entries.iter().any(|entry| entry.starts_with(dropped)),
+            "{dropped}: {entries:?}"
+        );
+    }
+    for field in [
+        "skipping destination outside the outbound registry grammar",
+        r#"resource_kind="ServiceEntry""#,
+        r#"resource_name="bad-hosts""#,
+        r#"entry="*""#,
+        r#"entry="my_service.internal""#,
+    ] {
+        assert!(logs.contains(field), "expected {field} in: {logs}");
+    }
+
+    // The HTTP lane builds exactly this registry; it must construct instead
+    // of rejecting the whole mesh config.
+    let plugin = create_plugin(
+        "mesh_outbound_registry",
+        &json!({"registry": entries, "outbound_listen_ports": [15001]}),
+    );
+    assert!(plugin.is_ok(), "{:?}", plugin.err());
+
+    // The stream lane narrows identically instead of degrading to deny-all.
+    let enforcement = MeshOutboundEnforcement::from_slice(
+        &slice,
+        "cluster.local",
+        "default".into(),
+        vec![15001],
+        502,
+    )
+    .expect("enforcement installed");
+    assert_eq!(
+        enforcement.check_destination(15001, "api.example.com", 443),
+        Decision::Admit
+    );
+    assert_eq!(
+        enforcement.check_destination(15001, "reviews.default.svc.cluster.local", 9080),
+        Decision::Admit
+    );
+    assert_eq!(
+        enforcement.check_destination(15001, "my_service.internal", 443),
+        Decision::Deny
     );
 }
 
