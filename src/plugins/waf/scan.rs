@@ -37,6 +37,162 @@ pub(super) struct ScanOutcome {
     pub timed_out: bool,
 }
 
+/// What the JSON-path pass learned about every reading of one body.
+struct JsonReadings {
+    /// Some reading a backend takes as the body was read completely (or is
+    /// blank): the raw bytes, a wide reading the body declares, a framed
+    /// message, or the NUL-skipping reading.
+    complete: bool,
+    /// Some UTF-16 / UTF-32 reading found only by the BOM-less signature was
+    /// read completely. A backend defaulting to UTF-8 does not take it, so
+    /// it does not vouch for a NUL-skipping reading of the raw bytes.
+    complete_sniffed: bool,
+    /// Some reading held something neither parse could read.
+    refused: bool,
+    /// The most JSON-like opening among the parts that could not be read.
+    refused_opening: json_doc::JsonOpening,
+    /// The lenient work every reading of this body shares.
+    budget: json_doc::WorkBudget,
+    /// Per JSON-path rule (by position in `body_json_paths`): already hit on
+    /// this body. Allocated on the first hit, so a clean body allocates
+    /// nothing; with `pending` it keeps the work per reading at one check
+    /// per rule, and none once every rule has hit.
+    hit: Vec<bool>,
+    /// JSON-path rules not yet hit on this body.
+    pending: usize,
+}
+
+/// How one reading's refusal is weighed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadingKind {
+    /// The raw bytes, a UTF-16 / UTF-32 reading the body declares (charset or
+    /// BOM), the raw bytes of a framed RPC stream as sent and with their NULs
+    /// removed, or the NUL-skipping reading of an ordinary body: several such
+    /// readings coexist, and a backend may take any of them.
+    Alternative,
+    /// A UTF-16 / UTF-32 reading found only by the BOM-less wide signature.
+    /// Judged like [`Self::Alternative`], but completing it does not vouch
+    /// for the raw bytes.
+    SniffedCharset,
+    /// One message of a framed RPC stream: the document itself, with no
+    /// alternative reading, so any refusal fails closed.
+    FramedMessage,
+}
+
+impl JsonReadings {
+    fn for_body(length: usize, rules: usize) -> Self {
+        Self {
+            complete: false,
+            complete_sniffed: false,
+            refused: false,
+            refused_opening: json_doc::JsonOpening::No,
+            budget: json_doc::WorkBudget::for_body(length),
+            hit: Vec::new(),
+            pending: rules,
+        }
+    }
+
+    fn record(&mut self, view: &json_doc::JsonView, kind: ReadingKind) {
+        let Some(opening) = view.refused() else {
+            match kind {
+                ReadingKind::SniffedCharset => self.complete_sniffed = true,
+                ReadingKind::Alternative | ReadingKind::FramedMessage => self.complete = true,
+            }
+            return;
+        };
+        let opening = match kind {
+            ReadingKind::Alternative | ReadingKind::SniffedCharset => opening,
+            ReadingKind::FramedMessage => json_doc::JsonOpening::Yes,
+        };
+        self.refused = true;
+        self.refused_opening = self.refused_opening.max(opening);
+    }
+
+    /// A message of a framed RPC stream the WAF cannot read (compressed): the
+    /// backend decodes it, so it fails closed like any unreadable message.
+    fn record_unreadable(&mut self) {
+        self.refused = true;
+        self.refused_opening = json_doc::JsonOpening::Yes;
+    }
+
+    fn is_hit(&self, position: usize) -> bool {
+        self.hit.get(position).copied().unwrap_or(false)
+    }
+
+    fn mark_hit(&mut self, position: usize, rules: usize) {
+        if self.hit.is_empty() {
+            self.hit = vec![false; rules];
+        }
+        if let Some(slot) = self.hit.get_mut(position)
+            && !*slot
+        {
+            *slot = true;
+            self.pending = self.pending.saturating_sub(1);
+        }
+    }
+
+    /// The raw bytes refused in a way only a NUL-skipping parser reads past,
+    /// and the only complete reading is a signature-sniffed wide one: that
+    /// reading is not what a UTF-8 backend takes, so the NUL-skipping reading
+    /// must be read itself (it vouches for the raw bytes when it completes).
+    fn needs_nul_skipping_reading(&self) -> bool {
+        self.refused_opening == json_doc::JsonOpening::SkippingNul
+            && !self.complete
+            && self.complete_sniffed
+    }
+
+    /// Whether the body is JSON the rules could not read, so the rules fail
+    /// closed:
+    ///
+    /// - a document that could not be read opens like a JSON object or array,
+    ///   in any reading, whatever the declared type and whatever the other
+    ///   readings did; a message of a framed stream could not be read
+    ///   (including a compressed one); or the body's lenient work budget ran
+    ///   out;
+    /// - no reading a backend takes was read completely, and a document that
+    ///   could not be read opens like a JSON container once U+0000 is skipped
+    ///   between tokens (Json.NET). A signature-sniffed wide reading does not
+    ///   count: it is not what a UTF-8 backend reads;
+    /// - no reading at all was read completely and the `Content-Type`
+    ///   declares JSON. Under a JSON declaration no sniff is needed: the
+    ///   backend is told the body is JSON, and a reading the WAF cannot parse
+    ///   is exactly the gap a lenient parser reads through.
+    ///
+    /// A complete reading is what keeps an ordinary UTF-16 / UTF-32 body open:
+    /// its raw bytes are refused (a NUL follows every ASCII character) while
+    /// its declared reading, or its NUL-skipping reading, parses.
+    fn fail_closed(&self, content_type: Option<&str>) -> bool {
+        if self.refused_opening == json_doc::JsonOpening::Yes || self.budget.exhausted() {
+            return true;
+        }
+        if self.complete || !self.refused {
+            return false;
+        }
+        if self.refused_opening == json_doc::JsonOpening::SkippingNul {
+            return true;
+        }
+        !self.complete_sniffed && json_doc::media_type_declares_json(content_type)
+    }
+}
+
+/// Whether a scanned body is the whole representation or only its first
+/// `max_scan_bytes`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum BodyExtent {
+    Complete,
+    Prefix,
+}
+
+impl BodyExtent {
+    pub(super) fn of(truncated: bool) -> Self {
+        if truncated {
+            BodyExtent::Prefix
+        } else {
+            BodyExtent::Complete
+        }
+    }
+}
+
 impl ScanOutcome {
     pub fn push(&mut self, hit: RuleHit) {
         if !self
@@ -285,8 +441,9 @@ impl Waf {
         ctx: &RequestContext,
         body: &[u8],
         content_type: Option<&str>,
+        extent: BodyExtent,
     ) -> ScanOutcome {
-        self.scan_request_body_rules(ScanSubject::Http(ctx), body, content_type)
+        self.scan_request_body_rules(ScanSubject::Http(ctx), body, content_type, extent)
     }
 
     /// Request-side body rule engine, shared by the HTTP final-request-body
@@ -296,8 +453,9 @@ impl Waf {
         subject: ScanSubject<'_>,
         body: &[u8],
         content_type: Option<&str>,
+        extent: BodyExtent,
     ) -> ScanOutcome {
-        self.scan_body_rules(subject, body, content_type, BodyDirection::Request)
+        self.scan_body_rules(subject, body, content_type, BodyDirection::Request, extent)
     }
 
     /// One bounded view policy for both HTTP directions and WS messages.
@@ -308,6 +466,7 @@ impl Waf {
         body: &[u8],
         content_type: Option<&str>,
         direction: BodyDirection,
+        extent: BodyExtent,
     ) -> ScanOutcome {
         let (bytes, text_rules_active) = match direction {
             BodyDirection::Request => (
@@ -338,9 +497,89 @@ impl Waf {
             // They parse every admitted reading of the body — the raw bytes and
             // each UTF-16 / UTF-32 view — since a backend may accept any of
             // them as JSON.
-            self.scan_json_path_rules(&mut outcome, body, subject);
+            let mut readings =
+                JsonReadings::for_body(body.len(), self.compiled.body_json_paths.len());
+            let mut framed = false;
+            // A body that parses as a gRPC / gRPC-Web / Connect stream is read
+            // as its messages, as an RPC backend reads it — and, because the
+            // media type and framing are client-controlled and say nothing
+            // about the backend, its raw bytes are read too, as sent and as a
+            // NUL-skipping parser (Json.NET) takes them, and judged like any
+            // other reading.
+            match json_doc::FramedStream::parse(content_type, body) {
+                // A non-JSON codec: no reading of the body is a JSON document.
+                Some(stream) if !stream.is_json_codec() => framed = true,
+                Some(stream) => {
+                    framed = true;
+                    for message in stream.messages() {
+                        match message {
+                            json_doc::FramedMessage::Json(message) => self.scan_json_path_rules(
+                                &mut outcome,
+                                message,
+                                subject,
+                                ReadingKind::FramedMessage,
+                                &mut readings,
+                            ),
+                            json_doc::FramedMessage::Compressed => readings.record_unreadable(),
+                        }
+                    }
+                    if !stream.is_text() {
+                        self.scan_json_path_rules(
+                            &mut outcome,
+                            body,
+                            subject,
+                            ReadingKind::Alternative,
+                            &mut readings,
+                        );
+                        let without_nuls = json_doc::without_nul_bytes(body);
+                        self.scan_json_path_rules(
+                            &mut outcome,
+                            &without_nuls,
+                            subject,
+                            ReadingKind::Alternative,
+                            &mut readings,
+                        );
+                    }
+                }
+                None => self.scan_json_path_rules(
+                    &mut outcome,
+                    body,
+                    subject,
+                    ReadingKind::Alternative,
+                    &mut readings,
+                ),
+            }
+            let wide_kind = if normalize::wide_charset_is_declared(body, content_type) {
+                ReadingKind::Alternative
+            } else {
+                ReadingKind::SniffedCharset
+            };
             for decoded in transcoded_views.iter() {
-                self.scan_json_path_rules(&mut outcome, decoded.as_bytes(), subject);
+                self.scan_json_path_rules(
+                    &mut outcome,
+                    decoded.as_bytes(),
+                    subject,
+                    wide_kind,
+                    &mut readings,
+                );
+            }
+            // A body whose wide reading is only sniffed: a UTF-8 backend that
+            // skips NULs (Json.NET) reads the raw bytes without their NULs, a
+            // different document whenever a code unit's two bytes are both
+            // non-zero. Read that document too. (A framed stream already
+            // reads it above.)
+            if !framed && readings.needs_nul_skipping_reading() {
+                let without_nuls = json_doc::without_nul_bytes(body);
+                self.scan_json_path_rules(
+                    &mut outcome,
+                    &without_nuls,
+                    subject,
+                    ReadingKind::Alternative,
+                    &mut readings,
+                );
+            }
+            if readings.fail_closed(content_type) {
+                self.push_unparsed_json_hits(&mut outcome, subject, extent);
             }
         }
         let text = String::from_utf8_lossy(body);
@@ -443,7 +682,14 @@ impl Waf {
         body: &[u8],
         content_type: Option<&str>,
     ) -> ScanOutcome {
-        self.scan_body_rules(subject, body, content_type, BodyDirection::Response)
+        // `body_json_path` rules are request-only, so the extent is unused.
+        self.scan_body_rules(
+            subject,
+            body,
+            content_type,
+            BodyDirection::Response,
+            BodyExtent::Complete,
+        )
     }
 
     fn scan_text_set(
@@ -512,30 +758,41 @@ impl Waf {
         outcome: &mut ScanOutcome,
         body: &[u8],
         subject: ScanSubject<'_>,
+        kind: ReadingKind,
+        readings: &mut JsonReadings,
     ) {
-        if self.compiled.body_json_paths.is_empty() {
+        if self.compiled.body_json_paths.is_empty() || readings.pending == 0 {
+            // Every JSON-path rule has already hit this body: no reading can
+            // change the outcome.
             return;
         }
         // Duplicate-preserving parse: every occurrence of a repeated member
         // is inspected, so the verdict holds whichever one the backend reads.
-        let Some(json) = json_doc::parse(body) else {
+        // Every document read is inspected, including the ones around a part
+        // that could not be read.
+        let view = json_doc::parse(body, &mut readings.budget);
+        readings.record(&view, kind);
+        let documents = view.documents();
+        if documents.is_empty() {
             return;
-        };
-        for path_rule in &self.compiled.body_json_paths {
+        }
+        let rules = self.compiled.body_json_paths.len();
+        for (position, path_rule) in self.compiled.body_json_paths.iter().enumerate() {
             // One hit per rule is all the outcome records. Stop at it, and skip
-            // a rule an earlier view already hit, so duplicated members cannot
-            // multiply matching or hit-deduplication work.
-            if outcome
-                .hits
-                .iter()
-                .any(|hit| hit.rule_index == path_rule.rule_index)
-            {
+            // a rule an earlier reading already hit, so duplicated members and
+            // many framed messages cannot multiply matching or
+            // hit-deduplication work.
+            if readings.is_hit(position) {
                 continue;
             }
-            'occurrences: for value in json_doc::select(&json, &path_rule.path) {
+            let selected = documents
+                .iter()
+                .flat_map(|document| json_doc::select(document, &path_rule.path));
+            'occurrences: for value in selected {
                 for text in json_doc::scan_texts(value) {
                     let text = text.as_ref();
                     if self.push_json_path_hit_if_matched(outcome, path_rule, text, text, subject) {
+                        readings.mark_hit(position, rules);
                         break 'occurrences;
                     }
                     // `text` is already JSON-unescaped; its single-character
@@ -544,10 +801,43 @@ impl Waf {
                         if self.push_json_path_hit_if_matched(
                             outcome, path_rule, &variant, text, subject,
                         ) {
+                            readings.mark_hit(position, rules);
                             break 'occurrences;
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// A body JSON-path rules could not read (see [`JsonReadings::fail_closed`]).
+    /// Backend parsers accept grammar `serde_json` refuses — a number beyond
+    /// the `f64` range, nesting deeper than 128 levels, `NaN` / `Infinity`,
+    /// comments, a trailing comma, unquoted member names, text after the
+    /// document — so treating such a body as "nothing selected" would let one
+    /// such token switch every JSON-path rule off. No path can be evaluated,
+    /// so every applicable `body_json_path` rule records a hit
+    /// and its own action, scoring, and paranoia band decide, exactly as for a
+    /// match.
+    ///
+    /// A prefix scan (`on_body_too_large: scan_truncated`, or a non-blocking
+    /// configuration's prefix observation) cuts the document short, so its
+    /// view is unparsed by construction and is not judged here.
+    fn push_unparsed_json_hits(
+        &self,
+        outcome: &mut ScanOutcome,
+        subject: ScanSubject<'_>,
+        extent: BodyExtent,
+    ) {
+        if extent == BodyExtent::Prefix {
+            return;
+        }
+        for path_rule in &self.compiled.body_json_paths {
+            if self.rule_applies(subject, path_rule.rule_index) {
+                outcome.push(RuleHit {
+                    rule_index: path_rule.rule_index,
+                    target_name: path_rule.target_name,
+                });
             }
         }
     }
