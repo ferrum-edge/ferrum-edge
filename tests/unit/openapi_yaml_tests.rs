@@ -6667,6 +6667,59 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         }),
         false,
     );
+    for (config, valid) in [
+        (
+            json!({"provider": "aws_lambda", "aws_credentials": "default_chain"}),
+            true,
+        ),
+        (
+            json!({
+                "provider": "aws_lambda",
+                "aws_credentials": "default_chain",
+                "aws_access_key_id": "AKIAEXAMPLE"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "provider": "aws_lambda",
+                "aws_credentials": "default_chain",
+                "aws_session_token": "token"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "provider": "aws_lambda",
+                "payload_format": "aws_api_gateway_v2",
+                "mode": "terminate"
+            }),
+            true,
+        ),
+        (
+            json!({"provider": "aws_lambda", "payload_format": "aws_api_gateway_v2"}),
+            false,
+        ),
+        (
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://functions.example/run",
+                "payload_format": "aws_api_gateway_v2",
+                "mode": "terminate"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "provider": "azure_functions",
+                "function_url": "https://functions.example/run",
+                "timeout_ms": 900_001
+            }),
+            false,
+        ),
+    ] {
+        assert_component_validity(&spec, "ServerlessFunctionConfig", &config, valid);
+    }
 
     for component in ["RequestTransformerConfig", "ResponseTransformerConfig"] {
         assert_component_validity(
@@ -18244,15 +18297,27 @@ fn serverless_function_schema_matches_runtime_admission() {
     let pattern_for = |field: &str| compile_pattern(&properties[field]);
 
     // Issue #5177: `format: uint64` is not an assertion, so the ceiling the
-    // runtime can actually represent must be published as `maximum`.
-    for field in ["timeout_ms", "max_response_body_bytes"] {
+    // runtime enforces must be published as `maximum`: 15 minutes for the
+    // invocation timeout and 64 MiB for the buffered response.
+    for (field, ceiling) in [
+        ("timeout_ms", 900_000_u64),
+        ("max_response_body_bytes", 64 * 1024 * 1024),
+    ] {
         assert_eq!(
             properties[field]["maximum"].as_u64(),
-            Some(u64::MAX),
-            "{field} must publish the u64 ceiling"
+            Some(ceiling),
+            "{field} must publish the runtime ceiling"
         );
         assert_eq!(properties[field]["minimum"].as_u64(), Some(1), "{field}");
     }
+    assert_eq!(
+        properties["aws_credentials"]["enum"],
+        json!(["static", "default_chain"])
+    );
+    assert_eq!(
+        properties["payload_format"]["enum"],
+        json!(["ferrum", "aws_api_gateway_v2"])
+    );
 
     // Issue #5176: `forward_headers` entries are HTTP field-name tokens.
     let header_item = &properties["forward_headers"]["items"];
@@ -18265,7 +18330,13 @@ fn serverless_function_schema_matches_runtime_admission() {
     assert!(!header_pattern.is_match("bad:header"));
 
     // Issue #5189: a credential must be representable as an HTTP field value.
-    for field in ["azure_function_key", "gcp_bearer_token"] {
+    // The AWS key id and session token are header-bearing too.
+    for field in [
+        "azure_function_key",
+        "gcp_bearer_token",
+        "aws_access_key_id",
+        "aws_session_token",
+    ] {
         let pattern = pattern_for(field);
         assert!(pattern.is_match("ordinary-credential=="), "{field}");
         assert!(!pattern.is_match("audit\ncredential"), "{field}");
@@ -18354,6 +18425,13 @@ fn serverless_function_schema_matches_runtime_admission() {
         json!({"forward_headers": ["bad header"]}),
         json!({"azure_function_key": "audit\ncredential"}),
         json!({"gcp_bearer_token": "audit\ncredential"}),
+        json!({"aws_access_key_id": "audit\ncredential"}),
+        json!({"aws_session_token": "audit\ncredential"}),
+        json!({"timeout_ms": 900_001}),
+        json!({"max_response_body_bytes": 64 * 1024 * 1024 + 1}),
+        json!({"aws_credentials": "instance_profile"}),
+        json!({"payload_format": "aws_api_gateway_v1"}),
+        json!({"payload_format": "aws_api_gateway_v2"}),
         json!({"aws_function_name": "bad name"}),
         json!({"aws_qualifier": "not a qualifier"}),
         json!({"aws_endpoint_url": "https://example.com/lambda"}),
