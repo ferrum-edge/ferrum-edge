@@ -92,9 +92,9 @@
 //! `endpoint.path` — and enrolls `Static`. But with no configured base and
 //! `discovery.trust_forwarded_headers` enabled, the rewritten origin is built
 //! from `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host` and, absent a
-//! forwarded scheme, from whether the connection carried a TLS SNI hostname.
+//! forwarded scheme, from whether the connection itself is secure.
 //! The fingerprint below binds neither the complete forwarded header set nor
-//! `frontend_sni_hostname`, so two requests sharing a replay key can legitimately
+//! `request_is_secure`, so two requests sharing a replay key can legitimately
 //! deserve cards advertising different origins. That configuration therefore
 //! reports `Dynamic` and is refused, while a configured-public-base deployment
 //! composes normally.

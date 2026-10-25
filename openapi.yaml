@@ -37309,6 +37309,9 @@ components:
                 rewrite_agent_card_urls:
                   enum: [false]
             - required: [public_base_url]
+              properties:
+                public_base_url:
+                  type: string
             - required: [trust_forwarded_headers, allowed_public_origins]
               properties:
                 trust_forwarded_headers:
@@ -37319,7 +37322,7 @@ components:
             rewrite_agent_card_urls:
               type: [boolean, "null"]
               default: true
-              description: Rewrite Agent Card endpoint URLs for detected HTTP JSON and unary gRPC card requests. Rewrites JSON-RPC endpoint URLs, preserves non-JSONRPC interface URLs such as GRPC and HTTP+JSON, removes stale signatures after mutation, and re-encodes A2A 0.3.x protobuf Agent Cards on the gRPC path. The gRPC path only inspects a proven-successful reply - HTTP 200 with a terminal grpc-status of exactly 0 - so a non-OK upstream response is forwarded as written rather than mistaken for a card. It rewrites the A2A 0.3.x wire layout only and requires positive proof of it TWICE - the responding gRPC service must be declared to carry the a2a-0.3 card schema (endpoint.grpc_services; a service declared a2a-1.0 or none fails closed with agent_card_grpc_schema_unsupported / agent_card_grpc_schema_undeclared before a byte is decoded) AND the card must carry an explicit protocol_version that exactly matches a configured endpoint.protocol_versions entry AND belongs to the 0.3 family. A card with an absent or empty protocol_version fails closed with a trailers-only gRPC INTERNAL under HTTP 200 and an unsupported_agent_card_protobuf_version diagnostic, and is not assumed to be 0.3.x even when endpoint.protocol_versions lists only 0.3.x. A2A renumbered AgentCard for 1.0, so guessing would corrupt the card and re-serve it under a stale signature. All seventeen known 0.3 top-level fields are schema-validated before any rewrite - each must carry the wire type the 0.3 schema declares (a canonical 0/1 varint for supports_authenticated_extended_card), each singular field may appear at most once, and every known string that is re-emitted must be valid UTF-8. url and every AgentInterface url must parse as a bounded absolute http/https URL with a real host and no embedded credentials, and an AgentInterface without a url is refused rather than counted as a usable endpoint. Faults fail closed with agent_card_protobuf_field_wire_mismatch, agent_card_protobuf_field_duplicated, agent_card_protobuf_string_invalid, agent_card_protobuf_bool_invalid, agent_card_protobuf_interface_url_missing, or agent_card_protobuf_url_layout_mismatch. The submessages the rewriter preserves rather than parses - provider, capabilities, security_schemes, security, skills, and signatures - are checked for wire type and multiplicity only; their contents are never decoded and are not claimed to be well formed. Unknown fields with any valid wire type are preserved untouched. Diagnostics are fixed strings; response bytes are never reflected into grpc-message or metadata. Set this to false when fronting a non-0.3 A2A backend; leaving it true refuses such cards rather than serving un-rewritten internal URLs.
+              description: Rewrite Agent Card endpoint URLs for detected HTTP JSON and unary gRPC card requests. Rewrites every advertised interface on a transport the gateway fronts - JSONRPC (or no transport) and HTTP+JSON/REST URLs become the public base plus endpoint.path, GRPC URLs become the public base itself, and the top-level url follows preferredTransport the same way; interfaces on any other transport keep the backend URL. Removes stale signatures after mutation. An HTTP card response whose backend representation is content-coded (gzip, br, ...) or a 206/226 fragment is claimed by the shared buffered-response representation gate - a supported coding is decoded and the decoded card rewritten and served as identity bytes, anything else fails closed with 502 - so an encoded card is never forwarded with its internal URLs. Also re-encodes A2A 0.3.x protobuf Agent Cards on the gRPC path. The gRPC path only inspects a proven-successful reply - HTTP 200 with a terminal grpc-status of exactly 0 - so a non-OK upstream response is forwarded as written rather than mistaken for a card. It rewrites the A2A 0.3.x wire layout only and requires positive proof of it TWICE - the responding gRPC service must be declared to carry the a2a-0.3 card schema (endpoint.grpc_services; a service declared a2a-1.0 or none fails closed with agent_card_grpc_schema_unsupported / agent_card_grpc_schema_undeclared before a byte is decoded) AND the card must carry an explicit protocol_version that exactly matches a configured endpoint.protocol_versions entry AND belongs to the 0.3 family. A card with an absent or empty protocol_version fails closed with a trailers-only gRPC INTERNAL under HTTP 200 and an unsupported_agent_card_protobuf_version diagnostic, and is not assumed to be 0.3.x even when endpoint.protocol_versions lists only 0.3.x. A2A renumbered AgentCard for 1.0, so guessing would corrupt the card and re-serve it under a stale signature. All seventeen known 0.3 top-level fields are schema-validated before any rewrite - each must carry the wire type the 0.3 schema declares (a canonical 0/1 varint for supports_authenticated_extended_card), each singular field may appear at most once, and every known string that is re-emitted must be valid UTF-8. url and every AgentInterface url must parse as a bounded absolute http/https URL with a real host and no embedded credentials, and an AgentInterface without a url is refused rather than counted as a usable endpoint. Faults fail closed with agent_card_protobuf_field_wire_mismatch, agent_card_protobuf_field_duplicated, agent_card_protobuf_string_invalid, agent_card_protobuf_bool_invalid, agent_card_protobuf_interface_url_missing, or agent_card_protobuf_url_layout_mismatch. The submessages the rewriter preserves rather than parses - provider, capabilities, security_schemes, security, skills, and signatures - are checked for wire type and multiplicity only; their contents are never decoded and are not claimed to be well formed. Unknown fields with any valid wire type are preserved untouched. Diagnostics are fixed strings; response bytes are never reflected into grpc-message or metadata. Set this to false when fronting a non-0.3 A2A backend; leaving it true refuses such cards rather than serving un-rewritten internal URLs.
             public_base_url:
               type: [string, "null"]
               format: uri
@@ -37329,7 +37332,7 @@ components:
             trust_forwarded_headers:
               type: [boolean, "null"]
               default: false
-              description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. Requires nonempty allowed_public_origins when rewriting is enabled; the trusted front door must replace forwarded headers. Schemes and ports must match an allowed normalized origin. In that request-derived mode the origin also depends on whether the connection carried a TLS SNI hostname, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
+              description: Derive the public gateway origin from X-Forwarded-Proto, X-Forwarded-Host, and Host when discovery.public_base_url is omitted. Requires nonempty allowed_public_origins when rewriting is enabled; the trusted front door must replace forwarded headers. Schemes and ports must match an allowed normalized origin. Without X-Forwarded-Proto the scheme is https exactly when the client connection is secure (TLS, or HTTP/3), never inferred from TLS SNI. In that request-derived mode the origin also depends on that transport security, which no replay fingerprint binds, so admission rejects the pair with request_deduplication on the same proxy with 400 (fatal in file mode, rejected update in DP) and the runtime retains and replays nothing. Setting discovery.public_base_url resolves it; a configured public base composes normally.
             allowed_public_origins:
               type: [array, "null"]
               default: []
@@ -37366,7 +37369,7 @@ components:
               type: [string, "null"]
               enum: [allow, deny, null]
               default: allow
-              description: With deny or any per-method deny rule, unrecognized requests inside the configured endpoint, discovery or gRPC-service scope fail closed, including unsupported payloads, methods, paths and disabled bindings. Known batch members are individually policed. Unrelated sibling paths and services are outside scope.
+              description: With deny, any per-method deny rule, or any group-conditioned allow rule (policy.methods.*.allowed_groups / denied_groups), unrecognized requests inside the configured endpoint, discovery or gRPC-service scope fail closed, including unsupported payloads, methods, paths and disabled bindings. Known batch members are individually policed. Unrelated sibling paths and services are outside scope.
             methods:
               type: [object, "null"]
               propertyNames:
@@ -37427,6 +37430,41 @@ components:
                     type: string
                     enum: [allow, deny]
                     description: Required; null is not accepted here.
+                  allowed_groups:
+                    type: [array, "null"]
+                    minItems: 1
+                    maxItems: 512
+                    description: Requires action allow. Grants the method only to a request whose gateway-mapped Consumer holds at least one of these acl_groups; a request with no mapped Consumer is never granted a group-conditioned method, and an ungranted method is refused exactly like a deny rule (JSON-RPC -32001, REST 403, gRPC PERMISSION_DENIED), re-decided over the final backend-visible JSON-RPC body. Omitting it (or null) drops only the allowed-group requirement; a mapped Consumer is still required whenever denied_groups is present. An empty list is rejected. Entries are matched byte-for-byte, must not contain control characters other than tab, LF, and CR, and are at most 255 bytes (the schema bounds code points; the byte bound is enforced at plugin load, as for Consumer acl_groups). A group-conditioned entry counts as a deny-capable rule for in-scope fail-closed classification.
+                    items:
+                      type: string
+                      minLength: 1
+                      maxLength: 255
+                      pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                      not:
+                        pattern: '[\u0000-\u0008\u000B\u000C\u000E-\u001F]'
+                  denied_groups:
+                    type: [array, "null"]
+                    minItems: 1
+                    maxItems: 512
+                    description: Requires action allow. A Consumer holding any of these acl_groups is refused the method even when it also holds an allowed group; with no allowed_groups it grants every mapped Consumer except these, and never a request without a mapped Consumer. An empty list is rejected, and one entry may not name the same group in both lists (enforced at plugin load). Entries follow the allowed_groups entry rules.
+                    items:
+                      type: string
+                      minLength: 1
+                      maxLength: 255
+                      pattern: '[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]'
+                      not:
+                        pattern: '[\u0000-\u0008\u000B\u000C\u000E-\u001F]'
+                if:
+                  properties:
+                    action:
+                      not:
+                        const: allow
+                then:
+                  properties:
+                    allowed_groups:
+                      type: "null"
+                    denied_groups:
+                      type: "null"
 
     McpGatewayConfig:
       type: object

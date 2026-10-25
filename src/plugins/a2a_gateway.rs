@@ -106,7 +106,10 @@ const A2A_DISCOVERY_KEYS: &[&str] = &[
 ];
 const A2A_OBSERVABILITY_KEYS: &[&str] = &["emit_metadata", "log_payloads", "max_payload_size"];
 const A2A_POLICY_KEYS: &[&str] = &["default_action", "methods"];
-const A2A_POLICY_METHOD_KEYS: &[&str] = &["action"];
+const A2A_POLICY_METHOD_KEYS: &[&str] = &["action", "allowed_groups", "denied_groups"];
+/// Upper bound on the entries one `policy.methods.*.allowed_groups` /
+/// `denied_groups` list may carry. Matches `mcp_gateway`'s per-list grant bound.
+const MAX_A2A_POLICY_GRANT_GROUPS: usize = 512;
 
 /// The complete A2A 0.3.x `AgentCard` top-level field table (`a2aproject/A2A`
 /// at tag `v0.3.0`, `specification/grpc/a2a.proto`, "Next ID: 18"). Wire surgery
@@ -273,7 +276,55 @@ struct A2aObservabilityConfig {
 #[derive(Debug, Clone)]
 struct A2aPolicyConfig {
     default_action: PolicyAction,
-    methods: HashMap<String, PolicyAction>,
+    methods: HashMap<String, A2aMethodPolicy>,
+}
+
+/// One `policy.methods` entry, precomputed at config load.
+#[derive(Debug, Clone)]
+struct A2aMethodPolicy {
+    action: PolicyAction,
+    /// Per-consumer group condition. Only an `allow` entry may carry one.
+    grant: Option<A2aMethodGrant>,
+}
+
+/// Per-consumer grant condition of an `allow` method entry.
+///
+/// A method is granted to a request iff the request carries a gateway-mapped
+/// `Consumer`, that consumer holds none of `denied`, and `allowed` is absent or
+/// the consumer holds at least one of its groups. It fails closed: a request
+/// with no mapped consumer (an anonymous proxy, or an external identity with no
+/// `Consumer` mapping) is never granted a group-conditioned method. Mirrors the
+/// `mcp_gateway` per-tool grant model.
+#[derive(Debug, Clone)]
+struct A2aMethodGrant {
+    allowed: Option<HashSet<String>>,
+    denied: HashSet<String>,
+}
+
+impl A2aMethodGrant {
+    /// Decided from the live `ctx.identified_consumer` snapshot on every call,
+    /// so both `before_proxy` and the final request-body re-decision read the
+    /// same identity. Allocation-free: group names are compared in place.
+    fn admits(&self, ctx: &RequestContext) -> bool {
+        let Some(consumer) = ctx.identified_consumer.as_deref() else {
+            return false;
+        };
+        // `denied_groups` takes precedence over every allow.
+        if consumer
+            .acl_groups
+            .iter()
+            .any(|group| self.denied.contains(group.as_str()))
+        {
+            return false;
+        }
+        match &self.allowed {
+            Some(allowed) => consumer
+                .acl_groups
+                .iter()
+                .any(|group| allowed.contains(group.as_str())),
+            None => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -334,9 +385,28 @@ type A2aStreamObservationSlot = Arc<Mutex<Option<A2aStreamObservation>>>;
 
 struct A2aStreamObservation {
     stream_events: u64,
-    task_id: Option<String>,
-    context_id: Option<String>,
-    task_state: Option<String>,
+    task_id: Option<BoundedMetadataValue>,
+    context_id: Option<BoundedMetadataValue>,
+    task_state: Option<TaskStateObservation>,
+}
+
+/// A semantic metadata value already reduced to the published
+/// `min(observability.max_payload_size, 1024)` bound, plus whether that
+/// reduction truncated it. See [`bound_metadata_value`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedMetadataValue {
+    value: String,
+    truncated: bool,
+}
+
+/// A task state already normalized to the closed protocol set, with the two
+/// facts about the raw input that its published flags need. See
+/// [`observe_task_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskStateObservation {
+    state: &'static str,
+    input_over_limit: bool,
+    unrecognized: bool,
 }
 
 /// Observe-only SSE parser for one A2A response.
@@ -346,8 +416,18 @@ struct A2aStreamObservation {
 /// SSE lines/events for metadata extraction. The per-event cap prevents a
 /// malformed stream without delimiters from growing the accumulator without
 /// bound; oversized events still pass through unchanged and are counted.
+///
+/// The semantic values carried between events are bounded WHEN THEY ENTER this
+/// state, not when the stream ends. A long-lived stream otherwise retained each
+/// backend-provided task id, context id, and raw task-state string at full
+/// event size (up to the 1 MiB event cap apiece) for the stream's whole
+/// lifetime, multiplied by every concurrently open stream, while the configured
+/// `observability.max_payload_size` bound applied only to what was finally
+/// published.
 struct A2aSseStreamInspector {
     binding: Option<&'static str>,
+    /// `observability.max_payload_size`, applied to every retained value.
+    metadata_limit: usize,
     line: Vec<u8>,
     data: Vec<u8>,
     line_had_bytes: bool,
@@ -355,16 +435,21 @@ struct A2aSseStreamInspector {
     discarding_event: bool,
     event_has_data: bool,
     stream_events: u64,
-    task_id: Option<String>,
-    context_id: Option<String>,
-    task_state: Option<String>,
+    task_id: Option<BoundedMetadataValue>,
+    context_id: Option<BoundedMetadataValue>,
+    task_state: Option<TaskStateObservation>,
     observation: A2aStreamObservationSlot,
 }
 
 impl A2aSseStreamInspector {
-    fn new(binding: Option<&'static str>, observation: A2aStreamObservationSlot) -> Self {
+    fn new(
+        binding: Option<&'static str>,
+        observation: A2aStreamObservationSlot,
+        metadata_limit: usize,
+    ) -> Self {
         Self {
             binding,
+            metadata_limit,
             line: Vec::new(),
             data: Vec::new(),
             line_had_bytes: false,
@@ -377,6 +462,18 @@ impl A2aSseStreamInspector {
             task_state: None,
             observation,
         }
+    }
+
+    /// Bytes of backend-provided semantic text this inspector currently retains
+    /// between events. Exposed to external tests through
+    /// [`sse_inspector_retained_semantic_bytes`].
+    fn retained_semantic_bytes(&self) -> usize {
+        self.task_id.as_ref().map_or(0, |value| value.value.len())
+            + self
+                .context_id
+                .as_ref()
+                .map_or(0, |value| value.value.len())
+            + self.task_state.map_or(0, |state| state.state.len())
     }
 
     fn ingest(&mut self, chunk: &[u8]) {
@@ -452,14 +549,16 @@ impl A2aSseStreamInspector {
                 && self.data.as_slice() != b"[DONE]"
                 && let Ok(value) = serde_json::from_slice::<Value>(&self.data)
             {
+                // Bounded on entry: the full extracted strings live only for the
+                // duration of this event, never across the stream.
                 if let Some(task_id) = extract_task_id_from_response(self.binding, &value) {
-                    self.task_id = Some(task_id);
+                    self.task_id = Some(bound_metadata_value(&task_id, self.metadata_limit));
                 }
                 if let Some(context_id) = extract_context_id_from_response(self.binding, &value) {
-                    self.context_id = Some(context_id);
+                    self.context_id = Some(bound_metadata_value(&context_id, self.metadata_limit));
                 }
                 if let Some(task_state) = find_task_state(&value) {
-                    self.task_state = Some(task_state);
+                    self.task_state = Some(observe_task_state(&task_state, self.metadata_limit));
                 }
             }
         }
@@ -499,6 +598,23 @@ impl A2aSseStreamInspector {
             *slot = Some(observation);
         }
     }
+}
+
+/// Feed `chunks` through a fresh SSE inspector bounded by `metadata_limit` and
+/// report how many bytes of semantic text it retains afterwards, BEFORE the
+/// stream ends. Reached by external tests through `crate::_test_support`; the
+/// inspector itself never leaves this module.
+pub(crate) fn sse_inspector_retained_semantic_bytes(
+    binding: &'static str,
+    metadata_limit: usize,
+    chunks: &[&[u8]],
+) -> usize {
+    let mut inspector =
+        A2aSseStreamInspector::new(Some(binding), Arc::new(Mutex::new(None)), metadata_limit);
+    for chunk in chunks {
+        inspector.ingest(chunk);
+    }
+    inspector.retained_semantic_bytes()
 }
 
 #[async_trait]
@@ -687,7 +803,7 @@ impl A2aGateway {
         }
         let value: Value = serde_json::from_slice(body).ok()?;
         if let Some(batch) = value.as_array() {
-            return self.detect_jsonrpc_batch(batch, headers);
+            return self.detect_jsonrpc_batch(ctx, batch, headers);
         }
         match self.detect_jsonrpc_value(&value, headers) {
             Some(detection) => Some(detection),
@@ -705,6 +821,7 @@ impl A2aGateway {
 
     fn detect_jsonrpc_batch(
         &self,
+        ctx: &RequestContext,
         batch: &[Value],
         headers: &HashMap<String, String>,
     ) -> Option<A2aDetection> {
@@ -724,7 +841,7 @@ impl A2aGateway {
                 return Some(detection);
             };
             detection.jsonrpc_batch_response = true;
-            if self.policy_action(&detection.method) == PolicyAction::Deny {
+            if self.policy_action(ctx, &detection.method) == PolicyAction::Deny {
                 detection.jsonrpc_batch_ids = Some(batch_ids);
                 return Some(detection);
             }
@@ -737,7 +854,13 @@ impl A2aGateway {
                 first_detection = Some(detection);
             }
         }
-        first_detection
+        // Carried on an admitted batch too, so a later refusal of the whole
+        // batch (the final-body operation-class check) still answers every
+        // request member rather than only the one that was classified.
+        first_detection.map(|mut detection| {
+            detection.jsonrpc_batch_ids = Some(batch_ids);
+            detection
+        })
     }
 
     fn detect_jsonrpc_value(
@@ -764,7 +887,7 @@ impl A2aGateway {
         let canonical_method = canonical_a2a_method(&method);
         let accepted_unknown = self.detection.allow_unknown_methods_with_version_header
             && header_value(headers, &self.detection.version_header).is_some();
-        let unknown_denied_by_policy = self.policy_action("unknown") == PolicyAction::Deny;
+        let unknown_denied_by_policy = self.policy_may_deny("unknown");
         if canonical_method.is_none() && !accepted_unknown && !unknown_denied_by_policy {
             return None;
         }
@@ -893,6 +1016,15 @@ impl A2aGateway {
         // and observability policy can apply to the response
         // (`GHSA-593v-25wm-37mw`). Request-phase policy below is unaffected and
         // still runs in every instance whose scope matched.
+        //
+        // Only a JSON-RPC classification was decided over body bytes, and only
+        // `request_body_bytes` (which `detect_jsonrpc` reads first) is a
+        // refcounted buffer that can be retained without copying.
+        let classified_request_body = if detection.binding == A2aBinding::JsonRpc {
+            ctx.request_body_bytes.clone()
+        } else {
+            None
+        };
         ctx.claim_a2a_gateway(A2aGatewayClaim {
             owner: self.instance_id,
             binding: detection.binding.as_str(),
@@ -902,6 +1034,7 @@ impl A2aGateway {
             public_base,
             card_rewrite: None,
             card_body_replaced: false,
+            classified_request_body,
         });
 
         if !self.observability.emit_metadata {
@@ -944,12 +1077,33 @@ impl A2aGateway {
         }
     }
 
-    fn policy_action(&self, method: &str) -> PolicyAction {
-        self.policy
-            .methods
-            .get(method)
-            .copied()
-            .unwrap_or(self.policy.default_action)
+    /// The action this request's `method` selects, including any per-consumer
+    /// grant on an `allow` entry (decided from the live consumer snapshot).
+    fn policy_action(&self, ctx: &RequestContext, method: &str) -> PolicyAction {
+        match self.policy.methods.get(method) {
+            Some(entry) => match (&entry.grant, entry.action) {
+                (Some(grant), PolicyAction::Allow) => {
+                    if grant.admits(ctx) {
+                        PolicyAction::Allow
+                    } else {
+                        PolicyAction::Deny
+                    }
+                }
+                (_, action) => action,
+            },
+            None => self.policy.default_action,
+        }
+    }
+
+    /// Whether `method` can be denied for SOME request — an unconditional
+    /// `deny`, a group-conditioned `allow`, or the deny default. Used where no
+    /// request identity is in hand yet (deciding whether an unknown JSON-RPC
+    /// method must be classified at all).
+    fn policy_may_deny(&self, method: &str) -> bool {
+        match self.policy.methods.get(method) {
+            Some(entry) => entry.action == PolicyAction::Deny || entry.grant.is_some(),
+            None => self.policy.default_action == PolicyAction::Deny,
+        }
     }
 
     fn policy_requires_inspection(&self) -> bool {
@@ -958,7 +1112,19 @@ impl A2aGateway {
                 .policy
                 .methods
                 .values()
-                .any(|action| *action == PolicyAction::Deny)
+                .any(|entry| entry.action == PolicyAction::Deny || entry.grant.is_some())
+    }
+
+    /// Whether the final backend-visible request-body hook can change any
+    /// outcome for this instance: a policy that can deny re-decides there, and
+    /// Agent Card rewriting or response metadata depends on the operation class
+    /// the arrival-time classification recorded.
+    fn final_request_body_recheck_applies(&self) -> bool {
+        self.enabled
+            && self.detection.bindings.contains(&A2aBinding::JsonRpc)
+            && (self.policy_requires_inspection()
+                || self.discovery.rewrite_agent_card_urls
+                || self.observability.emit_metadata)
     }
 
     fn rest_suffix<'a>(&self, path: &'a str) -> Option<&'a str> {
@@ -997,6 +1163,10 @@ impl A2aGateway {
         self.should_rewrite_agent_card(claim) && claim.binding == A2aBinding::Grpc.as_str()
     }
 
+    fn should_rewrite_http_agent_card(&self, claim: &A2aGatewayClaim) -> bool {
+        self.should_rewrite_agent_card(claim) && claim.binding != A2aBinding::Grpc.as_str()
+    }
+
     /// The public origin every rewritten Agent Card URL is built from.
     ///
     /// Resolved once per request in `before_proxy`, from THAT hook's header map,
@@ -1008,10 +1178,16 @@ impl A2aGateway {
     /// - **Request/transport-derived.** With no configured base and
     ///   `trust_forwarded_headers` enabled, the base comes from
     ///   `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host` **and**, when no
-    ///   forwarded scheme is present, from whether this connection carried a TLS
-    ///   SNI hostname (`ctx.frontend_sni_hostname`). That last input belongs to
-    ///   the transport, not to any request field a replay fingerprint binds —
-    ///   see [`discovery_is_request_derived`].
+    ///   forwarded scheme is present, from whether this connection is actually
+    ///   secure (`ctx.request_is_secure`: TLS on H1/H2, always on native H3).
+    ///   That last input belongs to the transport, not to any request field a
+    ///   replay fingerprint binds — see [`discovery_is_request_derived`].
+    ///
+    ///   It used to be guessed from whether the connection carried a TLS SNI
+    ///   hostname. SNI is optional in TLS, so an HTTPS client dialing by IP (or
+    ///   any SNI-less client) was handed an `http://` origin: refused when only
+    ///   the `https` origin was allowlisted, or published as a plaintext
+    ///   endpoint over a secure discovery channel when both were.
     ///
     /// `headers` is the request-hook's own map rather than `ctx.headers`, because
     /// the two are not the same object: the core moves request headers out of the
@@ -1031,13 +1207,12 @@ impl A2aGateway {
         if !self.discovery.trust_forwarded_headers {
             return None;
         }
-        let proto = header_value(headers, "x-forwarded-proto").unwrap_or_else(|| {
-            if ctx.frontend_sni_hostname.is_some() {
+        let proto =
+            header_value(headers, "x-forwarded-proto").unwrap_or(if ctx.request_is_secure {
                 "https"
             } else {
                 "http"
-            }
-        });
+            });
         let host =
             header_value(headers, "x-forwarded-host").or_else(|| header_value(headers, "host"))?;
         let candidate = forwarded_public_base_url(proto, host)?;
@@ -1205,14 +1380,29 @@ impl A2aGateway {
         };
         let endpoint_url = format!("{public_base}{}", self.endpoint.path);
         let card_url = format!("{public_base}{agent_card_path}");
+        let urls = PublicCardUrls {
+            endpoint: &endpoint_url,
+            grpc: public_base,
+        };
         let ceiling = ctx.retained_response_body_ceiling();
         let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+            if origin_response_is_still_encoded(ctx) {
+                // Admitted on an ENCODED representation the shared gate should
+                // have decoded into these bytes, and it did not: this is still
+                // the backend's content-coded card. Forwarding it would publish
+                // the internal URLs this rewrite exists to replace.
+                self.record_card_rewrite_state(
+                    ctx,
+                    A2aGrpcCardRewriteState::Failed("agent_card_representation_uninspectable"),
+                );
+                return None;
+            }
             // The admitted document is no longer parseable, which can only mean a
             // later phase replaced it. There is no card left to rewrite.
             self.record_card_rewrite_state(ctx, A2aGrpcCardRewriteState::Applied);
             return None;
         };
-        if !rewrite_agent_card_response(&mut value, &endpoint_url, &card_url) {
+        if !rewrite_agent_card_response(&mut value, &urls, &card_url) {
             // Every advertised URL already names the public origin: the backend's
             // original, still-signed bytes are forwarded untouched.
             self.record_card_rewrite_state(ctx, A2aGrpcCardRewriteState::Applied);
@@ -1265,7 +1455,7 @@ impl A2aGateway {
             }
             return Some(deny_response(detection));
         }
-        let action = self.policy_action(&detection.method);
+        let action = self.policy_action(ctx, &detection.method);
         if self.observability.emit_metadata {
             ctx.metadata.insert(
                 "a2a.policy_decision".to_string(),
@@ -1273,6 +1463,36 @@ impl A2aGateway {
             );
         }
         (action == PolicyAction::Deny).then(|| deny_response(detection))
+    }
+
+    /// Whether the finalized JSON-RPC `detection` selects response handling the
+    /// arrival-time classification did not set up for this instance.
+    ///
+    /// Only the two classes that decide the response phase are compared: Agent
+    /// Card (buffering, the admitted public origin, and the rewrite itself) and
+    /// streaming (response buffering for metadata). Each matters only when this
+    /// instance acts on it, so a change no configured behavior depends on is
+    /// not refused.
+    fn final_operation_class_changed(
+        &self,
+        ctx: &RequestContext,
+        detection: &A2aDetection,
+    ) -> bool {
+        match ctx.a2a_gateway_claim.as_deref() {
+            Some(claim) if claim.owner == self.instance_id => {
+                let card_changed = claim.is_agent_card != detection.is_agent_card;
+                let streaming_changed = claim.streaming != detection.streaming_hint;
+                (card_changed
+                    && (self.discovery.rewrite_agent_card_urls || self.observability.emit_metadata))
+                    || (streaming_changed && self.observability.emit_metadata)
+            }
+            // A sibling instance owns this request's response phase.
+            Some(_) => false,
+            // Nothing classified the request at arrival, so no response
+            // handling and no public origin exist for it: a card that only
+            // appears now would be served with the backend's URLs.
+            None => detection.is_agent_card && self.discovery.rewrite_agent_card_urls,
+        }
     }
 }
 
@@ -1342,9 +1562,9 @@ impl Plugin for A2aGateway {
     /// **`Dynamic`** is reported for the request/transport-derived mode
     /// ([`discovery_is_request_derived`]): with no configured base and
     /// `trust_forwarded_headers` on, the rewritten origin is shaped by
-    /// `X-Forwarded-*` / `Host` *and* by whether the connection carried a TLS
-    /// SNI hostname. The deduplication fingerprint binds neither the complete
-    /// forwarded header set nor `frontend_sni_hostname`, so two requests that
+    /// `X-Forwarded-*` / `Host` *and* by whether the connection is secure
+    /// (`request_is_secure`). The deduplication fingerprint binds neither the
+    /// complete forwarded header set nor the transport's security, so two requests that
     /// share a replay key can legitimately deserve `https://…` and `http://…`
     /// cards. No construction-time digest can describe that, and the honest
     /// answer is that this proxy has no provable presentation policy at all.
@@ -1363,6 +1583,51 @@ impl Plugin for A2aGateway {
 
     fn requires_response_body_buffering(&self) -> bool {
         self.enabled && (self.discovery.rewrite_agent_card_urls || self.observability.emit_metadata)
+    }
+
+    /// Claim an HTTP JSON Agent Card response the shared representation gate
+    /// must make inspectable before this plugin's rewrite can be trusted.
+    ///
+    /// The card rewrite is a body policy in the gate's sense: the operator
+    /// enabled it so discovery clients see the gateway, not the backend, and a
+    /// card the rewrite could not read used to be forwarded with its internal
+    /// URLs. Two representations are uninspectable as received, and both are
+    /// claimed:
+    ///
+    /// * a content-coded body (`gzip`, `br`, …; the pristine
+    ///   `crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY` stamp), which a
+    ///   backend may send whatever `detection.strip_accept_encoding` asked for.
+    ///   The gate decodes it, bounded and budget-charged, into the plaintext the
+    ///   transform phase rewrites, or fails it closed;
+    /// * a range slice or delta (`206` / `226`; the pristine
+    ///   `crate::proxy::ORIGIN_FRAGMENT_RESPONSE_METADATA_KEY` stamp). The
+    ///   gate rejects it rather than letting a client reassemble an un-rewritten
+    ///   card from slices.
+    ///
+    /// A complete identity body is NOT claimed: it is already the plaintext the
+    /// rewrite parses, and a non-JSON body there carries no card a client could
+    /// parse either, so claiming it would only turn ordinary error pages into
+    /// gateway errors. Scoped to this instance's own claim, to card requests
+    /// with rewriting enabled, and to JSON (or untyped) media; native gRPC
+    /// cards keep their own frame-level refusal path.
+    fn enforces_response_body_policy(
+        &self,
+        ctx: &RequestContext,
+        response_content_type: Option<&str>,
+        _response_body: &[u8],
+    ) -> bool {
+        self.may_enforce_response_body_policy(ctx)
+            && response_content_type.is_none_or(content_type_value_is_json)
+            && !response_content_type
+                .is_some_and(crate::plugins::utils::body_transform::is_framed_grpc_content_type)
+            && (origin_response_is_still_encoded(ctx) || origin_response_is_fragment(ctx))
+    }
+
+    /// Over-approximation used before the response headers are known: every
+    /// HTTP Agent Card request this instance owns and rewrites.
+    fn may_enforce_response_body_policy(&self, ctx: &RequestContext) -> bool {
+        self.claim(ctx)
+            .is_some_and(|claim| self.should_rewrite_http_agent_card(claim))
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
@@ -1444,6 +1709,7 @@ impl Plugin for A2aGateway {
         Some(Box::new(A2aSseStreamInspector::new(
             Some(binding),
             observation,
+            self.observability.max_payload_size,
         )))
     }
 
@@ -1473,24 +1739,15 @@ impl Plugin for A2aGateway {
             "a2a.stream_events".to_string(),
             observation.stream_events.to_string(),
         );
+        // Already bounded and normalized when the inspector retained them.
         if let Some(task_id) = observation.task_id {
-            insert_bounded_metadata(
-                ctx,
-                "a2a.task_id",
-                &task_id,
-                self.observability.max_payload_size,
-            );
+            insert_prebounded_metadata(ctx, "a2a.task_id", task_id);
         }
         if let Some(context_id) = observation.context_id {
-            insert_bounded_metadata(
-                ctx,
-                "a2a.context_id",
-                &context_id,
-                self.observability.max_payload_size,
-            );
+            insert_prebounded_metadata(ctx, "a2a.context_id", context_id);
         }
         if let Some(task_state) = observation.task_state {
-            emit_task_state(ctx, &task_state, self.observability.max_payload_size);
+            emit_task_state_observation(ctx, task_state, self.observability.max_payload_size);
         }
     }
 
@@ -1694,6 +1951,26 @@ impl Plugin for A2aGateway {
             return PluginResult::Continue;
         }
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            // A content-coded card cannot be parsed here: this hook sees the
+            // backend's WIRE bytes, before the shared representation gate runs.
+            // This instance claims that representation
+            // (`enforces_response_body_policy`), so the gate either decodes it
+            // into the plaintext the transform phase is handed or fails the
+            // response closed. Stage it, so the transform phase rewrites the
+            // decoded card and `on_final_response_body` refuses if nothing
+            // reports an outcome — the encoded card is never forwarded with the
+            // backend's internal URLs (it used to pass through untouched). An
+            // empty body carries no URL and is not inspected by the gate.
+            if rewrite_card && !body.is_empty() && origin_response_is_still_encoded(ctx) {
+                if !has_public_base {
+                    return agent_card_origin_failure(
+                        ctx,
+                        binding,
+                        self.observability.emit_metadata,
+                    );
+                }
+                self.record_card_rewrite_state(ctx, A2aGrpcCardRewriteState::Staged);
+            }
             return PluginResult::Continue;
         };
         if self.observability.emit_metadata {
@@ -1774,36 +2051,87 @@ impl Plugin for A2aGateway {
     /// reapplied (oversized, uninspectable, per-method policy), so a transform
     /// that turns an admitted request into an unclassifiable one also fails
     /// closed under a deny policy.
+    ///
+    /// An ALLOWED operation can still change class. The arrival-time
+    /// classification decided this instance's whole response handling — whether
+    /// the response is buffered, whether it is an Agent Card to rewrite (and
+    /// whether a public origin was admitted for it), whether it streams — and
+    /// none of that can be re-decided from here: on H1/H2 this hook runs on a
+    /// compatibility clone whose claim is discarded. So a finalized body whose
+    /// Agent Card or streaming class differs from the one admitted is refused
+    /// rather than dispatched under response handling built for a different
+    /// operation (a `tasks/get` rewritten into `agent/getCard` would otherwise
+    /// serve the backend's card with its internal URLs). A same-class method
+    /// change is admitted and its `a2a.method` metadata is refreshed.
+    ///
+    /// Cost is bounded to where the hook can matter. An instance with no deny
+    /// rule, no card rewriting, and no metadata does not run it at all, and a
+    /// finalized body byte-identical to the one classified at arrival is
+    /// provably classified the same way, so it is not re-parsed.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.enabled || !self.detection.bindings.contains(&A2aBinding::JsonRpc) {
+        if !self.final_request_body_recheck_applies() {
             return PluginResult::Continue;
         }
         // The PLAINTEXT the backend will parse: `body` itself unless the shared
         // representation gate decoded a content coding for this request.
         let decoded_view = ctx.inspectable_final_request_body_owned();
         let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
+        if self
+            .claim(ctx)
+            .and_then(|claim| claim.classified_request_body.as_deref())
+            .is_some_and(|classified| classified == body)
+        {
+            // The exact bytes `before_proxy` classified and admitted, under the
+            // same instance configuration and request identity.
+            return PluginResult::Continue;
+        }
         let Some(detection) = self.detect_jsonrpc_body(ctx, headers, body) else {
             return PluginResult::Continue;
         };
-        match self.jsonrpc_policy_terminal(ctx, &detection) {
-            Some(terminal) => {
-                warn_sampled!(
-                    method = %detection.method,
-                    "Refusing A2A request on the final backend-visible body"
-                );
-                terminal
-            }
-            None => PluginResult::Continue,
+        if let Some(terminal) = self.jsonrpc_policy_terminal(ctx, &detection) {
+            warn_sampled!(
+                method = %detection.method,
+                "Refusing A2A request on the final backend-visible body"
+            );
+            return terminal;
         }
+        if self.final_operation_class_changed(ctx, &detection) {
+            if self.observability.emit_metadata {
+                ctx.metadata
+                    .insert("a2a.policy_decision".to_string(), "deny".to_string());
+                ctx.metadata.insert(
+                    "a2a.error".to_string(),
+                    "operation_class_changed".to_string(),
+                );
+            }
+            warn_sampled!(
+                method = %detection.method,
+                "Refusing A2A request whose operation class changed after admission"
+            );
+            return reclassified_jsonrpc_response(&detection);
+        }
+        if self.observability.emit_metadata && self.claim(ctx).is_some() {
+            ctx.metadata
+                .insert("a2a.method".to_string(), detection.method.clone());
+            if let Some(task_id) = detection.task_id_hint.as_deref() {
+                insert_bounded_metadata(
+                    ctx,
+                    "a2a.task_id",
+                    task_id,
+                    self.observability.max_payload_size,
+                );
+            }
+        }
+        PluginResult::Continue
     }
 
     fn needs_final_request_body_context(&self) -> bool {
-        self.enabled && self.detection.bindings.contains(&A2aBinding::JsonRpc)
+        self.final_request_body_recheck_applies()
     }
 
     /// Claim the finalized request representation so the shared gate decodes a
@@ -2157,10 +2485,10 @@ fn parse_discovery(object: &Map<String, Value>) -> Result<A2aDiscoveryConfig, St
 ///
 /// This is the single definition of "A2A's Agent Card presentation is not a pure
 /// function of accepted configuration". With no `public_base_url` and
-/// `trust_forwarded_headers` enabled, [`A2aGateway::public_base_url`] falls back
+/// `trust_forwarded_headers` enabled, the public base falls back
 /// to `X-Forwarded-Proto` / `X-Forwarded-Host` / `Host`, and — when no forwarded
-/// scheme is present — to whether the connection carried a TLS SNI hostname.
-/// `frontend_sni_hostname` is transport state, so the same request bytes on a
+/// scheme is present — to whether the connection is secure.
+/// `request_is_secure` is transport state, so the same request bytes on a
 /// TLS and a cleartext listener yield `https://…` and `http://…` respectively;
 /// no request fingerprint (and therefore no `request_deduplication` replay key)
 /// witnesses the difference.
@@ -2271,8 +2599,12 @@ fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> 
                 })?,
                 "policy.methods.*.action",
             )?;
+            let grant = parse_method_grant(object, canonical_method, action)?;
             if methods
-                .insert(canonical_method.to_string(), action)
+                .insert(
+                    canonical_method.to_string(),
+                    A2aMethodPolicy { action, grant },
+                )
                 .is_some()
             {
                 return Err(format!(
@@ -2285,6 +2617,99 @@ fn parse_policy(object: &Map<String, Value>) -> Result<A2aPolicyConfig, String> 
         default_action,
         methods,
     })
+}
+
+/// Parse the optional `allowed_groups` / `denied_groups` condition of one
+/// `policy.methods` entry. Diagnostics name the schema path and the canonical
+/// method, never a supplied group name.
+fn parse_method_grant(
+    object: &Map<String, Value>,
+    method: &str,
+    action: PolicyAction,
+) -> Result<Option<A2aMethodGrant>, String> {
+    let present = |key: &str| object.get(key).is_some_and(|value| !value.is_null());
+    if !present("allowed_groups") && !present("denied_groups") {
+        return Ok(None);
+    }
+    // A group condition narrows an allow. On `deny` it could never grant
+    // anything, so it is refused rather than stored inert.
+    if action != PolicyAction::Allow {
+        return Err(format!(
+            "a2a_gateway: `policy.methods.*.allowed_groups` and `policy.methods.*.denied_groups` require `action: allow` for method {method:?}"
+        ));
+    }
+    let allowed = parse_method_grant_groups(object, "allowed_groups", method)?;
+    let denied = parse_method_grant_groups(object, "denied_groups", method)?.unwrap_or_default();
+    if allowed
+        .as_ref()
+        .is_some_and(|allowed| !allowed.is_disjoint(&denied))
+    {
+        return Err(format!(
+            "a2a_gateway: `policy.methods.*.allowed_groups` and `policy.methods.*.denied_groups` must not name the same group for method {method:?}"
+        ));
+    }
+    Ok(Some(A2aMethodGrant { allowed, denied }))
+}
+
+fn parse_method_grant_groups(
+    object: &Map<String, Value>,
+    key: &str,
+    method: &str,
+) -> Result<Option<HashSet<String>>, String> {
+    let Some(value) = object.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let entries = value.as_array().ok_or_else(|| {
+        format!(
+            "a2a_gateway: `policy.methods.*.{key}` must be an array of ACL group names for method {method:?}"
+        )
+    })?;
+    // An empty list is ambiguous (nobody, or everybody?), so it is refused;
+    // omitting `allowed_groups` is how a method is granted to every consumer.
+    if entries.is_empty() {
+        return Err(format!(
+            "a2a_gateway: `policy.methods.*.{key}` must not be empty for method {method:?}; omit it instead"
+        ));
+    }
+    if entries.len() > MAX_A2A_POLICY_GRANT_GROUPS {
+        return Err(format!(
+            "a2a_gateway: `policy.methods.*.{key}` must not have more than {MAX_A2A_POLICY_GRANT_GROUPS} entries for method {method:?}"
+        ));
+    }
+    let mut groups = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let group = entry.as_str().ok_or_else(|| {
+            format!(
+                "a2a_gateway: `policy.methods.*.{key}` entries must be strings for method {method:?}"
+            )
+        })?;
+        // Stored byte-for-byte like `access_control` and `mcp_gateway` group
+        // rules: a consumer group is never canonicalized, so trimming would
+        // silently build a rule that can never match.
+        if group.trim().is_empty() {
+            return Err(format!(
+                "a2a_gateway: `policy.methods.*.{key}` entries must contain non-whitespace characters for method {method:?}"
+            ));
+        }
+        // The same bounds Consumer `acl_groups` admission applies, so a policy
+        // can never name a group no Consumer is able to hold.
+        if group.len() > crate::config::types::MAX_ACL_GROUP_LENGTH {
+            return Err(format!(
+                "a2a_gateway: `policy.methods.*.{key}` entries must not exceed {} bytes for method {method:?}",
+                crate::config::types::MAX_ACL_GROUP_LENGTH
+            ));
+        }
+        if group
+            .bytes()
+            .any(|byte| byte < 0x20 && !matches!(byte, b'\t' | b'\n' | b'\r'))
+        {
+            return Err(format!(
+                "a2a_gateway: `policy.methods.*.{key}` entries must not contain control characters for method {method:?}"
+            ));
+        }
+        groups.insert(group.to_string());
+    }
+    Ok(Some(groups))
 }
 
 fn parse_jsonrpc_envelope(value: &Value) -> Result<A2aEnvelope, ()> {
@@ -2485,6 +2910,22 @@ fn jsonrpc_error_response(
             "data": Value::Object(data)
         }
     })
+}
+
+/// Refusal for a JSON-RPC request whose finalized body changed operation class
+/// after admission (see `A2aGateway::final_operation_class_changed`). Fixed
+/// text; no request field beyond the canonical method and ids is reflected.
+fn reclassified_jsonrpc_response(detection: &A2aDetection) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 200,
+        body: jsonrpc_error_response_body(
+            detection,
+            -32001,
+            "A2A operation changed after gateway admission",
+        )
+        .to_string(),
+        headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
 }
 
 fn oversized_jsonrpc_response(detection: &A2aDetection) -> PluginResult {
@@ -2817,9 +3258,9 @@ fn task_id_from_name(value: &str) -> Option<String> {
 
 // Only protocol states enter semantic metadata; arbitrary backend text is not
 // a state. Bound work before normalization as well as the retained result.
-fn normalize_task_state(value: &str) -> String {
+fn normalize_task_state(value: &str) -> &'static str {
     if value.len() > 64 {
-        return "unknown".to_string();
+        return "unknown";
     }
     let normalized = value.to_ascii_lowercase();
     let state = normalized
@@ -2836,21 +3277,40 @@ fn normalize_task_state(value: &str) -> String {
         "auth-required" => "auth-required",
         _ => "unknown",
     }
-    .to_string()
+}
+
+/// Reduce a raw task-state string to everything its published metadata needs,
+/// so a caller that has to carry it (the SSE inspector, across events) never
+/// retains the backend's raw text.
+fn observe_task_state(value: &str, limit: usize) -> TaskStateObservation {
+    let state = normalize_task_state(value);
+    TaskStateObservation {
+        state,
+        input_over_limit: value.len() > limit.min(1024),
+        unrecognized: state == "unknown" && !value.eq_ignore_ascii_case("unknown"),
+    }
 }
 
 fn emit_task_state(ctx: &mut RequestContext, value: &str, limit: usize) {
-    let state = normalize_task_state(value);
+    emit_task_state_observation(ctx, observe_task_state(value, limit), limit);
+}
+
+fn emit_task_state_observation(
+    ctx: &mut RequestContext,
+    observation: TaskStateObservation,
+    limit: usize,
+) {
+    let state = observation.state;
     if state.len() > limit.min(1024) {
         ctx.metadata.remove("a2a.task_state");
         ctx.metadata
             .insert("a2a.task_state.truncated".to_string(), "true".to_string());
     } else {
         ctx.metadata
-            .insert("a2a.task_state".to_string(), state.clone());
+            .insert("a2a.task_state".to_string(), state.to_string());
         ctx.metadata.remove("a2a.task_state.truncated");
     }
-    if state == "unknown" && !value.eq_ignore_ascii_case("unknown") {
+    if observation.unrecognized {
         ctx.metadata.insert(
             "a2a.task_state.unrecognized".to_string(),
             "true".to_string(),
@@ -2858,28 +3318,24 @@ fn emit_task_state(ctx: &mut RequestContext, value: &str, limit: usize) {
     } else {
         ctx.metadata.remove("a2a.task_state.unrecognized");
     }
-    if value.len() > limit.min(1024) {
+    if observation.input_over_limit {
         ctx.metadata
             .insert("a2a.task_state.truncated".to_string(), "true".to_string());
     }
 }
 
+/// Reduce `value` to the published `min(limit, 1024)`-byte bound.
+///
 /// The cap includes the ASCII marker. The separate flag distinguishes a
 /// truncated identifier from a complete one with the same visible prefix.
 /// A truncated identifier is diagnostic text, never an exact correlation key.
-fn insert_bounded_metadata(ctx: &mut RequestContext, key: &str, value: &str, limit: usize) {
+fn bound_metadata_value(value: &str, limit: usize) -> BoundedMetadataValue {
     let limit = limit.min(1024);
-    let marker_key = match key {
-        "a2a.task_id" => "a2a.task_id.truncated",
-        "a2a.context_id" => "a2a.context_id.truncated",
-        "a2a.error" => "a2a.error.truncated",
-        "a2a.protocol_version" => "a2a.protocol_version.truncated",
-        _ => return,
-    };
     if value.len() <= limit {
-        ctx.metadata.remove(marker_key);
-        ctx.metadata.insert(key.to_string(), value.to_string());
-        return;
+        return BoundedMetadataValue {
+            value: value.to_string(),
+            truncated: false,
+        };
     }
     let mut end = limit.saturating_sub(1);
     while !value.is_char_boundary(end) {
@@ -2889,9 +3345,43 @@ fn insert_bounded_metadata(ctx: &mut RequestContext, key: &str, value: &str, lim
     if limit > 0 {
         bounded.push('~');
     }
-    ctx.metadata.insert(key.to_string(), bounded);
-    ctx.metadata
-        .insert(marker_key.to_string(), "true".to_string());
+    BoundedMetadataValue {
+        value: bounded,
+        truncated: true,
+    }
+}
+
+/// The `.truncated` companion of a bounded semantic metadata key, or `None` for
+/// a key that is not bounded semantic metadata.
+fn bounded_metadata_marker_key(key: &str) -> Option<&'static str> {
+    match key {
+        "a2a.task_id" => Some("a2a.task_id.truncated"),
+        "a2a.context_id" => Some("a2a.context_id.truncated"),
+        "a2a.error" => Some("a2a.error.truncated"),
+        "a2a.protocol_version" => Some("a2a.protocol_version.truncated"),
+        _ => None,
+    }
+}
+
+fn insert_bounded_metadata(ctx: &mut RequestContext, key: &str, value: &str, limit: usize) {
+    if bounded_metadata_marker_key(key).is_none() {
+        return;
+    }
+    insert_prebounded_metadata(ctx, key, bound_metadata_value(value, limit));
+}
+
+/// Publish a value [`bound_metadata_value`] already reduced.
+fn insert_prebounded_metadata(ctx: &mut RequestContext, key: &str, value: BoundedMetadataValue) {
+    let Some(marker_key) = bounded_metadata_marker_key(key) else {
+        return;
+    };
+    if value.truncated {
+        ctx.metadata
+            .insert(marker_key.to_string(), "true".to_string());
+    } else {
+        ctx.metadata.remove(marker_key);
+    }
+    ctx.metadata.insert(key.to_string(), value.value);
 }
 
 fn agent_card_origin_failure(
@@ -2952,20 +3442,25 @@ fn looks_like_agent_card(value: &Value) -> bool {
         && (object.contains_key("name") || object.contains_key("description"))
 }
 
-/// Rewrite every advertised JSON-RPC endpoint URL in an Agent Card response.
+/// Rewrite every advertised endpoint URL the gateway fronts in an Agent Card
+/// response — see [`PublicCardUrls::for_transport`].
 ///
-/// `endpoint_url` and `card_url` are the finished public URLs, built once per
-/// response by the caller rather than re-formatted for each interface.
-fn rewrite_agent_card_response(value: &mut Value, endpoint_url: &str, card_url: &str) -> bool {
+/// `urls` and `card_url` are the finished public URLs, built once per response
+/// by the caller rather than re-formatted for each interface.
+fn rewrite_agent_card_response(
+    value: &mut Value,
+    urls: &PublicCardUrls<'_>,
+    card_url: &str,
+) -> bool {
     if let Some(batch) = value.as_array_mut() {
         let mut changed = false;
         for item in batch {
-            changed |= rewrite_agent_card_response(item, endpoint_url, card_url);
+            changed |= rewrite_agent_card_response(item, urls, card_url);
         }
         return changed;
     }
     if looks_like_agent_card(value) {
-        return rewrite_agent_card_urls(value, endpoint_url, card_url);
+        return rewrite_agent_card_urls(value, urls, card_url);
     }
     let Some(result) = value.get_mut("result") else {
         return false;
@@ -2973,22 +3468,24 @@ fn rewrite_agent_card_response(value: &mut Value, endpoint_url: &str, card_url: 
     if !looks_like_agent_card(result) {
         return false;
     }
-    rewrite_agent_card_urls(result, endpoint_url, card_url)
+    rewrite_agent_card_urls(result, urls, card_url)
 }
 
-fn rewrite_agent_card_urls(value: &mut Value, endpoint_url: &str, card_url: &str) -> bool {
+fn rewrite_agent_card_urls(value: &mut Value, urls: &PublicCardUrls<'_>, card_url: &str) -> bool {
     let Some(object) = value.as_object_mut() else {
         return false;
     };
     let mut changed = false;
-    let preferred_transport = object
-        .get("preferredTransport")
-        .or_else(|| object.get("preferred_transport"))
-        .and_then(Value::as_str);
-    if should_rewrite_transport(preferred_transport)
+    let preferred_target = urls.for_transport(
+        object
+            .get("preferredTransport")
+            .or_else(|| object.get("preferred_transport"))
+            .and_then(Value::as_str),
+    );
+    if let Some(target) = preferred_target
         && let Some(url) = object.get_mut("url")
     {
-        changed |= rewrite_url_value(url, endpoint_url);
+        changed |= rewrite_url_value(url, target);
     }
     for key in [
         "additionalInterfaces",
@@ -3001,11 +3498,11 @@ fn rewrite_agent_card_urls(value: &mut Value, endpoint_url: &str, card_url: &str
                 let Some(interface_object) = interface.as_object_mut() else {
                     continue;
                 };
-                if !should_rewrite_transport(interface_transport(interface_object)) {
+                let Some(target) = urls.for_transport(interface_transport(interface_object)) else {
                     continue;
-                }
+                };
                 if let Some(url) = interface_object.get_mut("url") {
-                    changed |= rewrite_url_value(url, endpoint_url);
+                    changed |= rewrite_url_value(url, target);
                 }
             }
         }
@@ -3027,16 +3524,72 @@ fn interface_transport(interface: &Map<String, Value>) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
-fn should_rewrite_transport(transport: Option<&str>) -> bool {
+/// The A2A transports this gateway fronts on its public origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontedTransport {
+    /// `JSONRPC` — served at `endpoint.path`.
+    JsonRpc,
+    /// `HTTP+JSON` / `REST` — the REST binding, whose operations live under
+    /// `endpoint.path` (see [`A2aGateway::rest_suffix`]).
+    HttpJson,
+    /// `GRPC` — the configured gRPC services, addressed by the public origin
+    /// alone because a gRPC request path is `/<service>/<method>`.
+    Grpc,
+}
+
+/// Classify an advertised transport name, comparing only its ASCII
+/// alphanumerics case-insensitively (`HTTP+JSON`, `http_json`, and `httpjson`
+/// are one name). An absent transport is the A2A default, JSON-RPC. Any other
+/// spelling — including an explicitly empty one in JSON — is a transport the
+/// gateway does not front, and its URL is preserved.
+fn fronted_transport(transport: Option<&str>) -> Option<FrontedTransport> {
     let Some(transport) = transport else {
-        return true;
+        return Some(FrontedTransport::JsonRpc);
     };
-    let normalized: String = transport
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    normalized == "jsonrpc"
+    let is = |name: &str| {
+        transport
+            .bytes()
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|byte| byte.to_ascii_lowercase())
+            .eq(name.bytes())
+    };
+    if is("jsonrpc") {
+        Some(FrontedTransport::JsonRpc)
+    } else if is("httpjson") || is("rest") {
+        Some(FrontedTransport::HttpJson)
+    } else if is("grpc") {
+        Some(FrontedTransport::Grpc)
+    } else {
+        None
+    }
+}
+
+/// The public URLs an Agent Card rewrite publishes, built once per response.
+///
+/// Every interface whose transport the gateway fronts is pointed at the
+/// gateway: an operator who enables `discovery.rewrite_agent_card_urls` to make
+/// the gateway the public face of an agent must not still be advertising the
+/// agent's direct gRPC or REST address to every discovery client — that is both
+/// topology disclosure and a working bypass of every gateway control wherever
+/// the address is reachable. Interfaces on transports the gateway does not
+/// front keep the backend's URL.
+#[derive(Debug, Clone, Copy)]
+struct PublicCardUrls<'a> {
+    /// Public base + `endpoint.path`: the JSON-RPC endpoint and the REST prefix.
+    endpoint: &'a str,
+    /// The public base itself: the gRPC authority.
+    grpc: &'a str,
+}
+
+impl<'a> PublicCardUrls<'a> {
+    /// The public URL an interface on `transport` must advertise, or `None`
+    /// when the gateway does not front that transport.
+    fn for_transport(&self, transport: Option<&str>) -> Option<&'a str> {
+        match fronted_transport(transport)? {
+            FrontedTransport::JsonRpc | FrontedTransport::HttpJson => Some(self.endpoint),
+            FrontedTransport::Grpc => Some(self.grpc),
+        }
+    }
 }
 
 /// Fail-closed terminal for a unary gRPC Agent Card the gateway admitted but
@@ -3262,15 +3815,20 @@ fn rewrite_grpc_agent_card_frame(
     let admitted =
         admit_grpc_agent_card_frame(body, response_headers, card_schema, configured_versions);
     let card = admitted.map_err(AgentCardRewriteRefusal::Diagnostic)?;
-    // The one public URL every rewritten field reuses. Built once per response,
+    // The public URLs every rewritten field reuses. Built once per response,
     // never per field and never per interface.
-    let new_url = format!("{}{}", public_base.trim_end_matches('/'), endpoint_path);
+    let public_base = public_base.trim_end_matches('/');
+    let new_url = format!("{public_base}{endpoint_path}");
+    let urls = PublicCardUrls {
+        endpoint: &new_url,
+        grpc: public_base,
+    };
     // An explicitly-encoded empty `preferred_transport` is proto3's default and
     // means "unset", which selects the JSON-RPC default just like an absent
-    // field. Only a present, non-empty, non-JSONRPC transport suppresses the
-    // `AgentCard.url` rewrite.
-    let rewrite_preferred =
-        should_rewrite_transport(card.preferred_transport.filter(|value| !value.is_empty()));
+    // field. Only a present, non-empty transport the gateway does not front
+    // suppresses the `AgentCard.url` rewrite.
+    let preferred_target =
+        urls.for_transport(card.preferred_transport.filter(|value| !value.is_empty()));
 
     // Pass one: exact encoded length, and whether anything changes at all. A
     // refused write here can only be the counter's own `usize` overflow, which
@@ -3279,8 +3837,8 @@ fn rewrite_grpc_agent_card_frame(
     let mut changed = false;
     emit_rewritten_agent_card(
         card.message,
-        &new_url,
-        rewrite_preferred,
+        &urls,
+        preferred_target,
         &mut counter,
         &mut changed,
     )
@@ -3315,8 +3873,8 @@ fn rewrite_grpc_agent_card_frame(
     let mut emitted_changed = false;
     emit_rewritten_agent_card(
         card.message,
-        &new_url,
-        rewrite_preferred,
+        &urls,
+        preferred_target,
         &mut sink,
         &mut emitted_changed,
     )
@@ -3943,7 +4501,7 @@ fn validate_agent_card_protobuf(message: &[u8]) -> Result<AgentCardSchema<'_>, &
 /// `url` is REQUIRED here even though the 0.3 proto carries no
 /// `field_behavior` annotation on it. An interface without a URL is not a usable
 /// endpoint: it can never be the JSON-RPC endpoint the gateway fronts, so
-/// [`agent_interface_needs_rewrite`] would leave it untouched, and it would then
+/// [`agent_interface_rewrite_target`] would leave it untouched, and it would then
 /// be preserved verbatim inside a card published as "rewritten" with its
 /// signatures removed — while also being the only thing that made the card look
 /// like it advertised an endpoint at all. Requiring the field means reaching the
@@ -3978,11 +4536,19 @@ fn validate_agent_interface_protobuf(
     Ok(AgentInterfaceSchema { url, transport })
 }
 
-/// Whether this advertised interface is the JSON-RPC endpoint the gateway
-/// fronts, and is not already pointing at the public URL.
-fn agent_interface_needs_rewrite(schema: &AgentInterfaceSchema<'_>, new_url: &str) -> bool {
-    should_rewrite_transport(schema.transport.filter(|value| !value.is_empty()))
-        && schema.url.is_some_and(|url| url != new_url)
+/// The public URL this advertised interface must be rewritten to: `Some` when
+/// its transport is one the gateway fronts and it does not already point at
+/// that public URL. An explicitly empty transport is proto3's "unset", which
+/// selects the JSON-RPC default.
+fn agent_interface_rewrite_target<'a>(
+    schema: &AgentInterfaceSchema<'_>,
+    urls: &PublicCardUrls<'a>,
+) -> Option<&'a str> {
+    let target = urls.for_transport(schema.transport.filter(|value| !value.is_empty()))?;
+    schema
+        .url
+        .is_some_and(|url| url != target)
+        .then_some(target)
 }
 
 // ---------------------------------------------------------------------------
@@ -3997,8 +4563,8 @@ fn agent_interface_needs_rewrite(schema: &AgentInterfaceSchema<'_>, new_url: &st
 /// types they name instead of re-checking them and falling through on mismatch.
 fn emit_rewritten_agent_card<E: ProtobufEmitter>(
     message: &[u8],
-    new_url: &str,
-    rewrite_preferred: bool,
+    urls: &PublicCardUrls<'_>,
+    preferred_target: Option<&str>,
     out: &mut E,
     changed: &mut bool,
 ) -> Result<(), &'static str> {
@@ -4011,32 +4577,37 @@ fn emit_rewritten_agent_card<E: ProtobufEmitter>(
                 // original, still-signed bytes.
                 Ok(())
             }
-            AGENT_CARD_PB_URL if rewrite_preferred => {
+            AGENT_CARD_PB_URL => {
+                let Some(target) = preferred_target else {
+                    // The preferred transport is one the gateway does not
+                    // front: the backend's URL is preserved verbatim.
+                    return emit_or_refuse(emit_protobuf_verbatim_field(out, field, wire, value));
+                };
                 let current = decode_rewritable_url_field(value)?;
-                if current == new_url {
+                if current == target {
                     emit_or_refuse(emit_protobuf_len_field(out, field, value))
                 } else {
                     *changed = true;
                     emit_or_refuse(emit_protobuf_len_field(
                         out,
                         AGENT_CARD_PB_URL,
-                        new_url.as_bytes(),
+                        target.as_bytes(),
                     ))
                 }
             }
             AGENT_CARD_PB_ADDITIONAL_INTERFACES => {
                 let schema = validate_agent_interface_protobuf(value)?;
-                if !agent_interface_needs_rewrite(&schema, new_url) {
+                let Some(target) = agent_interface_rewrite_target(&schema, urls) else {
                     return emit_or_refuse(emit_protobuf_len_field(out, field, value));
-                }
+                };
                 *changed = true;
                 // The submessage's own length prefix comes from a counting pass
                 // over the same emission code, so the rewritten interface is
                 // never built as a separate `Vec` beside the sink.
                 let mut counter = ProtobufLengthCounter::default();
-                emit_rewritten_agent_interface(value, new_url, &mut counter)?;
+                emit_rewritten_agent_interface(value, target, &mut counter)?;
                 emit_or_refuse(emit_protobuf_len_header(out, field, counter.len))?;
-                emit_rewritten_agent_interface(value, new_url, out)
+                emit_rewritten_agent_interface(value, target, out)
             }
             _ => emit_or_refuse(emit_protobuf_verbatim_field(out, field, wire, value)),
         }
@@ -4044,7 +4615,7 @@ fn emit_rewritten_agent_card<E: ProtobufEmitter>(
 }
 
 /// Emit one rewritten `AgentInterface` submessage body (no length prefix).
-/// Only called for an interface [`agent_interface_needs_rewrite`] selected.
+/// Only called for an interface [`agent_interface_rewrite_target`] selected.
 fn emit_rewritten_agent_interface<E: ProtobufEmitter>(
     message: &[u8],
     new_url: &str,
@@ -4216,6 +4787,23 @@ fn normalized_public_scheme(value: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Whether the pristine pre-`after_proxy` snapshot records a content coding on
+/// the backend response that the shared representation gate has not (yet)
+/// decoded. `install_decoded_response_body` clears the stamp when it installs
+/// plaintext, so after the gate ran this answers "are these bytes still
+/// encoded?".
+fn origin_response_is_still_encoded(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
+}
+
+/// Whether the pristine snapshot records the backend response as a range slice
+/// or delta rather than a complete representation.
+fn origin_response_is_fragment(ctx: &RequestContext) -> bool {
+    ctx.metadata
+        .contains_key(crate::proxy::ORIGIN_FRAGMENT_RESPONSE_METADATA_KEY)
 }
 
 fn content_type_is_json(headers: &HashMap<String, String>) -> bool {

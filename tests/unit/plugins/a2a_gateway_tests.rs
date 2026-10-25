@@ -554,14 +554,16 @@ async fn rest_agent_card_response_rewrites_gateway_urls() {
     .to_string();
 
     let body = expect_http_card_rewrite(&plugin, &mut ctx, &mut response_headers, &body).await;
-    assert_eq!(body["url"], "https://planner.internal/grpc");
+    // The gateway fronts gRPC on its public origin too, so a GRPC-preferred
+    // card advertises the gateway authority rather than the agent's own.
+    assert_eq!(body["url"], "https://gateway.example.com");
     assert_eq!(
         body["additionalInterfaces"][0]["url"],
         "https://gateway.example.com/a2a"
     );
     assert_eq!(
         body["additionalInterfaces"][1]["url"],
-        "https://planner.internal/grpc"
+        "https://gateway.example.com"
     );
     assert_eq!(
         body["agentCardUrl"],
@@ -653,7 +655,7 @@ async fn jsonrpc_agent_card_response_rewrites_gateway_urls() {
     );
     assert_eq!(
         result["supported_interfaces"][1]["url"],
-        "https://planner.internal/grpc"
+        "https://gateway.example.com"
     );
     assert!(result.get("signatures").is_none());
 }
@@ -1762,9 +1764,10 @@ async fn grpc_agent_card_response_rewrites_jsonrpc_urls() {
         u32::from_be_bytes([rewritten[1], rewritten[2], rewritten[3], rewritten[4]]) as usize;
     assert_eq!(rewritten.len(), 5 + msg_len);
     let message = &rewritten[5..];
+    // GRPC-preferred: `AgentCard.url` names the gateway's gRPC authority.
     assert_eq!(
         proto_string_field(message, 3).as_deref(),
-        Some("https://planner.internal/grpc")
+        Some("https://gateway.example.com")
     );
     let interfaces = proto_repeated_messages(message, 15);
     assert_eq!(interfaces.len(), 2);
@@ -1774,7 +1777,7 @@ async fn grpc_agent_card_response_rewrites_jsonrpc_urls() {
     );
     assert_eq!(
         proto_string_field(&interfaces[1], 1).as_deref(),
-        Some("https://planner.internal/grpc")
+        Some("https://gateway.example.com")
     );
     assert!(!proto_has_field(message, 17));
     plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
@@ -2716,12 +2719,13 @@ async fn grpc_agent_card_grpc_only_urls_need_no_mutation() {
         }
     }));
     let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    // Every gRPC URL already names the gateway's public authority.
     let card = encode_a2a_03_agent_card(
         "planner",
         "planning agent",
-        "https://planner.internal/grpc",
+        "https://gateway.example.com",
         "GRPC",
-        &[("https://planner.internal/grpc", "GRPC")],
+        &[("https://gateway.example.com", "GRPC")],
         "0.3.0",
         true,
     );
@@ -2743,7 +2747,73 @@ async fn grpc_agent_card_grpc_only_urls_need_no_mutation() {
             )
             .await
             .is_none(),
-        "GRPC-only cards must leave the upstream frame untouched"
+        "GRPC-only cards that already name the gateway must leave the upstream frame untouched"
+    );
+}
+
+#[tokio::test]
+async fn grpc_agent_card_rewrites_grpc_and_http_json_interfaces_to_the_gateway() {
+    // a2a_gateway-MUSE-6: the gateway fronts gRPC and the REST binding on its
+    // public origin, so neither may keep advertising the agent's own address.
+    let plugin = plugin(json!({
+        "discovery": {
+            "public_base_url": "https://gateway.example.com"
+        }
+    }));
+    let mut ctx = detect_grpc_agent_card(&plugin, "GetExtendedAgentCard").await;
+    let card = encode_a2a_03_agent_card(
+        "planner",
+        "planning agent",
+        "https://planner.internal:50051",
+        "GRPC",
+        &[
+            ("https://planner.internal:50051", "GRPC"),
+            ("http://10.0.0.9:8080/a2a", "HTTP+JSON"),
+            ("https://planner.internal/custom", "urn:example:custom"),
+        ],
+        "0.3.0",
+        true,
+    );
+    let body = frame_grpc_message(&card);
+    let mut response_headers = grpc_ok_response_headers();
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let rewritten = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &response_headers,
+        )
+        .await
+        .expect("internal gRPC and REST URLs must be rewritten");
+    let message = &rewritten[5..];
+    assert_eq!(
+        proto_string_field(message, 3).as_deref(),
+        Some("https://gateway.example.com")
+    );
+    let interfaces = proto_repeated_messages(message, 15);
+    assert_eq!(interfaces.len(), 3);
+    assert_eq!(
+        proto_string_field(&interfaces[0], 1).as_deref(),
+        Some("https://gateway.example.com")
+    );
+    assert_eq!(
+        proto_string_field(&interfaces[1], 1).as_deref(),
+        Some("https://gateway.example.com/a2a")
+    );
+    assert_eq!(
+        proto_string_field(&interfaces[2], 1).as_deref(),
+        Some("https://planner.internal/custom"),
+        "a transport the gateway does not front keeps the backend's URL"
+    );
+    assert!(
+        !proto_has_field(message, 17),
+        "signatures must be dropped once a URL mutation is published"
     );
 }
 
@@ -4550,8 +4620,8 @@ fn a2a_static_presentation_digest_moves_when_card_shaping_config_changes() {
 }
 
 /// The forwarded-derived public base is not static configuration: absent an
-/// `X-Forwarded-Proto`, the scheme comes from whether the connection carried a
-/// TLS SNI hostname, which no replay fingerprint binds.
+/// `X-Forwarded-Proto`, the scheme comes from whether the connection itself is
+/// secure, which no replay fingerprint binds.
 #[test]
 fn a2a_request_derived_public_base_reports_dynamic_presentation_policy() {
     let config = json!({"discovery": {
@@ -4561,7 +4631,7 @@ fn a2a_request_derived_public_base_reports_dynamic_presentation_policy() {
     assert_eq!(
         presentation_policy(config),
         ResponsePresentationPolicy::Dynamic,
-        "a forwarded/SNI-derived public base cannot be described by a static digest"
+        "a forwarded/transport-derived public base cannot be described by a static digest"
     );
 }
 
@@ -4696,7 +4766,8 @@ async fn grpc_agent_card_preserves_explicit_absolute_url_bytes() {
         "planning agent",
         "http://planner.internal/a2a",
         |out| {
-            encode_proto_string(14, "GRPC", out);
+            // A transport the gateway does not front leaves field 3 alone.
+            encode_proto_string(14, "urn:example:custom", out);
             encode_proto_bytes(
                 15,
                 &encode_agent_interface("https://planner.internal/a2a", "JSONRPC"),
@@ -4860,8 +4931,13 @@ async fn grpc_agent_card_complete_0_3_card_preserves_every_untouched_field() {
     assert_eq!(interfaces.len(), 1);
     assert_eq!(
         proto_string_field(&interfaces[0], 1).as_deref(),
-        Some("https://planner.internal/grpc"),
-        "a non-JSONRPC interface must be preserved verbatim"
+        Some("https://gateway.example.com"),
+        "a GRPC interface the gateway fronts must name the gateway"
+    );
+    assert_eq!(
+        proto_string_field(&interfaces[0], 2).as_deref(),
+        Some("GRPC"),
+        "only the interface URL is rewritten"
     );
 }
 
@@ -6200,4 +6276,725 @@ async fn streaming_jsonrpc_observation_behind_a_deferred_cut_counts_the_cleared_
         ctx.metadata.get("a2a.task_id").map(String::as_str),
         Some("task-9")
     );
+}
+
+// ─── Production-launch review fixes ──────────────────────────────────────
+
+use ferrum_edge::_test_support::{
+    BufferedRepresentationOutcome, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES,
+    ResponseBufferBudgetProbe, a2a_sse_retained_semantic_bytes_for_test,
+    stamp_original_response_metadata_for_test,
+};
+
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).expect("gzip write must succeed");
+    encoder.finish().expect("gzip finish must succeed")
+}
+
+fn representation_budget() -> ResponseBufferBudgetProbe {
+    ResponseBufferBudgetProbe::new(
+        RESPONSE_BUFFER_RESERVATION_UNIT_BYTES,
+        64 * RESPONSE_BUFFER_RESERVATION_UNIT_BYTES,
+    )
+}
+
+async fn detect_http_agent_card(plugin: &Arc<dyn Plugin>) -> RequestContext {
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    request_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    ctx
+}
+
+fn gzip_json_response_headers() -> HashMap<String, String> {
+    HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ])
+}
+
+/// a2a_gateway-SOL-1: a backend may compress the card whatever
+/// `strip_accept_encoding` negotiated. The card is claimed by the shared
+/// representation gate, decoded there, and the plaintext is rewritten.
+#[tokio::test]
+async fn encoded_http_agent_card_is_decoded_by_the_gate_and_rewritten() {
+    let gateway = plugin(json!({
+        "detection": {"strip_accept_encoding": false},
+        "discovery": {"public_base_url": "https://gateway.example.com"}
+    }));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&gateway)];
+    let mut ctx = detect_http_agent_card(&gateway).await;
+    assert!(gateway.may_enforce_response_body_policy(&ctx));
+
+    let card = json!({"name": "planner", "url": "https://planner.internal/a2a"}).to_string();
+    let mut response_headers = gzip_json_response_headers();
+    let mut body = Bytes::from(gzip_bytes(card.as_bytes()));
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &response_headers);
+
+    assert!(matches!(
+        gateway
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(gateway.enforces_response_body_policy(&ctx, Some("application/json"), &body));
+
+    let outcome = representation_budget().admit_buffered_representation(
+        &plugins,
+        &mut ctx,
+        true,
+        200,
+        &mut response_headers,
+        &mut body,
+    );
+    assert_eq!(outcome, BufferedRepresentationOutcome::Decoded);
+    assert_eq!(body.as_ref(), card.as_bytes());
+    assert!(!response_headers.contains_key("content-encoding"));
+
+    let rewritten = gateway
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &response_headers,
+        )
+        .await
+        .expect("the decoded card must be rewritten");
+    let rewritten: Value = serde_json::from_slice(&rewritten).expect("rewritten card is JSON");
+    assert_eq!(rewritten["url"], "https://gateway.example.com/a2a");
+    assert!(matches!(
+        gateway
+            .on_final_response_body(&mut ctx, 200, &response_headers, &[])
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// The backstop for SOL-1: an encoded card that reaches the rewrite without
+/// having been decoded is refused, never forwarded with its internal URLs.
+#[tokio::test]
+async fn encoded_http_agent_card_fails_closed_when_it_reaches_the_rewrite_undecoded() {
+    let gateway = plugin(json!({}));
+    let mut ctx = detect_http_agent_card(&gateway).await;
+    let card = json!({"name": "planner", "url": "https://planner.internal/a2a"}).to_string();
+    let mut response_headers = gzip_json_response_headers();
+    let body = gzip_bytes(card.as_bytes());
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &response_headers);
+
+    assert!(matches!(
+        gateway
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        gateway
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &response_headers,
+            )
+            .await
+            .is_none()
+    );
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway
+        .on_final_response_body(&mut ctx, 200, &response_headers, &[])
+        .await
+    else {
+        panic!("an encoded card the rewrite never read must be refused");
+    };
+    assert_eq!(status_code, 502);
+    assert!(
+        body.contains("agent_card_representation_uninspectable"),
+        "{body}"
+    );
+}
+
+/// A `206` slice of a card is refused by the gate rather than forwarded, so a
+/// client cannot reassemble the un-rewritten card from ranges.
+#[tokio::test]
+async fn partial_http_agent_card_is_refused_by_the_representation_gate() {
+    let gateway = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&gateway)];
+    let mut ctx = detect_http_agent_card(&gateway).await;
+    let card = json!({"name": "planner", "url": "https://planner.internal/a2a"}).to_string();
+    let slice = card.as_bytes()[..16].to_vec();
+    let mut response_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        (
+            "content-range".to_string(),
+            format!("bytes 0-15/{}", card.len()),
+        ),
+    ]);
+    let mut body = Bytes::from(slice);
+    stamp_original_response_metadata_for_test(&mut ctx, 206, &response_headers);
+    assert!(matches!(
+        gateway
+            .on_response_body(&mut ctx, 206, &mut response_headers, &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let outcome = representation_budget().admit_buffered_representation(
+        &plugins,
+        &mut ctx,
+        true,
+        206,
+        &mut response_headers,
+        &mut body,
+    );
+    assert_eq!(
+        outcome,
+        BufferedRepresentationOutcome::Rejected("partial_representation")
+    );
+}
+
+/// The claim covers exactly the HTTP card responses the rewrite cannot read
+/// as received; complete identity cards, other operations, disabled rewriting,
+/// other media, and native gRPC cards are not claimed.
+#[tokio::test]
+async fn representation_gate_claim_is_scoped_to_uninspectable_http_cards() {
+    let gateway = plugin(json!({}));
+    let mut ctx = detect_http_agent_card(&gateway).await;
+    assert!(gateway.may_enforce_response_body_policy(&ctx));
+
+    let identity = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &identity);
+    assert!(!gateway.enforces_response_body_policy(&ctx, Some("application/json"), b"{}"));
+
+    stamp_original_response_metadata_for_test(&mut ctx, 200, &gzip_json_response_headers());
+    assert!(gateway.enforces_response_body_policy(&ctx, Some("application/json"), b"x"));
+    assert!(gateway.enforces_response_body_policy(&ctx, None, b"x"));
+    assert!(!gateway.enforces_response_body_policy(&ctx, Some("text/html"), b"x"));
+
+    let (mut task_ctx, mut task_headers) = rest_ctx("GET", "/a2a/tasks/task-1");
+    assert!(matches!(
+        gateway.before_proxy(&mut task_ctx, &mut task_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(!gateway.may_enforce_response_body_policy(&task_ctx));
+
+    let passthrough = plugin(json!({"discovery": {"rewrite_agent_card_urls": false}}));
+    let passthrough_ctx = detect_http_agent_card(&passthrough).await;
+    assert!(!passthrough.may_enforce_response_body_policy(&passthrough_ctx));
+
+    let grpc_card = detect_grpc_agent_card(&gateway, "GetAgentCard").await;
+    assert!(!gateway.may_enforce_response_body_policy(&grpc_card));
+}
+
+/// a2a_gateway-SOL-2: an allowed operation a later body transformer turns into
+/// an Agent Card would be served under the arrival-time (non-card) response
+/// handling, with the backend's internal URLs.
+#[tokio::test]
+async fn final_body_reclassified_into_an_agent_card_is_refused() {
+    let gateway = plugin(json!({"observability": {"emit_metadata": false}}));
+    assert!(gateway.needs_final_request_body_context());
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get",
+        "params": {"id": "task-1"}
+    }));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(!gateway.should_buffer_response_body(&ctx));
+
+    let dispatched =
+        json!({"jsonrpc": "2.0", "id": "req-1", "method": "agent/getCard"}).to_string();
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway
+        .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+        .await
+    else {
+        panic!("a card the response phase was not set up for must be refused");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    assert_eq!(body["id"], "req-1");
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(
+        body["error"]["message"],
+        "A2A operation changed after gateway admission"
+    );
+    assert_eq!(body["error"]["data"]["method"], "agent/getCard");
+}
+
+#[tokio::test]
+async fn final_body_reclassified_from_a_stream_into_an_agent_card_is_refused() {
+    let gateway = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "message/stream",
+        "params": {"message": {"role": "user", "parts": []}}
+    }));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched =
+        json!({"jsonrpc": "2.0", "id": "req-1", "method": "agent/getCard"}).to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("operation_class_changed")
+    );
+}
+
+/// A card that only appears in the finalized body of a request nothing
+/// classified at arrival has no admitted public origin and no rewrite set up.
+#[tokio::test]
+async fn final_body_that_becomes_an_agent_card_without_arrival_classification_is_refused() {
+    let gateway = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({"hello": "world"}));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(ctx.metadata.get("a2a.method").is_none());
+    let dispatched = json!({"jsonrpc": "2.0", "id": 7, "method": "agent/getCard"}).to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn same_class_final_method_change_is_admitted_and_refreshes_method_metadata() {
+    let gateway = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get",
+        "params": {"id": "task-1"}
+    }));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/cancel",
+        "params": {"id": "task-2"}
+    })
+    .to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("tasks/cancel")
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.task_id").map(String::as_str),
+        Some("task-2")
+    );
+}
+
+/// a2a_gateway-MUSE-3: the final-body hook is skipped entirely where it cannot
+/// change an outcome, and a byte-identical body is not re-classified.
+#[tokio::test]
+async fn final_request_body_recheck_runs_only_where_it_can_matter() {
+    let inert = plugin(json!({
+        "discovery": {"rewrite_agent_card_urls": false},
+        "observability": {"emit_metadata": false}
+    }));
+    assert!(!inert.needs_final_request_body_context());
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get"
+    }));
+    assert!(matches!(
+        inert.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched =
+        json!({"jsonrpc": "2.0", "id": "req-1", "method": "agent/getCard"}).to_string();
+    assert!(matches!(
+        inert
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+
+    assert!(plugin(json!({})).needs_final_request_body_context());
+    let deny_only = plugin(json!({
+        "discovery": {"rewrite_agent_card_urls": false},
+        "observability": {"emit_metadata": false},
+        "policy": {"methods": {"message/send": {"action": "deny"}}}
+    }));
+    assert!(deny_only.needs_final_request_body_context());
+}
+
+#[tokio::test]
+async fn byte_identical_final_body_is_not_reclassified() {
+    let gateway = plugin(json!({}));
+    let arrival = json!({"jsonrpc": "2.0", "id": "req-1", "method": "tasks/get"});
+    let (mut ctx, mut headers) = jsonrpc_ctx(arrival.clone());
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    // A marker only a re-classification would overwrite.
+    ctx.metadata
+        .insert("a2a.policy_decision".to_string(), "sentinel".to_string());
+    let unchanged = arrival.to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, unchanged.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+        Some("sentinel"),
+        "the exact bytes classified at arrival must not be parsed again"
+    );
+
+    let changed = json!({"jsonrpc": "2.0", "id": "req-2", "method": "tasks/get"}).to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, changed.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.policy_decision").map(String::as_str),
+        Some("allow"),
+        "a changed body is re-classified"
+    );
+}
+
+/// a2a_gateway-SOL-3: semantic values are bounded when the SSE observer
+/// retains them, not only when the stream ends.
+#[test]
+fn sse_semantic_values_are_bounded_when_retained_not_at_stream_end() {
+    let large = 512 * 1024;
+    let events = [
+        format!(
+            "data: {}\n\n",
+            json!({"result": {"taskId": "t".repeat(large)}})
+        ),
+        format!(
+            "data: {}\n\n",
+            json!({"result": {"contextId": "c".repeat(large)}})
+        ),
+        format!(
+            "data: {}\n\n",
+            json!({"result": {"status": {"state": "s".repeat(large)}}})
+        ),
+        ": heartbeat\n\n".to_string(),
+    ];
+    let chunks: Vec<&[u8]> = events.iter().map(|event| event.as_bytes()).collect();
+    // Two ids at the 16-byte bound (15 bytes plus `~`) and the fixed `unknown`.
+    assert_eq!(
+        a2a_sse_retained_semantic_bytes_for_test("jsonrpc", 16, &chunks),
+        16 + 16 + "unknown".len()
+    );
+    // The bound is the configured one, capped at 1024 bytes per field.
+    assert_eq!(
+        a2a_sse_retained_semantic_bytes_for_test("jsonrpc", 4096, &chunks),
+        1024 + 1024 + "unknown".len()
+    );
+}
+
+/// a2a_gateway-MUSE-2: absent `X-Forwarded-Proto`, the derived scheme follows
+/// the connection's actual transport security, not TLS SNI presence.
+#[tokio::test]
+async fn forwarded_origin_scheme_follows_transport_security_not_sni() {
+    let gateway = plugin(json!({"discovery": {
+        "trust_forwarded_headers": true,
+        "allowed_public_origins": ["https://gateway.example.com"]
+    }}));
+    // An HTTPS client that sent no SNI (dialing by IP, for example).
+    let (mut ctx, mut request_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    ctx.request_is_secure = true;
+    ctx.frontend_sni_hostname = None;
+    request_headers.insert("host".to_string(), "gateway.example.com".to_string());
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let card = json!({"name": "planner", "url": "https://planner.internal/a2a"}).to_string();
+    let rewritten =
+        expect_http_card_rewrite(&gateway, &mut ctx, &mut response_headers, &card).await;
+    assert_eq!(rewritten["url"], "https://gateway.example.com/a2a");
+
+    // A plaintext connection derives `http`, which this allowlist refuses.
+    let (mut plain, mut plain_headers) = rest_ctx("GET", "/.well-known/agent-card.json");
+    plain.request_is_secure = false;
+    plain.frontend_sni_hostname = Some("gateway.example.com".to_string());
+    plain_headers.insert("host".to_string(), "gateway.example.com".to_string());
+    let PluginResult::Reject { status_code, .. } =
+        gateway.before_proxy(&mut plain, &mut plain_headers).await
+    else {
+        panic!("a plaintext connection must not be published as an https origin");
+    };
+    assert_eq!(status_code, 502);
+}
+
+/// a2a_gateway-MUSE-6 on the HTTP JSON path: every fronted transport points at
+/// the gateway; a transport the gateway does not front keeps its URL.
+#[tokio::test]
+async fn http_agent_card_rewrites_every_fronted_transport() {
+    let gateway = plugin(json!({}));
+    let mut ctx = detect_http_agent_card(&gateway).await;
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    let card = json!({
+        "name": "planner",
+        "preferredTransport": "HTTP+JSON",
+        "url": "http://10.0.0.9:8080/a2a",
+        "additionalInterfaces": [
+            {"transport": "GRPC", "url": "https://planner.internal:50051"},
+            {"transport": "HTTP+JSON", "url": "http://10.0.0.9:8080/a2a"},
+            {"transport": "urn:example:custom", "url": "https://planner.internal/custom"}
+        ]
+    })
+    .to_string();
+    let rewritten =
+        expect_http_card_rewrite(&gateway, &mut ctx, &mut response_headers, &card).await;
+    assert_eq!(rewritten["url"], "https://gateway.example.com/a2a");
+    let interfaces = &rewritten["additionalInterfaces"];
+    assert_eq!(interfaces[0]["url"], "https://gateway.example.com");
+    assert_eq!(interfaces[1]["url"], "https://gateway.example.com/a2a");
+    assert_eq!(interfaces[2]["url"], "https://planner.internal/custom");
+}
+
+// ── a2a_gateway-MUSE-5: per-consumer method grants ───────────────────────
+
+fn consumer_in(groups: &[&str]) -> Arc<ferrum_edge::config::types::Consumer> {
+    let mut consumer = super::plugin_utils::create_test_consumer();
+    consumer.acl_groups = groups.iter().map(|group| group.to_string()).collect();
+    Arc::new(consumer)
+}
+
+fn grant_plugin() -> Arc<dyn Plugin> {
+    plugin(json!({"policy": {"methods": {
+        "message/send": {
+            "action": "allow",
+            "allowed_groups": ["partner-agents", "internal-agents"]
+        },
+        "tasks/cancel": {
+            "action": "allow",
+            "allowed_groups": ["internal-agents"],
+            "denied_groups": ["suspended"]
+        }
+    }}}))
+}
+
+async fn cancel_as(
+    gateway: &Arc<dyn Plugin>,
+    consumer: Option<Arc<ferrum_edge::config::types::Consumer>>,
+) -> PluginResult {
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "cancel-1",
+        "method": "tasks/cancel",
+        "params": {"id": "task-1"}
+    }));
+    ctx.identified_consumer = consumer;
+    gateway.before_proxy(&mut ctx, &mut headers).await
+}
+
+#[tokio::test]
+async fn per_consumer_method_grants_follow_acl_groups() {
+    let gateway = grant_plugin();
+    assert!(gateway.gates_request_admission());
+    assert!(matches!(
+        cancel_as(&gateway, Some(consumer_in(&["internal-agents"]))).await,
+        PluginResult::Continue
+    ));
+    for refused in [
+        Some(consumer_in(&["partner-agents"])),
+        Some(consumer_in(&["internal-agents", "suspended"])),
+        None,
+    ] {
+        let PluginResult::Reject {
+            status_code, body, ..
+        } = cancel_as(&gateway, refused).await
+        else {
+            panic!("an ungranted consumer must be refused like a deny rule");
+        };
+        assert_eq!(status_code, 200);
+        let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+        assert_eq!(body["id"], "cancel-1");
+        assert_eq!(body["error"]["code"], -32001);
+    }
+
+    // The partner may still send messages.
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "send-1",
+        "method": "message/send",
+        "params": {"message": {"role": "user", "parts": []}}
+    }));
+    ctx.identified_consumer = Some(consumer_in(&["partner-agents"]));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    // REST carries the same decision.
+    let (mut rest, mut rest_headers) = rest_ctx("POST", "/a2a/tasks/task-1:cancel");
+    rest.identified_consumer = Some(consumer_in(&["partner-agents"]));
+    let PluginResult::Reject { status_code, .. } =
+        gateway.before_proxy(&mut rest, &mut rest_headers).await
+    else {
+        panic!("the REST binding must apply the same grant");
+    };
+    assert_eq!(status_code, 403);
+}
+
+#[tokio::test]
+async fn per_consumer_method_grant_is_re_decided_on_the_final_request_body() {
+    let gateway = grant_plugin();
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "message/send",
+        "params": {"message": {"role": "user", "parts": []}}
+    }));
+    ctx.identified_consumer = Some(consumer_in(&["partner-agents"]));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/cancel",
+        "params": {"id": "task-1"}
+    })
+    .to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[test]
+fn per_consumer_method_grants_are_validated() {
+    let with_method = |entry: Value| {
+        json!({
+            "discovery": {"public_base_url": "https://gateway.example.com"},
+            "policy": {"methods": {"tasks/cancel": entry}}
+        })
+    };
+    for (entry, reason) in [
+        (
+            json!({"action": "deny", "allowed_groups": ["internal"]}),
+            "require `action: allow`",
+        ),
+        (
+            json!({"action": "allow", "allowed_groups": []}),
+            "must not be empty",
+        ),
+        (
+            json!({"action": "allow", "allowed_groups": ["ops"], "denied_groups": ["ops"]}),
+            "must not name the same group",
+        ),
+        (
+            json!({"action": "allow", "allowed_groups": ["   "]}),
+            "non-whitespace characters",
+        ),
+        (
+            json!({"action": "allow", "denied_groups": [7]}),
+            "must be strings",
+        ),
+        (
+            json!({"action": "allow", "allowed_groups": "ops"}),
+            "must be an array",
+        ),
+        (
+            json!({"action": "allow", "allowed_groups": ["x".repeat(256)]}),
+            "must not exceed",
+        ),
+    ] {
+        let error = create_plugin("a2a_gateway", &with_method(entry))
+            .err()
+            .expect("an invalid grant must be rejected");
+        assert!(error.contains(reason), "{error}");
+    }
+    // `null` means omission, so a deny entry with null lists is accepted.
+    assert!(
+        create_plugin(
+            "a2a_gateway",
+            &with_method(json!({"action": "deny", "allowed_groups": null, "denied_groups": null})),
+        )
+        .is_ok()
+    );
+}
+
+/// a2a_gateway-MUSE-7 (and the grant schema): the published `A2aGatewayConfig`
+/// schema and the constructor agree on admission.
+#[test]
+fn openapi_a2a_gateway_schema_matches_constructor_admission() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/A2aGatewayConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("A2aGatewayConfig schema compiles");
+    let public = json!({"public_base_url": "https://gateway.example.com"});
+    for (config, expected) in [
+        (json!({"discovery": {"public_base_url": null}}), false),
+        (json!({"discovery": public.clone()}), true),
+        (
+            json!({"discovery": {"rewrite_agent_card_urls": false, "public_base_url": null}}),
+            true,
+        ),
+        (
+            json!({"discovery": public.clone(), "policy": {"methods": {"tasks/cancel": {
+                "action": "allow", "allowed_groups": ["internal-agents"], "denied_groups": ["suspended"]
+            }}}}),
+            true,
+        ),
+        (
+            json!({"discovery": public, "policy": {"methods": {"tasks/cancel": {
+                "action": "deny", "allowed_groups": ["internal-agents"]
+            }}}}),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            validator.validate(&config).is_ok(),
+            expected,
+            "schema admission for {config}"
+        );
+        assert_eq!(
+            create_plugin("a2a_gateway", &config).is_ok(),
+            expected,
+            "constructor admission for {config}"
+        );
+    }
 }

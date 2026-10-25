@@ -2231,6 +2231,16 @@ pub(crate) struct A2aGatewayClaim {
     /// mutable header map. The ordinary transform path needs no such flag: the
     /// core already runs the shared invalidation for it.
     pub(crate) card_body_replaced: bool,
+    /// The exact JSON-RPC request bytes the arrival-time classification above
+    /// was decided over, when the context held them as [`bytes::Bytes`].
+    ///
+    /// A refcounted handle, not a copy. The final backend-visible request-body
+    /// hook compares the finalized body against it: byte-identical bytes are
+    /// provably classified exactly as they were at arrival, so the hook skips
+    /// re-parsing them, while any difference re-runs the full classification
+    /// and refuses a change of response-shaping operation class the response
+    /// phase above was not set up for.
+    pub(crate) classified_request_body: Option<bytes::Bytes>,
 }
 
 /// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path
