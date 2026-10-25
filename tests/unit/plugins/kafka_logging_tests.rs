@@ -1,19 +1,21 @@
 //! Tests for kafka_logging plugin
 
 use ferrum_edge::_test_support::{
-    kafka_logging_parsed_sasl_credentials_for_test,
+    kafka_logging_http_record_key_for_test, kafka_logging_parsed_sasl_credentials_for_test,
     kafka_logging_probe_byte_budget_before_serialize_for_test,
     kafka_logging_probe_downstream_lease_ownership_for_test,
+    kafka_logging_probe_queue_full_backoff_for_test,
     kafka_logging_probe_reserve_before_serialize_for_test,
     kafka_logging_probe_terminal_loss_accounting_for_test,
+    kafka_logging_probe_worker_batching_for_test,
     kafka_logging_serialize_http_with_config_for_test,
-    kafka_logging_serialize_stream_with_config_for_test,
+    kafka_logging_serialize_stream_with_config_for_test, kafka_logging_stream_record_key_for_test,
     kafka_logging_validate_producer_admission_for_test,
 };
 use ferrum_edge::plugins::kafka_logging::{
     DEFAULT_BUFFER_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES,
-    HARD_MAX_ENTRY_BYTES, HARD_MAX_FLUSH_TIMEOUT_SECONDS, KafkaLogging,
-    MAX_KAFKA_TOPIC_NAME_LENGTH, MAX_MESSAGE_TIMEOUT_MS,
+    HARD_MAX_ENTRY_BYTES, HARD_MAX_FLUSH_TIMEOUT_SECONDS, KAFKA_MESSAGE_FRAMING_HEADROOM_BYTES,
+    KafkaLogging, MAX_KAFKA_TOPIC_NAME_LENGTH, MAX_MESSAGE_TIMEOUT_MS,
 };
 use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
@@ -440,7 +442,7 @@ async fn test_kafka_logging_buffer_full_drops_gracefully() {
 
 #[tokio::test]
 async fn test_kafka_logging_key_field_options() {
-    for key_field in &["client_ip", "proxy_id", "none"] {
+    for key_field in &["client_ip", "proxy_id", "consumer_username", "none"] {
         let plugin = KafkaLogging::new(
             &json!({
                 "broker_list": "localhost:9092",
@@ -2170,7 +2172,7 @@ fn ordinary_tuning_keys_do_not_need_the_opt_in() {
         &json!({
             "broker_list": "localhost:9092",
             "topic": "test",
-            "producer_config": {"linger.ms": "5", "compression.type": "lz4", "client.id": "edge"}
+            "producer_config": {"linger.ms": "5", "batch.num.messages": "1000", "client.id": "edge"}
         }),
         &default_http_client(),
     )
@@ -2220,4 +2222,638 @@ fn snapshot_validator_refuses_disabled_native_rows_under_the_local_opt_in() {
     assert!(
         ferrum_edge::_test_support::kafka_snapshot_native_key_refusals_for_test(&rows).is_empty()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes (kafka_logging-SOL-1/2, kafka_logging-CLAUDE-1..8).
+// ---------------------------------------------------------------------------
+
+use ferrum_edge::config::env_config::{KafkaBrokerAllowance, parse_kafka_allowed_brokers};
+use ferrum_edge::plugins::kafka_logging::screen_kafka_broker_list_egress_with_allowance;
+
+fn broker_allowance(raw: &str) -> KafkaBrokerAllowance {
+    parse_kafka_allowed_brokers(Some(raw)).expect("valid broker allowance")
+}
+
+fn literal(ip: &str) -> Option<std::net::IpAddr> {
+    Some(ip.parse().expect("test IP literal"))
+}
+
+// ── kafka_logging-SOL-2 / CLAUDE-7: operator-attested brokers ────────────────
+
+#[test]
+fn kafka_broker_allowance_parses_endpoints_and_cidrs_strictly() {
+    assert!(parse_kafka_allowed_brokers(None).expect("unset").is_empty());
+    assert!(
+        parse_kafka_allowed_brokers(Some("  "))
+            .expect("blank")
+            .is_empty()
+    );
+
+    let allowance =
+        broker_allowance("Kafka-0.Internal:9093, 10.20.0.0/24, [fd00::5]:9094, 192.0.2.7:9092");
+    assert!(allowance.covers("kafka-0.internal", None, 9093));
+    assert!(
+        !allowance.covers("kafka-0.internal", None, 9092),
+        "the port is part of a host:port attestation"
+    );
+    assert!(!allowance.covers("kafka-1.internal", None, 9093));
+    assert!(
+        allowance.covers("10.20.0.9", literal("10.20.0.9"), 1234),
+        "a listed CIDR covers its addresses on any port"
+    );
+    assert!(!allowance.covers("10.21.0.9", literal("10.21.0.9"), 9093));
+    assert!(allowance.covers("fd00::5", literal("fd00::5"), 9094));
+    assert!(!allowance.covers("fd00::5", literal("fd00::5"), 9095));
+    assert!(allowance.covers("192.0.2.7", literal("192.0.2.7"), 9092));
+    assert!(!allowance.covers("192.0.2.8", literal("192.0.2.8"), 9092));
+
+    for invalid in [
+        "kafka-0:9092,,kafka-1:9092",
+        "kafka-0:9092,",
+        "kafka-0",
+        "kafka-0:0",
+        "kafka-0:70000",
+        "[kafka-0]:9092",
+        "[fd00::1]",
+        "kafka 0:9092",
+        "10.0.0.0/33",
+        "0.0.0.0/0",
+        "::/0",
+        "0.0.0.0/1,128.0.0.0/1",
+    ] {
+        assert!(
+            parse_kafka_allowed_brokers(Some(invalid)).is_err(),
+            "{invalid:?} must fail closed instead of widening or dropping the attestation"
+        );
+    }
+}
+
+#[test]
+fn kafka_logging_is_admitted_under_a_restrictive_policy_only_for_attested_brokers() {
+    let policy = default_production_policy();
+    let config = json!({
+        "broker_list": "kafka-0.internal:9093,10.20.0.9:9093",
+        "topic": "logs"
+    });
+
+    let error = screen_kafka_broker_list_egress_with_allowance(
+        &config,
+        &policy,
+        &KafkaBrokerAllowance::default(),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("without an attestation the default posture stays closed"));
+    assert!(
+        error.contains("cannot be admitted") && error.contains("FERRUM_KAFKA_ALLOWED_BROKERS"),
+        "{error}"
+    );
+
+    screen_kafka_broker_list_egress_with_allowance(
+        &config,
+        &policy,
+        &broker_allowance("kafka-0.internal:9093,10.20.0.0/24"),
+    )
+    .expect("every attested bootstrap broker is admitted under the default posture");
+
+    let error = screen_kafka_broker_list_egress_with_allowance(
+        &config,
+        &policy,
+        &broker_allowance("kafka-0.internal:9093"),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("an unlisted bootstrap broker must refuse the config"));
+    assert!(
+        error.contains("10.20.0.9:9093") && error.contains("not listed"),
+        "{error}"
+    );
+
+    // A fully-open policy needs no attestation.
+    screen_kafka_broker_list_egress_with_allowance(
+        &config,
+        &BackendEgressPolicy::unrestricted(),
+        &KafkaBrokerAllowance::default(),
+    )
+    .expect("a fully-open policy has no boundary to bypass");
+}
+
+#[test]
+fn kafka_attested_literal_brokers_pass_deny_lists_but_never_the_dangerous_baseline() {
+    let config = json!({ "broker_list": "10.1.2.3:9092", "topic": "logs" });
+
+    let deny = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "10.0.0.0/8", true)
+        .expect("policy");
+    let error = screen_kafka_broker_list_egress_with_allowance(
+        &config,
+        &deny,
+        &KafkaBrokerAllowance::default(),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("an unattested denied literal must be refused"));
+    assert!(error.contains("FERRUM_BACKEND_DENY_CIDRS"), "{error}");
+    screen_kafka_broker_list_egress_with_allowance(
+        &config,
+        &deny,
+        &broker_allowance("10.1.2.3:9092"),
+    )
+    .expect("an attested broker may pass FERRUM_BACKEND_DENY_CIDRS");
+
+    let public =
+        BackendEgressPolicy::from_env(BackendAllowIps::Public, "", "", true).expect("policy");
+    screen_kafka_broker_list_egress_with_allowance(
+        &config,
+        &public,
+        &broker_allowance("10.1.2.0/24"),
+    )
+    .expect("an attested broker may pass the FERRUM_BACKEND_ALLOW_IPS mode");
+
+    let metadata = json!({ "broker_list": "PLAINTEXT://169.254.169.254:9092", "topic": "logs" });
+    for allowance in ["169.254.169.254:9092", "169.254.0.0/16"] {
+        let error = screen_kafka_broker_list_egress_with_allowance(
+            &metadata,
+            &default_production_policy(),
+            &broker_allowance(allowance),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{allowance}: the attestation must not waive the baseline"));
+        assert!(
+            error.contains("169.254.169.254") && error.contains("denied by backend egress policy"),
+            "{error}"
+        );
+    }
+    let escape_hatch =
+        BackendEgressPolicy::from_env(BackendAllowIps::Both, "169.254.169.254/32", "", true)
+            .expect("policy");
+    screen_kafka_broker_list_egress_with_allowance(
+        &metadata,
+        &escape_hatch,
+        &broker_allowance("169.254.169.254:9092"),
+    )
+    .expect("FERRUM_BACKEND_ALLOW_CIDRS stays the explicit override for the baseline");
+}
+
+#[tokio::test]
+async fn kafka_logging_admission_reads_the_node_broker_attestation() {
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+    let restricted = PluginHttpClient::default_with_backend_allow_ips(default_production_policy());
+    let config = json!({ "broker_list": "kafka-0.internal:9093", "topic": "logs" });
+
+    assert!(
+        KafkaLogging::new(&config, &restricted).is_err(),
+        "the default posture stays closed without an attestation"
+    );
+
+    env.set("FERRUM_KAFKA_ALLOWED_BROKERS", "kafka-0.internal:9093");
+    KafkaLogging::new(&config, &restricted)
+        .unwrap_or_else(|error| panic!("an attested broker must be admitted: {error}"));
+    ferrum_edge::plugins::validate_plugin_config_with_policy(
+        "kafka_logging",
+        &config,
+        &default_production_policy(),
+    )
+    .unwrap_or_else(|error| panic!("registry admission must honour the attestation: {error}"));
+
+    env.set("FERRUM_KAFKA_ALLOWED_BROKERS", "kafka-1.internal:9093");
+    assert!(
+        KafkaLogging::new(&config, &restricted).is_err(),
+        "a broker outside the attestation must stay refused"
+    );
+
+    // A malformed attestation never widens admission.
+    env.set("FERRUM_KAFKA_ALLOWED_BROKERS", "kafka-0.internal:9093,,");
+    assert!(KafkaLogging::new(&config, &restricted).is_err());
+}
+
+// ── kafka_logging-SOL-1: reload disposal must not wait in the dropping owner ──
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_drop_returns_before_a_stalled_flush_and_retires_in_background() {
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": "127.0.0.1:1",
+            "topic": "ferrum-retire",
+            "message_timeout_ms": 300_000,
+            "flush_timeout_seconds": 3
+        }),
+        &default_http_client(),
+    )
+    .expect("construct Kafka logger for retirement test");
+    start_kafka_logging(&plugin);
+    let generation_id = plugin.snapshot().generation_id;
+    plugin.log(&create_test_transaction_summary()).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while plugin.snapshot().admitted_total == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the record must reach librdkafka so the flush has work that cannot finish");
+
+    let started = std::time::Instant::now();
+    drop(plugin);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "dropping the last handle must not wait for the producer flush budget, took {elapsed:?}"
+    );
+    let retiring = ferrum_edge::plugins::kafka_logging::snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot.generation_id == generation_id)
+        .expect("a retiring generation stays visible until its finalize completes");
+    assert!(
+        !retiring.accepting,
+        "drop must close admission synchronously"
+    );
+    assert!(
+        !retiring.finalized,
+        "the stalled flush must still be running in the background"
+    );
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snapshot| snapshot.generation_id == generation_id)
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the tracked retirement must finalize and unregister the generation");
+}
+
+// ── kafka_logging-CLAUDE-1: aliases and duplicates of managed properties ─────
+
+#[tokio::test]
+async fn kafka_refuses_every_spelling_of_properties_top_level_fields_own() {
+    let client = default_http_client();
+    for (key, field) in [
+        ("acks", "acks"),
+        ("request.required.acks", "acks"),
+        ("Request.Required.Acks", "acks"),
+        ("topic.acks", "acks"),
+        ("topic.request.required.acks", "acks"),
+        ("message.timeout.ms", "message_timeout_ms"),
+        ("delivery.timeout.ms", "message_timeout_ms"),
+        ("topic.delivery.timeout.ms", "message_timeout_ms"),
+        ("compression.type", "compression"),
+        ("compression.codec", "compression"),
+        ("topic.compression.codec", "compression"),
+    ] {
+        let config = json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "acks": "all",
+            "producer_config": { key: "0" }
+        });
+        let error = KafkaLogging::new(&config, &client)
+            .err()
+            .unwrap_or_else(|| panic!("producer_config.{key} must be refused"));
+        assert!(
+            error.contains(&format!("{key:?}")) && error.contains(&format!("top-level `{field}`")),
+            "{key}: {error}"
+        );
+        assert_eq!(
+            kafka_logging_validate_producer_admission_for_test(&config, &client),
+            Err(error)
+        );
+    }
+}
+
+#[tokio::test]
+async fn kafka_refuses_two_spellings_of_one_librdkafka_property() {
+    let client = default_http_client();
+    for (first, second) in [
+        ("linger.ms", "queue.buffering.max.ms"),
+        ("retries", "message.send.max.retries"),
+        ("max.in.flight", "max.in.flight.requests.per.connection"),
+        ("batch.num.messages", "Batch.Num.Messages"),
+    ] {
+        let config = json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "producer_config": { first: "5", second: "50" }
+        });
+        let error = KafkaLogging::new(&config, &client)
+            .err()
+            .unwrap_or_else(|| panic!("{first} and {second} together must be refused"));
+        assert!(
+            error.contains(&format!("{first:?}")) && error.contains(&format!("{second:?}")),
+            "{error}"
+        );
+        assert!(
+            !error.contains("\"50\"") && !error.contains("\"5\""),
+            "{error}"
+        );
+    }
+    for single in ["linger.ms", "queue.buffering.max.ms", "retries"] {
+        KafkaLogging::new(
+            &json!({
+                "broker_list": "localhost:9092",
+                "topic": "audit-logs",
+                "producer_config": { single: "5" }
+            }),
+            &client,
+        )
+        .unwrap_or_else(|error| panic!("one spelling of {single} must be admitted: {error}"));
+    }
+}
+
+// ── kafka_logging-CLAUDE-2: message ceiling and idempotence coherence ────────
+
+#[tokio::test]
+async fn kafka_message_max_bytes_must_fit_the_largest_admitted_entry() {
+    let client = default_http_client();
+    let config = |max_entry_bytes: usize, message_max_bytes: Option<usize>| {
+        let mut config = json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "max_entry_bytes": max_entry_bytes,
+        });
+        if let Some(message_max_bytes) = message_max_bytes {
+            config["producer_config"] =
+                json!({ "message.max.bytes": message_max_bytes.to_string() });
+        }
+        config
+    };
+
+    let error = KafkaLogging::new(&config(DEFAULT_MAX_ENTRY_BYTES, Some(1024)), &client)
+        .err()
+        .unwrap_or_else(|| panic!("a message ceiling below max_entry_bytes must be refused"));
+    assert!(
+        error.contains("message.max.bytes") && error.contains("max_entry_bytes"),
+        "{error}"
+    );
+
+    let floor = 4096 + KAFKA_MESSAGE_FRAMING_HEADROOM_BYTES;
+    KafkaLogging::new(&config(4096, Some(floor)), &client)
+        .unwrap_or_else(|error| panic!("exactly the framing floor must be admitted: {error}"));
+    assert!(KafkaLogging::new(&config(4096, Some(floor - 1)), &client).is_err());
+
+    // Without an explicit ceiling the default grows to fit the largest entry.
+    KafkaLogging::new(&config(HARD_MAX_ENTRY_BYTES, None), &client).unwrap_or_else(|error| {
+        panic!("the default message ceiling must fit a hard-maximum entry: {error}")
+    });
+}
+
+#[tokio::test]
+async fn kafka_idempotence_requires_acks_all_at_admission() {
+    let client = default_http_client();
+    let config = |acks: Option<&str>, idempotence: &str| {
+        let mut config = json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "producer_config": { "enable.idempotence": idempotence }
+        });
+        if let Some(acks) = acks {
+            config["acks"] = json!(acks);
+        }
+        config
+    };
+    for acks in ["0", "1"] {
+        for idempotence in ["true", "TRUE", "t", "1"] {
+            let error = KafkaLogging::new(&config(Some(acks), idempotence), &client)
+                .err()
+                .unwrap_or_else(|| panic!("idempotence {idempotence} with acks {acks} must fail"));
+            assert!(
+                error.contains("enable.idempotence") && error.contains("acks"),
+                "{error}"
+            );
+        }
+    }
+    for acks in [None, Some("all"), Some("-1")] {
+        KafkaLogging::new(&config(acks, "true"), &client)
+            .unwrap_or_else(|error| panic!("idempotence with acks {acks:?} is valid: {error}"));
+    }
+    KafkaLogging::new(&config(Some("1"), "false"), &client)
+        .unwrap_or_else(|error| panic!("acks 1 without idempotence is valid: {error}"));
+}
+
+// ── kafka_logging-CLAUDE-3: SASL mechanism and credential coherence ─────────
+
+#[tokio::test]
+async fn kafka_sasl_mechanism_is_reconciled_with_its_credentials() {
+    let client = default_http_client();
+    let sasl = |extra: serde_json::Value| {
+        let mut config = json!({
+            "broker_list": "localhost:9092",
+            "topic": "audit-logs",
+            "security_protocol": "sasl_plaintext"
+        });
+        for (key, value) in extra.as_object().expect("overrides are an object") {
+            config[key] = value.clone();
+        }
+        config
+    };
+    let credentials = json!({"sasl_username": "ferrum", "sasl_password": "fixture-password"});
+    let with_credentials = |mechanism: &str| {
+        let mut extra = credentials.clone();
+        extra["sasl_mechanism"] = json!(mechanism);
+        sasl(extra)
+    };
+
+    for (config, expected) in [
+        (sasl(credentials.clone()), "GSSAPI"),
+        (sasl(json!({})), "sasl_mechanism"),
+        (
+            sasl(json!({"sasl_mechanism": "PLAIN"})),
+            "requires `sasl_username`",
+        ),
+        (
+            sasl(json!({"sasl_mechanism": "SCRAM-SHA-256"})),
+            "requires `sasl_username`",
+        ),
+        (with_credentials("OAUTHBEARER"), "used only by"),
+        (with_credentials("plain"), "unsupported `sasl_mechanism`"),
+        (
+            with_credentials("SCRAM-SHA-265"),
+            "unsupported `sasl_mechanism`",
+        ),
+    ] {
+        let error = KafkaLogging::new(&config, &client)
+            .err()
+            .unwrap_or_else(|| panic!("incoherent SASL config must be refused: {config}"));
+        assert!(error.contains(expected), "expected {expected:?}: {error}");
+        assert!(!error.contains("fixture-password"), "{error}");
+    }
+
+    for mechanism in ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] {
+        KafkaLogging::new(&with_credentials(mechanism), &client)
+            .unwrap_or_else(|error| panic!("{mechanism} with credentials is valid: {error}"));
+    }
+    KafkaLogging::new(&sasl(json!({"sasl_mechanism": "OAUTHBEARER"})), &client)
+        .unwrap_or_else(|error| panic!("OAUTHBEARER without credentials is valid: {error}"));
+
+    let gssapi = KafkaLogging::new(&sasl(json!({"sasl_mechanism": "GSSAPI"})), &client);
+    if cfg!(windows) {
+        gssapi.unwrap_or_else(|error| panic!("GSSAPI uses SSPI on Windows: {error}"));
+    } else {
+        let error = gssapi
+            .err()
+            .unwrap_or_else(|| panic!("GSSAPI must be refused without Cyrus SASL"));
+        assert!(error.contains("GSSAPI"), "{error}");
+    }
+}
+
+// ── kafka_logging-CLAUDE-4: QueueFull waits for queue space, bounded ────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_queue_full_waits_for_librdkafka_space_instead_of_dropping() {
+    let outcome = kafka_logging_probe_queue_full_backoff_for_test(
+        Some(Duration::from_millis(100)),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("librdkafka queue-full probe must run");
+    assert_eq!(
+        outcome.queue_rejected, 0,
+        "a record refused while the queue was momentarily full must be retried: {outcome:?}"
+    );
+    assert_eq!(outcome.admitted, 2, "{outcome:?}");
+    assert!(outcome.first_batch_waits >= 1, "{outcome:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_queue_full_backoff_is_bounded_and_not_repeated_while_saturated() {
+    let started = std::time::Instant::now();
+    let outcome = kafka_logging_probe_queue_full_backoff_for_test(None, Duration::from_millis(200))
+        .await
+        .expect("librdkafka queue-full probe must run");
+    assert_eq!(outcome.admitted, 1, "{outcome:?}");
+    assert_eq!(outcome.queue_rejected, 2, "{outcome:?}");
+    assert!(
+        outcome.first_batch_waits >= 1,
+        "the first QueueFull must back off before dropping: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.follow_up_waits, 0,
+        "a saturated producer must drop further QueueFull records without waiting again: \
+         {outcome:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the backoff must stay inside its budget"
+    );
+}
+
+// ── kafka_logging-CLAUDE-5: the worker batches records per turn ─────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_worker_hands_librdkafka_batches_not_single_records() {
+    let records = 1_000;
+    let (flushes, flushed) = kafka_logging_probe_worker_batching_for_test(records)
+        .await
+        .expect("worker batching probe must run");
+    assert_eq!(flushed, records, "close must still drain every record");
+    assert!(
+        flushes * 10 <= records,
+        "expected batched worker turns, saw {flushes} flushes for {records} records"
+    );
+}
+
+// ── kafka_logging-CLAUDE-6: saturation drops clear the healthy signal ───────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_admission_saturation_clears_healthy_until_delivery_recovers() {
+    let cluster = MockCluster::new(1).expect("create Kafka mock cluster");
+    let topic = "saturation-health";
+    cluster
+        .create_topic(topic, 1, 1)
+        .expect("create mock topic");
+    let plugin = KafkaLogging::new(
+        &json!({
+            "broker_list": cluster.bootstrap_servers(),
+            "topic": topic,
+            "compression": "none",
+            "max_entry_bytes": 4096,
+            "buffer_max_bytes": 4096,
+            "message_timeout_ms": 10_000,
+            "flush_timeout_seconds": 5,
+            "producer_config": { "linger.ms": "0" }
+        }),
+        &default_http_client(),
+    )
+    .expect("construct Kafka logger for saturation health");
+    start_kafka_logging(&plugin);
+    assert!(plugin.snapshot().healthy);
+
+    // The first record holds its lease until delivery, so the second one is
+    // refused by the retained-byte budget.
+    plugin.log(&create_test_transaction_summary()).await;
+    plugin.log(&create_test_transaction_summary()).await;
+    let saturated = plugin.snapshot();
+    assert_eq!(saturated.byte_budget_exhausted_total, 1, "{saturated:?}");
+    assert!(
+        !saturated.healthy,
+        "a generation shedding records must not report healthy: {saturated:?}"
+    );
+    let failure = saturated
+        .last_failure
+        .as_ref()
+        .expect("saturation records the latest failure");
+    assert_eq!(failure.operation, "admission");
+    assert_eq!(failure.error_kind, "byte_budget_exhausted");
+
+    let recovered = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let snapshot = plugin.snapshot();
+            if snapshot.delivered_total >= 1 && snapshot.healthy {
+                break snapshot;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the next terminal delivery must restore healthy");
+    assert_eq!(recovered.delivery_failed_total, 0);
+    plugin.finalize().await;
+}
+
+// ── kafka_logging-CLAUDE-8: partition key by effective identity ─────────────
+
+#[test]
+fn kafka_key_field_consumer_username_keys_by_effective_identity() {
+    let config = json!({
+        "broker_list": "localhost:9092",
+        "topic": "audit-logs",
+        "key_field": "consumer_username"
+    });
+
+    let mut http = create_test_transaction_summary();
+    http.consumer_username = Some("tenant-a".to_string());
+    assert_eq!(
+        kafka_logging_http_record_key_for_test(&config, &http),
+        Ok(Some("tenant-a".to_string()))
+    );
+    http.consumer_username = Some(String::new());
+    assert_eq!(
+        kafka_logging_http_record_key_for_test(&config, &http),
+        Ok(None)
+    );
+    http.consumer_username = None;
+    assert_eq!(
+        kafka_logging_http_record_key_for_test(&config, &http),
+        Ok(None)
+    );
+
+    let mut stream = create_test_stream_transaction_summary();
+    stream.consumer_username = Some("svc-b".to_string());
+    assert_eq!(
+        kafka_logging_stream_record_key_for_test(&config, &stream),
+        Ok(Some("svc-b".to_string()))
+    );
+    stream.consumer_username = None;
+    assert_eq!(
+        kafka_logging_stream_record_key_for_test(&config, &stream),
+        Ok(None)
+    );
+
+    // The existing options keep their keys.
+    let client_ip =
+        json!({"broker_list": "localhost:9092", "topic": "t", "key_field": "client_ip"});
+    assert_eq!(
+        kafka_logging_http_record_key_for_test(&client_ip, &http),
+        Ok(Some(http.client_ip.clone()))
+    );
+    let invalid = json!({"broker_list": "localhost:9092", "topic": "t", "key_field": "consumer"});
+    assert!(kafka_logging_http_record_key_for_test(&invalid, &http).is_err());
 }

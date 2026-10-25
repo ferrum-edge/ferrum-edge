@@ -9182,7 +9182,7 @@ published release notes.
   shipping under a restrictive policy should ship through a policy-aware sink
   (`http_logging`, `tcp_logging`, `ws_logging`, `loki_logging`) and bridge to
   Kafka outside the gateway. See
-  [Backend Egress / SSRF Protection](docs/configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
+  [Backend Egress / SSRF Protection](docs/configuration.md#kafka_logging-and-restrictive-egress-policies).
 
 - Authenticated `/metrics` now renders TLS certificate gauges from a cached,
   non-secret TLS inventory snapshot and performs no certificate, private-key,
