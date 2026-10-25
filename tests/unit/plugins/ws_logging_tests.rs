@@ -191,8 +191,7 @@ fn test_ws_logging_rejects_unknown_endpont_url_key() {
         }),
         default_client(),
     )
-    .err()
-    .expect("typo endpont_url must fail construction");
+    .expect_err("typo endpont_url must fail construction");
     assert!(err.contains("unknown configuration key"), "{err}");
     assert!(err.contains("endpont_url"), "{err}");
     assert!(err.contains("did you mean `endpoint_url`?"), "{err}");
@@ -256,8 +255,7 @@ async fn test_ws_logging_wss_rejects_mixed_ca_bundle_at_construction() {
             &json!({"endpoint_url": "wss://localhost:9300/logs"}),
             client_with_ca(ca_path.to_str().expect("utf8 path")),
         )
-        .err()
-        .expect("a rejected later CA record must reject plugin construction");
+        .expect_err("a rejected later CA record must reject plugin construction");
         let visible = [
             "ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`",
             "certificate record #2",
@@ -298,8 +296,7 @@ async fn test_ws_logging_wss_rejects_all_malformed_ca_bundle() {
         &json!({"endpoint_url": "wss://localhost:9300/logs"}),
         client_with_ca(ca_path.to_str().expect("utf8 path")),
     )
-    .err()
-    .expect("an all-malformed CA bundle must reject plugin construction");
+    .expect_err("an all-malformed CA bundle must reject plugin construction");
     assert!(
         error.contains("ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`"),
         "{error}"
@@ -323,8 +320,7 @@ async fn test_ws_logging_wss_rejects_empty_custom_ca_store() {
         &json!({"endpoint_url": "wss://localhost:9300/logs"}),
         client_with_ca(ca_path.to_str().expect("utf8 path")),
     )
-    .err()
-    .expect("an empty custom CA store must reject plugin construction");
+    .expect_err("an empty custom CA store must reject plugin construction");
     assert!(
         error.contains("ws_logging: `FERRUM_TLS_CA_BUNDLE_PATH`"),
         "{error}"
@@ -2108,8 +2104,7 @@ fn wss_source_diagnostics_distinguish_io_invalid_source_and_size() {
             &json!({"endpoint_url": "wss://localhost:9300/logs"}),
             client_with_ca(source),
         )
-        .err()
-        .expect("declared invalid CA source must reject construction");
+        .expect_err("declared invalid CA source must reject construction");
         let rendered = ferrum_edge::startup::render_startup_error(anyhow::Error::msg(error), &[]);
         for expected in [
             "ws_logging",
@@ -2244,16 +2239,14 @@ async fn ws_logging_refuses_credential_query_parameters_port_zero_and_fragments(
         &json!({ "endpoint_url": "ws://localhost:0/logs" }),
         default_client(),
     )
-    .err()
-    .expect("port 0 must be refused");
+    .expect_err("port 0 must be refused");
     assert!(port_zero.contains("port"), "{port_zero}");
 
     let fragment = WsLogging::new(
         &json!({ "endpoint_url": "ws://localhost:9300/logs#frag" }),
         default_client(),
     )
-    .err()
-    .expect("fragment must be refused");
+    .expect_err("fragment must be refused");
     assert!(fragment.contains("fragment"), "{fragment}");
 
     // Non-credential query parameters stay admissible.
@@ -2662,8 +2655,7 @@ async fn ws_logging_candidate_screen_refusal_fails_the_whole_dial() {
         Err(format!("dial candidate {candidate} denied"))
     })
     .await
-    .err()
-    .expect("a screen refusal must fail the dial");
+    .expect_err("a screen refusal must fail the dial");
     assert!(error.contains("denied"), "{error}");
 }
 
@@ -2688,8 +2680,7 @@ async fn ws_logging_header_secret_resolves_on_the_serving_node_not_at_admission(
 
     let error = plugin
         .start_background_tasks()
-        .err()
-        .expect("activation without the variable must fail closed");
+        .expect_err("activation without the variable must fail closed");
     assert!(error.contains("is not set"), "{error}");
     assert!(
         !error.contains(REFERENCE),
@@ -2710,8 +2701,7 @@ async fn ws_logging_header_secret_resolves_on_the_serving_node_not_at_admission(
     env.set(REFERENCE, "line\nbreak");
     let error = plugin
         .start_background_tasks()
-        .err()
-        .expect("a header-invalid secret must fail activation");
+        .expect_err("a header-invalid secret must fail activation");
     assert!(error.contains("not a valid HTTP header value"), "{error}");
     assert!(
         !error.contains("break"),
