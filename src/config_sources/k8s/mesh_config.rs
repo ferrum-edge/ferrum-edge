@@ -7,7 +7,8 @@ use crate::modes::mesh::config::{
     MAX_MESH_EXT_AUTHZ_PROVIDERS, MESH_EXT_AUTHZ_DEFAULT_TIMEOUT_MS,
     MESH_EXT_AUTHZ_MAX_REQUEST_BODY_BYTES, MESH_EXT_AUTHZ_MAX_TIMEOUT_MS, MeshExtAuthzBodyCheck,
     MeshExtAuthzHeader, MeshExtAuthzProvider, TracingProvider, sanitize_mesh_ext_authz_diagnostic,
-    validate_mesh_ext_authz_forwarded_header, validate_mesh_ext_authz_mutable_header,
+    validate_mesh_ext_authz_downstream_allow_header, validate_mesh_ext_authz_forwarded_header,
+    validate_mesh_ext_authz_mutable_header, validate_mesh_ext_authz_upstream_allow_header,
 };
 
 use super::{
@@ -494,7 +495,7 @@ fn envoy_ext_authz_http_provider(
         &display,
         "headersToUpstreamOnAllow",
         config,
-        validate_mesh_ext_authz_mutable_header,
+        validate_mesh_ext_authz_upstream_allow_header,
     )?;
     let headers_to_downstream_on_deny = ext_authz_header_list(
         &display,
@@ -506,7 +507,7 @@ fn envoy_ext_authz_http_provider(
         &display,
         "headersToDownstreamOnAllow",
         config,
-        validate_mesh_ext_authz_mutable_header,
+        validate_mesh_ext_authz_downstream_allow_header,
     )?;
     let include_additional_headers_in_check = ext_authz_additional_headers(&display, config)?;
     let include_request_body_in_check = ext_authz_body_check(&display, config)?;

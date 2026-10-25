@@ -73,6 +73,7 @@ mod unit {
         mod http_batch_response_drain_tests;
         mod http_logging_tests;
         mod ip_restriction_tests;
+        mod jwks_auth_algorithm_tests;
         mod jwks_auth_custom_token_location_tests;
         mod jwks_auth_inline_keys_tests;
         mod jwks_auth_multi_audience_tests;

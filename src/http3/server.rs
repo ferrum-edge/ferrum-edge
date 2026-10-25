@@ -5934,6 +5934,17 @@ async fn handle_h3_request(
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
+    } else if ctx.route_override_path.is_some() {
+        // Same as the H1/H2 ladder: a path-only route rewrite can select a
+        // method a per-method body policy did not vote for before_proxy.
+        crate::proxy::final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_plugin_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress,
+        )
     } else {
         (
             initial_plugin_needs_request_buffering,
@@ -6339,6 +6350,32 @@ async fn handle_h3_request(
         }
         ctx.bind_authorized_backend_path(backend_path);
     }
+
+    // Same as the H1/H2 ladder: a per-method gRPC body policy selects on the
+    // backend-effective method bound just above, which listen-path stripping
+    // and a base path can make differ from the method the earlier vote saw.
+    // The effective headers now live in `proxy_headers`, so swap them in for
+    // the request-time predicates.
+    let (plugin_needs_request_buffering, final_body_before_backend_dispatch) =
+        if backend_path_is_policy_bound && matches!(http_flavor, HttpFlavor::Grpc) {
+            std::mem::swap(&mut ctx.headers, &mut proxy_headers);
+            let (buffering, terminal_dispatch, _needs_context) =
+                crate::proxy::final_request_body_requirements(
+                    &plugins,
+                    &ctx,
+                    request_may_need_plugin_buffering,
+                    has_terminal_body_dispatch,
+                    has_contextual_final_body_hook,
+                    has_finalized_request_egress,
+                );
+            std::mem::swap(&mut ctx.headers, &mut proxy_headers);
+            (buffering, terminal_dispatch)
+        } else {
+            (
+                plugin_needs_request_buffering,
+                final_body_before_backend_dispatch,
+            )
+        };
 
     if has_deferred_routing_header_hooks {
         // Deferral changes authorization order, not the client-path view that

@@ -45,9 +45,9 @@ use crate::util::json_dup_keys::{self, JsonScanMemo};
 use crate::util::media_type::is_concrete_http_media_type;
 use crate::util::unknown_keys::reject_unknown_keys;
 
-use super::charged_decode::{ChargedDecodeError, decode_one_coding};
+use super::charged_decode::{ChargedDecodeError, decode_one_chain_coding};
 use super::utils::auth_flow::constant_time_eq;
-use super::utils::content_encoding::parse_content_codings;
+use super::utils::content_encoding::parse_content_codings_including_zstd;
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::utils::synthetic_response::{
     request_method_omits_response_body, synthetic_response_omits_body,
@@ -3543,7 +3543,10 @@ fn decode_body<'a>(
     // neither the request problem body nor transaction metadata can reproduce
     // a hostile coding token (`GHSA-5p2h-fq6q-gwh9`).
     let violation = || MediaFailure::Violation(CONTENT_ENCODING_DETAIL.to_string());
-    let codings = parse_content_codings(header).map_err(|_| violation())?;
+    // `zstd` is admitted alongside gzip/br: `compression` can emit it (and
+    // accept it on uploads) for an instance that opts in, and a valid zstd
+    // representation must be validated rather than reported undecodable.
+    let codings = parse_content_codings_including_zstd(header).map_err(|_| violation())?;
     if codings.len() > MAX_CONTENT_CODINGS {
         return Err(violation());
     }
@@ -3567,7 +3570,7 @@ fn decode_body<'a>(
             Some(previous) => (previous.as_slice(), previous.capacity()),
             None => (body, 0),
         };
-        let decoded = decode_one_coding(
+        let decoded = decode_one_chain_coding(
             coding,
             input,
             max_body_bytes,
