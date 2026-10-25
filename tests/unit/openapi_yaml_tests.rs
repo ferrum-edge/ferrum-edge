@@ -18573,7 +18573,13 @@ fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
         ),
         (
             "WsMessageSizeLimitingConfig",
-            &["close_reason", "max_frame_bytes", "max_message_bytes"][..],
+            &[
+                "backend_to_client",
+                "client_to_backend",
+                "close_reason",
+                "max_frame_bytes",
+                "max_message_bytes",
+            ][..],
             &["max_frame_bytes", "max_message_bytes"][..],
         ),
     ] {
