@@ -10144,11 +10144,26 @@ individual frame is within that limit and the message remains within
 `max_message_bytes`. Fragmented Text keeps tungstenite's incremental UTF-8
 validation, and interleaved Ping/Pong frames do not reset message state.
 
+**Ping/Pong count against `max_frame_bytes`.** Only Close bypasses the
+configured frame ceiling. Ping and Pong payloads are checked against it like
+data frames, so a `max_frame_bytes` (or a direction's override) below 125 — the
+RFC 6455 control-frame maximum — closes the connection with 1009 on an
+ordinary heartbeat whose payload is larger than the configured value. Keep the
+frame ceiling at 125 or more unless every peer's keepalive payload is known to
+fit.
+
 On either violation the gateway publishes cancellation before attempting
 bounded polite-close writes and sends close code **1009 (Message Too Big)**
 with the configured reason to both client and backend when their sinks remain
 writable. The same behavior applies in both relay directions and on H1, H2,
-and H3 WebSocket frontends.
+and H3 WebSocket frontends. Under `websocket_permessage_deflate: terminate`
+the inflate adapter enforces the same ceilings on the compressed wire frame
+and on the inflated frame and message; when the violated ceiling is this
+plugin's, the Close carries the configured reason too. A fault at an
+independent ceiling (the global `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` frame
+limit or a stricter `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`)
+keeps the adapter's fixed reason (`compressed frame too large`,
+`decompressed frame too large`, `decompressed message too large`).
 
 **Priority:** 2810
 
@@ -10156,11 +10171,25 @@ and H3 WebSocket frontends.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. |
-| `max_message_bytes` | u64 | `4 × max_frame_bytes` | Maximum reassembled Text/Binary message payload. Must be greater than or equal to `max_frame_bytes`. This separately bounds continuation accumulation without treating the whole message as one frame. |
-| `close_reason` | String | `"Message too large"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
+| `max_frame_bytes` | u64 | *(required)* | Maximum allowed frame payload in bytes, the default for both directions. Must be greater than 0 — configs with `max_frame_bytes` of 0 (or missing) are rejected at config load time. Applies to Text, Binary, continuation, Ping, and Pong frames (Close bypasses it), so values below 125 close the connection on heartbeat Ping/Pong traffic larger than the value. |
+| `max_message_bytes` | u64 | `4 × max_frame_bytes` | Maximum reassembled Text/Binary message payload, the default for both directions. Must be greater than or equal to `max_frame_bytes`. This separately bounds continuation accumulation without treating the whole message as one frame. |
+| `close_reason` | String | `"Message too large"` | Close-frame reason text, the default for both directions (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
+| `client_to_backend` | object | *(none)* | Optional override for frames the **client** sends (the client-side parser). Accepts `max_frame_bytes`, `max_message_bytes`, and `close_reason` with the same rules as the top-level fields. |
+| `backend_to_client` | object | *(none)* | Optional override for frames the **backend** sends (the backend-side parser). Accepts the same three fields. |
 
-Configuration must be a top-level object. The only accepted keys are `max_frame_bytes`, `max_message_bytes`, and `close_reason`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions, so a typo such as `max_frame_bytez` cannot silently leave frames unbounded. Registration is `FailClosed`.
+**Directional overrides.** The top-level fields are the default for both
+directions; `client_to_backend` / `backend_to_client` replace any of them for
+one direction, so a tight bound on untrusted client input can coexist with
+larger backend snapshots or pushes. A field an override omits is inherited from
+the top level, except that when `max_message_bytes` is set at neither level the
+direction defaults it to four times its own effective `max_frame_bytes`. Each
+direction's resolved values must satisfy `max_message_bytes >= max_frame_bytes`;
+an inherited explicit top-level `max_message_bytes` below an override's raised
+`max_frame_bytes` is rejected with a diagnostic that names the direction, so
+set `max_message_bytes` in the override too. Both directions are resolved once
+at construction; the relay reads the precomputed values once per session.
+
+Configuration must be a top-level object. The only accepted keys are `max_frame_bytes`, `max_message_bytes`, `close_reason`, `client_to_backend`, and `backend_to_client`; an override object accepts only `max_frame_bytes`, `max_message_bytes`, and `close_reason`. Unknown keys are rejected with path-qualified diagnostics and spelling suggestions (for example `config.backend_to_client.max_frame_bytez`), so a typo cannot silently leave frames unbounded. Registration is `FailClosed`.
 
 ```yaml
 plugin_name: ws_message_size_limiting
@@ -10169,11 +10198,36 @@ config:
   max_message_bytes: 262144
 ```
 
+Asymmetric limits — 4 KiB client frames and 16 KiB client messages, with
+64 KiB backend frames:
+
+```yaml
+plugin_name: ws_message_size_limiting
+config:
+  max_frame_bytes: 4096
+  max_message_bytes: 16384
+  close_reason: "client payload limit"
+  backend_to_client:
+    max_frame_bytes: 65536
+    max_message_bytes: 262144
+    close_reason: "backend payload limit"
+```
+
 With multiple applicable limiter instances, the relay uses the smallest frame
-ceiling and the smallest message ceiling independently; ties retain configured
-plugin order, including the corresponding close reason. The plugin opts the
-connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode, so both peer
-parsers receive the effective limits before their first frame read.
+ceiling and the smallest message ceiling independently, per direction; ties
+retain configured plugin order, including the corresponding close reason. The
+plugin opts the connection out of `FERRUM_WEBSOCKET_TUNNEL_MODE` raw-copy mode,
+so both peer parsers receive the effective limits before their first frame
+read.
+
+**Metrics:** Every session this plugin closes with 1009 increments
+`ferrum_ws_message_size_limit_rejected_total{direction}` once, where
+`direction` is `client_to_backend` (the client sent the oversized input) or
+`backend_to_client`. That includes terminated `permessage-deflate` faults at
+this plugin's ceiling. A rejection at the global
+`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` ceiling (empty 1009 reason) is not this
+plugin's decision and is not counted. The counter is process-wide and always
+exported, so alerting does not require `ws_frame_logging` or sampled logs.
 
 ### `ws_rate_limiting`
 

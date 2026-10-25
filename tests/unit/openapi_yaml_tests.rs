@@ -6512,6 +6512,61 @@ fn plugin_config_schema_applies_plugin_specific_config() {
         "ws_message_size_limiting should reject a zero max_message_bytes"
     );
 
+    let directional = plugin_config(
+        "ws_message_size_limiting",
+        Some(json!({
+            "max_frame_bytes": 4096,
+            "client_to_backend": {"close_reason": "client payload limit"},
+            "backend_to_client": {
+                "max_frame_bytes": 65536,
+                "max_message_bytes": 262144,
+                "close_reason": "backend payload limit"
+            }
+        })),
+    );
+    assert!(
+        validator.validate(&directional).is_ok(),
+        "ws_message_size_limiting should accept per-direction overrides"
+    );
+    for (override_config, why) in [
+        (
+            json!({"backend_to_client": {"max_frame_bytez": 1}}),
+            "an unknown key inside a direction override",
+        ),
+        (
+            json!({"backend_to_client": {"max_frame_bytes": 0}}),
+            "a zero override max_frame_bytes",
+        ),
+        (
+            json!({"client_to_backend": {"max_message_bytes": 0}}),
+            "a zero override max_message_bytes",
+        ),
+        (
+            json!({"client_to_backend": "bad"}),
+            "a non-object direction override",
+        ),
+    ] {
+        let mut config = override_config;
+        config
+            .as_object_mut()
+            .expect("override config should be object")
+            .insert("max_frame_bytes".to_string(), json!(1024));
+        let invalid = plugin_config("ws_message_size_limiting", Some(config));
+        assert!(
+            validator.validate(&invalid).is_err(),
+            "ws_message_size_limiting should reject {why}"
+        );
+        // The constructor is the runtime authority and must agree.
+        assert!(
+            ferrum_edge::plugins::validate_plugin_config(
+                "ws_message_size_limiting",
+                &invalid["config"]
+            )
+            .is_err(),
+            "constructor should reject {why}"
+        );
+    }
+
     let empty_termination = plugin_config("request_termination", Some(json!({})));
     assert!(
         validator.validate(&empty_termination).is_ok(),
@@ -18518,7 +18573,13 @@ fn size_limiting_plugin_configs_are_closed_and_bounded_in_openapi() {
         ),
         (
             "WsMessageSizeLimitingConfig",
-            &["close_reason", "max_frame_bytes", "max_message_bytes"][..],
+            &[
+                "backend_to_client",
+                "client_to_backend",
+                "close_reason",
+                "max_frame_bytes",
+                "max_message_bytes",
+            ][..],
             &["max_frame_bytes", "max_message_bytes"][..],
         ),
     ] {

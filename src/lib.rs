@@ -5768,6 +5768,46 @@ pub mod _test_support {
         crate::proxy::ws_capacity_error_class(size, client_to_backend)
     }
 
+    /// Effective parser ceilings `(max_frame_bytes, max_message_bytes)` the
+    /// relay installs in the framer reading frames that travel in `direction`.
+    pub fn effective_ws_size_limits_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+    ) -> (usize, usize) {
+        let limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
+            global_frame_bytes,
+            plugins,
+            direction,
+        );
+        (limits.max_frame_bytes, limits.max_message_bytes)
+    }
+
+    /// Plugin-attributed 1009 Close the relay publishes for a parser capacity
+    /// error read in `direction`; `None` when no plugin rule binds.
+    pub fn ws_plugin_capacity_close_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+        error: &WsError,
+    ) -> Option<CloseFrame> {
+        crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins, direction)
+            .plugin_close_for_error(error)
+            .map(|(close, _, _, _)| close)
+    }
+
+    /// Close the relay publishes for a terminated `permessage-deflate` read
+    /// fault in `direction`, and whether a size-policy plugin rule bound it.
+    pub fn ws_permessage_deflate_fault_close_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: crate::plugins::WebSocketFrameDirection,
+        fault: crate::proxy::ws_permessage_deflate::PermessageDeflateFault,
+    ) -> (CloseFrame, bool) {
+        crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins, direction)
+            .permessage_deflate_fault_close(fault)
+    }
+
     /// Global capacity-overflow Close selection used when no plugin rule binds.
     pub fn global_ws_capacity_close_for_error_for_test(
         error: &WsError,
