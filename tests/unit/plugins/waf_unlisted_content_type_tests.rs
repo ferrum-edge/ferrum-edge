@@ -158,7 +158,7 @@ async fn scan_scope_toggles_move_a_type_out_of_the_unlisted_set() {
 }
 
 #[tokio::test]
-async fn non_body_methods_and_exempt_requests_are_not_governed() {
+async fn bodies_on_any_method_are_governed_and_exempt_requests_are_not() {
     let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
@@ -167,11 +167,19 @@ async fn non_body_methods_and_exempt_requests_are_not_governed() {
     }))
     .unwrap();
 
+    // A body on a method outside `body_methods` is governed once the request
+    // declares a representation: a backend that reads a GET body must not
+    // receive what the same body on POST would be refused for.
     let mut get = request("GET", "/api/items", Some("application/octet-stream"));
-    assert!(!plugin.should_buffer_request_body(&get));
+    assert!(plugin.should_buffer_request_body(&get));
     let headers = get.headers.clone();
     let result = final_body(&plugin, &mut get, &headers, b"payload").await;
-    assert!(matches!(result, PluginResult::Continue));
+    assert!(is_reject(&result));
+    assert_eq!(meta(&get, "waf.block_reason"), Some("content_type"));
+
+    // A GET that declares no body at all keeps the streaming path.
+    let bare_get = request("GET", "/api/items", None);
+    assert!(!plugin.should_buffer_request_body(&bare_get));
 
     let mut exempt = request("POST", "/uploads/avatar", Some("image/png"));
     assert!(!plugin.should_buffer_request_body(&exempt));
@@ -417,41 +425,31 @@ async fn block_with_every_type_scanned_is_admitted_beside_an_enforcing_rule() {
 }
 
 #[tokio::test]
-async fn block_is_not_an_admission_enforcement_path_without_body_methods() {
-    // `body_methods: []` governs no HTTP request body, so `block` can never
-    // fire and the monitor-only default pack leaves nothing that can block.
-    let error = waf(json!({
-        "mode": "enforce",
-        "body_methods": [],
-        "on_unlisted_content_type": "block"
-    }))
-    .unwrap_err();
-    assert!(error.contains("no enabled enforcement path"), "{error}");
-    assert!(
-        error.contains("at least one `body_methods` entry"),
-        "{error}"
-    );
-
-    // Any listed method makes it reachable again.
-    waf(json!({
-        "mode": "enforce",
-        "body_methods": ["POST"],
-        "on_unlisted_content_type": "block"
-    }))
-    .unwrap();
-
-    // Accepted beside another enforcement path, where `block` stays inert.
+async fn block_stays_an_admission_enforcement_path_without_body_methods() {
+    // `body_methods` no longer gates body governance: a request that declares
+    // a body is governed on every method, so `block` can still fire with an
+    // empty list and remains a reachable enforcement path.
     let plugin = waf(json!({
         "mode": "enforce",
-        "default_rule_action": "enforce",
         "body_methods": [],
         "on_unlisted_content_type": "block"
     }))
     .unwrap();
     let (buffers, result, ctx) = post(&plugin, Some("application/octet-stream"), SQLI_JSON).await;
-    assert!(!buffers);
-    assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(meta(&ctx, "waf.body_uninspected"), None);
+    assert!(buffers, "a labelled body is buffered whatever the method");
+    assert!(is_reject(&result));
+    assert_eq!(meta(&ctx, "waf.block_reason"), Some("content_type"));
+
+    // Every content type in scope still leaves nothing `block` can refuse.
+    let error = waf(json!({
+        "mode": "enforce",
+        "body_methods": [],
+        "inspect_multipart": true,
+        "inspect_binary_body": true,
+        "on_unlisted_content_type": "block"
+    }))
+    .unwrap_err();
+    assert!(error.contains("no enabled enforcement path"), "{error}");
 }
 
 #[test]
@@ -469,14 +467,32 @@ fn an_oversize_block_stays_an_admission_path_without_body_methods() {
 #[tokio::test]
 async fn grpc_json_codecs_are_scanned_and_other_grpc_types_are_unlisted() {
     let plugin = recommended("block");
+    // The JSON codecs carry one JSON document per length-prefixed message.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut framed = vec![0u8];
+        framed.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_be_bytes());
+        framed.extend_from_slice(payload);
+        framed
+    }
     for ct in ["application/grpc+json", "application/grpc-web+json"] {
-        let (_, result, ctx) = post(&plugin, Some(ct), br#"{"name":"widget"}"#).await;
+        let (_, result, ctx) = post(&plugin, Some(ct), &frame(br#"{"name":"widget"}"#)).await;
         assert!(matches!(result, PluginResult::Continue), "{ct}");
         assert_eq!(meta(&ctx, "waf.body_uninspected"), None, "{ct}");
 
-        let (_, result, ctx) = post(&plugin, Some(ct), SQLI_JSON).await;
+        let (_, result, ctx) = post(&plugin, Some(ct), &frame(SQLI_JSON)).await;
         assert!(is_reject(&result), "{ct}");
         assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"), "{ct}");
+
+        // An unframed document under a gRPC type is not an RPC a gRPC server
+        // accepts; under an enforcing body policy it is refused as malformed
+        // framing rather than scanned as one document.
+        let (_, result, ctx) = post(&plugin, Some(ct), br#"{"name":"widget"}"#).await;
+        assert!(is_reject(&result), "{ct}");
+        assert_eq!(
+            meta(&ctx, "waf.body_uninspected"),
+            Some("grpc_malformed_framing"),
+            "{ct}"
+        );
     }
     for ct in [
         "application/grpc",
@@ -585,15 +601,22 @@ async fn delete_bodies_are_scanned_by_default() {
     assert!(is_reject(&result));
     assert_eq!(meta(&ctx, "waf.block_reason"), Some("rule"));
 
-    // An explicit list still replaces the default.
+    // An explicit list still replaces the default for requests that declare
+    // no body up front; a DELETE that declares one is governed anyway.
     let plugin = waf(json!({
         "mode": "enforce",
         "default_rule_action": "enforce",
         "body_methods": ["POST"]
     }))
     .unwrap();
-    let ctx = request("DELETE", "/api/items", Some("application/json"));
-    assert!(!plugin.should_buffer_request_body(&ctx));
+    let bare = request("DELETE", "/api/items", None);
+    assert!(!plugin.should_buffer_request_body(&bare));
+    let mut declared = request("DELETE", "/api/items", Some("application/json"));
+    assert!(plugin.should_buffer_request_body(&declared));
+    let headers = declared.headers.clone();
+    let result = final_body(&plugin, &mut declared, &headers, SQLI_JSON).await;
+    assert!(is_reject(&result));
+    assert_eq!(meta(&declared, "waf.block_reason"), Some("rule"));
 }
 
 // ── Responses: on_unlisted_response_content_type ───────────────────────────

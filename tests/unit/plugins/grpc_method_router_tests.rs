@@ -1,5 +1,6 @@
 use ferrum_edge::plugins::{GRPC_ONLY_PROTOCOLS, Plugin, PluginResult, create_plugin, priority};
 use serde_json::json;
+use std::sync::atomic::Ordering;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
@@ -1236,5 +1237,421 @@ fn method_rate_shape_errors_keep_schema_and_suggestions_without_supplied_content
                 assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
             }
         }
+    }
+}
+
+// ── Rate-limit metric accounting (grpc_method_router-SOL-2) ──
+
+/// An ordinary per-method quota refusal is a rate-limit rejection and must be
+/// counted in `ferrum_rate_limit_exceeded_total`, not only the capacity 429.
+#[tokio::test]
+async fn quota_refusal_increments_rate_limit_exceeded_metric() {
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.MetricSvc/Create": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+    assert_continue(call(plugin.as_ref(), "/pkg.MetricSvc/Create").await);
+
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
+    assert_reject(
+        call(plugin.as_ref(), "/pkg.MetricSvc/Create").await,
+        Some(429),
+    );
+    assert!(
+        registry.rate_limit_exceeded.load(Ordering::Relaxed) > before,
+        "a quota refusal must increment ferrum_rate_limit_exceeded_total"
+    );
+}
+
+async fn call(plugin: &dyn Plugin, path: &str) -> PluginResult {
+    let mut ctx = create_grpc_context(path);
+    let _ = plugin.on_request_received(&mut ctx).await;
+    enforce_effective_path(plugin, &mut ctx).await
+}
+
+// ── Service-level rules and default rate limit (grpc_method_router-MUSE-1) ──
+
+#[tokio::test]
+async fn service_level_deny_blocks_every_method_of_that_service_only() {
+    let config = json!({"deny_methods": ["/admin.AdminService/*"]});
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    assert_reject(
+        call(plugin.as_ref(), "/admin.AdminService/DeleteAll").await,
+        Some(403),
+    );
+    assert_reject(
+        call(plugin.as_ref(), "/admin.AdminService/NewlyShipped").await,
+        Some(403),
+    );
+    // A different service, including one sharing the package prefix, passes.
+    assert_continue(call(plugin.as_ref(), "/admin.AuditService/List").await);
+    assert_continue(call(plugin.as_ref(), "/admin.AdminServiceV2/DeleteAll").await);
+}
+
+#[tokio::test]
+async fn service_level_allow_admits_every_method_of_that_service_only() {
+    let config = json!({"allow_methods": ["pkg.Public/*", "pkg.Other/Exact"]});
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    assert_continue(call(plugin.as_ref(), "/pkg.Public/Any").await);
+    assert_continue(call(plugin.as_ref(), "/pkg.Public/Another").await);
+    assert_continue(call(plugin.as_ref(), "/pkg.Other/Exact").await);
+    assert_reject(
+        call(plugin.as_ref(), "/pkg.Other/NotListed").await,
+        Some(403),
+    );
+    assert_reject(call(plugin.as_ref(), "/pkg.Private/Any").await, Some(403));
+}
+
+#[tokio::test]
+async fn service_level_deny_wins_over_exact_allow() {
+    let config = json!({
+        "allow_methods": ["/pkg.Svc/Health"],
+        "deny_methods": ["/pkg.Svc/*"]
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    assert_reject(call(plugin.as_ref(), "/pkg.Svc/Health").await, Some(403));
+}
+
+#[tokio::test]
+async fn service_level_rate_limit_is_one_budget_across_the_service() {
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.PooledSvc/*": { "max_requests": 2, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    assert_continue(call(plugin.as_ref(), "/pkg.PooledSvc/A").await);
+    assert_continue(call(plugin.as_ref(), "/pkg.PooledSvc/B").await);
+    assert_reject(call(plugin.as_ref(), "/pkg.PooledSvc/C").await, Some(429));
+    // Another service is not covered by the rule.
+    assert_continue(call(plugin.as_ref(), "/pkg.OtherSvc/A").await);
+    // Distinct method names share one key; they cannot mint new counters.
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+#[tokio::test]
+async fn exact_rate_rule_wins_over_service_rule_and_does_not_charge_it() {
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.Svc/Hot": { "max_requests": 1, "window_seconds": 60 },
+            "/pkg.Svc/*": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    assert_continue(call(plugin.as_ref(), "/pkg.Svc/Hot").await);
+    assert_reject(call(plugin.as_ref(), "/pkg.Svc/Hot").await, Some(429));
+    // The exact rule's traffic never consumed the service-level budget.
+    assert_continue(call(plugin.as_ref(), "/pkg.Svc/Other").await);
+    assert_reject(call(plugin.as_ref(), "/pkg.Svc/Another").await, Some(429));
+}
+
+#[tokio::test]
+async fn default_rate_limit_covers_methods_without_a_specific_rule() {
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.Svc/Listed": { "max_requests": 5, "window_seconds": 60 },
+            "/pkg.Grouped/*": { "max_requests": 5, "window_seconds": 60 }
+        },
+        "default_rate_limit": { "max_requests": 1, "window_seconds": 60 }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    assert_continue(call(plugin.as_ref(), "/pkg.Svc/Unlisted").await);
+    // The default budget is pooled per caller across every uncovered method.
+    let refused = call(plugin.as_ref(), "/other.Svc/AlsoUnlisted").await;
+    match refused {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(
+                headers.get("x-grpc-ratelimit-limit").map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                headers.get("x-grpc-ratelimit-method").map(String::as_str),
+                Some("other.Svc/AlsoUnlisted")
+            );
+        }
+        other => panic!("expected 429 from the default rule, got {other:?}"),
+    }
+    // Exact and service-level rules take precedence over the default.
+    assert_continue(call(plugin.as_ref(), "/pkg.Svc/Listed").await);
+    assert_continue(call(plugin.as_ref(), "/pkg.Grouped/Any").await);
+}
+
+#[test]
+fn default_rate_limit_alone_is_a_configured_rule() {
+    let plugin = create_plugin(
+        "grpc_method_router",
+        &json!({"default_rate_limit": {"max_requests": 10, "window_seconds": 60}}),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(plugin.gates_request_admission());
+
+    // `null` is the same as omission, so it is not a rule on its own.
+    let err = create_plugin("grpc_method_router", &json!({"default_rate_limit": null}))
+        .err()
+        .expect("a null default_rate_limit alone configures nothing");
+    assert!(err.contains("no rules configured"), "got: {err}");
+    assert!(
+        create_plugin(
+            "grpc_method_router",
+            &json!({"deny_methods": ["pkg.Svc/X"], "default_rate_limit": null}),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn default_rate_limit_is_a_closed_bounded_spec() {
+    for (config, reason) in [
+        (json!({"default_rate_limit": 10}), "must be an object"),
+        (
+            json!({"default_rate_limit": {"max_requests": 5}}),
+            "`window_seconds` is required",
+        ),
+        (
+            json!({"default_rate_limit": {"window_seconds": 60}}),
+            "`max_requests` is required",
+        ),
+        (
+            json!({"default_rate_limit": {"max_requests": 0, "window_seconds": 60}}),
+            "must be greater than zero",
+        ),
+        (
+            json!({"default_rate_limit": {"max_requests": 5, "window_seconds": 60, "burst": 1}}),
+            "unknown configuration key(s)",
+        ),
+    ] {
+        let err = create_plugin("grpc_method_router", &config)
+            .err()
+            .unwrap_or_else(|| panic!("must be rejected: {config}"));
+        assert!(err.contains("`default_rate_limit`"), "got: {err}");
+        assert!(err.contains(reason), "{reason}: got: {err}");
+    }
+}
+
+#[test]
+fn only_the_literal_service_wildcard_is_admitted() {
+    for pattern in [
+        "pkg.*/*",
+        "*/*",
+        "*/Method",
+        "pkg.Svc/Get*",
+        "pkg.Svc/**",
+        "pkg.Svc*/Method",
+        "/pkg.Svc/*/Extra",
+    ] {
+        for config in [
+            json!({"deny_methods": [pattern]}),
+            json!({"allow_methods": [pattern]}),
+            json!({"method_rate_limits": {pattern: {"max_requests": 1, "window_seconds": 60}}}),
+        ] {
+            let err = create_plugin("grpc_method_router", &config)
+                .err()
+                .unwrap_or_else(|| panic!("pattern must be rejected: {config}"));
+            assert!(err.contains("invalid gRPC method path"), "got: {err}");
+        }
+    }
+}
+
+#[test]
+fn duplicate_service_rules_are_rejected_after_normalization() {
+    let err = create_plugin(
+        "grpc_method_router",
+        &json!({"deny_methods": ["/pkg.Svc/*", " pkg.Svc/* "]}),
+    )
+    .err()
+    .expect("duplicate normalized service rule must be rejected");
+    assert!(err.contains("duplicate method"), "got: {err}");
+
+    let err = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/pkg.Svc/*": {"max_requests": 1, "window_seconds": 60},
+                "pkg.Svc/*": {"max_requests": 2, "window_seconds": 60}
+            }
+        }),
+    )
+    .err()
+    .expect("duplicate normalized service rate rule must be rejected");
+    assert!(
+        err.contains("duplicate `method_rate_limits` entry"),
+        "got: {err}"
+    );
+
+    // An exact rule and a service rule for the same service coexist.
+    assert!(
+        create_plugin(
+            "grpc_method_router",
+            &json!({"deny_methods": ["pkg.Svc/*", "pkg.Svc/Method"]}),
+        )
+        .is_ok()
+    );
+}
+
+// ── Metadata refresh reuse (grpc_method_router-MUSE-3) ──
+
+#[tokio::test]
+async fn unchanged_backend_path_keeps_published_metadata_without_rebuilding_it() {
+    let config = json!({"deny_methods": ["/blocked.Svc/Blocked"]});
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/pkg.Svc/Method");
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    let published: Vec<*const u8> = ["grpc_service", "grpc_method", "grpc_full_method"]
+        .iter()
+        .map(|key| ctx.metadata.get(*key).expect("published").as_ptr())
+        .collect();
+
+    assert_continue(
+        plugin
+            .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Method")
+            .await,
+    );
+    let refreshed: Vec<*const u8> = ["grpc_service", "grpc_method", "grpc_full_method"]
+        .iter()
+        .map(|key| ctx.metadata.get(*key).expect("still published").as_ptr())
+        .collect();
+    assert_eq!(
+        published, refreshed,
+        "an unchanged backend-effective method must not re-materialize metadata"
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_full_method").map(String::as_str),
+        Some("pkg.Svc/Method")
+    );
+}
+
+#[tokio::test]
+async fn backend_refresh_still_overwrites_tampered_metadata_before_enforcement() {
+    let config = json!({"deny_methods": ["/pkg.Svc/Denied"]});
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_context("/pkg.Svc/Denied");
+    assert_continue(plugin.on_request_received(&mut ctx).await);
+    // A later plugin rewrites the published values to spoof another method.
+    ctx.metadata
+        .insert("grpc_service".to_string(), "pkg.Svc".to_string());
+    ctx.metadata
+        .insert("grpc_method".to_string(), "Allowed".to_string());
+    ctx.metadata.insert(
+        "grpc_full_method".to_string(),
+        "pkg.Svc/Allowed".to_string(),
+    );
+
+    let result = plugin
+        .on_backend_path_resolved(&mut ctx, "/pkg.Svc/Denied")
+        .await;
+    assert_reject(result, Some(403));
+    assert_eq!(
+        ctx.metadata.get("grpc_service").map(String::as_str),
+        Some("pkg.Svc")
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_method").map(String::as_str),
+        Some("Denied")
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_full_method").map(String::as_str),
+        Some("pkg.Svc/Denied")
+    );
+}
+
+// ── Documented rejection contract (grpc_method_router-MUSE-4) ──
+
+#[tokio::test]
+async fn documented_rejection_headers_match_the_runtime_contract() {
+    let docs = include_str!("../../../docs/plugins.md");
+    let section_start = docs
+        .find("### `grpc_method_router`")
+        .expect("grpc_method_router docs section");
+    let section_end = docs[section_start..]
+        .find("### `grpc_deadline`")
+        .map(|offset| section_start + offset)
+        .expect("next docs section");
+    let section = &docs[section_start..section_end];
+    for header in [
+        "x-grpc-ratelimit-limit",
+        "x-grpc-ratelimit-remaining",
+        "x-grpc-ratelimit-method",
+        "RESOURCE_EXHAUSTED",
+        "PERMISSION_DENIED",
+        "UNAVAILABLE",
+        "default_rate_limit",
+        "package.Service/*",
+    ] {
+        assert!(section.contains(header), "docs must describe {header}");
+    }
+
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.DocSvc/Create": { "max_requests": 3, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+    for _ in 0..3 {
+        assert_continue(call(plugin.as_ref(), "/pkg.DocSvc/Create").await);
+    }
+    match call(plugin.as_ref(), "/pkg.DocSvc/Create").await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc")
+            );
+            assert_eq!(
+                headers.get("x-grpc-ratelimit-limit").map(String::as_str),
+                Some("3")
+            );
+            assert_eq!(
+                headers
+                    .get("x-grpc-ratelimit-remaining")
+                    .map(String::as_str),
+                Some("0")
+            );
+            assert_eq!(
+                headers.get("x-grpc-ratelimit-method").map(String::as_str),
+                Some("pkg.DocSvc/Create")
+            );
+        }
+        other => panic!("expected 429, got {other:?}"),
     }
 }

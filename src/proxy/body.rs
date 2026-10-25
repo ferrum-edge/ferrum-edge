@@ -2053,6 +2053,17 @@ impl http_body::Body for ProxyBody {
                 } else {
                     crate::retry::classify_body_error(&**e as &dyn std::error::Error)
                 };
+                // A route request deadline cut is the route's own policy, not
+                // a backend fault (see `with_route_request_deadline`): keep the
+                // logged timeout class but settle backend accounting as
+                // neutrally as a client RPC deadline, and hand the typed cut to
+                // termination hooks so plugin-side breakers can do the same.
+                // Read only on this error arm, so the frame hot path pays
+                // nothing for it.
+                let route_policy_cut = this
+                    .route_request_deadline_fired
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire));
                 if let Some(logger) = this.logger.take() {
                     let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                     let grpc_status = if auth_deadline_termination.is_some() {
@@ -2064,19 +2075,11 @@ impl http_body::Body for ProxyBody {
                     logger.fire(
                         crate::proxy::deferred_log::BodyOutcome::error(class, bytes, disconnected)
                             .with_grpc_status(grpc_status)
-                            .with_authorization_termination(auth_deadline_termination),
+                            .with_authorization_termination(auth_deadline_termination)
+                            .with_route_policy_cut(route_policy_cut),
                     );
                 }
-                // A route request deadline cut is the route's own policy, not
-                // a backend fault (see `with_route_request_deadline`): keep the
-                // logged timeout class above but settle backend accounting as
-                // neutrally as a client RPC deadline. Read only on this error
-                // arm, so the frame hot path pays nothing for it.
-                let health_neutral = disconnected
-                    || this
-                        .route_request_deadline_fired
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(Ordering::Acquire));
+                let health_neutral = disconnected || route_policy_cut;
                 this.record_deferred_backend_admission(Some(class), health_neutral);
                 this.record_deferred_backend_dispatch(Some(class), health_neutral);
                 // A body error leaves the backend carrier in an unknown framing

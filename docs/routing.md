@@ -451,7 +451,8 @@ normal relay.
 Passthrough is refused by config validation (Admin API 400, file-mode startup,
 database / CP load) on any proxy that has a plugin requiring the parsed WebSocket
 relay — `waf`, `ws_frame_logging`, `ws_message_size_limiting`, `ws_rate_limiting`,
-or a custom plugin whose `requires_websocket_framing()` returns `true` — whether it
+an `api_chargeback` that prices bandwidth, or a custom plugin whose
+`requires_websocket_framing()` returns `true` — whether it
 is attached directly, through a proxy group, or inherited from a global plugin
 config. As a second guard, the runtime keeps stripping the offer whenever the
 proxy's live plugin chain requires framing. Stream proxies (`tcp`/`tcps`/`udp`/

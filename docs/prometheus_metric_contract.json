@@ -784,6 +784,45 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_ai_federation_provider_circuits_closed_total",
+    "type": "counter",
+    "help": "ai_federation circuit half-open recoveries, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_federation_provider_circuits_open",
+    "type": "gauge",
+    "help": "Current ai_federation circuits in open or half-open recovery state, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_federation_provider_circuits_opened_total",
+    "type": "counter",
+    "help": "ai_federation circuit closed-to-open transitions, by configured provider name.",
+    "labels": [
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
     "name": "ferrum_ai_prompt_tokens_total",
     "type": "counter",
     "help": "Prompt tokens reported by AI providers.",
@@ -4546,6 +4585,19 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_request_body_bytes_total",
+    "type": "counter",
+    "help": "HTTP-family request body bytes relayed from clients to backends.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_request_duration_ms",
     "type": "histogram",
     "help": "Request duration in milliseconds.",
@@ -4695,6 +4747,19 @@
     "export_surface": "/metrics",
     "bundled": "alert_and_dashboard",
     "emission": "always"
+  },
+  {
+    "name": "ferrum_response_body_bytes_total",
+    "type": "counter",
+    "help": "HTTP-family response body bytes relayed from backends to clients.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_service_discovery_body_budget_rejected_total",
@@ -5284,6 +5349,20 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "always"
+  },
+  {
+    "name": "ferrum_unmatched_requests_total",
+    "type": "counter",
+    "help": "Requests refused before routing because no proxy matched or the mesh REGISTRY_ONLY policy refused an outbound route miss, by closed reason and response status.",
+    "labels": [
+      "reason",
+      "status_code",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_upstream_targets",
