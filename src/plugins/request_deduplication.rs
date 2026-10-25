@@ -238,14 +238,18 @@ const FINGERPRINT_LOOKUP_HEADERS: [&str; FINGERPRINT_LOOKUP_HEADER_COUNT] = [
 ];
 /// Signature-context headers a re-signed retry regenerates even though the
 /// operation is unchanged: the HTTP `Date` that `hmac_auth` signs and checks
-/// for freshness, AWS SigV4's `x-amz-date` and `x-amz-content-sha256`, and the
-/// body-digest fields (`digest`, `content-digest`) that `hmac_auth` signs.
+/// for freshness, AWS SigV4's `x-amz-date` and `x-amz-content-sha256`, the
+/// per-attempt AWS SDK headers `amz-sdk-invocation-id` and `amz-sdk-request`,
+/// and the body-digest fields (`digest`, `content-digest`) that `hmac_auth`
+/// signs.
 /// Only under `caller_partition: authenticated_identity` with a verified
 /// principal are these presence-bound in the fingerprint; the request body is
 /// still bound through its own digest, so a digest header adds nothing a
 /// changed body would not already change. Everywhere else they stay
 /// value-bound. Names are lowercase, as the fingerprint header list is.
 const PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS: &[&str] = &[
+    "amz-sdk-invocation-id",
+    "amz-sdk-request",
     "content-digest",
     "date",
     "digest",
@@ -3551,17 +3555,27 @@ fn is_principal_scoped_signature_context_header(name: &str) -> bool {
     PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS.contains(&name)
 }
 
-/// Final header names that still carry a credential after the recorded
-/// `request_transformer` header renames, applied in order so chained renames
+/// Final header names that hold a credential after the recorded
+/// `request_transformer` header renames, replayed in order so chained renames
 /// (`authorization` -> `x-a` -> `x-b`) stay classified. Only the built-in and
 /// configured credential locations seed the walk, so an ordinary header never
 /// becomes presence-bound unless a credential was renamed onto it.
+///
+/// The set tracks the CURRENT holder of each credential, not every name it
+/// passed through: a rename moves the value out of its source (the source
+/// leaves the set) and overwrites its destination, so a destination that
+/// receives an ordinary header is dropped again. Otherwise a chain that parks
+/// a credential on an intermediate name and later renames business data onto
+/// that name would stop the fingerprint from seeing the business value.
 fn principal_renamed_credential_headers(ctx: &RequestContext) -> Vec<&str> {
     let mut renamed: Vec<&str> = Vec::new();
     for (source, destination) in ctx.request_header_rename_lineage() {
         let carries_credential =
             replay_partition::is_request_credential_context_header(ctx, source)
                 || renamed.iter().any(|name| name.eq_ignore_ascii_case(source));
+        renamed.retain(|name| {
+            !name.eq_ignore_ascii_case(source) && !name.eq_ignore_ascii_case(destination)
+        });
         if carries_credential {
             renamed.push(destination.as_str());
         }
@@ -3569,10 +3583,14 @@ fn principal_renamed_credential_headers(ctx: &RequestContext) -> Vec<&str> {
     renamed
 }
 
-/// Decoded query parameter names that carry a credential in the final query:
-/// the gateway-captured inventory of present credential locations plus every
-/// name a recorded `request_transformer` query rename moved one of them to,
-/// applied in order so chained renames stay classified.
+/// Decoded query parameter names that hold a credential in the final query:
+/// the gateway-captured inventory of present credential locations, moved
+/// through every recorded `request_transformer` query rename in order so
+/// chained renames stay classified. As for headers, a rename moves the
+/// credential out of its source and an ordinary parameter renamed onto a
+/// tracked name drops that name, so the set describes the final query rather
+/// than the credential's history. Dropping a name can only make its value
+/// bound again (a conflict), never relax an ordinary parameter.
 fn principal_query_credential_names(ctx: &RequestContext) -> Vec<&str> {
     let mut names: Vec<&str> = ctx
         .query_credential_partition_digests()
@@ -3583,7 +3601,9 @@ fn principal_query_credential_names(ctx: &RequestContext) -> Vec<&str> {
         return names;
     }
     for (source, destination) in ctx.request_query_rename_lineage() {
-        if names.contains(&source.as_str()) {
+        let carries_credential = names.contains(&source.as_str());
+        names.retain(|name| *name != source.as_str() && *name != destination.as_str());
+        if carries_credential {
             names.push(destination.as_str());
         }
     }

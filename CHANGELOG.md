@@ -165,10 +165,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     identity committed with its realm), the key binds that principal instead
     of credential digests and the peer address. The fingerprint binds only the
     presence, not the value, of credential headers, gateway-captured
-    credential query parameters, and the signature-context headers `date`,
-    `x-amz-date`, `x-amz-content-sha256`, `digest` and `content-digest`. A
-    retry after a token refresh, an `hmac_auth`/SigV4 re-signature, or an
-    address change then replays. The default `credential` partition is
+    credential query parameters, and exactly these signature-context headers:
+    `date`, `x-amz-date`, `x-amz-content-sha256`, `amz-sdk-invocation-id`,
+    `amz-sdk-request`, `digest` and `content-digest`. A retry after a token
+    refresh, an address change, or a re-signature that changes only those
+    fields then replays; a retry that changes any other header still returns
+    `409`. The default `credential` partition is
     unchanged.
   - Case-variant spellings of the idempotency header with different values,
     or of the authority/framing/coding headers the fingerprint reads, are

@@ -7578,6 +7578,64 @@ async fn authenticated_identity_partition_follows_credential_renames() {
     ));
 }
 
+/// PR6818-SOL-4: the credential classification follows the CURRENT holder.
+/// A chain that parks the credential on an intermediate name, moves it on, and
+/// then renames business data onto that intermediate name must leave the
+/// business value bound: changing it conflicts, while a refreshed credential of
+/// the same principal still replays.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_rebinds_names_reused_after_a_credential_rename() {
+    let _policy = pinned_policy_guard();
+    let dedup = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-stage"},
+            {"operation": "rename", "target": "header", "key": "x-stage", "new_key": "x-backend-token"},
+            {"operation": "rename", "target": "header", "key": "x-business", "new_key": "x-stage"}
+        ]
+    }))
+    .expect("chained rename request_transformer config");
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let dedup_ref = &dedup;
+    let transformer_ref = &transformer;
+    let alice_ref = &alice;
+    let run = move |token: &'static str, business: &'static str| async move {
+        let mut ctx = principal_ctx("127.0.0.1", "chained-rename-order", Some(alice_ref), token);
+        ctx.headers
+            .insert("x-business".to_string(), business.to_string());
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            transformer_ref.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(headers.get("x-stage").map(String::as_str), Some(business));
+        assert!(headers.contains_key("x-backend-token"));
+        let result = dedup_ref.before_proxy(&mut ctx, &mut headers).await;
+        (result, ctx)
+    };
+
+    let (first, mut first_ctx) = run("token-a", "selector-a").await;
+    assert!(matches!(first, PluginResult::Continue));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), b"chained-created")
+            .await,
+        PluginResult::Continue
+    ));
+
+    match run("token-b", "selector-a").await.0 {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"chained-created"),
+        other => panic!("a refreshed credential on its final name must replay: {other:?}"),
+    }
+
+    assert_fingerprint_conflict(run("token-b", "selector-b").await.0);
+}
+
 /// PR6818-MUSE-2: a re-signed retry (fresh `Authorization` signature, `Date`,
 /// `x-amz-date`, and `x-amz-content-sha256`) of the same verified principal
 /// replays under the opt-in, while any other changed header still conflicts.
@@ -7596,6 +7654,8 @@ async fn authenticated_identity_partition_presence_binds_signature_context_heade
             ("date", date),
             ("x-amz-date", date),
             ("x-amz-content-sha256", signature),
+            ("amz-sdk-invocation-id", signature),
+            ("amz-sdk-request", date),
             ("x-tenant", tenant),
         ] {
             ctx.headers.insert(name.to_string(), value.to_string());

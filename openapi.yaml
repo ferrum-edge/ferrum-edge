@@ -39939,10 +39939,12 @@ components:
             headers, of credential query parameters an authentication plugin
             captured from its configured query location, and of the
             signature-context headers `date`, `x-amz-date`,
-            `x-amz-content-sha256`, `digest`, and `content-digest` that an
-            hmac_auth or SigV4 re-signature regenerates. A credential header or
-            query parameter renamed by an earlier request_transformer keeps
-            that classification under its new name; every other header and
+            `x-amz-content-sha256`, `amz-sdk-invocation-id`, `amz-sdk-request`,
+            `digest`, and `content-digest` (exactly this list) that an
+            hmac_auth or SigV4 re-signature or an AWS SDK retry attempt
+            regenerates. A credential header or query parameter renamed by an
+            earlier request_transformer keeps that classification under its
+            current name; every other header and
             query pair stays value-bound. Two credentials of one principal with different scopes
             then share an operation, so scope-level distinction rests on the
             authorization plugins that ran before deduplication. Requests
