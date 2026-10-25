@@ -96,9 +96,9 @@ const MAX_LABEL_LEN: usize = MAX_FIELD_LEN;
 const MAX_CHARGE_EVENT_BYTES: usize = 224 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
 /// Smallest admitted `spool.max_bytes` when spooling is enabled.
 ///
-/// A quota below one encoded spool artifact refuses every spool write, which
-/// in snapshot mode means finalization can never succeed. One MiB comfortably
-/// holds a bounded failed batch of field-bounded charge events.
+/// A policy floor, not a proof that every artifact fits: a quota much smaller
+/// than this refuses ordinary failed batches and snapshot chunks so often that
+/// spooling (and, in snapshot mode, finalization) cannot be relied on.
 const MIN_SPOOL_MAX_BYTES: u64 = 1024 * 1024;
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
@@ -4721,19 +4721,28 @@ struct ClickHouseException {
     code: Option<u32>,
 }
 
-/// ClickHouse error codes that describe a transient server condition rather
-/// than a defect in the inserted rows. ClickHouse can report these after it
-/// has already committed HTTP 200, so they must stay retryable instead of
-/// dead-lettering otherwise valid billing rows once the server recovers:
-/// `UNEXPECTED_END_OF_FILE` (3), `TIMEOUT_EXCEEDED` (159),
-/// `TOO_MANY_SIMULTANEOUS_QUERIES` (202), `SOCKET_TIMEOUT` (209),
-/// `NETWORK_ERROR` (210), `MEMORY_LIMIT_EXCEEDED` (241),
-/// `TABLE_IS_READ_ONLY` (242), `TOO_MANY_PARTS` (252),
-/// `UNKNOWN_STATUS_OF_INSERT` (319), `QUERY_WAS_CANCELLED` (394),
-/// `SYSTEM_ERROR` (425), and `KEEPER_EXCEPTION` (999). Every other code, and
+/// ClickHouse error codes that describe a transient server or availability
+/// condition rather than a defect in the inserted rows. ClickHouse can report
+/// these after it has already committed HTTP 200, so they must stay retryable
+/// instead of dead-lettering otherwise valid billing rows once the server
+/// recovers.
+///
+/// The set is ClickHouse's own client retry classification
+/// (`clickhouse-java` client-v2 `ServerException::discoverIsRetryable`):
+/// `UNEXPECTED_END_OF_FILE` (3), `FILE_DOESNT_EXIST` (107), `READONLY` (164),
+/// `TOO_MANY_SIMULTANEOUS_QUERIES` (202), `NO_FREE_CONNECTION` (203),
+/// `SOCKET_TIMEOUT` (209), `NETWORK_ERROR` (210), `MEMORY_LIMIT_EXCEEDED`
+/// (241), `TABLE_IS_READ_ONLY` (242), `TOO_MANY_PARTS` (252),
+/// `TOO_FEW_LIVE_REPLICAS` (285), `UNKNOWN_STATUS_OF_INSERT` (319),
+/// `SYSTEM_ERROR` (425), and `KEEPER_EXCEPTION` (999) — plus four more
+/// transient execution/transport conditions: `ATTEMPT_TO_READ_AFTER_EOF` (32,
+/// a truncated request body), `TIMEOUT_EXCEEDED` (159),
+/// `QUERY_WAS_CANCELLED` (394, server-side cancellation such as shutdown), and
+/// `CANNOT_SCHEDULE_TASK` (439, thread-pool exhaustion). Every other code, and
 /// an exception whose code cannot be read, stays permanent.
-const CLICKHOUSE_TRANSIENT_EXCEPTION_CODES: &[u32] =
-    &[3, 159, 202, 209, 210, 241, 242, 252, 319, 394, 425, 999];
+const CLICKHOUSE_TRANSIENT_EXCEPTION_CODES: &[u32] = &[
+    3, 32, 107, 159, 164, 202, 203, 209, 210, 241, 242, 252, 285, 319, 394, 425, 439, 999,
+];
 
 /// Longest decimal ClickHouse error code accepted. Real codes have at most four
 /// digits; the bound keeps parsing fixed-cost on hostile acknowledgement bytes.
@@ -5504,8 +5513,8 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: `clickhouse.url` must not contain user-info; use `clickhouse.username`/`clickhouse.password_ref`"
         ));
     }
-    validate_clickhouse_identifier(&config.clickhouse.database, "database")?;
-    validate_clickhouse_identifier(&config.clickhouse.table, "table")?;
+    validate_clickhouse_identifier(&config.clickhouse.database, "database", 1)?;
+    validate_clickhouse_identifier(&config.clickhouse.table, "table", 2)?;
     if config.clickhouse.timeout_ms == 0 || config.clickhouse.timeout_ms > MAX_CLICKHOUSE_TIMEOUT_MS
     {
         return Err(format!(
@@ -5572,7 +5581,7 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
     if config.spool.enabled {
         if config.spool.max_bytes < MIN_SPOOL_MAX_BYTES {
             return Err(format!(
-                "{PLUGIN_NAME}: `spool.max_bytes` must be at least {MIN_SPOOL_MAX_BYTES} bytes so at least one encoded spool artifact can be admitted"
+                "{PLUGIN_NAME}: `spool.max_bytes` must be at least {MIN_SPOOL_MAX_BYTES} bytes (policy floor for a usable durable spool)"
             ));
         }
         if config.spool.replay_interval_secs == 0 {
@@ -5758,7 +5767,15 @@ fn parse_clickhouse_url(raw: &str) -> Result<Url, String> {
 /// so restrict them to a safe identifier charset (ASCII letters, digits,
 /// underscore, and a `.` db-qualifier) to keep operator config from injecting
 /// SQL into the export query.
-fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String> {
+///
+/// `max_parts` bounds the dot-separated qualification: `database` is a single
+/// identifier (1) and `table` is `table` or `database.table` (2), the only
+/// unquoted INSERT target shapes ClickHouse accepts.
+fn validate_clickhouse_identifier(
+    value: &str,
+    field: &str,
+    max_parts: usize,
+) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!(
             "{PLUGIN_NAME}: `clickhouse.{field}` must not be empty"
@@ -5783,6 +5800,17 @@ fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String
         return Err(format!(
             "{PLUGIN_NAME}: `clickhouse.{field}` must be a ClickHouse identifier: each dot-separated part must be nonempty and must not start with a digit"
         ));
+    }
+    if value.split('.').count() > max_parts {
+        return Err(if max_parts == 1 {
+            format!(
+                "{PLUGIN_NAME}: `clickhouse.{field}` must be a single ClickHouse identifier without dots"
+            )
+        } else {
+            format!(
+                "{PLUGIN_NAME}: `clickhouse.{field}` must be `table` or `database.table` (at most one dot)"
+            )
+        });
     }
     Ok(())
 }

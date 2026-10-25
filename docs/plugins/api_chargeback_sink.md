@@ -28,12 +28,15 @@ ClickHouse error code (from `X-ClickHouse-Exception-Code`, or from the
 `Code: <n>.` marker in the body when the header code is absent or unreadable).
 Known transient server conditions stay **retryable**, so the spool keeps the
 rows and replays them with unchanged event IDs after ClickHouse recovers:
-`UNEXPECTED_END_OF_FILE` (3), `TIMEOUT_EXCEEDED` (159),
-`TOO_MANY_SIMULTANEOUS_QUERIES` (202), `SOCKET_TIMEOUT` (209), `NETWORK_ERROR`
-(210), `MEMORY_LIMIT_EXCEEDED` (241), `TABLE_IS_READ_ONLY` (242),
-`TOO_MANY_PARTS` (252), `UNKNOWN_STATUS_OF_INSERT` (319),
-`QUERY_WAS_CANCELLED` (394), `SYSTEM_ERROR` (425), and `KEEPER_EXCEPTION`
-(999). Every other code — and an exception whose code cannot be read — is
+the codes ClickHouse's own client treats as retryable (`clickhouse-java`
+`ServerException`) — `UNEXPECTED_END_OF_FILE` (3), `FILE_DOESNT_EXIST` (107),
+`READONLY` (164), `TOO_MANY_SIMULTANEOUS_QUERIES` (202), `NO_FREE_CONNECTION`
+(203), `SOCKET_TIMEOUT` (209), `NETWORK_ERROR` (210), `MEMORY_LIMIT_EXCEEDED`
+(241), `TABLE_IS_READ_ONLY` (242), `TOO_MANY_PARTS` (252),
+`TOO_FEW_LIVE_REPLICAS` (285), `UNKNOWN_STATUS_OF_INSERT` (319),
+`SYSTEM_ERROR` (425), and `KEEPER_EXCEPTION` (999) — plus
+`ATTEMPT_TO_READ_AFTER_EOF` (32), `TIMEOUT_EXCEEDED` (159),
+`QUERY_WAS_CANCELLED` (394), and `CANNOT_SCHEDULE_TASK` (439). Every other code — and an exception whose code cannot be read — is
 **permanent** and isolated into dead-letter rows. Only the numeric code ever
 reaches diagnostics; the exception text is never logged or stored.
 
@@ -380,9 +383,9 @@ Admin, file-mode, and CP-DP admission share the OpenAPI
 `ApiChargebackSinkConfig` contract. It requires `config`, `clickhouse.url`, at
 least one valid pricing dimension, `spool.enabled` not disabled under snapshot
 mode, compatible `password_ref`/TLS settings, a non-blank `clickhouse.username`
-whenever `password_ref` is nonempty, `clickhouse.database`/`clickhouse.table`
-identifiers whose dot-separated parts are nonempty and do not start with a
-digit, no reserved `database`/`query` names in `insert_query_params`, an enabled
+whenever `password_ref` is nonempty, a single-identifier `clickhouse.database`
+and a `clickhouse.table` of `table` or `database.table` (at most one dot), each
+part not starting with a digit, no reserved `database`/`query` names in `insert_query_params`, an enabled
 spool's `spool.max_bytes` of at least 1048576, `clickhouse.tls.client_cert_file`
 and `client_key_file` set together, and every numeric/length bound the
 constructor also enforces.
@@ -1075,9 +1078,10 @@ probe is persistent operational evidence: status reports `spool.available=false`
 
 `spool.max_bytes` is a hard ceiling on **encoded** on-disk bytes owned by this
 sink under its managed namespace (after compression when `compression` is
-`zstd`). While spooling is enabled it must be at least **1048576** bytes: a
-smaller quota cannot admit even one encoded artifact, so every spool write —
-and, in snapshot mode, every finalization — would fail. The budget and status/metrics count every retained file class:
+`zstd`). While spooling is enabled it must be at least **1048576** bytes. This
+is a policy floor, not a proof that every artifact fits: a smaller quota would
+refuse ordinary failed batches and snapshot chunks so often that neither
+spooling nor snapshot finalization could be relied on. The budget and status/metrics count every retained file class:
 
 - active data files (`*.ndjson` / `*.ndjson.zst`)
 - in-progress atomic-write temps (`*.write-<process_tag>-<generation>.tmp` and

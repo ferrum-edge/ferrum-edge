@@ -2353,14 +2353,15 @@ needs explicit `clickhouse.allow_lossy_async_insert=true`, and omitted
 `wait_for_async_insert` pins `wait_for_async_insert=1` on every durable
 request so ClickHouse user/profile defaults cannot enable fire-and-forget async
 inserts. A ClickHouse exception reported under HTTP 200/204 is classified by its
-numeric code: known transient server conditions (for example 159
-`TIMEOUT_EXCEEDED`, 241 `MEMORY_LIMIT_EXCEEDED`, 252 `TOO_MANY_PARTS`) stay
+numeric code: known transient server and availability conditions (for example
+159 `TIMEOUT_EXCEEDED`, 203 `NO_FREE_CONNECTION`, 241 `MEMORY_LIMIT_EXCEEDED`,
+252 `TOO_MANY_PARTS`, 285 `TOO_FEW_LIVE_REPLICAS`) stay
 retryable in the spool, and every other exception is dead-lettered as a
 permanent row defect. A nonempty `clickhouse.password_ref` requires a non-blank
 `clickhouse.username`; `insert_query_params` may not name the reserved
-`database` / `query` parameters; `clickhouse.database` / `clickhouse.table` must
-be identifiers whose dot-separated parts are nonempty and do not start with a
-digit; and an enabled spool's `spool.max_bytes` is at least 1048576. It
+`database` / `query` parameters; `clickhouse.database` must be a single
+identifier and `clickhouse.table` must be `table` or `database.table`, each
+part not starting with a digit; and an enabled spool's `spool.max_bytes` is at least 1048576. It
 supports per-event mode for transaction-level provenance, snapshot mode for
 lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
 ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generation

@@ -38629,8 +38629,8 @@ components:
         certificate/hostname verification, and requires a non-blank
         `clickhouse.username` (the password is sent as that user's HTTP Basic
         password); `clickhouse.url` must be http(s) without user-info;
-        `clickhouse.database` / `clickhouse.table` are dot-separated
-        identifiers whose parts are nonempty and do not start with a digit;
+        `clickhouse.database` is a single identifier and `clickhouse.table` is
+        `table` or `database.table`, each part not starting with a digit;
         `insert_query_params` may not name the reserved `database` / `query`
         parameters; an enabled spool's `max_bytes` is at least 1048576;
         `clickhouse.tls.client_cert_file` and
@@ -38941,15 +38941,15 @@ components:
             database:
               type: string
               minLength: 1
-              pattern: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$'
+              pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
               default: ferrum
-              description: ClickHouse database identifier sent as the INSERT `database` parameter. ASCII letters, digits, underscore, and dot only; every dot-separated part must be nonempty and must not start with a digit.
+              description: ClickHouse database identifier sent as the INSERT `database` parameter. A single identifier of ASCII letters, digits, and underscore that does not start with a digit; dots are rejected.
             table:
               type: string
               minLength: 1
-              pattern: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$'
+              pattern: '^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$'
               default: charges_raw
-              description: ClickHouse table identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only; every dot-separated part must be nonempty and must not start with a digit, so names such as `123charges`, `.`, `ferrum.`, or `a..b` that ClickHouse cannot parse unquoted are rejected at admission.
+              description: ClickHouse table identifier interpolated into INSERT, as `table` or `database.table` (at most one dot). Each part uses ASCII letters, digits, and underscore and must not start with a digit, so names such as `123charges`, `.`, `ferrum.`, `a..b`, or `a.b.c` that ClickHouse cannot parse as an unquoted INSERT target are rejected at admission.
             username:
               type: [string, "null"]
               minLength: 1
@@ -39166,9 +39166,10 @@ components:
                 its managed namespace
                 (<spool.dir>/<safe_node>/<safe_plugin>/o<owner_digest>/) after
                 compression. While spooling is enabled it must be at least
-                1048576 bytes; a smaller quota cannot admit even one encoded
-                spool artifact, so every spool write (and every snapshot
-                finalization) would fail. The owner digest binds the plugin config id, Ferrum
+                1048576 bytes. This is a policy floor: a quota that small or
+                smaller refuses ordinary failed batches and snapshot chunks so
+                often that spooling (and snapshot finalization) cannot be relied
+                on, even though an individual small artifact may fit. The owner digest binds the plugin config id, Ferrum
                 namespace/ledger, sanitized ClickHouse endpoint, database, table, and
                 node id; it contains no credentials. Counts active spool files
                 (*.ndjson / *.ndjson.zst), atomic-write temps

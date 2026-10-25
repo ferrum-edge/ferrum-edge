@@ -145,14 +145,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the replacement generation delivers the unchanged rows instead of
   stranding an inert `.inflight` claim. ClickHouse exceptions reported under
   HTTP 200/204 are classified by their numeric code: known transient codes
-  (3, 159, 202, 209, 210, 241, 242, 252, 319, 394, 425, 999) stay retryable
+  (3, 32, 107, 159, 164, 202, 203, 209, 210, 241, 242, 252, 285, 319, 394,
+  425, 439, 999 — ClickHouse's own client retry set plus four transient
+  execution/transport codes) stay retryable
   in the spool instead of being dead-lettered; other codes stay permanent.
   Admission (constructor and OpenAPI) now rejects a nonempty
   `clickhouse.password_ref` without a non-blank `clickhouse.username` (the
   password was silently never sent), a blank `username`, the reserved
-  `insert_query_params` names `database` / `query`, `clickhouse.database` /
-  `clickhouse.table` values that are not dot-separated identifiers (parts
-  nonempty, not starting with a digit), and an enabled `spool.max_bytes`
+  `insert_query_params` names `database` / `query`, a `clickhouse.database`
+  that is not a single identifier, a `clickhouse.table` that is not `table` or
+  `database.table` (parts not starting with a digit), and an enabled `spool.max_bytes`
   below 1048576. Snapshot identities are now charged for every retained copy
   (map key, entry metadata, last-emitted baseline key), so
   `snapshot.max_retained_bytes` and the process ceiling admit fewer, honestly

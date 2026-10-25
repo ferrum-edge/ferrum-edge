@@ -14722,6 +14722,22 @@ async fn openapi_component_matches_constructor_defaults_and_field_bounds() {
             }),
         ),
         (
+            "table with two qualifier dots",
+            json!({
+                "clickhouse": {"url": url, "table": "a.b.c"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
+            "dotted database",
+            json!({
+                "clickhouse": {"url": url, "database": "ferrum.charges"},
+                "spool": {"enabled": false},
+                "pricing_tiers": tiers()
+            }),
+        ),
+        (
             "database with a trailing dot",
             json!({
                 "clickhouse": {"url": url, "database": "ferrum."},
@@ -14840,7 +14856,8 @@ fn clickhouse_success_status_exceptions_are_classified_by_code() {
     use ferrum_edge::plugins::api_chargeback_sink::classify_clickhouse_acknowledgement_with_header_for_tests as classify;
 
     for transient in [
-        "3", "159", "202", "209", "210", "241", "242", "252", "319", "394", "425", "999",
+        "3", "32", "107", "159", "164", "202", "203", "209", "210", "241", "242", "252", "285",
+        "319", "394", "425", "439", "999",
     ] {
         let body = format!("Code: {transient}. DB::Exception: transient server condition");
         assert_eq!(
@@ -14907,7 +14924,11 @@ fn clickhouse_success_status_exceptions_are_classified_by_code() {
     assert_eq!(classify(200, Some(b""), None), "delivered");
 }
 
-async fn mount_transient_exception_then_success(server: &MockServer, via_header: bool) {
+async fn mount_transient_exception_then_success(
+    server: &MockServer,
+    via_header: bool,
+    code: &'static str,
+) {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_mock = Arc::clone(&calls);
     Mock::given(method("POST"))
@@ -14916,11 +14937,11 @@ async fn mount_transient_exception_then_success(server: &MockServer, via_header:
                 return ResponseTemplate::new(200);
             }
             if via_header {
-                ResponseTemplate::new(200).insert_header("X-ClickHouse-Exception-Code", "159")
+                ResponseTemplate::new(200).insert_header("X-ClickHouse-Exception-Code", code)
             } else {
-                ResponseTemplate::new(200).set_body_string(
-                    "Code: 241. DB::Exception: Memory limit (total) exceeded. password=super-secret",
-                )
+                ResponseTemplate::new(200).set_body_string(format!(
+                    "Code: {code}. DB::Exception: Memory limit (total) exceeded. password=super-secret"
+                ))
             }
         })
         .mount(server)
@@ -14932,13 +14953,23 @@ async fn mount_transient_exception_then_success(server: &MockServer, via_header:
 /// event once the server recovers.
 #[tokio::test]
 async fn replay_retries_transient_http_200_exceptions_instead_of_dead_lettering() {
-    for via_header in [false, true] {
+    // 241/159 are resource/time limits; 203 (NO_FREE_CONNECTION) and 285
+    // (TOO_FEW_LIVE_REPLICAS) are availability failures that recover with the
+    // cluster. Each is exercised through both the body and header carriers.
+    for (via_header, code) in [
+        (false, "241"),
+        (true, "159"),
+        (false, "203"),
+        (true, "203"),
+        (false, "285"),
+        (true, "285"),
+    ] {
         let server = MockServer::start().await;
-        mount_transient_exception_then_success(&server, via_header).await;
+        mount_transient_exception_then_success(&server, via_header, code).await;
 
         let temp = tempfile::tempdir().unwrap();
         let spool = test_spool(&temp);
-        let event_id = format!("evt-transient-{via_header}");
+        let event_id = format!("evt-transient-{via_header}-{code}");
         let path = spool.write_events(&[sample_event(&event_id)]).unwrap();
 
         let err = replay_spool_once_for_tests(&spool, &server.uri())
@@ -15070,12 +15101,28 @@ async fn insert_query_params_reject_reserved_database_and_query_names() {
 }
 
 /// The identifier charset admitted names ClickHouse cannot parse unquoted, so
-/// every INSERT was a syntax error and every row was dead-lettered.
+/// every INSERT was a syntax error and every row was dead-lettered. `table` is
+/// `table` or `database.table`; `database` is a single identifier.
 #[tokio::test]
-async fn clickhouse_identifiers_must_be_parseable_dot_separated_names() {
+async fn clickhouse_identifiers_must_be_parseable_insert_targets() {
     use ferrum_edge::plugins::validate_plugin_config;
 
     let temp = tempfile::tempdir().unwrap();
+    let rejected = |field: &str, value: &str| {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"][field] = json!(value);
+        validate_plugin_config("api_chargeback_sink", &config)
+            .err()
+            .unwrap_or_else(|| panic!("`clickhouse.{field}` = {value:?} must be rejected"))
+    };
+    let admitted = |field: &str, value: &str| {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"][field] = json!(value);
+        validate_plugin_config("api_chargeback_sink", &config).unwrap_or_else(|error| {
+            panic!("`clickhouse.{field}` = {value:?} must be admitted: {error}")
+        });
+    };
+
     for field in ["table", "database"] {
         for bad in [
             "123charges",
@@ -15085,11 +15132,7 @@ async fn clickhouse_identifiers_must_be_parseable_dot_separated_names() {
             "a..b",
             "ferrum.9raw",
         ] {
-            let mut config = valid_config(temp.path());
-            config["clickhouse"][field] = json!(bad);
-            let error = validate_plugin_config("api_chargeback_sink", &config)
-                .err()
-                .unwrap_or_else(|| panic!("`clickhouse.{field}` = {bad:?} must be rejected"));
+            let error = rejected(field, bad);
             assert!(
                 error.contains(&format!(
                     "`clickhouse.{field}` must be a ClickHouse identifier"
@@ -15097,19 +15140,32 @@ async fn clickhouse_identifiers_must_be_parseable_dot_separated_names() {
                 "unexpected error for {field} = {bad:?}: {error}"
             );
         }
-        for good in ["charges_raw", "ferrum.charges_raw", "_t1", "T_2.c3"] {
-            let mut config = valid_config(temp.path());
-            config["clickhouse"][field] = json!(good);
-            validate_plugin_config("api_chargeback_sink", &config).unwrap_or_else(|error| {
-                panic!("`clickhouse.{field}` = {good:?} must be admitted: {error}")
-            });
+        for good in ["charges_raw", "_t1", "T_2"] {
+            admitted(field, good);
         }
+    }
+    for over_qualified in ["a.b.c", "ferrum.billing.charges_raw"] {
+        let error = rejected("table", over_qualified);
+        assert!(
+            error.contains("must be `table` or `database.table` (at most one dot)"),
+            "unexpected error for table = {over_qualified:?}: {error}"
+        );
+    }
+    for good in ["ferrum.charges_raw", "_db.T_2"] {
+        admitted("table", good);
+    }
+    for dotted in ["ferrum.charges", "a.b"] {
+        let error = rejected("database", dotted);
+        assert!(
+            error.contains("`clickhouse.database` must be a single ClickHouse identifier"),
+            "unexpected error for database = {dotted:?}: {error}"
+        );
     }
 }
 
-/// A spool quota below one encoded artifact refuses every spool write (and in
-/// snapshot mode every finalization), so it is rejected at admission while
-/// spooling is enabled.
+/// `spool.max_bytes` has a 1 MiB policy floor while spooling is enabled: a
+/// much smaller quota refuses ordinary failed batches and snapshot chunks too
+/// often for the durable spool to be relied on.
 #[tokio::test]
 async fn enabled_spool_max_bytes_has_a_viable_artifact_floor() {
     use ferrum_edge::plugins::validate_plugin_config;
