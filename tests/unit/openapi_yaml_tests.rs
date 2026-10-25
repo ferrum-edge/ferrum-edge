@@ -11161,8 +11161,35 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
             "cache_invalidation_min_age_ms",
             "mesh_series_budget_per_family",
             "render_cache_ttl_seconds",
+            "request_duration_buckets_ms",
+            "session_duration_buckets_ms",
             "stale_entry_ttl_seconds",
         ])
+    );
+    for field in ["request_duration_buckets_ms", "session_duration_buckets_ms"] {
+        assert_eq!(schema["properties"][field]["type"], json!("array"));
+        assert_eq!(schema["properties"][field]["minItems"], json!(1));
+        assert_eq!(schema["properties"][field]["maxItems"], json!(64));
+        assert_eq!(
+            schema["properties"][field]["items"]["exclusiveMinimum"],
+            json!(0)
+        );
+    }
+    let schema_default = |field: &str| -> Vec<f64> {
+        schema["properties"][field]["default"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} default is an array"))
+            .iter()
+            .map(|bound| bound.as_f64().expect("numeric bucket bound"))
+            .collect()
+    };
+    assert_eq!(
+        schema_default("request_duration_buckets_ms"),
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_REQUEST_DURATION_BUCKETS_MS.to_vec()
+    );
+    assert_eq!(
+        schema_default("session_duration_buckets_ms"),
+        ferrum_edge::plugins::prometheus_metrics::DEFAULT_SESSION_DURATION_BUCKETS_MS.to_vec()
     );
     assert!(
         !schema_fields.contains("schema") && !schema_fields.contains("schema_ref"),
@@ -11197,6 +11224,8 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
         json!({"cache_invalidation_min_age_ms": u64::MAX}),
         json!({"mesh_series_budget_per_family": 1}),
         json!({"mesh_series_budget_per_family": 1_000_000}),
+        json!({"request_duration_buckets_ms": [0.5, 100, 300000]}),
+        json!({"session_duration_buckets_ms": [1000, 3600000]}),
     ] {
         assert_component_validity(&spec, "PrometheusMetricsConfig", &config, true);
         PrometheusMetrics::new(&config, "ferrum")
@@ -11212,6 +11241,11 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
         json!({"cache_invalidation_min_age_ms": -1}),
         json!({"mesh_series_budget_per_family": 0}),
         json!({"mesh_series_budget_per_family": 1_000_001}),
+        json!({"request_duration_buckets_ms": []}),
+        json!({"request_duration_buckets_ms": [0]}),
+        json!({"request_duration_buckets_ms": "100"}),
+        json!({"session_duration_buckets_ms": [-1]}),
+        json!({"session_duration_buckets_ms": ["60000"]}),
     ] {
         assert_component_validity(&spec, "PrometheusMetricsConfig", &config, false);
         assert!(
@@ -11228,6 +11262,19 @@ fn prometheus_metrics_config_is_closed_and_bounds_unsigned_timing_fields() {
         .expect("object")
         .insert("render_cache_ttl_seconds".to_string(), over);
     assert_component_validity(&spec, "PrometheusMetricsConfig", &over_range, false);
+
+    // Strict ordering is not expressible in JSON Schema; the constructor is
+    // the authoritative gate for it.
+    for config in [
+        json!({"request_duration_buckets_ms": [100, 100]}),
+        json!({"session_duration_buckets_ms": [1000, 10]}),
+    ] {
+        assert_component_validity(&spec, "PrometheusMetricsConfig", &config, true);
+        assert!(
+            PrometheusMetrics::new(&config, "ferrum").is_err(),
+            "constructor must reject non-increasing bucket bounds {config}"
+        );
+    }
 }
 
 #[test]
