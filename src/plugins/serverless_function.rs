@@ -19,8 +19,17 @@
 //! ## Providers
 //!
 //! - **AWS Lambda**: Uses the Lambda Invoke API with SigV4 request signing.
-//!   Requires `aws_region`, `aws_access_key_id`, `aws_secret_access_key`,
-//!   and `aws_function_name`.
+//!   Requires `aws_region`, `aws_function_name`, and either a literal key pair
+//!   (`aws_access_key_id` / `aws_secret_access_key`, from config or the
+//!   environment) or `aws_credentials: default_chain`, which resolves and
+//!   refreshes the process / workload identity (IRSA, ECS task role, EC2
+//!   instance profile) through the AWS SDK default chain in builds with the
+//!   `secrets-aws` feature. Invoke API failures (any non-2xx status) are
+//!   invocation failures, never function output. `payload_format:
+//!   aws_api_gateway_v2` (terminate mode only) sends an API Gateway HTTP API
+//!   (payload format 2.0) proxy event and maps the proxy-integration response
+//!   (`statusCode`, `headers`, `multiValueHeaders`, `cookies`, `body`,
+//!   `isBase64Encoded`) to the client response.
 //! - **Azure Functions**: Calls the function's HTTP trigger URL with optional
 //!   function key authentication via `x-functions-key` header.
 //! - **GCP Cloud Functions**: Calls the function's HTTPS trigger URL with
@@ -98,8 +107,9 @@ use chrono::Utc;
 use http::header::{HeaderName, HeaderValue};
 use percent_encoding::percent_decode_str;
 use regex::Regex;
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use tracing::{debug, info};
 
@@ -110,6 +120,7 @@ use super::utils::ambient_cloud_credentials::{
     ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS, AmbientAwsEndpointScope, AwsCredentialSources,
     AwsService, aws_partition_dns_suffix, is_aws_region,
 };
+use super::utils::aws_refreshing_credentials::{AwsCredentialFetcher, RefreshingAwsCredentials};
 use super::utils::aws_sigv4;
 use super::utils::query::{QueryAmbiguity, canonical_query_for_policy, has_valid_percent_triplets};
 use super::utils::response_body::{
@@ -129,9 +140,11 @@ const ALLOWED_CONFIG_FIELDS: &[&str] = &[
     "aws_session_token",
     "aws_qualifier",
     "aws_endpoint_url",
+    "aws_credentials",
     "allow_custom_endpoint_with_ambient_credentials",
     "azure_function_key",
     "gcp_bearer_token",
+    "payload_format",
     "forward_body",
     "forward_headers",
     "forward_query_params",
@@ -140,6 +153,42 @@ const ALLOWED_CONFIG_FIELDS: &[&str] = &[
     "on_error",
     "error_status_code",
     "allow_plaintext",
+];
+
+/// Largest accepted `timeout_ms`: the 15-minute maximum duration of a
+/// synchronous AWS Lambda invocation, which is also beyond every Azure/GCP
+/// HTTP-trigger limit. A larger value is a unit mistake (seconds written into
+/// a millisecond field) or a request-hold amplifier, never a real budget.
+const MAX_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+
+/// Largest accepted `max_response_body_bytes` (64 MiB). The function response
+/// is buffered whole before it is returned or parsed, so this is the per
+/// invocation retained-memory ceiling; it matches `ai_federation`'s provider
+/// response ceiling and the shared governed-JSON scan budget.
+const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Fixed failure class for a non-2xx AWS Lambda Invoke API response. Those
+/// statuses (throttling, access denied, missing function, oversized payload,
+/// service errors) are authored by the Lambda service, not by the function.
+const LAMBDA_SERVICE_ERROR: &str = "lambda_service_error";
+
+/// Fixed failure class when `aws_credentials: default_chain` has no usable
+/// credential for this invocation.
+const AWS_CREDENTIALS_UNAVAILABLE: &str = "aws_credentials_unavailable";
+
+/// Fixed failure class for a malformed API Gateway proxy-integration response.
+const INVALID_API_GATEWAY_RESPONSE: &str = "invalid_api_gateway_response";
+
+/// Diagnostic subject for a `default_chain` row whose region or endpoint is
+/// outside the ambient-credential scope.
+const DEFAULT_CHAIN_CREDENTIAL_ORIGIN: &str =
+    "`aws_credentials: default_chain` signs with the gateway process's own AWS identity";
+
+/// Credential fields a `default_chain` row may not also carry.
+const AWS_LITERAL_CREDENTIAL_FIELDS: [&str; 3] = [
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
 ];
 
 /// Recognized string-typed provider fields.
@@ -396,19 +445,77 @@ enum ErrorAction {
     Reject,
 }
 
+/// Where an `aws_lambda` row's signing credentials come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AwsCredentialMode {
+    /// A literal key pair from config, or from `AWS_ACCESS_KEY_ID` /
+    /// `AWS_SECRET_ACCESS_KEY` (plus `AWS_SESSION_TOKEN`), resolved once.
+    Static,
+    /// The AWS SDK default chain (environment, profiles, web identity, ECS,
+    /// IMDS), cached and refreshed before expiry.
+    DefaultChain,
+}
+
+fn parse_aws_credential_mode(config: &Value) -> Result<AwsCredentialMode, String> {
+    match config.get("aws_credentials") {
+        None => Ok(AwsCredentialMode::Static),
+        Some(Value::String(value)) => match value.as_str() {
+            "static" => Ok(AwsCredentialMode::Static),
+            "default_chain" => Ok(AwsCredentialMode::DefaultChain),
+            _ => Err(
+                "serverless_function: unknown `aws_credentials` (expected `static` or `default_chain`)"
+                    .to_string(),
+            ),
+        },
+        Some(_) => Err("serverless_function: `aws_credentials` must be a string".to_string()),
+    }
+}
+
+/// Request event / response contract between the gateway and the function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadFormat {
+    /// The Ferrum invocation payload and response contracts.
+    Ferrum,
+    /// AWS API Gateway HTTP API proxy integration, payload format 2.0.
+    AwsApiGatewayV2,
+}
+
+fn parse_payload_format(config: &Value) -> Result<PayloadFormat, String> {
+    match config.get("payload_format") {
+        None => Ok(PayloadFormat::Ferrum),
+        Some(Value::String(value)) => match value.as_str() {
+            "ferrum" => Ok(PayloadFormat::Ferrum),
+            "aws_api_gateway_v2" => Ok(PayloadFormat::AwsApiGatewayV2),
+            _ => Err(
+                "serverless_function: unknown `payload_format` (expected `ferrum` or `aws_api_gateway_v2`)"
+                    .to_string(),
+            ),
+        },
+        Some(_) => Err("serverless_function: `payload_format` must be a string".to_string()),
+    }
+}
+
+/// How an `aws_lambda` instance obtains the credentials it signs with.
+#[derive(Clone)]
+enum AwsLambdaCredentials {
+    /// Resolved once at construction; the signing input is built once too.
+    Static(aws_sigv4::AwsSigV4Config),
+    /// Read lock-free from a refreshing cache on every invocation.
+    DefaultChain(RefreshingAwsCredentials),
+}
+
 /// AWS Lambda–specific configuration.
 #[derive(Clone)]
 #[allow(dead_code)]
 struct AwsLambdaConfig {
     region: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
+    credentials: AwsLambdaCredentials,
     function_name: String,
     qualifier: Option<String>,
-    /// Set when a credential came from the process environment and the
-    /// operator did not opt out: the only endpoints those credentials may be
-    /// signed for (issue #6111). Re-checked before every invocation.
+    /// Set when a credential came from the process environment or the default
+    /// chain and the operator did not opt out: the only endpoints those
+    /// credentials may be signed for (issue #6111). Re-checked before every
+    /// invocation.
     ambient_endpoint_scope: Option<AmbientAwsEndpointScope>,
 }
 
@@ -434,7 +541,9 @@ pub struct ServerlessFunction {
     /// Pre-validated `Authorization: Bearer …` field value, for the same
     /// reason as [`Self::azure_function_key`].
     gcp_authorization_header: Option<HeaderValue>,
+    payload_format: PayloadFormat,
     forward_body: bool,
+    /// Lowercased, de-duplicated (first occurrence kept) forwarded names.
     forward_headers: Vec<String>,
     forward_query_params: bool,
     timeout_ms: u64,
@@ -455,11 +564,24 @@ impl ServerlessFunction {
         http_client: PluginHttpClient,
         instance_id: &str,
     ) -> Result<Self, String> {
+        Self::construct(config, http_client, instance_id, None)
+    }
+
+    /// Serving-node construction. `default_chain_fetcher` replaces the AWS SDK
+    /// default chain for `aws_credentials: default_chain`; only the test
+    /// helpers pass one.
+    fn construct(
+        config: &Value,
+        http_client: PluginHttpClient,
+        instance_id: &str,
+        default_chain_fetcher: Option<AwsCredentialFetcher>,
+    ) -> Result<Self, String> {
         match Self::admit(
             config,
             http_client,
             instance_id,
             CredentialAdmission::Required,
+            default_chain_fetcher,
         )? {
             Some(plugin) => Ok(plugin),
             // `Required` either resolves every credential the selected
@@ -486,6 +608,7 @@ impl ServerlessFunction {
             http_client,
             DEFAULT_INSTANCE_ID,
             CredentialAdmission::Deferred,
+            None,
         )
         .map(|_| ())
     }
@@ -501,6 +624,7 @@ impl ServerlessFunction {
         http_client: PluginHttpClient,
         instance_id: &str,
         credentials: CredentialAdmission,
+        default_chain_fetcher: Option<AwsCredentialFetcher>,
     ) -> Result<Option<Self>, String> {
         let config_object = config
             .as_object()
@@ -585,6 +709,11 @@ impl ServerlessFunction {
         if timeout_ms == 0 {
             return Err("serverless_function: `timeout_ms` must be > 0".to_string());
         }
+        if timeout_ms > MAX_TIMEOUT_MS {
+            return Err(format!(
+                "serverless_function: `timeout_ms` must be at most {MAX_TIMEOUT_MS} (15 minutes)"
+            ));
+        }
 
         let max_response_body_bytes = parse_max_response_body_bytes(
             config,
@@ -592,6 +721,43 @@ impl ServerlessFunction {
             "max_response_body_bytes",
             10 * 1024 * 1024,
         )?;
+        if max_response_body_bytes > MAX_RESPONSE_BODY_BYTES {
+            return Err(format!(
+                "serverless_function: `max_response_body_bytes` must be at most \
+                 {MAX_RESPONSE_BODY_BYTES} (64 MiB)"
+            ));
+        }
+
+        let payload_format = parse_payload_format(config)?;
+        if payload_format == PayloadFormat::AwsApiGatewayV2 {
+            if provider != Provider::AwsLambda {
+                return Err(
+                    "serverless_function: `payload_format: aws_api_gateway_v2` requires \
+                     `provider: aws_lambda`"
+                        .to_string(),
+                );
+            }
+            if mode != InvocationMode::Terminate {
+                return Err(
+                    "serverless_function: `payload_format: aws_api_gateway_v2` requires \
+                     `mode: terminate`; pre_proxy keeps the Ferrum request/response contract"
+                        .to_string(),
+                );
+            }
+        }
+
+        let aws_credential_mode = parse_aws_credential_mode(config)?;
+        if aws_credential_mode == AwsCredentialMode::DefaultChain
+            && let Some(field) = AWS_LITERAL_CREDENTIAL_FIELDS
+                .into_iter()
+                .find(|field| config.get(*field).is_some())
+        {
+            return Err(format!(
+                "serverless_function: `{field}` cannot be combined with \
+                 `aws_credentials: default_chain`, which resolves credentials from the AWS \
+                 default credential chain"
+            ));
+        }
 
         // Strict `on_error` validation — a typo here changes whether a function
         // failure rejects the request or silently continues, so silent
@@ -653,7 +819,7 @@ impl ServerlessFunction {
                     if credentials == CredentialAdmission::Deferred
                         && !allow_custom_endpoint_with_ambient_credentials
                     {
-                        screen_shape_only_ambient_lambda_config(config)?;
+                        screen_shape_only_ambient_lambda_config(config, aws_credential_mode)?;
                     }
 
                     // Node-local credential resolution. Under
@@ -668,21 +834,35 @@ impl ServerlessFunction {
                         return Ok(None);
                     };
 
-                    let access_key_id = optional_config_string(config, "aws_access_key_id")?
-                        .or_else(|| env_non_empty("AWS_ACCESS_KEY_ID"));
-                    let Some(access_key_id) =
-                        credentials.require(access_key_id, AWS_ACCESS_KEY_ID_REQUIRED)?
-                    else {
-                        return Ok(None);
-                    };
+                    // A literal key pair is resolved now; `default_chain` resolves
+                    // credentials per invocation from the refreshing cache below.
+                    let static_key_pair = match aws_credential_mode {
+                        AwsCredentialMode::Static => {
+                            let access_key_id =
+                                optional_config_string(config, "aws_access_key_id")?
+                                    .or_else(|| env_non_empty("AWS_ACCESS_KEY_ID"));
+                            let Some(access_key_id) =
+                                credentials.require(access_key_id, AWS_ACCESS_KEY_ID_REQUIRED)?
+                            else {
+                                return Ok(None);
+                            };
+                            // The key id is interpolated into `Authorization`, so
+                            // the effective value — config or environment — must
+                            // be an HTTP field value, exactly like the Azure/GCP
+                            // credentials (issue #5189).
+                            credential_header_value("aws_access_key_id", &access_key_id)?;
 
-                    let secret_access_key =
-                        optional_config_string(config, "aws_secret_access_key")?
-                            .or_else(|| env_non_empty("AWS_SECRET_ACCESS_KEY"));
-                    let Some(secret_access_key) =
-                        credentials.require(secret_access_key, AWS_SECRET_ACCESS_KEY_REQUIRED)?
-                    else {
-                        return Ok(None);
+                            let secret_access_key =
+                                optional_config_string(config, "aws_secret_access_key")?
+                                    .or_else(|| env_non_empty("AWS_SECRET_ACCESS_KEY"));
+                            let Some(secret_access_key) = credentials
+                                .require(secret_access_key, AWS_SECRET_ACCESS_KEY_REQUIRED)?
+                            else {
+                                return Ok(None);
+                            };
+                            Some((access_key_id, secret_access_key))
+                        }
+                        AwsCredentialMode::DefaultChain => None,
                     };
 
                     let function_name = optional_config_string(config, "aws_function_name")?
@@ -701,17 +881,27 @@ impl ServerlessFunction {
                     // endpoint is scoped below (issue #6111). An STS session
                     // token is bound to its access key, so the environment
                     // token only completes an environment key pair.
-                    let mut credential_sources = configured_aws_credential_sources(config);
-                    let session_token = optional_config_string(config, "aws_session_token")?;
-                    let session_token = match session_token {
-                        Some(token) => Some(token),
-                        None if credential_sources.may_use_environment_session_token() => {
-                            let token = env_non_empty("AWS_SESSION_TOKEN");
-                            credential_sources.session_token_from_env = token.is_some();
-                            token
-                        }
-                        None => None,
+                    let mut credential_sources = match aws_credential_mode {
+                        AwsCredentialMode::Static => configured_aws_credential_sources(config),
+                        AwsCredentialMode::DefaultChain => AwsCredentialSources::default(),
                     };
+                    let session_token = if static_key_pair.is_some() {
+                        match optional_config_string(config, "aws_session_token")? {
+                            Some(token) => Some(token),
+                            None if credential_sources.may_use_environment_session_token() => {
+                                let token = env_non_empty("AWS_SESSION_TOKEN");
+                                credential_sources.session_token_from_env = token.is_some();
+                                token
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    // Sent verbatim as `x-amz-security-token`.
+                    if let Some(token) = session_token.as_deref() {
+                        credential_header_value("aws_session_token", token)?;
+                    }
 
                     let qualifier = optional_config_string(config, "aws_qualifier")?;
                     if let Some(ref qualifier) = qualifier {
@@ -745,10 +935,11 @@ impl ServerlessFunction {
                     {
                         info!("serverless_function: aws_region resolved from environment variable");
                     }
-                    if config["aws_access_key_id"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .is_none()
+                    if aws_credential_mode == AwsCredentialMode::Static
+                        && config["aws_access_key_id"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .is_none()
                     {
                         info!(
                             "serverless_function: aws_access_key_id resolved from environment variable"
@@ -775,41 +966,78 @@ impl ServerlessFunction {
                         url.push_str(&aws_sigv4::uri_encode(q, true));
                     }
 
-                    // Process-environment credentials may only be signed for
-                    // an official Lambda endpoint of the configured region
-                    // when the config chose the endpoint: the derived host (a
-                    // hostile `aws_region` is interpolated into it) or the
-                    // `aws_endpoint_url` override (issue #6111). An endpoint
-                    // from `AWS_LAMBDA_ENDPOINT_URL` is chosen by the same
-                    // environment owner as the credentials, so it is trusted
-                    // like them. The region is screened either way, so the
-                    // serving node and shape-only admission agree.
-                    let ambient_endpoint_scope = if !credential_sources.is_ambient() {
-                        None
-                    } else if allow_custom_endpoint_with_ambient_credentials {
-                        info!(
-                            "serverless_function: process-environment AWS credentials may be sent to a custom Lambda endpoint (`allow_custom_endpoint_with_ambient_credentials` is true)"
-                        );
-                        None
-                    } else {
-                        ensure_ambient_lambda_region(&region, credential_sources)?;
-                        if endpoint_from_env && endpoint_override.is_some() {
+                    // Process-environment and default-chain credentials may
+                    // only be signed for an official Lambda endpoint of the
+                    // configured region when the config chose the endpoint: the
+                    // derived host (a hostile `aws_region` is interpolated into
+                    // it) or the `aws_endpoint_url` override (issue #6111). An
+                    // endpoint from `AWS_LAMBDA_ENDPOINT_URL` is chosen by the
+                    // same environment owner as the credentials, so it is
+                    // trusted like them. The region is screened either way, so
+                    // the serving node and shape-only admission agree.
+                    let ambient_origin = match aws_credential_mode {
+                        AwsCredentialMode::DefaultChain => {
+                            Some(DEFAULT_CHAIN_CREDENTIAL_ORIGIN.to_string())
+                        }
+                        AwsCredentialMode::Static if credential_sources.is_ambient() => {
+                            Some(environment_credential_origin(credential_sources))
+                        }
+                        AwsCredentialMode::Static => None,
+                    };
+                    let ambient_endpoint_scope = match ambient_origin {
+                        None => None,
+                        Some(_) if allow_custom_endpoint_with_ambient_credentials => {
                             info!(
-                                "serverless_function: process-environment AWS credentials are sent to the `AWS_LAMBDA_ENDPOINT_URL` endpoint set in the same environment"
+                                "serverless_function: process-environment AWS credentials may be sent to a custom Lambda endpoint (`allow_custom_endpoint_with_ambient_credentials` is true)"
                             );
                             None
-                        } else {
-                            let scope = AmbientAwsEndpointScope::new(AwsService::Lambda, &region);
-                            ensure_ambient_lambda_endpoint(&scope, &url, credential_sources)?;
-                            Some(scope)
+                        }
+                        Some(origin) => {
+                            ensure_ambient_lambda_region(&region, &origin)?;
+                            if endpoint_from_env && endpoint_override.is_some() {
+                                info!(
+                                    "serverless_function: process-environment AWS credentials are sent to the `AWS_LAMBDA_ENDPOINT_URL` endpoint set in the same environment"
+                                );
+                                None
+                            } else {
+                                let scope =
+                                    AmbientAwsEndpointScope::new(AwsService::Lambda, &region);
+                                ensure_ambient_lambda_endpoint(&scope, &url, &origin)?;
+                                Some(scope)
+                            }
+                        }
+                    };
+
+                    let lambda_credentials = match static_key_pair {
+                        Some((access_key_id, secret_access_key)) => {
+                            AwsLambdaCredentials::Static(aws_sigv4::AwsSigV4Config {
+                                region: region.clone(),
+                                access_key_id,
+                                secret_access_key,
+                                session_token,
+                            })
+                        }
+                        None => {
+                            let fetcher = match default_chain_fetcher {
+                                Some(fetcher) => fetcher,
+                                // Whether this binary carries the AWS SDK chain
+                                // is a serving-node property, like the
+                                // credentials themselves: shape-only admission
+                                // has validated everything the row supplies.
+                                None if credentials == CredentialAdmission::Deferred => {
+                                    return Ok(None);
+                                }
+                                None => aws_default_chain_fetcher(&region)?,
+                            };
+                            AwsLambdaCredentials::DefaultChain(RefreshingAwsCredentials::new(
+                                fetcher,
+                            ))
                         }
                     };
 
                     let aws_cfg = AwsLambdaConfig {
                         region,
-                        access_key_id,
-                        secret_access_key,
-                        session_token,
+                        credentials: lambda_credentials,
                         function_name,
                         qualifier,
                         ambient_endpoint_scope,
@@ -894,6 +1122,7 @@ impl ServerlessFunction {
             aws_config,
             azure_function_key,
             gcp_authorization_header,
+            payload_format,
             forward_body,
             forward_headers,
             forward_query_params,
@@ -905,144 +1134,149 @@ impl ServerlessFunction {
         }))
     }
 
-    /// Build the JSON payload sent to the serverless function.
+    /// Build and serialize the JSON payload sent to the serverless function.
     ///
     /// `finalized_body` is the backend-visible request body: request-body
     /// transforms have run and every final request-policy hook has accepted it
     /// (GHSA-4vr5-4wm3-x5xv). The function therefore observes exactly what the
     /// backend would, including operator-configured removals and redactions.
+    ///
+    /// The payload is written straight into the request buffer from borrowed
+    /// request state: the body is never copied into an intermediate JSON value,
+    /// and a binary body is base64-encoded while it is written.
     fn build_invocation_payload(
         &self,
         ctx: &RequestContext,
         proxy_headers: &HashMap<String, String>,
         finalized_body: &[u8],
-    ) -> Result<Value, InvocationFailure> {
-        let mut payload = serde_json::Map::new();
+    ) -> Result<Vec<u8>, InvocationFailure> {
+        let headers = self.forwarded_headers(ctx, proxy_headers);
 
-        payload.insert("method".into(), Value::String(ctx.method.clone()));
-        payload.insert("path".into(), Value::String(ctx.path.clone()));
-        payload.insert("client_ip".into(), Value::String(ctx.client_ip.clone()));
+        let query_params = if self.forward_query_params {
+            unambiguous_query_params(ctx)?
+        } else {
+            Vec::new()
+        };
+        // Sorted by decoded name for a stable payload. Safe only because the
+        // canonical query is unambiguous here: every name occurs exactly once,
+        // so reordering cannot pick a different value than the backend runs.
+        let mut sorted_query: Vec<(&str, &str)> = query_params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        sorted_query.sort_unstable_by_key(|(name, _)| *name);
 
-        if let Some(ref consumer) = ctx.identified_consumer {
-            payload.insert(
-                "consumer_username".into(),
-                Value::String(consumer.username.clone()),
-            );
-        }
+        let body = if self.forward_body {
+            Some(forwarded_body(ctx, proxy_headers, finalized_body)?)
+        } else {
+            None
+        };
 
-        if let Some(ref identity) = ctx.authenticated_identity {
-            payload.insert(
-                "authenticated_identity".into(),
-                Value::String(identity.clone()),
-            );
-        }
-
-        // Forward selected headers
-        if !self.forward_headers.is_empty() {
-            let mut headers_map = serde_json::Map::new();
-            for key in &self.forward_headers {
-                // Read only the effective `before_proxy` header map. Falling
-                // back to `ctx.headers` would resurrect field lines an earlier
-                // `before_proxy` plugin deliberately removed — `authorization`
-                // under `strip_authorization_on_success`, or a gateway-owned
-                // `claim_headers` destination whose claim was absent — and hand
-                // that client-supplied value to the function as if the gateway
-                // had asserted it. `ctx.headers` is the pristine ingress map and
-                // is never the outbound view; on the no-clone path the handler
-                // has already moved it into `proxy_headers`.
-                // Issue #4164: the same client-identity rule the primary and
-                // secondary request boundaries apply. An untrusted peer's
-                // `X-Real-IP` never reaches the real backend, so it must not
-                // reach a function that may treat it as authoritative either —
-                // even when an operator listed it explicitly. The gateway's own
-                // resolved address is already in the payload as `client_ip`. A
-                // trusted peer's assertion still rides, matching primary
-                // dispatch.
-                if crate::proxy::headers::is_untrusted_real_ip_header(
-                    key,
-                    ctx.forwarding_peer_trusted,
-                ) {
-                    continue;
+        let body_bytes = match &body {
+            Some(PayloadBody::Utf8(text)) => text.len(),
+            Some(PayloadBody::Base64(bytes)) => bytes.len().div_ceil(3).saturating_mul(4),
+            None => 0,
+        };
+        let mut payload = Vec::with_capacity(body_bytes.saturating_add(1024));
+        let written = match self.payload_format {
+            PayloadFormat::Ferrum => serde_json::to_writer(
+                &mut payload,
+                &FerrumInvocationPayload {
+                    ctx,
+                    headers: &headers,
+                    query_params: &sorted_query,
+                    body_content_type: body
+                        .as_ref()
+                        .and_then(|_| proxy_headers.get("content-type"))
+                        .map(String::as_str),
+                    body,
+                },
+            ),
+            PayloadFormat::AwsApiGatewayV2 => {
+                let mut cookies = Vec::new();
+                let mut user_agent = None;
+                let mut event_headers = Vec::with_capacity(headers.len());
+                for (name, value) in headers {
+                    // Payload format 2.0 carries request cookies in their own
+                    // array rather than in `headers`.
+                    if name == "cookie" {
+                        cookies.extend(
+                            value
+                                .split(';')
+                                .map(str::trim)
+                                .filter(|cookie| !cookie.is_empty()),
+                        );
+                        continue;
+                    }
+                    if name == "user-agent" {
+                        user_agent = Some(value);
+                    }
+                    event_headers.push((name, value));
                 }
-                if let Some(val) = proxy_headers.get(key) {
-                    headers_map.insert(key.clone(), Value::String(val.clone()));
-                }
+                serde_json::to_writer(
+                    &mut payload,
+                    &ApiGatewayV2Event {
+                        ctx,
+                        raw_query_string: encode_raw_query_string(&query_params),
+                        cookies,
+                        headers: &event_headers,
+                        query_params: &sorted_query,
+                        user_agent,
+                        body,
+                    },
+                )
             }
-            if !headers_map.is_empty() {
-                payload.insert("headers".into(), Value::Object(headers_map));
-            }
-        }
-
-        // Forward query params
-        if self.forward_query_params {
-            let params = unambiguous_query_params(ctx)?;
-            if !params.is_empty() {
-                payload.insert("query_params".into(), Value::Object(params));
-            }
-        }
-
-        // Forward request body
-        if self.forward_body {
-            reject_encoded_request_body(ctx, proxy_headers)?;
-            // `finalized_body` is authoritative. `ctx.request_body_bytes` is not
-            // read for content — it would be the PRE-transform client body — but
-            // its absence still witnesses that the gateway never collected a
-            // body for this request, which is the one case where an empty
-            // `finalized_body` is not a faithful representation of a request
-            // that may carry one. Fail closed rather than invoke the function on
-            // a silently truncated payload.
-            let body: &[u8] = finalized_body;
-            if body.is_empty()
-                && ctx.request_body_bytes.is_none()
-                && crate::proxy::request_may_have_body(&ctx.method, proxy_headers)
-            {
-                return Err(InvocationFailure::governed_input(
-                    "request_body_unavailable",
-                    "governed request body was unavailable before function invocation",
-                ));
-            }
-            // Keep a single authoritative, lossless body representation. JSON
-            // parsing here would collapse duplicate object members and rewrite
-            // lexical number/whitespace forms before the external policy sees
-            // them, while the unchanged bytes continue to the backend. Valid
-            // UTF-8 has a unique byte encoding, so a JSON string round-trip is
-            // lossless; arbitrary bytes use base64. Always emit the encoding,
-            // and carry the active hook Content-Type separately as an
-            // interpretation hint rather than letting it change the bytes.
-            if let Ok(text) = std::str::from_utf8(body) {
-                payload.insert("body".into(), Value::String(text.to_string()));
-                payload.insert("body_encoding".into(), Value::String("utf8".into()));
-            } else {
-                payload.insert(
-                    "body".into(),
-                    Value::String(base64::engine::general_purpose::STANDARD.encode(body)),
-                );
-                payload.insert("body_encoding".into(), Value::String("base64".into()));
-            }
-            if let Some(content_type) = proxy_headers.get("content-type") {
-                payload.insert(
-                    "body_content_type".into(),
-                    Value::String(content_type.clone()),
-                );
-            }
-        }
-
-        Ok(Value::Object(payload))
-    }
-
-    /// Invoke the serverless function and return (status_code, headers, body_bytes).
-    async fn invoke(
-        &self,
-        payload: &Value,
-        ctx: &RequestContext,
-    ) -> Result<(u16, HashMap<String, String>, Bytes), InvocationFailure> {
-        let payload_bytes = serde_json::to_vec(payload).map_err(|_| {
+        };
+        written.map_err(|_| {
             InvocationFailure::pre_wire(
                 "payload_serialization_failed",
                 "failed to serialize function payload",
             )
         })?;
+        Ok(payload)
+    }
 
+    /// The configured headers present in the finalized backend-visible view.
+    fn forwarded_headers<'a>(
+        &'a self,
+        ctx: &RequestContext,
+        proxy_headers: &'a HashMap<String, String>,
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut headers = Vec::with_capacity(self.forward_headers.len());
+        for key in &self.forward_headers {
+            // Read only the effective `before_proxy` header map. Falling back
+            // to `ctx.headers` would resurrect field lines an earlier
+            // `before_proxy` plugin deliberately removed — `authorization`
+            // under `strip_authorization_on_success`, or a gateway-owned
+            // `claim_headers` destination whose claim was absent — and hand
+            // that client-supplied value to the function as if the gateway had
+            // asserted it. `ctx.headers` is the pristine ingress map and is
+            // never the outbound view; on the no-clone path the handler has
+            // already moved it into `proxy_headers`.
+            // Issue #4164: the same client-identity rule the primary and
+            // secondary request boundaries apply. An untrusted peer's
+            // `X-Real-IP` never reaches the real backend, so it must not reach
+            // a function that may treat it as authoritative either — even when
+            // an operator listed it explicitly. The gateway's own resolved
+            // address is already in the payload as `client_ip`. A trusted
+            // peer's assertion still rides, matching primary dispatch.
+            if crate::proxy::headers::is_untrusted_real_ip_header(key, ctx.forwarding_peer_trusted)
+            {
+                continue;
+            }
+            if let Some(value) = proxy_headers.get(key) {
+                headers.push((key.as_str(), value.as_str()));
+            }
+        }
+        headers
+    }
+
+    /// Invoke the serverless function and return (status_code, headers, body_bytes).
+    async fn invoke(
+        &self,
+        payload_bytes: Vec<u8>,
+        ctx: &RequestContext,
+    ) -> Result<(u16, HashMap<String, String>, Bytes), InvocationFailure> {
         let client = self.http_client.get().map_err(|_| {
             InvocationFailure::pre_wire("invocation_failed", "plugin HTTP client unavailable")
         })?;
@@ -1061,16 +1295,31 @@ impl ServerlessFunction {
         match &self.provider {
             Provider::AwsLambda => {
                 if let Some(ref aws) = self.aws_config {
+                    let refreshed;
+                    let signing: &aws_sigv4::AwsSigV4Config = match &aws.credentials {
+                        AwsLambdaCredentials::Static(signing) => signing,
+                        AwsLambdaCredentials::DefaultChain(chain) => {
+                            // Lock-free while the cached credential is fresh;
+                            // waits (bounded) only when none is usable.
+                            let snapshot = chain.credentials().await.map_err(|unavailable| {
+                                InvocationFailure::pre_wire(
+                                    AWS_CREDENTIALS_UNAVAILABLE,
+                                    unavailable.reason,
+                                )
+                            })?;
+                            refreshed = snapshot.signing_config(&aws.region);
+                            &refreshed
+                        }
+                    };
                     let now = Utc::now();
                     let auth_headers =
-                        sign_aws_request(aws, &self.function_url, &payload_bytes, &now).map_err(
-                            |_| {
+                        sign_lambda_request(signing, &self.function_url, &payload_bytes, &now)
+                            .map_err(|_| {
                                 InvocationFailure::pre_wire(
                                     "request_signing_failed",
                                     "failed to sign AWS Lambda invocation",
                                 )
-                            },
-                        )?;
+                            })?;
                     for (k, v) in &auth_headers {
                         req_builder = req_builder.header(k.as_str(), v.as_str());
                     }
@@ -1117,12 +1366,33 @@ impl ServerlessFunction {
             })?;
 
         let status = response.status().as_u16();
+        // The synchronous Lambda Invoke API answers 200 for every executed
+        // invocation — the function's own result, success or error, is the
+        // body. Any other status (throttling, access denied, a missing or
+        // misnamed function, an oversized payload, a service fault) is authored
+        // by the Lambda service, not by the function, so it is an invocation
+        // failure under `on_error` / `error_status_code` and its body — which
+        // names ARNs and account ids — is never read or returned. Azure and GCP
+        // HTTP triggers author their own status, so they keep passthrough.
+        if self.provider == Provider::AwsLambda && !(200..=299).contains(&status) {
+            let detail = match lambda_error_type(response.headers()) {
+                Some(error_type) => {
+                    format!("AWS Lambda Invoke API returned HTTP {status} ({error_type})")
+                }
+                None => format!("AWS Lambda Invoke API returned HTTP {status}"),
+            };
+            return Err(InvocationFailure::new(LAMBDA_SERVICE_ERROR, detail));
+        }
         let lambda_function_error = self.provider == Provider::AwsLambda
             && response.headers().contains_key("x-amz-function-error");
-        // Only terminate mode can return function response headers. Avoid the
-        // filtering and destination-inspection work for pre_proxy responses,
-        // whose JSON body alone supplies request-header candidates/metadata.
-        let response_headers = if self.mode == InvocationMode::Terminate {
+        // Only Ferrum-format terminate mode returns the provider's response
+        // headers. Avoid the filtering and destination-inspection work for
+        // pre_proxy responses, whose JSON body alone supplies request-header
+        // candidates/metadata, and for API Gateway responses, whose headers
+        // come from the function's proxy-integration result.
+        let response_headers = if self.mode == InvocationMode::Terminate
+            && self.payload_format == PayloadFormat::Ferrum
+        {
             sanitize_function_response_headers(response.headers(), &self.function_destination)
         } else {
             HashMap::new()
@@ -1286,53 +1556,69 @@ fn configured_aws_credential_sources(config: &Value) -> AwsCredentialSources {
 /// served, so the region and endpoint the config itself chooses are screened
 /// here. Without a configured region the serving node supplies one, so the
 /// endpoint is pinned to the service and to a well-formed region only.
-fn screen_shape_only_ambient_lambda_config(config: &Value) -> Result<(), String> {
-    let sources = configured_aws_credential_sources(config);
-    if !sources.is_ambient() {
-        return Ok(());
-    }
+fn screen_shape_only_ambient_lambda_config(
+    config: &Value,
+    credential_mode: AwsCredentialMode,
+) -> Result<(), String> {
+    let origin = match credential_mode {
+        AwsCredentialMode::DefaultChain => DEFAULT_CHAIN_CREDENTIAL_ORIGIN.to_string(),
+        AwsCredentialMode::Static => {
+            let sources = configured_aws_credential_sources(config);
+            if !sources.is_ambient() {
+                return Ok(());
+            }
+            environment_credential_origin(sources)
+        }
+    };
     let region = optional_config_string(config, "aws_region")?;
     if let Some(region) = region.as_deref() {
-        ensure_ambient_lambda_region(region, sources)?;
+        ensure_ambient_lambda_region(region, &origin)?;
     }
     if let Some(endpoint) = optional_config_string(config, "aws_endpoint_url")? {
         let scope = match region.as_deref() {
             Some(region) => AmbientAwsEndpointScope::new(AwsService::Lambda, region),
             None => AmbientAwsEndpointScope::any_region(AwsService::Lambda),
         };
-        ensure_ambient_lambda_endpoint(&scope, &endpoint, sources)?;
+        ensure_ambient_lambda_endpoint(&scope, &endpoint, &origin)?;
     }
     Ok(())
 }
 
+/// Diagnostic subject for a row whose key pair resolved from the process
+/// environment: the schema fields involved, never a value.
+fn environment_credential_origin(credential_sources: AwsCredentialSources) -> String {
+    format!(
+        "{} resolved from the process environment",
+        credential_sources.ambient_field_list()
+    )
+}
+
 /// Refuse a region outside the modelled AWS partitions for a row that signs
-/// with process credentials. The diagnostic never echoes the region.
-fn ensure_ambient_lambda_region(
-    region: &str,
-    credential_sources: AwsCredentialSources,
-) -> Result<(), String> {
+/// with process credentials. `origin` names where those credentials come from;
+/// the diagnostic never echoes the region.
+fn ensure_ambient_lambda_region(region: &str, origin: &str) -> Result<(), String> {
     if is_aws_region(region) {
         return Ok(());
     }
     Err(format!(
-        "serverless_function: {} resolved from the process environment, so `aws_region` must be \
+        "serverless_function: {origin}, so `aws_region` must be \
          a commercial, GovCloud, or China AWS region (for example `us-east-1`, `us-gov-west-1`, \
          or `cn-north-1`); set the AWS credentials in the plugin config, or set \
          `{ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS}: true` to use the process credentials \
-         with another partition or a private endpoint deliberately",
-        credential_sources.ambient_field_list()
+         with another partition or a private endpoint deliberately"
     ))
 }
 
 /// Refuse a Lambda endpoint outside the ambient-credential scope.
 ///
-/// The diagnostic names the schema fields that resolved from the environment
-/// and the accepted endpoint shapes, never the configured endpoint, region, or
-/// any credential.
+/// The diagnostic names where the credentials come from (`origin`: the schema
+/// fields that resolved from the environment, or the default chain) and the
+/// accepted endpoint shapes, never the configured endpoint, region, or any
+/// credential.
 fn ensure_ambient_lambda_endpoint(
     scope: &AmbientAwsEndpointScope,
     endpoint: &str,
-    credential_sources: AwsCredentialSources,
+    origin: &str,
 ) -> Result<(), String> {
     if let Ok(url) = Url::parse(endpoint)
         && scope.permits_url(&url)
@@ -1340,7 +1626,7 @@ fn ensure_ambient_lambda_endpoint(
         return Ok(());
     }
     Err(format!(
-        "serverless_function: {} resolved from the process environment, so the Lambda endpoint \
+        "serverless_function: {origin}, so the Lambda endpoint \
          must be an official AWS Lambda endpoint for the configured region over HTTPS on the \
          default port (`https://lambda[-fips].<region>.amazonaws.com`, \
          `https://lambda[-fips].<region>.api.aws`, or an interface VPC endpoint \
@@ -1349,8 +1635,7 @@ fn ensure_ambient_lambda_endpoint(
          dual-stack `api.amazonwebservices.com.cn` instead); set the AWS credentials in the \
          plugin config, or set \
          `{ALLOW_CUSTOM_ENDPOINT_WITH_AMBIENT_CREDENTIALS}: true` to send the process \
-         credentials to this endpoint deliberately",
-        credential_sources.ambient_field_list()
+         credentials to this endpoint deliberately"
     ))
 }
 
@@ -1371,7 +1656,12 @@ fn parse_forward_headers(config: &Value) -> Result<Vec<String>, String> {
         HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
             format!("serverless_function: `forward_headers[{idx}]` is not a valid HTTP header name")
         })?;
-        parsed.push(name.to_ascii_lowercase());
+        let name = name.to_ascii_lowercase();
+        // A repeated name forwards one value once; keeping the first
+        // occurrence preserves the payload's field order.
+        if !parsed.contains(&name) {
+            parsed.push(name);
+        }
     }
 
     Ok(parsed)
@@ -1433,6 +1723,16 @@ fn validate_supplied_provider_fields(config: &Value) -> Result<(), String> {
     }
     if let Some(qualifier) = optional_config_string(config, "aws_qualifier")? {
         validate_aws_qualifier(&qualifier)?;
+    }
+    // The access key id is interpolated into `Authorization` and the session
+    // token is sent verbatim as `x-amz-security-token`, so both must be HTTP
+    // field values. The secret access key is only HMAC input and is not
+    // screened.
+    if let Some(key_id) = optional_config_string(config, "aws_access_key_id")? {
+        credential_header_value("aws_access_key_id", &key_id)?;
+    }
+    if let Some(token) = optional_config_string(config, "aws_session_token")? {
+        credential_header_value("aws_session_token", &token)?;
     }
     if let Some(key) = optional_config_string(config, "azure_function_key")? {
         credential_header_value("azure_function_key", &key)?;
@@ -1673,9 +1973,10 @@ fn reject_encoded_request_body(
     Ok(())
 }
 
+/// The decoded backend-visible query parameters, in their canonical order.
 fn unambiguous_query_params(
     ctx: &RequestContext,
-) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
+) -> Result<Vec<(String, String)>, InvocationFailure> {
     // Decode the exact backend-visible bytes — transformer-published outbound
     // query (when present) composed with authentication-owned credential
     // strips — through the same shared canonicalizer OPA and
@@ -1722,18 +2023,428 @@ fn unambiguous_query_params(
             "query parameters were materialized without their original encoded representation",
         ));
     }
-    // Sorted by decoded name for a stable payload. Safe only because the
-    // canonical query is unambiguous here: every name occurs exactly once, so
-    // reordering cannot pick a different value than the backend executes.
-    let ordered: BTreeMap<&str, &str> = canonical
+    Ok(canonical
         .params()
         .iter()
-        .map(|param| (param.name.as_str(), param.value.as_str()))
-        .collect();
-    Ok(ordered
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+        .map(|param| (param.name.clone(), param.value.clone()))
         .collect())
+}
+
+/// Re-encode the unambiguous decoded query as an API Gateway
+/// `rawQueryString`: every byte outside the RFC 3986 unreserved set is
+/// percent-encoded, so the function decodes exactly the values the backend
+/// receives.
+fn encode_raw_query_string(params: &[(String, String)]) -> String {
+    let mut raw = String::new();
+    for (index, (name, value)) in params.iter().enumerate() {
+        if index > 0 {
+            raw.push('&');
+        }
+        raw.push_str(&aws_sigv4::uri_encode(name, true));
+        raw.push('=');
+        raw.push_str(&aws_sigv4::uri_encode(value, true));
+    }
+    raw
+}
+
+/// The forwarded finalized request body, after the fail-closed encoding and
+/// availability checks.
+fn forwarded_body<'b>(
+    ctx: &RequestContext,
+    proxy_headers: &HashMap<String, String>,
+    finalized_body: &'b [u8],
+) -> Result<PayloadBody<'b>, InvocationFailure> {
+    reject_encoded_request_body(ctx, proxy_headers)?;
+    // `finalized_body` is authoritative. `ctx.request_body_bytes` is not read
+    // for content — it would be the PRE-transform client body — but its
+    // absence still witnesses that the gateway never collected a body for this
+    // request, which is the one case where an empty `finalized_body` is not a
+    // faithful representation of a request that may carry one. Fail closed
+    // rather than invoke the function on a silently truncated payload.
+    if finalized_body.is_empty()
+        && ctx.request_body_bytes.is_none()
+        && crate::proxy::request_may_have_body(&ctx.method, proxy_headers)
+    {
+        return Err(InvocationFailure::governed_input(
+            "request_body_unavailable",
+            "governed request body was unavailable before function invocation",
+        ));
+    }
+    // Keep a single authoritative, lossless body representation. JSON parsing
+    // here would collapse duplicate object members and rewrite lexical
+    // number/whitespace forms before the external policy sees them, while the
+    // unchanged bytes continue to the backend. Valid UTF-8 has a unique byte
+    // encoding, so a JSON string round-trip is lossless; arbitrary bytes use
+    // base64. Always emit the encoding, and carry the active hook Content-Type
+    // separately as an interpretation hint rather than letting it change the
+    // bytes.
+    Ok(match std::str::from_utf8(finalized_body) {
+        Ok(text) => PayloadBody::Utf8(text),
+        Err(_) => PayloadBody::Base64(finalized_body),
+    })
+}
+
+/// One forwarded request body, borrowed from the finalized representation.
+enum PayloadBody<'a> {
+    /// Exact UTF-8 bytes, written as a JSON string.
+    Utf8(&'a str),
+    /// Arbitrary bytes, written as standard base64 while serializing.
+    Base64(&'a [u8]),
+}
+
+impl PayloadBody<'_> {
+    fn is_base64(&self) -> bool {
+        matches!(self, Self::Base64(_))
+    }
+}
+
+impl Serialize for PayloadBody<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Utf8(text) => serializer.serialize_str(text),
+            // `collect_str` streams the encoder's output through the JSON
+            // string writer, so the base64 form is never materialized.
+            Self::Base64(bytes) => serializer.collect_str(&base64::display::Base64Display::new(
+                bytes,
+                &base64::engine::general_purpose::STANDARD,
+            )),
+        }
+    }
+}
+
+/// Ordered `name -> value` pairs serialized as a JSON object.
+struct StrPairs<'a>(&'a [(&'a str, &'a str)]);
+
+impl Serialize for StrPairs<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in self.0 {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+/// The Ferrum invocation payload (`payload_format: ferrum`). Field order and
+/// spelling are the published contract.
+struct FerrumInvocationPayload<'a> {
+    ctx: &'a RequestContext,
+    headers: &'a [(&'a str, &'a str)],
+    query_params: &'a [(&'a str, &'a str)],
+    body: Option<PayloadBody<'a>>,
+    body_content_type: Option<&'a str>,
+}
+
+impl Serialize for FerrumInvocationPayload<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("method", &self.ctx.method)?;
+        map.serialize_entry("path", &self.ctx.path)?;
+        map.serialize_entry("client_ip", &self.ctx.client_ip)?;
+        if let Some(consumer) = self.ctx.identified_consumer.as_ref() {
+            map.serialize_entry("consumer_username", &consumer.username)?;
+        }
+        if let Some(identity) = self.ctx.authenticated_identity.as_ref() {
+            map.serialize_entry("authenticated_identity", identity)?;
+        }
+        if !self.headers.is_empty() {
+            map.serialize_entry("headers", &StrPairs(self.headers))?;
+        }
+        if !self.query_params.is_empty() {
+            map.serialize_entry("query_params", &StrPairs(self.query_params))?;
+        }
+        if let Some(body) = self.body.as_ref() {
+            map.serialize_entry("body", body)?;
+            map.serialize_entry(
+                "body_encoding",
+                if body.is_base64() { "base64" } else { "utf8" },
+            )?;
+            if let Some(content_type) = self.body_content_type {
+                map.serialize_entry("body_content_type", content_type)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// An API Gateway HTTP API proxy event, payload format 2.0
+/// (`payload_format: aws_api_gateway_v2`), built from the same finalized
+/// request view and fail-closed header/query/body selection as the Ferrum
+/// payload. Only configured `forward_headers` appear in `headers` /
+/// `cookies`, only an unambiguous forwarded query in `rawQueryString` /
+/// `queryStringParameters`, and the body only with `forward_body`.
+struct ApiGatewayV2Event<'a> {
+    ctx: &'a RequestContext,
+    raw_query_string: String,
+    cookies: Vec<&'a str>,
+    headers: &'a [(&'a str, &'a str)],
+    query_params: &'a [(&'a str, &'a str)],
+    user_agent: Option<&'a str>,
+    body: Option<PayloadBody<'a>>,
+}
+
+impl Serialize for ApiGatewayV2Event<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("version", "2.0")?;
+        map.serialize_entry("routeKey", "$default")?;
+        map.serialize_entry("rawPath", &self.ctx.path)?;
+        map.serialize_entry("rawQueryString", &self.raw_query_string)?;
+        if !self.cookies.is_empty() {
+            map.serialize_entry("cookies", &self.cookies)?;
+        }
+        map.serialize_entry("headers", &StrPairs(self.headers))?;
+        if !self.query_params.is_empty() {
+            map.serialize_entry("queryStringParameters", &StrPairs(self.query_params))?;
+        }
+        map.serialize_entry(
+            "requestContext",
+            &api_gateway_v2_request_context(self.ctx, self.user_agent),
+        )?;
+        if let Some(body) = self.body.as_ref() {
+            map.serialize_entry("body", body)?;
+        }
+        map.serialize_entry(
+            "isBase64Encoded",
+            &self.body.as_ref().is_some_and(PayloadBody::is_base64),
+        )?;
+        map.end()
+    }
+}
+
+/// The small `requestContext` object of a payload format 2.0 event. The
+/// gateway's authenticated consumer / identity ride as Lambda-authorizer
+/// context, the slot API Gateway uses for authorizer-supplied identity.
+fn api_gateway_v2_request_context(ctx: &RequestContext, user_agent: Option<&str>) -> Value {
+    let mut http = serde_json::Map::new();
+    http.insert("method".to_string(), Value::String(ctx.method.clone()));
+    http.insert("path".to_string(), Value::String(ctx.path.clone()));
+    http.insert("sourceIp".to_string(), Value::String(ctx.client_ip.clone()));
+    if let Some(user_agent) = user_agent {
+        http.insert(
+            "userAgent".to_string(),
+            Value::String(user_agent.to_string()),
+        );
+    }
+    let mut context = serde_json::Map::new();
+    context.insert("http".to_string(), Value::Object(http));
+    context.insert("routeKey".to_string(), Value::from("$default"));
+    context.insert("stage".to_string(), Value::from("$default"));
+    context.insert(
+        "time".to_string(),
+        Value::String(
+            ctx.timestamp_received
+                .format("%d/%b/%Y:%H:%M:%S %z")
+                .to_string(),
+        ),
+    );
+    context.insert(
+        "timeEpoch".to_string(),
+        Value::from(ctx.timestamp_received.timestamp_millis()),
+    );
+    let mut lambda = serde_json::Map::new();
+    if let Some(consumer) = ctx.identified_consumer.as_ref() {
+        lambda.insert(
+            "consumer_username".to_string(),
+            Value::String(consumer.username.clone()),
+        );
+    }
+    if let Some(identity) = ctx.authenticated_identity.as_ref() {
+        lambda.insert(
+            "authenticated_identity".to_string(),
+            Value::String(identity.clone()),
+        );
+    }
+    if !lambda.is_empty() {
+        let mut authorizer = serde_json::Map::new();
+        authorizer.insert("lambda".to_string(), Value::Object(lambda));
+        context.insert("authorizer".to_string(), Value::Object(authorizer));
+    }
+    Value::Object(context)
+}
+
+fn invalid_api_gateway_response(operator_detail: &'static str) -> InvocationFailure {
+    InvocationFailure::function_output(INVALID_API_GATEWAY_RESPONSE, operator_detail)
+}
+
+fn append_api_gateway_header(
+    headers: &mut http::HeaderMap,
+    name: &str,
+    value: &str,
+) -> Result<(), InvocationFailure> {
+    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+        invalid_api_gateway_response(
+            "API Gateway response header name is not a valid HTTP field name",
+        )
+    })?;
+    let value = HeaderValue::from_str(value).map_err(|_| {
+        invalid_api_gateway_response(
+            "API Gateway response header value is not a valid HTTP field value",
+        )
+    })?;
+    headers.append(name, value);
+    Ok(())
+}
+
+/// Map a Lambda result written for an API Gateway proxy integration to the
+/// client response, following the payload format 2.0 rules:
+///
+/// - A JSON object with `statusCode` is a structured response: `statusCode`
+///   (an integer in 200-599, the statuses terminate mode returns), optional
+///   `headers` (string values), `multiValueHeaders` (arrays of strings),
+///   `cookies` (one `Set-Cookie` each), `body` (a string), and
+///   `isBase64Encoded` (decode `body` from standard base64). Other members are
+///   ignored, as API Gateway ignores them.
+/// - Any other JSON value is returned as-is with status 200 and
+///   `content-type: application/json`.
+///
+/// The bytes are screened for duplicate members first: which `statusCode`,
+/// `headers`, or `body` the gateway honors must not depend on the parser.
+/// Mapped headers go through the same sanitization as provider response headers
+/// (hop-by-hop, credential, provider-control, and signed-URL leak screening).
+/// Malformed output is refused with a fixed class and never echoed.
+fn api_gateway_v2_terminate_response(
+    body: Bytes,
+    function_destination: &FunctionDestination,
+) -> Result<(u16, HashMap<String, String>, Bytes), InvocationFailure> {
+    if crate::util::json_dup_keys::slice_ambiguity(&body).is_some() {
+        return Err(invalid_api_gateway_response(
+            "API Gateway response is ambiguous (duplicate JSON members or scan budget exceeded)",
+        ));
+    }
+    let parsed: Value = serde_json::from_slice(&body)
+        .map_err(|_| invalid_api_gateway_response("API Gateway response is not valid JSON"))?;
+    let Some(object) = parsed
+        .as_object()
+        .filter(|object| object.contains_key("statusCode"))
+    else {
+        let mut headers = HashMap::with_capacity(1);
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        return Ok((200, headers, body));
+    };
+
+    let status = object
+        .get("statusCode")
+        .and_then(Value::as_u64)
+        .filter(|status| (200..=599).contains(status))
+        .ok_or_else(|| {
+            invalid_api_gateway_response(
+                "API Gateway `statusCode` must be an integer in the range 200-599",
+            )
+        })?;
+    // Lossless: the range check above bounds it to 599.
+    let status = status as u16;
+
+    let mut header_map = http::HeaderMap::new();
+    if let Some(headers) = object.get("headers") {
+        let headers = headers.as_object().ok_or_else(|| {
+            invalid_api_gateway_response("API Gateway `headers` must be an object")
+        })?;
+        for (name, value) in headers {
+            let value = value.as_str().ok_or_else(|| {
+                invalid_api_gateway_response("API Gateway `headers` values must be strings")
+            })?;
+            append_api_gateway_header(&mut header_map, name, value)?;
+        }
+    }
+    if let Some(headers) = object.get("multiValueHeaders") {
+        let headers = headers.as_object().ok_or_else(|| {
+            invalid_api_gateway_response("API Gateway `multiValueHeaders` must be an object")
+        })?;
+        for (name, values) in headers {
+            let values = values.as_array().ok_or_else(|| {
+                invalid_api_gateway_response(
+                    "API Gateway `multiValueHeaders` values must be arrays of strings",
+                )
+            })?;
+            for value in values {
+                let value = value.as_str().ok_or_else(|| {
+                    invalid_api_gateway_response(
+                        "API Gateway `multiValueHeaders` values must be arrays of strings",
+                    )
+                })?;
+                append_api_gateway_header(&mut header_map, name, value)?;
+            }
+        }
+    }
+    if let Some(cookies) = object.get("cookies") {
+        let cookies = cookies.as_array().ok_or_else(|| {
+            invalid_api_gateway_response("API Gateway `cookies` must be an array of strings")
+        })?;
+        for cookie in cookies {
+            let cookie = cookie.as_str().ok_or_else(|| {
+                invalid_api_gateway_response("API Gateway `cookies` must be an array of strings")
+            })?;
+            append_api_gateway_header(&mut header_map, "set-cookie", cookie)?;
+        }
+    }
+
+    let is_base64_encoded = match object.get("isBase64Encoded") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(invalid_api_gateway_response(
+                "API Gateway `isBase64Encoded` must be a boolean",
+            ));
+        }
+    };
+    let response_body = match object.get("body") {
+        None => Bytes::new(),
+        Some(Value::String(text)) if is_base64_encoded => {
+            // Never larger than the already size-capped function response.
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(text.as_bytes())
+                .map_err(|_| {
+                    invalid_api_gateway_response(
+                        "API Gateway `body` must be standard base64 when `isBase64Encoded` is true",
+                    )
+                })?;
+            Bytes::from(decoded)
+        }
+        Some(Value::String(text)) => Bytes::copy_from_slice(text.as_bytes()),
+        Some(_) => {
+            return Err(invalid_api_gateway_response(
+                "API Gateway `body` must be a string",
+            ));
+        }
+    };
+
+    let headers = sanitize_function_response_headers(&header_map, function_destination);
+    Ok((status, headers, response_body))
+}
+
+/// A bounded, credential-free AWS error type for operator diagnostics: the
+/// `x-amzn-ErrorType` exception name (for example `TooManyRequestsException`),
+/// without the URI suffix AWS may append and without any message text.
+fn lambda_error_type(headers: &http::HeaderMap) -> Option<String> {
+    const MAX_ERROR_TYPE_CHARS: usize = 64;
+    let value = headers.get("x-amzn-errortype")?.to_str().ok()?;
+    let name: String = value
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .take(MAX_ERROR_TYPE_CHARS)
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The AWS SDK default credential chain for `region`.
+#[cfg(feature = "secrets-aws")]
+fn aws_default_chain_fetcher(region: &str) -> Result<AwsCredentialFetcher, String> {
+    Ok(super::utils::aws_refreshing_credentials::aws_default_chain_fetcher(region))
+}
+
+/// Builds without `secrets-aws` carry no AWS SDK credential chain, so a
+/// serving node refuses the row instead of admitting one that cannot sign.
+#[cfg(not(feature = "secrets-aws"))]
+fn aws_default_chain_fetcher(_region: &str) -> Result<AwsCredentialFetcher, String> {
+    Err(
+        "serverless_function: `aws_credentials: default_chain` requires a build with the \
+         `secrets-aws` (or `cloud-secrets`) Cargo feature, which this binary was built without"
+            .to_string(),
+    )
 }
 
 #[derive(Clone)]
@@ -3181,20 +3892,14 @@ fn build_native_grpc_terminate_response(
 
 /// Sign an AWS Lambda Invoke API request using SigV4.
 /// Returns the headers that must be added to the request.
-fn sign_aws_request(
-    aws: &AwsLambdaConfig,
+fn sign_lambda_request(
+    config: &aws_sigv4::AwsSigV4Config,
     url_str: &str,
     payload: &[u8],
     now: &chrono::DateTime<Utc>,
 ) -> Result<Vec<(String, String)>, String> {
-    let config = aws_sigv4::AwsSigV4Config {
-        region: aws.region.clone(),
-        access_key_id: aws.access_key_id.clone(),
-        secret_access_key: aws.secret_access_key.clone(),
-        session_token: aws.session_token.clone(),
-    };
     aws_sigv4::sign_request(
-        &config,
+        config,
         "lambda",
         "POST",
         url_str,
@@ -3246,6 +3951,19 @@ pub mod test_helpers {
             payload,
             now,
         )
+    }
+
+    /// Serving-node construction with `fetcher` standing in for the AWS SDK
+    /// default chain of an `aws_credentials: default_chain` row, so the
+    /// refreshing-credential path is exercised in every build, including one
+    /// without the `secrets-aws` feature. Every other admission rule —
+    /// including the ambient endpoint scope — applies unchanged.
+    pub fn new_with_default_chain_fetcher_test(
+        config: &Value,
+        http_client: PluginHttpClient,
+        fetcher: AwsCredentialFetcher,
+    ) -> Result<ServerlessFunction, String> {
+        ServerlessFunction::construct(config, http_client, DEFAULT_INSTANCE_ID, Some(fetcher))
     }
 
     pub fn frame_uncompressed_unary_grpc_message_test(message: &[u8]) -> Result<Bytes, String> {
@@ -3455,6 +4173,19 @@ impl Plugin for ServerlessFunction {
         let native_grpc_terminate =
             self.mode == InvocationMode::Terminate && is_native_grpc_terminate_request(ctx);
 
+        // A native gRPC client needs the framed unary terminate contract; an
+        // API Gateway proxy response cannot express it.
+        if native_grpc_terminate && self.payload_format == PayloadFormat::AwsApiGatewayV2 {
+            return self.pre_invocation_failure_result(
+                ctx,
+                InvocationFailure::governed_input(
+                    "unsupported_grpc_payload_format",
+                    "native gRPC terminate requests are not supported with \
+                     `payload_format: aws_api_gateway_v2`",
+                ),
+            );
+        }
+
         let payload = match self.build_invocation_payload(ctx, headers, body) {
             Ok(payload) => payload,
             Err(failure) => return self.pre_invocation_failure_result(ctx, failure),
@@ -3472,7 +4203,7 @@ impl Plugin for ServerlessFunction {
             }
         }
 
-        let (status, response_headers, body) = match self.invoke(&payload, ctx).await {
+        let (status, response_headers, body) = match self.invoke(payload, ctx).await {
             Ok(result) => result,
             Err(failure) if failure.proven_pre_wire => {
                 // The outbound request never reached the function, so no external
@@ -3566,15 +4297,28 @@ impl Plugin for ServerlessFunction {
                     }
                 }
 
-                if !(200..=599).contains(&status) {
-                    return self.failure_result(
-                        ctx,
-                        InvocationFailure::new(
-                            "invalid_function_status",
-                            format!("function returned non-final status {status}"),
-                        ),
-                    );
-                }
+                let (status, response_headers, body) = match self.payload_format {
+                    PayloadFormat::Ferrum => {
+                        if !(200..=599).contains(&status) {
+                            return self.failure_result(
+                                ctx,
+                                InvocationFailure::new(
+                                    "invalid_function_status",
+                                    format!("function returned non-final status {status}"),
+                                ),
+                            );
+                        }
+                        (status, response_headers, body)
+                    }
+                    // The Invoke API answered 200; the client response is the
+                    // proxy-integration result the function returned.
+                    PayloadFormat::AwsApiGatewayV2 => {
+                        match api_gateway_v2_terminate_response(body, &self.function_destination) {
+                            Ok(mapped) => mapped,
+                            Err(failure) => return self.failure_result(ctx, failure),
+                        }
+                    }
+                };
                 // Return the function's response directly to the client
                 debug!(
                     "serverless_function: terminate mode — returning function response (status {})",

@@ -33396,7 +33396,12 @@ components:
         pre_proxy accepts only 2xx as approval, while terminate may
         intentionally return only final 2xx-5xx statuses (200-599).
         Informational and out-of-range three-digit function statuses follow the
-        configured error path.
+        configured error path. For aws_lambda, every non-2xx Lambda Invoke API
+        status (throttling, access denied, a missing function, an oversized
+        payload, a service fault) is authored by the Lambda service rather than
+        by the function, so it is an invocation failure
+        (`lambda_service_error`) under `on_error` / `error_status_code` in
+        every mode, and the AWS error body is never returned.
       required:
         - provider
       properties:
@@ -33422,10 +33427,11 @@ components:
           description: "AWS region (aws_lambda only). Falls back to AWS_DEFAULT_REGION, then AWS_REGION env vars. The default endpoint is partition-aware: cn-* regions derive lambda.<region>.amazonaws.com.cn and every other region derives lambda.<region>.amazonaws.com. The air-gapped ISO partitions and the AWS European Sovereign Cloud are not derived and require an explicit aws_endpoint_url. When the key id or secret resolves from the process environment, the region must be a lowercase commercial, GovCloud, or China region (see allow_custom_endpoint_with_ambient_credentials)."
         aws_access_key_id:
           type: string
-          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "IAM access key (aws_lambda only). Falls back to AWS_ACCESS_KEY_ID env var. The key id is interpolated into the SigV4 Authorization header, so the effective config or environment value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab); validated whenever supplied, whichever provider is selected. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials). Not allowed with aws_credentials: default_chain."
         aws_secret_access_key:
           type: string
-          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+          description: "IAM secret key (aws_lambda only). Falls back to AWS_SECRET_ACCESS_KEY env var. A process-environment credential may only be signed for an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials). Not allowed with aws_credentials: default_chain."
         aws_function_name:
           type: string
           minLength: 1
@@ -33434,7 +33440,8 @@ components:
           description: "Lambda function name, partial ARN, or full ARN (aws_lambda only), matching the Lambda Invoke API FunctionName grammar. Falls back to AWS_LAMBDA_FUNCTION_NAME env var; the environment value is held to the same grammar. Validated whenever supplied, whichever provider is selected. Existence and invoke permission are not checked at admission."
         aws_session_token:
           type: string
-          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. A process-environment token may only be sent to an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials)."
+          pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
+          description: "STS session token (aws_lambda only). Falls back to AWS_SESSION_TOKEN env var only when aws_access_key_id and aws_secret_access_key also resolve from the environment; the environment token is never paired with a config key pair. Sent verbatim as x-amz-security-token, so the effective value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab). A process-environment token may only be sent to an official AWS Lambda endpoint (see allow_custom_endpoint_with_ambient_credentials). Not allowed with aws_credentials: default_chain."
         aws_qualifier:
           type: string
           minLength: 1
@@ -33460,6 +33467,32 @@ components:
             field); an `AWS_LAMBDA_ENDPOINT_URL` fallback is set by the same
             environment owner and is trusted like the environment
             credentials.
+        aws_credentials:
+          type: string
+          enum: [static, default_chain]
+          default: static
+          description: >-
+            aws_lambda only. `static` (default) signs with a literal key pair
+            from the config or from the AWS_ACCESS_KEY_ID /
+            AWS_SECRET_ACCESS_KEY (and AWS_SESSION_TOKEN) environment
+            variables, resolved once when the plugin is built.
+            `default_chain` signs with the gateway process's own AWS identity
+            from the AWS SDK default credential chain — environment variables,
+            shared config/credentials profiles, web identity (EKS IRSA), ECS
+            container credentials, and EC2 instance metadata (IMDSv2) — cached
+            and refreshed in the background before expiry, so temporary
+            workload credentials keep working without a reload. A request
+            waits (bounded) only when no usable credential is cached;
+            expired credentials are never used, and an unavailable chain is an
+            invocation failure (`aws_credentials_unavailable`) under
+            `on_error`. `default_chain` may not be combined with
+            aws_access_key_id, aws_secret_access_key, or aws_session_token,
+            and is subject to the same ambient endpoint scope as
+            process-environment credentials (see
+            allow_custom_endpoint_with_ambient_credentials). It requires a
+            build with the `secrets-aws` (or `cloud-secrets`) Cargo feature:
+            CP/admin shape-only admission accepts the row, and a serving node
+            built without the feature refuses to construct it.
         allow_custom_endpoint_with_ambient_credentials:
           type: boolean
           default: false
@@ -33467,7 +33500,8 @@ components:
             aws_lambda only. When `aws_access_key_id` or
             `aws_secret_access_key` is omitted from the config and resolves
             from the gateway process environment (`AWS_SESSION_TOKEN` is then
-            used too; it never completes a config key pair), `aws_region` must
+            used too; it never completes a config key pair), or when
+            `aws_credentials` is `default_chain`, `aws_region` must
             be a lowercase commercial, GovCloud, or China region, and the
             config-chosen Lambda endpoint (the host derived from `aws_region`,
             or the `aws_endpoint_url` override) must be an official AWS Lambda
@@ -33498,6 +33532,29 @@ components:
           type: string
           pattern: '^[^\x00-\x08\x0A-\x1F\x7F]*$'
           description: "Bearer token for Authorization header (gcp_cloud_functions only). Falls back to the FERRUM_PLUGIN_SECRET_GCP_CLOUD_FUNCTIONS_BEARER_TOKEN env var (never the ambient GCP_CLOUD_FUNCTIONS_BEARER_TOKEN). The assembled `Bearer <token>` value must be representable as an HTTP field value (no NUL, CR, LF, or other control byte except horizontal tab) and is parsed at admission. Validated whenever supplied, whichever provider is selected."
+        payload_format:
+          type: string
+          enum: [ferrum, aws_api_gateway_v2]
+          default: ferrum
+          description: >-
+            `ferrum` (default) sends the Ferrum invocation payload and uses the
+            Ferrum response contracts. `aws_api_gateway_v2` (aws_lambda with
+            mode terminate only) sends an API Gateway HTTP API proxy event,
+            payload format 2.0 (`version`, `routeKey`, `rawPath`,
+            `rawQueryString`, `cookies`, `headers`, `queryStringParameters`,
+            `requestContext`, `body`, `isBase64Encoded`), built from the same
+            finalized request view and the same fail-closed forward_headers /
+            forward_query_params / forward_body selection, and maps the
+            function result like an API Gateway proxy integration: a JSON
+            object with `statusCode` (integer 200-599) is a structured
+            response with optional `headers`, `multiValueHeaders`, `cookies`
+            (one Set-Cookie each), `body`, and `isBase64Encoded`; any other
+            JSON value is returned with status 200 and content-type
+            application/json. Mapped headers are sanitized like provider
+            response headers. A duplicate-member or malformed result fails
+            with `invalid_api_gateway_response` under `on_error`. Native gRPC
+            terminate requests are refused before invocation with
+            `unsupported_grpc_payload_format`.
         forward_body:
           type: boolean
           default: false
@@ -33517,16 +33574,16 @@ components:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 900000
           default: 5000
-          description: "Function invocation timeout in milliseconds. Must be > 0 and representable as a u64; a larger integer is rejected before the plugin constructor sees it."
+          description: "Function invocation timeout in milliseconds, 1-900000 (15 minutes, the AWS Lambda synchronous invocation maximum). A larger value is rejected at admission."
         max_response_body_bytes:
           type: integer
           format: uint64
           minimum: 1
-          maximum: 18446744073709551615
+          maximum: 67108864
           default: 10485760
-          description: "Max function response body size (10 MiB default). Must be > 0 and representable as a u64 (and as a usize on the serving platform); a larger integer is rejected before the plugin constructor sees it."
+          description: "Max function response body size (10 MiB default), 1-67108864 (64 MiB). The response is buffered whole, so this is the per-invocation retained-memory ceiling; a larger value is rejected at admission."
         on_error:
           type: string
           enum: [reject, continue]
@@ -33554,6 +33611,31 @@ components:
             properties:
               function_url:
                 type: string
+        # The API Gateway proxy contract is a Lambda terminate contract.
+        - if:
+            required: [payload_format]
+            properties:
+              payload_format:
+                const: aws_api_gateway_v2
+          then:
+            required: [provider, mode]
+            properties:
+              provider:
+                const: aws_lambda
+              mode:
+                const: terminate
+        # The default chain supplies the credentials; literal ones conflict.
+        - if:
+            required: [aws_credentials]
+            properties:
+              aws_credentials:
+                const: default_chain
+          then:
+            not:
+              anyOf:
+                - required: [aws_access_key_id]
+                - required: [aws_secret_access_key]
+                - required: [aws_session_token]
         # Cleartext to anything but a loopback IP literal needs the opt-in.
         - if:
             required: [function_url]
