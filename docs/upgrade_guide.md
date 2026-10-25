@@ -28,6 +28,26 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### Consumer JWT secrets: unique per namespace, 32 non-whitespace characters (#6865)
+
+Each Consumer now needs its own `jwt` secret within a namespace. Writes and
+file-mode loading refuse a secret that another Consumer in the namespace
+already has. On a database, CP, or DP load, every Consumer that shares a JWT
+secret loses its `jwt` credential and gets `401` from `jwt_auth` until you
+rotate the secret. Each removal is logged at `error` as `Quarantined jwt
+credential of consumer ...`. The same happens to stored `jwt` secrets with
+fewer than 32 non-whitespace characters (whitespace no longer counts toward the
+floor) and to malformed stored `jwt` values, which previously loaded with only
+a validation warning. Before upgrading:
+- give every Consumer a distinct CSPRNG secret of at least 32 non-whitespace
+  characters;
+- rotate any secret that was copied across Consumers.
+
+Rotation entries inside one Consumer and reuse across namespaces are still
+allowed. `jwt_auth` also gains `algorithm` (`HS256` default) and
+`hide_credentials` (default `false`); existing configurations keep their
+behavior. See [plugins.md](plugins.md#jwt_auth).
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now

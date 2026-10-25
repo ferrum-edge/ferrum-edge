@@ -391,6 +391,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING: Consumer JWT secrets must be unique per namespace and carry 32
+  non-whitespace characters** (issue #6865). `jwt_auth` picks the verifying
+  Consumer from the token's signer-chosen identity claim, so a secret shared
+  by two Consumers let either sign as the other. Create, update, batch,
+  restore, the credential endpoints, and file-mode loading now refuse a `jwt`
+  secret already configured on another Consumer in the namespace. SQL/Mongo
+  full loads, CP snapshots and deltas, and every runtime swap quarantine
+  shared secrets on **every** holder (no first-loaded winner), along with weak
+  or malformed stored `jwt` credentials that used to load behind a warning.
+  The verifier also never checks a signature against a sub-floor stored
+  secret. Whitespace no longer counts toward the 32-character floor.
+- `jwt_auth` gains `algorithm` (`HS256` default, `HS384`, `HS512`), pinned by
+  configuration and never taken from the token header, and `hide_credentials`
+  (default `false`), which strips a `Bearer` `Authorization` value, a custom
+  token header, or a query token before forwarding (#6865). An unknown token
+  identity now spends one discarded verification, so timing does not reveal
+  which Consumers exist, and its debug log no longer echoes the unverified
+  identity claim.
+
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
