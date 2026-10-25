@@ -349,7 +349,17 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             secret(&["azure_function_key"]),
         ],
     ),
-    ("response_mock", NONE),
+    (
+        "response_mock",
+        // `rules[].match` values select which requests receive a mock;
+        // operators may target with a shared secret or a credential-bearing
+        // header / query parameter, so every condition value is secret.
+        // Response `headers` and `body` are static mock content.
+        &[
+            secret(&["rules", "*", "match", "headers", "*"]),
+            secret(&["rules", "*", "match", "query_params", "*"]),
+        ],
+    ),
     ("grpc_deadline", NONE),
     ("load_testing", NONE),
     ("request_mirror", NONE),

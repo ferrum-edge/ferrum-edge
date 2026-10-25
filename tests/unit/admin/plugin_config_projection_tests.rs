@@ -1335,6 +1335,37 @@ fn placeholder_outside_a_masked_site_is_not_reported() {
 }
 
 #[test]
+fn response_mock_match_values_are_secret_and_mock_content_stays_visible() {
+    let projected = project(
+        "response_mock",
+        json!({
+            "rules": [
+                {
+                    "path": "/users",
+                    "match": {
+                        "headers": {"x-tenant-token": "rm-header-canary"},
+                        "query_params": {"page": "rm-query-canary"}
+                    },
+                    "status_code": 200,
+                    "headers": {"x-mock": "visible"},
+                    "body": "[]"
+                },
+                {"path": "/plain", "body": "plain-body"}
+            ]
+        }),
+    );
+    let rules = projected["rules"].as_array().expect("rules stay an array");
+    assert_eq!(rules[0]["match"]["headers"]["x-tenant-token"], REDACTED);
+    assert_eq!(rules[0]["match"]["query_params"]["page"], REDACTED);
+    assert_eq!(rules[0]["path"], "/users");
+    assert_eq!(rules[0]["status_code"], 200);
+    assert_eq!(rules[0]["headers"]["x-mock"], "visible");
+    assert_eq!(rules[0]["body"], "[]");
+    assert_eq!(rules[1]["body"], "plain-body");
+    assert_no_canaries(&projected, &["rm-header-canary", "rm-query-canary"]);
+}
+
+#[test]
 fn request_transformer_rule_values_are_secret_for_every_target() {
     let projected = project(
         "request_transformer",

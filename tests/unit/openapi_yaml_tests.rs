@@ -15828,11 +15828,47 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     let status_one_of = rule["properties"]["status_code"]["oneOf"]
         .as_array()
         .expect("status_code oneOf");
-    assert_eq!(status_one_of.len(), 3);
+    assert_eq!(status_one_of.len(), 2);
     assert_eq!(status_one_of[0]["type"], "null");
-    assert_eq!(status_one_of[1]["const"], 101);
-    assert_eq!(status_one_of[2]["minimum"], 200);
-    assert_eq!(status_one_of[2]["maximum"], 599);
+    assert_eq!(status_one_of[1]["minimum"], 200);
+    assert_eq!(status_one_of[1]["maximum"], 599);
+    assert_eq!(
+        schema["properties"]["rules"]["maxItems"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_RULES
+    );
+    assert_eq!(
+        rule["properties"]["body"]["maxLength"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_BODY_BYTES
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["maxProperties"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_HEADERS_PER_RULE
+    );
+    assert_eq!(
+        rule["properties"]["headers"]["additionalProperties"]["maxLength"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_HEADER_VALUE_BYTES
+    );
+    let match_schema = &rule["properties"]["match"];
+    assert_eq!(match_schema["additionalProperties"], false);
+    let match_fields: BTreeSet<_> = match_schema["properties"]
+        .as_object()
+        .expect("ResponseMock match properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_match_fields: BTreeSet<_> =
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MATCH_KEYS
+            .iter()
+            .copied()
+            .collect();
+    assert_eq!(match_fields, runtime_match_fields);
+    for field in ["headers", "query_params"] {
+        assert_eq!(
+            match_schema["properties"][field]["maxProperties"],
+            ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_MATCH_CONDITIONS,
+            "{field}"
+        );
+    }
     assert_eq!(
         rule["properties"]["headers"]["type"],
         json!(["object", "null"])
@@ -15860,7 +15896,11 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         json!(["integer", "null"])
     );
     assert_eq!(rule["properties"]["delay_ms"]["minimum"], 0);
-    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 3600000);
+    assert_eq!(
+        rule["properties"]["delay_ms"]["maximum"],
+        ferrum_edge::plugins::response_mock::RESPONSE_MOCK_MAX_DELAY_MS
+    );
+    assert_eq!(rule["properties"]["delay_ms"]["maximum"], 60000);
     assert_eq!(
         schema["properties"]["passthrough_on_no_match"]["type"],
         json!(["boolean", "null"])
@@ -15886,16 +15926,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         .as_str()
         .expect("status_code description");
     assert!(
-        status_desc.contains("informational") && status_desc.contains("rejected"),
+        status_desc.contains("Informational statuses (100–199, including 101)")
+            && status_desc.contains("rejected"),
         "status_code must document informational rejection: {status_desc}"
     );
     assert!(
         status_desc.contains("101") && status_desc.contains("200–599"),
-        "status_code must document 101 + final range: {status_desc}"
+        "status_code must document 101 rejection + final range: {status_desc}"
     );
     assert!(
-        status_desc.contains("ordinary HTTP request") && status_desc.contains("500"),
-        "status_code must document the non-WebSocket 101 failure: {status_desc}"
+        status_desc.contains("WebSocket handshake") && status_desc.contains("500"),
+        "status_code must document the WebSocket 2xx refusal: {status_desc}"
     );
     let body_desc = rule["properties"]["body"]["description"]
         .as_str()
@@ -15926,12 +15967,17 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             "rules": [{
                 "method": "GET",
                 "path": "/users",
-                "status_code": 101,
+                "match": {
+                    "headers": {"x-scenario": "empty"},
+                    "query_params": {"page": "2"}
+                },
+                "status_code": 201,
                 "headers": {"x-mock": "true", "content-type": "text/plain"},
                 "body": "ok",
                 "delay_ms": 0
             }]
         }),
+        json!({"rules": [{"path": "/", "match": null}]}),
         json!({
             "passthrough_on_no_match": null,
             "rules": [{
@@ -15957,7 +16003,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "body": "must-not-be-sent"
             }]
         }),
-        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 60000}]}),
     ] {
         assert_component_validity(&spec, "ResponseMockConfig", &valid, true);
         assert!(
@@ -15983,7 +16029,14 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         json!({"rules": [{"path": "/health", "status_code": 199, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
         json!({"rules": [{"path": "/", "delay_ms": -1}]}),
-        json!({"rules": [{"path": "/", "delay_ms": 3600001}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 60001}]}),
+        json!({"rules": [{"path": "/", "delay_ms": 3600000}]}),
+        json!({"rules": [{"path": "/health", "status_code": 101, "body": ""}]}),
+        json!({"rules": [{"path": "/", "match": {}}]}),
+        json!({"rules": [{"path": "/", "match": {"headers": {}}}]}),
+        json!({"rules": [{"path": "/", "match": {"header": {"x-a": "1"}}}]}),
+        json!({"rules": [{"path": "/", "match": {"query_params": {"": "1"}}}]}),
+        json!({"rules": [{"path": "/", "body": "b".repeat(262_145)}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
         json!({}),
@@ -16018,11 +16071,12 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("Host-only"));
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
-    assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Unknown top-level, per-rule, and `match` keys are rejected"));
     assert!(guide.contains("Omitted or explicit `null`"));
-    assert!(guide.contains("0`–`3600000"));
+    assert!(guide.contains("0`–`60000"));
+    assert!(guide.contains("FERRUM_MAX_CONCURRENT_FAULT_DELAYS"));
     assert!(guide.contains("Status / body wire semantics"));
-    assert!(guide.contains("informational statuses"));
+    assert!(guide.contains("Informational statuses (`100`–`199`, including `101`) are rejected"));
     assert!(guide.contains("Native gRPC exclusion"));
     assert!(guide.contains("native gRPC unsupported"));
 
