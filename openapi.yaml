@@ -34142,11 +34142,13 @@ components:
             examples:
               type: array
               minItems: 1
+              maxItems: 64
               items:
                 type: string
                 minLength: 1
+                maxLength: 2048
                 pattern: "\\S"
-              description: Customer semantic examples for this built-in pack. Each entry must contain a non-whitespace character; surrounding whitespace is trimmed. Required when examples_mode is replace.
+              description: Customer semantic examples for this built-in pack (at most 64, each at most 2048 characters). Each entry must contain a non-whitespace character; surrounding whitespace is trimmed. Required when examples_mode is replace.
           description: Object form for tuning a built-in AI semantic firewall pack. The pack keeps its built-in rule id, pack metadata, and compiled-in matching behavior either way.
       description: Built-in pack toggle or tuning object.
 
@@ -34885,7 +34887,7 @@ components:
     AiSemanticFirewallConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata. An enabled instance must carry a provider, at least one active rule source, and rules that apply to the enabled inspection directions; a disabled instance (enabled: false) is exempt from those cross-field requirements but every block it DOES carry is still validated, matching the constructor. Three relationships standard JSON Schema cannot express and ferrum-edge validate still rejects with a field-specific error: streaming.overlap_bytes must be strictly less than streaming.max_window_bytes; streaming.overlap_tokens must be strictly less than streaming.max_window_tokens; and every allow_topics/deny_topics/custom_rules id must be unique across those three lists AND against the ids of the ACTIVE built-in packs (prompt_injection, jailbreak, system_prompt_exfiltration, data_exfiltration, indirect_prompt_injection, tool_abuse, response_leakage). A rule id is an operator-facing label only — naming a custom or deny-topic rule after a disabled built-in pack does not give it that built-in's matching behavior."
+      description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata. An enabled instance must carry a provider, at least one active rule source, and rules that apply to the enabled inspection directions; a disabled instance (enabled: false) is exempt from those cross-field requirements but every block it DOES carry is still validated, matching the constructor. Three relationships standard JSON Schema cannot express and ferrum-edge validate still rejects with a field-specific error: streaming.overlap_bytes must be strictly less than streaming.max_window_bytes; streaming.overlap_tokens must be strictly less than streaming.max_window_tokens; and every allow_topics/deny_topics/custom_rules id must be unique across those three lists AND against the ids of the ACTIVE built-in packs (prompt_injection, jailbreak, system_prompt_exfiltration, data_exfiltration, indirect_prompt_injection, tool_abuse, response_leakage). A rule id is an operator-facing label only — naming a custom or deny-topic rule after a disabled built-in pack does not give it that built-in's matching behavior. A fourth constructor-only bound: the ACTIVE rule material (built-in packs, allow_topics, deny_topics, custom_rules) may carry at most 512 examples in total, because every example is embedded when the rule index is built."
       allOf:
         - if:
             required: [enabled]
@@ -35010,11 +35012,11 @@ components:
         fail_on_uninspectable_body:
           type: boolean
           default: true
-          description: When true, missing, empty, malformed, encoded, oversized, or governed LLM JSON with no extractable content is handled through on_error (rejecting by default in enforce mode). Set false only as an explicit compatibility opt-out on a generic shared JSON proxy that intentionally forwards such bodies uninspected.
+          description: When true, missing, empty, malformed, encoded, oversized (above the 10 MiB inspection ceiling), governed LLM JSON with no extractable content, or a body yielding more than 1024 segments is handled through on_error (rejecting by default in enforce mode). In enforce mode with on_error=reject this also caps buffered governed request bodies at 10 MiB, refused at collection. Set false only as an explicit compatibility opt-out on a generic shared JSON proxy that intentionally forwards such bodies uninspected.
         streaming_response:
           type: string
           enum: [skip, reject, buffer, inspect]
-          description: "Behavior for stream:true requests when response-side inspection is active. The default is conditional and is NOT advertised as a static schema default on purpose: when omitted, enforce mode with response-side rules active defaults to reject (clients cannot bypass response inspection by streaming) while dry_run or request-only configurations default to skip. Tooling that materializes OpenAPI defaults must leave this field unset to inherit the correct default — sending an explicit reject for a dry_run/request-only config would flip request-body buffering on (requires_request_body_before_before_proxy) and buffer every JSON POST just to read the stream flag, unlike the omitted-field behavior. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject."
+          description: "Behavior for stream:true requests when response-side inspection is active. The default is conditional and is NOT advertised as a static schema default on purpose: when omitted, enforce mode with response-side rules active defaults to reject (clients cannot bypass response inspection by streaming) while dry_run or request-only configurations default to skip. Tooling that materializes OpenAPI defaults must leave this field unset to inherit the correct default — sending an explicit reject for a dry_run/request-only config would flip request-body buffering on (requires_request_body_before_before_proxy) and buffer every JSON POST just to read the stream flag, unlike the omitted-field behavior. skip is an explicit fail-open opt-out that allows the streamed response uninspected and records ai_semantic_firewall.response_inspection_skipped when the request body is available; reject fails closed and rejects the request so a client cannot disable response inspection by streaming — clients retry with stream:false to receive an inspectable buffered response; buffer forces the streamed response onto the buffered path, reassembles its SSE deltas into coherent text, and runs the full response engine before anything reaches the client (most accurate, highest time-to-first-byte; an oversized stream fails closed via FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES); inspect inspects the stream progressively in windows (reassemble to a sentence/paragraph or byte-cap boundary, inspect, release if clean) and cuts the stream mid-flight on a violation with a terminal SSE error event — preserves streaming UX (low time-to-first-byte) at the cost of windowed granularity plus a per-window inspection. inspect records ai_semantic_firewall.response_inspection=streaming_windowed. Production enforcement should use reject, buffer, or inspect with on_error=reject. A stream is DECLARED by a body stream:true or by a streaming request target (Gemini/Vertex :streamGenerateContent, Bedrock converse-stream / invoke-with-response-stream). A governed AI request that did not declare one but receives a text/event-stream response anyway (a backend that streams by default) is still governed: buffer and reject keep it buffered and inspect it whole, inspect windows it; an NDJSON stream (Ollama application/x-ndjson) is buffered and reassembled under every non-skip policy, and a Bedrock application/vnd.amazon.eventstream body fails closed through on_error."
         streaming:
           type: object
           additionalProperties: false
@@ -35064,6 +35066,7 @@ components:
               type: integer
               format: uint
               minimum: 1
+              maximum: 1048576
               default: 4096
               description: "Hard aggregate cap for the current window's input and retained raw/frame/reassembled state. Coalesced chunks are expanded event-by-event: only one complete event's bytes are taken at a time and a ready window is inspected and released before more events are absorbed, so transport batching never changes a clean completion's disposition. Only an event that cannot fit with nothing else retained is uninspectable (fails closed under on_error=reject, forwarded under warn/allow). The start of an event kept after a fail-open hold timeout forwarded it (see on_hold_timeout) counts toward the cap together with the rest of that event; when the two do not fit together, the rest of that event is uninspectable."
             overlap_bytes:
@@ -35087,8 +35090,9 @@ components:
               type: integer
               format: uint
               minimum: 1
+              maximum: 10000
               default: 64
-              description: Safety cap on provider inspections per response. Once reached, further inspectable windows honor on_error (reject cuts/fail-closed; warn/allow forward best-effort).
+              description: Safety cap on provider inspections per response (at most 10000). Once reached, further inspectable windows honor on_error (reject cuts/fail-closed; warn/allow forward best-effort).
             on_violation:
               type: string
               enum: [cut_with_error_event, cut_silent]
@@ -35126,6 +35130,22 @@ components:
             properties:
               allow_plaintext:
                 const: true
+          # auth_header / auth_scheme shape the credential, so they need one.
+          allOf:
+            - if:
+                required: [auth_header]
+              then:
+                required: [api_key_env]
+                properties:
+                  api_key_env:
+                    pattern: '\S'
+            - if:
+                required: [auth_scheme]
+              then:
+                required: [api_key_env]
+                properties:
+                  api_key_env:
+                    pattern: '\S'
           properties:
             type:
               type: string
@@ -35147,13 +35167,34 @@ components:
               type: string
               maxLength: 256
               pattern: '^\s*(?!\S*_(?:FILE|VAULT|AWS|AZURE|GCP)\s*$)FERRUM_PLUGIN_SECRET_[A-Z_][A-Z0-9_]*\s*$|^\s*$'
-              description: "Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key (`<NAME>` uppercase `[A-Z_][A-Z0-9_]*`; surrounding whitespace is trimmed and an empty value means unset). Any other process environment variable, including every other `FERRUM_*` setting, is refused at admission with a 400. The variable must exist after Ferrum startup secret resolution (`FERRUM_PLUGIN_SECRET_<NAME>_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` work) and is sent as Authorization Bearer; an unset or empty value fails the first embedding call."
+              description: "Name of the `FERRUM_PLUGIN_SECRET_<NAME>` environment variable holding the provider API key (`<NAME>` uppercase `[A-Z_][A-Z0-9_]*`; surrounding whitespace is trimmed and an empty value means unset). Any other process environment variable, including every other `FERRUM_*` setting, is refused at admission with a 400. The variable must exist after Ferrum startup secret resolution (`FERRUM_PLUGIN_SECRET_<NAME>_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` work) and is sent in provider.auth_header (default Authorization) prefixed by provider.auth_scheme (default Bearer); an unset or empty value fails the first embedding call."
+            auth_header:
+              type: string
+              minLength: 1
+              maxLength: 64
+              pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]+$'
+              not:
+                pattern: '^(?:[hH][oO][sS][tT]|[cC][oO][nN][tT][eE][nN][tT]-[lL][eE][nN][gG][tT][hH]|[cC][oO][nN][tT][eE][nN][tT]-[tT][yY][pP][eE]|[tT][rR][aA][nN][sS][fF][eE][rR]-[eE][nN][cC][oO][dD][iI][nN][gG]|[cC][oO][nN][nN][eE][cC][tT][iI][oO][nN]|[xX]-[fF][eE][rR][rR][uU][mM]-[hH][oO][pP][sS])$'
+              description: "Header the provider credential is sent in. Omit for Authorization. Azure OpenAI deployments use api-key (with auth_scheme set to the empty string). An HTTP token of at most 64 characters, taken verbatim; Host, Content-Length, Content-Type, Transfer-Encoding, Connection, and X-Ferrum-Hops (any casing) are refused. Requires api_key_env."
+            auth_scheme:
+              type: string
+              maxLength: 32
+              pattern: '^[!#$%&''*+.^_`|~0-9A-Za-z-]*$'
+              description: "Scheme prefixed to the credential with one space. Omit for Bearer; the empty string sends the raw key (Azure OpenAI api-key). An HTTP token of at most 32 characters. Requires api_key_env."
             request_timeout_ms:
               type: integer
               format: uint64
               minimum: 1
+              maximum: 60000
               default: 5000
-              description: Per-request embedding provider timeout in milliseconds.
+              description: Per-request embedding provider timeout in milliseconds (at most 60000). Also bounds how long a request waits for a provider.max_concurrent_requests admission permit before following on_error.
+            max_concurrent_requests:
+              type: integer
+              format: uint64
+              minimum: 1
+              maximum: 1024
+              default: 32
+              description: Outbound embedding calls this plugin instance may have in flight at once. A governed request that cannot obtain a slot within provider.request_timeout_ms follows on_error instead of queueing, so a stalled provider cannot pin an unbounded number of buffered requests.
           description: Required when the plugin has active rules.
         builtins:
           type: object
@@ -35248,9 +35289,13 @@ components:
                   - "$.choices[*].message.content"
                   - "$.choices[*].message.tool_calls[*].function.name"
                   - "$.choices[*].message.tool_calls[*].function.arguments"
+                  - "$.choices[*].message.function_call.name"
+                  - "$.choices[*].message.function_call.arguments"
                   - "$.choices[*].delta.content"
                   - "$.choices[*].delta.tool_calls[*].function.name"
                   - "$.choices[*].delta.tool_calls[*].function.arguments"
+                  - "$.choices[*].delta.function_call.name"
+                  - "$.choices[*].delta.function_call.arguments"
                   - "$.output_text"
                   - "$.output[*].content[*].text"
                   - "$.output[*].arguments"
@@ -35267,14 +35312,22 @@ components:
                   - "$.chat_history[*].message"
                   - "$.response"
                   - "$[*].generated_text"
+                  - "$.message.content"
+                  - "$.message.tool_plan"
+                  - "$.message.tool_calls[*].function.name"
+                  - "$.message.tool_calls[*].function.arguments"
               default:
                 - "$.choices[*].text"
                 - "$.choices[*].message.content"
                 - "$.choices[*].message.tool_calls[*].function.name"
                 - "$.choices[*].message.tool_calls[*].function.arguments"
+                - "$.choices[*].message.function_call.name"
+                - "$.choices[*].message.function_call.arguments"
                 - "$.choices[*].delta.content"
                 - "$.choices[*].delta.tool_calls[*].function.name"
                 - "$.choices[*].delta.tool_calls[*].function.arguments"
+                - "$.choices[*].delta.function_call.name"
+                - "$.choices[*].delta.function_call.arguments"
                 - "$.output_text"
                 - "$.output[*].content[*].text"
                 - "$.output[*].arguments"
@@ -35291,9 +35344,14 @@ components:
                 - "$.chat_history[*].message"
                 - "$.response"
                 - "$[*].generated_text"
+                - "$.message.content"
+                - "$.message.tool_plan"
+                - "$.message.tool_calls[*].function.name"
+                - "$.message.tool_calls[*].function.arguments"
               description: Supported simple response extraction paths. When configured, this list replaces the defaults.
         allow_topics:
           type: array
+          maxItems: 64
           items:
             type: object
             additionalProperties: false
@@ -35309,9 +35367,11 @@ components:
               examples:
                 type: array
                 minItems: 1
+                maxItems: 64
                 items:
                   type: string
                   minLength: 1
+                  maxLength: 2048
                   pattern: "\\S"
               threshold:
                 type: number
@@ -35326,6 +35386,7 @@ components:
           description: Mandatory request-side semantic allow topics.
         deny_topics:
           type: array
+          maxItems: 64
           items:
             type: object
             additionalProperties: false
@@ -35341,9 +35402,11 @@ components:
               examples:
                 type: array
                 minItems: 1
+                maxItems: 64
                 items:
                   type: string
                   minLength: 1
+                  maxLength: 2048
                   pattern: "\\S"
               threshold:
                 type: number
@@ -35358,6 +35421,7 @@ components:
           description: Customer-defined request/response semantic deny topics. Deny topics are bidirectional and apply to both inspection directions.
         custom_rules:
           type: array
+          maxItems: 64
           items:
             type: object
             additionalProperties: false
@@ -35385,9 +35449,11 @@ components:
               examples:
                 type: array
                 minItems: 1
+                maxItems: 64
                 items:
                   type: string
                   minLength: 1
+                  maxLength: 2048
                   pattern: "\\S"
               threshold:
                 type: number

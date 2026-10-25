@@ -2591,3 +2591,107 @@ fn openai_stream_within_the_index_ceiling_stays_inspectable() {
     }));
     assert!(!reassembler.provider_stream_uninspectable());
 }
+
+#[test]
+fn extended_reassembler_folds_legacy_function_calls_and_cohere_v2_events() {
+    let frames = [
+        json!({"choices": [{"index": 0, "delta": {"function_call": {"name": "no", "arguments": "{\"a\":"}}}]}),
+        json!({"choices": [{"index": 0, "delta": {"function_call": {"name": "te", "arguments": "1}"}}}]}),
+        json!({"type": "message-start", "delta": {"message": {"role": "assistant", "content": [], "tool_plan": "", "tool_calls": []}}}),
+        json!({"type": "content-start", "index": 0, "delta": {"message": {"content": {"type": "text", "text": ""}}}}),
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": "Hel"}}}}),
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": "lo."}}}}),
+        json!({"type": "tool-plan-delta", "delta": {"message": {"tool_plan": "I will look it up."}}}),
+        json!({"type": "tool-call-start", "index": 0, "delta": {"message": {"tool_calls": {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": ""}}}}}),
+        json!({"type": "tool-call-delta", "index": 0, "delta": {"message": {"tool_calls": {"function": {"arguments": "{\"q\":1}"}}}}}),
+        json!({"type": "tool-call-end", "index": 0}),
+        json!({"type": "message-end", "delta": {"finish_reason": "COMPLETE"}}),
+    ];
+
+    // The default reassembler leaves both shapes to its callers
+    // (`ai_response_guard` keeps its own legacy function_call accumulators).
+    let mut default = SseReassembler::new();
+    for frame in &frames {
+        default.push_frame(frame);
+    }
+    assert!(default.into_texts().is_empty());
+
+    let mut extended = SseReassembler::with_extended_provider_shapes();
+    for frame in &frames {
+        extended.push_frame(frame);
+    }
+    assert!(!extended.provider_stream_uninspectable());
+    assert_eq!(extended.assistant_content(), "Hello.I will look it up.");
+    let texts = extended.into_texts();
+    let text_of = |kind: SseTextKind| -> Vec<(String, String)> {
+        texts
+            .iter()
+            .filter(|text| text.kind == kind)
+            .map(|text| (text.json_path.clone(), text.text.clone()))
+            .collect()
+    };
+    assert_eq!(
+        text_of(SseTextKind::ChatFunctionCallName),
+        vec![(
+            "$.choices[0].delta.function_call.name".to_string(),
+            "note".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::ChatFunctionCallArguments),
+        vec![(
+            "$.choices[0].delta.function_call.arguments".to_string(),
+            "{\"a\":1}".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereText),
+        vec![(
+            "$.message.content[0].text".to_string(),
+            "Hello.".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolPlan),
+        vec![(
+            "$.message.tool_plan".to_string(),
+            "I will look it up.".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolName),
+        vec![(
+            "$.message.tool_calls[0].function.name".to_string(),
+            "lookup".to_string()
+        )]
+    );
+    assert_eq!(
+        text_of(SseTextKind::CohereToolArguments),
+        vec![(
+            "$.message.tool_calls[0].function.arguments".to_string(),
+            "{\"q\":1}".to_string()
+        )]
+    );
+}
+
+#[test]
+fn extended_reassembler_fails_closed_on_unmodelled_cohere_v2_content() {
+    for frame in [
+        // An unmodelled hyphenated event inside an identified Cohere v2 stream.
+        json!({"type": "content-shiny", "index": 0}),
+        // A non-text content part.
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"type": "thinking", "thinking": "hmm"}}}}),
+        // A non-string text fragment.
+        json!({"type": "content-delta", "index": 0, "delta": {"message": {"content": {"text": 7}}}}),
+    ] {
+        let mut reassembler = SseReassembler::with_extended_provider_shapes();
+        reassembler.push_frame(
+            &json!({"type": "message-start", "delta": {"message": {"role": "assistant"}}}),
+        );
+        reassembler.push_frame(&frame);
+        assert!(
+            reassembler.provider_stream_uninspectable(),
+            "{frame} must mark the stream uninspectable"
+        );
+    }
+}
