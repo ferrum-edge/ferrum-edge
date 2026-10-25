@@ -4076,6 +4076,17 @@ impl RequestContext {
         }
     }
 
+    /// Make `owner` the owner of this request's gateway `SERVER` span even
+    /// if another plugin established it. Used when a plugin forwards the
+    /// established span and freezes it (into a backend-attempt recorder), so
+    /// the establishing sibling must no longer re-derive it.
+    pub(crate) fn adopt_gateway_trace_owner(
+        &mut self,
+        owner: crate::plugins::otel_tracing::GatewayTraceOwner,
+    ) {
+        self.gateway_trace_owner = Some(owner);
+    }
+
     /// Install (or clear) the `otel_tracing` per-attempt span recorder.
     pub(crate) fn set_backend_attempt_trace(
         &mut self,

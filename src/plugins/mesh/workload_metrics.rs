@@ -706,7 +706,12 @@ impl WorkloadMetrics {
             ctx.claim_gateway_trace_owner(
                 crate::plugins::otel_tracing::GatewayTraceOwner::WorkloadMetrics,
             );
-            if let Some(tracestate) = probe.tracestate {
+            // W3C Trace Context: an invalid `tracestate` list is dropped,
+            // never propagated, while its parent is still honored.
+            if let Some(tracestate) = probe
+                .tracestate
+                .filter(|value| crate::plugins::otel_tracing::is_valid_tracestate(value))
+            {
                 ctx.metadata
                     .insert(TRACESTATE_HEADER.to_string(), tracestate.to_string());
             }

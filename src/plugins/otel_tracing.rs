@@ -1059,6 +1059,15 @@ impl Plugin for OtelTracing {
             .gateway_trace_owner()
             .is_some_and(|owner| owner != GatewayTraceOwner::OtelTracing)
         {
+            // The identity is reused, but companion state is still held to
+            // the W3C list grammar before this plugin forwards it.
+            if ctx
+                .metadata
+                .get(TRACESTATE_HEADER)
+                .is_some_and(|tracestate| !is_valid_tracestate(tracestate))
+            {
+                ctx.metadata.remove(TRACESTATE_HEADER);
+            }
             return PluginResult::Continue;
         }
 
@@ -1147,8 +1156,16 @@ impl Plugin for OtelTracing {
         });
         if let Some(traceparent) = ctx.metadata.get(TRACEPARENT_HEADER) {
             headers.insert(TRACEPARENT_HEADER.to_string(), traceparent.clone());
+            // Forwarding the SERVER span (and below, freezing it into the
+            // attempt recorder) adopts it: from here on no sibling may
+            // re-derive it, even one that created it (`workload_metrics`
+            // after a later final-header transform), or the attempt spans
+            // and the exported SERVER span would name different spans.
+            ctx.adopt_gateway_trace_owner(GatewayTraceOwner::OtelTracing);
         }
-        if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER) {
+        if let Some(tracestate) = ctx.metadata.get(TRACESTATE_HEADER)
+            && is_valid_tracestate(tracestate)
+        {
             headers.insert(TRACESTATE_HEADER.to_string(), tracestate.clone());
         }
         // Per-attempt CLIENT spans (issue #5864): only an exporting instance
@@ -3367,7 +3384,7 @@ fn parse_compression(config: &Value) -> Result<bool, String> {
 /// no duplicate keys, at least one member, and at most
 /// [`MAX_TRACESTATE_BYTES`] overall. Empty list members (`a=1,,b=2`) and
 /// optional whitespace around members are allowed by the specification.
-fn is_valid_tracestate(value: &str) -> bool {
+pub(crate) fn is_valid_tracestate(value: &str) -> bool {
     if value.len() > MAX_TRACESTATE_BYTES {
         return false;
     }

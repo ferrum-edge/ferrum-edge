@@ -26,7 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the first to establish the gateway SERVER span owns it and the other reuses
   it, so attempt CLIENT spans and the exported SERVER span no longer reference
   a parent that is never exported, and `workload_metrics` no longer restores a
-  caller `tracestate` that `otel_tracing` dropped as untrusted.
+  caller `tracestate` that `otel_tracing` dropped as untrusted. Once
+  `otel_tracing` forwards the SERVER span it owns it, so a later
+  `request_transformer` rewrite of `traceparent` cannot re-derive a span the
+  attempt recorder already froze, and a `tracestate` `workload_metrics`
+  imports is W3C-validated too.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

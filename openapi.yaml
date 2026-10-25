@@ -18792,8 +18792,9 @@ components:
             Per-plugin loss, listed only for sinks that have lost a record and
             only for the reasons with a non-zero count. Keys are the closed
             sink set (`ai_transcript_audit`, `api_chargeback_sink`,
-            `http_logging`, `kafka_logging`, `loki_logging`, `other`,
-            `statsd_logging`, `tcp_logging`, `udp_logging`, `ws_logging`).
+            `http_logging`, `kafka_logging`, `loki_logging`, `otel_tracing`,
+            `other`, `statsd_logging`, `tcp_logging`, `udp_logging`,
+            `ws_logging`).
           additionalProperties:
             type: object
             description: >-

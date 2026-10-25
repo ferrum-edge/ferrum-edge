@@ -344,6 +344,140 @@ async fn otel_tracing_does_not_overwrite_a_server_span_workload_metrics_establis
     );
 }
 
+// ── PR #6836 review round 1 (PR6836-SOL-1 / SOL-2) ─────────────────────────
+
+/// PR6836-SOL-1: `workload_metrics` created the SERVER span, `otel_tracing`
+/// (generation disabled, exporting) froze it into its attempt recorder, and a
+/// `request_transformer` (priority 3000) then rewrote the backend
+/// `traceparent`. `workload_metrics.before_proxy` (9360) must not re-derive
+/// the span from that header, or the attempt spans would hang off a SERVER
+/// span that is never exported.
+#[tokio::test]
+async fn transformer_rewrite_cannot_reparent_a_server_span_otel_tracing_froze() {
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+
+    let server = collector(200).await;
+    let tracer = otel(json!({
+        "endpoint": endpoint(&server),
+        "generate_trace_id": false,
+        "batch_size": 50,
+        "flush_interval_ms": 100
+    }));
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [{
+            "operation": "update",
+            "target": "header",
+            "key": "traceparent",
+            "value": CALLER_TRACEPARENT
+        }]
+    }))
+    .expect("traceparent replacement rule");
+    let metrics = traced_workload_metrics();
+
+    let mut ctx = ctx();
+    tracer.on_request_received(&mut ctx).await;
+    metrics.on_request_received(&mut ctx).await;
+    assert_eq!(
+        ctx.gateway_trace_owner(),
+        Some(GatewayTraceOwner::WorkloadMetrics)
+    );
+    let trace_id = ctx.metadata["trace_id"].clone();
+    let server_span = ctx.metadata["span_id"].clone();
+
+    let mut headers = HashMap::from([("x-app".to_string(), "kept".to_string())]);
+    tracer.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.gateway_trace_owner(),
+        Some(GatewayTraceOwner::OtelTracing),
+        "forwarding the span into the attempt recorder adopts it"
+    );
+    transformer.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(header(&headers, "traceparent"), Some(CALLER_TRACEPARENT));
+    metrics.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(ctx.metadata["trace_id"], trace_id);
+    assert_eq!(ctx.metadata["span_id"], server_span);
+    assert_eq!(
+        header(&headers, "traceparent"),
+        ctx.metadata.get("traceparent").map(String::as_str)
+    );
+
+    let (_attempt_headers, ()) =
+        run_backend_attempt_for_test(&ctx, BACKEND_URL, &headers, async {}).await;
+    record_backend_attempt_for_test(&ctx, None, true, Some(200));
+    tracer.log(&summary_for(&ctx, 200)).await;
+
+    let spans = exported_spans(&server, 2).await;
+    let server_spans: Vec<&Value> = spans.iter().filter(|span| span["kind"] == 2).collect();
+    let client_spans: Vec<&Value> = spans.iter().filter(|span| span["kind"] == 3).collect();
+    assert_eq!(server_spans.len(), 1, "{spans:#?}");
+    assert_eq!(client_spans.len(), 1, "{spans:#?}");
+    assert_eq!(server_spans[0]["spanId"], server_span.as_str());
+    assert_eq!(server_spans[0]["traceId"], trace_id.as_str());
+    assert_eq!(client_spans[0]["parentSpanId"], server_span.as_str());
+    assert_eq!(client_spans[0]["traceId"], trace_id.as_str());
+}
+
+/// PR6836-SOL-2: when `workload_metrics` establishes the span (ordered first,
+/// or because `otel_tracing` has generation disabled), an invalid caller
+/// `tracestate` must still be dropped while its valid parent is kept.
+#[tokio::test]
+async fn workload_owned_spans_still_drop_invalid_tracestate() {
+    for (workload_first, tracer_config) in [
+        (true, json!({"trace_context_trust": "trusted"})),
+        (false, json!({"generate_trace_id": false})),
+    ] {
+        for tracestate in ["dup=1,dup=2", "BAD KEY=x"] {
+            let tracer = otel(tracer_config.clone());
+            let metrics = traced_workload_metrics();
+            let mut ctx = ctx();
+            ctx.headers
+                .insert("traceparent".to_string(), CALLER_TRACEPARENT.to_string());
+            ctx.headers
+                .insert("tracestate".to_string(), tracestate.to_string());
+
+            if workload_first {
+                metrics.on_request_received(&mut ctx).await;
+                tracer.on_request_received(&mut ctx).await;
+            } else {
+                tracer.on_request_received(&mut ctx).await;
+                metrics.on_request_received(&mut ctx).await;
+            }
+            assert_eq!(
+                ctx.gateway_trace_owner(),
+                Some(GatewayTraceOwner::WorkloadMetrics),
+                "{workload_first} {tracestate:?}"
+            );
+            assert_eq!(ctx.metadata["trace_id"], CALLER_TRACE_ID);
+            assert!(
+                !ctx.metadata.contains_key("tracestate"),
+                "{workload_first} {tracestate:?}"
+            );
+
+            let mut headers = ctx.headers.clone();
+            if workload_first {
+                metrics.before_proxy(&mut ctx, &mut headers).await;
+                tracer.before_proxy(&mut ctx, &mut headers).await;
+            } else {
+                tracer.before_proxy(&mut ctx, &mut headers).await;
+                metrics.before_proxy(&mut ctx, &mut headers).await;
+            }
+            assert_eq!(ctx.metadata["trace_id"], CALLER_TRACE_ID);
+            assert!(
+                !ctx.metadata.contains_key("tracestate"),
+                "{workload_first} {tracestate:?}"
+            );
+            assert_eq!(
+                header(&headers, "tracestate"),
+                None,
+                "{workload_first} {tracestate:?}"
+            );
+            let forwarded = header(&headers, "traceparent").expect("parent forwarded");
+            assert!(forwarded.contains(CALLER_TRACE_ID), "{forwarded}");
+        }
+    }
+}
+
 // ── otel_tracing-SOL-2 / M3: successful WebSocket handshake echo ───────────
 
 #[tokio::test]
