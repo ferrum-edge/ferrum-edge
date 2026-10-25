@@ -473,23 +473,29 @@ const MIN_NAMESPACE_SCAN_BUDGET: usize = 4_194_304;
 ///   (`d²` comparisons). The screen charges
 ///   `n² × longest name + p² × longest URI + d² × longest prefix` per tag.
 /// - **Prefix resolution** — each prefixed attribute and a prefixed element
-///   name scans the in-scope declarations (at most every declaration seen so
-///   far) comparing prefixes: charged `declarations so far × prefix length`.
-/// - Both charges accumulate into one allowance of
-///   [`RAW_MARKUP_WORK_MULTIPLIER`] × envelope length (floor
-///   [`MIN_RAW_MARKUP_WORK`]): at the default 10 MiB body ceiling that is at
-///   most ~3.4 × 10⁸ compared bytes, the same order as one pass of the
-///   canonicalization budgets.
-/// - **Inherited-scope resolution** — an element that declares namespaces
-///   re-tests each inherited binding against the bindings collected so far,
-///   ≤ D² prefix comparisons for D = [`MAX_DOCUMENT_NAMESPACE_DECLARATIONS`],
-///   and at most D elements declare anything. That is ≤ D³ ≈ 2.1 × 10⁶
-///   comparisons of ≤ [`MAX_NAMESPACE_PREFIX_DECLARATION_BYTES`]-byte names,
-///   ≈ 1.5 × 10⁸ bytes worst case for the whole document, independent of its
-///   size, so it needs no running charge.
+///   name scans the declarations in scope at that element, comparing
+///   prefixes: charged `in-scope declarations × prefix length`.
+/// - **Inherited-scope merge** — an element that declares namespaces re-tests
+///   each inherited binding against the bindings collected so far for it:
+///   charged `inherited × (own + inherited) × longest declared prefix`. An
+///   element that declares nothing reuses its parent's scope for free.
 ///
-/// Real WS-Security / SOAP / SAML envelopes declare well under 50 namespaces,
-/// with URIs under 200 bytes, prefixes under 20 bytes, and a handful of
+/// "In scope" is tracked exactly as the parser sees it: the scan keeps a stack
+/// of the open elements that declared namespaces and returns their
+/// declarations when they close, so disjoint siblings that each redeclare one
+/// binding (a WCF `XmlNode[]` collection, a SAML attribute list with locally
+/// typed values) stay cheap however many there are, while a large inherited
+/// scope re-merged by many descendants pays for every merge. The active scope
+/// is also capped at [`MAX_IN_SCOPE_NAMESPACE_DECLARATIONS`] (counting a
+/// redeclared prefix again, which can only over-state it).
+///
+/// All charges accumulate into one allowance of [`RAW_MARKUP_WORK_MULTIPLIER`]
+/// × envelope length (floor [`MIN_RAW_MARKUP_WORK`]): at the default 10 MiB
+/// body ceiling that is at most ~3.4 × 10⁸ compared bytes, the same order as
+/// one pass of the canonicalization budgets.
+///
+/// Real WS-Security / SOAP / SAML envelopes keep well under 50 namespaces in
+/// scope, with URIs under 200 bytes, prefixes under 20 bytes, and a handful of
 /// attributes per element, so ordinary messages use a small fraction of each.
 const MAX_NAMESPACE_URI_BYTES: usize = 2_048;
 /// Ceiling on any attribute name.
@@ -499,8 +505,9 @@ const MAX_ATTRIBUTE_NAME_BYTES: usize = 128;
 const MAX_NAMESPACE_PREFIX_DECLARATION_BYTES: usize = 70;
 /// Ceiling on attributes (namespace declarations included) per start tag.
 const MAX_ATTRIBUTES_PER_ELEMENT: usize = 64;
-/// Ceiling on namespace declarations across the whole envelope.
-const MAX_DOCUMENT_NAMESPACE_DECLARATIONS: usize = 128;
+/// Ceiling on namespace declarations in scope at any one element (the
+/// declarations of all its open ancestors and its own).
+const MAX_IN_SCOPE_NAMESPACE_DECLARATIONS: usize = 256;
 /// Raw-markup comparison allowance multiplier, applied to the envelope length.
 const RAW_MARKUP_WORK_MULTIPLIER: usize = 32;
 /// Floor for the raw-markup comparison allowance.
@@ -7489,8 +7496,9 @@ enum RawMarkupScreen {
 /// Screen every start tag in the raw envelope against the per-item ceilings
 /// and the document-wide aggregates documented on
 /// [`MAX_NAMESPACE_URI_BYTES`]: attributes per tag, attribute-name, prefix, and
-/// URI length, total namespace declarations, and the accumulated parser
-/// comparison work.
+/// URI length, declarations in scope at each element, and the accumulated
+/// parser comparison work (duplicate checks, prefix resolution, and
+/// inherited-scope merges).
 ///
 /// One linear pass that recognizes start tags exactly as the id scan does
 /// (comments, CDATA, processing instructions, and declarations are skipped as
@@ -7512,14 +7520,30 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
         .saturating_mul(RAW_MARKUP_WORK_MULTIPLIER)
         .max(MIN_RAW_MARKUP_WORK);
     let mut work = 0usize;
-    let mut declarations = 0usize;
     let mut longest_uri = 0usize;
+    let mut longest_declared_prefix = 0usize;
+    // Open-element depth, and `(depth, declarations)` for each open element
+    // that declared namespaces; at most one entry per in-scope declaration, so
+    // the stack is bounded by `MAX_IN_SCOPE_NAMESPACE_DECLARATIONS`.
+    let mut depth = 0usize;
+    let mut declaring_scopes: Vec<(usize, usize)> = Vec::new();
+    let mut in_scope = 0usize;
     let mut search_from = 0usize;
     while let Some(rel) = xml.get(search_from..).and_then(|rest| rest.find('<')) {
         let tag_start = search_from + rel;
         match xml.as_bytes().get(tag_start + 1) {
             None => return RawMarkupScreen::Unframed,
             Some(b'/') => {
+                // An end tag closes the innermost open element and returns the
+                // declarations it brought into scope.
+                depth = depth.saturating_sub(1);
+                while let Some(&(scope_depth, count)) = declaring_scopes.last() {
+                    if scope_depth <= depth {
+                        break;
+                    }
+                    declaring_scopes.pop();
+                    in_scope = in_scope.saturating_sub(count);
+                }
                 search_from = tag_start + 1;
                 continue;
             }
@@ -7545,13 +7569,14 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
         let Some(tag) = xml.get(tag_start + 1..tag_start + tag_end_rel) else {
             return RawMarkupScreen::Unframed;
         };
+        let self_closing = tag.trim_end().ends_with('/');
 
         let mut attributes = 0usize;
         let mut prefixed = 0usize;
         let mut declared = 0usize;
         let mut longest_name = 0usize;
         let mut longest_prefix = 0usize;
-        let mut resolution_work = 0usize;
+        let mut prefixed_prefix_bytes = 0usize;
         let exceeded = scan_tag_attributes(tag, |name, value| {
             attributes += 1;
             if attributes > MAX_ATTRIBUTES_PER_ELEMENT || name.len() > MAX_ATTRIBUTE_NAME_BYTES {
@@ -7559,9 +7584,7 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
             }
             if name == "xmlns" || name.starts_with("xmlns:") {
                 declared += 1;
-                declarations += 1;
-                if declarations > MAX_DOCUMENT_NAMESPACE_DECLARATIONS
-                    || name.len() > MAX_NAMESPACE_PREFIX_DECLARATION_BYTES
+                if name.len() > MAX_NAMESPACE_PREFIX_DECLARATION_BYTES
                     || value.len() > MAX_NAMESPACE_URI_BYTES
                 {
                     return true;
@@ -7573,22 +7596,35 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
             longest_name = longest_name.max(name.len());
             if let Some((prefix, _)) = name.split_once(':') {
                 prefixed += 1;
-                resolution_work = resolution_work
-                    .saturating_add(declarations.max(1).saturating_mul(prefix.len().max(1)));
+                prefixed_prefix_bytes = prefixed_prefix_bytes.saturating_add(prefix.len().max(1));
             }
             false
         });
         if exceeded {
             return RawMarkupScreen::Exceeded;
         }
+        longest_declared_prefix = longest_declared_prefix.max(longest_prefix);
 
-        // A prefixed element name is resolved against the same in-scope set.
+        // The element's scope: everything inherited plus its own declarations.
+        let inherited = in_scope;
+        let element_scope = inherited.saturating_add(declared);
+        if element_scope > MAX_IN_SCOPE_NAMESPACE_DECLARATIONS {
+            return RawMarkupScreen::Exceeded;
+        }
+        let merge_work = if declared > 0 {
+            inherited
+                .saturating_mul(element_scope)
+                .saturating_mul(longest_declared_prefix.max(1))
+        } else {
+            0
+        };
+        // A prefixed element name is resolved against the same scope.
         if let Some((prefix, _)) =
             extract_full_tag_name_from_tag(tag).and_then(|qname| qname.split_once(':'))
         {
-            resolution_work = resolution_work
-                .saturating_add(declarations.max(1).saturating_mul(prefix.len().max(1)));
+            prefixed_prefix_bytes = prefixed_prefix_bytes.saturating_add(prefix.len().max(1));
         }
+        let resolution_work = element_scope.max(1).saturating_mul(prefixed_prefix_bytes);
         let regular = attributes.saturating_sub(declared);
         let tag_work = regular
             .saturating_mul(regular)
@@ -7603,10 +7639,19 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
                     .saturating_mul(declared)
                     .saturating_mul(longest_prefix.max(1)),
             )
+            .saturating_add(merge_work)
             .saturating_add(resolution_work);
         work = work.saturating_add(tag_work);
         if work > allowance {
             return RawMarkupScreen::Exceeded;
+        }
+
+        if !self_closing {
+            depth = depth.saturating_add(1);
+            if declared > 0 {
+                declaring_scopes.push((depth, declared));
+                in_scope = element_scope;
+            }
         }
         search_from = tag_start + tag_end_rel + 1;
     }

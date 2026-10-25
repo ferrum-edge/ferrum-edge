@@ -1954,6 +1954,9 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         /// Replace the whole SubjectConfirmation fragment (in both views), for
         /// assertions that carry several confirmations.
         pub subject_confirmations: Option<String>,
+        /// Raw statements (e.g. an `AttributeStatement`) appended after
+        /// `Conditions`, in both the emitted and the signed view.
+        pub extra_statements: Option<String>,
     }
 
     impl<'a> AssertionBuilder<'a> {
@@ -1983,6 +1986,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 signer: None,
                 extra_conditions: None,
                 subject_confirmations: None,
+                extra_statements: None,
             }
         }
 
@@ -2053,19 +2057,22 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 Some(fragment) => fragment.to_string(),
                 None => format!("<saml:NameID>{}</saml:NameID>", value),
             };
+            let statements = self.extra_statements.as_deref().unwrap_or("");
             let body_after_issuer = format!(
-                "<saml:Subject>{}{}</saml:Subject>{}",
+                "<saml:Subject>{}{}</saml:Subject>{}{}",
                 name_id(&subject_inner),
                 confirmation,
-                conditions
+                conditions,
+                statements
             );
 
             // The bytes we actually sign use the ORIGINAL (untampered) subject.
             let signed_body_after_issuer = format!(
-                "<saml:Subject>{}{}</saml:Subject>{}",
+                "<saml:Subject>{}{}</saml:Subject>{}{}",
                 name_id(self.subject_name_id),
                 confirmation,
-                conditions
+                conditions,
+                statements
             );
 
             // The assertion as it looks after enveloped-signature transform —
@@ -11539,10 +11546,11 @@ async fn aggregate_namespace_parse_work_is_refused_before_parsing() {
     let inherited_square = format!("<Item{ancestor_declarations}>{children}</Item>");
 
     // (b) A chain of nested elements that each declare eight new prefixes:
-    // 20 levels × 8 = 160 declarations, past the document-wide ceiling.
+    // every level re-merges the growing inherited scope, and 40 levels × 8
+    // also passes the in-scope ceiling.
     let mut chain_open = String::new();
     let mut chain_close = String::new();
-    for level in 0..20 {
+    for level in 0..40 {
         chain_open.push_str(&format!("<n{level}"));
         for index in 0..8 {
             chain_open.push_str(&format!(
@@ -11558,8 +11566,7 @@ async fn aggregate_namespace_parse_work_is_refused_before_parsing() {
     // per-tag ceilings, with long near-equal prefixes), then many descendants
     // that each redeclare one namespace. A redeclaration defeats the parser's
     // "no new declarations" shortcut, so every such descendant re-merges the
-    // whole inherited scope; each one is also a declaration, so the
-    // document-wide ceiling refuses the shape long before it can repeat.
+    // whole inherited scope, and each merge is charged to the allowance.
     let long_prefix_declarations = |ancestor: usize| -> String {
         (0..60)
             .map(|index| format!(r#" xmlns:p{}{ancestor}{index:02}="urn:p""#, "a".repeat(57)))
@@ -11610,6 +11617,55 @@ async fn ordinary_namespace_inheritance_is_accepted() {
     assert!(matches!(result, PluginResult::Continue), "{result:?}");
 }
 
+/// Disjoint siblings that each redeclare one binding keep the active scope
+/// tiny, so parser work stays linear however many there are. A WCF `XmlNode[]`
+/// collection resets the default namespace on every row; it must be accepted
+/// well past any per-document declaration count.
+#[tokio::test]
+async fn wide_collections_of_sibling_redeclarations_are_accepted() {
+    let rows = r#"<row xmlns="">value</row>"#.repeat(129);
+    let wcf_collection =
+        format!(r#"<Item><Batch xmlns="urn:example:batch"><Nodes>{rows}</Nodes></Batch></Item>"#);
+    let result = timestamp_only_outcome_with_item(&wcf_collection).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a 129-row XmlNode[] collection must be accepted: {result:?}"
+    );
+}
+
+/// A signed SAML assertion whose AttributeStatement carries many locally typed
+/// values (each declaring `xs` and `xsi` itself, as common IdPs emit) is an
+/// ordinary assertion, not resource abuse.
+#[tokio::test]
+async fn saml_attribute_values_with_local_type_declarations_are_accepted() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+    let values: String = (0..100)
+        .map(|index| {
+            format!(
+                r#"<saml:AttributeValue xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="xs:string">group-{index}</saml:AttributeValue>"#
+            )
+        })
+        .collect();
+    let mut builder = saml_fixtures::AssertionBuilder::new(
+        "_assertion-many-typed-values",
+        SAML_ISSUER,
+        "alice@example.com",
+    );
+    builder.extra_statements = Some(format!(
+        r#"<saml:AttributeStatement><saml:Attribute Name="groups">{values}</saml:Attribute></saml:AttributeStatement>"#
+    ));
+    let (result, ctx) = saml_outcome(&plugin, &builder.build()).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an assertion with 100 locally typed attribute values must be accepted: {result:?}"
+    );
+    assert_eq!(
+        ctx.authenticated_identity.as_deref(),
+        Some("alice@example.com")
+    );
+}
+
 /// A start tag that never terminates is not "within bounds" just because the
 /// screen cannot frame it: the parser tokenizes (and duplicate-checks) every
 /// declaration of such a tag before it discovers the missing `>` at end of
@@ -11657,17 +11713,16 @@ async fn unterminated_markup_is_refused_before_parsing() {
 }
 
 /// The ceilings sit far above real messages: a URI of exactly 2048 bytes, an
-/// element with exactly 64 attributes, and an envelope with exactly 128
-/// namespace declarations are still accepted, as is markup that merely looks
-/// oversized inside a comment or CDATA section.
+/// element with exactly 64 attributes, and 124 declarations nested across two
+/// elements are still accepted, as is markup that merely looks oversized
+/// inside a comment or CDATA section.
 #[tokio::test]
 async fn namespace_markup_at_the_ceilings_is_accepted() {
     let max_uri = format!("urn:{}", "A".repeat(2_044));
     assert_eq!(max_uri.len(), 2_048);
     let max_attributes: String = (0..64).map(|index| format!(" a{index}=\"\"")).collect();
-    // `wrap_soap` already declares four namespaces (soap, wsse, wsu, and the
-    // GetPrice default), so 124 more reach exactly 128, split across two
-    // elements to stay within the per-tag attribute ceiling.
+    // Split across two nested elements to stay within the per-tag attribute
+    // ceiling.
     let declarations = |prefix: &str| -> String {
         (0..62)
             .map(|index| format!(" xmlns:{prefix}{index}=\"urn:{prefix}{index}\""))
@@ -11688,7 +11743,7 @@ async fn namespace_markup_at_the_ceilings_is_accepted() {
             "64 attributes",
             format!("<Item{max_attributes}>Widget</Item>"),
         ),
-        ("128 namespace declarations", at_declaration_ceiling),
+        ("124 nested namespace declarations", at_declaration_ceiling),
         (
             "oversized text in a comment",
             format!(r#"<Item><!-- <x xmlns:p="{long_uri}"/> -->Widget</Item>"#),

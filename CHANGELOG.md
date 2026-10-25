@@ -424,10 +424,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Fixed raw markup ceilings on governed envelopes**, enforced before the
     XML parser runs: at most 64 attributes per start tag (namespace
     declarations included), 128-byte attribute names, 70-byte namespace
-    declaration names, 2048-byte namespace URIs, and 128 namespace
-    declarations per envelope, plus a document-wide allowance on the parser's
-    duplicate-attribute and prefix-resolution comparison work (32 × envelope
-    length, floor 1 048 576). Larger markup is refused with `400`
+    declaration names, 2048-byte namespace URIs, and 256 namespace
+    declarations in scope at any element, plus a document-wide allowance on
+    the parser's duplicate-attribute, prefix-resolution, and inherited-scope
+    merge comparison work (32 × envelope length, floor 1 048 576). Scope is
+    tracked with element nesting, so wide sibling collections that each
+    redeclare a namespace are unaffected. Larger markup is refused with `400`
     (`xml_namespace_bounds`), and a start tag, comment, CDATA section,
     processing instruction, or quote that never terminates is refused as
     malformed by the same pre-parse scan.

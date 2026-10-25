@@ -46,8 +46,9 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
   `xsi:type`-derived or extended standard conditions) are now rejected.
 - Governed envelopes with more than 64 attributes on one element, an
   attribute name over 128 bytes, a namespace declaration name over 70 bytes,
-  a namespace URI over 2048 bytes, more than 128 namespace declarations, or
-  parser comparison work beyond 32 × envelope length are now refused with
+  a namespace URI over 2048 bytes, more than 256 namespace declarations in
+  scope at one element, or parser comparison work beyond 32 × envelope length
+  are now refused with
   `400` (`xml_namespace_bounds`) before parsing.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
