@@ -823,6 +823,9 @@ fn append_route_override_partition(
 ///   order (a reordered list only costs a miss). The derived
 ///   `san_allow_list_key_digest` is skipped: it is recomputed from this list
 ///   and serde does not carry it, so it adds nothing and could be stale.
+/// * `suppress_global_client_identity` — whether the gateway-global client
+///   pair may be presented when the per-route pair is unset (bound only when
+///   set).
 ///
 /// There is no min-version or ALPN field on `BackendTlsConfig`; those follow
 /// the gateway-global TLS policy, which is identical for every rule.
@@ -855,6 +858,14 @@ fn append_route_override_backend_tls_partition(
     hasher.count("dst.override_tls_san_allow_list", tls.san_allow_list.len());
     for san in &tls.san_allow_list {
         hasher.text("dst.override_tls_san", san);
+    }
+    // Whether the gateway-global backend client identity may stand in for an
+    // unset per-route pair. An isolated provider destination presents no
+    // client certificate where an otherwise identical one presents the
+    // gateway's, so the two are different callers to the origin. Bound only
+    // when set, so every existing partition digest is unchanged.
+    if tls.suppress_global_client_identity {
+        hasher.bool_value("dst.override_tls_suppress_global_client_identity", true);
     }
 }
 

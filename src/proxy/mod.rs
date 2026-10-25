@@ -68950,6 +68950,7 @@ mod tests {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         };
 
         let sources = collect_backend_tls_watched_sources(&config, &env_config);
@@ -68994,6 +68995,7 @@ mod tests {
                 san_allow_list: Vec::new(),
                 san_allow_list_key_digest: None,
                 tls_refused: false,
+                suppress_global_client_identity: false,
             })
         }
         let env_config = EnvConfig::default();
@@ -73750,6 +73752,7 @@ mod tests {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         };
 
         let now = chrono::Utc::now();
