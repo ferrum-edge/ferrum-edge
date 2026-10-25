@@ -8,13 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `ai_tool_governor` refuses non-loopback cleartext approval
-  endpoints** (issue #6835). `approval.endpoint_url` with `http://` is now
-  admitted only when its host is a loopback IP literal (`127.d.d.d` or
-  `[::1]`); any other cleartext endpoint fails config admission unless
-  `approval.allow_plaintext: true` is set, because a man-in-the-middle on the
-  approval channel could forge `allow` verdicts. Switch the endpoint to
-  `https://` or opt in explicitly.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -146,6 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -398,39 +427,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`ai_tool_governor` closes several fail-open parser and policy gaps.**
-  A governed response that is well-formed JSON but nested past the inspection
-  parser's 128-level limit (or carrying an out-of-range number) is now
-  uninspectable — 502 / stream cut in enforce — on buffered JSON, the final
-  re-check, buffered and live SSE, and held JSON-shaped streams, instead of
-  being forwarded as call-free; malformed JSON is still forwarded. An SSE
-  event that is not valid UTF-8 (even in a comment line) cuts the stream
-  instead of being forwarded as data-free. `redact_args` binds its skip state
-  to the exact body `on_response_body` governed, so a call a transform injected
-  or renamed before the redaction is governed by the final re-check.
-  `blocked_arg_patterns` also match the JSON-decoded view of escaped string
-  arguments (a match that raw-text redaction cannot remove denies). The
-  unknown-shape backstop also covers a tool-call marker in a location no
-  extractor read when other calls were extracted, and its scan budget now
-  covers every value a 4 MiB body can hold, so large embeddings or numeric
-  bodies are no longer rejected for size alone. Approval decisions and the
-  webhook payload carry an authority-qualified `principal` (Consumer namespace
-  + id, or external subject + realm), so equal subjects from different
-  authorities never share a cached approval. `approval.endpoint_url` admits
-  `http://` only to a loopback IP literal unless `approval.allow_plaintext:
-  true` (breaking for non-loopback cleartext approval endpoints).
-- **`ai_tool_governor` adds tool globs, caller scopes, approval headers,
-  concurrent approvals, and Responses streaming.** `tools` keys may be `*`
-  globs (exact key wins, then the most literal glob); per-tool
-  `allowed_consumers` / `denied_consumers` / `allowed_groups` /
-  `denied_groups` scope a policy to mapped Consumers; `approval.headers`
-  sends literal or `${FERRUM_PLUGIN_SECRET_<NAME>}` headers resolved at the
-  first call; a batch resolves approvals with up to 8 webhook calls in flight
-  (identical cacheable calls share one resolution); and OpenAI Responses
-  event streams are accumulated, with every `.done` / `response.completed`
-  restatement required to match the deltas exactly. SSE framing and the
-  stream shape sniff resume across chunks instead of rescanning a long
-  partial event from its first byte.
+- **BREAKING — `ai_semantic_cache` hardening from the production-launch
+  review** (issue #6822). Exact keys and semantic scopes now bind the request's complete
+  response-side policy provenance (RTDS gate content plus the static
+  response-presentation digest), so an entry retained under an earlier
+  `response_transformer` rule — locally or by another replica in Redis — can no
+  longer replay past a new field-removal rule; a request whose presentation
+  policy is unprovable bypasses. Instruction state (`system`/`developer`
+  messages, Anthropic `system`, Responses `instructions` and
+  `system`/`developer` `input` items, Gemini `systemInstruction`, Cohere
+  `preamble`) is bound byte-exactly in semantic scopes and Responses
+  instruction items leave the embedding input. Cohere v1 `conversation_id`
+  requests, request bodies with duplicate JSON members, and requests carrying
+  `Cache-Control: no-store`/`no-cache` bypass lookup and storage; responses
+  with `Cache-Control: no-store`/`private` or `Set-Cookie` are never stored.
+  Composition admission refuses any final-request-body policy plugin ordered at
+  or after an `ai_semantic_cache` instance by `priority_override`. Key domains
+  move to v4, so previously retained entries are unreachable.
+- **`ai_semantic_cache` populates from `ai_federation` and tolerates replica
+  clock skew.** A provider-backed `ai_federation` 2xx answer (proven by
+  federation's internal external-operation provenance) is now stored, so the
+  documented cache-before-federation chain hits on repeats, but only when
+  federation recorded that the provider's original headers carried no
+  `Cache-Control: no-store`/`private` or `Set-Cookie`, and only from the
+  committed-response hook once the final synthetic headers (late
+  `after_proxy` header rules, rotated cookies) also allow it; fabricated
+  synthetic bodies remain ineligible. An authenticated Redis envelope sealed up
+  to 60 seconds in the reader's future is admitted, and an authentic envelope
+  that is expired or further in the future is a plain miss instead of being
+  quarantined and deleted. Canonical `"stream": true` requests skip the
+  embedding call.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
