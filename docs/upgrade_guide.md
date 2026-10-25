@@ -28,28 +28,35 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `ai_token_metrics`: priority 4070 and default streaming metering (#6857)
+### `cors` method and header lists are bounded (#6844)
 
-`ai_token_metrics` now runs at priority 4070 instead of 4100: after
-`ai_federation` (4060) and before `ai_response_guard` (4075) and
-`security_headers` (4080). Custom plugins or `priority_override` values that
-relied on running before token metrics in the 4070–4099 range, for example to
-rewrite a response body it reads, must move below 4070. A guard rejection of a
-2xx generation now keeps that generation's `ai_*` token metadata, estimated
-cost, and Prometheus counters, where previously the request recorded nothing.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
-Streamed `text/event-stream` and AWS `application/vnd.amazon.eventstream`
-responses are now metered by default without buffering, and a collected SSE
-body is metered whether or not `buffer_streaming_responses` is set. Under an
-unchanged configuration, `ferrum_ai_*_tokens_total` and
-`ferrum_ai_estimated_cost_currency_units_total` therefore rise to include
-streamed traffic that previously contributed nothing, and those transactions
-gain `ai_*` metadata and `ai_streaming: "true"`. Rebaseline cost dashboards and
-alert thresholds. `buffer_streaming_responses: true` is only needed to meter
-content-coded (`gzip`/`br`) SSE origins, which the incremental observer cannot
-read. A 2xx JSON or streamed response that yields no usage now carries
-`{prefix}_unmetered_reason`, and a backend model longer than 256 bytes or
-containing control characters is no longer copied into `{prefix}_model`.
+### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
+
+In `aggregate_router` mode prompts, resources, and resource templates are now
+policy-gated. `policy.default_prompt_action` and
+`policy.default_resource_action` fall back to `policy.default_action`, whose
+default is `deny`, so a gateway that exposed prompts or resources with
+`default_action: deny` now lists and routes none of them. Allow them per item
+in `policy.prompts` / `policy.resources`, or set the family default to `allow`
+to keep the previous behavior. Aggregate-routed calls no longer carry the
+client's `Authorization`, `Proxy-Authorization`, `Cookie`, route credential
+headers, or query string to the upstream (the backend query is committed
+empty, and the header boundary is re-asserted after later header rules); set `servers.<id>.forward_client_credentials:
+true` for an upstream that must receive end-user tokens, or configure a
+service credential in `servers.<id>.headers`. A `discovery.on_schema_change:
+hide_until_configured` quarantine now holds across new sessions until the
+configuration changes. An aggregate `DELETE` without the session header now
+answers `400` instead of `200`. See [plugins.md](plugins.md#mcp_gateway).
 
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 

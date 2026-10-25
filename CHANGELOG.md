@@ -8,31 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `ai_token_metrics` meters streamed responses without buffering
-  and runs before `ai_response_guard`** (issue/PR #6857). A streamed 2xx `text/event-stream` or AWS
-  `application/vnd.amazon.eventstream` response is now metered by default
-  through a pass-through stream inspector built on the shared bounded usage
-  extractor: chunks are forwarded unchanged and immediately, and the observed
-  usage (metadata, estimated cost, and the typed Prometheus snapshot) is
-  published once from the terminal stream hook before the transaction is
-  logged, including when the client disconnects after the provider reported
-  usage. Previously a streamed response produced no token metrics unless
-  `buffer_streaming_responses: true` collected the whole stream. At most 4,096
-  streams are observed concurrently; content-coded origin streams are left
-  unobserved. The plugin's priority moves from 4100 to 4070 (after
-  `ai_federation`, before `ai_response_guard` at 4075), so a guard rejection of
-  a 2xx generation the provider already produced no longer erases that
-  generation's tokens and cost. A collected SSE body is now metered whether or
-  not this instance opted into buffering, since a sibling's buffering would
-  otherwise drop its usage.
-- **`ai_token_metrics` adds per-model pricing and an unmetered-reason label.**
-  `model_pricing` is an ordered list (at most 128) of anchored `*`-only model
-  globs, each with its own `cost_per_prompt_token` / `cost_per_completion_token`;
-  the first match prices the response and the flat rates are the fallback. A
-  2xx JSON or streamed response that yields no usage now records
-  `{prefix}_unmetered_reason` (`body_too_large`, `decode_failed`,
-  `malformed_body`, `provider_undetected`, `no_usage`, `stream_not_inspected`,
-  or `stream_without_usage`), so "unmetered" is distinguishable from zero usage.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -164,15 +157,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`ai_token_metrics` buffered SSE no longer drops an unterminated final
-  usage event.** A final event missing its terminating blank line (or newline)
-  is dispatched at end of body, matching the streaming extractor, and stacked
-  leading BOMs are stripped. Non-2xx responses are no longer collected for
-  inspection the plugin always skips, and a backend-reported model longer than
-  256 bytes or containing control characters is no longer copied into
-  `{prefix}_model` (token counts are still recorded). H1/H2 streamed
-  transaction summaries now carry typed AI usage staged by terminal stream
-  hooks, so `prometheus_metrics` counts it.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
+- **`workload_metrics` (mesh telemetry) review hardening.**
+  - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
+    request/response size, gRPC message families) gain Istio's
+    `grpc_response_status` label: the finalized gRPC status `0`–`16`
+    (out-of-range, malformed, or missing statuses as UNKNOWN `2`), empty for
+    non-gRPC requests, and never on TCP families. It is also a tag-override
+    name. Failing RPCs behind HTTP 200 no longer merge into the success series.
+  - A `response_code` tag override whose value is a status's canonical
+    decimal spelling (`set` to `"200"`, `string(response.code)`) now shares
+    that status's series instead of exposing a duplicate series with the same
+    labels.
+  - B3 propagation: with a Zipkin provider, and whenever the backend request
+    still carries B3, the active span is injected as `x-b3-*` (and `b3` when
+    the request used the single-header form) beside W3C; stale incoming B3 is
+    replaced.
+  - New `ferrum_mesh_tracing_spans_dropped_total{provider,reason}` counts
+    spans an exporter refused at enqueue (`queue_full`, `byte_budget`,
+    `process_ceiling`, `shutting_down`, `unavailable`) or discarded at
+    delivery (`export_failed`).
+  - HBONE baggage attribution reads the same input as `mesh_authz` (wire
+    field-lines plus the folded map); a `baggage` header added by a request
+    transform after authorization is no longer honored.
+  - Mesh injection mirrors enabled proxy-/proxy-group-scoped `mesh_authz`
+    baggage gates into the auto-injected instance's conjunction (over 16
+    distinct gates locks baggage instead of failing construction).
+  - `custom_env_tags`, `custom_header_tags`, and `safe_tag_sources` reject a
+    `PAT` segment (`GITHUB_PAT`, `x-pat`) and a terminal `AUTH` segment
+    (`BASIC_AUTH`, `x-basic-auth`).
+  - No span is built when export is inactive, and the disabled-metrics marker
+    and tag-override plans are no longer re-copied on every stamp.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
@@ -394,6 +426,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes. EastWestGateway keeps the unscoped fail-closed fallback.
 
 ### Security
+
+- **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
+  client credentials off tool-selected upstreams** (issue #6819). New
+  `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
+  `policy.default_prompt_action` / `policy.default_resource_action`, both
+  falling back to `policy.default_action` (default `deny`), apply to the list
+  methods and to `prompts/get` / `resources/read` (refused with JSON-RPC
+  `-32001`); set the family defaults to `allow` to keep the previous open
+  behavior. A read is refused when ANY binding of its upstream URI (an exact
+  resource or a matching template) is denied, unless the requested public URI
+  has its own entry; configured denies are decided from configuration, so they
+  hold even when a server's resource or template list has never succeeded. Aggregate-routed calls no longer carry the client's
+  `Authorization`, `Proxy-Authorization`, `Cookie`, route credential headers,
+  or any query string to the tool-selected upstream: the gateway commits an
+  empty backend query and re-asserts the header boundary over the final
+  backend headers, unless the new per-server
+  `servers.*.forward_client_credentials: true` opts in. An aggregate `DELETE`
+  without a session header now answers HTTP 400 (JSON-RPC `-32600`) instead
+  of `200`. See `docs/upgrade_guide.md`.
+- **`mcp_gateway` production-launch hardening** (issue #6819). A discovered
+  tool `inputSchema` now passes the same bounded depth / node / local-`$ref`
+  walk audit as `outputSchema` — which now also descends into schema-valued
+  `dependencies`, `additionalItems`, and `$recursiveRef` — before `jsonschema`
+  compiles it on the request worker (whether or not
+  `validation.validate_tool_arguments` is on), so a hostile upstream's long
+  flat reference chain can no longer exhaust the worker stack; only that tool
+  is omitted. A second aggregate instance on a disjoint endpoint no longer
+  consumes or clears another instance's trusted public→upstream tool rewrite.
+  A `discovery.on_schema_change: hide_until_configured` quarantine is now an
+  instance-wide gate keyed by server and public tool name, enforced live on
+  `tools/list`, `tools/call`, and final admission in every session (including
+  already-cached and last-good catalogs); only a configuration change clears
+  it, and only published (non-colliding) tools occupy its bounded table.
+- **`mcp_gateway` upstream authentication** (issue #6819). New per-server
+  `servers.*.headers` (at most 32; a value may be a whole
+  `${FERRUM_PLUGIN_SECRET_<NAME>}` reference) are sent on every
+  gateway-originated request — `initialize`, `notifications/initialized`,
+  every `*/list` page, session `DELETE` — and installed on routed calls to
+  that server, replacing any client copy, including over the final backend
+  headers. Names join the credential-header registry; gateway-owned,
+  hop-by-hop, forwarding, `x-consumer-*`, and session header names are
+  refused.
+- **`mcp_gateway` session lifecycle** (issue #6819). An enabled aggregate
+  instance now runs a background reaper (every half
+  `sessions.session_ttl_seconds`, 1–60 s) that reclaims expired sessions at
+  rest; their upstream `DELETE`s run on a separate bounded worker (8 in
+  flight, 10 s each, best-effort queue), so a slow upstream never delays the
+  next sweep. An upstream session minted by `initialize` is owned by that call
+  until it is committed: if the downstream session was removed meanwhile, or
+  `notifications/initialized` fails, or the request is cancelled, the gateway
+  deletes it instead of orphaning it. Both
+  per-server catalog and resource-template discovery fan out concurrently (up
+  to 8 servers at a time).
 
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
