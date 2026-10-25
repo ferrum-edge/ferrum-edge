@@ -10004,10 +10004,15 @@ fn grpc_deadline_schema_matches_runtime_validation_contract() {
         (json!({"reject_no_deadline": 1}), false),
         (json!({"reject_no_deadline": false}), false),
         (json!({"subtract_gateway_processing": false}), false),
+        (json!({"headroom_ms": 0}), false),
+        (json!({"headroom_ms": null}), false),
+        (json!({"headroom_ms": "250"}), false),
         (
             json!({"max_deadline_ms": 30000, "reject_no_deadine": true}),
             false,
         ),
+        (json!({"headroom_ms": 250}), true),
+        (json!({"max_deadline_ms": 30000, "headroom_ms": 250}), true),
         (json!({"max_deadline_ms": 30000}), true),
         (json!({"default_deadline_ms": 5000}), true),
         (json!({"reject_no_deadline": true}), true),
@@ -10036,6 +10041,12 @@ fn grpc_deadline_schema_matches_runtime_validation_contract() {
         .err()
         .expect("runtime rejects default above max");
     assert!(runtime_error.contains("cannot exceed"));
+    let headroom_cross_field = json!({"max_deadline_ms": 500, "headroom_ms": 500});
+    let headroom_error =
+        ferrum_edge::plugins::create_plugin("grpc_deadline", &headroom_cross_field)
+            .err()
+            .expect("runtime rejects headroom that consumes the whole cap");
+    assert!(headroom_error.contains("must be less than `max_deadline_ms`"));
     assert!(
         component
             .get("description")

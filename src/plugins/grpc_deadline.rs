@@ -4,6 +4,7 @@
 //! - Enforces maximum deadlines (caps incoming `grpc-timeout` values)
 //! - Injects default deadlines when clients omit `grpc-timeout`
 //! - Subtracts gateway processing time before forwarding to backends
+//! - Optionally reserves a fixed `headroom_ms` from a client-supplied deadline
 //! - Optionally rejects requests that arrive without a deadline
 //!
 //! The `grpc-timeout` header format follows the gRPC spec:
@@ -22,18 +23,25 @@ use crate::proxy::grpc_proxy::{
 };
 
 const MAX_GRPC_TIMEOUT_VALUE: u64 = 99_999_999;
-const ALLOWED_CONFIG_KEYS: [&str; 4] = [
+const ALLOWED_CONFIG_KEYS: [&str; 5] = [
     "max_deadline_ms",
     "default_deadline_ms",
     "subtract_gateway_processing",
     "reject_no_deadline",
+    "headroom_ms",
 ];
+
+/// Smallest budget a `headroom_ms` reservation can leave. `0m` is not a legal
+/// `grpc-timeout`, and a reservation larger than the client's whole deadline
+/// means the RPC should end as soon as possible, not be left unbounded.
+const MIN_BUDGET_AFTER_HEADROOM_MS: u64 = 1;
 
 pub struct GrpcDeadline {
     max_deadline_ms: Option<u64>,
     default_deadline_ms: Option<u64>,
     subtract_gateway_processing: bool,
     reject_no_deadline: bool,
+    headroom_ms: Option<u64>,
 }
 
 impl GrpcDeadline {
@@ -56,6 +64,7 @@ impl GrpcDeadline {
         let subtract_gateway_processing =
             optional_bool(config, "subtract_gateway_processing")?.unwrap_or(false);
         let reject_no_deadline = optional_bool(config, "reject_no_deadline")?.unwrap_or(false);
+        let headroom_ms = optional_u64(config, "headroom_ms")?;
 
         if let Some(0) = max_deadline_ms {
             return Err(
@@ -75,6 +84,16 @@ impl GrpcDeadline {
                 "grpc_deadline: `default_deadline_ms` (\"{default_ms}\") cannot exceed `max_deadline_ms` (\"{max_ms}\")"
             ));
         }
+        if let Some(0) = headroom_ms {
+            return Err("grpc_deadline: `headroom_ms` must be greater than zero".to_string());
+        }
+        if let (Some(headroom), Some(max_ms)) = (headroom_ms, max_deadline_ms)
+            && headroom >= max_ms
+        {
+            return Err(format!(
+                "grpc_deadline: `headroom_ms` (\"{headroom}\") must be less than `max_deadline_ms` (\"{max_ms}\")"
+            ));
+        }
 
         // Reject configurations where the plugin does no useful work — same policy as
         // other admission/observability plugins (see CLAUDE.md "Plugin Config Validation").
@@ -88,14 +107,18 @@ impl GrpcDeadline {
         //     `grpc-timeout`). It is a no-op when the client omits the header, but
         //     that matches the user's intent — the rule shouldn't fire when there's
         //     nothing to subtract from.
+        //   - `headroom_ms`: reserves a fixed margin from a client-supplied
+        //     deadline (same no-op-without-a-header reasoning as above).
         let has_any_rule = max_deadline_ms.is_some()
             || default_deadline_ms.is_some()
             || subtract_gateway_processing
-            || reject_no_deadline;
+            || reject_no_deadline
+            || headroom_ms.is_some();
         if !has_any_rule {
             return Err(
                 "grpc_deadline: no rules configured — set at least one of `max_deadline_ms`, \
-                 `default_deadline_ms`, `subtract_gateway_processing`, or `reject_no_deadline`"
+                 `default_deadline_ms`, `subtract_gateway_processing`, `reject_no_deadline`, \
+                 or `headroom_ms`"
                     .to_string(),
             );
         }
@@ -105,6 +128,7 @@ impl GrpcDeadline {
             default_deadline_ms,
             subtract_gateway_processing,
             reject_no_deadline,
+            headroom_ms,
         })
     }
 }
@@ -176,15 +200,13 @@ fn parse_grpc_timeout(val: &str) -> Option<Duration> {
     }
 }
 
-fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
-    value / divisor + u64::from(!value.is_multiple_of(divisor))
-}
-
 /// Format a Duration as a valid `grpc-timeout` value.
 ///
 /// The gRPC wire format allows at most 8 digits. We preserve exact
 /// millisecond precision whenever it fits, and only coarsen the unit when the
-/// 8-digit limit would otherwise be exceeded.
+/// 8-digit limit would otherwise be exceeded. Coarsening ROUNDS DOWN, so the
+/// value on the wire never tells a backend it has more time than the budget it
+/// encodes (for example a `max_deadline_ms` cap).
 fn format_grpc_timeout(d: Duration) -> String {
     format_grpc_timeout_ms(d.as_millis().min(u128::from(u64::MAX)) as u64)
 }
@@ -197,6 +219,11 @@ fn format_grpc_timeout(d: Duration) -> String {
 /// Callers that must not emit the invalid wire value `0m` are responsible for
 /// passing at least `1` — the deadline plugin deliberately keeps `0m` for an
 /// exhausted budget it is about to reject.
+///
+/// Millisecond values are exact. A coarser unit is only reached for a budget
+/// above `99_999_999` ms, and is floored: the encoded value is the largest
+/// whole number of that unit within the budget, which is always at least
+/// `100_000` and therefore never collapses to zero.
 pub(crate) fn format_grpc_timeout_ms(ms: u64) -> String {
     let candidates = [
         ('m', 1_u64),
@@ -206,7 +233,7 @@ pub(crate) fn format_grpc_timeout_ms(ms: u64) -> String {
     ];
 
     for (unit, divisor) in candidates {
-        let value = ceil_div_u64(ms, divisor);
+        let value = ms / divisor;
         if value <= MAX_GRPC_TIMEOUT_VALUE {
             let mut timeout = value.to_string();
             timeout.push(unit);
@@ -254,6 +281,13 @@ fn mark_invalid_grpc_timeout_metadata(ctx: &mut RequestContext) {
         .insert("grpc_timeout_invalid".to_string(), "true".to_string());
 }
 
+fn record_adjusted_deadline_metadata(ctx: &mut RequestContext, deadline_ms: u64) {
+    ctx.metadata.insert(
+        "grpc_adjusted_deadline_ms".to_string(),
+        deadline_ms.to_string(),
+    );
+}
+
 fn initialize_deadline_from_headers(ctx: &mut RequestContext, headers: &HashMap<String, String>) {
     if ctx.grpc_deadline_initialized {
         return;
@@ -296,11 +330,27 @@ pub fn prepare_request_deadline(
         }
         ctx.initialize_grpc_deadline_budget(deadline_ms);
     }
+    // Stamp the documented transaction-log fields HERE, at receipt, rather than
+    // only in `before_proxy`: a `reject_no_deadline` refusal returns from this
+    // preflight, and an authentication/body-policy rejection between here and
+    // `before_proxy` never reaches the hook, yet both must still say whether
+    // the client sent an unparseable or zero `grpc-timeout` and which budget
+    // the policy decided.
+    if !plugins.is_empty() && client_grpc_timeout_is_invalid(&ctx.headers) {
+        mark_invalid_grpc_timeout_metadata(ctx);
+    }
     for plugin in plugins {
         match plugin.prepare_grpc_deadline(ctx) {
             PluginResult::Continue => {}
             reject => return reject,
         }
+    }
+    if !plugins.is_empty()
+        && let Some(budget_ms) = ctx.grpc_deadline_budget_ms
+    {
+        // `before_proxy` refines this to the remaining budget when
+        // `subtract_gateway_processing` is enabled.
+        record_adjusted_deadline_metadata(ctx, budget_ms);
     }
     ctx.grpc_deadline_preflight_complete = true;
     PluginResult::Continue
@@ -328,7 +378,9 @@ impl Plugin for GrpcDeadline {
     }
 
     fn prepare_grpc_deadline(&self, ctx: &mut RequestContext) -> PluginResult {
-        let mut deadline_ms = ctx.grpc_deadline_budget_ms;
+        // Start from the pre-headroom policy budget so a `headroom_ms`
+        // reservation made by an earlier instance is not compounded here.
+        let mut deadline_ms = ctx.grpc_deadline_policy_budget_ms;
         if !ctx.grpc_deadline_had_valid_client_timeout && self.reject_no_deadline {
             debug!(
                 plugin = "grpc_deadline",
@@ -340,12 +392,26 @@ impl Plugin for GrpcDeadline {
                 headers: grpc_content_type_header(),
             };
         }
+        // Every ceiling and headroom request is accumulated in typed request
+        // state BEFORE the default is injected, so composition is independent
+        // of instance order: a default injected by a later instance is still
+        // clamped by an earlier instance's `max_deadline_ms`, exactly as it is
+        // when the two run the other way round.
+        if let Some(max) = self.max_deadline_ms {
+            ctx.grpc_deadline_ceiling_ms = Some(
+                ctx.grpc_deadline_ceiling_ms
+                    .map_or(max, |ceiling| ceiling.min(max)),
+            );
+        }
+        if let Some(headroom) = self.headroom_ms {
+            ctx.grpc_deadline_headroom_ms = ctx.grpc_deadline_headroom_ms.max(headroom);
+        }
         if deadline_ms.is_none()
             && let Some(default_ms) = self.default_deadline_ms
         {
             deadline_ms = Some(default_ms);
         }
-        if let (Some(current), Some(max)) = (deadline_ms, self.max_deadline_ms)
+        if let (Some(current), Some(max)) = (deadline_ms, ctx.grpc_deadline_ceiling_ms)
             && current > max
         {
             debug!(
@@ -357,7 +423,23 @@ impl Plugin for GrpcDeadline {
             deadline_ms = Some(max);
         }
 
-        ctx.set_grpc_deadline_budget(deadline_ms);
+        ctx.grpc_deadline_policy_budget_ms = deadline_ms;
+        // `headroom_ms` reserves a fixed margin from a CLIENT-SUPPLIED deadline,
+        // after every cap: the gateway's own deadline and the forwarded
+        // `grpc-timeout` both end that much before the client's, so the
+        // gateway's `DEADLINE_EXCEEDED` reaches the client before the client's
+        // own deadline cancels the call. An operator-injected default is the
+        // gateway's own budget and is left as configured.
+        let headroom = ctx.grpc_deadline_headroom_ms;
+        let effective_ms = deadline_ms.map(|ms| {
+            if headroom > 0 && ctx.grpc_deadline_had_valid_client_timeout {
+                ms.saturating_sub(headroom)
+                    .max(MIN_BUDGET_AFTER_HEADROOM_MS)
+            } else {
+                ms
+            }
+        });
+        ctx.set_grpc_deadline_budget(effective_ms);
         ctx.grpc_deadline_header_is_remaining |= self.subtract_gateway_processing;
         PluginResult::Continue
     }
@@ -462,10 +544,7 @@ impl Plugin for GrpcDeadline {
         if client_timeout_invalid {
             mark_invalid_grpc_timeout_metadata(ctx);
         }
-        ctx.metadata.insert(
-            "grpc_adjusted_deadline_ms".to_string(),
-            deadline_ms.to_string(),
-        );
+        record_adjusted_deadline_metadata(ctx, deadline_ms);
 
         PluginResult::Continue
     }

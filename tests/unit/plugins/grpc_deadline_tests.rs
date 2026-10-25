@@ -6273,6 +6273,11 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "`max_deadline_ms`",
             "must be an unsigned integer",
         ),
+        (
+            json!({"headroom_ms": 918273641, "max_deadline_ms": 1}),
+            "`headroom_ms`",
+            "must be less than `max_deadline_ms`",
+        ),
     ] {
         let error = ferrum_edge::plugins::validate_plugin_config("grpc_deadline", &config)
             .expect_err("invalid configuration must still be rejected");
@@ -6283,4 +6288,434 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }
+}
+
+// ── Review fixes: order-independent ceilings, floored coarsening, receipt-time
+// metadata, headroom, and timer-driven streaming RPC deadline enforcement ──
+
+fn deadline_plugin(config: serde_json::Value) -> Arc<dyn Plugin> {
+    create_plugin("grpc_deadline", &config)
+        .expect("valid grpc_deadline config")
+        .expect("grpc_deadline is a built-in plugin")
+}
+
+fn remaining_budget_ms(ctx: &RequestContext) -> u64 {
+    ctx.grpc_deadline_remaining_ms()
+        .expect("an RPC deadline is established")
+}
+
+#[test]
+fn a_later_default_is_clamped_by_an_earlier_instance_ceiling_in_either_order() {
+    let ceiling = deadline_plugin(json!({"max_deadline_ms": 5000}));
+    let default = deadline_plugin(json!({"default_deadline_ms": 60000}));
+    for plugins in [
+        [Arc::clone(&ceiling), Arc::clone(&default)],
+        [Arc::clone(&default), Arc::clone(&ceiling)],
+    ] {
+        for timeout in [None, Some("invalid"), Some("0m")] {
+            let mut ctx = create_grpc_context_with_timeout(timeout);
+            assert_continue(
+                ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+            );
+            let remaining = remaining_budget_ms(&ctx);
+            assert!(
+                (4_000..=5_000).contains(&remaining),
+                "{timeout:?}: an injected default must never escape another instance's \
+                 max_deadline_ms, whatever the instance order (remaining {remaining} ms)"
+            );
+            assert_eq!(
+                ctx.metadata
+                    .get("grpc_adjusted_deadline_ms")
+                    .map(String::as_str),
+                Some("5000"),
+                "{timeout:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn coarsened_forwarded_timeout_never_exceeds_the_capped_budget() {
+    // Above 99,999,999 ms the 8-digit wire limit forces a coarser unit; the
+    // encoded value must round DOWN so the backend is never told it has more
+    // time than the operator's cap.
+    for (max_ms, expected) in [
+        (100_000_001_u64, "100000S"),
+        (6_000_000_001_u64, "6000000S"),
+        (99_999_999_u64, "99999999m"),
+    ] {
+        let plugin = deadline_plugin(json!({"max_deadline_ms": max_ms}));
+        let mut ctx = create_grpc_context_with_timeout(Some("99999999H"));
+        let mut headers = HashMap::from([("grpc-timeout".to_string(), "99999999H".to_string())]);
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert_eq!(
+            headers.get("grpc-timeout").map(String::as_str),
+            Some(expected),
+            "max_deadline_ms={max_ms}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("grpc_adjusted_deadline_ms")
+                .map(String::as_str),
+            Some(max_ms.to_string().as_str())
+        );
+    }
+}
+
+#[test]
+fn preflight_rejection_still_records_invalid_timeout_metadata() {
+    let required = deadline_plugin(json!({"reject_no_deadline": true}));
+    let mut ctx = create_grpc_context_with_timeout(Some("banana"));
+    assert_reject(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[required], &mut ctx),
+        Some(400),
+    );
+    assert_eq!(
+        ctx.metadata.get("grpc_timeout_invalid").map(String::as_str),
+        Some("true"),
+        "a receipt-time rejection must still tell operators the client sent an invalid \
+         grpc-timeout rather than none at all"
+    );
+    assert!(!ctx.metadata.contains_key("grpc_adjusted_deadline_ms"));
+}
+
+#[test]
+fn preflight_records_the_adjusted_budget_before_before_proxy_runs() {
+    let ceiling = deadline_plugin(json!({"max_deadline_ms": 5000}));
+    let mut ctx = create_grpc_context_with_timeout(Some("60S"));
+    assert_continue(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&[ceiling], &mut ctx),
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("grpc_original_deadline_ms")
+            .map(String::as_str),
+        Some("60000")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("grpc_adjusted_deadline_ms")
+            .map(String::as_str),
+        Some("5000"),
+        "a request rejected between the preflight and before_proxy must still log the \
+         capped budget"
+    );
+    assert!(!ctx.metadata.contains_key("grpc_timeout_invalid"));
+}
+
+#[test]
+fn headroom_config_is_validated() {
+    assert!(create_plugin("grpc_deadline", &json!({"headroom_ms": 250})).is_ok());
+    for config in [
+        json!({"headroom_ms": 0}),
+        json!({"headroom_ms": null}),
+        json!({"headroom_ms": -1}),
+        json!({"headroom_ms": 5000, "max_deadline_ms": 5000}),
+        json!({"headroom_ms": 6000, "max_deadline_ms": 5000}),
+    ] {
+        assert!(
+            create_plugin("grpc_deadline", &config).is_err(),
+            "{config} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn headroom_is_reserved_from_a_client_deadline() {
+    let plugin = deadline_plugin(json!({"headroom_ms": 500}));
+    let mut ctx = create_grpc_context_with_timeout(Some("5S"));
+    assert_continue(
+        ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(
+            std::slice::from_ref(&plugin),
+            &mut ctx,
+        ),
+    );
+    let remaining = remaining_budget_ms(&ctx);
+    assert!(
+        (4_000..=4_500).contains(&remaining),
+        "the gateway's own deadline ends headroom_ms before the client's (remaining {remaining} ms)"
+    );
+    let mut headers = HashMap::from([("grpc-timeout".to_string(), "5S".to_string())]);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("grpc-timeout").map(String::as_str),
+        Some("4500m")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("grpc_adjusted_deadline_ms")
+            .map(String::as_str),
+        Some("4500")
+    );
+}
+
+#[tokio::test]
+async fn headroom_floors_at_one_millisecond_and_leaves_injected_defaults_alone() {
+    let plugin = deadline_plugin(json!({"headroom_ms": 500}));
+    let mut ctx = create_grpc_context_with_timeout(Some("200m"));
+    let mut headers = HashMap::from([("grpc-timeout".to_string(), "200m".to_string())]);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("grpc-timeout").map(String::as_str),
+        Some("1m"),
+        "a reservation larger than the client deadline leaves the minimum legal budget"
+    );
+
+    let plugin = deadline_plugin(json!({"default_deadline_ms": 3000, "headroom_ms": 500}));
+    let mut ctx = create_grpc_context_with_timeout(None);
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        headers.get("grpc-timeout").map(String::as_str),
+        Some("3000m"),
+        "an operator-injected default is the gateway's own budget, not a client deadline"
+    );
+}
+
+#[test]
+fn headroom_is_reserved_once_after_caps_in_either_instance_order() {
+    let ceiling = deadline_plugin(json!({"max_deadline_ms": 5000}));
+    let headroom = deadline_plugin(json!({"headroom_ms": 500}));
+    let wider = deadline_plugin(json!({"headroom_ms": 200}));
+    for plugins in [
+        [
+            Arc::clone(&ceiling),
+            Arc::clone(&headroom),
+            Arc::clone(&wider),
+        ],
+        [
+            Arc::clone(&headroom),
+            Arc::clone(&wider),
+            Arc::clone(&ceiling),
+        ],
+        [
+            Arc::clone(&wider),
+            Arc::clone(&ceiling),
+            Arc::clone(&headroom),
+        ],
+    ] {
+        let mut ctx = create_grpc_context_with_timeout(Some("60S"));
+        assert_continue(
+            ferrum_edge::plugins::grpc_deadline::prepare_request_deadline(&plugins, &mut ctx),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("grpc_adjusted_deadline_ms")
+                .map(String::as_str),
+            Some("4500"),
+            "the largest headroom is reserved exactly once, after the tightest cap"
+        );
+        let remaining = remaining_budget_ms(&ctx);
+        assert!(
+            (4_000..=4_500).contains(&remaining),
+            "remaining {remaining} ms"
+        );
+    }
+}
+
+/// A backend response that yields its queued frames and then stalls forever,
+/// recording whether the gateway released it. Stands in for a backend that
+/// ignores the forwarded `grpc-timeout`.
+struct StalledRpcBackendBody {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for StalledRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match self.frames.pop_front() {
+            Some(frame) => std::task::Poll::Ready(Some(Ok(frame))),
+            None => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Drop for StalledRpcBackendBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A backend that produces DATA as fast as it is read, so the pump's bounded
+/// channel fills while the client reads nothing.
+struct FloodingRpcBackendBody {
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for FloodingRpcBackendBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(
+            b"\x00\x00\x00\x00\x01x",
+        )))))
+    }
+}
+
+impl Drop for FloodingRpcBackendBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn grpc_status_of(frame: &http_body::Frame<bytes::Bytes>) -> Option<String> {
+    frame
+        .trailers_ref()?
+        .get("grpc-status")?
+        .to_str()
+        .ok()
+        .map(str::to_string)
+}
+
+#[tokio::test(start_paused = true)]
+async fn rpc_deadline_releases_the_backend_while_the_client_polls_nothing() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::new(),
+        dropped: Arc::clone(&dropped),
+    }));
+    // The client withholds HTTP/2 response credit, so hyper never polls the
+    // client-visible body: nothing below polls it until the very end.
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        closer.clone(),
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the backend stream must be released AT the RPC deadline by a gateway timer, not \
+         whenever the client lets hyper poll the body again"
+    );
+    assert!(
+        !closer.close_requested(),
+        "the client still has its bounded grace to drain the DEADLINE_EXCEEDED terminal"
+    );
+
+    tokio::time::sleep(authorization_transport_close_grace() + Duration::from_secs(1)).await;
+    assert!(
+        closer.close_requested(),
+        "a client that never drains the terminal must have its connection closed, or the \
+         request, per-IP, admission, and load-balancer accounting held by the response body \
+         outlive the RPC deadline at the client's discretion"
+    );
+
+    // A late drain still observes the protocol-correct terminal: no response
+    // DATA was written, so it is DEADLINE_EXCEEDED trailers.
+    let frame = body
+        .frame()
+        .await
+        .expect("the elapsed deadline produces a terminal")
+        .expect("the pre-DATA terminal is trailers, not an error");
+    assert_eq!(grpc_status_of(&frame).as_deref(), Some("4"));
+    assert!(body.frame().await.is_none(), "exactly one completion");
+}
+
+#[tokio::test(start_paused = true)]
+async fn rpc_deadline_never_delivers_a_backend_frame_queued_behind_a_stalled_client() {
+    use ferrum_edge::_test_support::{
+        proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = proxy_body_streaming_for_test(Box::pin(FloodingRpcBackendBody {
+        dropped: Arc::clone(&dropped),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        None,
+        AuthorizationConnectionCloser::new(),
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "a full pump channel must not postpone releasing a backend that keeps producing"
+    );
+    let frame = body
+        .frame()
+        .await
+        .expect("the elapsed deadline produces a terminal")
+        .expect("nothing reached the client, so the terminal is trailers");
+    assert_eq!(
+        grpc_status_of(&frame).as_deref(),
+        Some("4"),
+        "the frame the pump queued before the deadline must not be delivered after it"
+    );
+    assert!(body.frame().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_rpc_that_completes_before_its_deadline_keeps_its_trailers_and_its_connection() {
+    use ferrum_edge::_test_support::{
+        authorization_transport_close_grace, proxy_body_streaming_for_test,
+        proxy_body_with_client_grpc_deadline_and_closer_for_test,
+    };
+    use ferrum_edge::proxy::auth_lifetime::AuthorizationConnectionCloser;
+    use http_body_util::BodyExt;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+    let closer = AuthorizationConnectionCloser::new();
+    let backend = proxy_body_streaming_for_test(Box::pin(StalledRpcBackendBody {
+        frames: std::collections::VecDeque::from([
+            http_body::Frame::data(bytes::Bytes::from_static(b"\x00\x00\x00\x00\x01x")),
+            http_body::Frame::trailers(trailers),
+        ]),
+        dropped: Arc::new(AtomicBool::new(false)),
+    }));
+    let mut body = proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        backend,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        None,
+        closer.clone(),
+    );
+
+    let data = body.frame().await.expect("data frame").expect("data ok");
+    assert_eq!(
+        data.data_ref().map(|bytes| &bytes[..]),
+        Some(b"\x00\x00\x00\x00\x01x".as_slice())
+    );
+    let terminal = body.frame().await.expect("trailers").expect("trailers ok");
+    assert_eq!(grpc_status_of(&terminal).as_deref(), Some("0"));
+    assert!(body.frame().await.is_none());
+    drop(body);
+
+    tokio::time::sleep(Duration::from_secs(5) + authorization_transport_close_grace() * 2).await;
+    assert!(
+        !closer.close_requested(),
+        "a response that finished before its RPC deadline must never cost the client its \
+         connection"
+    );
 }

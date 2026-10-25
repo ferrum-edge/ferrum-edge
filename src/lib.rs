@@ -14080,7 +14080,21 @@ pub mod _test_support {
         deadline: tokio::time::Instant,
         grpc_web_response_content_type: Option<&str>,
     ) -> crate::proxy::ProxyBody {
-        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, None)
+    }
+
+    /// [`proxy_body_with_client_grpc_deadline_for_test`] on a hyper-driven
+    /// HTTP/1.1 / HTTP/2 frontend connection: the upstream moves into the
+    /// gateway-owned response pump, so the client RPC deadline releases the
+    /// backend and, after the bounded grace, requests `closer` even while
+    /// nothing polls the client-visible body.
+    pub fn proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+        grpc_web_response_content_type: Option<&str>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> crate::proxy::ProxyBody {
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, Some(closer))
     }
 
     /// Parse a Gateway API Duration (GEP-2257) exactly as the HTTPRoute
@@ -18219,7 +18233,10 @@ pub mod _test_support {
                 http_body_util::StreamBody::new(backend),
                 None,
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h2_coalescing" => coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -18235,7 +18252,10 @@ pub mod _test_support {
                 None,
                 default_coalesce_target_bytes(),
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h3_direct" => direct_streaming_h3_body(
