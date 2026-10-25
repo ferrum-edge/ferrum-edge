@@ -23,6 +23,7 @@ use crate::config::types::{
 };
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
 use crate::plugins::mcp_openapi_bridge as mcp_bridge;
+use crate::plugins::utils::sse::is_text_event_stream_media_type;
 use crate::util::media_type::is_concrete_http_media_type;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
@@ -2335,6 +2336,16 @@ fn extract_operation_schemas(
                     &mut resolution_state,
                 )?
             };
+            let parameters = extract_operation_parameters(
+                resolver.primary_root(),
+                path_object,
+                operation,
+                version,
+                &format!("paths.{path_template}.{method}"),
+                &resolver,
+                &mut operation_budget,
+                &mut resolution_state,
+            )?;
 
             // One matcher per distinct effective pathname. Equivalent server
             // pathnames are deduplicated while preserving document order.
@@ -2379,6 +2390,9 @@ fn extract_operation_schemas(
                 }
                 if !responses.is_empty() {
                     entry.insert("responses".to_string(), Value::Object(responses.clone()));
+                }
+                if !parameters.is_empty() {
+                    entry.insert("parameters".to_string(), Value::Array(parameters.clone()));
                 }
                 let entry = Value::Object(entry);
                 let entry_bytes = serde_json::to_vec(&entry)
@@ -2811,6 +2825,255 @@ fn resolve_path_item(
         ResolveContext::ReferenceObject,
         state,
     )
+}
+
+/// A generated parameter's request-direction schema plus any explicit
+/// `style` / `explode`, or the reason the validator cannot deserialize it.
+type ParameterSerialization = Result<(Value, Option<String>, Option<bool>), String>;
+
+fn validator_parameter_error(error: String) -> ExtractError {
+    ExtractError::MalformedExtension {
+        which: "x-ferrum-validate",
+        error,
+    }
+}
+
+/// Generate `openapi_validator` parameter descriptors for one operation.
+///
+/// Path Item parameters are inherited and overridden by operation parameters
+/// with the same `name` and `in`. Each descriptor carries `name`, `in`,
+/// `required`, the request-direction `schema`, and any explicit `style` /
+/// `explode`. A parameter whose serialization the validator cannot
+/// deserialize (a `content` map, a non-default `style`, a Swagger
+/// `collectionFormat` other than `csv` / `multi`, nested collections) is
+/// omitted when it is optional and REFUSES the import when it is required, so
+/// a required parameter is never silently left unenforced. The support rule
+/// is the plugin constructor's own
+/// ([`crate::plugins::openapi_validator::parameter_serialization_support`]).
+/// Header parameters OpenAPI says are ignored (`Accept`, `Content-Type`,
+/// `Authorization`) and Swagger `body` / `formData` parameters (the
+/// request-body contract) are not emitted.
+#[allow(clippy::too_many_arguments)]
+fn extract_operation_parameters(
+    root: &Value,
+    path_item: &Map<String, Value>,
+    operation: &Map<String, Value>,
+    version: &str,
+    location: &str,
+    resolver: &LocalSchemaResolver,
+    budget: &mut GeneratedOperationBudget,
+    state: &mut ResolutionState,
+) -> Result<Vec<Value>, ExtractError> {
+    let mut declared: Vec<Value> = Vec::new();
+    for parameters in [path_item.get("parameters"), operation.get("parameters")]
+        .into_iter()
+        .flatten()
+    {
+        let Some(parameters) = parameters.as_array() else {
+            return Err(validator_parameter_error(format!(
+                "`{location}` parameters must be an array"
+            )));
+        };
+        for parameter in parameters {
+            let resolved = resolve_refs(
+                root,
+                parameter,
+                "#/paths/parameters",
+                MAX_SCHEMA_REF_DEPTH,
+                resolver.document_base(),
+                resolver,
+                ResolveContext::ReferenceObject,
+                state,
+            )?;
+            let key = |value: &Value| {
+                (
+                    value.get("name").and_then(Value::as_str).map(str::to_owned),
+                    value.get("in").and_then(Value::as_str).map(str::to_owned),
+                )
+            };
+            let resolved_key = key(&resolved);
+            declared.retain(|existing| key(existing) != resolved_key);
+            declared.push(resolved);
+        }
+    }
+
+    let mut generated = Vec::with_capacity(declared.len());
+    for parameter in &declared {
+        let Some(object) = parameter.as_object() else {
+            return Err(validator_parameter_error(format!(
+                "`{location}` has a parameter that is not a Parameter Object"
+            )));
+        };
+        let (Some(name), Some(location_in)) = (
+            object.get("name").and_then(Value::as_str),
+            object.get("in").and_then(Value::as_str),
+        ) else {
+            return Err(validator_parameter_error(format!(
+                "`{location}` has a parameter without a string `name` and `in`"
+            )));
+        };
+        if version == "2.0" && matches!(location_in, "body" | "formData") {
+            continue;
+        }
+        if location_in == "header"
+            && matches!(
+                name.to_ascii_lowercase().as_str(),
+                "accept" | "content-type" | "authorization"
+            )
+        {
+            continue;
+        }
+        let required = location_in == "path"
+            || object
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let serialization = if version == "2.0" {
+            swagger_parameter_serialization(object)
+        } else {
+            openapi_parameter_serialization(root, object, version, resolver, state)?
+        };
+        let supported = serialization.and_then(|(schema, style, explode)| {
+            crate::plugins::openapi_validator::parameter_serialization_support(
+                location_in,
+                style.as_deref(),
+                explode,
+                &schema,
+            )
+            .map(|()| (schema, style, explode))
+        });
+        let (schema, style, explode) = match supported {
+            Ok(parts) => parts,
+            Err(reason) if required => {
+                return Err(validator_parameter_error(format!(
+                    "`{location}` required {location_in} parameter {name:?} cannot be validated by openapi_validator ({reason}); the import is refused rather than leaving a required parameter unenforced"
+                )));
+            }
+            // An optional parameter the validator cannot deserialize stays
+            // unvalidated, exactly as before parameter validation existed.
+            // The omission is announced at import time (spec-declared names
+            // only, never request data) and documented in the guide.
+            Err(reason) => {
+                tracing::warn!(
+                    operation = %location,
+                    parameter = %name,
+                    location = %location_in,
+                    %reason,
+                    "x-ferrum-validate: optional parameter is not validated by openapi_validator"
+                );
+                continue;
+            }
+        };
+        let mut entry = Map::new();
+        entry.insert("name".to_string(), Value::String(name.to_string()));
+        entry.insert("in".to_string(), Value::String(location_in.to_string()));
+        entry.insert("required".to_string(), Value::Bool(required));
+        entry.insert("schema".to_string(), schema);
+        if let Some(style) = style {
+            entry.insert("style".to_string(), Value::String(style));
+        }
+        if let Some(explode) = explode {
+            entry.insert("explode".to_string(), Value::Bool(explode));
+        }
+        let entry = Value::Object(entry);
+        // Charged per descriptor (the repeated key is a fail-safe
+        // overestimate) before it is retained, like every generated entry.
+        budget.consume_map_entry("parameters", &entry, location)?;
+        generated.push(entry);
+    }
+    Ok(generated)
+}
+
+/// OpenAPI 3.x Parameter Object serialization: its `schema` (references
+/// resolved, request direction) and explicit `style` / `explode`.
+fn openapi_parameter_serialization(
+    root: &Value,
+    object: &Map<String, Value>,
+    version: &str,
+    resolver: &LocalSchemaResolver,
+    state: &mut ResolutionState,
+) -> Result<ParameterSerialization, ExtractError> {
+    if object.contains_key("content") {
+        return Ok(Err("it uses `content` instead of `schema`".to_string()));
+    }
+    let Some(schema) = object.get("schema") else {
+        return Ok(Err("it has no `schema`".to_string()));
+    };
+    let style = match object.get("style") {
+        None => None,
+        Some(Value::String(style)) => Some(style.clone()),
+        Some(_) => return Ok(Err("its `style` is not a string".to_string())),
+    };
+    let explode = match object.get("explode") {
+        None => None,
+        Some(Value::Bool(explode)) => Some(*explode),
+        Some(_) => return Ok(Err("its `explode` is not a boolean".to_string())),
+    };
+    let schema = resolve_refs(
+        root,
+        schema,
+        "#/paths/parameters/schema",
+        MAX_SCHEMA_REF_DEPTH,
+        resolver.document_base(),
+        resolver,
+        ResolveContext::Schema,
+        state,
+    )?;
+    let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
+    Ok(Ok((schema, style, explode)))
+}
+
+/// Swagger 2.0 non-body parameter serialization. The parameter object itself
+/// carries the JSON-Schema-subset fields; `collectionFormat` maps to `explode`
+/// (`csv` → `false`, `multi` → `true`).
+fn swagger_parameter_serialization(object: &Map<String, Value>) -> ParameterSerialization {
+    let Some(kind) = object.get("type").and_then(Value::as_str) else {
+        return Err("it has no `type`".to_string());
+    };
+    if kind == "file" {
+        return Err("it is a file parameter".to_string());
+    }
+    let explode = if kind == "array" {
+        match object
+            .get("collectionFormat")
+            .and_then(Value::as_str)
+            .unwrap_or("csv")
+        {
+            "csv" => Some(false),
+            "multi" => Some(true),
+            other => return Err(format!("it uses collectionFormat {other:?}")),
+        }
+    } else {
+        None
+    };
+    let schema = normalize_schema_for_openapi(
+        swagger_parameter_schema(object, 0),
+        "2.0",
+        SchemaDirection::Request,
+    );
+    Ok((schema, None, explode))
+}
+
+/// Copy a Swagger 2.0 parameter / Items Object into a JSON Schema, dropping the
+/// parameter-only fields. Nesting is bounded like every other schema walk.
+fn swagger_parameter_schema(object: &Map<String, Value>, depth: usize) -> Value {
+    let mut schema = Map::new();
+    for (key, value) in object {
+        if matches!(
+            key.as_str(),
+            "name" | "in" | "description" | "required" | "allowEmptyValue" | "collectionFormat"
+        ) {
+            continue;
+        }
+        let value = match (key.as_str(), value.as_object()) {
+            ("items", Some(items)) if depth < MAX_SCHEMA_INDEX_DEPTH => {
+                swagger_parameter_schema(items, depth + 1)
+            }
+            _ => value.clone(),
+        };
+        schema.insert(key.clone(), value);
+    }
+    Value::Object(schema)
 }
 
 fn extract_openapi_request_body(
@@ -3576,6 +3839,14 @@ fn extract_openapi_responses(
                         normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
                     budget.consume_map_entry(media_type, &schema, status)?;
                     content_schemas.insert(media_type.clone(), schema);
+                } else if is_text_event_stream_media_type(media_type) {
+                    // A declared event stream is an explicit contract even
+                    // without a schema: keep it (accept-anything schema) so the
+                    // validator can admit that status's stream instead of
+                    // refusing it as an undeclared, uninspectable response.
+                    let schema = json!({});
+                    budget.consume_map_entry(media_type, &schema, status)?;
+                    content_schemas.insert(media_type.clone(), schema);
                 }
             }
         }
@@ -3685,7 +3956,19 @@ fn extract_swagger_responses(
         };
         let mut content = Map::new();
         // As above: a declared status with no `schema` still occupies its slot
-        // so it cannot fall through to a wildcard or `default` response.
+        // so it cannot fall through to a wildcard or `default` response. A
+        // schemaless response that `produces` an event stream keeps that
+        // declaration, as in OpenAPI 3.x extraction.
+        if response_object.get("schema").is_none() {
+            for media_type in produces
+                .iter()
+                .filter(|media_type| is_text_event_stream_media_type(media_type))
+            {
+                let schema = json!({});
+                budget.consume_map_entry(media_type, &schema, status)?;
+                content.insert(media_type.clone(), schema);
+            }
+        }
         if let Some(schema) = response_object.get("schema") {
             let schema = resolve_refs(
                 root,

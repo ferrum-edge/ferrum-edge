@@ -1017,9 +1017,12 @@ on a native-gRPC request.
 - The standard AWS credential fallbacks (`AWS_ACCESS_KEY_ID` /
   `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) in `serverless_function`
   (`aws_lambda`) and `ai_federation` (`aws_bedrock`) are the only remaining
-  ambient credential fallbacks; neither plugin uses the AWS SDK default chain
-  (IMDS, ECS, web identity, SSO, profiles), so keep it that way or extend the
-  scope. Whenever the key id or secret resolves from the environment, the
+  ambient credential fallbacks. `serverless_function` additionally offers an
+  explicit opt-in `aws_credentials: default_chain` (AWS SDK chain: IMDS, ECS,
+  web identity, SSO, profiles; `secrets-aws` builds only), cached and refreshed
+  off the request path by `utils::aws_refreshing_credentials`; it is held to the
+  same endpoint scope below. `ai_federation` does not use the SDK chain.
+  Whenever the key id or secret resolves from the environment, the
   region must pass the partition grammar
   (`ambient_cloud_credentials::aws_region_partition`, mirroring the SDK
   `aws` / `aws-cn` / `aws-us-gov` regexes with lowercase letters) and the

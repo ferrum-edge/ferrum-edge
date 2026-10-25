@@ -224,8 +224,8 @@ pub enum SampleInput<'a> {
 }
 
 impl<'a> SampleInput<'a> {
-    pub fn proxy_id(&self) -> Option<&str> {
-        match self {
+    pub fn proxy_id(&self) -> Option<&'a str> {
+        match *self {
             Self::Http(s) => s.proxy_id.as_deref(),
             Self::Stream(s) => Some(s.proxy_id.as_str()),
             Self::WebSocket(s) => Some(s.proxy_id.as_str()),
@@ -240,16 +240,16 @@ impl<'a> SampleInput<'a> {
         }
     }
 
-    pub fn proxy_name(&self) -> Option<&str> {
-        match self {
+    pub fn proxy_name(&self) -> Option<&'a str> {
+        match *self {
             Self::Http(s) => s.proxy_name.as_deref(),
             Self::Stream(s) => s.proxy_name.as_deref(),
             Self::WebSocket(s) => s.proxy_name.as_deref(),
         }
     }
 
-    pub fn namespace(&self) -> &str {
-        match self {
+    pub fn namespace(&self) -> &'a str {
+        match *self {
             Self::Http(s) => s.namespace.as_str(),
             Self::Stream(s) => s.namespace.as_str(),
             Self::WebSocket(s) => s.namespace.as_str(),
@@ -264,8 +264,10 @@ pub struct RuleObservation {
     /// `true` when the threshold is currently exceeded (subject to
     /// `min_request_count` etc.).
     pub breach: bool,
-    /// Total number of samples in the window (denominator for rates,
-    /// hit count for counters, total observations for histograms).
+    /// Total number of samples in the rule's window: every recorded sample
+    /// for counter rules (the denominator for rates; matched and unmatched
+    /// samples alike for count rules, whose matched count is `observed`) and
+    /// total observations for histograms.
     pub sample_count: u64,
     /// Raw observation data. Rendered only when a notification is actually
     /// dispatched so the common non-breaching hot path stays allocation-light.
@@ -505,6 +507,167 @@ impl Rule {
             }
         })
     }
+
+    /// Evaluate the rule against its current window at `now_ms` without
+    /// recording a sample.
+    ///
+    /// Used by the background lifecycle re-evaluation so an incident on a proxy
+    /// that stopped producing traffic can still age out of breach, enter
+    /// recovery, and resolve on schedule. `owner_key` is the namespace-qualified
+    /// lifecycle identity (`namespace|proxy_id`) the window rows are keyed by.
+    pub fn window_observation(
+        &self,
+        store: &WindowStore,
+        owner_key: &str,
+        ownership_generation: u64,
+        now_ms: u64,
+    ) -> RuleObservation {
+        let id = self.id();
+        match self {
+            Rule::ErrorRate(r) => {
+                let (matched, total) =
+                    store.snapshot_count(id, owner_key, ownership_generation, now_ms);
+                error_rate_observation(r, matched, total)
+            }
+            Rule::StatusCodeCount(r) => {
+                let (matched, total) =
+                    store.snapshot_count(id, owner_key, ownership_generation, now_ms);
+                status_code_count_observation(r, matched, total)
+            }
+            Rule::LatencyPercentile(r) => {
+                let (estimate, total) = store.snapshot_percentile(
+                    id,
+                    owner_key,
+                    ownership_generation,
+                    r.percentile,
+                    now_ms,
+                );
+                latency_observation(r, estimate, total)
+            }
+            Rule::ErrorClass(r) => {
+                let (matched, total) =
+                    store.snapshot_count(id, owner_key, ownership_generation, now_ms);
+                error_class_observation(r, matched, total)
+            }
+            Rule::StreamDisconnectCause(r) => {
+                let (matched, total) =
+                    store.snapshot_count(id, owner_key, ownership_generation, now_ms);
+                stream_disconnect_observation(r, matched, total)
+            }
+            Rule::GrpcStatusCount(r) => {
+                let (matched, total) =
+                    store.snapshot_count(id, owner_key, ownership_generation, now_ms);
+                grpc_status_count_observation(r, matched, total)
+            }
+            Rule::GrpcStatusRate(r) => {
+                let (matched, total) =
+                    store.snapshot_count(id, owner_key, ownership_generation, now_ms);
+                grpc_status_rate_observation(r, matched, total)
+            }
+        }
+    }
+}
+
+fn rate_percent(matched_total: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (matched_total as f64 / total as f64) * 100.0
+    }
+}
+
+fn error_rate_observation(rule: &ErrorRateRule, matched_total: u64, total: u64) -> RuleObservation {
+    let percent = rate_percent(matched_total, total);
+    let breach = total >= rule.min_request_count && percent >= rule.threshold_percent;
+    RuleObservation {
+        breach,
+        sample_count: total,
+        detail: RuleObservationDetail::ErrorRate {
+            matched_total,
+            total,
+            percent,
+        },
+    }
+}
+
+fn status_code_count_observation(
+    rule: &StatusCodeCountRule,
+    matched_total: u64,
+    total: u64,
+) -> RuleObservation {
+    RuleObservation {
+        breach: matched_total >= rule.threshold_count,
+        sample_count: total,
+        detail: RuleObservationDetail::StatusCodeCount { matched_total },
+    }
+}
+
+fn latency_observation(
+    rule: &LatencyPercentileRule,
+    estimate_upper_bound_ms: Option<f64>,
+    total: u64,
+) -> RuleObservation {
+    RuleObservation {
+        breach: latency_estimate_breaches(estimate_upper_bound_ms, total, rule),
+        sample_count: total,
+        detail: RuleObservationDetail::LatencyPercentile {
+            estimate_upper_bound_ms,
+        },
+    }
+}
+
+fn error_class_observation(
+    rule: &ErrorClassRule,
+    matched_total: u64,
+    total: u64,
+) -> RuleObservation {
+    RuleObservation {
+        breach: matched_total >= rule.threshold_count,
+        sample_count: total,
+        detail: RuleObservationDetail::ErrorClass { matched_total },
+    }
+}
+
+fn stream_disconnect_observation(
+    rule: &StreamDisconnectCauseRule,
+    matched_total: u64,
+    total: u64,
+) -> RuleObservation {
+    RuleObservation {
+        breach: matched_total >= rule.threshold_count,
+        sample_count: total,
+        detail: RuleObservationDetail::StreamDisconnectCause { matched_total },
+    }
+}
+
+fn grpc_status_count_observation(
+    rule: &GrpcStatusCountRule,
+    matched_total: u64,
+    total: u64,
+) -> RuleObservation {
+    RuleObservation {
+        breach: matched_total >= rule.threshold_count,
+        sample_count: total,
+        detail: RuleObservationDetail::GrpcStatusCount { matched_total },
+    }
+}
+
+fn grpc_status_rate_observation(
+    rule: &GrpcStatusRateRule,
+    matched_total: u64,
+    total: u64,
+) -> RuleObservation {
+    let percent = rate_percent(matched_total, total);
+    let breach = total >= rule.min_request_count && percent >= rule.threshold_percent;
+    RuleObservation {
+        breach,
+        sample_count: total,
+        detail: RuleObservationDetail::GrpcStatusRate {
+            matched_total,
+            total,
+            percent,
+        },
+    }
 }
 
 fn observe_error_rate(
@@ -519,30 +682,14 @@ fn observe_error_rate(
         return None;
     };
     let matched = rule.status_codes.contains(&s.response_status_code);
-    store.record_count(
+    let (matched_total, total) = store.record_count_and_snapshot(
         rule.common.id,
         proxy_id,
         ownership_generation,
         matched,
         now_ms,
     );
-    let (matched_total, total) =
-        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
-    let percent = if total == 0 {
-        0.0
-    } else {
-        (matched_total as f64 / total as f64) * 100.0
-    };
-    let breach = total >= rule.min_request_count && percent >= rule.threshold_percent;
-    Some(RuleObservation {
-        breach,
-        sample_count: total,
-        detail: RuleObservationDetail::ErrorRate {
-            matched_total,
-            total,
-            percent,
-        },
-    })
+    Some(error_rate_observation(rule, matched_total, total))
 }
 
 fn observe_status_code_count(
@@ -557,21 +704,14 @@ fn observe_status_code_count(
         return None;
     };
     let matched = rule.status_codes.contains(&s.response_status_code);
-    store.record_count(
+    let (matched_total, total) = store.record_count_and_snapshot(
         rule.common.id,
         proxy_id,
         ownership_generation,
         matched,
         now_ms,
     );
-    let (matched_total, _) =
-        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
-    let breach = matched_total >= rule.threshold_count;
-    Some(RuleObservation {
-        breach,
-        sample_count: matched_total,
-        detail: RuleObservationDetail::StatusCodeCount { matched_total },
-    })
+    Some(status_code_count_observation(rule, matched_total, total))
 }
 
 fn observe_latency_percentile(
@@ -601,37 +741,17 @@ fn observe_latency_percentile(
             rule.percentile,
             now_ms,
         );
-        let breach = latency_estimate_breaches(estimate, total, rule);
-        return Some(RuleObservation {
-            breach,
-            sample_count: total,
-            detail: RuleObservationDetail::LatencyPercentile {
-                estimate_upper_bound_ms: estimate,
-            },
-        });
+        return Some(latency_observation(rule, estimate, total));
     }
-    store.record_latency(
+    let (estimate, total) = store.record_latency_and_percentile(
         rule.common.id,
         proxy_id,
         ownership_generation,
         latency,
-        now_ms,
-    );
-    let (estimate, total) = store.snapshot_percentile(
-        rule.common.id,
-        proxy_id,
-        ownership_generation,
         rule.percentile,
         now_ms,
     );
-    let breach = latency_estimate_breaches(estimate, total, rule);
-    Some(RuleObservation {
-        breach,
-        sample_count: total,
-        detail: RuleObservationDetail::LatencyPercentile {
-            estimate_upper_bound_ms: estimate,
-        },
-    })
+    Some(latency_observation(rule, estimate, total))
 }
 
 fn latency_estimate_breaches(
@@ -666,21 +786,14 @@ fn observe_error_class(
         SampleInput::Stream(s) => s.error_class.is_some_and(|c| rule.classes.contains(&c)),
         SampleInput::WebSocket(s) => s.error_class.is_some_and(|c| rule.classes.contains(&c)),
     };
-    store.record_count(
+    let (matched_total, total) = store.record_count_and_snapshot(
         rule.common.id,
         proxy_id,
         ownership_generation,
         matched,
         now_ms,
     );
-    let (matched_total, _) =
-        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
-    let breach = matched_total >= rule.threshold_count;
-    Some(RuleObservation {
-        breach,
-        sample_count: matched_total,
-        detail: RuleObservationDetail::ErrorClass { matched_total },
-    })
+    Some(error_class_observation(rule, matched_total, total))
 }
 
 fn observe_stream_disconnect(
@@ -700,21 +813,14 @@ fn observe_stream_disconnect(
         Some(c) => rule.causes.contains(&c),
         None => false,
     };
-    store.record_count(
+    let (matched_total, total) = store.record_count_and_snapshot(
         rule.common.id,
         proxy_id,
         ownership_generation,
         matched,
         now_ms,
     );
-    let (matched_total, _) =
-        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
-    let breach = matched_total >= rule.threshold_count;
-    Some(RuleObservation {
-        breach,
-        sample_count: matched_total,
-        detail: RuleObservationDetail::StreamDisconnectCause { matched_total },
-    })
+    Some(stream_disconnect_observation(rule, matched_total, total))
 }
 
 fn observe_grpc_status_count(
@@ -734,24 +840,17 @@ fn observe_grpc_status_count(
     // Evaluation runs from `log()` after terminal completion (buffered,
     // trailers-only, streamed H2/H3, and gateway-generated rejections), so
     // trailer-borne statuses are visible before this sample is counted.
-    if let Some(status) = s.grpc_status() {
-        let matched = grpc_status_matches(&rule.grpc_statuses, status);
-        store.record_count(
+    let (matched_total, total) = match s.grpc_status() {
+        Some(status) => store.record_count_and_snapshot(
             rule.common.id,
             proxy_id,
             ownership_generation,
-            matched,
+            grpc_status_matches(&rule.grpc_statuses, status),
             now_ms,
-        );
-    }
-    let (matched_total, _) =
-        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
-    let breach = matched_total >= rule.threshold_count;
-    Some(RuleObservation {
-        breach,
-        sample_count: matched_total,
-        detail: RuleObservationDetail::GrpcStatusCount { matched_total },
-    })
+        ),
+        None => store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms),
+    };
+    Some(grpc_status_count_observation(rule, matched_total, total))
 }
 
 fn observe_grpc_status_rate(
@@ -768,33 +867,17 @@ fn observe_grpc_status_rate(
     // Denominator is gRPC transactions only so plain HTTP does not dilute
     // the rate. Non-gRPC HTTP still returns a snapshot observation so
     // recovery/resolve can progress without recording into the window.
-    if let Some(status) = s.grpc_status() {
-        let matched = grpc_status_matches(&rule.grpc_statuses, status);
-        store.record_count(
+    let (matched_total, total) = match s.grpc_status() {
+        Some(status) => store.record_count_and_snapshot(
             rule.common.id,
             proxy_id,
             ownership_generation,
-            matched,
+            grpc_status_matches(&rule.grpc_statuses, status),
             now_ms,
-        );
-    }
-    let (matched_total, total) =
-        store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms);
-    let percent = if total == 0 {
-        0.0
-    } else {
-        (matched_total as f64 / total as f64) * 100.0
+        ),
+        None => store.snapshot_count(rule.common.id, proxy_id, ownership_generation, now_ms),
     };
-    let breach = total >= rule.min_request_count && percent >= rule.threshold_percent;
-    Some(RuleObservation {
-        breach,
-        sample_count: total,
-        detail: RuleObservationDetail::GrpcStatusRate {
-            matched_total,
-            total,
-            percent,
-        },
-    })
+    Some(grpc_status_rate_observation(rule, matched_total, total))
 }
 
 fn grpc_status_matches(selectors: &[GrpcStatusMatch], status: u32) -> bool {
@@ -807,6 +890,20 @@ fn format_grpc_status_matches(selectors: &[GrpcStatusMatch]) -> String {
 }
 
 fn websocket_disconnect_cause(ctx: &WsDisconnectContext) -> DisconnectCause {
+    // Core publishes the authoritative teardown classification under
+    // `websocket.termination_reason`, overwriting any value inherited from the
+    // upgrade request's metadata. A gateway policy close (credential expiry,
+    // client-trust withdrawal, absolute maximum lifetime) carries no relay
+    // error by design, so it must be read before the no-error fallback — and
+    // it stays the cause even when the bounded close-delivery grace later
+    // records a timeout for the remaining half.
+    if ctx
+        .metadata
+        .get(crate::proxy::WS_TERMINATION_METADATA_KEY)
+        .is_some_and(|reason| is_websocket_policy_termination(reason.as_str()))
+    {
+        return DisconnectCause::GatewayPolicy;
+    }
     let Some(class) = ctx.error_class else {
         return DisconnectCause::GracefulShutdown;
     };
@@ -817,6 +914,17 @@ fn websocket_disconnect_cause(ctx: &WsDisconnectContext) -> DisconnectCause {
         None if class == ErrorClass::ReadWriteTimeout => DisconnectCause::IdleTimeout,
         None => DisconnectCause::RecvError,
     }
+}
+
+fn is_websocket_policy_termination(reason: &str) -> bool {
+    use crate::proxy::WsTerminationReason;
+    [
+        WsTerminationReason::CredentialExpired,
+        WsTerminationReason::TrustWithdrawn,
+        WsTerminationReason::MaxLifetime,
+    ]
+    .iter()
+    .any(|policy| policy.as_str() == reason)
 }
 
 fn disconnect_cause_str(c: DisconnectCause) -> &'static str {

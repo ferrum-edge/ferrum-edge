@@ -2556,6 +2556,15 @@ pub struct RequestContext {
     /// metadata. Keeping a credential/body-derived digest here also prevents
     /// transaction-log serialization.
     soap_ws_security_authenticated_body_digest: Option<[u8; 32]>,
+    /// The validated request trailer block the `grpc_web` translation owner
+    /// split off a gRPC-Web request body. Request-private typed state rather
+    /// than `metadata`: the trailer frame is already gone from the body, so a
+    /// plugin deleting or rewriting a metadata entry must not be able to make
+    /// dispatch silently drop (or forge) these trailers. Only `grpc_web` can
+    /// populate it; every gRPC dispatch path (H1/H2, H3, retry replay) reads it,
+    /// and the H1/H2 body-hook context hands it back to the live context in
+    /// [`Self::adopt_final_request_body_hook_terminals`].
+    pub(crate) grpc_web_request_trailers: grpc_web::StagedRequestTrailers,
     pub timestamp_received: DateTime<Utc>,
     /// Whether the request's gRPC deadline state has been initialized from the
     /// inbound `grpc-timeout` value. Initialization happens once, immediately
@@ -2637,6 +2646,13 @@ pub struct RequestContext {
     /// Latest dispatch outcome, retaining possible execution across retries.
     /// Only trusted transport code may set this; it is not serialized.
     backend_dispatch_state: BackendDispatchState,
+    /// Error class of the LATEST dispatch attempt (`None` when it produced a
+    /// backend response or nothing was dispatched). Written beside
+    /// `backend_dispatch_state` by the same trusted transport call, so a
+    /// response-phase plugin can tell a gateway-authored transport-failure
+    /// response (timeout, reset, refused) from a real origin status without
+    /// reading plugin-writable metadata. Not serialized.
+    last_backend_dispatch_error_class: Option<crate::retry::ErrorClass>,
     /// Diagnostic-reference slot of this request (issue #5767). `None` unless
     /// `FERRUM_DIAGNOSTIC_REFS` enabled the store. Set only by the HTTP
     /// frontends; the terminal transaction log records the request's detail
@@ -3750,9 +3766,11 @@ pub(crate) struct PluginRequestState {
     pub(crate) ai_semantic_cache_pending_stores:
         HashMap<u64, crate::plugins::ai_semantic_cache::PendingSemanticCacheStore>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
-    /// final body hooks. Kept out of public metadata so per-instance state does
-    /// not leak into transaction logs.
-    pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
+    /// final body hooks, as the `(method bucket, entry)` index into the owning
+    /// instance's immutable operation table, so later predicates index the
+    /// pinned operation instead of re-matching. Kept out of public metadata so
+    /// per-instance state does not leak into transaction logs.
+    pub(crate) openapi_validator_matches: HashMap<usize, (usize, usize)>,
     /// OpenAPI validator instances whose CLIENT-contract decision has already
     /// been made on the original client representation in
     /// `validate_client_request_body_contract`.
@@ -3916,6 +3934,13 @@ pub(crate) struct PluginRequestState {
     /// rewrite it and it never reaches a transaction log.
     pub(crate) ai_transcript_audit_grpc_request_encoding:
         Option<ai_transcript_audit::GrpcMessageEncoding>,
+    /// Per-`transaction_debugger`-instance record that a body-capture record
+    /// was already emitted for each direction, so the header-phase and
+    /// final-body hooks emit exactly one record between them. Content-free
+    /// flags keyed by the process-unique instance id; bounded by the attached
+    /// debugger instances.
+    pub(crate) transaction_debugger_capture_records:
+        HashMap<u64, transaction_debugger::CaptureRecordState>,
 }
 
 /// Return an identity only when it contains a meaningful non-whitespace value.
@@ -3949,6 +3974,7 @@ impl RequestContext {
         error_class: Option<crate::retry::ErrorClass>,
         request_on_wire: bool,
     ) {
+        self.last_backend_dispatch_error_class = error_class;
         self.backend_dispatch_state = if error_class.is_none() {
             BackendDispatchState::BackendResponse
         } else if request_on_wire
@@ -3965,6 +3991,12 @@ impl RequestContext {
 
     pub(crate) fn backend_dispatch_state(&self) -> BackendDispatchState {
         self.backend_dispatch_state
+    }
+
+    /// Error class of the latest dispatch attempt; `None` when that attempt
+    /// produced a backend response or nothing was dispatched.
+    pub(crate) fn last_backend_dispatch_error_class(&self) -> Option<crate::retry::ErrorClass> {
+        self.last_backend_dispatch_error_class
     }
 
     /// Note that this request's terminal transaction record, logged with
@@ -4178,6 +4210,7 @@ impl RequestContext {
             self.response_transform_size_refusal_selected;
         ctx.route_request_timeout_phase = self.route_request_timeout_phase;
         ctx.backend_dispatch_state = self.backend_dispatch_state;
+        ctx.last_backend_dispatch_error_class = self.last_backend_dispatch_error_class;
         ctx.diagnostic_slot = self.diagnostic_slot.clone();
         ctx.grpc_deadline_at = self.grpc_deadline_at;
         ctx.mesh_labels = self.mesh_labels.clone();
@@ -4371,6 +4404,7 @@ impl RequestContext {
             websocket_shutdown_rx: None,
             client_trust_session: None,
             soap_ws_security_authenticated_body_digest: None,
+            grpc_web_request_trailers: grpc_web::StagedRequestTrailers::default(),
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
@@ -4387,6 +4421,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: false,
             route_request_timeout_phase: None,
             backend_dispatch_state: BackendDispatchState::NotDispatched,
+            last_backend_dispatch_error_class: None,
             diagnostic_slot: None,
             backend_attempt_trace: None,
             gateway_capacity_response_selected: false,
@@ -4835,6 +4870,12 @@ impl RequestContext {
     /// late transport encoding of a decoded cache hit. These private decisions
     /// are only ever set, never cleared, when adopting the hook stage's state.
     pub(crate) fn adopt_final_request_body_hook_terminals(&mut self, hook_ctx: &RequestContext) {
+        // The `grpc_web` request-body transform runs on this hook context on
+        // H1/H2 and stages the split trailer block here as typed state; it must
+        // reach the live context that dispatch reads, or the stripped trailers
+        // would be lost. The hook context was cloned from this one, so taking
+        // its value is a no-op when no trailer frame was split.
+        self.grpc_web_request_trailers = hook_ctx.grpc_web_request_trailers.clone();
         self.semantic_cache_response_replay |= hook_ctx.semantic_cache_response_replay;
         if hook_ctx.gateway_capacity_response_selected() {
             self.mark_gateway_capacity_response_selected();
@@ -5900,6 +5941,9 @@ impl RequestContext {
             client_trust_session: self.client_trust_session.clone(),
             soap_ws_security_authenticated_body_digest: self
                 .soap_ws_security_authenticated_body_digest,
+            // Carried so a hook run that splits no trailer frame keeps an
+            // already-staged block, and adopted back afterwards.
+            grpc_web_request_trailers: self.grpc_web_request_trailers.clone(),
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
@@ -5916,6 +5960,7 @@ impl RequestContext {
             charged_backend_deadline_terminal: self.charged_backend_deadline_terminal,
             route_request_timeout_phase: self.route_request_timeout_phase,
             backend_dispatch_state: self.backend_dispatch_state,
+            last_backend_dispatch_error_class: self.last_backend_dispatch_error_class,
             diagnostic_slot: self.diagnostic_slot.clone(),
             backend_attempt_trace: self.backend_attempt_trace.clone(),
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
@@ -13444,8 +13489,9 @@ pub fn create_plugin_with_http_client(
 /// it so reload generations inherit prior claims, `waf` instances isolate
 /// anomaly-score accumulators / ownership metadata, and `api_chargeback_sink`
 /// instances publish accepted-generation
-/// status/metrics under that stable identity, while `request_mirror` records
-/// attribute each shadow destination. Pass `None` for config-validation and
+/// status/metrics under that stable identity, `proxy_alerts` scopes its
+/// `${incident_key}` receiver correlation key to it, while `request_mirror`
+/// records attribute each shadow destination. Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
 /// (uses the plugin's standalone default id). Blank ids fail closed when
 /// supplied.
@@ -13700,10 +13746,16 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.namespace(),
         )?))),
-        "proxy_alerts" => Ok(Some(Arc::new(proxy_alerts::ProxyAlerts::new(
-            config,
-            http_client.clone(),
-        )?))),
+        // The stable plugin-config id scopes `${incident_key}`, so two
+        // instances that reuse a rule name on one proxy never share a
+        // receiver incident.
+        "proxy_alerts" => Ok(Some(Arc::new(
+            proxy_alerts::ProxyAlerts::new_with_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "api_chargeback" => Ok(Some(Arc::new(
             api_chargeback::ApiChargeback::new_with_shard_amount(
                 config,
