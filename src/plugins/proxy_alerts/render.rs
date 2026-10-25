@@ -10,18 +10,60 @@ use crate::notifications::{EventAction, Notification, NotificationField};
 
 use super::rules::{Rule, RuleObservation, SampleInput};
 
+/// Proxy identity a notification is rendered for.
+///
+/// Built from the triggering sample on the traffic path, or from the identity
+/// recorded when the incident was alerted when the background lifecycle
+/// re-evaluation resolves an incident on a proxy that stopped producing
+/// traffic.
+#[derive(Debug, Clone, Copy)]
+pub struct AlertSubject<'a> {
+    pub namespace: &'a str,
+    pub proxy_id: Option<&'a str>,
+    pub proxy_name: Option<&'a str>,
+}
+
+impl<'a> AlertSubject<'a> {
+    pub fn from_sample(sample: SampleInput<'a>) -> Self {
+        Self {
+            namespace: sample.namespace(),
+            proxy_id: sample.proxy_id(),
+            proxy_name: sample.proxy_name(),
+        }
+    }
+}
+
+/// Stable receiver-side incident key for one `(namespace, proxy, rule)`.
+///
+/// Identical for the Trigger, every reminder, and the Resolve of the same
+/// rule/proxy, so a receiver that correlates on it (PagerDuty `dedup_key`,
+/// Opsgenie `alias`) closes the incident the Trigger opened. Fields are
+/// length-prefixed before hashing so distinct identities cannot collide by
+/// concatenation; the output is fixed-length ASCII (`pa1-` + 64 hex chars),
+/// safe for any JSON string and well under PagerDuty's 255-character limit.
+pub fn incident_key(namespace: &str, proxy_id: &str, rule_name: &str) -> String {
+    use crate::fips::approved::Sha256;
+    let mut hasher = Sha256::new();
+    hasher.update(b"ferrum-edge/proxy_alerts/incident/v1");
+    for part in [namespace, proxy_id, rule_name] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("pa1-{}", hex::encode(hasher.finalize()))
+}
+
 pub fn build_notification(
     rule: &Rule,
     observation: &RuleObservation,
-    sample: SampleInput<'_>,
+    subject: AlertSubject<'_>,
     event_action: EventAction,
     now: DateTime<Utc>,
 ) -> Notification {
     let common = rule.common();
     let rendered = observation.render(rule);
-    let proxy_label = sample
-        .proxy_name()
-        .or(sample.proxy_id())
+    let proxy_label = subject
+        .proxy_name
+        .or(subject.proxy_id)
         .unwrap_or("(unknown proxy)");
     let title = match event_action {
         EventAction::Trigger => format!("[ALERT] {} on {}", common.name, proxy_label),
@@ -38,7 +80,7 @@ pub fn build_notification(
         NotificationField::new("Window", format!("{}s", common.window_seconds)),
         NotificationField::new("Samples", observation.sample_count.to_string()),
     ];
-    let ns = sample.namespace();
+    let ns = subject.namespace;
     if !ns.is_empty() {
         fields.push(NotificationField::new("Namespace", ns.to_string()));
     }
@@ -60,9 +102,9 @@ pub fn build_notification(
         .source(source)
         .fired_at(now)
         .fields(fields);
-    if let Some(name) = sample.proxy_name() {
+    if let Some(name) = subject.proxy_name {
         builder = builder.subject_id(Arc::from(name));
-    } else if let Some(id) = sample.proxy_id() {
+    } else if let Some(id) = subject.proxy_id {
         builder = builder.subject_id(Arc::from(id));
     }
     if !ns.is_empty() {
@@ -74,23 +116,25 @@ pub fn build_notification(
 pub fn build_webhook_vars(
     rule: &Rule,
     observation: &RuleObservation,
-    sample: SampleInput<'_>,
+    subject: AlertSubject<'_>,
     event_action: EventAction,
     now: DateTime<Utc>,
 ) -> HashMap<String, String> {
     let common = rule.common();
     let rendered = observation.render(rule);
-    let mut vars = HashMap::with_capacity(12);
+    let proxy_id = subject.proxy_id.unwrap_or("");
+    let mut vars = HashMap::with_capacity(13);
     vars.insert("rule_name".to_string(), common.name.to_string());
-    vars.insert(
-        "proxy_id".to_string(),
-        sample.proxy_id().unwrap_or("").to_string(),
-    );
+    vars.insert("proxy_id".to_string(), proxy_id.to_string());
     vars.insert(
         "proxy_name".to_string(),
-        sample.proxy_name().unwrap_or("").to_string(),
+        subject.proxy_name.unwrap_or("").to_string(),
     );
-    vars.insert("namespace".to_string(), sample.namespace().to_string());
+    vars.insert("namespace".to_string(), subject.namespace.to_string());
+    vars.insert(
+        "incident_key".to_string(),
+        incident_key(subject.namespace, proxy_id, &common.name),
+    );
     vars.insert("fired_at".to_string(), now.to_rfc3339());
     vars.insert("observed".to_string(), rendered.observed);
     vars.insert("threshold".to_string(), rendered.threshold);

@@ -12,6 +12,11 @@
 //! - **Channels are reusable**: live in `src/notifications/channels/`. Other
 //!   subsystems (overload manager, mesh policy, future plugins) can use the
 //!   same channel implementations without depending on `proxy_alerts`.
+//! - **Per-`(rule, proxy, channel)` incident lifecycle**: every channel owns
+//!   its own [`RecoveryGate`], so Trigger/Resolve delivery state is tracked
+//!   per channel. A channel that missed an event (dispatch backpressure,
+//!   failed delivery) keeps owing it and retries on the next eligible
+//!   evaluation even when a sibling channel delivered successfully.
 //! - **Per-`(rule, proxy, channel)` cooldown** prevents repeated dispatches
 //!   without suppressing unrelated proxies that share a global/group rule.
 //!   Cooldown is armed at dispatch admission and released if delivery fails
@@ -19,7 +24,10 @@
 //! - **Pending delivery seats**: Trigger/Resolve commit
 //!   `PendingTrigger` / `PendingResolve` when a send is admitted; state moves
 //!   to `Active` / `Healthy` only after a successful settle (or rolls back on
-//!   failure so the next sample can retry).
+//!   failure so the next evaluation can retry). A reminder Trigger for an
+//!   already-Active incident reserves `PendingReminder`, which holds recovery
+//!   until the reminder settles so a slow reminder can never land after the
+//!   Resolve and reopen a resolved incident at the receiver.
 //! - **Compensating Trigger after an uncertain Resolve**: a Resolve that is
 //!   already externally in flight cannot be unsent, and retiring its local
 //!   future is not a rollback. If the rule breaches again in that window the
@@ -31,6 +39,12 @@
 //!   leave a genuinely breached incident silently suppressed. If the rule is no
 //!   longer breaching by then, the Resolve was accurate and the state returns
 //!   to `Healthy` with no phantom alert.
+//! - **Time-driven lifecycle**: a background task re-evaluates
+//!   Active/Recovering/CompensatingTrigger incidents against their windows
+//!   every `LIFECYCLE_TICK` (5s) without recording a sample, so an incident on a
+//!   proxy that stopped producing traffic still ages out of breach, enters
+//!   recovery, and resolves on schedule. The task holds only a `Weak` handle
+//!   and is aborted on `Drop`.
 //! - **Best-effort endpoint delivery**: bounded backpressure/failure paths can
 //!   produce zero copies, while transport timeouts, post-write connection
 //!   errors, and cancellation after bytes left the process are all reported as
@@ -68,19 +82,21 @@
 use crate::plugins::utils::log_sampling::warn_sampled;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::notifications::dispatch::{DeliveryCallback, DeliveryRetryPolicy};
 use crate::notifications::generation::{DispatchGeneration, DispatchSettle};
-use crate::notifications::{EventAction, NotificationChannel};
+use crate::notifications::{EventAction, Notification, NotificationChannel};
 use crate::plugins::utils::http_client::PluginHttpClient;
 
 use super::{
@@ -97,12 +113,22 @@ pub mod windows;
 
 use config::{ProxyAlertsConfig, QuietHourWindow};
 use cooldown::{CooldownGate, LifecycleOutcome, RecoveryGate, RuleState};
+use render::AlertSubject;
 use rules::{Rule, RuleObservation, SampleInput};
 use windows::{WindowStore, monotonic_now_ms};
 
 /// Floor for background lifecycle retention, matching the historical window
 /// sweep cadence documented for inactive proxies.
 const LIFECYCLE_KEEP_FLOOR_MS: u64 = 3_600_000;
+
+/// Cadence of the background lifecycle re-evaluation. Matches the minimum
+/// `window_seconds` / `resolved_window_seconds`, so an idle incident resolves
+/// at most one tick after its recovery window elapses.
+const LIFECYCLE_TICK: Duration = Duration::from_secs(5);
+
+/// Ownership retention + stale-row eviction run every this many lifecycle
+/// ticks (60s), the historical eviction cadence.
+const EVICTION_EVERY_TICKS: u32 = 12;
 
 /// Ownership generation used by offline / unarmed unit tests that intentionally
 /// omit an admission token. Armed production instances reject missing tokens
@@ -112,20 +138,38 @@ pub const UNARMED_PROXY_LIFECYCLE_GENERATION: u64 = 0;
 static NEXT_DISPATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct ProxyAlerts {
+    core: Arc<AlertCore>,
+    /// Background lifecycle task (re-evaluation + eviction) for runtime plugin
+    /// instances. `None` when the plugin was instantiated by an offline
+    /// validation path without a Tokio runtime. Holds only a `Weak` core and
+    /// is aborted on `Drop`.
+    lifecycle_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Shared plugin state. Owned by [`ProxyAlerts`]; the background lifecycle
+/// task reaches it through a `Weak` so it never extends the instance's life.
+struct AlertCore {
     rules: Arc<Vec<Rule>>,
     channel_by_id: Arc<HashMap<u32, Arc<NotificationChannel>>>,
     windows: Arc<WindowStore>,
     cooldowns: Arc<CooldownGate>,
-    recovery: Arc<RecoveryGate>,
+    /// One incident-lifecycle gate per channel, indexed by channel id (ids are
+    /// dense `0..channels.len()`, assigned at config parse).
+    recovery_by_channel: Vec<Arc<RecoveryGate>>,
+    /// Rendering identity remembered when a sample admitted an alert, so the
+    /// background re-evaluation can label a Resolve for a proxy that stopped
+    /// producing traffic. Keyed by namespace-qualified owner key; bounded by
+    /// owned proxies with live incidents (ownership retain + sweep prune it).
+    subjects: DashMap<String, IncidentSubject>,
     /// Published ownership generations for proxies this instance may observe.
     /// `None` until the first cold-path retain (unit tests that never retain
     /// keep the historical ungated write path). After retain, writes require a
     /// matching admitted generation.
-    active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
+    active_proxy_generations: ArcSwap<Option<HashMap<String, u64>>>,
     /// Serializes full ownership retention passes (commit-path retain and the
     /// background ownership sweep). Request observation only loads the
     /// ArcSwap snapshot and never takes this lock.
-    retention_lock: Arc<Mutex<()>>,
+    retention_lock: Mutex<()>,
     dispatch_sem: Arc<Semaphore>,
     /// Per-instance dispatch generation: closed and cancelled on Drop so
     /// reload retires in-flight sends without leaking them into the next
@@ -134,20 +178,50 @@ pub struct ProxyAlerts {
     delivery_retry: DeliveryRetryPolicy,
     http_client: PluginHttpClient,
     enabled: AtomicBool,
-    quiet_hours: Arc<Vec<QuietHourWindow>>,
-    /// Eviction sweep handle for runtime plugin instances. `None` when the
-    /// plugin was instantiated by an offline validation path without a Tokio
-    /// runtime.
-    eviction_handle: Option<tokio::task::JoinHandle<()>>,
+    quiet_hours: Vec<QuietHourWindow>,
+    lifecycle_keep_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IncidentSubject {
+    generation: u64,
+    namespace: Arc<str>,
+    proxy_id: Arc<str>,
+    proxy_name: Option<Arc<str>>,
+}
+
+impl IncidentSubject {
+    fn as_alert_subject(&self) -> AlertSubject<'_> {
+        AlertSubject {
+            namespace: self.namespace.as_ref(),
+            proxy_id: Some(self.proxy_id.as_ref()),
+            proxy_name: self.proxy_name.as_deref(),
+        }
+    }
+}
+
+/// A notification rendered for one event action, shared by every channel
+/// admitted for that action from the same observation.
+type RenderedAlert = (EventAction, Arc<Notification>, Arc<HashMap<String, String>>);
+
+/// One channel delivery admitted by [`AlertCore::advance_channel`]: its
+/// lifecycle seat is reserved and the dispatch permit is held.
+struct AdmittedDispatch {
+    channel: Arc<NotificationChannel>,
+    channel_id: u32,
+    permit: OwnedSemaphorePermit,
+    gate: Arc<RecoveryGate>,
+    event_action: EventAction,
+    left_threshold_at_ms: u64,
 }
 
 impl std::fmt::Debug for ProxyAlerts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProxyAlerts")
-            .field("rules", &self.rules.len())
-            .field("channels", &self.channel_by_id.len())
-            .field("enabled", &self.enabled.load(Ordering::Acquire))
-            .field("quiet_hours", &self.quiet_hours.len())
+            .field("rules", &self.core.rules.len())
+            .field("channels", &self.core.channel_by_id.len())
+            .field("enabled", &self.core.enabled.load(Ordering::Acquire))
+            .field("quiet_hours", &self.core.quiet_hours.len())
             .finish()
     }
 }
@@ -174,45 +248,36 @@ impl ProxyAlerts {
         let shard_amount = http_client.pool_shard_amount();
         let windows = Arc::new(WindowStore::with_shard_amount(rule_specs, shard_amount));
         let cooldowns = Arc::new(CooldownGate::with_shard_amount(shard_amount));
-        let recovery = Arc::new(RecoveryGate::with_shard_amount(shard_amount));
+        let recovery_by_channel = (0..parsed.channel_by_id.len())
+            .map(|_| Arc::new(RecoveryGate::with_shard_amount(shard_amount)))
+            .collect();
         let lifecycle_keep_ms = lifecycle_keep_ms(parsed.rules.as_ref());
-        let active_proxy_generations = Arc::new(ArcSwap::from_pointee(None));
-        let retention_lock = Arc::new(Mutex::new(()));
-        let eviction_handle = start_lifecycle_eviction_task(
-            Arc::clone(&windows),
-            Arc::clone(&cooldowns),
-            Arc::clone(&recovery),
-            Arc::clone(&active_proxy_generations),
-            Arc::clone(&retention_lock),
-            lifecycle_keep_ms,
-        );
-
         let dispatch_sem = Arc::new(Semaphore::new(parsed.max_concurrent_dispatches));
         let dispatch_generation =
             DispatchGeneration::new(NEXT_DISPATCH_GENERATION.fetch_add(1, Ordering::Relaxed));
 
-        Ok(Self {
+        let core = Arc::new(AlertCore {
             rules: parsed.rules,
             channel_by_id: parsed.channel_by_id,
             windows,
             cooldowns,
-            recovery,
-            active_proxy_generations,
-            retention_lock,
+            recovery_by_channel,
+            subjects: DashMap::with_shard_amount(shard_amount),
+            active_proxy_generations: ArcSwap::from_pointee(None),
+            retention_lock: Mutex::new(()),
             dispatch_sem,
             dispatch_generation,
             delivery_retry: parsed.delivery_retry,
             http_client,
             enabled: AtomicBool::new(parsed.enabled),
-            quiet_hours: Arc::new(parsed.quiet_hours),
-            eviction_handle,
+            quiet_hours: parsed.quiet_hours,
+            lifecycle_keep_ms,
+        });
+        let lifecycle_task = start_lifecycle_task(Arc::downgrade(&core));
+        Ok(Self {
+            core,
+            lifecycle_task,
         })
-    }
-
-    fn retention_guard(&self) -> MutexGuard<'_, ()> {
-        self.retention_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Publish ownership generations and retire per-proxy window/cooldown/
@@ -222,24 +287,7 @@ impl ProxyAlerts {
     /// Invoked from the plugin-cache commit path for preserved global and
     /// proxy-group instances. Must not run on the request hot path.
     pub fn retain_proxies(&self, active_proxy_generations: &HashMap<&str, u64>) {
-        let owned: HashMap<String, u64> = active_proxy_generations
-            .iter()
-            .map(|(id, generation)| ((*id).to_string(), *generation))
-            .collect();
-        // Serialize against the background ownership sweep. Publish under the
-        // same guard before the retain walks so admission sees the new map
-        // immediately while a concurrent sweep cannot still be retaining an
-        // older snapshot (which would delete current-generation rows).
-        let _guard = self.retention_guard();
-        self.active_proxy_generations
-            .store(Arc::new(Some(owned.clone())));
-        let borrowed: HashMap<&str, u64> = owned
-            .iter()
-            .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
-            .collect();
-        self.windows.retain_proxies(&borrowed);
-        self.cooldowns.retain_proxies(&borrowed);
-        self.recovery.retain_proxies(&borrowed);
+        self.core.retain_proxies(active_proxy_generations);
     }
 
     /// Compatibility helper for tests that only have an active-ID set.
@@ -251,6 +299,7 @@ impl ProxyAlerts {
             .copied()
             .map(|id| {
                 let generation = self
+                    .core
                     .active_proxy_generations
                     .load()
                     .as_ref()
@@ -263,38 +312,46 @@ impl ProxyAlerts {
         self.retain_proxies(&generations);
     }
 
-    /// Seed cooldown + Active recovery state for deterministic external tests.
+    /// Seed cooldown + Active recovery state (on every channel) for
+    /// deterministic external tests.
     #[doc(hidden)]
     pub fn seed_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
         // Ensure the seeded proxy is owned under `generation` so subsequent
         // gated writes from the same incarnation succeed in tests.
         let mut map = self
+            .core
             .active_proxy_generations
             .load()
             .as_ref()
             .clone()
             .unwrap_or_default();
         map.insert(proxy_id.to_string(), generation);
-        self.active_proxy_generations.store(Arc::new(Some(map)));
+        self.core
+            .active_proxy_generations
+            .store(Arc::new(Some(map)));
         let _ = self
+            .core
             .cooldowns
             .try_acquire(0, proxy_id, 0, 60_000, 1, generation);
-        let _ = self
-            .recovery
-            .observe(0, proxy_id, true, 5_000, 1, generation);
-        // observe now lands on PendingTrigger; commit Active for seeders that
-        // need a fully-delivered incident (plugin-cache retention tests).
-        self.recovery
-            .settle_trigger_success(0, proxy_id, generation, 1, 1);
+        for gate in &self.core.recovery_by_channel {
+            let _ = gate.observe(0, proxy_id, true, 5_000, 1, generation);
+            // observe lands on PendingTrigger; commit Active for seeders that
+            // need a fully-delivered incident (plugin-cache retention tests).
+            gate.settle_trigger_success(0, proxy_id, generation, 1, 1);
+        }
     }
 
     /// Whether this instance currently holds lifecycle state for `proxy_id`
     /// under any ownership generation.
     #[doc(hidden)]
     pub fn has_lifecycle_state_for_test(&self, proxy_id: &str) -> bool {
-        self.cooldowns.contains_proxy(proxy_id)
-            || self.recovery.contains_proxy(proxy_id)
-            || self.windows.contains_proxy(proxy_id)
+        self.core.cooldowns.contains_proxy(proxy_id)
+            || self
+                .core
+                .recovery_by_channel
+                .iter()
+                .any(|gate| gate.contains_proxy(proxy_id))
+            || self.core.windows.contains_proxy(proxy_id)
     }
 
     /// Whether this instance holds lifecycle state for `(proxy_id, generation)`.
@@ -304,12 +361,18 @@ impl ProxyAlerts {
         proxy_id: &str,
         generation: u64,
     ) -> bool {
-        self.cooldowns
+        self.core
+            .cooldowns
             .contains_proxy_generation(proxy_id, generation)
             || self
-                .recovery
+                .core
+                .recovery_by_channel
+                .iter()
+                .any(|gate| gate.contains_proxy_generation(proxy_id, generation))
+            || self
+                .core
+                .windows
                 .contains_proxy_generation(proxy_id, generation)
-            || self.windows.contains_proxy_generation(proxy_id, generation)
     }
 
     /// Direct store write that bypasses the admission precheck — used by
@@ -317,18 +380,19 @@ impl ProxyAlerts {
     /// even when a stale writer races past retain publication.
     #[doc(hidden)]
     pub fn write_lifecycle_state_for_test(&self, proxy_id: &str, generation: u64) {
-        if let Some(rule) = self.rules.first() {
-            self.windows
+        if let Some(rule) = self.core.rules.first() {
+            self.core
+                .windows
                 .record_count(rule.id(), proxy_id, generation, true, 1);
         }
         let _ = self
+            .core
             .cooldowns
             .try_acquire(0, proxy_id, 0, 60_000, 1, generation);
-        let _ = self
-            .recovery
-            .observe(0, proxy_id, true, 5_000, 1, generation);
-        self.recovery
-            .settle_trigger_success(0, proxy_id, generation, 1, 1);
+        for gate in &self.core.recovery_by_channel {
+            let _ = gate.observe(0, proxy_id, true, 5_000, 1, generation);
+            gate.settle_trigger_success(0, proxy_id, generation, 1, 1);
+        }
     }
 
     /// Run the ownership portion of the background lifecycle sweep without
@@ -336,20 +400,78 @@ impl ProxyAlerts {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn sweep_lifecycle_ownership_for_test(&self) {
-        retain_published_proxy_generations(
-            &self.windows,
-            &self.cooldowns,
-            &self.recovery,
-            &self.active_proxy_generations,
-            &self.retention_lock,
+        self.core.retain_published_proxy_generations();
+    }
+
+    /// Run the background lifecycle re-evaluation once at an injected
+    /// monotonic `now_ms`, without waiting for its cadence.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn reevaluate_incidents_at_for_test(&self, now_ms: u64) {
+        self.core.reevaluate_idle_incidents(now_ms, Utc::now());
+    }
+
+    /// Stop the background lifecycle task so a deterministic test that injects
+    /// monotonic timestamps owns every re-evaluation itself.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn stop_lifecycle_task_for_test(&self) {
+        if let Some(task) = self.lifecycle_task.as_ref() {
+            task.abort();
+        }
+    }
+
+    /// Whether the background lifecycle task is still running (`None` when the
+    /// instance was built without a Tokio runtime).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn lifecycle_task_finished_for_test(&self) -> Option<bool> {
+        self.lifecycle_task
+            .as_ref()
+            .map(tokio::task::JoinHandle::is_finished)
+    }
+
+    /// Probe reporting whether this instance's shared core is still alive, so
+    /// a test can prove the background task does not keep a dropped instance
+    /// (and its channels/credentials) alive.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn core_alive_probe_for_test(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
+        let core = Arc::downgrade(&self.core);
+        Box::new(move || core.strong_count() > 0)
+    }
+
+    /// Feed one sample through the full observation + dispatch path at an
+    /// injected monotonic `now_ms` (quiet hours ignored). Ownership checks
+    /// match the production `log()` / disconnect hooks.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn handle_sample_at_for_test(&self, sample: SampleInput<'_>, now_ms: u64) {
+        let Some(proxy_id) = sample.proxy_id() else {
+            return;
+        };
+        let mut owner_key = String::new();
+        crate::config::db_backend::write_namespaced_runtime_key(
+            &mut owner_key,
+            sample.namespace(),
+            proxy_id,
         );
+        if !proxy_id.is_empty()
+            && !self
+                .core
+                .owns_proxy_generation(&owner_key, sample.proxy_lifecycle_generation())
+        {
+            return;
+        }
+        self.core
+            .handle_at(sample, &owner_key, now_ms, Utc::now(), false);
     }
 
     /// Hold the cold-path retention lock for deterministic serialization tests.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn with_retention_lock_for_test<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _guard = self.retention_guard();
+        let _guard = self.core.retention_guard();
         f()
     }
 
@@ -357,7 +479,7 @@ impl ProxyAlerts {
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn try_retention_lock_for_test(&self) -> bool {
-        self.retention_lock.try_lock().is_ok()
+        self.core.retention_lock.try_lock().is_ok()
     }
 
     /// Publish ownership generations without retaining (test-only). Callers
@@ -373,7 +495,221 @@ impl ProxyAlerts {
             .iter()
             .map(|(id, generation)| ((*id).to_string(), *generation))
             .collect();
-        self.active_proxy_generations.store(Arc::new(Some(owned)));
+        self.core
+            .active_proxy_generations
+            .store(Arc::new(Some(owned)));
+    }
+
+    /// Cancel admission for this instance's dispatch generation (test hook).
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn cancel_dispatch_generation_for_test(&self) {
+        self.core.dispatch_generation.cancel();
+    }
+
+    /// Borrow this instance's dispatch generation so a deterministic external
+    /// test can observe retirement and drain *after* the plugin itself has been
+    /// dropped (the reload boundary this contract is about).
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn dispatch_generation_for_test(&self) -> Arc<DispatchGeneration> {
+        Arc::clone(&self.core.dispatch_generation)
+    }
+
+    /// Borrow the recovery gate of the first rule's first channel so a
+    /// deterministic external test can assert producer state settled after the
+    /// plugin was dropped.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn recovery_gate_for_test(&self) -> Arc<RecoveryGate> {
+        self.core
+            .rules
+            .first()
+            .and_then(|rule| self.core.primary_gate_for_rule(rule.id()))
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(RecoveryGate::new()))
+    }
+
+    /// In-flight dispatch count for this instance generation.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn dispatch_in_flight_for_test(&self) -> usize {
+        self.core.dispatch_generation.in_flight()
+    }
+
+    /// Current recovery state of the rule's first channel for deterministic
+    /// external delivery tests.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    pub fn recovery_state_for_test(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+    ) -> Option<RuleState> {
+        self.core.primary_gate_for_rule(rule_id)?.current_state(
+            rule_id,
+            proxy_id,
+            ownership_generation,
+        )
+    }
+
+    /// Current recovery state of `rule_id` on the channel configured as
+    /// `channel_name` (per-channel lifecycle).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn recovery_state_for_channel_for_test(
+        &self,
+        rule_id: u32,
+        channel_name: &str,
+        proxy_id: &str,
+        ownership_generation: u64,
+    ) -> Option<RuleState> {
+        let channel_id = self
+            .core
+            .channel_by_id
+            .iter()
+            .find(|(_, channel)| channel.name() == channel_name)
+            .map(|(id, _)| *id)?;
+        self.core
+            .recovery_gate(channel_id)?
+            .current_state(rule_id, proxy_id, ownership_generation)
+    }
+
+    /// Try to reserve one cooldown seat for deterministic external tests.
+    #[doc(hidden)]
+    // External tests consume this through the library target; the binary target
+    // recompiles the module tree without that caller.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_acquire_cooldown_for_test(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        channel_id: u32,
+        cooldown_ms: u64,
+        now_ms: u64,
+        ownership_generation: u64,
+    ) -> bool {
+        self.core.cooldowns.try_acquire(
+            rule_id,
+            proxy_id,
+            channel_id,
+            cooldown_ms,
+            now_ms,
+            ownership_generation,
+        )
+    }
+}
+
+impl AlertCore {
+    fn retention_guard(&self) -> MutexGuard<'_, ()> {
+        self.retention_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn recovery_gate(&self, channel_id: u32) -> Option<&Arc<RecoveryGate>> {
+        self.recovery_by_channel.get(channel_id as usize)
+    }
+
+    /// Gate of the first channel configured on `rule_id` (test accessors).
+    fn primary_gate_for_rule(&self, rule_id: u32) -> Option<&Arc<RecoveryGate>> {
+        let channel_id = self
+            .rules
+            .iter()
+            .find(|rule| rule.id() == rule_id)
+            .and_then(|rule| rule.common().channel_ids.first().copied())
+            .unwrap_or(0);
+        self.recovery_gate(channel_id)
+    }
+
+    fn in_quiet_hours(&self, now: DateTime<Utc>) -> bool {
+        self.quiet_hours.iter().any(|w| w.matches(now))
+    }
+
+    fn retain_proxies(&self, active_proxy_generations: &HashMap<&str, u64>) {
+        let owned: HashMap<String, u64> = active_proxy_generations
+            .iter()
+            .map(|(id, generation)| ((*id).to_string(), *generation))
+            .collect();
+        // Serialize against the background ownership sweep. Publish under the
+        // same guard before the retain walks so admission sees the new map
+        // immediately while a concurrent sweep cannot still be retaining an
+        // older snapshot (which would delete current-generation rows).
+        let _guard = self.retention_guard();
+        self.active_proxy_generations
+            .store(Arc::new(Some(owned.clone())));
+        let borrowed: HashMap<&str, u64> = owned
+            .iter()
+            .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
+            .collect();
+        self.retain_lifecycle_rows(&borrowed);
+    }
+
+    /// Re-apply the latest published ownership map. Serialized with the
+    /// commit-path retain by the retention lock.
+    fn retain_published_proxy_generations(&self) {
+        let _guard = self.retention_guard();
+        // Load only after acquiring the serialization guard so a concurrent
+        // commit cannot publish a newer map and finish retaining before this
+        // pass still deletes against a stale snapshot.
+        let active = self.active_proxy_generations.load();
+        let Some(active) = active.as_ref() else {
+            return;
+        };
+        let borrowed: HashMap<&str, u64> = active
+            .iter()
+            .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
+            .collect();
+        self.retain_lifecycle_rows(&borrowed);
+    }
+
+    /// Caller must hold the retention lock.
+    fn retain_lifecycle_rows(&self, active: &HashMap<&str, u64>) {
+        self.windows.retain_proxies(active);
+        self.cooldowns.retain_proxies(active);
+        for gate in &self.recovery_by_channel {
+            gate.retain_proxies(active);
+        }
+        self.subjects.retain(|owner_key, subject| {
+            active.get(owner_key.as_str()).copied() == Some(subject.generation)
+        });
+    }
+
+    /// Periodic eviction: ownership retention, stale windows/cooldowns,
+    /// terminal Healthy recovery rows, and remembered subjects that no longer
+    /// back any lifecycle row.
+    fn sweep_lifecycle(&self, now_ms: u64) {
+        // A sample can pass the admission-generation check immediately
+        // before a cache commit and finish its write immediately after the
+        // commit-time retain. Generation-keying isolates that row from the
+        // replacement; periodically reapplying the published ownership map
+        // also bounds the orphan rather than leaving an old-generation
+        // Active/Recovering recovery row resident indefinitely. The
+        // retention lock ensures this sweep loads the latest published map
+        // and cannot interleave with a commit-path retain pass.
+        self.retain_published_proxy_generations();
+        self.windows.evict_stale(now_ms, self.lifecycle_keep_ms);
+        self.cooldowns.evict_stale(now_ms, self.lifecycle_keep_ms);
+        for gate in &self.recovery_by_channel {
+            gate.evict_resolved();
+        }
+        self.subjects.retain(|owner_key, subject| {
+            self.recovery_by_channel
+                .iter()
+                .any(|gate| gate.contains_proxy_generation(owner_key, subject.generation))
+        });
     }
 
     /// Whether an admitted sample may mutate lifecycle state for `proxy_id`.
@@ -418,52 +754,248 @@ impl ProxyAlerts {
             }
             let now = Utc::now();
             let now_ms = monotonic_now_ms();
-            let in_quiet = self.quiet_hours.iter().any(|w| w.matches(now));
-            // `observe` re-derives the same namespace-qualified identity from the
-            // sample (its own thread-local scratch); `process_observation` reuses
-            // this `owner_key`. Both agree because the composition is identical.
-            for rule in self.rules.iter() {
-                let Some(observation) = rule.observe(sample, &self.windows, now_ms) else {
-                    continue;
-                };
-                self.process_observation(
-                    rule,
-                    &observation,
-                    sample,
-                    owner_key,
-                    now_ms,
-                    now,
-                    in_quiet,
-                );
-            }
+            let in_quiet = self.in_quiet_hours(now);
+            self.handle_at(sample, owner_key, now_ms, now, in_quiet);
         });
     }
 
+    /// Observe `sample` against every rule and advance each rule's per-channel
+    /// lifecycle. `owner_key` is the namespace-qualified identity already
+    /// admitted by the ownership check.
+    fn handle_at(
+        &self,
+        sample: SampleInput<'_>,
+        owner_key: &str,
+        now_ms: u64,
+        now: DateTime<Utc>,
+        in_quiet: bool,
+    ) {
+        let ownership_generation = sample
+            .proxy_lifecycle_generation()
+            .unwrap_or(UNARMED_PROXY_LIFECYCLE_GENERATION);
+        let subject = AlertSubject::from_sample(sample);
+        // `observe` re-derives the same namespace-qualified identity from the
+        // sample (its own thread-local scratch); `process_observation` reuses
+        // this `owner_key`. Both agree because the composition is identical.
+        for rule in self.rules.iter() {
+            let Some(observation) = rule.observe(sample, &self.windows, now_ms) else {
+                continue;
+            };
+            self.process_observation(
+                rule,
+                &observation,
+                subject,
+                owner_key,
+                ownership_generation,
+                now_ms,
+                now,
+                in_quiet,
+                None,
+            );
+        }
+    }
+
+    /// Background lifecycle re-evaluation (no sample recorded).
+    ///
+    /// For every Active / Recovering / CompensatingTrigger incident still owned
+    /// by its generation, snapshot the rule's window at `now_ms`. A window that
+    /// still breaches is left to the traffic path; a non-breaching window is
+    /// fed through the normal per-channel lifecycle, so an idle proxy enters
+    /// recovery and dispatches its single Resolve on schedule.
+    fn reevaluate_idle_incidents(&self, now_ms: u64, now: DateTime<Utc>) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let in_quiet = self.in_quiet_hours(now);
+        for rule in self.rules.iter() {
+            for &channel_id in &rule.common().channel_ids {
+                let Some(gate) = self.recovery_gate(channel_id) else {
+                    continue;
+                };
+                // Owned rows: no gate guard is held while dispatching below.
+                for (owner_key, generation, _) in gate.time_driven_rows(rule.id()) {
+                    if !self.owns_proxy_generation(&owner_key, Some(generation)) {
+                        continue;
+                    }
+                    let observation =
+                        rule.window_observation(&self.windows, &owner_key, generation, now_ms);
+                    if observation.breach {
+                        continue;
+                    }
+                    let subject = self.subject_for(&owner_key, generation);
+                    self.process_observation(
+                        rule,
+                        &observation,
+                        subject.as_alert_subject(),
+                        &owner_key,
+                        generation,
+                        now_ms,
+                        now,
+                        in_quiet,
+                        Some(channel_id),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rendering identity for a time-driven event: the one remembered when the
+    /// incident was alerted, or (if pruned) one derived from the owner key.
+    fn subject_for(&self, owner_key: &str, generation: u64) -> IncidentSubject {
+        if let Some(stored) = self
+            .subjects
+            .get(owner_key)
+            .filter(|stored| stored.generation == generation)
+            .map(|stored| stored.value().clone())
+        {
+            return stored;
+        }
+        let (namespace, proxy_id) = owner_key.split_once('|').unwrap_or(("", owner_key));
+        IncidentSubject {
+            generation,
+            namespace: Arc::from(namespace),
+            proxy_id: Arc::from(proxy_id),
+            proxy_name: None,
+        }
+    }
+
+    /// Remember the rendering identity of an alerted incident (cold path:
+    /// runs only when a dispatch was admitted).
+    fn remember_subject(&self, owner_key: &str, generation: u64, subject: AlertSubject<'_>) {
+        let unchanged = self.subjects.get(owner_key).is_some_and(|existing| {
+            existing.generation == generation
+                && existing.proxy_name.as_deref() == subject.proxy_name
+        });
+        if unchanged {
+            return;
+        }
+        self.subjects.insert(
+            owner_key.to_string(),
+            IncidentSubject {
+                generation,
+                namespace: Arc::from(subject.namespace),
+                proxy_id: Arc::from(subject.proxy_id.unwrap_or("")),
+                proxy_name: subject.proxy_name.map(Arc::from),
+            },
+        );
+    }
+
+    /// Advance the rule's lifecycle on every configured channel (or only
+    /// `only_channel`) and dispatch whatever each channel is owed.
     #[allow(clippy::too_many_arguments)]
     fn process_observation(
         &self,
         rule: &Rule,
         observation: &RuleObservation,
-        sample: SampleInput<'_>,
+        subject: AlertSubject<'_>,
         owner_key: &str,
+        ownership_generation: u64,
         now_ms: u64,
-        now: chrono::DateTime<chrono::Utc>,
+        now: DateTime<Utc>,
         in_quiet: bool,
+        only_channel: Option<u32>,
     ) {
-        // Namespace-qualified lifecycle identity; `sample` still carries the
-        // bare proxy name/namespace used for notification rendering.
-        let proxy_id = owner_key;
-        let ownership_generation = sample
-            .proxy_lifecycle_generation()
-            .unwrap_or(UNARMED_PROXY_LIFECYCLE_GENERATION);
-        let previous_state = self
-            .recovery
-            .current_state(rule.id(), proxy_id, ownership_generation);
-        if observation.breach
-            && in_quiet
-            && matches!(previous_state, None | Some(RuleState::Healthy))
-        {
+        let mut admitted: Option<Vec<AdmittedDispatch>> = None;
+        for &channel_id in &rule.common().channel_ids {
+            if only_channel.is_some_and(|only| only != channel_id) {
+                continue;
+            }
+            if let Some(dispatch) = self.advance_channel(
+                rule,
+                observation.breach,
+                owner_key,
+                ownership_generation,
+                channel_id,
+                now_ms,
+                in_quiet,
+            ) {
+                admitted.get_or_insert_with(Vec::new).push(dispatch);
+            }
+        }
+        let Some(admitted) = admitted else {
             return;
+        };
+        if only_channel.is_none() {
+            // Traffic-path admission: remember who this incident is about so a
+            // later time-driven Resolve renders the same proxy identity.
+            self.remember_subject(owner_key, ownership_generation, subject);
+        }
+        // Channels admitted from one observation normally share one event
+        // action (a breach can only Trigger, a clear can only Resolve); render
+        // once and share it, re-rendering only if an action ever differs.
+        let mut rendered: Option<RenderedAlert> = None;
+        for dispatch in admitted {
+            let reuse = rendered
+                .as_ref()
+                .filter(|(action, _, _)| *action == dispatch.event_action)
+                .map(|(_, notification, extras)| (Arc::clone(notification), Arc::clone(extras)));
+            let (notification, extras) = match reuse {
+                Some(pair) => pair,
+                None => {
+                    let notification = Arc::new(render::build_notification(
+                        rule,
+                        observation,
+                        subject,
+                        dispatch.event_action,
+                        now,
+                    ));
+                    let extras = Arc::new(render::build_webhook_vars(
+                        rule,
+                        observation,
+                        subject,
+                        dispatch.event_action,
+                        now,
+                    ));
+                    rendered = Some((
+                        dispatch.event_action,
+                        Arc::clone(&notification),
+                        Arc::clone(&extras),
+                    ));
+                    (notification, extras)
+                }
+            };
+            let pending = Arc::new(PendingDelivery {
+                event_action: dispatch.event_action,
+                rule_id: rule.id(),
+                channel_id: dispatch.channel_id,
+                proxy_id: owner_key.to_string(),
+                ownership_generation,
+                reserved_at_ms: now_ms,
+                left_threshold_at_ms: dispatch.left_threshold_at_ms,
+                cooldowns: Arc::clone(&self.cooldowns),
+                recovery: dispatch.gate,
+            });
+            self.spawn_dispatch(
+                dispatch.channel,
+                notification,
+                extras,
+                dispatch.permit,
+                pending,
+            );
+        }
+    }
+
+    /// Evaluate and (when an event is owed and admitted) commit one channel's
+    /// lifecycle for this observation. Returns the admitted dispatch, or
+    /// `None` when nothing is sent on this channel.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_channel(
+        &self,
+        rule: &Rule,
+        breach: bool,
+        owner_key: &str,
+        ownership_generation: u64,
+        channel_id: u32,
+        now_ms: u64,
+        in_quiet: bool,
+    ) -> Option<AdmittedDispatch> {
+        let gate = self.recovery_gate(channel_id)?;
+        let channel = self.channel_by_id.get(&channel_id)?;
+        let rule_id = rule.id();
+        // One state read per channel per sample; evaluation reuses it.
+        let previous_state = gate.current_state(rule_id, owner_key, ownership_generation);
+        if breach && in_quiet && matches!(previous_state, None | Some(RuleState::Healthy)) {
+            return None;
         }
         let recovery_ms = rule
             .common()
@@ -471,165 +1003,94 @@ impl ProxyAlerts {
             .as_ref()
             .map(|r| r.resolved_window_ms)
             .unwrap_or(0);
-        let outcome = self.recovery.evaluate(
-            rule.id(),
-            proxy_id,
-            observation.breach,
-            recovery_ms,
-            now_ms,
-            ownership_generation,
-        );
+        let outcome = RecoveryGate::evaluate_state(previous_state, breach, recovery_ms, now_ms);
         let Some(event_action) = lifecycle_event_action(outcome) else {
             if non_event_outcome_needs_commit(outcome, previous_state, recovery_ms) {
                 // Commit the non-event transition, but if evaluate→observe
                 // raced into an event-reserving seat (no dispatch was admitted
                 // on this path), roll that exact reservation back immediately.
-                let committed = self.recovery.observe(
-                    rule.id(),
-                    proxy_id,
-                    observation.breach,
+                let committed = gate.observe(
+                    rule_id,
+                    owner_key,
+                    breach,
                     recovery_ms,
                     now_ms,
                     ownership_generation,
                 );
-                self.recovery.rollback_unadmitted_reservation(
-                    rule.id(),
-                    proxy_id,
+                gate.rollback_unadmitted_reservation(
+                    rule_id,
+                    owner_key,
                     ownership_generation,
                     committed,
                     now_ms,
                 );
             }
-            return;
+            return None;
         };
         if event_action == EventAction::Trigger && in_quiet {
-            return;
+            return None;
         }
-        let mut dispatches: Option<Vec<(Arc<NotificationChannel>, u32, OwnedSemaphorePermit)>> =
-            None;
-        let mut cooldown_suppressed = false;
-        for &channel_id in &rule.common().channel_ids {
-            let Some(channel) = self.channel_by_id.get(&channel_id) else {
-                continue;
-            };
-            let Some(permit) = self.try_acquire_dispatch_permit(channel.name(), channel.kind())
-            else {
-                continue;
-            };
-            let cooldown_ok = match event_action {
-                EventAction::Resolve => true,
-                _ => self.cooldowns.try_acquire(
-                    rule.id(),
-                    proxy_id,
-                    channel_id,
-                    rule.common().cooldown_ms,
-                    now_ms,
-                    ownership_generation,
-                ),
-            };
-            if !cooldown_ok {
-                cooldown_suppressed = true;
-                continue;
-            }
-            dispatches
-                .get_or_insert_with(Vec::new)
-                .push((Arc::clone(channel), channel_id, permit));
+        // Backpressure: nothing is committed, so this channel keeps owing the
+        // event and the next eligible evaluation retries it.
+        let permit = self.try_acquire_dispatch_permit(channel.name(), channel.kind())?;
+        if event_action != EventAction::Resolve
+            && !self.cooldowns.try_acquire(
+                rule_id,
+                owner_key,
+                channel_id,
+                rule.common().cooldown_ms,
+                now_ms,
+                ownership_generation,
+            )
+        {
+            return None;
         }
-        let Some(dispatches) = dispatches else {
-            if cooldown_suppressed && matches!(outcome, LifecycleOutcome::StillActive) {
-                // Same class of race as the non-event commit path: observe may
-                // reserve Trigger/Resolve without an admitted delivery.
-                let committed = self.recovery.observe(
-                    rule.id(),
-                    proxy_id,
-                    observation.breach,
-                    recovery_ms,
-                    now_ms,
-                    ownership_generation,
-                );
-                self.recovery.rollback_unadmitted_reservation(
-                    rule.id(),
-                    proxy_id,
-                    ownership_generation,
-                    committed,
-                    now_ms,
-                );
-            }
-            return;
-        };
-        let committed_outcome = self.recovery.observe(
-            rule.id(),
-            proxy_id,
-            observation.breach,
+        let (committed, committed_state) = gate.observe_committed(
+            rule_id,
+            owner_key,
+            breach,
             recovery_ms,
             now_ms,
             ownership_generation,
         );
-        if lifecycle_event_action(committed_outcome) != Some(event_action) {
-            // State raced; release cooldowns we just armed and drop permits.
+        if lifecycle_event_action(committed) != Some(event_action) {
+            // State raced; release the cooldown we just armed and drop the
+            // permit. `observe` may have committed a different event
+            // reservation than the one evaluated above; no delivery is admitted
+            // for it, so roll its exact token back as well.
             if event_action != EventAction::Resolve {
-                for (_, channel_id, _) in &dispatches {
-                    self.cooldowns.release(
-                        rule.id(),
-                        proxy_id,
-                        *channel_id,
-                        ownership_generation,
-                        now_ms,
-                    );
-                }
+                self.cooldowns.release(
+                    rule_id,
+                    owner_key,
+                    channel_id,
+                    ownership_generation,
+                    now_ms,
+                );
             }
-            // `observe` may have committed a different event reservation than
-            // the one evaluated above. No delivery is admitted for that
-            // mismatched event, so roll its exact token back as well.
-            self.recovery.rollback_unadmitted_reservation(
-                rule.id(),
-                proxy_id,
+            gate.rollback_unadmitted_reservation(
+                rule_id,
+                owner_key,
                 ownership_generation,
-                committed_outcome,
+                committed,
                 now_ms,
             );
-            return;
+            return None;
         }
-        let (left_threshold_at_ms, recovery_reserved_at_ms) =
-            match self
-                .recovery
-                .current_state(rule.id(), proxy_id, ownership_generation)
-            {
-                Some(RuleState::PendingResolve {
-                    left_threshold_at_ms,
-                    reserved_at_ms,
-                }) => (left_threshold_at_ms, reserved_at_ms),
-                Some(RuleState::PendingTrigger { reserved_at_ms }) => (now_ms, reserved_at_ms),
-                _ => (now_ms, now_ms),
-            };
-        let notification = render::build_notification(rule, observation, sample, event_action, now);
-        let extras = render::build_webhook_vars(rule, observation, sample, event_action, now);
-        let notification = Arc::new(notification);
-        let extras = Arc::new(extras);
-        let pending = Arc::new(PendingDeliveryFanout {
-            remaining: AtomicUsize::new(dispatches.len()),
-            any_success: AtomicBool::new(false),
+        let left_threshold_at_ms = match committed_state {
+            RuleState::PendingResolve {
+                left_threshold_at_ms,
+                ..
+            } => left_threshold_at_ms,
+            _ => now_ms,
+        };
+        Some(AdmittedDispatch {
+            channel: Arc::clone(channel),
+            channel_id,
+            permit,
+            gate: Arc::clone(gate),
             event_action,
-            rule_id: rule.id(),
-            proxy_id: proxy_id.to_string(),
-            ownership_generation,
-            fired_at_ms: now_ms,
             left_threshold_at_ms,
-            recovery_reserved_at_ms,
-            cooldown_reserved_at_ms: now_ms,
-            cooldowns: Arc::clone(&self.cooldowns),
-            recovery: Arc::clone(&self.recovery),
-        });
-        for (channel, channel_id, permit) in dispatches {
-            self.spawn_dispatch(
-                channel,
-                channel_id,
-                Arc::clone(&notification),
-                Arc::clone(&extras),
-                permit,
-                Arc::clone(&pending),
-            );
-        }
+        })
     }
 
     fn try_acquire_dispatch_permit(
@@ -655,24 +1116,18 @@ impl ProxyAlerts {
     fn spawn_dispatch(
         &self,
         channel: Arc<NotificationChannel>,
-        channel_id: u32,
-        notification: Arc<crate::notifications::Notification>,
+        notification: Arc<Notification>,
         extras: Arc<HashMap<String, String>>,
         permit: OwnedSemaphorePermit,
-        pending: Arc<PendingDeliveryFanout>,
+        pending: Arc<PendingDelivery>,
     ) {
         let generation = Arc::clone(&self.dispatch_generation);
         let retry = self.delivery_retry;
         let http = self.http_client.clone();
-        // Re-insert the already-acquired permit by transferring ownership into
-        // the spawned task via the dispatch helper's permit parameter. We
-        // already hold `permit`; dispatch_one would try_acquire again. Run the
-        // retry loop directly instead.
-        let on_settle: DeliveryCallback = Arc::new({
-            let pending = Arc::clone(&pending);
-            move |settle| {
-                pending.on_channel_settle(channel_id, settle);
-            }
+        // We already hold `permit`; dispatch_one would try_acquire again. Run
+        // the retry loop directly, transferring the permit into the task.
+        let on_settle: DeliveryCallback = Arc::new(move |settle| {
+            pending.on_settle(settle);
         });
         let channel_type = channel.kind();
         let spawned = generation.spawn(channel_type, Some(on_settle), {
@@ -701,132 +1156,35 @@ impl ProxyAlerts {
             );
         }
     }
-
-    /// Cancel admission for this instance's dispatch generation (test hook).
-    #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
-    pub fn cancel_dispatch_generation_for_test(&self) {
-        self.dispatch_generation.cancel();
-    }
-
-    /// Borrow this instance's dispatch generation so a deterministic external
-    /// test can observe retirement and drain *after* the plugin itself has been
-    /// dropped (the reload boundary this contract is about).
-    #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
-    pub fn dispatch_generation_for_test(&self) -> Arc<DispatchGeneration> {
-        Arc::clone(&self.dispatch_generation)
-    }
-
-    /// Borrow this instance's recovery gate so a deterministic external test can
-    /// assert producer state settled after the plugin was dropped.
-    #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
-    pub fn recovery_gate_for_test(&self) -> Arc<RecoveryGate> {
-        Arc::clone(&self.recovery)
-    }
-
-    /// In-flight dispatch count for this instance generation.
-    #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
-    pub fn dispatch_in_flight_for_test(&self) -> usize {
-        self.dispatch_generation.in_flight()
-    }
-
-    /// Current recovery state for deterministic external delivery tests.
-    #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
-    pub fn recovery_state_for_test(
-        &self,
-        rule_id: u32,
-        proxy_id: &str,
-        ownership_generation: u64,
-    ) -> Option<RuleState> {
-        self.recovery
-            .current_state(rule_id, proxy_id, ownership_generation)
-    }
-
-    /// Try to reserve one cooldown seat for deterministic external tests.
-    #[doc(hidden)]
-    // External tests consume this through the library target; the binary target
-    // recompiles the module tree without that caller.
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_acquire_cooldown_for_test(
-        &self,
-        rule_id: u32,
-        proxy_id: &str,
-        channel_id: u32,
-        cooldown_ms: u64,
-        now_ms: u64,
-        ownership_generation: u64,
-    ) -> bool {
-        self.cooldowns.try_acquire(
-            rule_id,
-            proxy_id,
-            channel_id,
-            cooldown_ms,
-            now_ms,
-            ownership_generation,
-        )
-    }
 }
 
-/// Coordinates fan-out settle across every channel admitted for one lifecycle
-/// event so Trigger/Resolve state commits only after a defined delivery
-/// outcome.
-struct PendingDeliveryFanout {
-    remaining: AtomicUsize,
-    any_success: AtomicBool,
+/// Settles one channel's admitted lifecycle event: commits Trigger/Resolve
+/// state only after a defined delivery outcome, or rolls the reservation back.
+struct PendingDelivery {
     event_action: EventAction,
     rule_id: u32,
+    channel_id: u32,
     proxy_id: String,
     ownership_generation: u64,
-    fired_at_ms: u64,
+    /// Reservation token of the lifecycle seat and the cooldown arm (both the
+    /// admission `now_ms`).
+    reserved_at_ms: u64,
     left_threshold_at_ms: u64,
-    recovery_reserved_at_ms: u64,
-    cooldown_reserved_at_ms: u64,
     cooldowns: Arc<CooldownGate>,
     recovery: Arc<RecoveryGate>,
 }
 
-impl PendingDeliveryFanout {
-    fn on_channel_settle(&self, channel_id: u32, settle: DispatchSettle) {
+impl PendingDelivery {
+    fn on_settle(&self, settle: DispatchSettle) {
         let success = matches!(settle, DispatchSettle::Succeeded);
-        if success {
-            self.any_success.store(true, Ordering::Release);
-        } else if self.event_action != EventAction::Resolve {
-            // Failed Trigger/StillActive must not keep the cooldown seat.
-            self.cooldowns.release(
-                self.rule_id,
-                &self.proxy_id,
-                channel_id,
-                self.ownership_generation,
-                self.cooldown_reserved_at_ms,
-            );
-        }
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
-        }
-        // Last channel settled: commit or roll back incident state.
         match self.event_action {
             EventAction::Resolve => {
-                if self.any_success.load(Ordering::Acquire) {
+                if success {
                     self.recovery.settle_resolve_success(
                         self.rule_id,
                         &self.proxy_id,
                         self.ownership_generation,
-                        self.recovery_reserved_at_ms,
+                        self.reserved_at_ms,
                     );
                 } else {
                     self.recovery.settle_resolve_failure(
@@ -834,28 +1192,35 @@ impl PendingDeliveryFanout {
                         &self.proxy_id,
                         self.ownership_generation,
                         self.left_threshold_at_ms,
-                        self.recovery_reserved_at_ms,
+                        self.reserved_at_ms,
                     );
                 }
             }
             EventAction::Trigger | EventAction::Info => {
-                // StillActive re-triggers leave Active in place; only the
-                // initial PendingTrigger path needs settle. settle_* no-ops
-                // when state is already Active.
-                if self.any_success.load(Ordering::Acquire) {
+                // Initial Triggers settle PendingTrigger; reminders settle
+                // PendingReminder back to Active either way.
+                if success {
                     self.recovery.settle_trigger_success(
                         self.rule_id,
                         &self.proxy_id,
                         self.ownership_generation,
-                        self.recovery_reserved_at_ms,
-                        self.fired_at_ms,
+                        self.reserved_at_ms,
+                        self.reserved_at_ms,
                     );
                 } else {
+                    // A failed Trigger/reminder must not keep the cooldown seat.
+                    self.cooldowns.release(
+                        self.rule_id,
+                        &self.proxy_id,
+                        self.channel_id,
+                        self.ownership_generation,
+                        self.reserved_at_ms,
+                    );
                     self.recovery.settle_trigger_failure(
                         self.rule_id,
                         &self.proxy_id,
                         self.ownership_generation,
-                        self.recovery_reserved_at_ms,
+                        self.reserved_at_ms,
                     );
                 }
             }
@@ -870,9 +1235,9 @@ impl Drop for ProxyAlerts {
         // Tasks observe the cancel flag between attempts and settle as
         // abandoned; the global observability registry still owns hard-abort
         // on process-shutdown deadline expiry.
-        self.dispatch_generation.cancel();
-        if let Some(handle) = self.eviction_handle.take() {
-            handle.abort();
+        self.core.dispatch_generation.cancel();
+        if let Some(task) = self.lifecycle_task.take() {
+            task.abort();
         }
     }
 }
@@ -890,68 +1255,30 @@ fn lifecycle_keep_ms(rules: &[Rule]) -> u64 {
     keep
 }
 
-fn start_lifecycle_eviction_task(
-    windows: Arc<WindowStore>,
-    cooldowns: Arc<CooldownGate>,
-    recovery: Arc<RecoveryGate>,
-    active_proxy_generations: Arc<ArcSwap<Option<HashMap<String, u64>>>>,
-    retention_lock: Arc<Mutex<()>>,
-    keep_ms: u64,
-) -> Option<tokio::task::JoinHandle<()>> {
+fn start_lifecycle_task(core: Weak<AlertCore>) -> Option<tokio::task::JoinHandle<()>> {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return None;
     };
     Some(handle.spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + LIFECYCLE_TICK, LIFECYCLE_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick: u32 = 0;
         loop {
             ticker.tick().await;
-            let now_ms = windows::monotonic_now_ms();
-            // A sample can pass the admission-generation check immediately
-            // before a cache commit and finish its write immediately after the
-            // commit-time retain. Generation-keying isolates that row from the
-            // replacement; periodically reapplying the published ownership map
-            // also bounds the orphan rather than leaving an old-generation
-            // Active/Recovering recovery row resident indefinitely. The
-            // retention lock ensures this sweep loads the latest published map
-            // and cannot interleave with a commit-path retain pass.
-            retain_published_proxy_generations(
-                &windows,
-                &cooldowns,
-                &recovery,
-                &active_proxy_generations,
-                &retention_lock,
-            );
-            windows.evict_stale(now_ms, keep_ms);
-            cooldowns.evict_stale(now_ms, keep_ms);
-            recovery.evict_resolved();
+            // Never extend the instance's life: a dropped plugin ends the task
+            // even before its `Drop` abort is observed.
+            let Some(core) = core.upgrade() else {
+                return;
+            };
+            let now_ms = monotonic_now_ms();
+            core.reevaluate_idle_incidents(now_ms, Utc::now());
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(EVICTION_EVERY_TICKS) {
+                core.sweep_lifecycle(now_ms);
+            }
         }
     }))
-}
-
-fn retain_published_proxy_generations(
-    windows: &WindowStore,
-    cooldowns: &CooldownGate,
-    recovery: &RecoveryGate,
-    active_proxy_generations: &ArcSwap<Option<HashMap<String, u64>>>,
-    retention_lock: &Mutex<()>,
-) {
-    let _guard = retention_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Load only after acquiring the serialization guard so a concurrent
-    // commit cannot publish a newer map and finish retaining before this
-    // pass still deletes against a stale snapshot.
-    let active = active_proxy_generations.load();
-    let Some(active) = active.as_ref() else {
-        return;
-    };
-    let borrowed: HashMap<&str, u64> = active
-        .iter()
-        .map(|(proxy_id, generation)| (proxy_id.as_str(), *generation))
-        .collect();
-    windows.retain_proxies(&borrowed);
-    cooldowns.retain_proxies(&borrowed);
-    recovery.retain_proxies(&borrowed);
 }
 
 fn lifecycle_event_action(outcome: LifecycleOutcome) -> Option<EventAction> {
@@ -1042,6 +1369,7 @@ impl Plugin for ProxyAlerts {
 
     fn warmup_hostnames(&self) -> Vec<String> {
         let mut hosts: Vec<String> = self
+            .core
             .channel_by_id
             .values()
             .flat_map(|channel| channel.warmup_hostnames())
@@ -1055,19 +1383,19 @@ impl Plugin for ProxyAlerts {
         if summary.mirror {
             return;
         }
-        self.handle(SampleInput::Http(summary));
+        self.core.handle(SampleInput::Http(summary));
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.handle(SampleInput::Stream(summary));
+        self.core.handle(SampleInput::Stream(summary));
     }
 
     fn requires_ws_disconnect_hooks(&self) -> bool {
-        self.rules.iter().any(Rule::observes_ws_disconnect)
+        self.core.rules.iter().any(Rule::observes_ws_disconnect)
     }
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
-        self.handle(SampleInput::WebSocket(ctx));
+        self.core.handle(SampleInput::WebSocket(ctx));
     }
 }
 
@@ -1104,7 +1432,7 @@ mod tests {
 
         plugin.log(&summary).await;
         assert_eq!(
-            plugin.windows.snapshot_count(
+            plugin.core.windows.snapshot_count(
                 0,
                 "ferrum|p1",
                 UNARMED_PROXY_LIFECYCLE_GENERATION,
@@ -1117,7 +1445,7 @@ mod tests {
         primary_summary.mirror = false;
         plugin.log(&primary_summary).await;
         assert_eq!(
-            plugin.windows.snapshot_count(
+            plugin.core.windows.snapshot_count(
                 0,
                 "ferrum|p1",
                 UNARMED_PROXY_LIFECYCLE_GENERATION,
@@ -1151,9 +1479,11 @@ mod tests {
         plugin.log(&summary).await;
 
         assert_eq!(
-            plugin
-                .recovery
-                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            plugin.core.recovery_by_channel[0].current_state(
+                0,
+                "ferrum|p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION
+            ),
             None
         );
     }
@@ -1173,6 +1503,7 @@ mod tests {
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
         let _held_permit = plugin
+            .core
             .dispatch_sem
             .clone()
             .try_acquire_owned()
@@ -1188,7 +1519,7 @@ mod tests {
         plugin.log(&summary).await;
 
         assert!(
-            plugin.cooldowns.try_acquire(
+            plugin.core.cooldowns.try_acquire(
                 0,
                 "ferrum|p1",
                 0,
@@ -1227,7 +1558,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Ok(permit) = plugin.dispatch_sem.clone().try_acquire_owned() {
+                if let Ok(permit) = plugin.core.dispatch_sem.clone().try_acquire_owned() {
                     drop(permit);
                     break;
                 }
@@ -1254,6 +1585,7 @@ mod tests {
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
         let held_permit = plugin
+            .core
             .dispatch_sem
             .clone()
             .try_acquire_owned()
@@ -1268,9 +1600,11 @@ mod tests {
 
         plugin.log(&summary).await;
         assert_eq!(
-            plugin
-                .recovery
-                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            plugin.core.recovery_by_channel[0].current_state(
+                0,
+                "ferrum|p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION
+            ),
             None
         );
 
@@ -1279,14 +1613,16 @@ mod tests {
         // Admission commits PendingTrigger; a failed channel send rolls back
         // to Healthy rather than silently marking Active.
         assert!(matches!(
-            plugin
-                .recovery
-                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            plugin.core.recovery_by_channel[0].current_state(
+                0,
+                "ferrum|p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION
+            ),
             Some(RuleState::PendingTrigger { .. }) | Some(RuleState::Healthy) | None
         ));
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                match plugin.recovery.current_state(
+                match plugin.core.recovery_by_channel[0].current_state(
                     0,
                     "ferrum|p1",
                     UNARMED_PROXY_LIFECYCLE_GENERATION,
@@ -1324,7 +1660,7 @@ mod tests {
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
         let now_ms = monotonic_now_ms();
-        assert!(plugin.cooldowns.try_acquire(
+        assert!(plugin.core.cooldowns.try_acquire(
             0,
             "ferrum|p1",
             0,
@@ -1343,9 +1679,11 @@ mod tests {
         plugin.log(&summary).await;
 
         assert_eq!(
-            plugin
-                .recovery
-                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            plugin.core.recovery_by_channel[0].current_state(
+                0,
+                "ferrum|p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION
+            ),
             None,
             "a first trigger suppressed by cooldown must not create a resolvable incident"
         );
@@ -1368,7 +1706,7 @@ mod tests {
             ]
         });
         let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
-        plugin.recovery.observe(
+        plugin.core.recovery_by_channel[0].observe(
             0,
             "ferrum|p1",
             true,
@@ -1376,14 +1714,14 @@ mod tests {
             1,
             UNARMED_PROXY_LIFECYCLE_GENERATION,
         );
-        plugin.recovery.settle_trigger_success(
+        plugin.core.recovery_by_channel[0].settle_trigger_success(
             0,
             "ferrum|p1",
             UNARMED_PROXY_LIFECYCLE_GENERATION,
             1,
             1,
         );
-        plugin.recovery.observe(
+        plugin.core.recovery_by_channel[0].observe(
             0,
             "ferrum|p1",
             false,
@@ -1392,13 +1730,16 @@ mod tests {
             UNARMED_PROXY_LIFECYCLE_GENERATION,
         );
         assert!(matches!(
-            plugin
-                .recovery
-                .current_state(0, "ferrum|p1", UNARMED_PROXY_LIFECYCLE_GENERATION),
+            plugin.core.recovery_by_channel[0].current_state(
+                0,
+                "ferrum|p1",
+                UNARMED_PROXY_LIFECYCLE_GENERATION
+            ),
             Some(RuleState::Recovering { .. })
         ));
 
         let held_permit = plugin
+            .core
             .dispatch_sem
             .clone()
             .try_acquire_owned()
@@ -1414,46 +1755,52 @@ mod tests {
         let sample = SampleInput::Http(&summary);
         // Namespace-qualified lifecycle identity the plugin composes internally.
         let owner_key = "ferrum|p1";
-        let rule = &plugin.rules[0];
+        let rule = &plugin.core.rules[0];
         let first_resolve_ms = 5_002;
         let observation = rule
-            .observe(sample, &plugin.windows, first_resolve_ms)
+            .observe(sample, &plugin.core.windows, first_resolve_ms)
             .expect("error-rate rule observes HTTP summaries");
-        plugin.process_observation(
+        plugin.core.process_observation(
             rule,
             &observation,
-            sample,
+            AlertSubject::from_sample(sample),
             owner_key,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
             first_resolve_ms,
             chrono::Utc::now(),
             false,
+            None,
         );
         assert!(matches!(
-            plugin
-                .recovery
-                .current_state(0, owner_key, UNARMED_PROXY_LIFECYCLE_GENERATION),
+            plugin.core.recovery_by_channel[0].current_state(
+                0,
+                owner_key,
+                UNARMED_PROXY_LIFECYCLE_GENERATION
+            ),
             Some(RuleState::Recovering { .. })
         ));
 
         drop(held_permit);
         let second_resolve_ms = first_resolve_ms + 1;
         let observation = rule
-            .observe(sample, &plugin.windows, second_resolve_ms)
+            .observe(sample, &plugin.core.windows, second_resolve_ms)
             .expect("error-rate rule observes HTTP summaries");
-        plugin.process_observation(
+        plugin.core.process_observation(
             rule,
             &observation,
-            sample,
+            AlertSubject::from_sample(sample),
             owner_key,
+            UNARMED_PROXY_LIFECYCLE_GENERATION,
             second_resolve_ms,
             chrono::Utc::now(),
             false,
+            None,
         );
         // Admit PendingResolve; the unreachable webhook fails and rolls back to
         // Recovering so a later healthy sample can retry Resolve.
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                match plugin.recovery.current_state(
+                match plugin.core.recovery_by_channel[0].current_state(
                     0,
                     owner_key,
                     UNARMED_PROXY_LIFECYCLE_GENERATION,

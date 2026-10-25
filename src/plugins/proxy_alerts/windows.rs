@@ -333,8 +333,12 @@ pub struct RuleWindowSpec {
 /// Outer rule/proxy DashMaps use `pool_shard_amount` and avoid composite string
 /// keys on the hot path (`proxy_id` uses `String: Borrow<str>`). The generation
 /// dimension is a compact [`GenerationMap`] of `Arc<WindowState>` so typically
-/// one live incarnation does not pay for a fully pool-sharded DashMap, while
-/// record/snapshot still run lock-free on the window atomics after lookup.
+/// one live incarnation does not pay for a fully pool-sharded DashMap. An
+/// established generation is resolved through the map's lock-free `ArcSwap`
+/// snapshot (no mutex), and record/snapshot then run on the window atomics.
+/// Rule evaluation uses the fused [`WindowStore::record_count_and_snapshot`] /
+/// [`WindowStore::record_latency_and_percentile`] so one sample walks the
+/// store once per rule.
 type GenerationWindows = GenerationMap<Arc<WindowState>>;
 type ProxyWindows = DashMap<String, Arc<GenerationWindows>>;
 type RuleWindows = DashMap<u32, Arc<ProxyWindows>>;
@@ -423,6 +427,7 @@ impl WindowStore {
         }
     }
 
+    #[allow(dead_code)] // Rule evaluation uses the fused path; kept for tests.
     pub fn record_latency(
         &self,
         rule_id: u32,
@@ -441,6 +446,81 @@ impl WindowStore {
         if let WindowState::Histogram(h) = state.as_ref() {
             h.record(latency_ms, now_ms);
         }
+    }
+
+    /// Record one counter sample and return the window's `(matched, total)`
+    /// at `now_ms`, resolving the window row once.
+    pub fn record_count_and_snapshot(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        matched: bool,
+        now_ms: u64,
+    ) -> (u64, u64) {
+        let Some(spec) = self.rule_specs.get(&rule_id).copied() else {
+            return (0, 0);
+        };
+        let Some(generations) = self.generations_for(rule_id, proxy_id) else {
+            return (0, 0);
+        };
+        let state = Self::window_for_generation(&generations, ownership_generation, spec);
+        match state.as_ref() {
+            WindowState::Counter(c) => {
+                c.record(matched, now_ms);
+                c.snapshot(now_ms)
+            }
+            WindowState::Histogram(_) => (0, 0),
+        }
+    }
+
+    /// Record one latency sample and return the window's
+    /// `(estimated_percentile_upper_bound_ms, total)` at `now_ms`, resolving the
+    /// window row once.
+    pub fn record_latency_and_percentile(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        ownership_generation: u64,
+        latency_ms: f64,
+        percentile: u8,
+        now_ms: u64,
+    ) -> (Option<f64>, u64) {
+        let Some(spec) = self.rule_specs.get(&rule_id).copied() else {
+            return (None, 0);
+        };
+        let Some(generations) = self.generations_for(rule_id, proxy_id) else {
+            return (None, 0);
+        };
+        let state = Self::window_for_generation(&generations, ownership_generation, spec);
+        match state.as_ref() {
+            WindowState::Histogram(h) => {
+                h.record(latency_ms, now_ms);
+                h.percentile(percentile, now_ms)
+            }
+            WindowState::Counter(_) => (None, 0),
+        }
+    }
+
+    /// Run `f` while the generation-map writer mutex for `(rule_id, proxy_id)`
+    /// is held. Returns `None` when no window row exists yet.
+    ///
+    /// Test-only hook proving established record/snapshot lookups are served
+    /// from the lock-free snapshot rather than waiting on that mutex.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External test crate only.
+    pub fn with_generation_writer_lock_for_test<R>(
+        &self,
+        rule_id: u32,
+        proxy_id: &str,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let generations = {
+            let inner = self.by_rule.get(&rule_id)?;
+            let generations = inner.get(proxy_id)?;
+            Arc::clone(generations.value())
+        };
+        Some(generations.with_writer_lock_held(f))
     }
 
     pub fn snapshot_count(

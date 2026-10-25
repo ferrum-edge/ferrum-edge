@@ -150,7 +150,7 @@ These are always available to the operator-templated channels (generic `webhook`
 
 The `email` channel adds one more: `${fields}` — the notification's key/value rows rendered as `Name: value` lines.
 
-Callers can supply additional variables via `dispatch_with_vars`. The [`proxy_alerts` plugin](proxy_alerts.md#webhook-template-variables) adds `${rule_name}`, `${proxy_id}`, `${observed}`, `${threshold}`, etc. Extra variables are consumed only by the `webhook` and `email` channels because Slack, Teams, and Discord use fixed native payload shapes. Generic notification variables win on key collisions, so a caller cannot shadow `${title}` or `${severity}`.
+Callers can supply additional variables via `dispatch_with_vars`. The [`proxy_alerts` plugin](proxy_alerts.md#webhook-template-variables) adds `${rule_name}`, `${proxy_id}`, `${incident_key}`, `${observed}`, `${threshold}`, etc. Extra variables are consumed only by the `webhook` and `email` channels because Slack, Teams, and Discord use fixed native payload shapes. Generic notification variables win on key collisions, so a caller cannot shadow `${title}` or `${severity}`.
 
 Special characters:
 - `${name}` — variable substitution.
@@ -233,7 +233,7 @@ Conversely, a 2xx followed by a response-body drain failure is classified **perm
 
 Operator expectations for webhook and email consumers:
 
-- Make the receiver idempotent, or tolerant of duplicates. Retries inside one admitted task reuse the same notification (including `fired_at`), but rollback followed by a later re-admission creates a new timestamp and Ferrum does not emit a cross-admission idempotency key. For incident-level deduplication, derive a receiver-owned stable business key/window from rule + proxy + `event_action`; do not rely on `fired_at` alone across re-admission.
+- Make the receiver idempotent, or tolerant of duplicates. Retries inside one admitted task reuse the same notification (including `fired_at`), but rollback followed by a later re-admission creates a new timestamp and Ferrum does not emit a cross-admission idempotency key. For incident-level deduplication, derive a receiver-owned stable business key/window from rule + proxy + `event_action` — `proxy_alerts` supplies one as [`${incident_key}`](proxy_alerts.md#webhook-template-variables) — and do not rely on `fired_at` alone across re-admission.
 - Treat `abandoned_total{reason="shutdown_deadline"}` and `{reason="generation_retired"}` as **delivery state unknown**, not as "definitely not delivered".
 - Setting `max_delivery_retries: 0` narrows duplicate windows 1 and 2, at the cost of dropping recoverable transient failures. It cannot close window 3.
 
