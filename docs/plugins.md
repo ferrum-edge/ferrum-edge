@@ -4766,21 +4766,28 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 | `allowed_origins` | (String \| Object)[] | required, max 64 | Permitted origins. Use `["*"]` only for intentional allow-all. Plain strings are NATIVE syntax: exact origins are canonicalized at config load and matched case-insensitively, and `*.suffix.com` is the wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex` and keep LITERAL source semantics — object `exact` is a byte-for-byte case-sensitive match with no canonicalization or wildcard interpretation, so `{exact: "*.example.com"}` matches only that literal string; `{exact: "*"}` is Istio allow-all. Matcher values are bounded at 512 bytes and regexes compile once at config construction/reload under explicit complexity limits. |
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Case-sensitive preflight-only allowed methods; `*` allows any valid method when credentials are disabled and is literal when credentials are enabled. Not evaluated on actual requests. |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Case-insensitive preflight-only allowed headers; with credentials disabled, `*` permits every header except `Authorization`, which requires an explicit entry. With credentials enabled, `*` is literal. Not evaluated on actual requests. |
-| `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
+| `exposed_headers` | String[] | `[]` | Case-insensitive response headers exposed to browser JavaScript; with credentials disabled, `*` exposes every response header, and it is literal when credentials are enabled. |
 | `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true`. Exact `*` drops credentials; opaque exact `null`, a `*.suffix` wildcard over a single label or public suffix (`*.com`, `*.co.uk`), and an effectively universal prefix or regex are refused. A credentialed prefix must be the host-bounded `scheme://host:` form, because prefix matching is an unbounded `starts_with`. |
+| `allow_private_network` | bool | `false` | Private Network Access opt-in: answer a preflight from an allowed origin that sends `Access-Control-Request-Private-Network: true` with `Access-Control-Allow-Private-Network: true`. Never sent on actual responses; a backend's own value is always stripped. Answers PNA preflights only; it does not grant Chrome 142+ Local Network Access permission. |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds, from 0 through 18446744073709551615; translated Istio omission remains absent. |
 | `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
 | `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
 
 The root config must be an object. Unknown keys, explicit `null`, malformed
 values, and an omitted `allowed_origins` policy fail startup/reload instead of
-falling back to wildcard access. Multiple attached CORS instances compose
-origin/credential/exposure policy on actual requests and additionally
-intersect method/header/max-age policy on preflight.
+falling back to wildcard access. `allowed_methods`, `allowed_headers`, and
+`exposed_headers` are each bounded at 128 entries of at most 256 bytes. A
+single policy does not refuse an unlisted requested header; it emits its
+configured `Access-Control-Allow-Headers` list and the browser enforces it.
+Multiple attached CORS instances compose
+origin/credential/exposure/private-network policy on actual requests and
+preflights, and additionally intersect method/header/max-age policy on
+preflight; a requested header that one instance allows but the intersection
+does not is refused with `403 CORS header not allowed`.
 
-Wildcard method/header permissions intersect with explicit lists, preserving
-each sibling's restrictions and requiring every sibling to name `Authorization`
-explicitly. A credentialed policy's literal `*` is omitted if the aggregate
+Wildcard method/header/exposed-header permissions intersect with explicit
+lists, preserving each sibling's restrictions; allowed request headers also
+require every sibling to name `Authorization` explicitly. A credentialed policy's literal `*` is omitted if the aggregate
 disables credentials, so it cannot become a wildcard in the final response.
 Responses vary on `Origin` even when Origin is absent or unmatched; preflights
 also vary on the requested method and headers. Existing `Vary` tokens and

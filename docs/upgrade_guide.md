@@ -28,18 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `hmac_auth` `replay_max_entries` bounds (#6853)
+### `cors` method and header lists are bounded (#6844)
 
-`replay_max_entries` now accepts `1`–`10000000`, and it is refused on a
-`signing_profile: ferrum-hmac-v1` policy, where it never had an effect. Before
-upgrading, remove `replay_max_entries` from every `ferrum-hmac-v1` `hmac_auth`
-config, and lower any larger value to at most `10000000` (or move the policy
-to `replay_scope: shared` with `sync_mode: redis` when one process needs more
-replay state). A config that still carries either is rejected at admission
-and at startup. No other `hmac_auth` setting changes: `signed_headers`,
-`required_components`, `max_body_bytes`, and `signing_profile: rfc9421` are
-new opt-ins, and a policy that sets none of them keeps its signing base
-byte-for-byte.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
