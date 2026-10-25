@@ -467,8 +467,7 @@ async fn test_provider_is_case_insensitive() {
         .on_response_body(&mut ctx, 200, &mut resp_headers, &body)
         .await;
 
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_reject(
         plugin.before_proxy(&mut ctx2, &mut headers2).await,
         Some(429),
@@ -501,8 +500,7 @@ async fn test_token_accumulation_and_limit() {
         .await;
 
     // Second request passes (150 < 200)
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 
     // Record another 100 tokens (total now 250)
@@ -516,8 +514,7 @@ async fn test_token_accumulation_and_limit() {
     // aggregate limiter metric.
     let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
     let before = registry.rate_limit_exceeded.load(Ordering::Relaxed);
-    let mut ctx3 = create_test_context();
-    let mut headers3 = HashMap::new();
+    let (mut ctx3, mut headers3) = budget_probe();
     let result = plugin.before_proxy(&mut ctx3, &mut headers3).await;
     assert_reject(result, Some(429));
     assert!(registry.rate_limit_exceeded.load(Ordering::Relaxed) > before);
@@ -550,8 +547,7 @@ async fn test_sliding_window_eviction() {
         .await;
 
     // Should be rejected now
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_reject(
         plugin.before_proxy(&mut ctx2, &mut headers2).await,
         Some(429),
@@ -561,8 +557,7 @@ async fn test_sliding_window_eviction() {
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
     // Should pass now (window expired)
-    let mut ctx3 = create_test_context();
-    let mut headers3 = HashMap::new();
+    let (mut ctx3, mut headers3) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx3, &mut headers3).await);
 }
 
@@ -593,19 +588,17 @@ async fn test_different_consumers_independent() {
         .await;
 
     // Consumer A should be rejected
-    let mut ctx_a2 = create_test_context();
+    let (mut ctx_a2, mut headers_a2) = budget_probe();
     ctx_a2.identified_consumer = ctx_a.identified_consumer.clone();
-    let mut headers_a2 = HashMap::new();
     assert_reject(
         plugin.before_proxy(&mut ctx_a2, &mut headers_a2).await,
         Some(429),
     );
 
     // Consumer B (different IP) should still pass
-    let mut ctx_b = create_test_context();
+    let (mut ctx_b, mut headers_b) = budget_probe();
     ctx_b.client_ip = "10.0.0.2".to_string();
     ctx_b.identified_consumer = None;
-    let mut headers_b = HashMap::new();
     assert_continue(plugin.before_proxy(&mut ctx_b, &mut headers_b).await);
 }
 
@@ -637,8 +630,7 @@ async fn test_count_mode_prompt_tokens() {
         .await;
 
     // Should still pass (50 < 100)
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 }
 
@@ -668,8 +660,7 @@ async fn test_count_mode_completion_tokens() {
         .await;
 
     // Should still pass (50 < 100)
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 }
 
@@ -702,8 +693,7 @@ async fn test_anthropic_format() {
         .await;
 
     // 120 total > 100 limit
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_reject(
         plugin.before_proxy(&mut ctx2, &mut headers2).await,
         Some(429),
@@ -741,8 +731,7 @@ async fn test_google_format() {
         .await;
 
     // 110 > 100
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_reject(
         plugin.before_proxy(&mut ctx2, &mut headers2).await,
         Some(429),
@@ -774,8 +763,7 @@ async fn test_non_json_response_not_counted() {
         .await;
 
     // No tokens counted — should still pass
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 }
 
@@ -803,8 +791,7 @@ async fn test_non_2xx_response_not_counted() {
         .await;
 
     // Should still pass
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 }
 
@@ -828,8 +815,7 @@ async fn test_empty_body_not_counted() {
         .on_response_body(&mut ctx, 200, &mut resp_headers, b"")
         .await;
 
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 }
 
@@ -856,8 +842,7 @@ async fn test_zero_tokens_counted_but_no_usage() {
         .await;
 
     // 0 tokens used — still within limit
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 }
 
@@ -876,8 +861,7 @@ async fn test_expose_headers() {
     )
     .unwrap();
 
-    let mut ctx = create_test_context();
-    let mut headers = HashMap::new();
+    let (mut ctx, mut headers) = budget_probe();
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     assert_eq!(scoped_meta(&ctx, "ai_ratelimit_limit").unwrap(), "1000");
@@ -886,7 +870,7 @@ async fn test_expose_headers() {
     assert_eq!(scoped_meta(&ctx, "ai_ratelimit_usage").unwrap(), "0");
 
     // after_proxy should inject headers
-    let mut response_headers = HashMap::new();
+    let mut response_headers = json_headers();
     plugin
         .after_proxy(&mut ctx, 200, &mut response_headers)
         .await;
@@ -921,8 +905,7 @@ async fn test_expose_headers_on_rejection() {
         .await;
 
     // Should be rejected with headers
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     match result {
         PluginResult::Reject {
@@ -965,10 +948,9 @@ async fn test_consumer_fallback_to_ip() {
         .await;
 
     // Same IP should be rejected
-    let mut ctx2 = create_test_context();
+    let (mut ctx2, mut headers2) = budget_probe();
     ctx2.identified_consumer = None;
     ctx2.authenticated_identity = None;
-    let mut headers2 = HashMap::new();
     assert_reject(
         plugin.before_proxy(&mut ctx2, &mut headers2).await,
         Some(429),
@@ -1012,8 +994,7 @@ async fn test_reads_tokens_from_ai_token_metrics_metadata() {
         .await;
 
     // Should have recorded 150 tokens from metadata → next request rejected
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_reject(
         plugin.before_proxy(&mut ctx2, &mut headers2).await,
         Some(429),
@@ -1163,8 +1144,7 @@ async fn test_anthropic_sse_only_message_delta_records_completion_tokens() {
         .on_response_body(&mut ctx, 200, &mut resp_headers, sse)
         .await;
 
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 
     let sse2 = b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":300}}\n\n";
@@ -1174,8 +1154,7 @@ async fn test_anthropic_sse_only_message_delta_records_completion_tokens() {
         .await;
 
     // 750 + 300 = 1050 → exceeds 1000 → next request must be rejected.
-    let mut ctx3 = create_test_context();
-    let mut headers3 = HashMap::new();
+    let (mut ctx3, mut headers3) = budget_probe();
     assert_reject(
         plugin.before_proxy(&mut ctx3, &mut headers3).await,
         Some(429),
@@ -1215,8 +1194,7 @@ async fn test_cohere_v2_sse_message_end_records_tokens() {
 
     // 75 tokens recorded — second request fits (75 + 25 ≤ 100), a 26-token
     // follow-up would exceed.
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
 
     let sse2 = b"data: {\"type\":\"message-end\",\"delta\":{\"finish_reason\":\"COMPLETE\",\"usage\":{\"tokens\":{\"input_tokens\":15,\"output_tokens\":15}}}}\n\n";
@@ -1225,8 +1203,7 @@ async fn test_cohere_v2_sse_message_end_records_tokens() {
         .on_response_body(&mut ctx2, 200, &mut resp_headers, sse2)
         .await;
 
-    let mut ctx3 = create_test_context();
-    let mut headers3 = HashMap::new();
+    let (mut ctx3, mut headers3) = budget_probe();
     assert_reject(
         plugin.before_proxy(&mut ctx3, &mut headers3).await,
         Some(429),
@@ -1266,8 +1243,7 @@ async fn test_window_running_sum_matches_after_eviction() {
         .await;
 
     // Next call should see remaining = 200 - 50 = 150.
-    let mut ctx2 = create_test_context();
-    let mut headers2 = HashMap::new();
+    let (mut ctx2, mut headers2) = budget_probe();
     assert_continue(plugin.before_proxy(&mut ctx2, &mut headers2).await);
     let remaining = scoped_meta(&ctx2, "ai_ratelimit_remaining")
         .map(|v| v.parse::<u64>().unwrap_or(0))
@@ -1292,23 +1268,20 @@ async fn test_tracked_keys_count_grows_with_distinct_keys() {
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 
     // First IP creates a key.
-    let mut ctx_a = create_test_context();
+    let (mut ctx_a, mut headers_a) = budget_probe();
     ctx_a.client_ip = "10.0.0.1".to_string();
-    let mut headers_a = HashMap::new();
     plugin.before_proxy(&mut ctx_a, &mut headers_a).await;
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 
     // Second IP creates a second key.
-    let mut ctx_b = create_test_context();
+    let (mut ctx_b, mut headers_b) = budget_probe();
     ctx_b.client_ip = "10.0.0.2".to_string();
-    let mut headers_b = HashMap::new();
     plugin.before_proxy(&mut ctx_b, &mut headers_b).await;
     assert_eq!(plugin.tracked_keys_count(), Some(2));
 
     // Repeated request from the first IP reuses the existing key.
-    let mut ctx_a_again = create_test_context();
+    let (mut ctx_a_again, mut headers_a_again) = budget_probe();
     ctx_a_again.client_ip = "10.0.0.1".to_string();
-    let mut headers_a_again = HashMap::new();
     plugin
         .before_proxy(&mut ctx_a_again, &mut headers_a_again)
         .await;
@@ -1323,15 +1296,13 @@ async fn test_tracked_keys_count_uses_canonical_ingress_identity() {
     )
     .unwrap();
 
-    let mut native = create_test_context();
+    let (mut native, mut native_headers) = budget_probe();
     native.client_ip = "192.0.2.10".to_string();
-    let mut native_headers = HashMap::new();
     plugin.before_proxy(&mut native, &mut native_headers).await;
 
-    let mut mapped = create_test_context();
+    let (mut mapped, mut mapped_headers) = budget_probe();
     let no_trust = TrustedProxies::parse_strict("", "test").expect("empty trust list is valid");
     mapped.client_ip = resolve_client_ip("::ffff:192.0.2.10", None, &no_trust);
-    let mut mapped_headers = HashMap::new();
     plugin.before_proxy(&mut mapped, &mut mapped_headers).await;
 
     assert_eq!(plugin.tracked_keys_count(), Some(1));
@@ -1368,11 +1339,25 @@ fn reserved_tokens(ctx: &RequestContext) -> u64 {
         .unwrap_or(0)
 }
 
-/// Read the current-window usage the limiter would charge, by issuing a
-/// follow-up `before_proxy` and reading the exposed `ai_ratelimit_usage`.
-async fn observed_usage(plugin: &AiRateLimiter) -> u64 {
+/// A budget probe: a JSON `POST` whose body is still content-coded, which
+/// `before_proxy` treats as an uninspectable AI candidate. It consults the
+/// budget exactly as an AI call with no estimate does (and reserves nothing).
+///
+/// Out-of-scope traffic such as a bare `GET` no longer consults the token
+/// budget at all (ai_rate_limiter-MUSE-4), so tests that assert admission
+/// (`429`, exposed usage, tracked keys) probe with this instead.
+fn budget_probe() -> (RequestContext, HashMap<String, String>) {
     let mut ctx = create_test_context();
-    let mut headers = HashMap::new();
+    ctx.method = "POST".to_string();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    (ctx, headers)
+}
+
+/// Read the current-window usage the limiter would charge, by issuing a
+/// follow-up budget probe and reading the exposed `ai_ratelimit_usage`.
+async fn observed_usage(plugin: &AiRateLimiter) -> u64 {
+    let (mut ctx, mut headers) = budget_probe();
     plugin.before_proxy(&mut ctx, &mut headers).await;
     scoped_meta(&ctx, "ai_ratelimit_usage")
         .map(|v| v.parse::<u64>().unwrap_or(0))
@@ -5189,9 +5174,11 @@ async fn invalid_request_body_json_skips_reservation() {
 }
 
 #[tokio::test]
-async fn buffers_request_body_for_json_post_only() {
-    // `should_buffer_request_body` must be true for a JSON POST (so the body is
-    // available for estimation) and false otherwise. Covers the predicate.
+async fn buffers_every_uncompressed_post_regardless_of_label() {
+    // ai_rate_limiter-MUSE-3: the client-supplied `Content-Type` cannot decide
+    // whether a body is classified — a lenient upstream parses a JSON chat body
+    // labelled `text/plain` or unlabelled exactly like `application/json`. Every
+    // uncompressed POST is buffered so `before_proxy` classifies the bytes.
     let plugin =
         AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default()).unwrap();
 
@@ -5201,9 +5188,10 @@ async fn buffers_request_body_for_json_post_only() {
         "POST",
         "application/json; charset=utf-8"
     )));
+    assert!(plugin.should_buffer_request_body(&ctx_with_content_type("POST", "text/plain")));
+    assert!(plugin.should_buffer_request_body(&ctx_without_content_type("POST")));
     assert!(!plugin.should_buffer_request_body(&ctx_with_content_type("GET", "application/json")));
-    assert!(!plugin.should_buffer_request_body(&ctx_with_content_type("POST", "text/plain")));
-    assert!(!plugin.should_buffer_request_body(&ctx_without_content_type("POST")));
+    assert!(!plugin.should_buffer_request_body(&ctx_with_content_type("POST", "application/grpc")));
 }
 
 // ─── Federation token recording idempotency ──────────────────────────────
@@ -7023,9 +7011,15 @@ async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
         ctx.metadata
             .insert("request_body".to_string(), (*body).to_string());
 
-        assert!(
-            !plugin.should_buffer_request_body(&ctx),
-            "framed body must not be buffered for {content_type}"
+        // Native gRPC never reaches the HTTP view and is never buffered. A
+        // gRPC-Web label is client-supplied, so its body IS buffered and its
+        // bytes — a frame never parses as JSON — keep it out of scope
+        // (ai_rate_limiter-MUSE-3).
+        let grpc_web = content_type.starts_with("application/grpc-web");
+        assert_eq!(
+            plugin.should_buffer_request_body(&ctx),
+            grpc_web,
+            "only a gRPC-Web label is buffered for classification: {content_type}"
         );
 
         let mut headers = ctx.headers.clone();
@@ -7380,8 +7374,7 @@ async fn exposed_header_metadata_is_instance_owned() {
     let small = local_limiter(1_000, "total_tokens", "ip");
     let large = local_limiter(9_000, "total_tokens", "consumer");
 
-    let mut ctx = create_test_context();
-    let mut headers = HashMap::new();
+    let (mut ctx, mut headers) = budget_probe();
     assert_continue(small.before_proxy(&mut ctx, &mut headers).await);
     assert_continue(large.before_proxy(&mut ctx, &mut headers).await);
 
@@ -7401,7 +7394,7 @@ async fn exposed_header_metadata_is_instance_owned() {
     // The header NAMES collide by public contract (last writer in configured
     // order wins), but each instance publishes a self-consistent set rather
     // than an interleaving of two budgets.
-    let mut response_headers = HashMap::new();
+    let mut response_headers = json_headers();
     assert_continue(
         small
             .after_proxy(&mut ctx, 200, &mut response_headers)
@@ -9152,4 +9145,1101 @@ async fn a_deferred_cut_ahead_of_the_limiter_charges_the_cleared_usage_once() {
         50,
         "the reservation reconciles to the usage the cleared frame reported, once"
     );
+}
+
+// ─── Production-launch review fixes (ai_rate_limiter SOL-1..4, MUSE-1..8) ──
+
+use ferrum_edge::plugins::utils::rate_limit::RateLimitBackend;
+
+fn local_token_backend(
+    token_limit: u64,
+    window_seconds: u64,
+) -> RateLimitBackend<String, AiTokenRateAlgorithm> {
+    RateLimitBackend::from_plugin_config(
+        "ai_rate_limiter",
+        &json!({}),
+        &PluginHttpClient::default(),
+        AiTokenRateAlgorithm::new(token_limit, window_seconds),
+    )
+    .expect("a local token backend constructs")
+}
+
+/// A JSON `POST` context carrying `body` as its staged request text.
+fn post_ctx_with_body(body: &str) -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    ctx
+}
+
+/// ai_rate_limiter-SOL-1: idle cleanup may delete an identity's window while a
+/// request it admitted is still in flight. The recreated window must never hand
+/// out an id a late correction can match, or that correction releases the NEW
+/// request's live reservation and the identity reserves the budget twice.
+#[test]
+fn a_late_correction_never_releases_a_recreated_windows_reservation() {
+    let backend = local_token_backend(100, 1);
+    let key = "consumer:late-stream".to_string();
+    let t0 = std::time::Instant::now();
+
+    let first = backend.check_local_at(key.clone(), &AiRateLimitOp::Reserve { tokens: 100 }, t0);
+    assert!(first.allowed);
+    let stale_id = first
+        .reservation_id
+        .expect("a local reserve carries a reservation id");
+
+    // Request A is still running when sampled cleanup reclaims the idle key.
+    let later = t0 + std::time::Duration::from_secs(2);
+    backend.prune_stale_at(later);
+    assert!(!backend.contains_local_key(&key));
+
+    let second =
+        backend.check_local_at(key.clone(), &AiRateLimitOp::Reserve { tokens: 100 }, later);
+    assert!(second.allowed);
+    assert_ne!(
+        second.reservation_id,
+        Some(stale_id),
+        "a recreated window must not reissue a stale reservation id"
+    );
+
+    // A's late non-2xx release, then a late low-usage success. Neither may
+    // touch B's reservation; the success still charges what A consumed.
+    for (actual_tokens, delta, expected_usage) in [(0_u64, -100_i64, 100_u64), (40, -60, 140)] {
+        backend.check_local_at(
+            key.clone(),
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(stale_id),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens,
+                delta,
+            },
+            later,
+        );
+        let budget = backend.check_local_at(key.clone(), &AiRateLimitOp::CheckBudget, later);
+        assert_eq!(budget.usage, Some(expected_usage));
+        let refused =
+            backend.check_local_at(key.clone(), &AiRateLimitOp::Reserve { tokens: 1 }, later);
+        assert!(
+            !refused.allowed,
+            "B's full reservation must still hold the budget"
+        );
+    }
+}
+
+/// ai_rate_limiter-MUSE-1 (local half): a request that outlives its window is
+/// charged its whole actual usage, whether that is below or above the expired
+/// estimate — never just the excess, and never nothing.
+#[test]
+fn an_aged_out_local_reservation_reconciles_its_full_actual_usage() {
+    let algorithm = AiTokenRateAlgorithm::new(10_000, 1);
+    for actual in [40_u64, 500] {
+        let mut state = algorithm.new_state();
+        let t0 = std::time::Instant::now();
+        let reserved =
+            algorithm.check_local(&mut state, &AiRateLimitOp::Reserve { tokens: 100 }, t0);
+        let reservation_id = reserved.reservation_id.expect("local reservation id");
+
+        let late = t0 + std::time::Duration::from_secs(3);
+        algorithm.check_local(
+            &mut state,
+            &AiRateLimitOp::AdjustUsage {
+                reservation_id: Some(reservation_id),
+                reserved_window_index: None,
+                reservation_backend: ReservationBackend::Local,
+                actual_tokens: actual,
+                delta: actual as i64 - 100,
+            },
+            late,
+        );
+        let budget = algorithm.check_local(&mut state, &AiRateLimitOp::CheckBudget, late);
+        assert_eq!(
+            budget.usage,
+            Some(actual),
+            "an aged-out reservation must charge its full actual usage ({actual})"
+        );
+    }
+}
+
+/// ai_rate_limiter-SOL-2: a body transform runs after `before_proxy`, so a rule
+/// that renames `user_text` to `input` turns an ordinary JSON POST into a
+/// provider call. The final-body pass must admit and meter it.
+#[tokio::test]
+async fn a_body_transform_that_creates_an_ai_call_is_admitted_and_metered() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 500,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let inbound =
+        json!({"model": "gpt-4o-mini", "user_text": "hello", "max_output_tokens": 100}).to_string();
+    let transformed = serde_json::to_vec(
+        &json!({"model": "gpt-4o-mini", "input": "hello", "max_output_tokens": 100}),
+    )
+    .unwrap();
+
+    for round in 0..2 {
+        let mut ctx = post_ctx_with_body(&inbound);
+        let mut headers = json_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            !has_scoped_meta(&ctx, "ai_ratelimit_request"),
+            "round {round}: the inbound body is not an AI request"
+        );
+
+        // An unchanged final body stays out of scope.
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, inbound.as_bytes())
+                .await,
+        );
+        assert!(!has_scoped_meta(&ctx, "ai_ratelimit_request"));
+
+        // The transformed body is a Responses call: admitted and reserved.
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
+                .await,
+        );
+        assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
+        assert!(reserved_tokens(&ctx) > 0, "round {round}: reserved");
+
+        assert_continue(
+            plugin
+                .on_response_body(
+                    &mut ctx,
+                    200,
+                    &mut json_headers(),
+                    &openai_response(150, 50),
+                )
+                .await,
+        );
+        assert_eq!(
+            scoped_meta(&ctx, "ai_ratelimit_actual_tokens").map(String::as_str),
+            Some("200"),
+            "round {round}: the provider usage is charged"
+        );
+    }
+
+    // 400 tokens are charged; the next transformed call no longer fits.
+    let mut ctx = post_ctx_with_body(&inbound);
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
+            .await,
+        Some(429),
+    );
+}
+
+/// ai_rate_limiter-SOL-3: Cohere v1 chat makes `model` optional. A Cohere-scoped
+/// limiter (explicit provider, or the `/v1/chat` path) must meter it.
+#[tokio::test]
+async fn cohere_v1_requests_without_a_model_are_metered() {
+    let body =
+        json!({"message": "Tell me about LLMs", "stream": false, "max_tokens": 100}).to_string();
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "provider": "cohere",
+            "on_unmetered_response": "reject"
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = post_ctx_with_body(&body);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
+    assert!(reserved_tokens(&ctx) > 0);
+    let reply = serde_json::to_vec(&json!({
+        "text": "LLMs are...",
+        "meta": {"tokens": {"input_tokens": 20, "output_tokens": 80}}
+    }))
+    .unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &reply)
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&ctx, "ai_ratelimit_actual_tokens").map(String::as_str),
+        Some("100")
+    );
+
+    // `auto` scopes a bare `message` by Cohere's chat path, and only there.
+    let auto = local_limiter(1000, "total_tokens", "ip");
+    let mut chat = post_ctx_with_body(&body);
+    chat.path = "/v1/chat".to_string();
+    assert_continue(auto.before_proxy(&mut chat, &mut json_headers()).await);
+    assert!(has_scoped_meta(&chat, "ai_ratelimit_request"));
+    let mut generic = post_ctx_with_body(&body);
+    generic.path = "/api/contact".to_string();
+    assert_continue(auto.before_proxy(&mut generic, &mut json_headers()).await);
+    assert!(!has_scoped_meta(&generic, "ai_ratelimit_request"));
+}
+
+/// ai_rate_limiter-SOL-4: `response.incomplete` is a TERMINAL Responses event (a
+/// finished response that stopped early) and bills the usage it reports. Under
+/// `warn` it must be charged, not refunded as if usage were missing.
+#[tokio::test]
+async fn a_responses_incomplete_terminal_is_charged_not_refunded() {
+    let incomplete = sse_frame(json!({
+        "type": "response.incomplete",
+        "response": {
+            "id": "resp_1",
+            "object": "response",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 20, "output_tokens": 64, "total_tokens": 84}
+        }
+    }));
+    for (label, buffered) in [("streamed", false), ("buffered", true)] {
+        let plugin = streaming_limiter("warn");
+        let mut ctx = ai_request_ctx(64, "incomplete responses stream");
+        assert_continue(plugin.before_proxy(&mut ctx, &mut HashMap::new()).await);
+        assert!(instance_reserved(&plugin, &ctx) > 0);
+        if buffered {
+            assert_continue(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut sse_headers(), &incomplete)
+                    .await,
+            );
+        } else {
+            drive_stream(
+                &plugin,
+                &mut ctx,
+                200,
+                "text/event-stream",
+                &[&incomplete],
+                BodyOutcome::success(incomplete.len() as u64),
+            )
+            .await;
+        }
+        assert_eq!(
+            observed_usage(&plugin).await,
+            84,
+            "{label}: response.incomplete usage must be charged"
+        );
+    }
+}
+
+/// ai_rate_limiter-MUSE-2: a JSON POST `serde_json` cannot parse (nesting past
+/// its depth limit) that a lenient upstream still serves is an uninspectable
+/// candidate — charged from provider usage, and a usage-less 2xx is refused
+/// under the default policy — never a free call. A leading BOM is ignored.
+#[tokio::test]
+async fn unparseable_json_posts_are_uninspectable_candidates_not_free_calls() {
+    let deep = format!(
+        "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"tools\":{}1{}}}",
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&deep).is_err(),
+        "the fixture must exceed the JSON parser's depth limit"
+    );
+    let plugin = local_limiter(10_000, "total_tokens", "ip");
+
+    let mut metered = post_ctx_with_body(&deep);
+    assert_continue(plugin.before_proxy(&mut metered, &mut json_headers()).await);
+    assert!(has_scoped_meta(&metered, "ai_ratelimit_request"));
+    assert!(has_scoped_meta(
+        &metered,
+        "ai_ratelimit_compressed_ai_request"
+    ));
+    assert_eq!(reserved_tokens(&metered), 0);
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut metered,
+                200,
+                &mut json_headers(),
+                &openai_response(30, 20),
+            )
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&metered, "ai_ratelimit_actual_tokens").map(String::as_str),
+        Some("50")
+    );
+
+    let mut unmetered = post_ctx_with_body(&deep);
+    assert_continue(
+        plugin
+            .before_proxy(&mut unmetered, &mut json_headers())
+            .await,
+    );
+    assert_reject(
+        plugin
+            .on_response_body(&mut unmetered, 200, &mut json_headers(), br#"{"ok":true}"#)
+            .await,
+        Some(502),
+    );
+
+    // Prose under a non-JSON label and an empty JSON body stay out of scope.
+    let mut text_headers = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    let mut prose = post_ctx_with_body("please call me back");
+    assert_continue(plugin.before_proxy(&mut prose, &mut text_headers).await);
+    assert!(!has_scoped_meta(&prose, "ai_ratelimit_request"));
+    let mut empty = post_ctx_with_body("");
+    assert_continue(plugin.before_proxy(&mut empty, &mut json_headers()).await);
+    assert!(!has_scoped_meta(&empty, "ai_ratelimit_request"));
+
+    // A BOM-prefixed chat body is parsed and estimated normally.
+    let bom = format!(
+        "\u{feff}{}",
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    );
+    let mut bom_ctx = post_ctx_with_body(&bom);
+    assert_continue(plugin.before_proxy(&mut bom_ctx, &mut json_headers()).await);
+    assert!(has_scoped_meta(&bom_ctx, "ai_ratelimit_request"));
+    assert!(!has_scoped_meta(
+        &bom_ctx,
+        "ai_ratelimit_compressed_ai_request"
+    ));
+    assert!(reserved_tokens(&bom_ctx) > 0);
+}
+
+/// ai_rate_limiter-MUSE-3: the client-supplied label cannot exempt a call. A
+/// chat body sent as `text/plain`, unlabelled, or under a gRPC-Web label is
+/// buffered, reserved, and metered like `application/json`.
+#[tokio::test]
+async fn mislabelled_ai_bodies_are_buffered_and_reserved() {
+    for label in [Some("text/plain"), None, Some("application/grpc-web+json")] {
+        let plugin = local_limiter(10_000, "total_tokens", "ip");
+        let mut ctx = ai_request_ctx(50, "mislabelled");
+        ctx.headers.remove("content-type");
+        let mut headers = HashMap::new();
+        if let Some(label) = label {
+            ctx.headers
+                .insert("content-type".to_string(), label.to_string());
+            headers.insert("content-type".to_string(), label.to_string());
+        }
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "{label:?} must be buffered"
+        );
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            has_scoped_meta(&ctx, "ai_ratelimit_request"),
+            "{label:?} must be classified from its body"
+        );
+        assert!(instance_reserved(&plugin, &ctx) > 0, "{label:?} reserves");
+    }
+}
+
+/// ai_rate_limiter-MUSE-4: out-of-scope traffic can never be charged, so it
+/// must never be refused by an exhausted budget or an unavailable store.
+#[tokio::test]
+async fn out_of_scope_requests_never_consult_the_budget() {
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 100, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ai = ai_request_ctx(10, "hi");
+    assert_continue(plugin.before_proxy(&mut ai, &mut HashMap::new()).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ai, 200, &mut json_headers(), &openai_response(100, 50))
+            .await,
+    );
+    let (mut probe, mut probe_headers) = budget_probe();
+    assert_reject(
+        plugin.before_proxy(&mut probe, &mut probe_headers).await,
+        Some(429),
+    );
+
+    let mut get = create_test_context();
+    assert_continue(plugin.before_proxy(&mut get, &mut HashMap::new()).await);
+    let mut framed = post_ctx_with_body("\u{0}\u{0}\u{0}\u{0}\u{5}hello");
+    let mut framed_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    )]);
+    assert_continue(plugin.before_proxy(&mut framed, &mut framed_headers).await);
+    let mut order = post_ctx_with_body(&json!({"order_id": 42}).to_string());
+    assert_continue(plugin.before_proxy(&mut order, &mut json_headers()).await);
+
+    // A centralized outage refuses AI admission, never out-of-scope traffic.
+    let centralized = AiRateLimiter::new(
+        &unreachable_redis_ai_config(None),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut get = create_test_context();
+    assert_continue(
+        centralized
+            .before_proxy(&mut get, &mut HashMap::new())
+            .await,
+    );
+    let mut order = post_ctx_with_body(&json!({"order_id": 42}).to_string());
+    assert_continue(
+        centralized
+            .before_proxy(&mut order, &mut json_headers())
+            .await,
+    );
+    let (mut probe, mut probe_headers) = budget_probe();
+    assert_generic_enforcement_unavailable(
+        centralized
+            .before_proxy(&mut probe, &mut probe_headers)
+            .await,
+    );
+}
+
+/// ai_rate_limiter-MUSE-5: embedding and predict surfaces of supported
+/// providers are AI calls, and Cohere Embed's billed units are its usage.
+#[tokio::test]
+async fn embedding_and_predict_surfaces_are_metered() {
+    let plugin = local_limiter(10_000, "total_tokens", "ip");
+    let mut embed = post_ctx_with_body(
+        &json!({
+            "model": "embed-english-v3.0",
+            "texts": ["alpha", "beta"],
+            "input_type": "search_document"
+        })
+        .to_string(),
+    );
+    assert_continue(plugin.before_proxy(&mut embed, &mut json_headers()).await);
+    assert!(has_scoped_meta(&embed, "ai_ratelimit_request"));
+    let reply = serde_json::to_vec(&json!({
+        "id": "emb-1",
+        "embeddings": [[0.1, 0.2], [0.3, 0.4]],
+        "texts": ["alpha", "beta"],
+        "meta": {"api_version": {"version": "1"}, "billed_units": {"input_tokens": 12}}
+    }))
+    .unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut embed, 200, &mut json_headers(), &reply)
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&embed, "ai_ratelimit_actual_tokens").map(String::as_str),
+        Some("12")
+    );
+
+    for (body, is_ai) in [
+        (json!({"content": {"parts": [{"text": "hello"}]}}), true),
+        (
+            json!({"requests": [{"model": "models/text-embedding-004", "content": {"parts": [{"text": "a"}]}}]}),
+            true,
+        ),
+        (json!({"instances": [{"content": "hello"}]}), true),
+        (json!({"instances": [{"prompt": "hello"}]}), true),
+        (json!({"instances": [[1.0, 2.0]]}), false),
+        (json!({"content": "plain document"}), false),
+    ] {
+        let mut ctx = post_ctx_with_body(&body.to_string());
+        assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+        assert_eq!(
+            has_scoped_meta(&ctx, "ai_ratelimit_request"),
+            is_ai,
+            "classification of {body}"
+        );
+    }
+}
+
+/// ai_rate_limiter-MUSE-6: wide scripts reserve at least a token per CJK
+/// scalar, and recognized media parts reserve `media_token_estimate` each.
+#[tokio::test]
+async fn estimates_are_script_aware_and_reserve_media() {
+    let chat =
+        |content: String| json!({"model": "m", "messages": [{"role": "user", "content": content}]});
+    let ascii = prompt_tokens_reserved(chat("a".repeat(200))).await;
+    let cjk = prompt_tokens_reserved(chat("你".repeat(200))).await;
+    assert_eq!(
+        cjk - ascii,
+        150,
+        "200 CJK scalars reserve 200 tokens where 200 ASCII characters reserve 50"
+    );
+
+    let vision = json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+        ]}]
+    });
+    let mut reserved = Vec::new();
+    for media_token_estimate in [0_u64, 500] {
+        let plugin = AiRateLimiter::new(
+            &json!({
+                "token_limit": 1_000_000,
+                "count_mode": "prompt_tokens",
+                "limit_by": "ip",
+                "media_token_estimate": media_token_estimate
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let mut ctx = post_ctx_with_body(&vision.to_string());
+        assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+        reserved.push(instance_reserved(&plugin, &ctx));
+    }
+    assert_eq!(
+        reserved[1] - reserved[0],
+        1000,
+        "two image parts reserve 500 tokens each"
+    );
+}
+
+/// ai_rate_limiter-MUSE-7: a listed consumer is enforced against its own
+/// ceiling; everyone else keeps the default.
+#[tokio::test]
+async fn consumer_limits_override_the_default_ceiling() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "consumer",
+            "consumer_limits": {"testuser": 50},
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = ai_request_ctx(10, "hi");
+    assert_continue(plugin.before_proxy(&mut ctx, &mut HashMap::new()).await);
+    assert_eq!(
+        scoped_meta(&ctx, "ai_ratelimit_limit").map(String::as_str),
+        Some("50")
+    );
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &openai_response(30, 20))
+            .await,
+    );
+
+    let (mut probe, mut probe_headers) = budget_probe();
+    match plugin.before_proxy(&mut probe, &mut probe_headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert!(body.contains("exceeds limit 50"), "{body}");
+        }
+        other => panic!("the overridden consumer must be refused, got {other:?}"),
+    }
+
+    // An unlisted caller (here keyed by IP) keeps the default ceiling.
+    let (mut other, mut other_headers) = budget_probe();
+    other.identified_consumer = None;
+    other.authenticated_identity = None;
+    assert_continue(plugin.before_proxy(&mut other, &mut other_headers).await);
+    assert_eq!(
+        scoped_meta(&other, "ai_ratelimit_limit").map(String::as_str),
+        Some("1000")
+    );
+
+    assert!(
+        AiRateLimiter::new(
+            &json!({"token_limit": 1000, "limit_by": "ip", "consumer_limits": {"testuser": 50}}),
+            PluginHttpClient::default(),
+        )
+        .is_err(),
+        "consumer_limits requires limit_by: consumer"
+    );
+}
+
+/// ai_rate_limiter-MUSE-7: a listed model has its own window and ceiling and
+/// never consumes the default budget.
+#[tokio::test]
+async fn model_limits_give_a_model_its_own_budget_window() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "model_limits": {"o1": 100},
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let o1_body = json!({
+        "model": "o1",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 10
+    })
+    .to_string();
+
+    let mut o1 = post_ctx_with_body(&o1_body);
+    assert_continue(plugin.before_proxy(&mut o1, &mut json_headers()).await);
+    assert_eq!(
+        scoped_meta(&o1, "ai_ratelimit_budget_model").map(String::as_str),
+        Some("o1")
+    );
+    assert_eq!(
+        scoped_meta(&o1, "ai_ratelimit_limit").map(String::as_str),
+        Some("100")
+    );
+    assert_continue(
+        plugin
+            .on_response_body(&mut o1, 200, &mut json_headers(), &openai_response(80, 40))
+            .await,
+    );
+
+    let mut o1_again = post_ctx_with_body(&o1_body);
+    assert_reject(
+        plugin
+            .before_proxy(&mut o1_again, &mut json_headers())
+            .await,
+        Some(429),
+    );
+
+    // Another model is charged against the untouched default window.
+    let mut other = ai_request_ctx(10, "hi");
+    assert_continue(plugin.before_proxy(&mut other, &mut HashMap::new()).await);
+    assert_eq!(
+        scoped_meta(&other, "ai_ratelimit_limit").map(String::as_str),
+        Some("100000")
+    );
+    assert!(!has_scoped_meta(&other, "ai_ratelimit_budget_model"));
+    assert_eq!(
+        scoped_meta(&other, "ai_ratelimit_usage"),
+        scoped_meta(&other, "ai_ratelimit_reserved_tokens"),
+        "the default window holds only this call's reservation, not o1's 120 tokens"
+    );
+}
+
+/// ai_rate_limiter-MUSE-8: budget refusals carry `Retry-After` whether or not
+/// telemetry headers are exposed.
+#[tokio::test]
+async fn budget_refusals_carry_retry_after() {
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 100, "window_seconds": 30, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = ai_request_ctx(10, "hi");
+    assert_continue(plugin.before_proxy(&mut ctx, &mut HashMap::new()).await);
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut json_headers(),
+                &openai_response(100, 50),
+            )
+            .await,
+    );
+    let (mut probe, mut probe_headers) = budget_probe();
+    match plugin.before_proxy(&mut probe, &mut probe_headers).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(headers.get("retry-after").map(String::as_str), Some("30"));
+            assert!(
+                !headers.contains_key("x-ai-ratelimit-limit"),
+                "telemetry stays opt-in"
+            );
+        }
+        other => panic!("expected a budget refusal, got {other:?}"),
+    }
+}
+
+// ─── PR #6847 review round 1 (PR6847-SOL-1..5) ───────────────────────────
+
+/// A JSON chat document nested past `serde_json`'s depth limit.
+fn too_deep_chat_body(model: &str) -> String {
+    format!(
+        "{{\"model\":\"{model}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}],\"tools\":{}1{}}}",
+        "[".repeat(200),
+        "]".repeat(200)
+    )
+}
+
+fn model_budget_limiter() -> AiRateLimiter {
+    AiRateLimiter::new(
+        &json!({
+            "token_limit": 100_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "model_limits": {"o1": 100},
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+fn chat_body(model: &str) -> String {
+    json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 10
+    })
+    .to_string()
+}
+
+/// PR6847-SOL-1: a gRPC-Web label is non-AI only when the body really is a
+/// frame. An unparseable body that begins like a JSON object stays an
+/// uninspectable candidate under that label too.
+#[tokio::test]
+async fn an_unparseable_json_object_under_a_grpc_web_label_is_a_candidate() {
+    let plugin = local_limiter(10_000, "total_tokens", "ip");
+    let deep = too_deep_chat_body("m");
+    let mut headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web+json".to_string(),
+    )]);
+    let mut ctx = post_ctx_with_body(&deep);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
+    assert!(has_scoped_meta(&ctx, "ai_ratelimit_compressed_ai_request"));
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), br#"{"ok":true}"#)
+            .await,
+        Some(502),
+    );
+
+    // A genuine frame under the same label stays out of scope.
+    let mut frame = post_ctx_with_body("\u{0}\u{0}\u{0}\u{0}\u{7}{\"a\":1}");
+    assert_continue(plugin.before_proxy(&mut frame, &mut headers).await);
+    assert!(!has_scoped_meta(&frame, "ai_ratelimit_request"));
+}
+
+/// PR6847-SOL-2: each listed model owns an independent window, so with
+/// `model_limits` a candidate whose model cannot be read is refused rather
+/// than admitted against any single window — here model `b` is exhausted
+/// while the smaller `a` window is still empty.
+#[tokio::test]
+async fn uninspectable_candidates_cannot_escape_a_model_budget() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 100_000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "model_limits": {"a": 100, "b": 200}
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut b = post_ctx_with_body(&chat_body("b"));
+    assert_continue(plugin.before_proxy(&mut b, &mut json_headers()).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut b, 200, &mut json_headers(), &openai_response(150, 50))
+            .await,
+    );
+    let mut b_again = post_ctx_with_body(&chat_body("b"));
+    assert_reject(
+        plugin.before_proxy(&mut b_again, &mut json_headers()).await,
+        Some(429),
+    );
+
+    // A still-compressed call (to `b`, unknowably) is refused with 415.
+    let (mut compressed, mut gzip_headers) = budget_probe();
+    match plugin
+        .before_proxy(&mut compressed, &mut gzip_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 415);
+            assert_eq!(
+                headers.get("accept-encoding").map(String::as_str),
+                Some("identity")
+            );
+        }
+        other => panic!("an unknown-model compressed call must be refused, got {other:?}"),
+    }
+    assert!(!has_scoped_meta(&compressed, "ai_ratelimit_request"));
+
+    // An unparseable body is refused with 400.
+    let mut deep = post_ctx_with_body(&too_deep_chat_body("b"));
+    assert_reject(
+        plugin.before_proxy(&mut deep, &mut json_headers()).await,
+        Some(400),
+    );
+
+    // Without model budgets the same candidate is admitted as before.
+    let plain = local_limiter(10_000, "total_tokens", "ip");
+    let (mut compressed, mut gzip_headers) = budget_probe();
+    assert_continue(plain.before_proxy(&mut compressed, &mut gzip_headers).await);
+    assert!(has_scoped_meta(&compressed, "ai_ratelimit_request"));
+}
+
+/// PR6847-SOL-2: the decoded fallback is attributed to the model its final
+/// plaintext names and checked against that model's window; a plaintext that
+/// still cannot be read is refused.
+#[tokio::test]
+async fn the_decoded_fallback_attributes_its_real_model() {
+    let plugin = model_budget_limiter();
+    let deferred = || {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.metadata.insert(
+            "compression:request_encoding".to_string(),
+            "gzip".to_string(),
+        );
+        ctx
+    };
+    for (model, expected) in [("cheap", None), ("o1", Some("o1"))] {
+        let mut ctx = deferred();
+        let mut headers = json_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(has_scoped_meta(
+            &ctx,
+            "ai_ratelimit_deferred_compressed_classify"
+        ));
+        assert!(!has_scoped_meta(&ctx, "ai_ratelimit_budget_model"));
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, chat_body(model).as_bytes())
+                .await,
+        );
+        assert!(has_scoped_meta(&ctx, "ai_ratelimit_request"));
+        assert_eq!(
+            scoped_meta(&ctx, "ai_ratelimit_budget_model").map(String::as_str),
+            expected,
+            "{model}: the decoded body's model decides the budget"
+        );
+        if model == "o1" {
+            assert_continue(
+                plugin
+                    .on_response_body(&mut ctx, 200, &mut json_headers(), &openai_response(80, 40))
+                    .await,
+            );
+        }
+    }
+
+    // o1 is now exhausted: a decoded o1 call is refused on o1's window.
+    let mut ctx = deferred();
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, chat_body("o1").as_bytes())
+            .await,
+        Some(429),
+    );
+
+    // A decoded plaintext that does not parse cannot name its model.
+    let mut ctx = deferred();
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                too_deep_chat_body("o1").as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+}
+
+/// PR6847-SOL-3 (round 2): a transform that rewrites an admitted call into a
+/// body the gateway cannot parse may now name any model, so it is refused —
+/// and the gateway rejection releases the admitted reservation.
+#[tokio::test]
+async fn an_admitted_call_rewritten_into_an_unparseable_body_is_refused() {
+    let plugin = model_budget_limiter();
+    let cheap = chat_body("cheap");
+
+    let mut ctx = post_ctx_with_body(&cheap);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    let reservation = reserved_tokens(&ctx);
+    assert!(reservation > 0);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &json_headers(),
+                too_deep_chat_body("o1").as_bytes(),
+            )
+            .await,
+        Some(400),
+    );
+    // The proxy replays the rejection through `after_proxy`, which releases.
+    ctx.metadata
+        .insert("ferrum:rejection_response".to_string(), "true".to_string());
+    assert_continue(plugin.after_proxy(&mut ctx, 400, &mut HashMap::new()).await);
+
+    let mut next = post_ctx_with_body(&cheap);
+    assert_continue(plugin.before_proxy(&mut next, &mut json_headers()).await);
+    assert_eq!(
+        scoped_meta(&next, "ai_ratelimit_usage").map(String::as_str),
+        Some(reservation.to_string().as_str()),
+        "the refused call's reservation was released"
+    );
+}
+
+/// PR6847-SOL-3: a transform that changes `model` moves the reservation to
+/// the final model's budget, and is refused when that window is exhausted.
+#[tokio::test]
+async fn a_model_rewrite_is_charged_to_the_final_models_budget() {
+    let plugin = model_budget_limiter();
+    let cheap = chat_body("cheap");
+    let o1 = chat_body("o1");
+
+    let mut ctx = post_ctx_with_body(&cheap);
+    assert_continue(plugin.before_proxy(&mut ctx, &mut json_headers()).await);
+    assert!(!has_scoped_meta(&ctx, "ai_ratelimit_budget_model"));
+    let default_reservation = reserved_tokens(&ctx);
+    assert!(default_reservation > 0);
+
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), o1.as_bytes())
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&ctx, "ai_ratelimit_budget_model").map(String::as_str),
+        Some("o1")
+    );
+    assert_eq!(
+        scoped_meta(&ctx, "ai_ratelimit_limit").map(String::as_str),
+        Some("100")
+    );
+    assert!(reserved_tokens(&ctx) > 0);
+
+    // The default window no longer holds the moved reservation: a new cheap
+    // call sees only its own reservation there.
+    let mut next = post_ctx_with_body(&cheap);
+    assert_continue(plugin.before_proxy(&mut next, &mut json_headers()).await);
+    assert_eq!(
+        scoped_meta(&next, "ai_ratelimit_usage").map(String::as_str),
+        Some(default_reservation.to_string().as_str())
+    );
+
+    // The provider's usage is charged to o1's window...
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &openai_response(80, 40))
+            .await,
+    );
+    // ...so the next rewrite into o1 is refused.
+    let mut again = post_ctx_with_body(&cheap);
+    assert_continue(plugin.before_proxy(&mut again, &mut json_headers()).await);
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut again, &json_headers(), o1.as_bytes())
+            .await,
+        Some(429),
+    );
+}
+
+/// PR6847-SOL-4: a transform that creates an AI request the gateway cannot
+/// parse enters the fail-closed candidate lifecycle, as at `before_proxy`.
+#[tokio::test]
+async fn an_unparseable_transformed_body_is_an_uninspectable_candidate() {
+    let plugin = local_limiter(10_000, "total_tokens", "ip");
+    let inbound = json!({"model": "m", "user_text": "hi"}).to_string();
+    let transformed = too_deep_chat_body("m");
+
+    let mut metered = post_ctx_with_body(&inbound);
+    assert_continue(plugin.before_proxy(&mut metered, &mut json_headers()).await);
+    assert!(!has_scoped_meta(&metered, "ai_ratelimit_request"));
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut metered,
+                &json_headers(),
+                transformed.as_bytes(),
+            )
+            .await,
+    );
+    assert!(has_scoped_meta(&metered, "ai_ratelimit_request"));
+    assert!(has_scoped_meta(
+        &metered,
+        "ai_ratelimit_compressed_ai_request"
+    ));
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut metered,
+                200,
+                &mut json_headers(),
+                &openai_response(30, 20),
+            )
+            .await,
+    );
+    assert_eq!(
+        scoped_meta(&metered, "ai_ratelimit_actual_tokens").map(String::as_str),
+        Some("50")
+    );
+
+    let mut unmetered = post_ctx_with_body(&inbound);
+    assert_continue(
+        plugin
+            .before_proxy(&mut unmetered, &mut json_headers())
+            .await,
+    );
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut unmetered,
+                &json_headers(),
+                transformed.as_bytes(),
+            )
+            .await,
+    );
+    assert_reject(
+        plugin
+            .on_response_body(&mut unmetered, 200, &mut json_headers(), br#"{"ok":true}"#)
+            .await,
+        Some(502),
+    );
+}
+
+/// PR6847-SOL-5: a `GET` never consults the budget, even when another plugin
+/// staged an AI-shaped body for it.
+#[tokio::test]
+async fn a_body_bearing_get_never_consults_the_budget() {
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 100, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ai = ai_request_ctx(10, "hi");
+    assert_continue(plugin.before_proxy(&mut ai, &mut HashMap::new()).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ai, 200, &mut json_headers(), &openai_response(100, 50))
+            .await,
+    );
+
+    let staged_get = || {
+        let mut ctx = create_test_context();
+        ctx.metadata
+            .insert("request_body".to_string(), chat_body("gpt-4o-mini"));
+        ctx
+    };
+    let mut get = staged_get();
+    assert_continue(plugin.before_proxy(&mut get, &mut json_headers()).await);
+    assert!(!has_scoped_meta(&get, "ai_ratelimit_request"));
+
+    let centralized = AiRateLimiter::new(
+        &unreachable_redis_ai_config(None),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut get = staged_get();
+    assert_continue(
+        centralized
+            .before_proxy(&mut get, &mut json_headers())
+            .await,
+    );
+    assert!(!has_scoped_meta(&get, "ai_ratelimit_request"));
 }

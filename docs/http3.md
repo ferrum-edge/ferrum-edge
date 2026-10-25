@@ -962,7 +962,12 @@ This means every WebSocket plugin works on H3 sessions unchanged:
   by the shared relay. The bridge relays client bytes verbatim, so fragment
   accounting sees exactly the same frame sequence on H1, H2, and H3
 - `on_ws_disconnect` (end-of-session bookkeeping with success-only frame/byte
-  counts, direction, and `io_side` attribution)
+  counts, direction, and `io_side` attribution). Because the H3 framer writes
+  into the in-process bridge, the shared relay settles the send pump before
+  firing this hook: a QUIC DATA/FIN failure toward the client after the framer
+  accepted the final Close (for example a client `STOP_SENDING`) is attributed
+  as `BackendToClient` + `write`, and an expired pump drain grace as
+  `read_write_timeout`, instead of a clean close
 - `prometheus_metrics` WebSocket session count/duration and directional
   byte/frame totals (the shared disconnect hook gives H1 Upgrade, H2 Extended
   CONNECT, and H3 Extended CONNECT identical completion accounting)
@@ -1052,7 +1057,10 @@ The recv pump (QUIC → WS framer) is `abort()`ed after
 `run_websocket_proxy` returns, before joining. The send pump (WS framer
 → QUIC) is awaited normally — it exits on EOF when the framer drops
 its sink half, and the await ensures `finish()` runs so the peer sees
-a clean FIN. Aborting the recv pump prevents a non-cooperative client
+a clean FIN. On the framed relay path the shared relay drops its client
+framer and awaits the pump itself (bounded by the 30 s pump drain grace)
+before `on_ws_disconnect`, recording the pump's first DATA/FIN failure when
+the relay recorded none; the frontend's later wait is then a no-op. Aborting the recv pump prevents a non-cooperative client
 (one that exchanges close frames without closing the QUIC stream) from
 pinning the recv task for the QUIC idle-timeout window.
 

@@ -353,6 +353,7 @@ async fn udp_capacity_deny_preserves_existing_client_budgets() {
             payload: &[],
             payload_kind: StreamBytesKind::PlaintextWire,
             metadata_sink: None,
+            admission_datagram: false,
         };
         assert_eq!(
             plugin.on_udp_datagram(&ctx).await,

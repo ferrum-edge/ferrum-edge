@@ -6,7 +6,8 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::HttpFlavor;
 use ferrum_edge::plugins::transaction_debugger::{
     BODY_BINARY_MARKER, BODY_MALFORMED_MARKER, BODY_OVER_LIMIT_MARKER, BodyKind,
-    DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, MAX_RENDERED_BODY_BYTES,
+    DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, MAX_PREFIX_SOURCE_BYTES,
+    MAX_RENDERED_BODY_BYTES,
 };
 use ferrum_edge::plugins::{
     Direction, DisconnectCause, Plugin, ProxyProtocol, RequestContext, StreamTransactionSummary,
@@ -1697,7 +1698,9 @@ async fn test_final_response_hook_fails_closed_on_transformation_length_drift() 
     assert!(!logs.contains("resp-secret"), "secret leaked: {logs}");
     assert!(!logs.contains("zzzz"), "body content leaked: {logs}");
 
-    // A body that actually fits is still captured on the same path.
+    // A body that actually fits is still captured on the same path. A new
+    // request: each direction of one request emits exactly one record.
+    let mut ctx = make_ctx();
     let small = br#"{"detail":"ok"}"#;
     let logs = capture_debug_logs_during(|| async {
         let _ = plugin
@@ -2480,4 +2483,912 @@ fn test_text_body_quoted_field_names_are_classified_whole() {
         "{}",
         text.rendered
     );
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes
+// ---------------------------------------------------------------------------
+
+/// HS256 JWT whose protected header is `{ "alg": "HS256" }` (RFC 7515 permits
+/// the whitespace), so it encodes as `eyAi…` rather than `eyJ…`.
+const WHITESPACE_HEADER_JWT: &str = "eyAiYWxnIjogIkhTMjU2IiB9.eyAic3ViIjogImFsaWNlIiwgImV4cCI6IDIwMDAwMDAwMDAgfQ.bm90LWEtcmVhbC1zaWduYXR1cmUtYnV0LXNoYXBlZC1saWtlLW9uZQ";
+/// JWS whose protected header starts `{\n` (`ewo…`).
+const NEWLINE_HEADER_JWT: &str = "ewogICJhbGciOiAiRVMyNTYiCn0.eyAic3ViIjogImJvYiIgfQ.c2lnbmF0dXJl";
+
+#[test]
+fn test_jwt_with_whitespace_in_protected_header_is_redacted_everywhere() {
+    let plugin = capture_plugin();
+    for token in [WHITESPACE_HEADER_JWT, NEWLINE_HEADER_JWT] {
+        assert!(
+            !token.contains("eyJ"),
+            "fixture must avoid the literal prefix"
+        );
+        let signature = token.rsplit('.').next().unwrap();
+
+        let json_body = serde_json::to_vec(&json!({"note": token})).unwrap();
+        let json = plugin.render_captured_body(&json_body, BodyKind::Json, 512);
+        assert!(!json.rendered.contains(signature), "{}", json.rendered);
+        assert!(
+            json.rendered.contains("***REDACTED***"),
+            "{}",
+            json.rendered
+        );
+
+        let form_body = format!("note={token}&keep=yes");
+        let form = plugin.render_captured_body(form_body.as_bytes(), BodyKind::Form, 512);
+        assert!(!form.rendered.contains(signature), "{}", form.rendered);
+        assert!(form.rendered.contains("keep=yes"), "{}", form.rendered);
+
+        let text_body = format!("line one is fine\n{token}\nline three is fine");
+        let text = plugin.render_captured_body(text_body.as_bytes(), BodyKind::Text, 512);
+        assert!(!text.rendered.contains(signature), "{}", text.rendered);
+        assert!(
+            text.rendered.contains("line one is fine"),
+            "{}",
+            text.rendered
+        );
+        assert!(
+            text.rendered.contains("line three is fine"),
+            "{}",
+            text.rendered
+        );
+    }
+}
+
+#[test]
+fn test_dotted_values_that_are_not_compact_jose_stay_visible() {
+    let plugin = capture_plugin();
+    let body = serde_json::to_vec(&json!({
+        "host": "api.eu-west-1.example.com",
+        "version": "1.2.3.4",
+        "empty_objects": "e30.e30.e30",
+    }))
+    .unwrap();
+    let rendered = plugin.render_captured_body(&body, BodyKind::Json, 512);
+    assert_eq!(rendered.state, "captured");
+    for visible in ["api.eu-west-1.example.com", "1.2.3.4", "e30.e30.e30"] {
+        assert!(
+            rendered.rendered.contains(visible),
+            "{visible} over-redacted: {}",
+            rendered.rendered
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_pre_header_client_abort_is_classified_client_disconnected_everywhere() {
+    // The shared pre-header cancellation terminal: status 499, the flag, and
+    // the `ClientDisconnect` class together.
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 499;
+    summary.client_disconnected = true;
+    summary.error_class = Some(ErrorClass::ClientDisconnect);
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "client_disconnected"
+    );
+    let projected = projected_http(json!({"schema": {}}), &summary);
+    assert_eq!(projected["outcome"], json!("client_disconnected"));
+
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
+    let logs = capture_debug_logs_during(|| async { plugin.log(&summary).await }).await;
+    assert!(logs.contains("outcome=client_disconnected"), "got: {logs}");
+
+    // The class alone (a gateway deadline or authorization terminal) is not a
+    // proven client abort.
+    summary.client_disconnected = false;
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "dispatch_error"
+    );
+    // A genuine transport failure still wins over a later disconnect.
+    summary.client_disconnected = true;
+    summary.error_class = Some(ErrorClass::ConnectionRefused);
+    assert_eq!(
+        TransactionDebugger::classify_http_outcome(&summary),
+        "dispatch_error"
+    );
+}
+
+const AWS_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+const GITHUB_TOKEN: &str = "ghp_0123456789abcdefghijABCDEFGHIJklmnop";
+const LLM_API_KEY: &str = "sk-proj-0123456789abcdefghijABCDEFGHIJ";
+const SLACK_TOKEN: &str = "xoxb-1234567890-abcdefghij";
+
+#[test]
+fn test_provider_and_private_key_value_shapes_are_redacted_in_bodies() {
+    let plugin = capture_plugin();
+    let json_body = serde_json::to_vec(&json!({
+        "note": AWS_ACCESS_KEY,
+        "repo": GITHUB_TOKEN,
+        "llm": format!("configured with {LLM_API_KEY}"),
+        "chat": SLACK_TOKEN,
+        "pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAsecretpem\n-----END RSA PRIVATE KEY-----",
+        "word": "task-0123456789abcdefghijklmnopqrstuvwxyz",
+        "short": "AKIAshort",
+        "keep": "visible",
+    }))
+    .unwrap();
+    let json = plugin.render_captured_body(&json_body, BodyKind::Json, 1024);
+    for secret in [
+        AWS_ACCESS_KEY,
+        GITHUB_TOKEN,
+        LLM_API_KEY,
+        SLACK_TOKEN,
+        "secretpem",
+    ] {
+        assert!(
+            !json.rendered.contains(secret),
+            "{secret}: {}",
+            json.rendered
+        );
+    }
+    for visible in [
+        "visible",
+        "task-0123456789abcdefghijklmnopqrstuvwxyz",
+        "AKIAshort",
+    ] {
+        assert!(
+            json.rendered.contains(visible),
+            "{visible}: {}",
+            json.rendered
+        );
+    }
+
+    let form_body = format!("note={AWS_ACCESS_KEY}&keep=visible");
+    let form = plugin.render_captured_body(form_body.as_bytes(), BodyKind::Form, 512);
+    assert!(!form.rendered.contains(AWS_ACCESS_KEY), "{}", form.rendered);
+    assert!(form.rendered.contains("keep=visible"), "{}", form.rendered);
+
+    // The base64 lines of a PEM block carry no marker of their own.
+    let text_body = "intro is fine\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEF\nBKcwggSjAgEAAoIBAQC7pemline\n-----END PRIVATE KEY-----\noutro is fine";
+    let text = plugin.render_captured_body(text_body.as_bytes(), BodyKind::Text, 512);
+    for secret in [
+        "MIIEvQIBADANBgkqhkiG9w0BAQEF",
+        "BKcwggSjAgEAAoIBAQC7pemline",
+    ] {
+        assert!(
+            !text.rendered.contains(secret),
+            "{secret}: {}",
+            text.rendered
+        );
+    }
+    assert!(text.rendered.contains("intro is fine"), "{}", text.rendered);
+    assert!(text.rendered.contains("outro is fine"), "{}", text.rendered);
+
+    // An unterminated block redacts through the end of the text.
+    let unterminated = "intro is fine\n-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIunterminated";
+    let text = plugin.render_captured_body(unterminated.as_bytes(), BodyKind::Text, 512);
+    assert!(
+        !text.rendered.contains("MHcCAQEEIunterminated"),
+        "{}",
+        text.rendered
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_credential_shaped_header_values_are_redacted_under_any_header_name() {
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "x-forwarded-note".to_string(),
+        format!("token {GITHUB_TOKEN}"),
+    );
+    ctx.headers.insert(
+        "x-trace-copy".to_string(),
+        WHITESPACE_HEADER_JWT.to_string(),
+    );
+    ctx.headers.insert(
+        "x-safe-header".to_string(),
+        "safe-request-value".to_string(),
+    );
+    let mut response_headers = HashMap::from([
+        (
+            "location".to_string(),
+            format!(
+                "https://bucket.s3.amazonaws.com/obj?X-Amz-Credential={AWS_ACCESS_KEY}%2F20261024%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=abc"
+            ),
+        ),
+        (
+            "x-safe-response".to_string(),
+            "safe-response-value".to_string(),
+        ),
+    ]);
+
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut ctx).await;
+        let _ = plugin
+            .after_proxy(&mut ctx, 302, &mut response_headers)
+            .await;
+    })
+    .await;
+    for secret in [
+        GITHUB_TOKEN,
+        AWS_ACCESS_KEY,
+        "bm90LWEtcmVhbC1zaWduYXR1cmUtYnV0LXNoYXBlZC1saWtlLW9uZQ",
+    ] {
+        assert!(!logs.contains(secret), "leaked {secret}: {logs}");
+    }
+    assert!(logs.contains("safe-request-value"), "got: {logs}");
+    assert!(logs.contains("safe-response-value"), "got: {logs}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_response_decision_flip_to_skip_still_emits_exactly_one_record() {
+    let plugin = TransactionDebugger::new(&json!({
+        "log_response_body": true,
+        "max_response_body_bytes": 128,
+    }))
+    .unwrap();
+
+    // `after_proxy` admits a 96-byte JSON response; a response transform then
+    // grows it and the proxy syncs `Content-Length` before the final hook.
+    let mut ctx = make_ctx();
+    let mut admitted = body_headers("application/json", 96);
+    let synced = body_headers("application/json", 2048);
+    let body = format!(
+        r#"{{"api_key":"resp-secret","detail":"{}"}}"#,
+        "z".repeat(2000)
+    );
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.after_proxy(&mut ctx, 200, &mut admitted).await;
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &synced, body.as_bytes())
+            .await;
+    })
+    .await;
+    assert_eq!(
+        logs.matches("Bounded body capture").count(),
+        1,
+        "exactly one record: {logs}"
+    );
+    assert!(logs.contains("reason=over_capture_limit"), "got: {logs}");
+    assert!(!logs.contains("resp-secret"), "secret leaked: {logs}");
+
+    // A transform that empties the body and syncs `Content-Length: 0`.
+    let mut ctx = make_ctx();
+    let mut admitted = body_headers("application/json", 96);
+    let emptied = body_headers("application/json", 0);
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.after_proxy(&mut ctx, 200, &mut admitted).await;
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &emptied, b"")
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("reason=empty_body"), "got: {logs}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_header_phase_omission_suppresses_a_later_final_body_record() {
+    let plugin = capture_plugin();
+    let small_headers = body_headers("application/json", 15);
+    let small = br#"{"detail":"ok"}"#;
+
+    // Response: header phase omits, a transform relabels the body capturable.
+    let mut ctx = make_ctx();
+    let mut declared_large = body_headers("application/json", 4096);
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.after_proxy(&mut ctx, 200, &mut declared_large).await;
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &small_headers, small)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("reason=over_capture_limit"), "got: {logs}");
+    assert!(!logs.contains("capture=captured"), "got: {logs}");
+
+    // A re-invoked final hook (legacy re-decision sweep) stays idempotent.
+    let mut ctx = make_ctx();
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &small_headers, small)
+            .await;
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &small_headers, small)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+
+    // Request: header phase omits, the final hook would otherwise capture.
+    let mut ctx = make_ctx();
+    let mut declared_large = body_headers("application/json", 4096);
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.before_proxy(&mut ctx, &mut declared_large).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &small_headers, small)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("reason=over_capture_limit"), "got: {logs}");
+
+    // Request: header phase admits, a transform grows the body.
+    let mut ctx = make_ctx();
+    let mut admitted = body_headers("application/json", 32);
+    let grown = body_headers("application/json", 4096);
+    let big = format!(r#"{{"password":"hunter2","pad":"{}"}}"#, "q".repeat(4000));
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.before_proxy(&mut ctx, &mut admitted).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &grown, big.as_bytes())
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("reason=over_capture_limit"), "got: {logs}");
+    assert!(!logs.contains("hunter2"), "got: {logs}");
+
+    // Sibling instances keep independent record state on one request.
+    let sibling = capture_plugin();
+    let mut ctx = make_ctx();
+    let mut declared_large = body_headers("application/json", 4096);
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.after_proxy(&mut ctx, 200, &mut declared_large).await;
+        let _ = sibling
+            .after_proxy(&mut ctx, 200, &mut declared_large)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 2, "{logs}");
+}
+
+fn targeted_plugin(extra: serde_json::Value) -> TransactionDebugger {
+    let mut config = json!({
+        "log_request_body": true,
+        "log_response_body": true,
+        "max_request_body_bytes": 512,
+        "max_response_body_bytes": 512,
+    });
+    for (key, value) in extra.as_object().expect("extra config object") {
+        config[key.as_str()] = value.clone();
+    }
+    TransactionDebugger::new(&config).expect("targeted config is valid")
+}
+
+fn capturable_ctx() -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-length".to_string(), "16".to_string());
+    ctx
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_capture_request_header_selects_which_requests_are_captured() {
+    let plugin = targeted_plugin(json!({
+        "capture_request_header": "X-Debug-Capture",
+        "capture_request_header_value": "incident-42",
+    }));
+    let unselected = capturable_ctx();
+    let mut wrong_value = capturable_ctx();
+    wrong_value
+        .headers
+        .insert("x-debug-capture".to_string(), "incident-7".to_string());
+    let mut selected = capturable_ctx();
+    selected
+        .headers
+        .insert("x-debug-capture".to_string(), "incident-42".to_string());
+    with_debug_target(|| {
+        assert!(!plugin.should_buffer_request_body(&unselected));
+        assert!(!plugin.should_buffer_response_body(&unselected));
+        assert!(!plugin.should_buffer_request_body(&wrong_value));
+        assert!(!plugin.should_buffer_response_body(&wrong_value));
+        assert!(plugin.should_buffer_request_body(&selected));
+        assert!(plugin.should_buffer_response_body(&selected));
+    });
+
+    // A request outside the target reports a content-free omission, even when
+    // another plugin buffered its body.
+    let mut ctx = capturable_ctx();
+    let headers = body_headers("application/json", 16);
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, br#"{"user":"alice"}"#)
+            .await;
+    })
+    .await;
+    assert!(logs.contains("reason=not_selected"), "got: {logs}");
+    assert!(!logs.contains("alice"), "unselected body rendered: {logs}");
+
+    // The context-free hook cannot judge targeting, so it captures nothing.
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin
+            .on_final_request_body(&headers, br#"{"user":"alice"}"#)
+            .await;
+    })
+    .await;
+    assert!(logs.is_empty(), "got: {logs}");
+
+    // The selector value is an operator token and never reaches the dump.
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut selected).await;
+    })
+    .await;
+    assert!(logs.contains("Incoming request"), "got: {logs}");
+    assert!(!logs.contains("incident-42"), "selector leaked: {logs}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_capture_expires_at_switches_capture_off_by_receive_time() {
+    let expired = targeted_plugin(json!({"capture_expires_at": "2000-01-01T00:00:00Z"}));
+    let live = targeted_plugin(json!({"capture_expires_at": "2999-01-01T00:00:00+00:00"}));
+    let ctx = capturable_ctx();
+    with_debug_target(|| {
+        assert!(!expired.should_buffer_request_body(&ctx));
+        assert!(!expired.should_buffer_response_body(&ctx));
+        assert!(live.should_buffer_request_body(&ctx));
+        assert!(live.should_buffer_response_body(&ctx));
+    });
+
+    let mut ctx = capturable_ctx();
+    let mut headers = body_headers("application/json", 16);
+    let logs = capture_debug_logs_during(|| async {
+        let _ = expired.before_proxy(&mut ctx, &mut headers).await;
+    })
+    .await;
+    assert!(logs.contains("reason=capture_expired"), "got: {logs}");
+
+    // Judged against the request's receive time: a request admitted before
+    // the deadline is still captured in both directions.
+    let deadline = targeted_plugin(json!({"capture_expires_at": "2026-01-01T00:00:00Z"}));
+    let mut early = capturable_ctx();
+    early.timestamp_received = chrono::DateTime::parse_from_rfc3339("2025-12-31T23:59:59Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let mut late = capturable_ctx();
+    late.timestamp_received = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    with_debug_target(|| {
+        assert!(deadline.should_buffer_request_body(&early));
+        assert!(deadline.should_buffer_response_body(&early));
+        assert!(!deadline.should_buffer_request_body(&late));
+    });
+}
+
+#[test]
+fn test_capture_sample_rate_is_deterministic_and_proportional() {
+    let half = targeted_plugin(json!({"capture_sample_rate": 0.5}));
+    let all = targeted_plugin(json!({"capture_sample_rate": 1}));
+    let mut selected = 0usize;
+    with_debug_target(|| {
+        for i in 0..1000i64 {
+            let mut ctx = capturable_ctx();
+            ctx.timestamp_received = chrono::DateTime::from_timestamp(
+                1_800_000_000 + i,
+                ((i * 7_919) % 1_000_000_000) as u32,
+            )
+            .expect("valid timestamp");
+            let request = half.should_buffer_request_body(&ctx);
+            assert_eq!(
+                request,
+                half.should_buffer_response_body(&ctx),
+                "both directions of one request agree"
+            );
+            assert_eq!(request, half.should_buffer_request_body(&ctx));
+            assert!(all.should_buffer_request_body(&ctx));
+            if request {
+                selected += 1;
+            }
+        }
+    });
+    assert!(
+        (350..=650).contains(&selected),
+        "selected {selected} of 1000 at rate 0.5"
+    );
+}
+
+#[test]
+fn test_capture_targeting_and_prefix_options_are_validated() {
+    TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "capture_sample_rate": 0.25,
+        "capture_request_header": "x-debug",
+        "capture_request_header_value": "incident 42",
+        "capture_expires_at": "2026-12-31T23:59:59Z",
+        "capture_body_prefix": true,
+    }))
+    .expect("valid targeting configuration");
+    TransactionDebugger::new(&json!({"capture_body_prefix": false}))
+        .expect("a false prefix switch needs no capture switch");
+
+    for (config, needle) in [
+        (
+            json!({"capture_sample_rate": 0.5}),
+            "`capture_sample_rate` requires",
+        ),
+        (
+            json!({"log_request_body": true, "capture_sample_rate": 0}),
+            "greater than 0",
+        ),
+        (
+            json!({"log_request_body": true, "capture_sample_rate": 1.5}),
+            "at most 1",
+        ),
+        (
+            json!({"log_request_body": true, "capture_sample_rate": "0.5"}),
+            "`capture_sample_rate` must be a number",
+        ),
+        (
+            json!({"log_request_body": true, "capture_sample_rate": null}),
+            "null is not allowed",
+        ),
+        (
+            json!({"capture_request_header": "x-debug"}),
+            "`capture_request_header` requires",
+        ),
+        (
+            json!({"log_request_body": true, "capture_request_header": "bad header"}),
+            "not a valid HTTP header name",
+        ),
+        (
+            json!({"log_request_body": true, "capture_request_header": ""}),
+            "must not be empty",
+        ),
+        (
+            json!({"log_request_body": true, "capture_request_header_value": "x"}),
+            "requires `capture_request_header`",
+        ),
+        (
+            json!({
+                "log_request_body": true,
+                "capture_request_header": "x-debug",
+                "capture_request_header_value": " padded",
+            }),
+            "visible ASCII",
+        ),
+        (
+            json!({
+                "log_request_body": true,
+                "capture_request_header": "x-debug",
+                "capture_request_header_value": "x".repeat(257),
+            }),
+            "visible ASCII",
+        ),
+        (
+            json!({"capture_expires_at": "2026-12-31T23:59:59Z"}),
+            "`capture_expires_at` requires",
+        ),
+        (
+            json!({"log_request_body": true, "capture_expires_at": "tomorrow"}),
+            "RFC 3339",
+        ),
+        (
+            json!({"log_request_body": true, "capture_expires_at": 1_800_000_000}),
+            "RFC 3339",
+        ),
+        (
+            json!({"capture_body_prefix": true}),
+            "`capture_body_prefix` requires",
+        ),
+        (
+            json!({"log_request_body": true, "capture_body_prefix": "yes"}),
+            "`capture_body_prefix` must be a boolean",
+        ),
+    ] {
+        let err = TransactionDebugger::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {config}"));
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
+
+    // A rejected selector value is never echoed.
+    let err = TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "capture_request_header": "x-debug",
+        "capture_request_header_value": "secret-selector\u{7f}",
+    }))
+    .err()
+    .expect("control characters are rejected");
+    assert!(!err.contains("secret-selector"), "{err}");
+}
+
+fn prefix_plugin() -> TransactionDebugger {
+    TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "log_response_body": true,
+        "max_request_body_bytes": 64,
+        "max_response_body_bytes": 64,
+        "capture_body_prefix": true,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn test_prefix_mode_admits_only_bounded_prefix_renderable_bodies() {
+    let plugin = prefix_plugin();
+    assert!(plugin.capture_body_prefix());
+    assert!(
+        plugin
+            .request_body_capture_decision(&body_headers("text/plain", 4096))
+            .is_capture()
+    );
+    assert!(
+        plugin
+            .response_body_capture_decision(&body_headers(
+                "application/x-www-form-urlencoded",
+                4096
+            ))
+            .is_capture()
+    );
+    assert_eq!(
+        plugin
+            .request_body_capture_decision(&body_headers("application/json", 4096))
+            .skip_reason(),
+        Some("over_capture_limit")
+    );
+    assert_eq!(
+        plugin
+            .request_body_capture_decision(&body_headers(
+                "text/plain",
+                MAX_PREFIX_SOURCE_BYTES as usize + 1
+            ))
+            .skip_reason(),
+        Some("over_capture_limit")
+    );
+    let chunked = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+    assert_eq!(
+        plugin.request_body_capture_decision(&chunked).skip_reason(),
+        Some("unknown_length")
+    );
+
+    // Without the opt-in the cap stays a hard admission bound.
+    let plain = TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "max_request_body_bytes": 64,
+    }))
+    .unwrap();
+    assert!(!plain.capture_body_prefix());
+    assert_eq!(
+        plain
+            .request_body_capture_decision(&body_headers("text/plain", 4096))
+            .skip_reason(),
+        Some("over_capture_limit")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_prefix_mode_renders_complete_redacted_units_marked_truncated() {
+    let plugin = prefix_plugin();
+    let text = format!(
+        "line one is fine\npassword=hunter2\nline three is fine\n{}",
+        "tail-content ".repeat(100)
+    );
+    let headers = body_headers("text/plain", text.len());
+    let mut ctx = make_ctx();
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, text.as_bytes())
+            .await;
+    })
+    .await;
+    assert!(logs.contains("capture=truncated"), "got: {logs}");
+    assert!(logs.contains("truncated=true"), "got: {logs}");
+    assert!(logs.contains("body_kind=text"), "got: {logs}");
+    assert!(
+        logs.contains(&format!("body_bytes={}", text.len())),
+        "got: {logs}"
+    );
+    assert!(logs.contains("line one is fine"), "got: {logs}");
+    assert!(logs.contains("line three is fine"), "got: {logs}");
+    assert!(!logs.contains("hunter2"), "secret leaked: {logs}");
+    assert!(!logs.contains("tail-content"), "cut line rendered: {logs}");
+
+    let form = format!(
+        "user=alice&client_secret=shh&note=fine&pad={}",
+        "x".repeat(200)
+    );
+    let sample = plugin
+        .render_captured_prefix(form.as_bytes(), BodyKind::Form, 64)
+        .expect("form prefix renders");
+    assert_eq!(sample.state, "truncated");
+    assert!(sample.truncated);
+    assert_eq!(sample.original_bytes, form.len());
+    assert!(
+        sample.rendered.contains("user=alice"),
+        "{}",
+        sample.rendered
+    );
+    assert!(sample.rendered.contains("note=fine"), "{}", sample.rendered);
+    assert!(!sample.rendered.contains("shh"), "{}", sample.rendered);
+    assert!(!sample.rendered.contains("pad="), "{}", sample.rendered);
+
+    // JSON needs the whole document; a window with no complete unit is not
+    // rendered either.
+    let json = format!(r#"{{"pad":"{}"}}"#, "y".repeat(200));
+    assert!(
+        plugin
+            .render_captured_prefix(json.as_bytes(), BodyKind::Json, 64)
+            .is_none()
+    );
+    let one_line = "z".repeat(200);
+    assert!(
+        plugin
+            .render_captured_prefix(one_line.as_bytes(), BodyKind::Text, 64)
+            .is_none()
+    );
+
+    // An admitted JSON response that grew past the cap stays a content-free
+    // omission under prefix mode.
+    let mut ctx = make_ctx();
+    let admitted = body_headers("application/json", 32);
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &admitted, json.as_bytes())
+            .await;
+    })
+    .await;
+    assert!(logs.contains("reason=over_capture_limit"), "got: {logs}");
+    assert!(!logs.contains("yyyy"), "got: {logs}");
+}
+
+// ---------------------------------------------------------------------------
+// PR #6851 review round 1
+// ---------------------------------------------------------------------------
+
+/// A compact JWS whose protected header carries `leading` JSON-whitespace
+/// bytes before `{ "alg": "HS256" }` (RFC 7515 permits them).
+fn leading_whitespace_jwt(leading: usize) -> String {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut header = vec![b' '; leading];
+    header.extend_from_slice(br#"{ "alg": "HS256" }"#);
+    format!(
+        "{}.{}.{}",
+        engine.encode(&header),
+        engine.encode(br#"{ "sub": "alice", "exp": 2000000000 }"#),
+        engine.encode(b"not-a-real-signature-but-shaped-like-one"),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_jwt_with_leading_whitespace_past_the_decode_window_is_redacted() {
+    let plugin = capture_plugin();
+    // 47/48 decoded bytes straddle the 64-character window; 60 and 200 put the
+    // opener entirely beyond it.
+    for leading in [0usize, 30, 47, 48, 60, 200] {
+        let token = leading_whitespace_jwt(leading);
+        assert!(
+            !token.to_ascii_lowercase().contains("eyj"),
+            "fixture must avoid the literal prefix"
+        );
+        let signature = token.rsplit('.').next().unwrap().to_string();
+
+        let json_body = serde_json::to_vec(&json!({"note": token})).unwrap();
+        let json = plugin.render_captured_body(&json_body, BodyKind::Json, 1024);
+        assert!(
+            !json.rendered.contains(&signature),
+            "leading={leading}: {}",
+            json.rendered
+        );
+
+        let form_body = format!("note={token}&keep=yes");
+        let form = plugin.render_captured_body(form_body.as_bytes(), BodyKind::Form, 1024);
+        assert!(
+            !form.rendered.contains(&signature),
+            "leading={leading}: {}",
+            form.rendered
+        );
+        assert!(form.rendered.contains("keep=yes"), "{}", form.rendered);
+
+        let text_body = format!("line one is fine\n{token}\nline three is fine");
+        let text = plugin.render_captured_body(text_body.as_bytes(), BodyKind::Text, 1024);
+        assert!(
+            !text.rendered.contains(&signature),
+            "leading={leading}: {}",
+            text.rendered
+        );
+
+        // Both header-dump directions.
+        let header_plugin = TransactionDebugger::new(&json!({})).unwrap();
+        let mut ctx = make_ctx();
+        ctx.headers
+            .insert("x-trace-copy".to_string(), token.clone());
+        let mut response_headers = HashMap::from([("x-upstream-copy".to_string(), token.clone())]);
+        let logs = capture_debug_logs_during(|| async {
+            let _ = header_plugin.on_request_received(&mut ctx).await;
+            let _ = header_plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await;
+        })
+        .await;
+        assert!(logs.contains("Incoming request"), "got: {logs}");
+        assert!(logs.contains("Backend response"), "got: {logs}");
+        assert!(
+            !logs.contains(&signature),
+            "leading={leading} leaked: {logs}"
+        );
+    }
+
+    // Short whitespace-only segments are not a header.
+    let rendered = plugin.render_captured_body(br#"{"v":"ICAg.ICAg.ICAg"}"#, BodyKind::Json, 512);
+    assert!(
+        rendered.rendered.contains("ICAg.ICAg.ICAg"),
+        "{}",
+        rendered.rendered
+    );
+}
+
+/// Run `before_proxy` the way core does when no plugin modifies request
+/// headers: `ctx.headers` is moved into the hook map and restored afterwards.
+async fn before_proxy_with_moved_headers(plugin: &TransactionDebugger, ctx: &mut RequestContext) {
+    let mut moved = std::mem::take(&mut ctx.headers);
+    let _ = plugin.before_proxy(ctx, &mut moved).await;
+    ctx.headers = moved;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_selected_request_is_captured_when_core_moves_headers_for_before_proxy() {
+    let plugin = targeted_plugin(json!({
+        "capture_request_header": "x-debug-capture",
+        "capture_request_header_value": "incident-42",
+    }));
+    let headers = body_headers("application/json", 16);
+    let body = br#"{"user":"alice"}"#;
+
+    // Full lifecycle: the selector is memoized in `on_request_received`.
+    let mut ctx = capturable_ctx();
+    ctx.headers
+        .insert("x-debug-capture".to_string(), "incident-42".to_string());
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut ctx).await;
+        assert!(plugin.should_buffer_request_body(&ctx));
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+    assert!(logs.contains("alice"), "got: {logs}");
+    assert!(!logs.contains("not_selected"), "got: {logs}");
+
+    // Without a memo, `before_proxy` reads the selector from the hook map.
+    let mut ctx = capturable_ctx();
+    ctx.headers
+        .insert("x-debug-capture".to_string(), "incident-42".to_string());
+    let logs = capture_debug_logs_during(|| async {
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+
+    // The memo is the original client view: a later rewrite of the selector
+    // does not change the decision for this request.
+    let mut ctx = capturable_ctx();
+    ctx.headers
+        .insert("x-debug-capture".to_string(), "incident-42".to_string());
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut ctx).await;
+        ctx.headers.remove("x-debug-capture");
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+
+    // An unselected request still reports exactly one omission.
+    let mut ctx = capturable_ctx();
+    let logs = capture_debug_logs_during(|| async {
+        let _ = plugin.on_request_received(&mut ctx).await;
+        before_proxy_with_moved_headers(&plugin, &mut ctx).await;
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert_eq!(logs.matches("Bounded body capture").count(), 1, "{logs}");
+    assert!(logs.contains("reason=not_selected"), "got: {logs}");
+    assert!(!logs.contains("alice"), "got: {logs}");
 }

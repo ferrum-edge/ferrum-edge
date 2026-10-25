@@ -28,7 +28,9 @@ impl Schema {
             Self::Slice => SLICE,
             Self::Policy => "name namespace scope rules",
             Self::Route => "rules reject_unmatched",
-            Self::Registry => "registry reject_status outbound_listen_ports namespace",
+            Self::Registry => {
+                "registry reject_status outbound_listen_ports namespace wildcard_match"
+            }
             Self::Direction => "server client",
             Self::Provider => "kind config",
             Self::Fields(fields) => fields,
