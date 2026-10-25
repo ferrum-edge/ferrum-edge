@@ -259,14 +259,14 @@ fn test_declares_header_mutation_and_trigger_redaction() {
         ],
         "every backend-folded spelling of the trigger key must be redacted"
     );
-    // The replay ceiling bounds retention in `before_proxy`, never the
-    // collect limit: a plugin-local buffering ceiling would answer an
-    // oversized trigger body without a declared length with a 413 for the
-    // primary request (load_testing-claude-1, PR6856-SOL-2).
+    // The replay ceiling also bounds collection, so a trigger reserves at
+    // most 10 MiB of the aggregate request-buffer budget instead of the whole
+    // configured upload limit (PR6856-SOL-3). Declared oversized bodies are
+    // never selected for buffering at all.
     assert_eq!(
         plugin.request_body_buffer_limit(),
-        None,
-        "load_testing must not shorten the bytes the gateway forwards"
+        Some(MAX_REPLAY_REQUEST_BODY_BYTES),
+        "trigger collection must stay bounded by the replay ceiling"
     );
 }
 

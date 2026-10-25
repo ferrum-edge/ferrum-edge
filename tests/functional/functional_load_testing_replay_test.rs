@@ -388,15 +388,28 @@ fn replay_plugin(id: &str, proxy_id: &str) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
-// An oversized trigger body never blocks the primary request (PR #6856)
+// A declared oversized trigger body is forwarded without a run (PR #6856)
 // ---------------------------------------------------------------------------
 
 /// The plugin's 10 MiB replay ceiling (`MAX_REPLAY_REQUEST_BODY_BYTES`).
 const REPLAY_CEILING_BYTES: usize = 10 * 1024 * 1024;
 
-/// A backend that drains each request body (Content-Length or chunked),
-/// reports `(request target, body length)`, and answers `200`.
-async fn spawn_draining_backend() -> (u16, mpsc::Receiver<(String, usize)>, JoinHandle<()>) {
+/// One application request a [`spawn_draining_backend`] observed.
+#[derive(Debug)]
+struct DrainedRequest {
+    method: String,
+    target: String,
+    body_len: usize,
+}
+
+/// A backend that drains each HTTP/1.1 request body (Content-Length or
+/// chunked), reports it, and answers `200`.
+///
+/// The gateway's startup capability refresh dials every plaintext HTTP
+/// backend with the h2c connection preface (`PRI * HTTP/2.0`) regardless of
+/// `pool_enable_http2`. Such a probe is closed without being reported, so it
+/// can never be mistaken for the primary request or a synthetic replay.
+async fn spawn_draining_backend() -> (u16, mpsc::Receiver<DrainedRequest>, JoinHandle<()>) {
     let listener = TcpListener::bind_test("127.0.0.1:0")
         .await
         .expect("bind draining backend");
@@ -423,7 +436,13 @@ async fn spawn_draining_backend() -> (u16, mpsc::Receiver<(String, usize)>, Join
     (port, receiver, handle)
 }
 
-async fn drain_request(stream: &mut TcpStream) -> Option<(String, usize)> {
+/// `true` for the HTTP/2 connection-preface request line, which is a
+/// transport capability probe, never an application request.
+fn is_h2c_preface_request_line(request_line: &str) -> bool {
+    request_line.starts_with("PRI * HTTP/2.0")
+}
+
+async fn drain_request(stream: &mut TcpStream) -> Option<DrainedRequest> {
     let mut buf = Vec::with_capacity(8192);
     let mut chunk = [0u8; 65536];
     let header_end = loop {
@@ -441,7 +460,13 @@ async fn drain_request(stream: &mut TcpStream) -> Option<(String, usize)> {
     };
     let header_text = std::str::from_utf8(&buf[..header_end]).ok()?.to_string();
     let mut lines = header_text.split("\r\n");
-    let target = lines.next()?.split_whitespace().nth(1)?.to_string();
+    let request_line = lines.next()?;
+    if is_h2c_preface_request_line(request_line) {
+        return None;
+    }
+    let mut request_line_parts = request_line.split_whitespace();
+    let method = request_line_parts.next()?.to_string();
+    let target = request_line_parts.next()?.to_string();
     let mut content_length = None;
     let mut chunked = false;
     for line in lines {
@@ -455,7 +480,7 @@ async fn drain_request(stream: &mut TcpStream) -> Option<(String, usize)> {
         }
     }
     let mut body = buf[header_end..].to_vec();
-    if let Some(length) = content_length {
+    let body_len = if let Some(length) = content_length {
         while body.len() < length {
             let read = stream.read(&mut chunk).await.ok()?;
             if read == 0 {
@@ -463,51 +488,102 @@ async fn drain_request(stream: &mut TcpStream) -> Option<(String, usize)> {
             }
             body.extend_from_slice(&chunk[..read]);
         }
-        return Some((target, length));
-    }
-    if !chunked {
-        return Some((target, 0));
-    }
-    // Minimal chunked decoder: sum chunk sizes until the zero-size chunk.
-    let mut total = 0usize;
-    let mut cursor = 0usize;
-    loop {
-        let line_end = loop {
-            if let Some(offset) = body[cursor..]
-                .windows(2)
-                .position(|window| window == b"\r\n")
-            {
-                break cursor + offset;
+        length
+    } else if chunked {
+        // Minimal chunked decoder: sum chunk sizes until the zero-size chunk.
+        let mut total = 0usize;
+        let mut cursor = 0usize;
+        loop {
+            let line_end = loop {
+                if let Some(offset) = body[cursor..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                {
+                    break cursor + offset;
+                }
+                let read = stream.read(&mut chunk).await.ok()?;
+                if read == 0 {
+                    return None;
+                }
+                body.extend_from_slice(&chunk[..read]);
+            };
+            let size_text = std::str::from_utf8(&body[cursor..line_end]).ok()?;
+            let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+            let data_start = line_end + 2;
+            if size == 0 {
+                break total;
             }
-            let read = stream.read(&mut chunk).await.ok()?;
-            if read == 0 {
-                return None;
+            while body.len() < data_start + size + 2 {
+                let read = stream.read(&mut chunk).await.ok()?;
+                if read == 0 {
+                    return None;
+                }
+                body.extend_from_slice(&chunk[..read]);
             }
-            body.extend_from_slice(&chunk[..read]);
-        };
-        let size_text = std::str::from_utf8(&body[cursor..line_end]).ok()?;
-        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
-        let data_start = line_end + 2;
-        if size == 0 {
-            return Some((target, total));
+            total += size;
+            cursor = data_start + size + 2;
         }
-        while body.len() < data_start + size + 2 {
-            let read = stream.read(&mut chunk).await.ok()?;
-            if read == 0 {
-                return None;
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
-        total += size;
-        cursor = data_start + size + 2;
-    }
+    } else {
+        0
+    };
+    Some(DrainedRequest {
+        method,
+        target,
+        body_len,
+    })
 }
 
-/// Send a chunked HTTP/1.1 trigger (no Content-Length) and return the status
-/// line of the gateway's response.
-async fn send_chunked_h1_trigger(port: u16, target: &str, body_len: usize) -> String {
+/// The startup capability refresh sends the h2c preface to a plaintext
+/// backend. The draining backend must close that probe unreported, while a
+/// real upload on the same backend still counts.
+#[tokio::test]
+async fn draining_backend_ignores_the_h2c_capability_probe() {
+    let (port, mut observed, backend) = spawn_draining_backend().await;
+
+    let mut probe = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect probe");
+    probe
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("write h2c preface");
+    let mut closed = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut closed)).await;
+    assert!(closed.is_empty(), "the probe must be closed unanswered");
+
+    let mut upload = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("connect upload");
+    upload
+        .write_all(b"POST /probe-check HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest")
+        .await
+        .expect("write upload");
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), upload.read_to_end(&mut response)).await;
+    assert!(response.starts_with(b"HTTP/1.1 200"));
+
+    let first = tokio::time::timeout(Duration::from_secs(5), observed.recv())
+        .await
+        .expect("upload observation")
+        .expect("draining backend stopped");
+    assert_eq!(
+        first.method, "POST",
+        "the probe must not be reported: {first:?}"
+    );
+    assert_eq!(first.target, "/probe-check");
+    assert_eq!(first.body_len, 4);
+    assert!(
+        observed.try_recv().is_err(),
+        "exactly one observation expected"
+    );
+    backend.abort();
+}
+
+/// Send an HTTP/1.1 trigger that declares its `Content-Length` and return the
+/// status line of the gateway's response.
+async fn send_declared_h1_trigger(port: u16, target: &str, body_len: usize) -> String {
     let request_head = format!(
-        "POST {target} HTTP/1.1\r\nHost: localhost\r\nX-Loadtesting-Key: {TRIGGER_KEY}\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\nX-Loadtesting-Key: {TRIGGER_KEY}\r\nContent-Type: application/octet-stream\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
     );
     let response = tokio::time::timeout(Duration::from_secs(30), async {
         let mut stream = TcpStream::connect(("127.0.0.1", port))
@@ -521,25 +597,20 @@ async fn send_chunked_h1_trigger(port: u16, target: &str, body_len: usize) -> St
         let mut remaining = body_len;
         while remaining > 0 {
             let size = remaining.min(piece.len());
-            let framed_head = format!("{size:x}\r\n");
             // The gateway may answer early (for example a 413) and close;
             // stop writing then and read whatever it answered.
-            if stream.write_all(framed_head.as_bytes()).await.is_err()
-                || stream.write_all(&piece[..size]).await.is_err()
-                || stream.write_all(b"\r\n").await.is_err()
-            {
+            if stream.write_all(&piece[..size]).await.is_err() {
                 break;
             }
             remaining -= size;
         }
-        let _ = stream.write_all(b"0\r\n\r\n").await;
         let _ = stream.flush().await;
         let mut response = Vec::new();
         let _ = stream.read_to_end(&mut response).await;
         response
     })
     .await
-    .expect("chunked H1 trigger deadline");
+    .expect("declared H1 trigger deadline");
     String::from_utf8_lossy(&response)
         .lines()
         .next()
@@ -549,7 +620,8 @@ async fn send_chunked_h1_trigger(port: u16, target: &str, body_len: usize) -> St
 
 #[ignore]
 #[tokio::test]
-async fn functional_load_testing_oversized_chunked_trigger_is_forwarded_without_a_run() {
+async fn functional_load_testing_declared_oversized_trigger_is_forwarded_without_a_run() {
+    const TARGET: &str = "/load-oversize/upload";
     let (backend_port, mut observed, backend) = spawn_draining_backend().await;
     let config = serde_json::json!({
         "version": "1",
@@ -581,30 +653,46 @@ async fn functional_load_testing_oversized_chunked_trigger_is_forwarded_without_
         .expect("oversize gateway proxy port");
 
     let body_len = REPLAY_CEILING_BYTES + 1;
-    let status_line =
-        send_chunked_h1_trigger(gateway.proxy_port, "/load-oversize/upload", body_len).await;
+    let status_line = send_declared_h1_trigger(gateway.proxy_port, TARGET, body_len).await;
     assert!(
         status_line.starts_with("HTTP/1.1 200"),
-        "an oversized trigger body must not block the primary request: {status_line}"
+        "a declared oversized trigger body must not block the primary request: {status_line}"
     );
 
-    let (target, length) = tokio::time::timeout(Duration::from_secs(10), observed.recv())
-        .await
-        .expect("primary request must reach the backend")
-        .expect("draining backend stopped");
-    assert_eq!(target, "/load-oversize/upload");
+    // Only application POSTs to the route count; anything else the backend
+    // might see is not the behavior under test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let primary = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let request = tokio::time::timeout(remaining, observed.recv())
+            .await
+            .expect("primary request must reach the backend")
+            .expect("draining backend stopped");
+        if request.method == "POST" && request.target == TARGET {
+            break request;
+        }
+    };
     assert_eq!(
-        length, body_len,
+        primary.body_len, body_len,
         "the backend must receive the complete body"
     );
 
-    // No cohort starts for a body that cannot be replayed intact: nothing
-    // else reaches the backend during the one-second run window.
-    let extra = tokio::time::timeout(Duration::from_millis(1500), observed.recv()).await;
-    assert!(
-        extra.is_err(),
-        "an oversized trigger must start no synthetic requests: {extra:?}"
-    );
+    // No cohort starts for a body that cannot be replayed: no further POST to
+    // the route arrives during (and just after) the one-second run window.
+    let window_end = Instant::now() + Duration::from_millis(1500);
+    loop {
+        let remaining = window_end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, observed.recv()).await {
+            Err(_) | Ok(None) => break,
+            Ok(Some(request)) => assert!(
+                !(request.method == "POST" && request.target == TARGET),
+                "an oversized trigger must start no synthetic requests: {request:?}"
+            ),
+        }
+    }
 
     gateway.shutdown();
     backend.abort();

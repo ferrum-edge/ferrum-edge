@@ -22,10 +22,11 @@
 //! applied exactly once to the synthetic cohort as well.
 //!
 //! The triggering request itself proceeds normally through the proxy pipeline
-//! and is not blocked by the load test. A trigger body above the 10 MiB
-//! replay ceiling is forwarded under the ordinary request-body limits and no
-//! load test starts; a declared oversized `Content-Length` is not even
-//! buffered.
+//! and is not blocked by the load test. A trigger that declares a
+//! `Content-Length` above the 10 MiB replay ceiling is not buffered: it is
+//! forwarded under the ordinary request-body limits and no load test starts.
+//! Known limitation: an undeclared-length (chunked) trigger body above the
+//! ceiling is refused with `413`, since the ceiling also bounds collection.
 //!
 //! ## Multi-node fan-out
 //!
@@ -125,8 +126,9 @@ const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
 /// A matching trigger may retain one shared request body for its local cohort
 /// and bounded fan-out work. Keep that retained body bounded even when the
 /// global request-body limit is configured as unlimited, and cap aggregate
-/// retained replay bodies across plugin instances. This bounds replay
-/// retention only: a larger trigger body is still forwarded, without a run.
+/// retained replay bodies across plugin instances. A trigger declaring a
+/// larger `Content-Length` is forwarded without a run; an undeclared-length
+/// trigger body above it is refused with `413` at collection.
 pub const MAX_REPLAY_REQUEST_BODY_BYTES: usize = 10_485_760;
 const MAX_PROCESS_RETAINED_BODY_BYTES: u64 = 67_108_864;
 
@@ -1087,19 +1089,20 @@ impl Plugin for LoadTesting {
         false
     }
 
-    /// Deliberately no plugin-local buffering ceiling. The 10 MiB replay
-    /// ceiling bounds what a run RETAINS, never what the gateway forwards: a
-    /// plugin ceiling here would be folded into the pre-`before_proxy` collect
-    /// limit and turn an oversized trigger body without a declared length
-    /// (chunked H1, H2/H3 DATA without `Content-Length`) into a client-visible
-    /// `413` for the primary request. Collection is therefore bounded by the
-    /// same global/route request-body limit the request faces when streamed
-    /// (with `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` and the aggregate
-    /// request-buffer budget when that limit is unlimited), and `before_proxy`
-    /// skips the run for a body above the replay ceiling. A trigger that
-    /// declares a larger body is not buffered at all.
+    /// The replay ceiling is also the trigger's collection ceiling. The
+    /// generic collector reserves its whole ceiling from the aggregate
+    /// request-buffer budget before reading, so without this bound even a
+    /// tiny trigger would reserve the full global/route upload limit and could
+    /// be refused with `503` when that limit exceeds the budget.
+    ///
+    /// Known limitation: a trigger body WITHOUT a declared length (chunked
+    /// HTTP/1.1, HTTP/2 or HTTP/3 DATA without `Content-Length`) larger than
+    /// this ceiling is refused with `413`, because the collector cannot hand
+    /// the consumed prefix back to the primary stream. A trigger that declares
+    /// a larger `Content-Length` is never selected for buffering (see
+    /// `should_buffer_request_body`) and is forwarded without a run.
     fn request_body_buffer_limit(&self) -> Option<usize> {
-        None
+        Some(MAX_REPLAY_REQUEST_BODY_BYTES)
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
