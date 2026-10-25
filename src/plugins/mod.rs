@@ -2613,6 +2613,18 @@ pub struct RequestContext {
     /// policy has applied its default/cap decision. Kept separate from the
     /// relative header forwarded upstream so retries never re-arm the budget.
     pub(crate) grpc_deadline_budget_ms: Option<u64>,
+    /// The policy budget BEFORE any `headroom_ms` reservation: the client
+    /// deadline (or injected default) after every cap applied so far. Each
+    /// `grpc_deadline` instance recomputes from this value, so the headroom is
+    /// reserved exactly once and composition does not depend on instance order.
+    pub(crate) grpc_deadline_policy_budget_ms: Option<u64>,
+    /// The tightest `max_deadline_ms` any `grpc_deadline` instance has applied
+    /// to this request. Kept in typed state so a default injected by a LATER
+    /// instance is still clamped by an earlier instance's ceiling.
+    pub(crate) grpc_deadline_ceiling_ms: Option<u64>,
+    /// The largest `headroom_ms` any `grpc_deadline` instance requested for
+    /// this request. Reserved once from a client-supplied deadline.
+    pub(crate) grpc_deadline_headroom_ms: u64,
     /// Single monotonic absolute deadline shared by request phases, backend
     /// attempts, retry backoff, and streaming response bodies.
     pub(crate) grpc_deadline_at: Option<tokio::time::Instant>,
@@ -3917,6 +3929,17 @@ pub(crate) struct PluginRequestState {
     /// Typed rather than `metadata`: a digest of a client query document must not
     /// enter a transaction log, and no plugin may forge one to skip the recheck.
     pub(crate) graphql_request_envelope_hashes: HashMap<u64, [u8; 32]>,
+    /// Per-`body_validator`-instance digest of the `Content-Type` and request
+    /// body that instance validated and PASSED in `before_proxy`.
+    ///
+    /// The final request-body hook re-validates the exact backend-visible
+    /// bytes; when they (and the media type) are byte-identical to what the
+    /// early hook already accepted, the verdict is the same pure function of
+    /// the same input, so the second JSON parse and schema evaluation are
+    /// skipped. Any transform, relabel, or decode changes the digest and is
+    /// re-validated. Typed rather than `metadata` so no plugin can forge a
+    /// digest to skip the final check, and a body digest never reaches a log.
+    pub(crate) body_validator_early_request_digests: HashMap<u64, [u8; 32]>,
     /// Rate-limit buckets one `graphql` instance already charged for this
     /// request, as `(instance id, bucket key)`.
     ///
@@ -4526,6 +4549,9 @@ impl RequestContext {
             grpc_deadline_received_at: tokio::time::Instant::now(),
             grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
+            grpc_deadline_policy_budget_ms: None,
+            grpc_deadline_ceiling_ms: None,
+            grpc_deadline_headroom_ms: 0,
             grpc_deadline_at: None,
             route_request_deadline_at: None,
             route_attempt_timeout: None,
@@ -5060,6 +5086,7 @@ impl RequestContext {
         }
         self.grpc_deadline_initialized = true;
         self.grpc_deadline_had_valid_client_timeout = budget_ms.is_some();
+        self.grpc_deadline_policy_budget_ms = budget_ms;
         self.set_grpc_deadline_budget(budget_ms);
     }
 
@@ -6069,6 +6096,9 @@ impl RequestContext {
             grpc_deadline_received_at: self.grpc_deadline_received_at,
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
+            grpc_deadline_policy_budget_ms: self.grpc_deadline_policy_budget_ms,
+            grpc_deadline_ceiling_ms: self.grpc_deadline_ceiling_ms,
+            grpc_deadline_headroom_ms: self.grpc_deadline_headroom_ms,
             grpc_deadline_at: self.grpc_deadline_at,
             route_request_deadline_at: self.route_request_deadline_at,
             route_attempt_timeout: self.route_attempt_timeout,
@@ -13789,6 +13819,12 @@ pub fn create_plugin_with_http_client_and_config_id(
                 brotli_enabled,
                 max_request_body_size_bytes,
             )?;
+            // Serving clients carry the process response limit; validation-only
+            // clients do not, and stay silent rather than warning about a
+            // limit they never resolved.
+            if let Some(max_response_body_size_bytes) = http_client.max_response_body_size_bytes() {
+                compression::warn_if_response_limit_gates_compression(max_response_body_size_bytes);
+            }
             Ok(Some(Arc::new(plugin)))
         }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
@@ -14745,6 +14781,7 @@ mod tests {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         };
 
         let canary: Upstream = serde_json::from_value(json!({

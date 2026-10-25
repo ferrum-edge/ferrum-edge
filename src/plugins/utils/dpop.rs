@@ -28,7 +28,7 @@ use crate::fips::approved::Sha256;
 use std::time::Duration;
 
 use base64::Engine;
-use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
+use jsonwebtoken::jwk::{AlgorithmParameters, EllipticCurve, Jwk};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use serde_json::Value;
@@ -101,6 +101,26 @@ const TOKEN_BINDING_MISMATCH: &str = "DPoP binding mismatch";
 /// [`verify`] failure: the proof's RSA `jwk` is outside the 2048-8192-bit
 /// window the JWT backend verifies with.
 pub const DPOP_RSA_KEY_SIZE: &str = "DPoP RSA key must be 2048-8192 bits";
+/// [`verify`] failure: the proof's `alg` is not an admitted asymmetric JWS
+/// algorithm (or, for `EdDSA`, is refused by the enforced FIPS policy).
+pub const DPOP_UNSUPPORTED_ALGORITHM: &str = "Unsupported DPoP algorithm";
+
+/// Asymmetric JWS algorithms a DPoP proof may be signed with (RFC 9449 §4.2
+/// requires an asymmetric algorithm; symmetric `HS*` and `none` are refused).
+/// The same set the JWKS key store admits for access tokens. `ES512` is absent
+/// because the `jsonwebtoken` backend exposes no P-521 JWS path; `EdDSA` is
+/// additionally refused while FIPS mode is enforced.
+pub const DPOP_PROOF_ALGORITHMS: [Algorithm; 9] = [
+    Algorithm::ES256,
+    Algorithm::ES384,
+    Algorithm::RS256,
+    Algorithm::RS384,
+    Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
+    Algorithm::EdDSA,
+];
 
 /// Whether a [`verify`] failure faults the access token's key binding rather
 /// than the proof itself. RFC 9449 §7.1 answers the former with
@@ -116,8 +136,11 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
     if header.typ.as_deref() != Some("dpop+jwt") {
         return Err("Invalid DPoP proof type");
     }
-    if !matches!(header.alg, Algorithm::ES256 | Algorithm::RS256) {
-        return Err("Unsupported DPoP algorithm");
+    if !DPOP_PROOF_ALGORITHMS.contains(&header.alg) {
+        return Err(DPOP_UNSUPPORTED_ALGORITHM);
+    }
+    if header.alg == Algorithm::EdDSA && crate::fips::keys::check_jwk_okp_public_key().is_err() {
+        return Err(DPOP_UNSUPPORTED_ALGORITHM);
     }
     let jwk = header.jwk.as_ref().ok_or("DPoP proof missing jwk")?;
     let jkt = jwk_thumbprint_sha256(jwk).map_err(|_| "Invalid DPoP jwk")?;
@@ -127,7 +150,7 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
         return Err(TOKEN_BINDING_MISMATCH);
     }
 
-    // The JWT backend verifies RS256 only with 2048-8192-bit RSA keys; name
+    // The JWT backend verifies RS*/PS* only with 2048-8192-bit RSA keys; name
     // that instead of reporting a signature failure for a well-formed proof.
     if let AlgorithmParameters::RSA(rsa) = &jwk.algorithm {
         let modulus = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -159,10 +182,11 @@ pub fn verify(input: DpopVerifyInput<'_>) -> Result<ReplayMarker, &'static str> 
         return Err("DPoP method mismatch");
     }
     // RFC 9449 §4.3: compare `htu` ignoring query and fragment, and normalize
-    // scheme/host case and default ports. `input.htu` is already canonical (the
-    // caller built it via `canonical_htu`), so normalize the client-supplied
-    // proof `htu` the same way before comparing. Reject if the proof's `htu`
-    // cannot be parsed/normalized.
+    // scheme/host case, default ports, and the path's percent-encoding.
+    // `input.htu` is already canonical (the caller built it via
+    // `canonical_htu` from the canonical policy path), so normalize the
+    // client-supplied proof `htu` the same way before comparing. Reject if the
+    // proof's `htu` cannot be parsed/normalized.
     let proof_htu = canonical_htu_from_url(&claims.htu).ok_or("DPoP URL mismatch")?;
     if proof_htu != input.htu {
         return Err("DPoP URL mismatch");
@@ -237,6 +261,17 @@ pub fn canonical_htu(scheme: &str, host: &str, path: &str) -> Option<String> {
 /// fails to parse, has no host, or contains userinfo. Per RFC 9449 §4.3, query
 /// and fragment are ignored (dropped by `canonical_htu`), but userinfo is part
 /// of the authority and must not be normalized away.
+///
+/// The path is canonicalized with [`crate::policy_path::canonicalize_policy_path`]
+/// — the same canonicalization the frontend applies before any plugin runs.
+/// The request-side reference is built from `RequestContext::path`, which the
+/// frontend has already rewritten to that canonical form (`/v1/a%3Ab` becomes
+/// `/v1/a:b`), while the `url` crate keeps the client's escapes verbatim. A
+/// proof bound to the exact URI the client sent would otherwise be rejected
+/// solely because the gateway canonicalized it. Both sides now describe the
+/// path the gateway authorizes and forwards; a proof path the frontend would
+/// itself refuse (an encoded separator, a dot segment, double encoding) has no
+/// canonical form and is a mismatch.
 pub fn canonical_htu_from_url(raw: &str) -> Option<String> {
     let parsed = url::Url::parse(raw).ok()?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -247,7 +282,8 @@ pub fn canonical_htu_from_url(raw: &str) -> Option<String> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     };
-    canonical_htu(parsed.scheme(), &host_with_port, parsed.path())
+    let path = crate::policy_path::canonicalize_policy_path(parsed.path()).ok()?;
+    canonical_htu(parsed.scheme(), &host_with_port, &path)
 }
 
 pub fn jwk_thumbprint_sha256(jwk: &Jwk) -> Result<String, String> {
@@ -263,6 +299,11 @@ pub fn jwk_thumbprint_sha256(jwk: &Jwk) -> Result<String, String> {
         ),
         AlgorithmParameters::RSA(params) => {
             format!(r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#, params.e, params.n)
+        }
+        // RFC 8037 §2: the OKP thumbprint members are `crv`, `kty`, `x`, in
+        // lexicographic order. Only Ed25519 is a DPoP signing key.
+        AlgorithmParameters::OctetKeyPair(params) if params.curve == EllipticCurve::Ed25519 => {
+            format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{}"}}"#, params.x)
         }
         _ => return Err("unsupported JWK type".to_string()),
     };
