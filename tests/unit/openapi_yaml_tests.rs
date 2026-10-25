@@ -7589,6 +7589,55 @@ fn assert_component_validity(
     );
 }
 
+/// `SpiffeIdentityConfig` admits exactly what `SpiffeIdentity::new` admits for
+/// every shape the schema can express — including the documented `null`
+/// config (spiffe_identity-SOL-2).
+#[test]
+fn spiffe_identity_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentity;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let cases = [
+        (serde_json::Value::Null, true),
+        (json!({}), true),
+        (json!({"require_identity": true}), true),
+        (json!({"allowed_trust_domains": ["prod.example.com"]}), true),
+        (json!({"forward_header": "x-spiffe-id"}), true),
+        (
+            json!({
+                "require_identity": true,
+                "allowed_trust_domains": ["prod.example.com", "staging.example.com"],
+                "forward_header": "x-spiffe-id"
+            }),
+            true,
+        ),
+        (json!([]), false),
+        (json!("spiffe"), false),
+        (json!(1), false),
+        (json!(true), false),
+        (json!({"unexpected": true}), false),
+        (json!({"require_identity": "yes"}), false),
+        (json!({"allowed_trust_domains": []}), false),
+        (json!({"allowed_trust_domains": [1]}), false),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com", "prod.example.com"]}),
+            false,
+        ),
+        (json!({"forward_header": ""}), false),
+        (json!({"forward_header": 7}), false),
+    ];
+    for (instance, expected_valid) in cases {
+        assert_component_validity(&spec, "SpiffeIdentityConfig", &instance, expected_valid);
+        assert_eq!(
+            SpiffeIdentity::new(&instance).is_ok(),
+            expected_valid,
+            "constructor/schema admission mismatch for {instance}"
+        );
+    }
+}
+
 #[test]
 fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
     let spec: serde_json::Value =

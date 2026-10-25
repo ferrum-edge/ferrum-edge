@@ -4192,8 +4192,9 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that every effective `mtls_auth` instance can receive a verified
-    /// client certificate on the proxy transport where it will execute.
+    /// Validate that every effective `mtls_auth` instance, and every
+    /// proxy/proxy-group-scoped `spiffe_identity` instance, can receive a
+    /// verified client certificate on the proxy transport where it will execute.
     pub fn validate_mtls_auth_compatibility(&self) -> Result<(), Vec<String>> {
         let errors = self.mtls_auth_compatibility_errors();
         if errors.is_empty() {
@@ -4207,14 +4208,6 @@ impl GatewayConfig {
     /// would install for each proxy. Any local proxy/proxy-group instance
     /// shadows all global instances of the same plugin type on that proxy.
     fn effective_mtls_auth_plugins_by_proxy(&self) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
-        // Association plugin_config_id values are namespace-local to the
-        // proxy. A bare-id index would bind a proxy to another tenant's
-        // same-id mtls_auth config.
-        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
-            .plugin_configs
-            .iter()
-            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
-            .collect();
         let global_mtls: Vec<&PluginConfig> = self
             .plugin_configs
             .iter()
@@ -4225,10 +4218,40 @@ impl GatewayConfig {
             })
             .collect();
 
+        self.local_plugins_by_proxy("mtls_auth")
+            .into_iter()
+            .map(|(proxy, local_mtls)| {
+                let effective = if local_mtls.is_empty() {
+                    // Globals are gateway-wide at runtime (`PluginCache` merges
+                    // the single global list into every proxy in every
+                    // namespace), so this must NOT be namespace-filtered —
+                    // only the association lookup in `local_plugins_by_proxy`
+                    // is namespace-local.
+                    global_mtls.clone()
+                } else {
+                    local_mtls
+                };
+                (proxy, effective)
+            })
+            .collect()
+    }
+
+    /// The enabled proxy/proxy-group-scoped `plugin_name` configurations each
+    /// proxy's associations attach to it. Globals are never included.
+    fn local_plugins_by_proxy(&self, plugin_name: &str) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
+        // Association plugin_config_id values are namespace-local to the
+        // proxy. A bare-id index would bind a proxy to another tenant's
+        // same-id config.
+        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
+            .plugin_configs
+            .iter()
+            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
+            .collect();
+
         self.proxies
             .iter()
             .map(|proxy| {
-                let local_mtls: Vec<&PluginConfig> = proxy
+                let local: Vec<&PluginConfig> = proxy
                     .plugins
                     .iter()
                     .filter_map(|association| {
@@ -4246,22 +4269,23 @@ impl GatewayConfig {
                             }
                             PluginScope::Global => false,
                         };
-                        (plugin.enabled && plugin.plugin_name == "mtls_auth" && scope_applies)
+                        (plugin.enabled && plugin.plugin_name == plugin_name && scope_applies)
                             .then_some(plugin)
                     })
                     .collect();
-                let effective = if local_mtls.is_empty() {
-                    // Globals are gateway-wide at runtime (`PluginCache` merges
-                    // the single global list into every proxy in every
-                    // namespace), so this must NOT be namespace-filtered —
-                    // only the association lookup above is namespace-local.
-                    global_mtls.clone()
-                } else {
-                    local_mtls
-                };
-                (proxy, effective)
+                (proxy, local)
             })
             .collect()
+    }
+
+    /// Whether the named proxy has an enabled proxy/proxy-group-scoped
+    /// `spiffe_identity` instance attached. Globals are deliberately not
+    /// counted: a global instance legitimately no-ops on plaintext listeners
+    /// (the mesh-injected `__mesh_spiffe_identity` among them).
+    pub(crate) fn has_scoped_spiffe_identity_for_proxy(&self, proxy_id: &str) -> bool {
+        self.local_plugins_by_proxy("spiffe_identity")
+            .into_iter()
+            .any(|(proxy, plugins)| proxy.id == proxy_id && !plugins.is_empty())
     }
 
     /// Whether the named proxy has at least one enabled `mtls_auth` instance
@@ -4290,6 +4314,25 @@ impl GatewayConfig {
                         proxy.id, plugin.id
                     ));
                 }
+            }
+        }
+
+        // A deliberately attached `spiffe_identity` on a stream proxy that
+        // terminates no TLS/DTLS can never see a peer certificate, so it would
+        // accept the config and then silently publish no principal for every
+        // connection — leaving a principal-keyed `mesh_authz` DENY unmatched.
+        // Globals stay exempt: they legitimately no-op on plaintext listeners.
+        for (proxy, scoped_plugins) in self.local_plugins_by_proxy("spiffe_identity") {
+            if !proxy.effective_scheme().is_stream() || (proxy.frontend_tls && !proxy.passthrough) {
+                continue;
+            }
+            for plugin in scoped_plugins {
+                errors.push(format!(
+                    "Proxy {:?} cannot use `spiffe_identity` PluginConfig {:?}: stream SPIFFE \
+                     identity extraction requires `frontend_tls=true` with TLS/DTLS termination \
+                     (`passthrough=false`)",
+                    proxy.id, plugin.id
+                ));
             }
         }
 

@@ -1270,6 +1270,100 @@ fn scoped_mtls_auth_does_not_cross_namespaces() {
     );
 }
 
+fn spiffe_identity_plugin(id: &str, scope: PluginScope, proxy_id: Option<&str>) -> PluginConfig {
+    let mut plugin = mtls_plugin(id, scope, proxy_id, serde_json::json!({}));
+    plugin.plugin_name = "spiffe_identity".to_string();
+    plugin
+}
+
+fn associate(proxy: &mut Proxy, plugin_config_id: &str) {
+    proxy.plugins.push(PluginAssociation {
+        plugin_config_id: plugin_config_id.to_string(),
+    });
+}
+
+#[test]
+fn scoped_spiffe_identity_is_refused_on_non_terminating_stream_proxies() {
+    // A deliberately attached instance on a stream listener that terminates no
+    // TLS/DTLS can never see a peer certificate (spiffe_identity-MUSE-2).
+    let mut plaintext = stream_proxy("plain", BackendScheme::Tcp, false);
+    associate(&mut plaintext, "spiffe-proxy");
+    let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, true);
+    passthrough.passthrough = true;
+    associate(&mut passthrough, "spiffe-group");
+    let mut plaintext_udp = stream_proxy("udp", BackendScheme::Udp, false);
+    associate(&mut plaintext_udp, "spiffe-group");
+    let config = GatewayConfig {
+        proxies: vec![plaintext, passthrough, plaintext_udp],
+        plugin_configs: vec![
+            spiffe_identity_plugin("spiffe-proxy", PluginScope::Proxy, Some("plain")),
+            spiffe_identity_plugin("spiffe-group", PluginScope::ProxyGroup, None),
+        ],
+        ..empty_config()
+    };
+
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    for proxy in ["plain", "passthrough", "udp"] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains(&format!("Proxy {proxy:?}"))
+                    && error.contains("cannot use `spiffe_identity` PluginConfig")
+                    && error.contains("passthrough=false")),
+            "{proxy}: {errors:?}"
+        );
+    }
+    assert!(config.validate_plugin_references().is_err());
+}
+
+#[test]
+fn scoped_spiffe_identity_is_admitted_on_terminating_streams_and_http() {
+    let mut tcps = stream_proxy("tcps", BackendScheme::Tcp, true);
+    associate(&mut tcps, "spiffe-group");
+    let mut dtls = stream_proxy("dtls", BackendScheme::Dtls, true);
+    associate(&mut dtls, "spiffe-group");
+    let mut http = make_proxy("http", "/api");
+    associate(&mut http, "spiffe-group");
+    let config = GatewayConfig {
+        proxies: vec![tcps, dtls, http],
+        plugin_configs: vec![spiffe_identity_plugin(
+            "spiffe-group",
+            PluginScope::ProxyGroup,
+            None,
+        )],
+        ..empty_config()
+    };
+
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
+}
+
+#[test]
+fn global_spiffe_identity_stays_a_no_op_beside_plaintext_streams() {
+    // The mesh-injected `__mesh_spiffe_identity` (and any operator global)
+    // legitimately no-ops on plaintext listeners in mixed deployments.
+    let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, false);
+    passthrough.passthrough = true;
+    let mut disabled_scoped = spiffe_identity_plugin("spiffe-off", PluginScope::ProxyGroup, None);
+    disabled_scoped.enabled = false;
+    let mut plain = stream_proxy("plain", BackendScheme::Tcp, false);
+    associate(&mut plain, "spiffe-off");
+    let config = GatewayConfig {
+        proxies: vec![
+            stream_proxy("tcp", BackendScheme::Tcp, false),
+            passthrough,
+            plain,
+        ],
+        plugin_configs: vec![
+            spiffe_identity_plugin("__mesh_spiffe_identity", PluginScope::Global, None),
+            disabled_scoped,
+        ],
+        ..empty_config()
+    };
+
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
+}
+
 #[test]
 fn omitted_consumers_deserializes_as_empty_vec() {
     let yaml = r#"

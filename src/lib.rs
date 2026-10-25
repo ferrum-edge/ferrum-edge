@@ -10645,6 +10645,16 @@ pub mod _test_support {
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
     }
 
+    /// Whether `ctx` carries, or would admit, a verified peer SPIFFE identity
+    /// — the HBONE refusal paths' peerless classifier. Exposed so external
+    /// tests can pin its agreement with `spiffe_identity` admission after a
+    /// captured deadline elapses.
+    pub fn has_verified_peer_spiffe_identity_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::plugins::mesh::spiffe_identity::has_verified_peer_spiffe_identity(ctx)
+    }
+
     /// The accepted request credential's monotonic deadline Instant, if any.
     /// Used to prove cache hits return the identical captured Instant rather
     /// than a freshly converted later value (issue #3816).
