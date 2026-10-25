@@ -44,8 +44,16 @@ unchanged. To publish backend cards exactly as written, set
 
 The same release also refuses a JSON-RPC request whose final backend-visible
 body changes Agent Card or streaming class after `a2a_gateway` admitted it (for
-example a `request_transformer` rule that rewrites `method`). A body rewrite
-that keeps the operation within one class is still admitted.
+example a `request_transformer` rule that rewrites `method`), or whose final
+body grows past `detection.max_request_body_size` or stops being a JSON
+document. A body rewrite that keeps the operation within one class is still
+admitted.
+
+`a2a_gateway`'s replay-provenance digest moved to a new version, so
+`request_deduplication` / `response_caching` representations retained before
+the upgrade on a proxy with `a2a_gateway` no longer replay: a retry under a
+previous idempotency key answers `409 Conflict` until the record expires, and a
+cached response is re-fetched.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 

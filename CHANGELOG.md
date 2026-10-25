@@ -160,8 +160,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into an Agent Card (or changed its streaming class) was dispatched under the
   arrival-time response handling, so a card could be served with the backend's
   internal URLs. Such a body is now refused with JSON-RPC `-32001` and
-  `a2a.error: operation_class_changed`; a same-class change refreshes
-  `a2a.method`. The final-body hook no longer runs where it cannot change an
+  `a2a.error: operation_class_changed`, and an admitted request whose final
+  body outgrows `detection.max_request_body_size` (`413`) or is no longer a
+  JSON document (`-32001`, `operation_class_unprovable`) is refused too; a
+  same-class change refreshes `a2a.method` and `a2a.task_id`. The final-body hook no longer runs where it cannot change an
   outcome and skips re-parsing a body byte-identical to the one classified at
   arrival.
 - **`a2a_gateway` bounds SSE semantic metadata when it is retained** (PR

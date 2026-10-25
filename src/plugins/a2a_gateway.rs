@@ -26,7 +26,13 @@ use crate::util::unknown_keys::reject_unknown_keys;
 /// Domain separator and schema version for [`A2aGateway`] replay provenance.
 /// Bumping the version invalidates every previously persisted representation
 /// rather than letting an old digest match new semantics.
-const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.a2a_gateway.static.v1";
+///
+/// `v2`: encoded and partial HTTP Agent Cards are now decoded-and-rewritten or
+/// refused, and `GRPC` / `HTTP+JSON` interface URLs are rewritten. A
+/// representation retained under `v1` may be an encoded card carrying the
+/// backend's internal URLs, which a finalized replay would serve without
+/// re-running the rewrite, so it must no longer match.
+const STATIC_POLICY_DIGEST_DOMAIN: &str = "ferrum.plugin.a2a_gateway.static.v2";
 
 /// Process-unique instance identity for the per-request claim
 /// ([`A2aGatewayClaim`]). Two `a2a_gateway` instances on one proxy have
@@ -785,19 +791,7 @@ impl A2aGateway {
                 "Skipping A2A JSON-RPC detection because request body exceeds plugin detection limit"
             );
             if self.policy_requires_inspection() {
-                return Some(A2aDetection {
-                    binding: A2aBinding::JsonRpc,
-                    method: "unknown".to_string(),
-                    jsonrpc_id: None,
-                    jsonrpc_batch_response: false,
-                    jsonrpc_batch_ids: None,
-                    task_id_hint: None,
-                    streaming_hint: false,
-                    is_agent_card: false,
-                    grpc_card_schema: None,
-                    oversized_body: true,
-                    inspection_failed: false,
-                });
+                return Some(oversized_jsonrpc_detection());
             }
             return None;
         }
@@ -1494,6 +1488,57 @@ impl A2aGateway {
             None => detection.is_agent_card && self.discovery.rewrite_agent_card_urls,
         }
     }
+
+    /// Whether a finalized body this instance admitted as JSON-RPC can no
+    /// longer be classified at all, while its response handling still depends
+    /// on the operation class.
+    ///
+    /// [`A2aGateway::detect_jsonrpc_body`] answers `None` both for a request
+    /// outside this instance's scope and for an in-scope body it cannot read —
+    /// one grown past `detection.max_request_body_size`, or one that is no
+    /// longer a JSON document (a content coding a later phase applied, for
+    /// example). For a request admitted as JSON-RPC the second case cannot be
+    /// proven to keep the admitted class (a valid but oversized
+    /// `agent/getCard` envelope would otherwise be dispatched under non-card
+    /// response handling), so it is refused at the detection ceiling rather
+    /// than parsed without bound. A parseable body this classifier simply does
+    /// not recognize (for example an unknown method) is not covered: that is
+    /// not an Agent Card or streaming operation the response phase acts on.
+    ///
+    /// Returns `Some(true)` for an oversized body, `Some(false)` for one that is
+    /// no longer a JSON document, and `None` when nothing needs refusing.
+    fn final_jsonrpc_class_unprovable(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> Option<bool> {
+        if !(self.discovery.rewrite_agent_card_urls || self.observability.emit_metadata) {
+            return None;
+        }
+        if !self
+            .claim(ctx)
+            .is_some_and(|claim| claim.binding == A2aBinding::JsonRpc.as_str())
+        {
+            return None;
+        }
+        if !ctx.method.eq_ignore_ascii_case("POST")
+            || ctx.path != self.endpoint.path
+            || !content_type_is_json(headers)
+        {
+            return None;
+        }
+        if self.detection.max_request_body_size > 0
+            && body.len() as u64 > self.detection.max_request_body_size
+        {
+            return Some(true);
+        }
+        // Bounded by the detection ceiling just checked; parses without
+        // building a tree.
+        serde_json::from_slice::<serde::de::IgnoredAny>(body)
+            .is_err()
+            .then_some(false)
+    }
 }
 
 #[async_trait]
@@ -2091,6 +2136,26 @@ impl Plugin for A2aGateway {
             return PluginResult::Continue;
         }
         let Some(detection) = self.detect_jsonrpc_body(ctx, headers, body) else {
+            if let Some(oversized) = self.final_jsonrpc_class_unprovable(ctx, headers, body) {
+                if self.observability.emit_metadata {
+                    ctx.metadata
+                        .insert("a2a.policy_decision".to_string(), "deny".to_string());
+                    ctx.metadata.insert(
+                        "a2a.error".to_string(),
+                        "operation_class_unprovable".to_string(),
+                    );
+                }
+                warn_sampled!(
+                    body_size = body.len(),
+                    "Refusing admitted A2A request whose final body can no longer be classified"
+                );
+                let detection = unclassified_jsonrpc_detection(oversized);
+                return if oversized {
+                    oversized_jsonrpc_response(&detection)
+                } else {
+                    reclassified_jsonrpc_response(&detection)
+                };
+            }
             return PluginResult::Continue;
         };
         if let Some(terminal) = self.jsonrpc_policy_terminal(ctx, &detection) {
@@ -2125,6 +2190,10 @@ impl Plugin for A2aGateway {
                     task_id,
                     self.observability.max_payload_size,
                 );
+            } else {
+                // The arrival-time hint described a different envelope.
+                ctx.metadata.remove("a2a.task_id");
+                ctx.metadata.remove("a2a.task_id.truncated");
             }
         }
         PluginResult::Continue
@@ -2925,6 +2994,31 @@ fn reclassified_jsonrpc_response(detection: &A2aDetection) -> PluginResult {
         )
         .to_string(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    }
+}
+
+/// The detection a JSON-RPC body over `detection.max_request_body_size`
+/// receives: it was never parsed, so nothing about it is known.
+fn oversized_jsonrpc_detection() -> A2aDetection {
+    unclassified_jsonrpc_detection(true)
+}
+
+/// A JSON-RPC detection that carries no classified operation: `oversized` when
+/// the body exceeded the detection ceiling, otherwise one that could not be
+/// read.
+fn unclassified_jsonrpc_detection(oversized: bool) -> A2aDetection {
+    A2aDetection {
+        binding: A2aBinding::JsonRpc,
+        method: "unknown".to_string(),
+        jsonrpc_id: None,
+        jsonrpc_batch_response: false,
+        jsonrpc_batch_ids: None,
+        task_id_hint: None,
+        streaming_hint: false,
+        is_agent_card: false,
+        grpc_card_schema: None,
+        oversized_body: oversized,
+        inspection_failed: !oversized,
     }
 }
 

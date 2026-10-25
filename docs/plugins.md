@@ -9017,7 +9017,14 @@ therefore refused before dispatch with JSON-RPC `-32001` ("A2A operation changed
 after gateway admission", `a2a.error: operation_class_changed`) whenever card
 rewriting or metadata depends on that class, instead of being served under
 response handling built for a different operation. A same-class method change is
-admitted and refreshes `a2a.method`. A finalized body byte-identical to the one
+admitted and refreshes `a2a.method` (and `a2a.task_id`, which is removed when
+the new envelope carries no task hint). A finalized body of an admitted
+JSON-RPC request that can no longer be classified at all — grown past
+`detection.max_request_body_size` (HTTP `413`, JSON-RPC `-32013`) or no longer a
+JSON document (`-32001`, `a2a.error: operation_class_unprovable`) — is refused
+the same way while card rewriting or metadata is enabled; raise
+`detection.max_request_body_size` (or set it to `0`) if transforms legitimately
+grow bodies past it. A finalized body byte-identical to the one
 classified at arrival is not re-parsed, and an instance with no deny rule, no
 card rewriting, and no metadata skips the final-body hook entirely.
 

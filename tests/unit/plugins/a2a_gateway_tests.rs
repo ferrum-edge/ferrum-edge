@@ -6565,7 +6565,7 @@ async fn final_body_that_becomes_an_agent_card_without_arrival_classification_is
         gateway.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
     ));
-    assert!(ctx.metadata.get("a2a.method").is_none());
+    assert!(!ctx.metadata.contains_key("a2a.method"));
     let dispatched = json!({"jsonrpc": "2.0", "id": 7, "method": "agent/getCard"}).to_string();
     assert!(matches!(
         gateway
@@ -6997,4 +6997,156 @@ fn openapi_a2a_gateway_schema_matches_constructor_admission() {
             "constructor admission for {config}"
         );
     }
+}
+
+// ── PR #6841 fix round 1 ──────────────────────────────────────────────────
+
+/// PR6841-SOL-1: a valid card envelope grown past the detection ceiling after
+/// admission cannot be classified, so it is refused rather than dispatched
+/// under the admitted non-card response handling.
+#[tokio::test]
+async fn admitted_request_whose_final_body_outgrows_detection_is_refused() {
+    let gateway = plugin(json!({
+        "detection": {"max_request_body_size": 128},
+        "observability": {"emit_metadata": false}
+    }));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/list",
+        "params": {}
+    }));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = json!({
+        "jsonrpc": "2.0",
+        "id": "x".repeat(256),
+        "method": "agent/getCard"
+    })
+    .to_string();
+    assert!(dispatched.len() > 128);
+    let PluginResult::Reject { status_code, .. } = gateway
+        .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+        .await
+    else {
+        panic!("an unclassifiable final body of an admitted request must be refused");
+    };
+    assert_eq!(status_code, 413);
+}
+
+/// The same holds for a final body that is no longer a JSON document (here a
+/// content coding a later phase applied).
+#[tokio::test]
+async fn admitted_request_whose_final_body_is_unreadable_is_refused() {
+    let gateway = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get",
+        "params": {"id": "task-1"}
+    }));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let card = json!({"jsonrpc": "2.0", "id": "req-1", "method": "agent/getCard"}).to_string();
+    let dispatched = gzip_bytes(card.as_bytes());
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway
+        .on_final_request_body_with_context(&mut ctx, &headers, &dispatched)
+        .await
+    else {
+        panic!("an unreadable final body of an admitted request must be refused");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(
+        ctx.metadata.get("a2a.error").map(String::as_str),
+        Some("operation_class_unprovable")
+    );
+}
+
+/// A request that was never classified (here: already over the ceiling at
+/// arrival) is unaffected, so large uploads on an observability-only
+/// configuration keep passing.
+#[tokio::test]
+async fn unclassified_oversized_request_is_not_refused_at_the_final_body() {
+    let gateway = plugin(json!({"detection": {"max_request_body_size": 64}}));
+    let large = json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "message/send",
+        "params": {"message": {"role": "user", "parts": [{"text": "y".repeat(256)}]}}
+    });
+    let (mut ctx, mut headers) = jsonrpc_ctx(large.clone());
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(!ctx.metadata.contains_key("a2a.method"));
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, large.to_string().as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// PR6841-SOL-3: a same-class rewrite that drops the task hint must not leave
+/// the arrival-time task id (or its truncation flag) behind.
+#[tokio::test]
+async fn same_class_final_method_change_drops_a_stale_task_id() {
+    let gateway = plugin(json!({"observability": {"max_payload_size": 8}}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "tasks/get",
+        "params": {"id": "task-old-and-long"}
+    }));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(ctx.metadata.contains_key("a2a.task_id"));
+    assert!(ctx.metadata.contains_key("a2a.task_id.truncated"));
+    let dispatched = json!({
+        "jsonrpc": "2.0",
+        "id": "req-1",
+        "method": "message/send",
+        "params": {"message": {"role": "user", "parts": []}}
+    })
+    .to_string();
+    assert!(matches!(
+        gateway
+            .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("a2a.method").map(String::as_str),
+        Some("message/send")
+    );
+    assert!(!ctx.metadata.contains_key("a2a.task_id"));
+    assert!(!ctx.metadata.contains_key("a2a.task_id.truncated"));
+}
+
+/// PR6841-SOL-2: the presentation semantics changed (encoded/partial cards,
+/// GRPC and HTTP+JSON rewriting), so a representation retained under the
+/// previous replay-provenance domain must no longer match.
+#[test]
+fn a2a_presentation_digest_moved_past_the_v1_domain() {
+    let config = configured_base_config();
+    let v1 = ferrum_edge::plugins::utils::policy_digest::static_config_digest(
+        "ferrum.plugin.a2a_gateway.static.v1",
+        &config,
+    );
+    assert_ne!(
+        static_presentation_digest(config),
+        v1,
+        "replays stored under the pre-fix card semantics must be refused"
+    );
 }
