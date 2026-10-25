@@ -5,8 +5,11 @@ use ferrum_edge::plugins::ws_rate_limiting::WsRateLimiting;
 use ferrum_edge::plugins::{
     Plugin, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection, priority,
 };
+use ferrum_edge::plugins::{RequestContext, WsDisconnectContext};
 use serde_json::json;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 // === Plugin creation and metadata ===
@@ -492,9 +495,10 @@ fn test_zero_burst_size_returns_error() {
 fn test_burst_size_smaller_than_fps_returns_error() {
     // The Redis sliding-window approximation assumes burst >= fps so the
     // derived window stays >= 1s and sustained rate matches fps. Reject
-    // burst < fps at construction to keep local and Redis paths aligned.
+    // burst < fps at construction when Redis sync keeps local and Redis paths
+    // aligned.
     let result = WsRateLimiting::new(
-        &json!({"frames_per_second": 100, "burst_size": 50}),
+        &unavailable_redis_ws_config(json!({"frames_per_second": 100, "burst_size": 50})),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -513,9 +517,9 @@ fn test_burst_size_smaller_than_fps_returns_error() {
 fn test_nonintegral_burst_fps_ratio_returns_error() {
     // GHSA-cjcm-546w-696v: ceil(burst/fps) windows under-admit non-integral
     // ratios on Redis (e.g. 75/50 → 37.5 fps). Reject them so accepted
-    // configs keep local/Redis sustained-rate parity.
+    // Redis-synced configs keep local/Redis sustained-rate parity.
     let result = WsRateLimiting::new(
-        &json!({"frames_per_second": 50, "burst_size": 75}),
+        &unavailable_redis_ws_config(json!({"frames_per_second": 50, "burst_size": 75})),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -533,7 +537,7 @@ fn test_overlong_refill_window_returns_error() {
     // or historically 10_000_000 / 3600 ≈ 2778 fps). Keep burst within the
     // operational ceiling so this asserts the window-parity gate specifically.
     let result = WsRateLimiting::new(
-        &json!({"frames_per_second": 1, "burst_size": 3601}),
+        &unavailable_redis_ws_config(json!({"frames_per_second": 1, "burst_size": 3601})),
         PluginHttpClient::default(),
     );
     assert!(result.is_err());
@@ -650,6 +654,7 @@ fn test_accepts_every_documented_root_key() {
             "frames_per_second": 10,
             "burst_size": 20,
             "close_reason": "slow down",
+            "limit_by": "connection",
             "sync_mode": "redis",
             "redis_url": "redis://127.0.0.1:6379/0",
             "redis_tls": false,
@@ -1220,7 +1225,8 @@ fn shared_frame_rate_relations_keep_fields_and_withhold_numeric_operands() {
         (731, 1463, "must be an integer multiple of"),
         (1, 3731, "exceeds the Redis-representable maximum"),
     ] {
-        let config = json!({"frames_per_second": frames, "burst_size": burst});
+        let config =
+            unavailable_redis_ws_config(json!({"frames_per_second": frames, "burst_size": burst}));
         let error = WsRateLimiting::new(&config, PluginHttpClient::default())
             .err()
             .expect("unrepresentable frame rate must still be rejected");
@@ -1237,4 +1243,497 @@ fn shared_frame_rate_relations_keep_fields_and_withhold_numeric_operands() {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }
+}
+
+// === Hard-cap reclamation (ws_rate_limiting-SOL-1) ===
+
+/// Atomic admission never lets the map grow past the cap, so capacity pressure
+/// must start AT the cap. A map filled exactly to the cap with idle entries is
+/// reclaimed by the pre-admission eviction gate, and the next unseen session is
+/// admitted, without waiting for a traffic-count-sampled sweep.
+#[test]
+fn idle_entries_at_the_hard_cap_are_reclaimed_before_admission() {
+    use ferrum_edge::_test_support::{
+        ws_rate_limiting_admits_at_production_cap_for_test as admits,
+        ws_rate_limiting_max_state_entries_for_test as max_state_entries,
+        ws_rate_limiting_maybe_evict_at_for_test as maybe_evict,
+        ws_rate_limiting_seed_connection_for_test as seed,
+    };
+
+    // Defaults: 100 fps / burst 100 → 1 s refill window, idle after 2 s.
+    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap();
+    let cap = max_state_entries();
+    let seeded_at = Instant::now();
+    for connection_id in 0..cap as u64 {
+        seed(&plugin, connection_id, seeded_at);
+    }
+    assert_eq!(plugin.tracked_keys_count(), Some(cap));
+    let fresh = cap as u64;
+    assert!(
+        !admits(&plugin, fresh, seeded_at),
+        "precondition: an unseen session is refused while the map is exactly full"
+    );
+
+    // The periodic sample is not armed: only capacity pressure can sweep.
+    // Buckets record their creation instant, so stay well past the 2 s idle
+    // threshold even if seeding the full map was slow.
+    let idle_at = seeded_at + Duration::from_secs(30);
+    let _ = maybe_evict(&plugin, idle_at);
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "idle entries at exactly the cap must be reclaimed by the capacity gate"
+    );
+    assert!(
+        admits(&plugin, fresh, idle_at),
+        "a new session must be admitted once idle state is reclaimed"
+    );
+}
+
+/// The reclamation is stale-only: a map full of active budgets keeps them and
+/// keeps refusing unseen sessions, while existing sessions continue.
+#[test]
+fn active_budgets_at_the_hard_cap_are_never_evicted() {
+    use ferrum_edge::_test_support::{
+        ws_rate_limiting_admits_at_production_cap_for_test as admits,
+        ws_rate_limiting_max_state_entries_for_test as max_state_entries,
+        ws_rate_limiting_maybe_evict_at_for_test as maybe_evict,
+        ws_rate_limiting_seed_connection_for_test as seed,
+    };
+
+    let plugin = WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap();
+    let cap = max_state_entries();
+    let seeded_at = Instant::now();
+    for connection_id in 0..cap as u64 {
+        seed(&plugin, connection_id, seeded_at);
+    }
+
+    // Still inside the 2 s activity window of every bucket (each records its
+    // creation instant, which is no earlier than `seeded_at`).
+    let active_at = seeded_at + Duration::from_millis(1500);
+    let _ = maybe_evict(&plugin, active_at);
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(cap),
+        "active budgets must never be force-evicted"
+    );
+    assert!(
+        !admits(&plugin, cap as u64, active_at),
+        "an unseen session must still fail closed at an active cap"
+    );
+    assert!(
+        admits(&plugin, 0, active_at),
+        "an existing session continues on its own budget at the cap"
+    );
+}
+
+// === Disconnect releases connection state (ws_rate_limiting-CLAUDE-1) ===
+
+fn ws_disconnect_ctx(connection_id: u64) -> WsDisconnectContext {
+    WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "test-proxy".to_string(),
+        proxy_lifecycle_generation: None,
+        proxy_name: None,
+        client_ip: "10.0.0.1".to_string(),
+        backend_target: "ws://backend.local:9000/ws".to_string(),
+        http_method: "GET".to_string(),
+        request_path: "/ws".to_string(),
+        handshake_status_code: 101,
+        listen_port: 8080,
+        duration_ms: 1.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 0,
+        bytes_client_to_backend: 5,
+        bytes_backend_to_client: 0,
+        timestamp_connected: "2026-01-01T00:00:00Z".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01Z".to_string(),
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: None,
+        auth_method: None,
+        connection_id,
+        metadata: ferrum_edge::plugins::MetadataMap::default(),
+    }
+}
+
+/// A long refill window keeps a bucket "active" for two hours after its last
+/// frame, so only the disconnect hook can release a finished session's slot.
+fn long_window_config() -> serde_json::Value {
+    json!({"frames_per_second": 1, "burst_size": 3600})
+}
+
+#[tokio::test]
+async fn disconnect_releases_the_finished_connection_budget() {
+    let plugin = WsRateLimiting::new(&long_window_config(), PluginHttpClient::default()).unwrap();
+    assert!(
+        plugin.requires_ws_disconnect_hooks(),
+        "connection mode must opt into disconnect hooks to release its state"
+    );
+    let msg = Message::Text("hello".into());
+    let direction = WebSocketFrameDirection::ClientToBackend;
+
+    assert!(
+        plugin
+            .on_ws_frame("test-proxy", 7, direction, &msg)
+            .await
+            .is_none()
+    );
+    assert!(
+        plugin
+            .on_ws_frame("test-proxy", 8, direction, &msg)
+            .await
+            .is_none()
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    plugin.on_ws_disconnect(&ws_disconnect_ctx(7)).await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    assert!(!ferrum_edge::_test_support::ws_rate_limiting_contains_connection_for_test(&plugin, 7));
+    assert!(
+        ferrum_edge::_test_support::ws_rate_limiting_contains_connection_for_test(&plugin, 8),
+        "a live session keeps its consumed budget"
+    );
+
+    // A repeated or unknown disconnect is a no-op, never an underflow.
+    plugin.on_ws_disconnect(&ws_disconnect_ctx(7)).await;
+    plugin.on_ws_disconnect(&ws_disconnect_ctx(99)).await;
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
+
+/// More finished sessions than the hard cap, each of whose bucket stays
+/// "active" for the whole test: without disconnect release the map fills and
+/// every later session is policy-closed on its first frame.
+#[tokio::test]
+async fn connection_churn_beyond_the_cap_never_locks_out_new_sessions() {
+    let plugin = WsRateLimiting::new(&long_window_config(), PluginHttpClient::default()).unwrap();
+    let cap = ferrum_edge::_test_support::ws_rate_limiting_max_state_entries_for_test() as u64;
+    let msg = Message::Text("hello".into());
+    let direction = WebSocketFrameDirection::ClientToBackend;
+    let mut disconnect = ws_disconnect_ctx(0);
+
+    for connection_id in 0..=cap {
+        let result = plugin
+            .on_ws_frame("test-proxy", connection_id, direction, &msg)
+            .await;
+        assert!(
+            result.is_none(),
+            "session {connection_id} must be admitted after earlier sessions ended"
+        );
+        disconnect.connection_id = connection_id;
+        plugin.on_ws_disconnect(&disconnect).await;
+    }
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+// === Aggregate budgets via `limit_by` (ws_rate_limiting-SOL-2) ===
+
+fn upgrade_context(client_ip: &str, consumer: Option<&str>) -> RequestContext {
+    let mut ctx = RequestContext::new(client_ip.to_string(), "GET".to_string(), "/ws".to_string());
+    if let Some(username) = consumer {
+        let mut identified = super::plugin_utils::create_test_consumer();
+        identified.id = username.to_string();
+        identified.username = username.to_string();
+        ctx.identified_consumer = Some(Arc::new(identified));
+    }
+    ctx
+}
+
+fn proxy_context(proxy_id: &str) -> RequestContext {
+    let mut ctx = upgrade_context("10.0.0.1", None);
+    let mut proxy = super::plugin_utils::create_test_proxy();
+    proxy.id = proxy_id.to_string();
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    ctx
+}
+
+/// Burst 2 refilled at one frame per second: the shared-budget tests spend the
+/// burst within a few awaits, so a scheduling stall under a second cannot refill
+/// a token and flip a refusal.
+fn aggregate_plugin(limit_by: &str) -> Arc<WsRateLimiting> {
+    Arc::new(
+        WsRateLimiting::new(
+            &json!({"frames_per_second": 1, "burst_size": 2, "limit_by": limit_by}),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    )
+}
+
+fn bind(plugin: &Arc<WsRateLimiting>, ctx: &RequestContext) -> Arc<dyn Plugin> {
+    Arc::clone(plugin)
+        .bind_ws_session(ctx)
+        .expect("an aggregate limit_by must bind a session-scoped instance")
+}
+
+async fn frame(session: &Arc<dyn Plugin>, connection_id: u64) -> Option<Message> {
+    session
+        .on_ws_frame(
+            "test-proxy",
+            connection_id,
+            WebSocketFrameDirection::ClientToBackend,
+            &Message::Text("hello".into()),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn consumer_budget_is_shared_across_sessions_and_isolated_between_consumers() {
+    let plugin = aggregate_plugin("consumer");
+    let alice = upgrade_context("10.0.0.1", Some("alice"));
+    let first = bind(&plugin, &alice);
+    let second = bind(&plugin, &alice);
+    assert_eq!(first.name(), "ws_rate_limiting");
+    assert_eq!(first.priority(), priority::WS_RATE_LIMITING);
+    assert!(first.requires_ws_frame_hooks());
+
+    assert!(frame(&first, 1).await.is_none());
+    assert!(frame(&second, 2).await.is_none());
+    assert!(
+        is_policy_close(&frame(&second, 2).await),
+        "a second session of the same consumer must draw on the shared budget"
+    );
+
+    // Same client IP, different consumer: an independent budget.
+    let bob = bind(&plugin, &upgrade_context("10.0.0.1", Some("bob")));
+    assert!(frame(&bob, 3).await.is_none());
+}
+
+#[tokio::test]
+async fn consumer_mode_falls_back_to_the_client_ip_for_anonymous_sessions() {
+    let plugin = aggregate_plugin("consumer");
+    let first = bind(&plugin, &upgrade_context("10.0.0.9", None));
+    let second = bind(&plugin, &upgrade_context("10.0.0.9", None));
+    assert!(frame(&first, 1).await.is_none());
+    assert!(frame(&first, 1).await.is_none());
+    assert!(is_policy_close(&frame(&second, 2).await));
+
+    let other_ip = bind(&plugin, &upgrade_context("10.0.0.10", None));
+    assert!(frame(&other_ip, 3).await.is_none());
+}
+
+#[tokio::test]
+async fn ip_budget_is_shared_across_sessions_and_consumers_of_one_address() {
+    let plugin = aggregate_plugin("ip");
+    let alice = bind(&plugin, &upgrade_context("192.0.2.1", Some("alice")));
+    let bob = bind(&plugin, &upgrade_context("192.0.2.1", Some("bob")));
+    assert!(frame(&alice, 1).await.is_none());
+    assert!(frame(&bob, 2).await.is_none());
+    assert!(is_policy_close(&frame(&alice, 1).await));
+
+    let other_ip = bind(&plugin, &upgrade_context("192.0.2.2", Some("alice")));
+    assert!(frame(&other_ip, 3).await.is_none());
+}
+
+#[tokio::test]
+async fn service_budget_is_shared_across_sessions_of_one_proxy() {
+    let plugin = aggregate_plugin("service");
+    let first = bind(&plugin, &proxy_context("proxy-a"));
+    let second = bind(&plugin, &proxy_context("proxy-a"));
+    assert!(frame(&first, 1).await.is_none());
+    assert!(frame(&second, 2).await.is_none());
+    assert!(is_policy_close(&frame(&first, 1).await));
+
+    let other_proxy = bind(&plugin, &proxy_context("proxy-b"));
+    assert!(frame(&other_proxy, 3).await.is_none());
+}
+
+#[tokio::test]
+async fn aggregate_fragment_batches_charge_the_shared_budget() {
+    let plugin = aggregate_plugin("ip");
+    let first = bind(&plugin, &upgrade_context("198.51.100.7", None));
+    let second = bind(&plugin, &upgrade_context("198.51.100.7", None));
+    let direction = WebSocketFrameDirection::ClientToBackend;
+
+    assert!(
+        first
+            .on_ws_reassembly_frames("test-proxy", 1, direction, 2)
+            .await
+            .is_none()
+    );
+    assert!(
+        is_policy_close(
+            &second
+                .on_ws_reassembly_frames("test-proxy", 2, direction, 1)
+                .await
+        ),
+        "fragments on one session must drain the budget every bound session shares"
+    );
+    assert!(
+        second
+            .on_ws_reassembly_frames("test-proxy", 2, direction, 0)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn connection_mode_keeps_the_shared_instance_and_aggregate_modes_skip_disconnect() {
+    let connection =
+        Arc::new(WsRateLimiting::new(&json!({}), PluginHttpClient::default()).unwrap());
+    let explicit = Arc::new(
+        WsRateLimiting::new(
+            &json!({"limit_by": "connection"}),
+            PluginHttpClient::default(),
+        )
+        .unwrap(),
+    );
+    let ctx = upgrade_context("10.0.0.1", Some("alice"));
+    assert!(Arc::clone(&connection).bind_ws_session(&ctx).is_none());
+    assert!(Arc::clone(&explicit).bind_ws_session(&ctx).is_none());
+    assert!(explicit.requires_ws_disconnect_hooks());
+
+    for limit_by in ["consumer", "ip", "service"] {
+        assert!(
+            !aggregate_plugin(limit_by).requires_ws_disconnect_hooks(),
+            "{limit_by}: an aggregate budget outlives one session"
+        );
+    }
+}
+
+/// An aggregate budget resolves its identity only at session binding. A relay
+/// path that skipped binding has no identity to charge, so the shared instance
+/// fails closed instead of silently enforcing a weaker per-connection budget.
+#[tokio::test]
+async fn unbound_aggregate_frames_fail_closed() {
+    let plugin = aggregate_plugin("consumer");
+    let direction = WebSocketFrameDirection::ClientToBackend;
+    let message = plugin
+        .on_ws_frame("test-proxy", 1, direction, &Message::Text("hello".into()))
+        .await;
+    assert!(is_policy_close(&message));
+    let fragment = plugin
+        .on_ws_reassembly_frames("test-proxy", 1, direction, 2)
+        .await;
+    assert!(is_policy_close(&fragment));
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+#[test]
+fn limit_by_rejects_unknown_and_non_string_values_without_echo() {
+    for config in [
+        json!({"limit_by": "UNREGISTERED_DIMENSION"}),
+        json!({"limit_by": "Consumer"}),
+        json!({"limit_by": 7}),
+        json!({"limit_by": null}),
+    ] {
+        let error = WsRateLimiting::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("limit_by must be rejected: {config}"));
+        assert!(error.contains("`limit_by`"), "{error}");
+        assert!(!error.contains("UNREGISTERED_DIMENSION"), "{error}");
+    }
+}
+
+#[test]
+fn limit_by_is_part_of_the_local_state_semantics() {
+    use ferrum_edge::_test_support::{
+        ws_rate_limiting_shares_local_state_for_test as shares,
+        ws_rate_limiting_with_policy_identity_for_test as with_identity,
+    };
+    let omitted = with_identity(&json!({}), "ferrum", "ws-limit-by-semantics").unwrap();
+    let explicit = with_identity(
+        &json!({"limit_by": "connection"}),
+        "ferrum",
+        "ws-limit-by-semantics",
+    )
+    .unwrap();
+    let consumer = with_identity(
+        &json!({"limit_by": "consumer"}),
+        "ferrum",
+        "ws-limit-by-semantics",
+    )
+    .unwrap();
+    assert!(
+        shares(&omitted, &explicit),
+        "the explicit default must keep the live budget"
+    );
+    assert!(
+        !shares(&omitted, &consumer),
+        "a dimension change must isolate onto fresh state"
+    );
+}
+
+// === Local mode accepts any token-bucket shape (ws_rate_limiting-CLAUDE-3) ===
+
+#[test]
+fn local_mode_accepts_any_token_bucket_shape_and_enforces_its_burst() {
+    use ferrum_edge::_test_support::ws_rate_limiting_charge_frame_for_test as charge;
+    for (frames_per_second, burst_size) in [(60u64, 90u64), (1000, 100), (1, 7200)] {
+        let plugin = WsRateLimiting::new(
+            &json!({
+                "frames_per_second": frames_per_second,
+                "burst_size": burst_size,
+                "sync_mode": "local"
+            }),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|error| panic!("{frames_per_second}/{burst_size}: {error}"));
+        let now = Instant::now();
+        for index in 0..burst_size {
+            assert!(
+                charge(&plugin, 1, now),
+                "{frames_per_second}/{burst_size}: frame {index} is inside the burst"
+            );
+        }
+        assert!(
+            !charge(&plugin, 1, now),
+            "{frames_per_second}/{burst_size}: the burst is the instantaneous ceiling"
+        );
+    }
+}
+
+#[test]
+fn redis_mode_keeps_rejecting_unrepresentable_token_bucket_shapes() {
+    for (frames_per_second, burst_size, reason) in [
+        (60u64, 90u64, "integer multiple"),
+        (1000, 100, "must be >="),
+        (1, 7200, "Redis-representable maximum"),
+    ] {
+        let error = WsRateLimiting::new(
+            &unavailable_redis_ws_config(
+                json!({"frames_per_second": frames_per_second, "burst_size": burst_size}),
+            ),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{frames_per_second}/{burst_size} must be rejected"));
+        assert!(error.contains(reason), "{error}");
+    }
+}
+
+// === Close accounting by reason (ws_rate_limiting-CLAUDE-4) ===
+
+/// A fail-closed close while Redis is unavailable is not a budget overrun: it
+/// is counted in `ferrum_rate_limit_enforcement_unavailable_total` so an outage
+/// that mass-closes sessions is visible in metrics.
+#[tokio::test]
+async fn fail_closed_close_is_counted_as_enforcement_unavailable() {
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let before = registry
+        .rate_limit_unavailable_denials
+        .load(Ordering::Relaxed);
+    let plugin = WsRateLimiting::new(
+        &unavailable_redis_ws_config(json!({})),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let direction = WebSocketFrameDirection::ClientToBackend;
+
+    let message = plugin
+        .on_ws_frame("proxy", 1, direction, &Message::Text("hello".into()))
+        .await;
+    let fragment = plugin
+        .on_ws_reassembly_frames("proxy", 2, direction, 3)
+        .await;
+    assert!(is_policy_close(&message));
+    assert!(is_policy_close(&fragment));
+    assert!(
+        registry
+            .rate_limit_unavailable_denials
+            .load(Ordering::Relaxed)
+            >= before + 2,
+        "each fail-closed close must count as enforcement unavailable"
+    );
 }

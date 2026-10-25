@@ -38,6 +38,9 @@ struct CapturedWsLog {
     bytes_c2b: Option<u64>,
     bytes_b2c: Option<u64>,
     io_side: Option<String>,
+    plugin_id: Option<String>,
+    termination_reason: Option<String>,
+    max_records_per_connection: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -97,6 +100,9 @@ where
             bytes_c2b: visitor.bytes_c2b,
             bytes_b2c: visitor.bytes_b2c,
             io_side: visitor.io_side,
+            plugin_id: visitor.plugin_id,
+            termination_reason: visitor.termination_reason,
+            max_records_per_connection: visitor.max_records_per_connection,
         });
     }
 }
@@ -120,6 +126,9 @@ struct WsLogVisitor {
     bytes_c2b: Option<u64>,
     bytes_b2c: Option<u64>,
     io_side: Option<String>,
+    plugin_id: Option<String>,
+    termination_reason: Option<String>,
+    max_records_per_connection: Option<u64>,
 }
 
 impl tracing::field::Visit for WsLogVisitor {
@@ -133,6 +142,7 @@ impl tracing::field::Visit for WsLogVisitor {
             "frames_b2c" => self.frames_b2c = Some(value),
             "bytes_c2b" => self.bytes_c2b = Some(value),
             "bytes_b2c" => self.bytes_b2c = Some(value),
+            "max_records_per_connection" => self.max_records_per_connection = Some(value),
             _ => {}
         }
     }
@@ -154,6 +164,8 @@ impl tracing::field::Visit for WsLogVisitor {
             "correlation_id" => self.correlation_id = Some(value.to_string()),
             "configured_level" => self.configured_level = Some(value.to_string()),
             "io_side" => self.io_side = Some(value.to_string()),
+            "plugin_id" => self.plugin_id = Some(value.to_string()),
+            "termination_reason" => self.termination_reason = Some(value.to_string()),
             _ => {}
         }
     }
@@ -170,13 +182,21 @@ impl tracing::field::Visit for WsLogVisitor {
             "correlation_id" => self.correlation_id = Some(rendered),
             "configured_level" => self.configured_level = Some(rendered),
             "io_side" => self.io_side = Some(rendered),
+            "plugin_id" => self.plugin_id = Some(rendered),
+            "termination_reason" => self.termination_reason = Some(rendered),
             "connection_id" => {
                 if let Ok(parsed) = rendered.parse::<u64>() {
                     self.connection_id = Some(parsed);
                 }
             }
-            "size_bytes" | "close_code" | "close_reason_len" | "frames_c2b" | "frames_b2c"
-            | "bytes_c2b" | "bytes_b2c" => {
+            "size_bytes"
+            | "close_code"
+            | "close_reason_len"
+            | "frames_c2b"
+            | "frames_b2c"
+            | "bytes_c2b"
+            | "bytes_b2c"
+            | "max_records_per_connection" => {
                 if let Ok(parsed) = rendered.parse::<u64>() {
                     self.record_u64(field, parsed);
                 }
@@ -262,13 +282,23 @@ fn disconnect_context_with_id(
 async fn log_frame(plugin: &WsFrameLogging, connection_id: u64, message: &Message) {
     // Ordinary frames emit only on the post-delivery path (prepare + emit),
     // matching the shared H1/H2/H3 relay success boundary.
-    if let Some(observation) = plugin.prepare_ws_frame_delivery(message) {
-        plugin.emit_ws_frame_delivery(
-            "test-proxy",
-            connection_id,
-            WebSocketFrameDirection::ClientToBackend,
-            observation,
-        );
+    log_frame_dir(
+        plugin,
+        connection_id,
+        WebSocketFrameDirection::ClientToBackend,
+        message,
+    );
+}
+
+/// Production prepare → (successful send) → emit sequence for one message.
+fn log_frame_dir(
+    plugin: &dyn Plugin,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    message: &Message,
+) {
+    if let Some(observation) = plugin.prepare_ws_frame_delivery(connection_id, direction, message) {
+        plugin.emit_ws_frame_delivery("test-proxy", connection_id, direction, observation);
     }
 }
 
@@ -1242,7 +1272,56 @@ async fn peer_close_delivery_logs_code_and_reason_len_without_raw_reason() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn policy_close_emits_from_on_ws_frame_with_distinct_outcome() {
+async fn policy_close_emits_from_on_ws_policy_close_with_distinct_outcome() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+    let close = CloseFrame {
+        code: CloseCode::Policy,
+        reason: "rate exceeded".into(),
+    };
+
+    plugin.on_ws_policy_close(
+        "test-proxy",
+        12,
+        WebSocketFrameDirection::BackendToClient,
+        Some(&close),
+    );
+
+    let events = capture.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].outcome.as_deref(), Some("policy_close"));
+    assert_eq!(events[0].frame_type.as_deref(), Some("close"));
+    assert_eq!(events[0].close_code, Some(1008));
+    assert_eq!(
+        events[0].close_reason_len,
+        Some("rate exceeded".len() as u64)
+    );
+    assert_eq!(events[0].size_bytes, Some(2 + "rate exceeded".len() as u64));
+    assert_eq!(events[0].direction.as_deref(), Some("backend->client"));
+
+    // A Close(None) decision is still recorded, without close fields.
+    plugin.on_ws_policy_close(
+        "test-proxy",
+        12,
+        WebSocketFrameDirection::ClientToBackend,
+        None,
+    );
+    let events = capture.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1].outcome.as_deref(), Some("policy_close"));
+    assert_eq!(events[1].size_bytes, Some(0));
+    assert!(events[1].close_code.is_none());
+}
+
+/// The decision now arrives once through `on_ws_policy_close`; the mutating
+/// chain hook must not ALSO record it, or an observer ordered after the
+/// rejecting plugin would double-count the Close.
+#[tokio::test(flavor = "current_thread")]
+async fn on_ws_frame_never_records_a_close_decision() {
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
@@ -1263,17 +1342,7 @@ async fn policy_close_emits_from_on_ws_frame_with_distinct_outcome() {
         )
         .await;
     assert!(result.is_none());
-
-    let events = capture.events();
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].outcome.as_deref(), Some("policy_close"));
-    assert_eq!(events[0].frame_type.as_deref(), Some("close"));
-    assert_eq!(events[0].close_code, Some(1008));
-    assert_eq!(
-        events[0].close_reason_len,
-        Some("rate exceeded".len() as u64)
-    );
-    assert_eq!(events[0].direction.as_deref(), Some("backend->client"));
+    assert!(capture.events().is_empty(), "{:?}", capture.events());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1282,7 +1351,11 @@ async fn discarded_prepare_without_emit_produces_no_frame_event() {
     let capture = WsLogCapture::default();
     let _guard = install_ws_log_capture(&capture);
     let plugin = WsFrameLogging::new(&json!({})).unwrap();
-    let prepared = plugin.prepare_ws_frame_delivery(&Message::Text("abandoned".into()));
+    let prepared = plugin.prepare_ws_frame_delivery(
+        13,
+        WebSocketFrameDirection::ClientToBackend,
+        &Message::Text("abandoned".into()),
+    );
     assert!(prepared.is_some());
     drop(prepared);
     assert!(
@@ -1368,4 +1441,389 @@ async fn disconnect_schema_complete_at_each_configured_log_level() {
         assert_eq!(event.bytes_b2c, Some(16), "level={level}");
         assert_eq!(event.connection_id, Some(90), "level={level}");
     }
+}
+
+// === Volume controls: sample_rate / direction / max_records_per_connection ===
+
+#[test]
+fn volume_control_keys_accept_documented_values() {
+    for config in [
+        json!({"sample_rate": 0}),
+        json!({"sample_rate": 0.25}),
+        json!({"sample_rate": 1}),
+        json!({"sample_rate": 1.0}),
+        json!({"direction": "both"}),
+        json!({"direction": "client_to_backend"}),
+        json!({"direction": "backend_to_client"}),
+        json!({"max_records_per_connection": 0}),
+        json!({"max_records_per_connection": 500}),
+    ] {
+        WsFrameLogging::new(&config).unwrap_or_else(|e| panic!("{config}: {e}"));
+    }
+    assert_eq!(
+        ferrum_edge::plugins::ws_frame_logging::DIRECTION_FILTER_VALUES,
+        &["both", "client_to_backend", "backend_to_client"]
+    );
+}
+
+#[test]
+fn volume_control_keys_reject_invalid_values() {
+    for (config, field) in [
+        (json!({"sample_rate": null}), "sample_rate"),
+        (json!({"sample_rate": -0.1}), "sample_rate"),
+        (json!({"sample_rate": 1.5}), "sample_rate"),
+        (json!({"sample_rate": "0.5"}), "sample_rate"),
+        (json!({"sample_rate": true}), "sample_rate"),
+        (json!({"direction": null}), "direction"),
+        (json!({"direction": "inbound"}), "direction"),
+        (json!({"direction": "BOTH"}), "direction"),
+        (json!({"direction": 1}), "direction"),
+        (
+            json!({"max_records_per_connection": null}),
+            "max_records_per_connection",
+        ),
+        (
+            json!({"max_records_per_connection": -1}),
+            "max_records_per_connection",
+        ),
+        (
+            json!({"max_records_per_connection": 1.5}),
+            "max_records_per_connection",
+        ),
+        (
+            json!({"max_records_per_connection": "10"}),
+            "max_records_per_connection",
+        ),
+    ] {
+        let err = WsFrameLogging::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{config} must be rejected"));
+        assert!(err.contains(field), "{config}: {err}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sample_rate_zero_drops_delivered_but_keeps_decisions_and_disconnect() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({
+        "sample_rate": 0,
+        "include_payload_preview": true
+    }))
+    .unwrap();
+
+    for connection_id in 0..64 {
+        assert!(!plugin.connection_sampled(connection_id));
+        // Unsampled sessions skip observation (and so fingerprinting) entirely.
+        assert!(
+            plugin
+                .prepare_ws_frame_delivery(
+                    connection_id,
+                    WebSocketFrameDirection::ClientToBackend,
+                    &Message::Text("unsampled".into()),
+                )
+                .is_none()
+        );
+        log_frame(&plugin, connection_id, &Message::Text("unsampled".into())).await;
+    }
+    assert!(capture.events().is_empty(), "{:?}", capture.events());
+
+    plugin.on_ws_policy_close(
+        "test-proxy",
+        3,
+        WebSocketFrameDirection::ClientToBackend,
+        Some(&CloseFrame {
+            code: CloseCode::Policy,
+            reason: "".into(),
+        }),
+    );
+    plugin
+        .on_ws_disconnect(&disconnect_context_with_id(3, HashMap::new()))
+        .await;
+    let events = capture.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].outcome.as_deref(), Some("policy_close"));
+    assert_eq!(events[1].event.as_deref(), Some("disconnect"));
+}
+
+#[test]
+fn sample_rate_is_deterministic_per_connection_and_proportional() {
+    let first = WsFrameLogging::new(&json!({"sample_rate": 0.5})).unwrap();
+    let second = WsFrameLogging::new(&json!({"sample_rate": 0.5})).unwrap();
+    let all = WsFrameLogging::new(&json!({"sample_rate": 1})).unwrap();
+
+    let mut sampled = 0usize;
+    for connection_id in 0..4_000u64 {
+        let decision = first.connection_sampled(connection_id);
+        assert_eq!(
+            decision,
+            first.connection_sampled(connection_id),
+            "a session is either fully sampled or not"
+        );
+        assert_eq!(
+            decision,
+            second.connection_sampled(connection_id),
+            "the decision is a pure function of the connection id"
+        );
+        assert!(all.connection_sampled(connection_id));
+        if decision {
+            sampled += 1;
+        }
+    }
+    assert!(
+        (1_600..=2_400).contains(&sampled),
+        "sample_rate 0.5 sampled {sampled} of 4000 connections"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sampled_connection_still_logs_delivered_records() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({"sample_rate": 0.5})).unwrap();
+    let sampled_id = (0..1_000u64)
+        .find(|id| plugin.connection_sampled(*id))
+        .expect("a sampled connection id");
+    let unsampled_id = (0..1_000u64)
+        .find(|id| !plugin.connection_sampled(*id))
+        .expect("an unsampled connection id");
+
+    log_frame(&plugin, sampled_id, &Message::Text("kept".into())).await;
+    log_frame(&plugin, unsampled_id, &Message::Text("dropped".into())).await;
+
+    let events = capture.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].connection_id, Some(sampled_id));
+    assert_eq!(events[0].outcome.as_deref(), Some("delivered"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn direction_filter_selects_delivered_records_only() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    for (filter, kept, dropped) in [
+        (
+            "client_to_backend",
+            WebSocketFrameDirection::ClientToBackend,
+            WebSocketFrameDirection::BackendToClient,
+        ),
+        (
+            "backend_to_client",
+            WebSocketFrameDirection::BackendToClient,
+            WebSocketFrameDirection::ClientToBackend,
+        ),
+    ] {
+        let capture = WsLogCapture::default();
+        let _guard = install_ws_log_capture(&capture);
+        let plugin = WsFrameLogging::new(&json!({"direction": filter})).unwrap();
+
+        log_frame_dir(&plugin, 1, kept, &Message::Text("kept".into()));
+        log_frame_dir(&plugin, 1, dropped, &Message::Text("dropped".into()));
+        // The decision record is never direction-filtered.
+        plugin.on_ws_policy_close(
+            "test-proxy",
+            1,
+            dropped,
+            Some(&CloseFrame {
+                code: CloseCode::Size,
+                reason: "".into(),
+            }),
+        );
+
+        let events = capture.events();
+        assert_eq!(events.len(), 2, "filter={filter}: {events:?}");
+        assert_eq!(events[0].outcome.as_deref(), Some("delivered"));
+        assert_eq!(events[0].size_bytes, Some("kept".len() as u64));
+        assert_eq!(events[1].outcome.as_deref(), Some("policy_close"));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn record_cap_is_per_session_and_reported_once() {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let shared: Arc<dyn Plugin> =
+        Arc::new(WsFrameLogging::new(&json!({"max_records_per_connection": 2})).unwrap());
+    let ctx = super::plugin_utils::create_test_context();
+
+    let session = Arc::clone(&shared)
+        .bind_ws_session(&ctx)
+        .expect("a configured cap binds per-session state");
+    assert!(session.requires_ws_frame_hooks());
+    assert!(session.observes_ws_frame_decisions());
+    for _ in 0..5 {
+        log_frame_dir(
+            session.as_ref(),
+            21,
+            WebSocketFrameDirection::ClientToBackend,
+            &Message::Text("x".into()),
+        );
+    }
+    // A capped session still records its policy decision.
+    session.on_ws_policy_close(
+        "test-proxy",
+        21,
+        WebSocketFrameDirection::ClientToBackend,
+        Some(&CloseFrame {
+            code: CloseCode::Policy,
+            reason: "".into(),
+        }),
+    );
+
+    let events = capture.events();
+    let delivered = events
+        .iter()
+        .filter(|e| e.outcome.as_deref() == Some("delivered"))
+        .count();
+    assert_eq!(delivered, 2, "{events:?}");
+    let markers: Vec<_> = events
+        .iter()
+        .filter(|e| e.event.as_deref() == Some("record_cap_reached"))
+        .collect();
+    assert_eq!(markers.len(), 1, "{events:?}");
+    assert_eq!(markers[0].connection_id, Some(21));
+    assert_eq!(markers[0].max_records_per_connection, Some(2));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.outcome.as_deref() == Some("policy_close"))
+            .count(),
+        1
+    );
+
+    // A second session starts with its own full budget.
+    let other = Arc::clone(&shared)
+        .bind_ws_session(&ctx)
+        .expect("each session binds its own budget");
+    for _ in 0..3 {
+        log_frame_dir(
+            other.as_ref(),
+            22,
+            WebSocketFrameDirection::BackendToClient,
+            &Message::Text("y".into()),
+        );
+    }
+    let session_two_delivered = capture
+        .events()
+        .iter()
+        .filter(|e| e.outcome.as_deref() == Some("delivered") && e.connection_id == Some(22))
+        .count();
+    assert_eq!(session_two_delivered, 2);
+}
+
+#[test]
+fn uncapped_config_binds_no_per_session_state() {
+    let shared: Arc<dyn Plugin> = Arc::new(WsFrameLogging::new(&json!({})).unwrap());
+    let ctx = super::plugin_utils::create_test_context();
+    assert!(
+        shared.bind_ws_session(&ctx).is_none(),
+        "max_records_per_connection: 0 must keep the shared instance (no per-session allocation)"
+    );
+}
+
+// === Plugin-instance identity (plugin_id) ===
+
+#[test]
+fn plugin_id_defaults_to_unattributed_and_rejects_blank_ids() {
+    use ferrum_edge::plugins::ws_frame_logging::UNATTRIBUTED_PLUGIN_ID;
+
+    assert_eq!(
+        WsFrameLogging::new(&json!({})).unwrap().plugin_id(),
+        UNATTRIBUTED_PLUGIN_ID
+    );
+    assert_eq!(
+        WsFrameLogging::new_with_config_id(&json!({}), Some("wfl-a"))
+            .unwrap()
+            .plugin_id(),
+        "wfl-a"
+    );
+    for bad in ["", "   ", "wfl\nforged=1"] {
+        let err = WsFrameLogging::new_with_config_id(&json!({}), Some(bad))
+            .err()
+            .unwrap_or_else(|| panic!("plugin config id {bad:?} must be refused"));
+        assert!(err.contains("plugin config id"), "{err}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_instances_on_one_session_emit_distinguishable_records() {
+    use ferrum_edge::plugins::{PluginHttpClient, create_plugin_with_http_client_and_config_id};
+
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let mut instances = Vec::new();
+    for id in ["wfl-routine", "wfl-debug"] {
+        instances.push(
+            create_plugin_with_http_client_and_config_id(
+                "ws_frame_logging",
+                &json!({}),
+                PluginHttpClient::default(),
+                Some(id),
+            )
+            .expect("valid config")
+            .expect("built-in plugin"),
+        );
+    }
+
+    for instance in &instances {
+        log_frame_dir(
+            instance.as_ref(),
+            31,
+            WebSocketFrameDirection::ClientToBackend,
+            &Message::Text("same".into()),
+        );
+        instance
+            .on_ws_disconnect(&disconnect_context_with_id(31, HashMap::new()))
+            .await;
+    }
+
+    let events = capture.events();
+    assert_eq!(events.len(), 4, "{events:?}");
+    let ids: Vec<_> = events.iter().map(|e| e.plugin_id.as_deref()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            Some("wfl-routine"),
+            Some("wfl-routine"),
+            Some("wfl-debug"),
+            Some("wfl-debug")
+        ],
+        "frame and disconnect records must carry the plugin-config id"
+    );
+}
+
+// === Disconnect termination_reason ===
+
+#[tokio::test(flavor = "current_thread")]
+async fn disconnect_reports_bounded_termination_reason() {
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let plugin = WsFrameLogging::new(&json!({})).unwrap();
+
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "websocket.termination_reason".to_string(),
+        "idle_timeout".to_string(),
+    );
+    plugin
+        .on_ws_disconnect(&disconnect_context_with_id(41, metadata))
+        .await;
+    plugin
+        .on_ws_disconnect(&disconnect_context_with_id(42, HashMap::new()))
+        .await;
+
+    let events = capture.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0].termination_reason.as_deref(),
+        Some("idle_timeout")
+    );
+    assert_eq!(events[1].termination_reason.as_deref(), Some("-"));
 }

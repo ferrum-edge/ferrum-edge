@@ -779,6 +779,58 @@ fn grpc_method_router_normalized_paths_and_stateless_lists_share_state() {
     );
 }
 
+/// Service-level rules and `default_rate_limit` are budgets, so they are part
+/// of the effective semantics; an omitted and a `null` default are one policy.
+#[test]
+fn grpc_method_router_service_and_default_rules_are_budget_semantics() {
+    let base = json!({
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
+    });
+    let null_default = json!({
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
+        "default_rate_limit": null,
+    });
+    assert!(
+        grpc_pair("norm-grpc-default", &base, &null_default),
+        "a null default_rate_limit is the same as omitting it"
+    );
+
+    let with_default = json!({
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
+        "default_rate_limit": {"max_requests": 5, "window_seconds": 60},
+    });
+    assert!(
+        !grpc_pair("norm-grpc-default-add", &base, &with_default),
+        "adding a default budget must isolate onto fresh state"
+    );
+    let changed_default = json!({
+        "method_rate_limits": {"/pkg.Svc/M": {"max_requests": 10, "window_seconds": 60}},
+        "default_rate_limit": {"max_requests": 6, "window_seconds": 60},
+    });
+    assert!(
+        !grpc_pair("norm-grpc-default-change", &with_default, &changed_default),
+        "a changed default budget must isolate onto fresh state"
+    );
+
+    let service = json!({
+        "method_rate_limits": {"/pkg.Svc/*": {"max_requests": 10, "window_seconds": 60}},
+    });
+    let service_normalized = json!({
+        "method_rate_limits": {" pkg.Svc/* ": {"max_requests": 10, "window_seconds": 60}},
+    });
+    assert!(
+        grpc_pair("norm-grpc-service", &service, &service_normalized),
+        "the parser trims and strips the leading slash on service-level rules"
+    );
+    let service_changed = json!({
+        "method_rate_limits": {"/pkg.Svc/*": {"max_requests": 11, "window_seconds": 60}},
+    });
+    assert!(
+        !grpc_pair("norm-grpc-service-change", &service, &service_changed),
+        "a changed service-level budget must isolate onto fresh state"
+    );
+}
+
 #[test]
 fn ai_rate_limiter_defaults_and_normalized_provider_share_state() {
     let base = json!({"token_limit": 1000});

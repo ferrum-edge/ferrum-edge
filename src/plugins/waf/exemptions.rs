@@ -72,6 +72,23 @@ impl CompiledExemptions {
         )?;
 
         let paths = optional_string_vec(object, "paths")?.unwrap_or_default();
+        // Exemptions are matched against the canonical request path, exactly
+        // like rule `conditions.paths`, so a non-canonical exact or `prefix*`
+        // value (a percent escape, `//`, a dot segment — easily copied from a
+        // raw access log) could never match and would silently exempt
+        // nothing. Refuse it at admission with the same canonical-path rules
+        // (GHSA-fcqw-793q-wg5x). A `~regex` is regex text and is left alone.
+        for (index, path) in paths.iter().enumerate() {
+            if path.starts_with('~') {
+                continue;
+            }
+            let literal = path.strip_suffix('*').unwrap_or(path.as_str());
+            if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(literal) {
+                return Err(format!(
+                    "waf: `global_exemptions.paths[{index}]` is not a canonical path: {reason}"
+                ));
+            }
+        }
         let path_set = if paths.is_empty() {
             None
         } else {

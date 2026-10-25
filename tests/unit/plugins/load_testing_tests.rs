@@ -178,6 +178,14 @@ fn parse_captured_request(raw: &[u8]) -> (String, HashMap<String, String>, Vec<u
     (request_line, headers, raw[header_end..].to_vec())
 }
 
+/// A load-testing run id: 32 lowercase hex characters.
+fn is_run_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 #[test]
 fn validate_plugin_config_with_policy_screens_denied_gateway_address() {
     use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
@@ -203,7 +211,7 @@ fn validate_plugin_config_with_policy_screens_denied_gateway_address() {
         "concurrent_clients": 5,
         "duration_seconds": 10,
         "gateway_port": 8000,
-        "gateway_addresses": ["http://10.0.0.2:8000"]
+        "gateway_addresses": ["https://10.0.0.2:8443"]
     });
     assert!(
         validate_plugin_config_with_policy("load_testing", &loopback, &default_policy).is_ok(),
@@ -241,11 +249,24 @@ fn test_supported_protocols() {
 fn test_declares_header_mutation_and_trigger_redaction() {
     let plugin = make_plugin();
     assert!(plugin.modifies_request_headers());
-    assert_eq!(plugin.request_headers_to_redact(), &["x-loadtesting-key"]);
+    assert_eq!(
+        plugin.request_headers_to_redact(),
+        &[
+            "x-loadtesting-key",
+            "x_loadtesting_key",
+            "x-loadtesting_key",
+            "x_loadtesting-key"
+        ],
+        "every backend-folded spelling of the trigger key must be redacted"
+    );
+    // The replay ceiling also bounds collection, so a trigger reserves at
+    // most 10 MiB of the aggregate request-buffer budget instead of the whole
+    // configured upload limit (PR6856-SOL-3). Declared oversized bodies are
+    // never selected for buffering at all.
     assert_eq!(
         plugin.request_body_buffer_limit(),
         Some(MAX_REPLAY_REQUEST_BODY_BYTES),
-        "load-testing replay bodies must remain bounded when the global limit is unlimited"
+        "trigger collection must stay bounded by the replay ceiling"
     );
 }
 
@@ -332,7 +353,8 @@ fn test_valid_config_with_every_supported_field() {
         "gateway_port": 8443,
         "gateway_tls": true,
         "gateway_tls_no_verify": true,
-        "gateway_addresses": ["https://10.0.0.2:8443", "https://10.0.0.3:8443"]
+        "gateway_addresses": ["https://10.0.0.2:8443", "https://10.0.0.3:8443"],
+        "allow_plaintext": false
     });
     assert_eq!(
         config.as_object().unwrap().len(),
@@ -357,7 +379,8 @@ fn test_optional_null_fields_still_select_defaults() {
         "gateway_port": null,
         "gateway_tls": null,
         "gateway_tls_no_verify": null,
-        "gateway_addresses": null
+        "gateway_addresses": null,
+        "allow_plaintext": null
     });
     assert!(LoadTesting::new(&config, PluginHttpClient::default()).is_ok());
 }
@@ -839,8 +862,10 @@ async fn test_skips_when_key_does_not_match() {
         "X-Loadtesting-Key".to_string(),
         "operator-injected-load-key-variant".to_string(),
     );
-    headers.insert("x-loadtesting-fanout".to_string(), "1".to_string());
+    // Case variants of the marker that are not the ingress fan-out marker
+    // itself; the canonical marker with a failed key is covered separately.
     headers.insert("X-Loadtesting-Fanout".to_string(), "1".to_string());
+    headers.insert("X-LOADTESTING-FANOUT".to_string(), "1".to_string());
 
     let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
@@ -996,7 +1021,17 @@ async fn test_fanout_control_request_terminates_before_backend() {
 
     let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
     match result {
-        PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 204),
+        PluginResult::Reject {
+            status_code,
+            headers: reject_headers,
+            ..
+        } => {
+            assert_eq!(status_code, 204);
+            let ack = reject_headers
+                .get("x-loadtesting-ack")
+                .expect("an admission must carry the correlated acknowledgment header");
+            assert!(is_run_id(ack), "ack must carry a run id, got {ack:?}");
+        }
         other => panic!("expected fanout ack reject, got {other:?}"),
     }
     assert!(!headers.contains_key("x-loadtesting-key"));
@@ -1494,6 +1529,12 @@ async fn test_fanout_request_replays_body_query_and_sanitized_headers_on_wire() 
             .get("x-loadtesting-fanout")
             .map(String::as_str),
         Some("1")
+    );
+    assert!(
+        fanout_headers
+            .get("x-loadtesting-run-id")
+            .is_some_and(|run_id| is_run_id(run_id)),
+        "fan-out must carry the run's correlation id: {fanout_headers:?}"
     );
     assert_eq!(
         fanout_headers.get("content-length").map(String::as_str),
@@ -2028,12 +2069,21 @@ async fn test_replay_snapshots_ingress_headers_not_the_transformed_map() {
 // Fan-out reports peers that never admitted a cohort (issue #5158)
 // ---------------------------------------------------------------------------
 
-/// Accept one request on `listener` and answer with a fixed status line plus
-/// optional extra header lines. Returns the captured request bytes.
+/// How a fake fan-out peer answers the control request.
+#[derive(Clone, Copy)]
+enum PeerReply {
+    /// A fixed status line plus optional extra header lines.
+    Status(&'static str, &'static str),
+    /// `204` echoing the request's run id in `X-Loadtesting-Ack`, exactly as
+    /// an admitting Ferrum peer answers.
+    CorrelatedAck,
+}
+
+/// Accept one request on `listener` and answer it per `reply`. Returns the
+/// captured request bytes.
 async fn answer_one_request_with_status(
     listener: tokio::net::TcpListener,
-    status_line: &'static str,
-    extra_headers: &'static str,
+    reply: PeerReply,
 ) -> Vec<u8> {
     let (mut socket, _) = listener.accept().await.expect("accept");
     let mut buf = Vec::new();
@@ -2047,27 +2097,33 @@ async fn answer_one_request_with_status(
         }
         assert!(buf.len() < 64 * 1024, "request grew too large");
     }
-    let response =
-        format!("{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n");
+    let response = match reply {
+        PeerReply::Status(status_line, extra_headers) => format!(
+            "{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        PeerReply::CorrelatedAck => {
+            let (_, request_headers, _) = parse_captured_request(&buf);
+            let run_id = request_headers
+                .get("x-loadtesting-run-id")
+                .cloned()
+                .unwrap_or_default();
+            format!(
+                "HTTP/1.1 204 No Content\r\nX-Loadtesting-Ack: {run_id}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        }
+    };
     let _ = socket.write_all(response.as_bytes()).await;
     buf
 }
 
-async fn fanout_peer_response_logs(
-    status_line: &'static str,
-    extra_headers: &'static str,
-) -> String {
+async fn fanout_peer_response_logs(reply: PeerReply) -> String {
     let (logs, _guard) = capture_logs();
     let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_port = local_listener.local_addr().unwrap().port();
     let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote_port = remote_listener.local_addr().unwrap().port();
     let local_capture = tokio::spawn(capture_one_http_request(local_listener));
-    let remote_capture = tokio::spawn(answer_one_request_with_status(
-        remote_listener,
-        status_line,
-        extra_headers,
-    ));
+    let remote_capture = tokio::spawn(answer_one_request_with_status(remote_listener, reply));
 
     let plugin = LoadTesting::new(
         &json!({
@@ -2115,8 +2171,17 @@ async fn test_fanout_reports_peer_http_rejection_and_redirect_without_leaking_th
             "Location: /redirect-destination\r\n",
             "302",
         ),
+        // A peer route without load_testing whose application backend answers
+        // 204, or a 204 acknowledging a different run, is not an admission
+        // (load_testing-SOL-1).
+        ("HTTP/1.1 204 No Content", "", "204"),
+        (
+            "HTTP/1.1 204 No Content",
+            "X-Loadtesting-Ack: 0123456789abcdef0123456789abcdef\r\n",
+            "204",
+        ),
     ] {
-        let logs = fanout_peer_response_logs(status_line, extra_headers).await;
+        let logs = fanout_peer_response_logs(PeerReply::Status(status_line, extra_headers)).await;
         assert!(
             logs.contains("remote node did not acknowledge the fan-out trigger"),
             "peer answering {status_line} must be reported: {logs}"
@@ -2138,7 +2203,7 @@ async fn test_fanout_reports_peer_http_rejection_and_redirect_without_leaking_th
 
 #[tokio::test]
 async fn test_fanout_accepts_the_documented_204_acknowledgment_without_a_warning() {
-    let logs = fanout_peer_response_logs("HTTP/1.1 204 No Content", "").await;
+    let logs = fanout_peer_response_logs(PeerReply::CorrelatedAck).await;
     assert!(
         !logs.contains("remote node did not acknowledge the fan-out trigger"),
         "the documented 204 acknowledgment must not be reported as a failure: {logs}"
@@ -2394,6 +2459,13 @@ fn test_openapi_load_testing_schema_matches_constructor_admission() {
         json!({ "gateway_addresses": ["http://user:pass@127.0.0.1:42424"] }),
         json!({ "gateway_addresses": ["http://127.0.0.1:42424?x=y"] }),
         json!({ "gateway_addresses": ["http://127.0.0.1:42424#frag"] }),
+        // Cleartext fan-out off a loopback IP literal needs the explicit
+        // opt-in (load_testing-claude-4).
+        json!({ "gateway_addresses": ["http://10.0.0.2:8000"] }),
+        json!({ "gateway_addresses": ["http://localhost:42424"] }),
+        json!({ "gateway_addresses": ["https://10.0.0.3:8443", "HTTP://node2:8000/sub"] }),
+        json!({ "gateway_addresses": ["http://node2:8000"], "allow_plaintext": false }),
+        json!({ "gateway_addresses": ["http://node2:8000"], "allow_plaintext": null }),
         // The constructor parses this as a serde_json u64 (issue #5160).
         json!({ "max_response_body_bytes": above_u64 }),
     ];
@@ -2414,6 +2486,15 @@ fn test_openapi_load_testing_schema_matches_constructor_admission() {
         json!({ "gateway_addresses": ["https://node1:8443"] }),
         json!({ "gateway_addresses": ["https://node1:8443/"] }),
         json!({ "gateway_addresses": ["http://[::1]:42424"] }),
+        json!({ "gateway_addresses": ["http://127.0.0.2:42424/path"] }),
+        json!({ "gateway_addresses": ["http://10.0.0.2:8000"], "allow_plaintext": true }),
+        json!({ "gateway_addresses": ["http://node2:8000"], "allow_plaintext": true }),
+        json!({ "allow_plaintext": true }),
+        json!({ "allow_plaintext": serde_json::Value::Null }),
+        // Ordinary service DNS names and paths containing `s` must match the
+        // published peer-URL pattern (load_testing-SOL-3).
+        json!({ "gateway_addresses": ["https://gateway.svc.cluster.local:8443"] }),
+        json!({ "gateway_addresses": ["https://gateways.example.com/sites/east"] }),
         json!({ "gateway_addresses": serde_json::Value::Null }),
         json!({ "max_response_body_bytes": u64::MAX }),
         json!({ "max_response_body_bytes": 1 }),
@@ -2680,4 +2761,594 @@ async fn test_replays_and_fanout_carry_the_proxy_hop_count() {
     assert_eq!(captured_proxy_hops(&local_raw), vec!["4".to_string()]);
     let run = wait_for_result(&plugin).await;
     assert!(run.attempted_requests > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes
+// ---------------------------------------------------------------------------
+
+fn fanout_receiver() -> LoadTesting {
+    LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9,
+            "request_timeout_ms": 100
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap()
+}
+
+fn ack_header(result: &PluginResult) -> Option<String> {
+    match result {
+        PluginResult::Reject {
+            status_code: 204,
+            headers,
+            ..
+        } => headers.get("x-loadtesting-ack").cloned(),
+        _ => None,
+    }
+}
+
+/// load_testing-SOL-1: a fan-out control request whose key fails (a rolling
+/// key change between nodes, or a forged marker) is terminated before backend
+/// dispatch instead of executing the copied method, body, and credentials as
+/// an ordinary application request.
+#[tokio::test]
+async fn test_fanout_marked_request_with_failed_key_is_refused_before_backend() {
+    for key in [
+        Some("rotated-load-key-0123456789abcdef!"),
+        Some("short"),
+        None,
+    ] {
+        let plugin = fanout_receiver();
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "DELETE".to_string(),
+            "/objects/123".to_string(),
+        );
+        ctx.matched_proxy = Some(matched_proxy());
+        let mut headers = HashMap::from([
+            ("x-loadtesting-fanout".to_string(), "1".to_string()),
+            ("authorization".to_string(), "Bearer app-token".to_string()),
+        ]);
+        if let Some(key) = key {
+            headers.insert("x-loadtesting-key".to_string(), key.to_string());
+        }
+
+        let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers: reject_headers,
+            } => {
+                assert_eq!(
+                    status_code, 403,
+                    "failed fan-out key must be refused, key {key:?}"
+                );
+                assert!(body.is_empty(), "refusal body must stay empty: {body:?}");
+                assert!(
+                    !reject_headers.contains_key("x-loadtesting-ack"),
+                    "a refusal must never carry the admission acknowledgment"
+                );
+            }
+            other => panic!("expected fan-out key refusal for {key:?}, got {other:?}"),
+        }
+        assert!(
+            !plugin.is_running(),
+            "a refused control request starts no cohort"
+        );
+        assert!(
+            plugin.last_run_result().is_none(),
+            "an unauthenticated control request must not record a run"
+        );
+        assert!(!headers.contains_key("x-loadtesting-key"));
+        assert!(!headers.contains_key("x-loadtesting-fanout"));
+    }
+
+    // Ordinary wrong-key application traffic without the marker still flows.
+    let plugin = fanout_receiver();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    let mut headers = HashMap::from([(
+        "x-loadtesting-key".to_string(),
+        "rotated-load-key-0123456789abcdef!".to_string(),
+    )]);
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+/// load_testing-SOL-1 / claude-5: an admitting peer echoes the controller's
+/// well-formed run id; a missing or malformed id gets a fresh one.
+#[tokio::test]
+async fn test_fanout_ack_echoes_a_well_formed_run_id_and_replaces_a_malformed_one() {
+    const SUPPLIED: &str = "0123456789abcdef0123456789abcdef";
+    for (supplied, expect_echo) in [
+        (Some(SUPPLIED), true),
+        (Some("0123456789ABCDEF0123456789ABCDEF"), false),
+        (Some("not-a-run-id\r\ninjected"), false),
+        (None, false),
+    ] {
+        let plugin = fanout_receiver();
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/api/test".to_string(),
+        );
+        ctx.matched_proxy = Some(matched_proxy());
+        let mut headers = HashMap::from([
+            ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+            ("x-loadtesting-fanout".to_string(), "1".to_string()),
+        ]);
+        if let Some(run_id) = supplied {
+            headers.insert("x-loadtesting-run-id".to_string(), run_id.to_string());
+        }
+        let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+        let ack = ack_header(&result).expect("an admission must carry the ack header");
+        assert!(is_run_id(&ack), "ack must be a run id: {ack:?}");
+        if expect_echo {
+            assert_eq!(ack, SUPPLIED);
+        } else {
+            assert_ne!(Some(ack.as_str()), supplied);
+        }
+        assert!(
+            !headers.contains_key("x-loadtesting-run-id"),
+            "the run-id control header must be stripped: {headers:?}"
+        );
+        wait_until_idle(&plugin).await;
+    }
+}
+
+/// load_testing-claude-1: a matching trigger that declares a body above the
+/// replay ceiling is not buffered (so the plugin-local cap cannot become a
+/// client-visible 413) and the primary request proceeds without a run.
+#[tokio::test]
+async fn test_oversized_declared_trigger_body_streams_through_and_starts_no_run() {
+    let plugin = make_plugin();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/upload".to_string(),
+    );
+    ctx.headers
+        .insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    ctx.headers.insert(
+        "content-length".to_string(),
+        MAX_REPLAY_REQUEST_BODY_BYTES.to_string(),
+    );
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "a body exactly at the replay ceiling is still buffered for replay"
+    );
+    ctx.headers.insert(
+        "content-length".to_string(),
+        (MAX_REPLAY_REQUEST_BODY_BYTES + 1).to_string(),
+    );
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "a trigger declaring more than the replay ceiling must not be buffered"
+    );
+
+    // Application trigger: forwarded unchanged, no cohort, terminal Failed.
+    let plugin = fanout_receiver();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/upload".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::from([
+        ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+        (
+            "content-length".to_string(),
+            (MAX_REPLAY_REQUEST_BODY_BYTES + 1).to_string(),
+        ),
+    ]);
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "the triggering request must proceed normally"
+    );
+    assert!(!headers.contains_key("x-loadtesting-key"));
+    assert!(!plugin.is_running());
+    let run = plugin
+        .last_run_result()
+        .expect("a skipped trigger records a terminal result");
+    assert_eq!(run.outcome, RunOutcome::Failed);
+    assert_eq!(run.attempted_requests, 0);
+
+    // A body another plugin buffered beyond the ceiling is refused too.
+    let plugin = fanout_receiver();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/upload".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    ctx.request_body_bytes = Some(Bytes::from(vec![0u8; MAX_REPLAY_REQUEST_BODY_BYTES + 1]));
+    let mut headers = HashMap::from([
+        ("x-loadtesting-key".to_string(), VALID_KEY.to_string()),
+        ("x-loadtesting-fanout".to_string(), "1".to_string()),
+    ]);
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(
+            status_code, 503,
+            "an oversized fan-out trigger is refused, never acknowledged"
+        ),
+        other => panic!("expected fan-out refusal, got {other:?}"),
+    }
+    assert!(!plugin.is_running());
+}
+
+/// load_testing-claude-2: underscore spellings of the reserved control
+/// headers fold onto the same CGI variable at many backends. They never
+/// authenticate a trigger, and they are stripped on every path.
+#[tokio::test]
+async fn test_underscore_control_header_spellings_never_trigger_and_are_stripped() {
+    let underscore_spellings = [
+        "x_loadtesting_key",
+        "X_Loadtesting_Key",
+        "x-loadtesting_key",
+        "x_loadtesting_fanout",
+        "X_LOADTESTING-FANOUT",
+        "x_loadtesting_run_id",
+    ];
+    let plugin = fanout_receiver();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    let mut headers: HashMap<String, String> = underscore_spellings
+        .iter()
+        .map(|name| (name.to_string(), VALID_KEY.to_string()))
+        .collect();
+    headers.insert("x-keep".to_string(), "present".to_string());
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "an underscore spelling must not authenticate a trigger"
+    );
+    assert!(!plugin.is_running());
+    assert_eq!(
+        headers.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["x-keep"],
+        "every folded spelling of the control headers must be stripped"
+    );
+
+    // Matching path: stripped from the effective request and never replayed.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let capture = tokio::spawn(capture_one_http_request(listener));
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": port,
+            "request_timeout_ms": 500
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/test".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers: HashMap<String, String> = underscore_spellings
+        .iter()
+        .map(|name| (name.to_string(), VALID_KEY.to_string()))
+        .collect();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert("x-keep".to_string(), "present".to_string());
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        headers.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["x-keep"]
+    );
+    let raw = tokio::time::timeout(Duration::from_secs(3), capture)
+        .await
+        .expect("synthetic request timeout")
+        .expect("capture task");
+    let (_, replay_headers, _) = parse_captured_request(&raw);
+    for name in replay_headers.keys() {
+        let folded = name.replace('_', "-");
+        assert!(
+            !folded.starts_with("x-loadtesting-"),
+            "synthetic request replayed control header {name}: {replay_headers:?}"
+        );
+    }
+    assert!(
+        !String::from_utf8_lossy(&raw).contains(VALID_KEY),
+        "the trigger key must never reach a synthetic request"
+    );
+    wait_until_idle(&plugin).await;
+}
+
+/// load_testing-claude-4: cleartext fan-out off a loopback IP literal needs
+/// the explicit `allow_plaintext` opt-in.
+#[test]
+fn test_cleartext_remote_fanout_peer_requires_allow_plaintext() {
+    let config = |addresses: serde_json::Value, allow: serde_json::Value| {
+        json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 8000,
+            "gateway_addresses": addresses,
+            "allow_plaintext": allow
+        })
+    };
+    for address in [
+        "http://10.0.0.2:8000",
+        "http://node2:8000",
+        "HTTP://node2:8000/sub",
+        "http://localhost:8001",
+        "http://127.1:8001",
+    ] {
+        for allow in [json!(false), serde_json::Value::Null] {
+            let err = LoadTesting::new(
+                &config(json!([address]), allow),
+                PluginHttpClient::default(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("cleartext peer {address} must need the opt-in"));
+            assert!(err.contains("allow_plaintext"), "address {address}: {err}");
+            assert!(!err.contains(VALID_KEY), "error leaked the key: {err}");
+        }
+        assert!(
+            LoadTesting::new(
+                &config(json!([address]), json!(true)),
+                PluginHttpClient::default()
+            )
+            .is_ok(),
+            "allow_plaintext must admit cleartext peer {address}"
+        );
+    }
+    for address in [
+        "https://node2:8443",
+        "http://127.0.0.1:8001",
+        "http://127.0.0.2:8001",
+        "http://[::1]:8001",
+    ] {
+        assert!(
+            LoadTesting::new(
+                &config(json!([address]), json!(false)),
+                PluginHttpClient::default()
+            )
+            .is_ok(),
+            "{address} needs no cleartext opt-in"
+        );
+    }
+    let err = LoadTesting::new(
+        &config(json!(["http://node2:8000"]), json!("yes")),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("non-boolean allow_plaintext must fail");
+    assert!(
+        err.contains("`allow_plaintext` must be a boolean"),
+        "got: {err}"
+    );
+}
+
+/// load_testing-SOL-2 / claude-3: the fan-out control request is owned by the
+/// run. Removing the last plugin owner cancels an outstanding peer call.
+#[tokio::test]
+async fn test_last_owner_removal_cancels_an_outstanding_fanout_request() {
+    let (peer_port, request_started, client_closed) = spawn_stalled_request_observer().await;
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 30,
+            "gateway_port": 9,
+            "gateway_addresses": [format!("http://127.0.0.1:{peer_port}")],
+            "request_timeout_ms": 200
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/slowpeer".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    tokio::time::timeout(Duration::from_secs(3), request_started)
+        .await
+        .expect("fan-out must reach the stalled peer")
+        .expect("stalled peer must report the request");
+
+    drop(plugin);
+
+    tokio::time::timeout(Duration::from_secs(3), client_closed)
+        .await
+        .expect(
+            "last-owner removal must cancel the pending fan-out instead of waiting for the \
+             shared client's 60s timeout",
+        )
+        .expect("stalled peer must report the client closing");
+}
+
+/// load_testing-SOL-2: a stalled fan-out call never outlives the run duration.
+#[tokio::test]
+async fn test_stalled_fanout_request_is_bounded_by_the_run_duration() {
+    let (peer_port, request_started, client_closed) = spawn_stalled_request_observer().await;
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 1,
+            "gateway_port": 9,
+            "gateway_addresses": [format!("http://127.0.0.1:{peer_port}")],
+            "request_timeout_ms": 200
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/slowpeer".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+
+    tokio::time::timeout(Duration::from_secs(3), request_started)
+        .await
+        .expect("fan-out must reach the stalled peer")
+        .expect("stalled peer must report the request");
+    tokio::time::timeout(Duration::from_secs(4), client_closed)
+        .await
+        .expect("a 1s run must abandon its stalled fan-out call within the run duration")
+        .expect("stalled peer must report the client closing");
+    drop(plugin);
+}
+
+/// load_testing-claude-3 / SOL-2: a fan-out trigger is a decision, not a
+/// report. With plugin HTTP retries enabled, a dropped connection must not be
+/// replayed into a second trigger.
+#[tokio::test]
+async fn test_fanout_trigger_is_never_retried_by_the_shared_client() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_port = peer.local_addr().unwrap().port();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let peer_attempts = Arc::clone(&attempts);
+    let peer_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = peer.accept().await else {
+                return;
+            };
+            peer_attempts.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            // Close without a response: a retryable "connection closed"
+            // transport failure for the shared plugin client.
+            drop(socket);
+        }
+    });
+
+    let http_client = PluginHttpClient::from_pool_config_with_settings(
+        &ferrum_edge::config::PoolConfig::default(),
+        10_000,
+        3,
+        1,
+    );
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": 9,
+            "gateway_addresses": [format!("http://127.0.0.1:{peer_port}")],
+            "request_timeout_ms": 200
+        }),
+        http_client,
+    )
+    .unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/retry".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while attempts.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give a retrying client ample time (retry delay is 1 ms) to dial again.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the fan-out trigger must be sent exactly once"
+    );
+    // The fan-out call cannot outlive the run, so once the run is idle no
+    // late retry can still be pending.
+    wait_until_idle(&plugin).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no retry may follow after the run ends"
+    );
+    peer_task.abort();
+}
+
+/// load_testing-claude-5: start/finish records carry a run id and a key
+/// fingerprint for attribution, never the key itself.
+#[tokio::test]
+async fn test_run_start_and_finish_records_carry_run_id_and_key_fingerprint() {
+    let (logs, guard) = capture_logs();
+    let plugin = fanout_receiver();
+    let mut ctx = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/audit".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::from([("x-loadtesting-key".to_string(), VALID_KEY.to_string())]);
+    let _ = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    let _ = wait_for_result(&plugin).await;
+    drop(guard);
+
+    let captured = logs.contents();
+    let start = captured
+        .lines()
+        .find(|line| line.contains("starting load test"))
+        .unwrap_or_else(|| panic!("missing start record: {captured}"));
+    let finish = captured
+        .lines()
+        .find(|line| line.contains("load test finished"))
+        .unwrap_or_else(|| panic!("missing finish record: {captured}"));
+    let field = |line: &str, name: &str| -> String {
+        let marker = format!("{name}=");
+        let rest = &line[line
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{name} missing from {line}"))
+            + marker.len()..];
+        rest.split_whitespace().next().unwrap_or("").to_string()
+    };
+    let run_id = field(start, "run_id");
+    assert!(is_run_id(&run_id), "start run_id: {start}");
+    assert_eq!(
+        field(finish, "run_id"),
+        run_id,
+        "finish must join the start record"
+    );
+    let fingerprint = field(start, "key_fingerprint");
+    assert_eq!(fingerprint.len(), 16, "start fingerprint: {start}");
+    assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(field(finish, "key_fingerprint"), fingerprint);
+    assert_eq!(field(start, "concurrent_clients"), "1");
+    assert_eq!(field(finish, "concurrent_clients"), "1");
+    assert!(
+        start.contains("203.0.113.7"),
+        "start must attribute the client: {start}"
+    );
+    assert!(
+        !captured.contains(VALID_KEY),
+        "audit records must never contain the key: {captured}"
+    );
 }
