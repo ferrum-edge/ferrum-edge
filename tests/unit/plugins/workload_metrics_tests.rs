@@ -686,3 +686,242 @@ fn tracing_provider_cleartext_needs_opt_in_off_loopback() {
         assert!(error.contains("allow_plaintext"), "{error}");
     }
 }
+
+const WORKLOAD_METRICS_SOURCE: &str = include_str!("../../../src/plugins/mesh/workload_metrics.rs");
+
+/// The production half of `workload_metrics.rs` (its inline test module and
+/// everything after it excluded).
+fn workload_metrics_production_source() -> &'static str {
+    WORKLOAD_METRICS_SOURCE
+        .split_once("#[cfg(test)]\nmod tests {")
+        .map_or(WORKLOAD_METRICS_SOURCE, |(production, _)| production)
+}
+
+/// The text of `source` from `start` up to the first `end` after it.
+fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("source must contain {start:?}"));
+    let rest = &source[from..];
+    let to = rest
+        .find(end)
+        .unwrap_or_else(|| panic!("{start:?} must be followed by {end:?}"));
+    &rest[..to]
+}
+
+/// workload_metrics-SOL-2: propagation-only instances (span reporting
+/// disabled, or no exporter) must decide BEFORE building a `SpanData`, not
+/// build every sampled span's owned IDs and attributes and then drop it.
+#[test]
+fn inactive_span_export_is_checked_before_span_construction() {
+    let source = workload_metrics_production_source();
+    for (hook, builder) in [
+        (
+            "async fn log_span(",
+            "SpanData::from_transaction_summary_with_kind(",
+        ),
+        (
+            "async fn on_stream_disconnect(",
+            "SpanData::from_stream_summary_with_kind(",
+        ),
+    ] {
+        let before_builder = source_between(source, hook, builder);
+        assert!(
+            before_builder.contains("self.span_export_active()"),
+            "{hook} must check span_export_active() before {builder}"
+        );
+    }
+}
+
+/// workload_metrics-MUSE-4: the instance-immutable disabled-metrics marker
+/// and per-family tag-override plans (up to 16 KiB) are written only when the
+/// stamped value differs, so the repeat stamp copies nothing.
+#[test]
+fn immutable_metric_plans_are_not_recopied_on_every_stamp() {
+    let source = workload_metrics_production_source();
+    let stamp = source_between(
+        source,
+        "fn apply_telemetry_metadata_with_probe<",
+        "fn should_export_metadata<",
+    );
+    assert!(
+        stamp.contains(
+            "insert_metadata_if_changed(metadata, MESH_METRICS_DISABLED_METADATA, marker)"
+        ),
+        "disabled-metrics marker must use insert_metadata_if_changed"
+    );
+    assert!(
+        stamp
+            .contains("insert_metadata_if_changed(metadata, family.override_metadata_key(), plan)"),
+        "tag-override plans must use insert_metadata_if_changed"
+    );
+    assert!(
+        !stamp.contains("plan.clone()") && !stamp.contains("marker.clone()"),
+        "no unconditional clone of the marker or plans"
+    );
+}
+
+#[tokio::test]
+async fn repeated_stamps_keep_metric_plans_byte_identical() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "metrics": {
+            "disabled_metrics": ["REQUEST_SIZE"],
+            "tag_overrides": [{
+                "metric": "REQUEST_COUNT",
+                "name": "destination_service",
+                "operation": {"type": "set", "value": "reviews"}
+            }]
+        }
+    }))
+    .expect("metric plan config");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    plugin.on_request_received(&mut ctx).await;
+    let first = ctx.metadata.clone();
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    for key in [
+        "mesh.metrics.disabled",
+        "mesh.metrics.request_count.tag_overrides",
+    ] {
+        assert!(first.contains_key(key), "{key} stamped");
+        assert_eq!(first.get(key), ctx.metadata.get(key), "{key}");
+    }
+}
+
+fn traceparent_parts(traceparent: &str) -> (String, String, String) {
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    assert_eq!(parts.len(), 4, "{traceparent}");
+    (
+        parts[1].to_string(),
+        parts[2].to_string(),
+        parts[3].to_string(),
+    )
+}
+
+fn b3_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.to_ascii_lowercase();
+            name == "b3" || name.starts_with("x-b3-")
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    found.sort();
+    found
+}
+
+/// workload_metrics-SOL-4: with a Zipkin provider, a fresh gateway root is
+/// propagated as B3 (multi-header) beside W3C, carrying the same IDs and
+/// sampling decision, so a B3-only backend joins the exported trace.
+#[tokio::test]
+async fn zipkin_provider_injects_the_active_span_as_b3() {
+    let plugin = WorkloadMetrics::new(&json!({
+        "sampling_percentage": 100.0,
+        "tracing_providers": [{
+            "kind": "zipkin",
+            "config": {"url": "http://127.0.0.1:9411/api/v2/spans"}
+        }]
+    }))
+    .expect("zipkin workload metrics");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let traceparent = headers.get("traceparent").expect("W3C context").clone();
+    let (trace_id, span_id, flags) = traceparent_parts(&traceparent);
+    assert_eq!(flags, "01");
+    assert_eq!(
+        b3_headers(&headers),
+        vec![
+            ("x-b3-sampled".to_string(), "1".to_string()),
+            ("x-b3-spanid".to_string(), span_id),
+            ("x-b3-traceid".to_string(), trace_id),
+        ],
+        "a fresh root has no parent and the request used no single header"
+    );
+}
+
+/// workload_metrics-SOL-4: an incoming single-header `b3` is replaced by the
+/// gateway span (with the caller's span as parent), not forwarded stale.
+#[tokio::test]
+async fn incoming_single_header_b3_is_replaced_with_the_gateway_span() {
+    let plugin = WorkloadMetrics::new(&json!({"sampling_percentage": 100.0}))
+        .expect("sampling workload metrics");
+    let trace_id = "abcdef1234567890abcdef1234567890";
+    let caller_span = "1234567890abcdef";
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::from([("b3".to_string(), format!("{trace_id}-{caller_span}-1"))]);
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let traceparent = headers.get("traceparent").expect("W3C context").clone();
+    let (w3c_trace, gateway_span, _) = traceparent_parts(&traceparent);
+    assert_eq!(w3c_trace, trace_id);
+    assert_ne!(gateway_span, caller_span);
+    assert_eq!(
+        headers.get("b3").map(String::as_str),
+        Some(format!("{trace_id}-{gateway_span}-1-{caller_span}").as_str())
+    );
+    assert_eq!(
+        headers.get("x-b3-spanid").map(String::as_str),
+        Some(gateway_span.as_str())
+    );
+    assert_eq!(
+        headers.get("x-b3-parentspanid").map(String::as_str),
+        Some(caller_span)
+    );
+}
+
+/// workload_metrics-SOL-4: when W3C context wins over a conflicting stale
+/// multi-header B3 copy, every casing of the stale copy is replaced by the
+/// active span instead of pointing a B3-only backend at another trace.
+#[tokio::test]
+async fn stale_multi_header_b3_is_rewritten_from_the_active_w3c_span() {
+    let plugin = WorkloadMetrics::new(&json!({"sampling_percentage": 100.0}))
+        .expect("sampling workload metrics");
+    let w3c_trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let w3c_parent = "00f067aa0ba902b7";
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::from([
+        (
+            "traceparent".to_string(),
+            format!("00-{w3c_trace}-{w3c_parent}-01"),
+        ),
+        (
+            "X-B3-TraceId".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        ("X-B3-SpanId".to_string(), "bbbbbbbbbbbbbbbb".to_string()),
+        ("x-b3-sampled".to_string(), "0".to_string()),
+        ("x-b3-flags".to_string(), "1".to_string()),
+    ]);
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let traceparent = headers.get("traceparent").expect("W3C context").clone();
+    let (trace_id, span_id, _) = traceparent_parts(&traceparent);
+    assert_eq!(trace_id, w3c_trace);
+    assert_eq!(
+        b3_headers(&headers),
+        vec![
+            ("x-b3-parentspanid".to_string(), w3c_parent.to_string()),
+            ("x-b3-sampled".to_string(), "1".to_string()),
+            ("x-b3-spanid".to_string(), span_id),
+            ("x-b3-traceid".to_string(), trace_id),
+        ]
+    );
+}
+
+/// Metrics-only instances own no trace context: B3 headers pass untouched.
+#[tokio::test]
+async fn metrics_only_instance_leaves_b3_headers_alone() {
+    let plugin = WorkloadMetrics::new(&json!({})).expect("metrics-only workload metrics");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let original = HashMap::from([(
+        "b3".to_string(),
+        "abcdef1234567890abcdef1234567890-1234567890abcdef-1".to_string(),
+    )]);
+    let mut headers = original.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(b3_headers(&headers), b3_headers(&original));
+    assert!(!headers.contains_key("traceparent"));
+}
