@@ -247,10 +247,6 @@ impl CandidateProviders {
 struct JwksProvider {
     /// Expected `iss` claim value. Used to match incoming tokens to this provider.
     issuer: Option<String>,
-    /// Accepted `aud` claim values. jsonwebtoken treats this as OR matching.
-    /// When non-empty, `aud` must be present; `set_audience` alone does not
-    /// require presence.
-    audiences: Vec<String>,
     /// Configured token extraction locations.
     token_locations: Vec<TokenLocation>,
     /// Scopes that must be present in the token (all required).
@@ -267,8 +263,6 @@ struct JwksProvider {
     consumer_header_claim: Option<String>,
     /// Whether to forward the original token-bearing header or query param upstream.
     forward_original_token: bool,
-    /// Whether this provider requires tokens to include an `exp` claim.
-    require_exp: bool,
     /// JWT `exp`/`nbf` clock leeway in seconds (`clock_skew_seconds`). Also
     /// extends the authenticated-stream credential deadline by the same
     /// amount so the stream lifetime agrees with verification.
@@ -956,7 +950,6 @@ impl JwksAuth {
 
             providers.push(JwksProvider {
                 issuer,
-                audiences,
                 token_locations,
                 required_scopes,
                 required_roles,
@@ -965,7 +958,6 @@ impl JwksAuth {
                 consumer_identity_claim: prov_consumer_identity_claim,
                 consumer_header_claim: prov_consumer_header_claim,
                 forward_original_token,
-                require_exp: provider_require_exp,
                 clock_skew_seconds: provider_clock_skew_seconds,
                 validation,
                 claim_headers: provider_claim_headers,
