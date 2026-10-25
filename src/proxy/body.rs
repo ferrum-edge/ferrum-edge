@@ -2695,6 +2695,41 @@ pub(crate) fn sanitize_backend_request_trailer_frame(frame: Frame<Bytes>) -> Fra
     }
 }
 
+/// Remove the route's configured credential header locations from a request
+/// TRAILERS frame, after [`sanitize_backend_request_trailer_frame`] has
+/// applied the static boundary.
+///
+/// The static predicate knows only the fixed credential names. A custom
+/// `key_auth` `header:<name>` (or JWT / JWKS / OAuth token header) is per-route
+/// configuration, so the streaming adapters carry the route's precomputed list
+/// (`RequestContext::request_trailer_credential_header_names`) and apply it
+/// here ([`crate::proxy::headers::strip_configured_credential_request_trailers`]).
+/// Nothing runs for a DATA frame or a route without configured names.
+#[inline]
+pub(crate) fn strip_configured_credential_trailer_frame(
+    frame: &mut Frame<Bytes>,
+    credential_header_names: &[String],
+) {
+    if credential_header_names.is_empty() {
+        return;
+    }
+    if let Some(trailers) = frame.trailers_mut() {
+        crate::proxy::headers::strip_configured_credential_request_trailers(
+            trailers,
+            credential_header_names,
+        );
+    }
+}
+
+/// Borrow an adapter's optional configured credential-header list as a slice.
+#[inline]
+pub(crate) fn trailer_credential_names(names: &Option<Arc<Vec<String>>>) -> &[String] {
+    match names {
+        Some(names) => names.as_slice(),
+        None => &[],
+    }
+}
+
 // -- Gateway-owned upload source ----------------------------------------------
 
 /// Where a streaming client request-body adapter reads its frames from.
@@ -2788,6 +2823,18 @@ impl UploadSource {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        self.poll_frame_with_trailer_credentials(cx, &[])
+    }
+
+    /// [`Self::poll_frame`], additionally removing the route's configured
+    /// credential header locations from a TRAILERS frame
+    /// ([`strip_configured_credential_trailer_frame`]). Every request-body
+    /// adapter that carries a route's list polls through here.
+    pub(crate) fn poll_frame_with_trailer_credentials(
+        &mut self,
+        cx: &mut Context<'_>,
+        credential_header_names: &[String],
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let polled = match self {
             UploadSource::Direct(incoming) => {
                 let frame = std::task::ready!(http_body::Body::poll_frame(Pin::new(incoming), cx));
@@ -2805,7 +2852,9 @@ impl UploadSource {
         // come from the same client body across a bounded bridge.
         match polled {
             Poll::Ready(Some(Ok(frame))) => {
-                Poll::Ready(Some(Ok(sanitize_backend_request_trailer_frame(frame))))
+                let mut frame = sanitize_backend_request_trailer_frame(frame);
+                strip_configured_credential_trailer_frame(&mut frame, credential_header_names);
+                Poll::Ready(Some(Ok(frame)))
             }
             other => other,
         }
@@ -2954,6 +3003,10 @@ pub struct SizeLimitedIncoming {
     /// Where an UNPUMPED adapter records why the client body it reads failed
     /// (issue #6776). See [`SizeLimitedIncoming::with_client_fault_latch`].
     client_fault: Option<Arc<crate::proxy::upload_pump::ClientUploadFaultLatch>>,
+    /// The route's configured credential header locations, removed from a
+    /// request TRAILERS frame. See
+    /// [`SizeLimitedIncoming::with_trailer_credential_header_names`].
+    trailer_credential_header_names: Option<Arc<Vec<String>>>,
 }
 
 /// The error a frontend HTTP/2 upload yields when its EOF is not backed by the
@@ -3107,6 +3160,7 @@ impl SizeLimitedIncoming {
             auth_deadline: None,
             require_end_stream: false,
             client_fault: None,
+            trailer_credential_header_names: None,
         }
     }
 
@@ -3138,6 +3192,7 @@ impl SizeLimitedIncoming {
             auth_deadline: None,
             require_end_stream: false,
             client_fault: None,
+            trailer_credential_header_names: None,
         }
     }
 
@@ -3231,6 +3286,20 @@ impl SizeLimitedIncoming {
         latch: Arc<crate::proxy::upload_pump::ClientUploadFaultLatch>,
     ) -> Self {
         self.client_fault = Some(latch);
+        self
+    }
+
+    /// Remove the route's configured credential header locations
+    /// (`RequestContext::request_trailer_credential_header_names`) from the
+    /// client's request TRAILERS frame, in addition to the static late
+    /// request-trailer boundary every adapter already applies. `None` keeps
+    /// the static boundary only.
+    #[must_use]
+    pub(crate) fn with_trailer_credential_header_names(
+        mut self,
+        names: Option<Arc<Vec<String>>>,
+    ) -> Self {
+        self.trailer_credential_header_names = names;
         self
     }
 
@@ -3491,6 +3560,10 @@ pub enum DirectH2RequestBody {
         /// The frontend is HTTP/2, so EOF must be backed by the client's own
         /// END_STREAM (issue #6022); see [`h2_upload_reset_error`].
         require_end_stream: bool,
+        /// The route's configured credential header locations, removed from
+        /// the client's request TRAILERS frame
+        /// ([`strip_configured_credential_trailer_frame`]).
+        trailer_credential_header_names: Option<Arc<Vec<String>>>,
     },
     /// Boxed so the enum stays the size of the passthrough arm: that arm is
     /// the common unlimited-upload path and is moved into hyper's detached
@@ -3537,6 +3610,7 @@ impl http_body::Body for DirectH2RequestBody {
                 published,
                 latch,
                 require_end_stream,
+                trailer_credential_header_names,
             } => {
                 if poll_upload_cancel(cancel, cx) == UploadCancelSignal::Cancelled {
                     publish_passthrough_request_bytes(observed, *seen, published, latch);
@@ -3557,7 +3631,12 @@ impl http_body::Body for DirectH2RequestBody {
                         // `UploadSource` — it polls the client `Incoming` in
                         // place — so the late request-trailer trust boundary
                         // has to be applied here too.
-                        Poll::Ready(Some(Ok(sanitize_backend_request_trailer_frame(frame))))
+                        let mut frame = sanitize_backend_request_trailer_frame(frame);
+                        strip_configured_credential_trailer_frame(
+                            &mut frame,
+                            trailer_credential_names(trailer_credential_header_names),
+                        );
+                        Poll::Ready(Some(Ok(frame)))
                     }
                     Poll::Ready(Some(Err(e))) => {
                         publish_passthrough_request_bytes(observed, *seen, published, latch);
@@ -3706,7 +3785,10 @@ impl http_body::Body for SizeLimitedIncoming {
             )));
         }
         let polled = loop {
-            match this.inner.poll_frame(cx) {
+            match this.inner.poll_frame_with_trailer_credentials(
+                cx,
+                trailer_credential_names(&this.trailer_credential_header_names),
+            ) {
                 // See `poll_nonempty_frame` (issue #5588).
                 Poll::Ready(Some(Ok(frame)))
                     if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
@@ -3805,6 +3887,9 @@ pub struct CountingIncoming {
     /// A frontend HTTP/2 upload's EOF must be backed by the client's own
     /// END_STREAM. See [`SizeLimitedIncoming::with_h2_end_stream_required`].
     require_end_stream: bool,
+    /// The route's configured credential header locations. See
+    /// [`SizeLimitedIncoming::with_trailer_credential_header_names`].
+    trailer_credential_header_names: Option<Arc<Vec<String>>>,
 }
 
 impl CountingIncoming {
@@ -3839,6 +3924,7 @@ impl CountingIncoming {
             grpc_scanner: None,
             auth_deadline: None,
             require_end_stream: false,
+            trailer_credential_header_names: None,
         }
     }
 
@@ -3881,6 +3967,18 @@ impl CountingIncoming {
     #[must_use]
     pub(crate) fn with_h2_end_stream_required(mut self, required: bool) -> Self {
         self.require_end_stream = required;
+        self
+    }
+
+    /// Identical contract to
+    /// [`SizeLimitedIncoming::with_trailer_credential_header_names`], for the
+    /// unlimited-size streaming upload path.
+    #[must_use]
+    pub(crate) fn with_trailer_credential_header_names(
+        mut self,
+        names: Option<Arc<Vec<String>>>,
+    ) -> Self {
+        self.trailer_credential_header_names = names;
         self
     }
 
@@ -3954,7 +4052,10 @@ impl http_body::Body for CountingIncoming {
             return Poll::Ready(Some(Err(deadline.message().into())));
         }
         let polled = loop {
-            match this.inner.poll_frame(cx) {
+            match this.inner.poll_frame_with_trailer_credentials(
+                cx,
+                trailer_credential_names(&this.trailer_credential_header_names),
+            ) {
                 // See `poll_nonempty_frame` (issue #5588).
                 Poll::Ready(Some(Ok(frame)))
                     if frame.data_ref().is_some_and(|data| data.is_empty()) => {}

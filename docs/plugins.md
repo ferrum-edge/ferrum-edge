@@ -3236,6 +3236,31 @@ and contain no whitespace; query names and values use the same percent-decoded
 representation on HTTP/1.1, HTTP/2, and HTTP/3. Unknown configuration fields
 are rejected.
 
+**`;` sub-parameter aliases (query locations).** Ferrum splits the query on `&`
+only, while some backends also split on `;`, so `?carrier=;api_key=k` is one
+`carrier` parameter to Ferrum but an `api_key` to such a backend. A request
+whose configured query name also appears as a `;`-separated sub-parameter
+(matched by raw spelling or any percent/form decoding, and including a name
+such as `api_key;x`) is **ambiguous** and is refused with `401`
+`{"error":"Ambiguous API key query parameter"}` — the alias never
+authenticates, whichever spelling holds a valid key. When another mechanism
+authenticates the request instead, the alias is still marked for policy
+redaction and, with `hide_credentials`, the whole carrying `&` segment is
+removed from the forwarded query. A `;` inside a value (`api_key=k;x=1`) is
+part of that value, not an alias.
+
+**Request trailers.** A configured `header:<name>` location is also removed
+from the client's request trailers on every protocol path (HTTP/1.1, HTTP/2,
+HTTP/3, native gRPC, gRPC-Web), whatever `hide_credentials` says: trailers are
+never a credential location, so a client cannot re-send the key after the
+initial header block was authenticated and stripped. See
+[Backend Request Trailers](plugin_execution_order.md#backend-request-trailers).
+
+The authenticate hook borrows the key from the request (a single header field
+line, or the decoded query map) instead of copying it, so a lookup allocates
+nothing for the credential itself; only a repeated header field line that must
+be folded allocates.
+
 **Consumer credential** (`keyauth`) — array:
 ```yaml
 credentials:
@@ -3265,6 +3290,8 @@ Authenticates using HTTP Basic credentials. Every HTTP 401 response advertises `
 | `hide_credentials` | Boolean | `true` | Remove the `Authorization` field carrying the `Basic` scheme before proxying an authenticated request, including when another mechanism wins a multi-auth chain. Set to `false` only for a legacy backend that explicitly requires the reusable password. |
 
 Basic encodes a **reusable** username and password in reversible Base64: an upstream that receives the field recovers the password and can replay it on any other gateway route that consumer can reach. The credential is therefore removed by default on every HTTP/1.1, HTTP/2, HTTP/3, gRPC, gRPC-Web, and WebSocket handshake path, and it is removed even when a different mechanism authenticated the request — a mixed chain must not forward Alice's password to a backend the gateway is telling `x-consumer-username: bob`. Only the `Basic` scheme is removed; a `Bearer` or other `Authorization` scheme another policy needs is left in place. Consumer identity injection and the `401` challenge are unchanged.
+
+**One `Authorization` credential per request.** `Authorization` is a single credential (RFC 9110 §11.6.2), not a list. The gateway's ingress protocol guard — on HTTP/1.1, HTTP/2, HTTP/3, and WebSocket upgrades alike, before routing and before any authentication plugin runs — refuses with `400` a request that sends `Authorization` as more than one field line (`{"error":"Request contains multiple Authorization headers"}`), or whose single value carries a second credential after a top-level comma, such as `Bearer x, Basic …` (`{"error":"Authorization header contains more than one credential"}`). Without that refusal, `Authorization: Bearer x` followed by `Authorization: Basic <password>` folds to one value whose first scheme is `Bearer`, and a request authenticated by `key_auth` would forward the Basic password. The scan is quote-aware: `auth-param` lists (`Digest username="a", realm="r"`, AWS SigV4 `Credential=…, SignedHeaders=…, Signature=…`) are unaffected, and a comma inside a quoted string separates nothing. The refusal applies to every route, with or without `basic_auth`.
 
 Admin API writes may supply exactly one of `password` or `password_hash`; plaintext passwords are hashed and removed before persistence. File-mode configuration must supply only `password_hash` so plaintext credentials never enter observable runtime configuration.
 
@@ -4613,8 +4640,14 @@ Restricts access based on the geographic location of the client IP address using
 
 `allow_countries` and `deny_countries` are mutually exclusive. At least one must be non-empty.
 
-Country code matches are O(1) and allocation-free on the default request path: codes are decoded as borrowed MMDB strings, packed into two bytes, and matched against precomputed bitsets. A `String` is created only when `inject_headers: true` emits an authoritative value.
+Country code matches are O(1): codes are decoded as borrowed MMDB strings, packed into two bytes, and matched against precomputed bitsets. A record's `registered_country` is decoded only when it has no direct `country`, and a failed lookup formats no error. The request path allocates only the two decision-metadata entries below and, when `inject_headers: true` emits an authoritative value, that header. A GeoIP-only request (no authenticated principal) re-asserts `x-geo-country` at the dispatch boundary in place, without copying the request header map.
 IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 before lookup, so both forms receive the same GeoIP decision.
+
+**Decision metadata.** Every HTTP request and stream session the plugin evaluates writes `geo.decision` with one of seven fixed values — `allowed`, `country_not_allowed`, `country_denied`, `lookup_failed_allowed`, `lookup_failed_denied`, `db_not_loaded_allowed`, `db_not_loaded_denied` — and, when a country was resolved (admitted or rejected), `geo.country` with its ISO 3166-1 alpha-2 code. Both keys are on the built-in metadata allowlist, so transaction-log sinks emit them unredacted; this is the per-request record of which requests a fail-open policy admitted and why. When several geo instances evaluate one request, the last one to run writes the values.
+
+**Database freshness.** Each construction (startup and every reload) logs the loaded database's `database_type`, `build_epoch`, and `age_days`: at `debug` for a database up to 30 days old, and as a `warn` ("MaxMind database is stale") beyond that. The source path is not logged.
+
+**Request trailers.** `x-geo-country` and its underscore spellings (`x_geo_country`, `x_geo-country`, `x-geo_country`) are removed from client request trailers on every protocol path, with the same folded match the initial header block uses, so a trailing block cannot restate a country a CGI-style backend would fold onto the gateway's assertion.
 
 **Loading.** The `.mmdb` file is read into an owned immutable byte buffer at plugin startup, with metadata and bounded-read checks rejecting files larger than 512 MiB before parsing. Non-regular paths (including FIFOs and devices) are rejected by path metadata before open; Unix also opens non-blocking so a regular path raced to a special file cannot wedge startup or reload, then verifies the opened handle's type and identity.
 

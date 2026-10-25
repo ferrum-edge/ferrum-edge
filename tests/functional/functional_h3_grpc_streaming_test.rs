@@ -368,6 +368,12 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
         http::HeaderValue::from_static("forged"),
     );
     request_trailers.insert("x-geo-country", http::HeaderValue::from_static("XX"));
+    // Underscore spellings a CGI-style backend folds onto the same
+    // `HTTP_X_GEO_COUNTRY` variable as the gateway's verified assertion.
+    request_trailers.insert("x_geo_country", http::HeaderValue::from_static("US"));
+    request_trailers.insert("x_geo-country", http::HeaderValue::from_static("US"));
+    request_trailers.insert("x-geo_country", http::HeaderValue::from_static("US"));
+    request_trailers.insert("x_consumer_role", http::HeaderValue::from_static("admin"));
     request_trailers.insert(
         "x-forwarded-for",
         http::HeaderValue::from_static("203.0.113.44"),
@@ -417,6 +423,10 @@ async fn h3_grpc_streaming_forwards_sanitized_request_trailers() {
             name.as_str(),
             "x-consumer-username"
                 | "x-geo-country"
+                | "x_geo_country"
+                | "x_geo-country"
+                | "x-geo_country"
+                | "x_consumer_role"
                 | "x-forwarded-for"
                 | "forwarded"
                 | "via"

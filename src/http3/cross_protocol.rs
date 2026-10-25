@@ -10695,6 +10695,9 @@ pub(crate) async fn dispatch_grpc_streaming(
         grpc_auth.as_ref().map(|(plan, _, _)| *plan),
     );
     let pump_auth = grpc_auth.clone();
+    // The route's configured credential header locations, stripped from the
+    // client's trailing metadata after the static late-boundary filter.
+    let pump_trailer_credential_header_names = ctx.request_trailer_credential_header_names();
     let pump = tokio::spawn(async move {
         let mut cancelled_before_eof = false;
         let upload = async {
@@ -10756,6 +10759,12 @@ pub(crate) async fn dispatch_grpc_streaming(
                                 match trailer_result {
                                     Ok(Some(mut trailers)) if !trailers.is_empty() => {
                                         sanitize_backend_request_trailers(&mut trailers);
+                                        crate::proxy::headers::strip_configured_credential_request_trailers(
+                                            &mut trailers,
+                                            crate::proxy::body::trailer_credential_names(
+                                                &pump_trailer_credential_header_names,
+                                            ),
+                                        );
                                         if !trailers.is_empty() {
                                             tokio::select! {
                                                 biased;

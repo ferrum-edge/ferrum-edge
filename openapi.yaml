@@ -25448,15 +25448,21 @@ components:
           description: >-
             Exact credential location (header:<name> or query:<name>).
             Whitespace is not trimmed; header names must be valid HTTP tokens,
-            and query names must be non-empty and contain no whitespace.
+            and query names must be non-empty and contain no whitespace. A
+            query name that also appears as a `;`-separated sub-parameter
+            (`carrier=;api_key=k`, raw or percent/form-decoded) is ambiguous:
+            the request is refused with 401 and the alias never
+            authenticates. A configured header name is always removed from
+            client request trailers.
         hide_credentials:
           type: boolean
           default: true
           description: >-
             Remove the configured API-key header or query parameter before
             forwarding an authenticated request upstream, including when
-            another mechanism wins a multi-auth chain. Disable only when a
-            legacy backend explicitly requires the reusable credential.
+            another mechanism wins a multi-auth chain. For a query location
+            this also removes a `;`-separated sub-parameter alias. Disable only
+            when a legacy backend explicitly requires the reusable credential.
 
     BasicAuthConfig:
       type: [object, "null"]
@@ -25480,7 +25486,10 @@ components:
             reversible Base64, so it is removed by default. Only the `Basic`
             scheme is removed; a `Bearer` or other scheme another policy needs
             is left in place. Disable only when a legacy backend explicitly
-            requires the reusable credential.
+            requires the reusable credential. A request that sends more than
+            one `Authorization` credential (repeated field lines, or a second
+            credential after a top-level comma) never reaches this plugin: the
+            ingress protocol guard rejects it with 400 on every protocol.
 
     LdapAuthConfig:
       type: object
@@ -42324,7 +42333,12 @@ components:
         `on_lookup_failure`, while a readable corrupt, incompatible, or
         wrong-product database is rejected.
         Exactly one of `allow_countries` and `deny_countries` must be non-empty.
-        Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
+        Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP. Every
+        evaluated request or stream session records the log-allowlisted
+        metadata `geo.decision` (`allowed`, `country_not_allowed`,
+        `country_denied`, `lookup_failed_allowed`, `lookup_failed_denied`,
+        `db_not_loaded_allowed`, `db_not_loaded_denied`) and, when a country
+        was resolved, `geo.country`.
       required: [db_path]
       oneOf:
         - title: Allow-list mode

@@ -315,6 +315,8 @@ pub const BUILTIN_SAFE_METADATA_KEYS: &[&str] = &[
     "ferrum:synthetic_response_method_override",
     "ferrum:synthetic_short_circuit",
     "frontend_listen_port",
+    "geo.country",
+    "geo.decision",
     "graphql_complexity",
     "graphql_depth",
     "graphql_operation_name",

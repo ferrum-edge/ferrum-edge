@@ -6432,6 +6432,15 @@ impl RequestContext {
             .unwrap_or(&[])
     }
 
+    /// Shared handle to the same configured credential header list, for the
+    /// late request-trailer boundaries that outlive this context (streaming
+    /// request-body adapters and HTTP/3 upload pumps). One reference-count
+    /// increment, and `None` when the route configures no credential header,
+    /// so an unauthenticated route carries nothing into its body adapter.
+    pub(crate) fn request_trailer_credential_header_names(&self) -> Option<Arc<Vec<String>>> {
+        self.request_headers_to_redact.clone()
+    }
+
     /// Retain one credential-query digest outside public metadata.
     pub(crate) fn mark_query_credential_partition_digest(&mut self, name: &str, digest: [u8; 32]) {
         let digests = &mut self.plugin_state_mut().query_credential_partition_digests;

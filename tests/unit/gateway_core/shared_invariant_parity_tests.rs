@@ -3050,9 +3050,11 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         ".filter(|name| is_consumer_assertion_header(name.as_str()))",
     ),
     (
+        // The folded gateway predicate, so underscore spellings of
+        // `x-geo-country` / `x-consumer-*` cannot ride a trailer block either.
         "H1/H2/H3 request trailers",
         "src/proxy/headers.rs",
-        "|| is_consumer_assertion_header(name)\n",
+        "|| is_gateway_assertion_header(name)\n",
     ),
     (
         "post-plugin refresh (H1/H2, H3, egress overlay, deferred passes)",
@@ -3070,9 +3072,11 @@ const CONSUMER_ASSERTION_NAMESPACE_SITES: &[(&str, &str, &str)] = &[
         "    headers_mod::is_consumer_assertion_header(name)\n        || matches!(",
     ),
     (
+        // Delegates to the same initial-boundary helper whose gate is the
+        // "H1/H2 dispatch refresh gate" above.
         "native H3 dispatch refresh gate",
         "src/http3/server.rs",
-        ".any(|k| crate::proxy::headers::is_gateway_assertion_header(k));",
+        "crate::proxy::refresh_initial_backend_gateway_assertion_headers(",
     ),
     (
         "H3 WebSocket handshake",
