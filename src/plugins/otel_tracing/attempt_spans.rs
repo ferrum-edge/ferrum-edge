@@ -50,7 +50,7 @@ use super::{
     OtelTracing, SUPPORTED_TRACEPARENT_VERSION, SpanData, SpanKind, TRACEPARENT_HEADER,
     TraceExporter, build_traceparent, http_method_for_span_name, is_lowercase_hex, otlp_attribute,
     otlp_attribute_bool, otlp_attribute_double, otlp_attribute_int, parse_backend_host_port,
-    timestamp_before_now, timestamp_nanos, trace_is_sampled, truncate_attr,
+    record_span_admission, timestamp_before_now, timestamp_nanos, trace_is_sampled, truncate_attr,
 };
 
 /// Exporter handle shared by every trace one `otel_tracing` instance installs.
@@ -87,7 +87,8 @@ impl AttemptSpanSink {
 
     /// Hand `span` to the exporter's bounded, non-blocking queue.
     fn export_with(&self, span: SpanData, without_blocking: bool) {
-        let Err(error) = self.exporter.try_export(span) else {
+        // Attempt spans share the plugin's export accounting.
+        let Err(error) = record_span_admission(self.exporter.try_export(span)) else {
             return;
         };
         let now_ms = crate::socket_opts::monotonic_now_ms();

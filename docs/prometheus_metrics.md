@@ -308,9 +308,10 @@ that token covers is labelled `dispatch_policy_rejected` here). Access-log
 accounting of the per-plugin observability sinks (`http_logging`,
 `tcp_logging`, `udp_logging`, `ws_logging`, `statsd_logging`, `loki_logging`,
 `kafka_logging`, `ai_transcript_audit`, `api_chargeback_sink`,
-`stdout_logging`), so a truncated audit trail is visible on `/metrics` rather
-than only in logs. `stdout_logging` counts its access records' outcomes at the
-shared process stdout queue (`queue_full` is that queue's saturation), so
+`stdout_logging`, and the `otel_tracing` span exporter), so a truncated audit
+trail or a lossy trace pipeline is visible on `/metrics` rather than only in
+logs. `stdout_logging` counts its access records' outcomes at the shared
+process stdout queue (`queue_full` is that queue's saturation), so
 access-record loss is attributable apart from runtime tracing records;
 `ferrum_log_sink_*{sink="stdout"}` counts both together.
 

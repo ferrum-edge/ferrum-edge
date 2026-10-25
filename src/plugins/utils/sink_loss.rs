@@ -36,12 +36,14 @@ pub const OTHER_PLUGIN: &str = "other";
 /// Sorted so the rendered exposition is stable across scrapes. Adding a sink
 /// means adding it here *and* to the `docs/prometheus_metrics.md` inventory
 /// note; the label set is asserted bounded by the unit tests.
-pub const SINK_PLUGINS: [&str; 11] = [
+pub const SINK_PLUGINS: [&str; 12] = [
     "ai_transcript_audit",
     "api_chargeback_sink",
     "http_logging",
     "kafka_logging",
     "loki_logging",
+    // Span records of the standalone tracing exporter.
+    "otel_tracing",
     OTHER_PLUGIN,
     "statsd_logging",
     "stdout_logging",
@@ -252,8 +254,8 @@ pub fn snapshot() -> SinkLossSnapshot {
 /// alert on `rate(...[5m]) > 0` does not depend on a sink having already lost
 /// a record for the series to exist.
 pub fn render_prometheus() -> String {
-    // 11 plugins * 7 series, each well under 128 bytes of exposition.
-    let mut output = String::with_capacity(10_240);
+    // 12 plugins * 7 series, each well under 128 bytes of exposition.
+    let mut output = String::with_capacity(12_288);
     output.push_str(
         "# HELP ferrum_plugin_log_sink_records_accepted_total Observability records admitted to a per-plugin logging sink's bounded queue. Process-cumulative; not reset by a plugin-cache reload.\n\
 # TYPE ferrum_plugin_log_sink_records_accepted_total counter\n",
