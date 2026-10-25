@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `ai_rate_limiter` classifies requests by their body and scopes
+  the budget to AI calls** (#6847). Every uncompressed `POST` is now buffered
+  and classified from its bytes whatever its `Content-Type`, so an AI body sent
+  as `text/plain`, unlabelled, or under a gRPC-Web label is reserved and
+  metered. A JSON `POST` that does not parse (or a non-UTF-8 JSON-labelled
+  body) is an uninspectable AI candidate like a still-compressed one, so under
+  the default `charge_estimate` a usage-less 2xx for it is refused with `502`.
+  Embedding/predict shapes (Cohere `texts`, Gemini `content.parts` /
+  `requests[].content.parts`, Vertex `instances[]`) and Cohere-scoped bare v1
+  `message` bodies are AI calls, and Cohere Embed is charged from
+  `meta.billed_units`. Conversely, out-of-scope traffic (`GET`, framed
+  gRPC-Web, parsed non-LLM JSON) no longer consults the budget and is never
+  refused with `429`/`503`. A body a request transform turns into an AI call is
+  re-classified and admitted at the final request-body stage. The prompt
+  estimate is now script-aware (CJK/emoji count a token per scalar), a
+  reservation that outlived its window charges its full actual usage, terminal
+  `response.incomplete` usage is read (also by `ai_token_metrics`), local
+  reservation ids are process-unique, and budget `429`s carry `Retry-After`.
+  New optional `consumer_limits`, `model_limits`, and `media_token_estimate`
+  settings add per-consumer and per-model budgets and a per-media reservation.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
