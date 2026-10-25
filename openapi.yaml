@@ -25298,18 +25298,19 @@ components:
             type: string
             minLength: 1
             maxLength: 255
-        forward_header:
-          type: string
-          minLength: 1
+            pattern: "^[a-z0-9._-]+$"
+        forward_identity:
+          type: boolean
+          default: false
           description: |
-            Request header the admitted SPIFFE ID is forwarded to the backend
-            in (HTTP family only). Every client-supplied copy — compared
-            ASCII case-insensitively with `_` read as `-` — is removed before
-            the gateway's value is set, including on requests that carry no
-            identity. Gateway-owned, hop-by-hop, and credential-bearing names
-            (`authorization`, `cookie`, `host`, `forwarded`, `x-real-ip`,
-            `x-geo-country`, `x-consumer-*`, `x-forwarded-*`, `x-ferrum-*`,
-            `x-path-param-*`, and the like) are rejected.
+            When true, the admitted SPIFFE ID is forwarded to the backend in
+            the fixed gateway-owned request header `x-ferrum-peer-spiffe-id`
+            (HTTP family only). Every client-supplied copy — compared ASCII
+            case-insensitively with `_` read as `-` — is removed from the
+            initial header block before the gateway's value is set, including
+            on requests that carry no identity; client request-trailer copies
+            are dropped by the gateway's request-trailer boundary, which owns
+            the whole `x-ferrum-*` namespace.
 
     MeshAuthzPolicy:
       type: object

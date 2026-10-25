@@ -884,7 +884,7 @@ fn test_admission_policy_config_is_validated_without_echoing_values() {
         json!({"require_identity": false}),
         json!({"require_identity": true}),
         json!({"allowed_trust_domains": ["prod.example.com", "_audit.example"]}),
-        json!({"forward_header": "x-spiffe-id"}),
+        json!({"forward_identity": true}),
     ] {
         assert!(
             SpiffeIdentity::new(&valid).is_ok(),
@@ -1061,7 +1061,7 @@ async fn test_allowed_trust_domains_gate_stream_identities() {
 fn test_admission_policy_withdraws_hbone_inner_reuse() {
     for (config, reusable) in [
         (json!({}), true),
-        (json!({"forward_header": "x-spiffe-id"}), true),
+        (json!({"forward_identity": true}), true),
         (json!({"require_identity": false}), true),
         (json!({"require_identity": true}), false),
         (
@@ -1076,9 +1076,18 @@ fn test_admission_policy_withdraws_hbone_inner_reuse() {
 
 // ── Backend identity propagation (spiffe_identity-MUSE-5) ──────────────────
 
+const FORWARDED: &str = ferrum_edge::plugins::mesh::spiffe_identity::FORWARDED_IDENTITY_HEADER;
+
+#[test]
+fn test_forwarded_identity_header_is_gateway_owned_at_the_trailer_boundary() {
+    // PR #6871 review SOL-3: the fixed name sits in the `x-ferrum-*` namespace
+    // the shared request-trailer boundary owns.
+    assert_eq!(FORWARDED, "x-ferrum-peer-spiffe-id");
+}
+
 #[tokio::test]
-async fn test_forward_header_replaces_every_client_copy_with_the_admitted_identity() {
-    let plugin = SpiffeIdentity::new(&json!({"forward_header": "X-Spiffe-Id"})).unwrap();
+async fn test_forward_identity_replaces_every_client_copy_with_the_admitted_identity() {
+    let plugin = SpiffeIdentity::new(&json!({"forward_identity": true})).unwrap();
     assert!(plugin.modifies_request_headers());
 
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
@@ -1090,10 +1099,10 @@ async fn test_forward_header_replaces_every_client_copy_with_the_admitted_identi
 
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert(
-        "x-spiffe-id".to_string(),
+        FORWARDED.to_string(),
         "spiffe://attacker.example/ns/forged/sa/x".to_string(),
     );
-    headers.insert("X_Spiffe_Id".to_string(), "forged".to_string());
+    headers.insert("X_Ferrum_Peer_Spiffe_Id".to_string(), "forged".to_string());
     headers.insert("accept".to_string(), "*/*".to_string());
     assert!(matches!(
         plugin.before_proxy(&mut ctx, &mut headers).await,
@@ -1101,17 +1110,17 @@ async fn test_forward_header_replaces_every_client_copy_with_the_admitted_identi
     ));
 
     assert_eq!(
-        headers.get("x-spiffe-id").map(String::as_str),
+        headers.get(FORWARDED).map(String::as_str),
         Some(LIFETIME_SVID)
     );
-    assert!(!headers.contains_key("X_Spiffe_Id"));
+    assert!(!headers.contains_key("X_Ferrum_Peer_Spiffe_Id"));
     assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
     assert_eq!(headers.len(), 2);
 }
 
 #[tokio::test]
-async fn test_forward_header_strips_client_copies_without_an_identity() {
-    let plugin = SpiffeIdentity::new(&json!({"forward_header": "x-spiffe-id"})).unwrap();
+async fn test_forward_identity_strips_client_copies_without_an_identity() {
+    let plugin = SpiffeIdentity::new(&json!({"forward_identity": true})).unwrap();
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     assert!(matches!(
         plugin.on_request_received(&mut ctx).await,
@@ -1120,7 +1129,7 @@ async fn test_forward_header_strips_client_copies_without_an_identity() {
 
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert(
-        "X-SPIFFE-ID".to_string(),
+        "X-FERRUM-PEER-SPIFFE-ID".to_string(),
         "spiffe://attacker.example/ns/forged/sa/x".to_string(),
     );
     plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -1133,6 +1142,7 @@ async fn test_forward_header_strips_client_copies_without_an_identity() {
 #[tokio::test]
 async fn test_default_config_forwards_nothing() {
     let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    assert!(!plugin.modifies_request_headers());
     let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
     ctx.tls_client_cert_der = Some(Arc::new(build_cert(Some(LIFETIME_SVID), None)));
     plugin.on_request_received(&mut ctx).await;
@@ -1143,42 +1153,22 @@ async fn test_default_config_forwards_nothing() {
     assert_eq!(
         headers.get("x-spiffe-id").map(String::as_str),
         Some("client-value"),
-        "without forward_header the plugin must not touch backend headers"
+        "without forward_identity the plugin must not touch backend headers"
     );
+    assert!(!headers.contains_key(FORWARDED));
 }
 
 #[test]
-fn test_forward_header_refuses_gateway_owned_and_invalid_names() {
-    for name in [
-        "authorization",
-        "Proxy-Authorization",
-        "cookie",
-        "host",
-        "connection",
-        "forwarded",
-        "x-real-ip",
-        "X-Forwarded-Client-Cert",
-        "x_forwarded_for",
-        "x-consumer-username",
-        "X_Consumer_Id",
-        "x-ferrum-hops",
-        "X_Path_Param_Id",
-        "X-Geo-Country",
-    ] {
-        let err = SpiffeIdentity::new(&json!({ "forward_header": name }))
+fn test_forward_identity_must_be_a_boolean() {
+    for invalid in [json!("x-spiffe-id"), json!(1), json!(null), json!([])] {
+        let err = SpiffeIdentity::new(&json!({ "forward_identity": invalid }))
             .err()
-            .unwrap_or_else(|| panic!("{name} must be refused"));
-        assert!(err.contains("gateway-owned"), "{name}: {err}");
-    }
-    for invalid in [
-        json!(""),
-        json!("bad header"),
-        json!(":authority"),
-        json!(7),
-    ] {
+            .unwrap_or_else(|| panic!("{invalid} must be refused"));
         assert!(
-            SpiffeIdentity::new(&json!({ "forward_header": invalid })).is_err(),
-            "{invalid} must be refused"
+            err.contains("`forward_identity` must be a boolean"),
+            "{err}"
         );
     }
+    // The configurable header name of the first revision is gone.
+    assert!(SpiffeIdentity::new(&json!({"forward_header": "x-spiffe-id"})).is_err());
 }

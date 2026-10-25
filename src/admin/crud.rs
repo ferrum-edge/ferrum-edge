@@ -555,6 +555,12 @@ fn validate_candidate_plugin_graph(
     crate::plugin_cache::validate_plugin_composition_candidate(candidate, http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
     crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
+        .map_err(AfterValidateError::BadRequest)?;
+    // Shared by direct plugin/proxy writes, API-spec create/replace, proxy
+    // deletes, and restore, so an API-spec bundle cannot attach a scoped
+    // `spiffe_identity` to a non-terminating stream listener either.
+    candidate
+        .validate_scoped_spiffe_identity_stream_compatibility()
         .map_err(AfterValidateError::BadRequest)
 }
 

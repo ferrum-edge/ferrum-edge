@@ -7604,12 +7604,12 @@ fn spiffe_identity_schema_matches_constructor_admission() {
         (json!({}), true),
         (json!({"require_identity": true}), true),
         (json!({"allowed_trust_domains": ["prod.example.com"]}), true),
-        (json!({"forward_header": "x-spiffe-id"}), true),
+        (json!({"forward_identity": true}), true),
         (
             json!({
                 "require_identity": true,
                 "allowed_trust_domains": ["prod.example.com", "staging.example.com"],
-                "forward_header": "x-spiffe-id"
+                "forward_identity": true
             }),
             true,
         ),
@@ -7625,8 +7625,24 @@ fn spiffe_identity_schema_matches_constructor_admission() {
             json!({"allowed_trust_domains": ["prod.example.com", "prod.example.com"]}),
             false,
         ),
-        (json!({"forward_header": ""}), false),
-        (json!({"forward_header": 7}), false),
+        // Lexical trust-domain grammar the constructor enforces
+        // (PR #6871 review SOL-4).
+        (json!({"allowed_trust_domains": ["PROD.example"]}), false),
+        (
+            json!({"allowed_trust_domains": ["spiffe://prod.example.com"]}),
+            false,
+        ),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com:8443"]}),
+            false,
+        ),
+        (json!({"allowed_trust_domains": [""]}), false),
+        (json!({"allowed_trust_domains": ["a".repeat(256)]}), false),
+        (json!({"allowed_trust_domains": ["a".repeat(255)]}), true),
+        (json!({"allowed_trust_domains": ["_audit.example-1"]}), true),
+        (json!({"forward_identity": "x-spiffe-id"}), false),
+        (json!({"forward_identity": 7}), false),
+        (json!({"forward_header": "x-spiffe-id"}), false),
     ];
     for (instance, expected_valid) in cases {
         assert_component_validity(&spec, "SpiffeIdentityConfig", &instance, expected_valid);

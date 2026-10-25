@@ -4317,6 +4317,29 @@ impl GatewayConfig {
             }
         }
 
+        errors.extend(self.scoped_spiffe_identity_stream_compatibility_errors());
+
+        errors
+    }
+
+    /// Validate that no proxy/proxy-group-scoped `spiffe_identity` instance is
+    /// attached to a stream proxy that terminates no TLS/DTLS.
+    ///
+    /// Already part of [`Self::validate_mtls_auth_compatibility`]; exposed on
+    /// its own for admission paths that judge a merged plugin-graph candidate
+    /// (API-spec create/replace, plugin-graph writes) without the namespace's
+    /// `mtls_auth` posture.
+    pub fn validate_scoped_spiffe_identity_stream_compatibility(&self) -> Result<(), Vec<String>> {
+        let errors = self.scoped_spiffe_identity_stream_compatibility_errors();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn scoped_spiffe_identity_stream_compatibility_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
         // A deliberately attached `spiffe_identity` on a stream proxy that
         // terminates no TLS/DTLS can never see a peer certificate, so it would
         // accept the config and then silently publish no principal for every

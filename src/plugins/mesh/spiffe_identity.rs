@@ -18,7 +18,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use http::HeaderName;
 use serde_json::{Map, Value};
 use tracing::debug;
 use x509_parser::prelude::*;
@@ -46,11 +45,22 @@ const MULTIPLE_URI_SANS: &str = "peer certificate carries more than one URI SAN"
 /// admission, so it stays small by construction.
 const MAX_ALLOWED_TRUST_DOMAINS: usize = 64;
 
+/// The gateway-owned request header `forward_identity` writes the admitted
+/// SPIFFE ID into.
+///
+/// Deliberately fixed, and deliberately inside the `x-ferrum-*` namespace: the
+/// shared request-trailer boundary
+/// (`crate::proxy::headers::is_forbidden_backend_request_trailer_name`) drops
+/// every client `x-ferrum-*` trailer — `_`/`-` folded — on every H1/H2/H3
+/// forwarding path, so a client can restate this field neither in the initial
+/// header block (the hook strips it) nor in a late trailer block.
+pub const FORWARDED_IDENTITY_HEADER: &str = "x-ferrum-peer-spiffe-id";
+
 /// Every configuration key the constructor admits.
 const SUPPORTED_CONFIG_FIELDS: &[&str] = &[
     "require_identity",
     "allowed_trust_domains",
-    "forward_header",
+    "forward_identity",
 ];
 
 /// Outcome of extracting a SPIFFE ID from a peer certificate. The peer
@@ -381,10 +391,11 @@ pub struct SpiffeIdentity {
     /// When set, admit only identities whose trust domain is listed. Applies
     /// to certificate-derived and pre-stamped identities alike.
     allowed_trust_domains: Option<Vec<TrustDomain>>,
-    /// Lowercase request header the admitted identity is forwarded to the
-    /// backend in. Every client-supplied copy (compared as a CGI-style backend
-    /// reads names) is removed first, whether or not an identity is forwarded.
-    forward_header: Option<String>,
+    /// Forward the admitted identity to the backend in
+    /// [`FORWARDED_IDENTITY_HEADER`]. Every client-supplied copy (compared as a
+    /// CGI-style backend reads names) is removed first, whether or not an
+    /// identity is forwarded.
+    forward_identity: bool,
 }
 
 impl SpiffeIdentity {
@@ -409,14 +420,14 @@ impl SpiffeIdentity {
         {
             return Err(
                 "spiffe_identity: unsupported configuration field; supported fields \
-                 are `require_identity`, `allowed_trust_domains`, and `forward_header`"
+                 are `require_identity`, `allowed_trust_domains`, and `forward_identity`"
                     .to_string(),
             );
         }
         Ok(Self {
-            require_identity: parse_require_identity(obj)?,
+            require_identity: parse_bool_field(obj, "require_identity")?,
             allowed_trust_domains: parse_allowed_trust_domains(obj)?,
-            forward_header: parse_forward_header(obj)?,
+            forward_identity: parse_bool_field(obj, "forward_identity")?,
         })
     }
 
@@ -436,12 +447,12 @@ impl SpiffeIdentity {
     }
 }
 
-fn parse_require_identity(obj: &Map<String, Value>) -> Result<bool, String> {
-    match obj.get("require_identity") {
+fn parse_bool_field(obj: &Map<String, Value>, field: &'static str) -> Result<bool, String> {
+    match obj.get(field) {
         None => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
         Some(other) => Err(format!(
-            "spiffe_identity: `require_identity` must be a boolean, got a JSON {}",
+            "spiffe_identity: `{field}` must be a boolean, got a JSON {}",
             json_type_name(other)
         )),
     }
@@ -498,38 +509,6 @@ fn parse_allowed_trust_domains(
         domains.push(domain);
     }
     Ok(Some(domains))
-}
-
-fn parse_forward_header(obj: &Map<String, Value>) -> Result<Option<String>, String> {
-    let Some(value) = obj.get("forward_header") else {
-        return Ok(None);
-    };
-    let Value::String(raw) = value else {
-        return Err(format!(
-            "spiffe_identity: `forward_header` must be a string, got a JSON {}",
-            json_type_name(value)
-        ));
-    };
-    let name = HeaderName::from_bytes(raw.as_bytes()).map_err(|_| {
-        "spiffe_identity: `forward_header` is not a valid HTTP header name".to_string()
-    })?;
-    // The same refusal set claim-to-header mappings use — hop-by-hop and
-    // framing fields, credentials, `x-consumer-*`, `x-forwarded-*`,
-    // `x-ferrum-*`, `forwarded`, and the rest of the gateway-owned names —
-    // plus the remaining gateway assertions (`x-geo-country`, the
-    // `x-path-param-*` route captures), all compared as a CGI-style backend
-    // reads them.
-    if crate::plugins::utils::claim_header_fanout::is_output_claim_reserved_header(name.as_str())
-        || crate::proxy::headers::is_gateway_assertion_header(name.as_str())
-        || crate::proxy::headers::is_path_param_assertion_header(name.as_str())
-    {
-        return Err(
-            "spiffe_identity: `forward_header` cannot target a gateway-owned, hop-by-hop, or \
-             credential-bearing header"
-                .to_string(),
-        );
-    }
-    Ok(Some(name.as_str().to_string()))
 }
 
 fn json_type_name(value: &Value) -> &'static str {
@@ -621,7 +600,7 @@ impl Plugin for SpiffeIdentity {
     /// or `allowed_trust_domains`) refuses: that verdict is a per-CONNECT
     /// decision no sweep re-issues, so a reload that tightens it must withdraw
     /// reuse (`reuse_withdrawn`) and force a fresh CONNECT judged by the new
-    /// policy. `forward_header` only rewrites the CONNECT's own headers and
+    /// policy. `forward_identity` only rewrites the CONNECT's own headers and
     /// leaves the classification unchanged.
     fn allows_hbone_inner_reuse(&self) -> bool {
         !self.require_identity && self.allowed_trust_domains.is_none()
@@ -630,7 +609,7 @@ impl Plugin for SpiffeIdentity {
     /// Only an instance that forwards the identity to the backend touches
     /// backend-visible headers (`before_proxy`).
     fn modifies_request_headers(&self) -> bool {
-        self.forward_header.is_some()
+        self.forward_identity
     }
 
     /// Audited (issue #6793): this plugin reads only the peer certificate and
@@ -702,24 +681,32 @@ impl Plugin for SpiffeIdentity {
         }
     }
 
-    /// Forward the admitted identity to the backend when `forward_header` is
-    /// configured. Every client-supplied copy is removed first — case-
-    /// insensitively and with `_` read as `-`, the way a CGI-style backend
-    /// folds names — so the backend never sees a value the client chose, even
-    /// on a request that carries no identity.
+    /// Forward the admitted identity to the backend in
+    /// [`FORWARDED_IDENTITY_HEADER`] when `forward_identity` is set. Every
+    /// client-supplied copy is removed first — case-insensitively and with `_`
+    /// read as `-`, the way a CGI-style backend folds names — so the backend
+    /// never sees a value the client chose, even on a request that carries no
+    /// identity. Client trailer copies are dropped by the shared request-trailer
+    /// boundary, which owns the whole `x-ferrum-*` namespace.
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let Some(forward_header) = self.forward_header.as_deref() else {
+        if !self.forward_identity {
             return PluginResult::Continue;
-        };
+        }
         headers.retain(|name, _| {
-            !crate::proxy::headers::field_names_equivalent_for_backends(name, forward_header)
+            !crate::proxy::headers::field_names_equivalent_for_backends(
+                name,
+                FORWARDED_IDENTITY_HEADER,
+            )
         });
         if let Some(id) = ctx.peer_spiffe_id.as_ref() {
-            headers.insert(forward_header.to_string(), id.as_str().to_string());
+            headers.insert(
+                FORWARDED_IDENTITY_HEADER.to_string(),
+                id.as_str().to_string(),
+            );
         }
         PluginResult::Continue
     }

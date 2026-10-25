@@ -1276,23 +1276,17 @@ fn spiffe_identity_plugin(id: &str, scope: PluginScope, proxy_id: Option<&str>) 
     plugin
 }
 
-fn associate(proxy: &mut Proxy, plugin_config_id: &str) {
-    proxy.plugins.push(PluginAssociation {
-        plugin_config_id: plugin_config_id.to_string(),
-    });
-}
-
 #[test]
 fn scoped_spiffe_identity_is_refused_on_non_terminating_stream_proxies() {
     // A deliberately attached instance on a stream listener that terminates no
     // TLS/DTLS can never see a peer certificate (spiffe_identity-MUSE-2).
     let mut plaintext = stream_proxy("plain", BackendScheme::Tcp, false);
-    associate(&mut plaintext, "spiffe-proxy");
+    associate(&mut plaintext, &["spiffe-proxy"]);
     let mut passthrough = stream_proxy("passthrough", BackendScheme::Tcp, true);
     passthrough.passthrough = true;
-    associate(&mut passthrough, "spiffe-group");
+    associate(&mut passthrough, &["spiffe-group"]);
     let mut plaintext_udp = stream_proxy("udp", BackendScheme::Udp, false);
-    associate(&mut plaintext_udp, "spiffe-group");
+    associate(&mut plaintext_udp, &["spiffe-group"]);
     let config = GatewayConfig {
         proxies: vec![plaintext, passthrough, plaintext_udp],
         plugin_configs: vec![
@@ -1315,16 +1309,24 @@ fn scoped_spiffe_identity_is_refused_on_non_terminating_stream_proxies() {
         );
     }
     assert!(config.validate_plugin_references().is_err());
+    // The standalone validator the shared plugin-graph admission path (and
+    // therefore API-spec create/replace) uses reports the same refusals.
+    assert_eq!(
+        config
+            .validate_scoped_spiffe_identity_stream_compatibility()
+            .unwrap_err(),
+        errors
+    );
 }
 
 #[test]
 fn scoped_spiffe_identity_is_admitted_on_terminating_streams_and_http() {
     let mut tcps = stream_proxy("tcps", BackendScheme::Tcp, true);
-    associate(&mut tcps, "spiffe-group");
+    associate(&mut tcps, &["spiffe-group"]);
     let mut dtls = stream_proxy("dtls", BackendScheme::Dtls, true);
-    associate(&mut dtls, "spiffe-group");
+    associate(&mut dtls, &["spiffe-group"]);
     let mut http = make_proxy("http", "/api");
-    associate(&mut http, "spiffe-group");
+    associate(&mut http, &["spiffe-group"]);
     let config = GatewayConfig {
         proxies: vec![tcps, dtls, http],
         plugin_configs: vec![spiffe_identity_plugin(
@@ -1336,6 +1338,11 @@ fn scoped_spiffe_identity_is_admitted_on_terminating_streams_and_http() {
     };
 
     assert!(config.validate_mtls_auth_compatibility().is_ok());
+    assert!(
+        config
+            .validate_scoped_spiffe_identity_stream_compatibility()
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1347,7 +1354,7 @@ fn global_spiffe_identity_stays_a_no_op_beside_plaintext_streams() {
     let mut disabled_scoped = spiffe_identity_plugin("spiffe-off", PluginScope::ProxyGroup, None);
     disabled_scoped.enabled = false;
     let mut plain = stream_proxy("plain", BackendScheme::Tcp, false);
-    associate(&mut plain, "spiffe-off");
+    associate(&mut plain, &["spiffe-off"]);
     let config = GatewayConfig {
         proxies: vec![
             stream_proxy("tcp", BackendScheme::Tcp, false),
