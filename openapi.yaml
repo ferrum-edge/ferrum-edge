@@ -31440,7 +31440,11 @@ components:
         `{"error":"Request Content-Length is ambiguous"}`.
         The ceiling applies to every method: an HTTP/2 GET, HEAD, or OPTIONS
         request carrying DATA without Content-Length is forwarded through the
-        size-limited adapter, not replaced by an empty backend body.
+        size-limited adapter, not replaced by an empty backend body (residual:
+        an HTTPS backend with HTTP/2 enabled whose target is not yet
+        capability-classified can negotiate HTTP/1.1 via ALPN and send an
+        unknown-length GET/HEAD bodyless until classified; pool warmup,
+        FERRUM_POOL_WARMUP_ENABLED, classifies targets up front).
         Every 413 for this policy, from any plugin hook or from the proxy core's
         streaming overrun, carries the one shared body
         `{"error":"Request body exceeds maximum size"}` without the limit. A
