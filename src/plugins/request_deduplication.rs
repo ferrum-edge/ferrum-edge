@@ -1835,13 +1835,18 @@ impl RequestDeduplication {
         // configured query location (`jwt_auth` `token_lookup: query:<name>`,
         // `key_auth` query keys, ...) is presence-bound like a credential
         // header, using the gateway-captured private inventory of present
-        // credential query parameters. Every other query pair stays bound
-        // verbatim, and the default credential partition is unchanged.
-        let query_credentials = ctx.query_credential_partition_digests();
-        if principal_scoped && !query_credentials.is_empty() {
-            append_principal_scoped_query(&mut hasher, query, query_credentials);
+        // credential query parameters carried through every recorded
+        // `request_transformer` query rename. Every other query pair stays
+        // bound verbatim, and the default credential partition is unchanged.
+        let query_credentials = if principal_scoped {
+            principal_query_credential_names(ctx)
         } else {
+            Vec::new()
+        };
+        if query_credentials.is_empty() {
             hasher.text("query", query);
+        } else {
+            append_principal_scoped_query(&mut hasher, query, &query_credentials);
         }
         // The fingerprint must also witness the effective destination: a
         // header-selected route rewrite changes what the backend would do with
@@ -1863,6 +1868,13 @@ impl RequestDeduplication {
         // the verified principal itself is already in the logical key. The
         // same applies to the signature-context headers a re-signed retry
         // regenerates (`PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS`).
+        // A credential header that an earlier `request_transformer` renamed
+        // to an ordinary name keeps its credential classification here.
+        let renamed_credential_headers = if principal_scoped {
+            principal_renamed_credential_headers(ctx)
+        } else {
+            Vec::new()
+        };
         let mut fields = request_headers_for_fingerprint(headers, &self.header_name);
         hasher.count("headers", fields.len());
         for (header_name, value) in fields.drain(..) {
@@ -1870,7 +1882,11 @@ impl RequestDeduplication {
             let credential =
                 replay_partition::is_request_credential_context_header(ctx, &header_name);
             if principal_scoped
-                && (credential || is_principal_scoped_signature_context_header(&header_name))
+                && (credential
+                    || is_principal_scoped_signature_context_header(&header_name)
+                    || renamed_credential_headers
+                        .iter()
+                        .any(|renamed| renamed.eq_ignore_ascii_case(&header_name)))
             {
                 hasher.bool_value("header_value_principal_scoped", true);
             } else if credential {
@@ -3535,27 +3551,60 @@ fn is_principal_scoped_signature_context_header(name: &str) -> bool {
     PRINCIPAL_SCOPED_SIGNATURE_CONTEXT_HEADERS.contains(&name)
 }
 
+/// Final header names that still carry a credential after the recorded
+/// `request_transformer` header renames, applied in order so chained renames
+/// (`authorization` -> `x-a` -> `x-b`) stay classified. Only the built-in and
+/// configured credential locations seed the walk, so an ordinary header never
+/// becomes presence-bound unless a credential was renamed onto it.
+fn principal_renamed_credential_headers(ctx: &RequestContext) -> Vec<&str> {
+    let mut renamed: Vec<&str> = Vec::new();
+    for (source, destination) in ctx.request_header_rename_lineage() {
+        let carries_credential =
+            replay_partition::is_request_credential_context_header(ctx, source)
+                || renamed.iter().any(|name| name.eq_ignore_ascii_case(source));
+        if carries_credential {
+            renamed.push(destination.as_str());
+        }
+    }
+    renamed
+}
+
+/// Decoded query parameter names that carry a credential in the final query:
+/// the gateway-captured inventory of present credential locations plus every
+/// name a recorded `request_transformer` query rename moved one of them to,
+/// applied in order so chained renames stay classified.
+fn principal_query_credential_names(ctx: &RequestContext) -> Vec<&str> {
+    let mut names: Vec<&str> = ctx
+        .query_credential_partition_digests()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if names.is_empty() {
+        return names;
+    }
+    for (source, destination) in ctx.request_query_rename_lineage() {
+        if names.contains(&source.as_str()) {
+            names.push(destination.as_str());
+        }
+    }
+    names
+}
+
 /// Bind the fingerprint query under the principal partition: credential
-/// parameters named in the gateway-captured inventory contribute only their
-/// raw name, every other pair is bound verbatim, and pair order and count are
-/// framed. Names are compared after `application/x-www-form-urlencoded`
-/// decoding, the form the authentication plugins captured; a pair whose name
-/// does not decode to an inventoried credential stays value-bound, which can
-/// only cost a conflict, never a replay across a non-credential difference.
-fn append_principal_scoped_query(
-    hasher: &mut PartitionHasher,
-    query: &str,
-    credentials: &[(String, [u8; 32])],
-) {
+/// parameters contribute only their raw name, every other pair is bound
+/// verbatim, and pair order and count are framed. A pair's name is
+/// percent-decoded exactly as `RequestContext` materializes `query_params`
+/// (no `+`-to-space folding), the form the authentication plugins captured; a
+/// name that does not decode to a credential stays value-bound, which can only
+/// cost a conflict, never a replay across a non-credential difference.
+fn append_principal_scoped_query(hasher: &mut PartitionHasher, query: &str, credentials: &[&str]) {
     hasher.bool_value("query_principal_scoped", true);
     let pairs = query.split('&').filter(|pair| !pair.is_empty());
     hasher.count("query_pairs", pairs.clone().count());
     for pair in pairs {
-        let is_credential = url::form_urlencoded::parse(pair.as_bytes())
-            .next()
-            .is_some_and(|(name, _)| credentials.iter().any(|(known, _)| name == known.as_str()));
-        if is_credential {
-            let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let decoded_name = percent_encoding::percent_decode_str(raw_name).decode_utf8_lossy();
+        if credentials.iter().any(|known| decoded_name == *known) {
             hasher.text("query_credential_name", raw_name);
         } else {
             hasher.text("query_pair", pair);

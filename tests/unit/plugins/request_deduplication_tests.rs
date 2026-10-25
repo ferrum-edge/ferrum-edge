@@ -28,6 +28,7 @@ use ferrum_edge::plugins::request_deduplication::{
     CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS, DYNAMIC_RESPONSE_PRESENTATION_PLUGINS,
     RequestDeduplication,
 };
+use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::response_transformer::ResponseTransformer;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::utils::policy_digest::presentation_policy_digest;
@@ -7371,15 +7372,29 @@ fn query_principal_ctx(
     token: &str,
     amount: u32,
 ) -> RequestContext {
+    query_principal_ctx_named(key, consumer, "access_token", token, amount)
+}
+
+/// [`query_principal_ctx`] with an explicit credential parameter name. The
+/// name is used verbatim on the wire and in `query_params`, which is how the
+/// gateway materializes a name without percent escapes (a literal `+` stays a
+/// `+`).
+fn query_principal_ctx_named(
+    key: &str,
+    consumer: &Arc<ferrum_edge::config::types::Consumer>,
+    param: &str,
+    token: &str,
+    amount: u32,
+) -> RequestContext {
     let mut ctx = dedup_ctx("127.0.0.1", key);
     ctx.identified_consumer = Some(Arc::clone(consumer));
     ctx.auth_method = Some("jwt_auth");
-    ctx.set_raw_query_string(format!("access_token={token}&amount={amount}"));
+    ctx.set_raw_query_string(format!("{param}={token}&amount={amount}"));
     ctx.query_params
-        .insert("access_token".to_string(), token.to_string());
+        .insert(param.to_string(), token.to_string());
     ctx.query_params
         .insert("amount".to_string(), amount.to_string());
-    mark_query_credential_for_test(&mut ctx, "access_token");
+    mark_query_credential_for_test(&mut ctx, param);
     ctx
 }
 
@@ -7426,6 +7441,139 @@ async fn authenticated_identity_partition_presence_binds_query_credentials() {
     let mut other_headers = other.headers.clone();
     assert!(matches!(
         plugin.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+/// PR6818-SOL-3: credential query names are matched with the gateway's own
+/// percent-decoding, which keeps a literal `+`, so a `token_lookup:
+/// query:access+token` credential is presence-bound too.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_matches_literal_plus_query_credential_names() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let mut original =
+        query_principal_ctx_named("plus-rotation", &alice, "access+token", "jwt-a", 100);
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"plus-created").await,
+        PluginResult::Continue
+    ));
+
+    let mut refreshed =
+        query_principal_ctx_named("plus-rotation", &alice, "access+token", "jwt-b", 100);
+    let mut refreshed_headers = refreshed.headers.clone();
+    match plugin
+        .before_proxy(&mut refreshed, &mut refreshed_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"plus-created"),
+        other => panic!("a refreshed `access+token` credential must replay: {other:?}"),
+    }
+
+    let mut changed =
+        query_principal_ctx_named("plus-rotation", &alice, "access+token", "jwt-b", 200);
+    let mut changed_headers = changed.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut changed, &mut changed_headers)
+            .await,
+    );
+}
+
+/// Renames a query credential and a credential header to ordinary names, as
+/// an admitted `request_transformer` at priority 3000 may before deduplication.
+fn credential_renaming_transformer() -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "access_token", "new_key": "backend_token"},
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-backend-token"}
+        ]
+    }))
+    .expect("credential-renaming request_transformer config")
+}
+
+/// Run the real transformer, then deduplication, over one verified-principal
+/// request whose credential travels in both the query and `Authorization`.
+async fn renamed_principal_request(
+    dedup: &RequestDeduplication,
+    transformer: &RequestTransformer,
+    consumer: &Arc<ferrum_edge::config::types::Consumer>,
+    token: &str,
+    amount: u32,
+) -> (PluginResult, RequestContext) {
+    let mut ctx = query_principal_ctx("renamed-rotation", consumer, token, amount);
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        transformer.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        headers.contains_key("x-backend-token") && !headers.contains_key("authorization"),
+        "the transformer must have renamed the credential header"
+    );
+    assert!(
+        ctx.outbound_query_string().is_some_and(
+            |query| query.contains("backend_token=") && !query.contains("access_token=")
+        ),
+        "the transformer must have renamed the credential query parameter"
+    );
+    let result = dedup.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+/// PR6818-SOL-2 (round 2): a credential that an earlier `request_transformer`
+/// renamed to an ordinary header or query name keeps its presence-only
+/// classification, so a refreshed credential of the same principal still
+/// replays; a changed business parameter conflicts and another principal stays
+/// isolated.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_follows_credential_renames() {
+    let _policy = pinned_policy_guard();
+    let dedup = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let transformer = credential_renaming_transformer();
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let (first, mut first_ctx) =
+        renamed_principal_request(&dedup, &transformer, &alice, "jwt-a", 100).await;
+    assert!(matches!(first, PluginResult::Continue));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), b"renamed-created")
+            .await,
+        PluginResult::Continue
+    ));
+
+    match renamed_principal_request(&dedup, &transformer, &alice, "jwt-b", 100)
+        .await
+        .0
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"renamed-created"),
+        other => panic!("a refreshed renamed credential must replay: {other:?}"),
+    }
+
+    assert_fingerprint_conflict(
+        renamed_principal_request(&dedup, &transformer, &alice, "jwt-b", 200)
+            .await
+            .0,
+    );
+
+    let bob = consumer_principal("consumer-bob", "bob");
+    assert!(matches!(
+        renamed_principal_request(&dedup, &transformer, &bob, "jwt-a", 100)
+            .await
+            .0,
         PluginResult::Continue
     ));
 }

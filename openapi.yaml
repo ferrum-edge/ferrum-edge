@@ -39940,7 +39940,9 @@ components:
             captured from its configured query location, and of the
             signature-context headers `date`, `x-amz-date`,
             `x-amz-content-sha256`, `digest`, and `content-digest` that an
-            hmac_auth or SigV4 re-signature regenerates; every other header and
+            hmac_auth or SigV4 re-signature regenerates. A credential header or
+            query parameter renamed by an earlier request_transformer keeps
+            that classification under its new name; every other header and
             query pair stays value-bound. Two credentials of one principal with different scopes
             then share an operation, so scope-level distinction rests on the
             authorization plugins that ran before deduplication. Requests
