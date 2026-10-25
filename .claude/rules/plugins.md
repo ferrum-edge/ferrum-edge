@@ -259,8 +259,10 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     `run_final_request_body_hooks_with_provenance` immediately before step 6 on
     every dispatch ladder (`GHSA-3973-47g5-4mcx`). A plugin claims a request with
     `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`,
-    deny-policy `a2a_gateway` configurations, and `preserve_tag`-configured
-    `ai_prompt_compressor` instances on candidate JSON `POST`s)
+    deny-policy `a2a_gateway` configurations, `preserve_tag`-configured
+    `ai_prompt_compressor` instances on candidate JSON `POST`s, and
+    `ai_transcript_audit` under a fail-closed `on_sink_error` /
+    `on_buffer_full: reject` sink policy)
     only when its configured policy would BOTH inspect this representation and
     be able to REFUSE it — a `monitor`-mode WAF, a body rule set that only logs,
     and an `on_body_too_large: skip` body outside the scan window all lose an
