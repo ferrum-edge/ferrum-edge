@@ -83,8 +83,7 @@ fn test_spiffe_identity_trait_contract() {
 #[test]
 fn test_spiffe_identity_rejects_config_fields() {
     let err = SpiffeIdentity::new(&json!({"unexpected_canary_key": true}))
-        .err()
-        .expect("unknown config must be rejected");
+        .expect_err("unknown config must be rejected");
     assert!(err.contains("unsupported configuration field"), "{err}");
     assert!(
         !err.contains("unexpected_canary_key"),
