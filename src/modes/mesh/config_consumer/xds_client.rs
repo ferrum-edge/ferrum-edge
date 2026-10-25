@@ -1874,6 +1874,15 @@ fn reverse_translate(
         node_waypoint_capture_destinations: recovered.node_waypoint_capture_destinations,
         node_waypoint_capture_peer_authentications: recovered
             .node_waypoint_capture_peer_authentications,
+        // The capture destinations' AuthorizationPolicy inventory rides its own
+        // carrier too. Empty when the CP emitted none — the scoped evaluator
+        // then sees only `mesh_policies`, exactly like a native slice built by
+        // a CP that resolved no foreign destination policy.
+        node_waypoint_capture_mesh_policies: recovered.node_waypoint_capture_mesh_policies,
+        // Completeness evidence is the carrier's PRESENCE, never its contents:
+        // a CP that resolved the inventory emits the carrier even when empty.
+        node_waypoint_capture_mesh_policies_resolved: recovered
+            .node_waypoint_capture_mesh_policies_seen,
         services,
         // Inbound-only un-narrowed local services recovered from the dedicated
         // carrier (kept separate from `services` so egress scope / the outbound
@@ -1977,6 +1986,11 @@ fn reverse_translate(
     // proved here, before the slice is returned: an incoherent recovery is an
     // error, which NACKs and retains last-good.
     validate_recovered_ext_authz_binding(&slice)?;
+    // Capture destinations without the AuthorizationPolicy carrier mean the CP
+    // never resolved the destinations' own policies. NACK (the accumulator is
+    // rolled back and last-good keeps serving) instead of building a slice
+    // that would authorize captured connections against an incomplete set.
+    slice.validate_node_waypoint_capture_inventory()?;
     Ok(slice)
 }
 
@@ -1991,7 +2005,13 @@ fn validate_recovered_ext_authz_binding(
 ) -> Result<(), String> {
     use crate::modes::mesh::config::sanitize_mesh_ext_authz_diagnostic;
 
-    for policy in &slice.mesh_policies {
+    // The NodeWaypoint capture-destination inventory is evaluated beside
+    // `mesh_policies`, so its CUSTOM rules must bind a recovered provider too.
+    for policy in slice
+        .mesh_policies
+        .iter()
+        .chain(slice.node_waypoint_capture_mesh_policies.iter())
+    {
         for rule in &policy.rules {
             let Some(provider) = rule.action.custom_provider() else {
                 continue;
@@ -2107,6 +2127,10 @@ struct RecoveredSliceCarriers {
     node_waypoint_assertors: Vec<crate::modes::mesh::config::NodeWaypointAssertor>,
     node_waypoint_capture_destinations: Vec<crate::modes::mesh::config::Workload>,
     node_waypoint_capture_peer_authentications: Vec<crate::modes::mesh::config::PeerAuthentication>,
+    node_waypoint_capture_mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
+    /// Whether a `NodeWaypointCaptureMeshPoliciesCarrier` arrived at all — the
+    /// capture inventory's completeness evidence (an empty carrier is complete).
+    node_waypoint_capture_mesh_policies_seen: bool,
     mesh_policies: Vec<crate::modes::mesh::config::MeshPolicy>,
     ext_authz_providers: Vec<crate::modes::mesh::config::MeshExtAuthzProvider>,
     virtual_service_cors_policies: Vec<crate::modes::mesh::config::MeshVirtualServiceCorsPolicy>,
@@ -2581,6 +2605,10 @@ fn apply_recovered_carrier(
         }
         MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(value) => {
             recovered.node_waypoint_capture_peer_authentications = value
+        }
+        MeshSliceCarrier::NodeWaypointCaptureMeshPolicies(value) => {
+            recovered.node_waypoint_capture_mesh_policies = value;
+            recovered.node_waypoint_capture_mesh_policies_seen = true;
         }
         MeshSliceCarrier::WorkloadLabels(value) => recovered.labels = Some(value),
         MeshSliceCarrier::LabelsAmbiguous(value) => recovered.labels_ambiguous = value,
@@ -6248,6 +6276,134 @@ mod tests {
             1,
             "a padded entry naming this namespace must be canonicalized, not silently inert"
         );
+    }
+
+    /// NodeWaypoint capture-destination AuthorizationPolicy inventory over the
+    /// real CP translate → accumulator → `reverse_translate` path: the field and
+    /// its completeness evidence survive; a complete EMPTY inventory is
+    /// accepted; capture destinations without the evidence carrier (an older
+    /// producer) and a capture-only CUSTOM policy without its provider are
+    /// refused; and a withdrawn inventory recovers empty, not stale.
+    #[test]
+    fn xds_round_trip_enforces_capture_authorization_inventory_completeness() {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            MeshPolicy, MeshRule, PolicyAction, PolicyScope, Workload, WorkloadSelector,
+        };
+
+        let destination = Workload {
+            spiffe_id: SpiffeId::new("spiffe://cluster.local/ns/payments/sa/ledger".to_string())
+                .expect("spiffe id"),
+            selector: WorkloadSelector {
+                labels: HashMap::from([("app".to_string(), "ledger".to_string())]),
+                namespace: Some("payments".to_string()),
+            },
+            service_name: "ledger".to_string(),
+            service_namespace: None,
+            addresses: vec!["10.244.1.7".to_string()],
+            ports: Vec::new(),
+            trust_domain: TrustDomain::new("cluster.local").expect("trust domain"),
+            namespace: "payments".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: Some("ledger".to_string()),
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        };
+        let policy = |name: &str, action: PolicyAction| MeshPolicy {
+            name: name.to_string(),
+            namespace: "payments".to_string(),
+            scope: PolicyScope::Namespace {
+                namespace: "payments".to_string(),
+            },
+            rules: vec![MeshRule {
+                action,
+                ..MeshRule::default()
+            }],
+        };
+        let native = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
+            version: "v1".to_string(),
+            node_waypoint_capture_destinations: vec![destination],
+            node_waypoint_capture_mesh_policies: vec![policy("payments-deny", PolicyAction::Deny)],
+            node_waypoint_capture_mesh_policies_resolved: true,
+            ..MeshSlice::default()
+        };
+        let mut config = test_config();
+        config.node_id = native.node_id.clone();
+        config.namespace = native.namespace.clone();
+        let recover = |slice: &MeshSlice| {
+            accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(slice))
+                .try_build_mesh_slice(&config)
+                .map(|slice| slice.expect("all required types present"))
+        };
+
+        let recovered = recover(&native).expect("complete inventory recovers");
+        assert_eq!(
+            recovered.node_waypoint_capture_mesh_policies,
+            native.node_waypoint_capture_mesh_policies
+        );
+        assert!(recovered.node_waypoint_capture_mesh_policies_resolved);
+
+        let mut complete_empty = native.clone();
+        complete_empty.node_waypoint_capture_mesh_policies.clear();
+        let recovered = recover(&complete_empty).expect("an empty complete inventory recovers");
+        assert!(recovered.node_waypoint_capture_mesh_policies.is_empty());
+        assert!(recovered.node_waypoint_capture_mesh_policies_resolved);
+
+        let mut missing_evidence = complete_empty.clone();
+        missing_evidence.node_waypoint_capture_mesh_policies_resolved = false;
+        let error = recover(&missing_evidence)
+            .expect_err("capture destinations without policy evidence must be refused");
+        assert!(
+            error.contains("node_waypoint_capture_mesh_policies_resolved"),
+            "unexpected rejection: {error}"
+        );
+
+        let mut unbound_custom = native.clone();
+        unbound_custom.node_waypoint_capture_mesh_policies = vec![policy(
+            "payments-custom",
+            PolicyAction::Custom {
+                provider: "payments-authz".to_string(),
+            },
+        )];
+        let error = recover(&unbound_custom)
+            .expect_err("a capture-only CUSTOM policy without its provider must be refused");
+        assert!(
+            error.contains("ExtAuthzProviders carrier does not declare"),
+            "unexpected rejection: {error}"
+        );
+
+        // Withdrawal on the SAME accumulator: the next generation carries no
+        // destination and an empty (complete) inventory, so nothing stale
+        // survives the SotW replacement.
+        let mut accumulator = accumulator_from_snapshot(&translate_mesh_slice_to_snapshot(&native));
+        let mut withdrawn = native.clone();
+        withdrawn.version = "v2".to_string();
+        withdrawn.node_waypoint_capture_destinations.clear();
+        withdrawn.node_waypoint_capture_mesh_policies.clear();
+        let snapshot = translate_mesh_slice_to_snapshot(&withdrawn);
+        for type_url in XDS_TYPE_URLS {
+            let resources: Vec<proto::Any> = snapshot
+                .resources(type_url)
+                .iter()
+                .map(|resource| resource.to_any())
+                .collect();
+            accumulator
+                .apply_sotw_response(type_url, &resources, &snapshot.version)
+                .expect("withdrawal applies");
+        }
+        let recovered = accumulator
+            .try_build_mesh_slice(&config)
+            .expect("withdrawal recovers")
+            .expect("all required types present");
+        assert!(recovered.node_waypoint_capture_destinations.is_empty());
+        assert!(recovered.node_waypoint_capture_mesh_policies.is_empty());
+        assert!(recovered.node_waypoint_capture_mesh_policies_resolved);
     }
 
     #[test]

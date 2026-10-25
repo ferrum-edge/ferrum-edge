@@ -1630,6 +1630,15 @@ fn prepare_normalized_gateway_config_for_mesh(
     runtime: &MeshRuntimeConfig,
     mesh_slice: &MeshSlice,
 ) -> Result<GatewayConfig, anyhow::Error> {
+    // A capture inventory whose destination AuthorizationPolicy set was never
+    // resolved by its producer would authorize captured connections against
+    // an incomplete policy set. Refuse the candidate before anything is
+    // materialized: at startup no capture-serving generation is built, and on
+    // reload the previous complete generation keeps serving. Every slice
+    // source (native, xDS, file) converges here.
+    mesh_slice
+        .validate_node_waypoint_capture_inventory()
+        .map_err(|error| anyhow::anyhow!("Mesh slice validation failed: {error}"))?;
     // This is the untrusted/operator boundary. Reserved mesh IDs are invalid
     // here exactly like every other leading-underscore ID. Only after this
     // strict gate succeeds may the trusted materializers below create reserved
@@ -1710,6 +1719,21 @@ fn prepare_normalized_gateway_config_for_mesh(
         mesh.node_waypoint_capture_peer_authentications = mesh_slice
             .node_waypoint_capture_peer_authentications
             .clone();
+        // The destination AuthorizationPolicy inventory rides along under the
+        // same unconditional-assignment rule, so a withdrawn destination's
+        // policies leave with it. `mesh_authz` reads the slice copy; this
+        // back-projection keeps the prepared config's capture view complete.
+        mesh.node_waypoint_capture_mesh_policies =
+            mesh_slice.node_waypoint_capture_mesh_policies.clone();
+        // The prepared config's capture inventory IS the slice's; record its
+        // provenance so nothing ever rebuilds an inventory from this config's
+        // narrowed routing views.
+        mesh.node_waypoint_capture_inventory_state =
+            if mesh_slice.node_waypoint_capture_mesh_policies_resolved {
+                crate::modes::mesh::config::NodeWaypointCaptureInventoryState::Resolved
+            } else {
+                crate::modes::mesh::config::NodeWaypointCaptureInventoryState::NotResolved
+            };
         // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
         // SEPARATE from the egress-narrowed `services` — never folded in, per
         // the egress-scope security rule) so the router's inbound per-port
@@ -3130,6 +3154,10 @@ fn mesh_authz_config_policies(config: &serde_json::Value) -> Vec<MeshPolicy> {
         return crate::util::deserialization::from_json_value::<
             crate::util::json_object::JsonObject<MeshSlice>,
         >(value.clone())
+        // Ordinary policies only: like `mesh_authz`'s source-scope census, the
+        // NodeWaypoint capture-destination inventory governs connections TO
+        // its destinations, not the source-attributed UDP/DTLS sessions this
+        // census decides about.
         .map(|object| object.0.mesh_policies)
         .unwrap_or_else(|_| {
             warn!(
@@ -30863,6 +30891,8 @@ mod tests {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
+            node_waypoint_capture_mesh_policies_resolved: false,
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -43561,6 +43591,8 @@ mod tests {
                 name: "reviews".to_string(),
             }],
             node_waypoint_capture_destinations: vec![enrolled],
+            // A capture-scoped producer always stamps the completeness marker.
+            node_waypoint_capture_mesh_policies_resolved: true,
             ..MeshSlice::default()
         };
         let pod_ip = "10.244.1.7"

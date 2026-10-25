@@ -4763,6 +4763,49 @@ pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_jso
 
 // ── Top-level mesh config container ───────────────────────────────────────
 
+/// Provenance of a [`MeshConfig`]'s NodeWaypoint capture inventory
+/// (`node_waypoint_capture_*` fields).
+///
+/// The capture inventory must be derived from the AUTHORITATIVE, pre-narrowing
+/// mesh view: once the CP has narrowed `workloads` / `peer_authentications` /
+/// `mesh_policies` to a subscription (or a Sidecar egress import has widened
+/// `workloads` without widening policy), rebuilding the inventory from those
+/// views can resurrect a destination the CP withheld or drop that
+/// destination's own policies — and then certify the result as complete. The
+/// slice builder therefore reads this state instead of guessing from whether
+/// the dedicated fields are empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NodeWaypointCaptureInventoryState {
+    /// An authority document that no CP filter has narrowed (the file/local
+    /// source, a stock-xDS baseline, or the CP's own snapshot before
+    /// filtering). The slice builder derives the inventory from the whole
+    /// document.
+    #[default]
+    Unfiltered,
+    /// The CP filter resolved the inventory BEFORE narrowing, under the
+    /// request's CP scope and bearer bounds (or a mesh-prepared DP config
+    /// back-projected a resolved slice). The dedicated fields are
+    /// authoritative even when empty; nothing is reconstructed from the
+    /// narrowed views.
+    Resolved,
+    /// The config was narrowed without resolving a capture inventory (a
+    /// non-capture request, or a slice that carried none). A capture-scoped
+    /// build from it yields an EMPTY inventory and no completeness evidence —
+    /// fail closed.
+    NotResolved,
+}
+
+impl NodeWaypointCaptureInventoryState {
+    /// Stable label (fingerprints, diagnostics).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unfiltered => "unfiltered",
+            Self::Resolved => "resolved",
+            Self::NotResolved => "not_resolved",
+        }
+    }
+}
+
 /// All mesh-specific configuration, kept in a single container so the
 /// core `GatewayConfig` struct stays lean for non-mesh deployments.
 /// Stored as `Option<Box<MeshConfig>>` on `GatewayConfig` — `None` when
@@ -4887,6 +4930,20 @@ pub struct MeshConfig {
     /// reason.
     #[serde(skip)]
     pub node_waypoint_capture_peer_authentications: Vec<PeerAuthentication>,
+    /// Runtime-only AuthorizationPolicy (`MeshPolicy`) entries applicable to
+    /// [`Self::node_waypoint_capture_destinations`]. CP-side it is resolved
+    /// alongside that inventory, BEFORE `mesh_policies` is narrowed to the
+    /// subscription namespace, so a captured pod's own-namespace policy still
+    /// reaches its NodeWaypoint; DP-side it is back-projected from
+    /// `MeshSlice.node_waypoint_capture_mesh_policies`. Never folded into
+    /// `mesh_policies`. `serde(skip)` for the same reason as the fields above.
+    #[serde(skip)]
+    pub node_waypoint_capture_mesh_policies: Vec<MeshPolicy>,
+    /// Provenance of the three `node_waypoint_capture_*` fields above; see
+    /// [`NodeWaypointCaptureInventoryState`]. Runtime-only (`serde(skip)`):
+    /// a deserialized document is always `Unfiltered`.
+    #[serde(skip)]
+    pub node_waypoint_capture_inventory_state: NodeWaypointCaptureInventoryState,
     /// Runtime-only back-projection of the slice's narrowed **local-inbound**
     /// service view (`MeshSlice.local_inbound_services`), set by mesh
     /// preparation. `Some` exactly when Sidecar narrowing resolved the local
@@ -6334,6 +6391,8 @@ impl Default for MeshConfig {
             node_waypoint_assertors: Vec::new(),
             node_waypoint_capture_destinations: Vec::new(),
             node_waypoint_capture_peer_authentications: Vec::new(),
+            node_waypoint_capture_mesh_policies: Vec::new(),
+            node_waypoint_capture_inventory_state: NodeWaypointCaptureInventoryState::Unfiltered,
             local_inbound_services: None,
             local_ingress_listeners: Vec::new(),
             sidecar_ingress_declared: false,
