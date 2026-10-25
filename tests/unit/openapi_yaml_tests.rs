@@ -14397,7 +14397,8 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
 #[test]
 fn ws_frame_logging_schema_matches_runtime_admission_contract() {
     use ferrum_edge::plugins::ws_frame_logging::{
-        DEFAULT_LOG_LEVEL, MAX_PAYLOAD_PREVIEW_BYTES, WS_FRAME_LOGGING_CONFIG_KEYS,
+        DEFAULT_LOG_LEVEL, DIRECTION_FILTER_VALUES, MAX_PAYLOAD_PREVIEW_BYTES,
+        WS_FRAME_LOGGING_CONFIG_KEYS, WsFrameLogging,
     };
 
     let spec: serde_json::Value =
@@ -14423,6 +14424,22 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
         schema["properties"]["payload_preview_bytes"]["minimum"],
         json!(0)
     );
+    assert_eq!(
+        schema["properties"]["direction"]["enum"],
+        json!(DIRECTION_FILTER_VALUES)
+    );
+    assert_eq!(schema["properties"]["direction"]["default"], json!("both"));
+    assert_eq!(schema["properties"]["sample_rate"]["minimum"], json!(0));
+    assert_eq!(schema["properties"]["sample_rate"]["maximum"], json!(1));
+    assert_eq!(schema["properties"]["sample_rate"]["default"], json!(1));
+    assert_eq!(
+        schema["properties"]["max_records_per_connection"]["minimum"],
+        json!(0)
+    );
+    assert_eq!(
+        schema["properties"]["max_records_per_connection"]["default"],
+        json!(0)
+    );
 
     let documented: BTreeSet<_> = schema["properties"]
         .as_object()
@@ -14444,6 +14461,10 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
         "not clamped",
         "requires_ws_frame_hooks",
         "raw-copy tunnel",
+        "one record per complete (reassembled) message",
+        "independent of this plugin's priority",
+        "plugin_id",
+        "termination_reason",
     ] {
         assert!(
             description.contains(contract),
@@ -14463,8 +14484,34 @@ fn ws_frame_logging_schema_matches_runtime_admission_contract() {
             "include_payload_preview": false,
             "payload_preview_bytes": 0
         }),
+        json!({"sample_rate": 0}),
+        json!({"sample_rate": 0.5}),
+        json!({"sample_rate": 1}),
+        json!({"direction": "client_to_backend"}),
+        json!({"direction": "backend_to_client"}),
+        json!({"max_records_per_connection": 100}),
     ] {
         assert_component_validity(&spec, "WsFrameLoggingConfig", &valid, true);
+        assert!(
+            WsFrameLogging::new(&valid).is_ok(),
+            "runtime must admit schema-valid {valid}"
+        );
+    }
+    for invalid in [
+        json!({"sample_rate": 1.5}),
+        json!({"sample_rate": -0.5}),
+        json!({"sample_rate": "0.5"}),
+        json!({"sample_rate": null}),
+        json!({"direction": "inbound"}),
+        json!({"direction": null}),
+        json!({"max_records_per_connection": -1}),
+        json!({"max_records_per_connection": null}),
+    ] {
+        assert_component_validity(&spec, "WsFrameLoggingConfig", &invalid, false);
+        assert!(
+            WsFrameLogging::new(&invalid).is_err(),
+            "runtime must refuse schema-invalid {invalid}"
+        );
     }
     for invalid in [
         json!({"log_levle": "debug"}),

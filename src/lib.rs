@@ -5628,9 +5628,12 @@ pub mod _test_support {
     /// Prepare deferred delivery observations for the final post-plugin message.
     pub fn prepare_ws_frame_deliveries_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
         message: &Message,
     ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
-        match crate::proxy::prepare_ws_frame_deliveries(plugins, message) {
+        match crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, message)
+        {
             crate::proxy::WsFrameDeliveryBatch::None => Vec::new(),
             crate::proxy::WsFrameDeliveryBatch::One(index, observation) => {
                 vec![(index, observation)]
@@ -5691,12 +5694,14 @@ pub mod _test_support {
             crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
                 .await;
         if matches!(&outgoing, Message::Close(_)) {
-            // Policy Close is already recorded by observational `on_ws_frame`
-            // hooks inside the applicator; the production relay does not also
-            // emit a delivered observation for that rejection path.
+            // Policy Close is already reported to decision observers
+            // (`on_ws_policy_close`) by the applicator after the full pass; the
+            // production relay does not also emit a delivered observation for
+            // that rejection path.
             return outgoing;
         }
-        let prepared = crate::proxy::prepare_ws_frame_deliveries(plugins, &outgoing);
+        let prepared =
+            crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, &outgoing);
         crate::proxy::emit_ws_frame_deliveries(
             plugins,
             proxy_id,
@@ -5705,6 +5710,89 @@ pub mod _test_support {
             prepared,
         );
         outgoing
+    }
+
+    /// Report one gateway policy Close to the decision observers in `plugins`
+    /// exactly as both relay halves do (`on_ws_policy_close`).
+    pub fn observe_ws_policy_close_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        close: Option<&CloseFrame>,
+    ) {
+        crate::proxy::observe_ws_policy_close(plugins, proxy_id, connection_id, direction, close)
+    }
+
+    /// Drive the production framed WebSocket relay (`run_websocket_session`,
+    /// shared by H1 Upgrade and H2/H3 Extended CONNECT) end to end over
+    /// caller-owned transports.
+    ///
+    /// `client_io` is the gateway's client-side byte transport (the relay runs
+    /// a server-role framer over it, so client frames must be masked);
+    /// `backend_ws_stream` is the gateway's client-role framer toward the
+    /// backend. `plugins` goes through the production per-session collection
+    /// (execution-trigger admission and `bind_ws_session` substitution) to
+    /// build the parser-policy, frame-hook, and disconnect lists. Tunnel mode,
+    /// the idle timeout, the session deadline, drain, client trust, and
+    /// `permessage-deflate` are all off, so the session ends only through peer
+    /// Close, transport EOF/error, or a policy Close. `client_transport_settle`
+    /// is the H3 bridge verdict seam ([`crate::proxy::WsClientTransportSettle`]).
+    pub async fn run_framed_websocket_relay_for_test<C, B>(
+        client_io: C,
+        backend_ws_stream: tokio_tungstenite::WebSocketStream<B>,
+        proxy_id: &str,
+        connection_id: u64,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        session_meta: crate::proxy::WsSessionMeta,
+        client_transport_settle: Option<crate::proxy::WsClientTransportSettle<'_>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let env_config = crate::config::EnvConfig::default();
+        let mut upgrade_ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        let (ws_framing_plugins, ws_frame_plugins) =
+            crate::proxy::collect_websocket_relay_plugins(plugins, true, &mut upgrade_ctx);
+        let ws_disconnect_plugins =
+            crate::proxy::collect_websocket_disconnect_plugins(plugins, &mut upgrade_ctx);
+        let adaptive_buffer = crate::adaptive_buffer::AdaptiveBufferTracker::new(
+            false, false, 300, 8_192, 65_536, 65_536, 64,
+        );
+        let session_deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now() + Duration::from_secs(3_600),
+            reason: crate::proxy::WsTerminationReason::MaxLifetime,
+        };
+        crate::proxy::run_websocket_session(
+            client_io,
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            None,
+            env_config.max_websocket_frame_size_bytes,
+            env_config.websocket_write_buffer_size,
+            false,
+            Duration::from_secs(30),
+            None,
+            session_deadline,
+            None,
+            Arc::new(crate::overload::OverloadState::new()),
+            crate::proxy::WsFragmentPolicy::from_env(&env_config),
+            &adaptive_buffer,
+            None,
+            None,
+            client_transport_settle,
+        )
+        .await
     }
 
     /// Run the production per-session plugin-collection step, including

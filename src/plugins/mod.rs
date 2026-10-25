@@ -13084,16 +13084,48 @@ pub trait Plugin: Any + Send + Sync {
     /// Returns `true` when this plugin only observes WebSocket frame decisions
     /// and never mutates or rejects them.
     ///
-    /// After an earlier admission/mutating `on_ws_frame` hook returns a
-    /// terminal `Message::Close`, the shared H1/H2/H3 relay keeps invoking
-    /// observational hooks with that already-final Close so they can record
-    /// the decision, while skipping later mutating plugins so they neither
-    /// charge budget nor replace the Close code/reason.
-    /// The relay ignores the return value from an observational hook for every
-    /// frame, enforcing the observe-only contract even if an implementation
-    /// accidentally returns a replacement.
+    /// Observational plugins still receive [`Plugin::on_ws_frame`] for each
+    /// message at their configured priority position, but the relay ignores
+    /// their return value (enforcing the observe-only contract even if an
+    /// implementation accidentally returns a replacement) and skips them in
+    /// [`Plugin::on_ws_reassembly_frames`]. Once any admission/mutating hook
+    /// returns a terminal `Message::Close`, the rest of the chain — observers
+    /// included — is skipped for that message, so later mutating plugins
+    /// neither charge budget nor replace the Close code/reason.
+    ///
+    /// The final decision is instead delivered exactly once, independent of
+    /// priority order, through [`Plugin::on_ws_policy_close`].
     fn observes_ws_frame_decisions(&self) -> bool {
         false
+    }
+
+    /// Observe one gateway-published WebSocket policy Close.
+    ///
+    /// Called only on plugins whose [`Plugin::observes_ws_frame_decisions`]
+    /// returns `true`, exactly once per relay-half policy decision and AFTER
+    /// the full decision is known, so the record does not depend on where the
+    /// observer sits in priority order. Sources: a terminal Close returned by
+    /// the `on_ws_frame` chain (after the control-frame guard), a fragment
+    /// budget Close from [`Plugin::on_ws_reassembly_frames`], and the relay's
+    /// parser rejections of an inbound message (plugin or global
+    /// frame/message size ceilings, incomplete-message bounds, and terminated
+    /// `permessage-deflate` faults). `direction` is the direction of the
+    /// rejected input. Session-level stops (idle timeout, drain, maximum
+    /// lifetime, credential expiry, trust withdrawal) and relay transport
+    /// faults are not policy Closes; they surface on `on_ws_disconnect` through
+    /// the bounded `websocket.termination_reason` metadata and the failure
+    /// attribution fields.
+    ///
+    /// This is a decision record, not a delivery record: it fires before the
+    /// bounded Close write and regardless of whether that write succeeds.
+    /// Must not block or mutate protocol state.
+    fn on_ws_policy_close(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _close: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) {
     }
 
     /// Optional parser-level WebSocket size policy.
@@ -13191,9 +13223,10 @@ pub trait Plugin: Any + Send + Sync {
     /// Returning `Some(Message::Close(...))` will close the WebSocket in both directions.
     ///
     /// The first terminal Close from a priority-ordered admission/mutating hook
-    /// is preserved for the rest of the chain: later mutating plugins are not
-    /// invoked for that frame, and observational hooks
-    /// ([`Plugin::observes_ws_frame_decisions`]) may still see the final Close.
+    /// is preserved for the rest of the chain: no later plugin is invoked for
+    /// that frame, and observational hooks
+    /// ([`Plugin::observes_ws_frame_decisions`]) receive the final Close once
+    /// through [`Plugin::on_ws_policy_close`] instead.
     ///
     /// Delivery-accurate frame logging must use
     /// [`Plugin::prepare_ws_frame_delivery`] /
@@ -13252,9 +13285,14 @@ pub trait Plugin: Any + Send + Sync {
     /// Return `Some` only when this plugin will emit after a successful sink
     /// accept. The relay discards prepared observations on cancel/write failure
     /// so frame logs share the success-only boundary with `frames_*` /
-    /// `bytes_*` counters. Default: no observation.
+    /// `bytes_*` counters. `connection_id` and `direction` are the same values
+    /// the matching [`Plugin::emit_ws_frame_delivery`] call receives, so a
+    /// plugin can apply per-session or per-direction selection before doing
+    /// any per-message work. Default: no observation.
     fn prepare_ws_frame_delivery(
         &self,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<WsFrameDeliveryObservation> {
         None
@@ -13849,9 +13887,12 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ws_message_size_limiting" => Ok(Some(Arc::new(
             ws_message_size_limiting::WsMessageSizeLimiting::new(config)?,
         ))),
-        "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
-            config,
-        )?))),
+        // The stable plugin-config id is stamped on every record as
+        // `plugin_id`, so two effective instances on one proxy stay
+        // distinguishable in `ws_frame_log` output.
+        "ws_frame_logging" => Ok(Some(Arc::new(
+            ws_frame_logging::WsFrameLogging::new_with_config_id(config, plugin_config_id)?,
+        ))),
         "ws_rate_limiting" => {
             let plugin = ws_rate_limiting::WsRateLimiting::new_with_config_id(
                 config,

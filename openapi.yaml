@@ -13876,21 +13876,47 @@ components:
       type: object
       additionalProperties: false
       description: |
-        Configuration for the `ws_frame_logging` plugin. Logs WebSocket frame
+        Configuration for the `ws_frame_logging` plugin. Logs WebSocket message
         metadata (direction, frame type, payload size, optional payload
         fingerprint, Close code / reason length) under the `ws_frame_log`
         tracing target after the shared H1/H2/H3 relay successfully delivers
-        the final post-plugin message (`outcome=delivered`), and records
-        plugin-generated rejection Closes separately (`outcome=policy_close`).
-        Logs Text and Binary frames by default; Ping/Pong are opt-in via
+        the final post-plugin message (`outcome=delivered`), and records every
+        gateway-published policy Close separately (`outcome=policy_close`).
+        Granularity is one record per complete (reassembled) message, not per
+        wire frame: a Text/Binary message sent as several fragments produces
+        one record whose `size_bytes` is the reassembled payload length
+        (inflated length under `websocket_permessage_deflate: terminate`), and
+        the disconnect record's `frames_*` counters count delivered messages.
+        Logs Text and Binary messages by default; Ping/Pong are opt-in via
         `log_ping_pong`. Peer Close frames are logged on the delivery path with
         `close_code` / `close_reason_len` (raw reason text is never logged).
         `size_bytes` for Close with a status code is `2 + reason.len()`. The
         plugin never transforms or drops frames — it is purely observational.
         Cancelled or failed destination writes produce no frame event; frame
         and disconnect `frames_*` / `bytes_*` counters share that success-only
-        boundary. Disconnect records also emit `io_side` (`read`/`write`/`none`)
-        and success-only `bytes_c2b` / `bytes_b2c`.
+        boundary. Disconnect records also emit `io_side` (`read`/`write`/`none`),
+        success-only `bytes_c2b` / `bytes_b2c`, and `termination_reason` (the
+        relay's bounded session-end classification, e.g. `normal_peer_close`,
+        `relay_error`, `idle_timeout`, `drain`, `max_lifetime`). On HTTP/3, a
+        client-side QUIC write/FIN failure after the relay accepted the final
+        Close is attributed on the disconnect record (`backend_to_client` /
+        `write`).
+
+        `policy_close` records are emitted once per relay-half decision after
+        the full decision is known, independent of this plugin's priority
+        (including under `priority_override`): a terminal Close from any
+        `on_ws_frame` plugin, a fragment-budget Close, and parser rejections of
+        an inbound message (plugin or global frame/message size ceilings,
+        incomplete-message bounds, terminated `permessage-deflate` faults).
+        Session-level stops and relay transport faults are reported on the
+        disconnect record instead. Every frame, policy-close, and disconnect
+        record carries `plugin_id` (the plugin-config resource id, `-` when
+        unattributed) so multiple effective instances stay distinguishable.
+
+        Volume controls (`sample_rate`, `direction`,
+        `max_records_per_connection`) select `delivered` records only;
+        `policy_close` and disconnect records are always emitted at the
+        configured level.
 
         Default `log_level` is `info` so healthy frame traffic does not become
         warning-level noise. Under the gateway's default
@@ -13904,10 +13930,10 @@ components:
         `debug` likewise require a matching (or more verbose) runtime filter;
         `warn` is available only when selected deliberately. Filtering skips
         fingerprint computation and tracing event construction only — frame
-        parsing, plugin selection (`requires_ws_frame_hooks`), mutating-chain
-        `on_ws_frame` (policy Close observation), delivery prepare/emit, and
-        disconnect dispatch still occur, so H1 raw-copy tunnel mode remains
-        unavailable while this plugin is attached.
+        parsing, plugin selection (`requires_ws_frame_hooks`), `on_ws_frame` /
+        `on_ws_policy_close` dispatch, delivery prepare/emit, and disconnect
+        dispatch still occur, so H1 raw-copy tunnel mode remains unavailable
+        while this plugin is attached.
 
         Admission contract: only the keys below are allowed; unknown keys and
         explicit `null` field values are rejected. `payload_preview_bytes`
@@ -13961,6 +13987,38 @@ components:
           default: false
           description: >-
             Whether to log ping/pong frames in addition to text/binary frames.
+            Explicit `null` is rejected.
+        sample_rate:
+          type: number
+          default: 1
+          minimum: 0
+          maximum: 1
+          description: >-
+            Fraction of WebSocket connections whose `delivered` records are
+            emitted. Sampling is deterministic per connection (a session is
+            either fully recorded or not), so a sampled session stays coherent;
+            unsampled sessions skip fingerprinting entirely. `0` emits no
+            `delivered` records while keeping `policy_close` and disconnect
+            records. Values outside 0–1, non-numbers, and explicit `null` are
+            rejected.
+        direction:
+          type: string
+          enum: [both, client_to_backend, backend_to_client]
+          default: both
+          description: >-
+            Relay direction whose `delivered` records are emitted. Does not
+            filter `policy_close` or disconnect records. Case-sensitive;
+            unknown values and explicit `null` are rejected.
+        max_records_per_connection:
+          type: integer
+          default: 0
+          minimum: 0
+          description: >-
+            Maximum `delivered` records emitted per WebSocket connection, shared
+            by both directions. `0` (default) is unlimited. When a connection
+            reaches the cap the plugin emits one `event=record_cap_reached`
+            record and suppresses further `delivered` records for that
+            connection; `policy_close` and disconnect records are not capped.
             Explicit `null` is rejected.
       allOf:
         - if:
