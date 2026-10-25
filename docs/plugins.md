@@ -6627,7 +6627,7 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `mirror_host` | String | **(required)** | Hostname or IP of the mirror target. A bare host only (no scheme, port, path, or userinfo). An IPv6 literal may be written bracketed (`[2001:db8::10]`) or bare (`2001:db8::10`); both normalize to the bracketed URL authority |
+| `mirror_host` | String | **(required)** | Hostname or IP of the mirror target. A bare host only (no scheme, port, path, or userinfo). An IPv6 literal may be written bracketed (`[2001:db8::10]`) or bare (`2001:db8::10`); both normalize to the bracketed URL authority. A bracketed IPv4 literal (`[127.0.0.1]`) normalizes to its bare form. IP literals are parsed strictly: malformed forms such as `:::1`, `1::2::3`, or `12345::1` are rejected, and the published OpenAPI pattern models the same grammar |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
 | `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. Precedence is explicit `mirror_path`, then the matched mesh route rewrite, then the backend-effective authorized path when backend-path policy is active, then the original request path |

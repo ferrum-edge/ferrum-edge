@@ -150,8 +150,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saturated mirror or a decompression-inflated body never pays that work (or a
   second full body allocation) on the primary request path. Mirror query
   policy classifies each pair once and skips redundant decoded-value digests.
-  The `RequestMirrorConfig.mirror_host` OpenAPI pattern now accepts a bare
-  IPv6 literal, matching the constructor.
+  The `RequestMirrorConfig.mirror_host` OpenAPI pattern now models the
+  constructor's IP grammar exactly: it accepts a bare IPv6 literal and
+  bracketed IPv4/IPv6, and rejects malformed literals (`:::1`, `1::2::3`,
+  `12345::1`, `[cafe:80]`) the runtime refuses.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
