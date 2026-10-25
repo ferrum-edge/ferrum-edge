@@ -14059,8 +14059,12 @@ components:
             Frame counter storage: 'local' (in-memory) or 'redis' (externalized
             per-connection counters namespaced per plugin/gateway instance; not
             a portable cross-instance budget), parsed case-insensitively.
-            `redis` additionally requires `redis_url`. Database-backed counters
-            are unsupported. Any RESP-compatible server works.
+            `redis` additionally requires `redis_url`. With an aggregate
+            `limit_by` (`consumer`, `ip`, `service`) the Redis counter is keyed
+            by that identity and shared by every replica of the policy; a
+            refused frame batch is handed back, so refusals never consume the
+            shared budget. Database-backed counters are unsupported. Any
+            RESP-compatible server works.
         redis_url:
           type: string
           minLength: 1

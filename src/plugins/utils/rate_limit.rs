@@ -3591,6 +3591,37 @@ pub fn validate_ws_frame_rate_bounds(
     Ok(())
 }
 
+/// Hand back a refused `ws_rate_limiting` frame charge.
+///
+/// Issued from a DETACHED task that owns a clone of the client `Arc`, so a
+/// session teardown that drops the frame hook cannot strand the charge, and the
+/// refused frame does not wait a second round trip. `INCRBY -charge` rides with
+/// `EXPIRE` in one transaction so a key that expired in between is recreated
+/// with a TTL (its negative value reads as zero usage). A hand-back that cannot
+/// be delivered is reported through the client's ordinary command-failure path,
+/// so `redis_failure_policy` governs the next decision; the refusal itself
+/// already stands. Without a Tokio runtime the hand-back is awaited inline,
+/// because spawning would panic.
+async fn uncharge_ws_frames(
+    redis: &Arc<RedisRateLimitClient>,
+    current_key: String,
+    charge: i64,
+    ttl_seconds: u64,
+) {
+    let client = Arc::clone(redis);
+    let refund = async move {
+        let _ = client
+            .incrby_with_expire(&current_key, charge.saturating_neg(), ttl_seconds)
+            .await;
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(refund);
+        }
+        Err(_) => refund.await,
+    }
+}
+
 impl WsFrameRateAlgorithm {
     pub fn new(frames_per_second: f64, burst_size: f64) -> Self {
         Self {
@@ -3682,6 +3713,16 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         // than the configured sustained rate.
         let (window_seconds, limit) = self.redis_window_derivation();
 
+        // A batch larger than the whole window budget can never be admitted
+        // (the local bucket refuses it the same way), so it is refused before
+        // it can touch the shared counter at all.
+        if op.frame_count() > limit {
+            return Ok(RateLimitOutcome::deny()
+                .with_limit(limit)
+                .with_window(window_seconds)
+                .with_remaining(0));
+        }
+
         let progress = RedisRateLimitClient::window_progress(window_seconds);
         let curr_idx = progress.index;
         let prev_idx = curr_idx.saturating_sub(1);
@@ -3697,13 +3738,24 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         let (prev_count, curr_count) = redis
             .sliding_window_increment_by(&prev_key, &curr_key, charge, ttl)
             .await?;
-        let weighted = weighted_window_count(prev_count, curr_count, elapsed_fraction);
+        // A counter recreated by a hand-back that outlived its key reads
+        // negative; it is zero usage, never credit.
+        let weighted =
+            weighted_window_count(prev_count.max(0), curr_count.max(0), elapsed_fraction);
         let allowed = weighted <= limit as f64;
         let remaining = ((limit as f64) - weighted).max(0.0) as u64;
 
         let outcome = if allowed {
             RateLimitOutcome::allow()
         } else {
+            // Charge-then-compensate, like request-quota admission: the charge
+            // precedes the decision so racing sessions and replicas cannot all
+            // admit against one stale read, and a refusal then hands back
+            // exactly what it charged. Without this, every refused batch stayed
+            // on the shared counter, and on an aggregate `limit_by` key (shared
+            // by reconnects and replicas) each refusal fed the next one,
+            // starving the budget for every session that shares it.
+            uncharge_ws_frames(redis, curr_key, charge, ttl).await;
             RateLimitOutcome::deny()
         };
         Ok(outcome

@@ -1448,10 +1448,13 @@ fn proxy_context(proxy_id: &str) -> RequestContext {
     ctx
 }
 
+/// Burst 2 refilled at one frame per second: the shared-budget tests spend the
+/// burst within a few awaits, so a scheduling stall under a second cannot refill
+/// a token and flip a refusal.
 fn aggregate_plugin(limit_by: &str) -> Arc<WsRateLimiting> {
     Arc::new(
         WsRateLimiting::new(
-            &json!({"frames_per_second": 2, "limit_by": limit_by}),
+            &json!({"frames_per_second": 1, "burst_size": 2, "limit_by": limit_by}),
             PluginHttpClient::default(),
         )
         .unwrap(),
