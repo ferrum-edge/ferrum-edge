@@ -20681,9 +20681,10 @@ components:
         looks like a literal HTTP auth credential is refused. Under
         `metadata.mode: flatten`, `omit` may not list `metadata` and `rename`
         may not rename it; under `metadata.mode: omit`, `rename` may not rename
-        it (those directives would otherwise be silently ignored). The combined
-        `static_fields` keys and values must serialize to at most 16384 bytes
-        of JSON and a static value may nest at most 8 objects/arrays deep.
+        it (those directives would otherwise be silently ignored). The whole
+        `static_fields` object serialized as JSON (escaped keys and values,
+        quotes, separators, braces) must be at most 16384 bytes and a static
+        value may nest at most 8 objects/arrays deep.
         `transforms` keys must be fields of the selected `summary_type`, may
         not also be omitted, `ip_prefix` applies only to `client_ip` /
         `backend_resolved_ip`, and a `hash` `secret_ref` must resolve to a set
@@ -20732,8 +20733,9 @@ components:
             keys matching sensitive substrings or credential-class names
             (for example `session_id`) are rejected at compile time. A `null` value is rejected — use `omit`
             to drop a field. At most 64 entries; keys are at most 128 bytes;
-            all keys and values together serialize to at most 16384 bytes of
-            JSON; a value nests at most 8 objects/arrays deep. Static fields
+            the whole object serialized as JSON (escaped keys and values
+            included) is at most 16384 bytes; a value nests at most 8
+            objects/arrays deep. Static fields
             are stamped into every record, so these bounds are a per-record
             cost cap.
         derived_fields:

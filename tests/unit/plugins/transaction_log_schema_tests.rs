@@ -974,6 +974,30 @@ fn test_schema_compiler_bounds_are_enforced() {
     );
     compile(json!({ "static_fields": { "blob": "x".repeat(MAX_STATIC_FIELDS_BYTES / 2) } }))
         .expect("a static payload under the byte cap compiles");
+    // The cap is the exact serialized JSON of the whole object:
+    // `{"blob":"<n>"}` is n + 11 bytes.
+    compile(json!({ "static_fields": { "blob": "x".repeat(MAX_STATIC_FIELDS_BYTES - 11) } }))
+        .expect("a static object of exactly the byte cap compiles");
+    assert_contains(
+        &compile(json!({ "static_fields": { "blob": "x".repeat(MAX_STATIC_FIELDS_BYTES - 10) } }))
+            .unwrap_err(),
+        "serialize to more than",
+    );
+    // Escaped key bytes count: 64 keys of 126 NULs (six bytes each once
+    // JSON-escaped) plus a two-digit index used to fit under a raw-length
+    // budget while serializing to over 55 KiB.
+    let escaped: serde_json::Map<String, Value> = (0..MAX_STATIC_FIELDS)
+        .map(|index| {
+            (
+                format!("{}{index:02}", "\u{0}".repeat(126)),
+                json!("x".repeat(100)),
+            )
+        })
+        .collect();
+    assert_contains(
+        &compile(json!({ "static_fields": escaped })).unwrap_err(),
+        "serialize to more than",
+    );
     let nested = |levels: usize| {
         let mut value = json!("leaf");
         for _ in 0..levels {

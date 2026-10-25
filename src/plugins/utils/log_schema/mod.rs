@@ -43,9 +43,10 @@ pub const MAX_OUTPUT_KEY_BYTES: usize = 128;
 /// Upper bound on `static_fields` entries.
 pub const MAX_STATIC_FIELDS: usize = 64;
 
-/// Upper bound on the serialized JSON size of all `static_fields` keys and
-/// values together. Static fields are re-serialized into every record on
-/// every sink that uses the schema, so this is a per-record cost cap.
+/// Upper bound on the serialized JSON size of the whole `static_fields`
+/// object (escaped keys and values, quotes, separators, and braces). Static
+/// fields are re-serialized into every record on every sink that uses the
+/// schema, so this is a per-record cost cap.
 pub const MAX_STATIC_FIELDS_BYTES: usize = 16 * 1024;
 
 /// Upper bound on object/array nesting inside one `static_fields` value.
@@ -767,8 +768,19 @@ fn parse_static_fields(
             obj.len()
         ));
     }
+    // Every static entry is re-serialized into every record, so bound the
+    // per-record stamp at the boundary. Measure the exact serialized JSON of
+    // the whole object — escaped keys and values, quotes, separators, and
+    // framing — through a bounded counting writer, before anything is cloned.
+    // A record carries `,"key":value` per entry, which this object length
+    // bounds from above.
+    if !static_fields_fit_serialized_budget(v) {
+        return Err(format!(
+            "{plugin_name}: schema `static_fields` serialize to more than {MAX_STATIC_FIELDS_BYTES} bytes \
+             of JSON; static fields are stamped into every record, so keep them small"
+        ));
+    }
     let mut out = Vec::with_capacity(obj.len());
-    let mut serialized_bytes: usize = 0;
     for (k, val) in obj {
         if k.is_empty() {
             return Err(format!(
@@ -793,25 +805,36 @@ fn parse_static_fields(
         // Defense in depth: walk nested structures, reject sensitive keys and
         // excessive nesting.
         reject_sensitive_in_value(val, plugin_name, k, 0)?;
-        // Every static value is re-serialized into every record, so bound the
-        // total per-record stamp at the boundary.
-        let value_bytes = serde_json::to_string(val)
-            .map_err(|error| {
-                format!("{plugin_name}: schema `static_fields` value for {k:?} cannot be serialized: {error}")
-            })?
-            .len();
-        serialized_bytes = serialized_bytes
-            .saturating_add(k.len())
-            .saturating_add(value_bytes);
-        if serialized_bytes > MAX_STATIC_FIELDS_BYTES {
-            return Err(format!(
-                "{plugin_name}: schema `static_fields` serialize to more than {MAX_STATIC_FIELDS_BYTES} bytes; \
-                 static fields are stamped into every record, so keep them small"
-            ));
-        }
         out.push((k.clone(), val.clone()));
     }
     Ok(out)
+}
+
+/// `true` when `static_fields` serializes to at most
+/// [`MAX_STATIC_FIELDS_BYTES`] bytes of JSON. Serialization stops as soon as
+/// the budget is exceeded, so an oversized payload is never fully rendered.
+fn static_fields_fit_serialized_budget(static_fields: &Value) -> bool {
+    struct BoundedCounter {
+        written: usize,
+    }
+
+    impl std::io::Write for BoundedCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written = self.written.saturating_add(buf.len());
+            if self.written > MAX_STATIC_FIELDS_BYTES {
+                return Err(std::io::Error::other("static_fields byte budget exceeded"));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = BoundedCounter { written: 0 };
+    serde_json::to_writer(&mut counter, static_fields).is_ok()
+        && counter.written <= MAX_STATIC_FIELDS_BYTES
 }
 
 fn reject_sensitive_in_value(

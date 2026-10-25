@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use serde::ser::SerializeMap;
 use serde_json::Value;
@@ -71,11 +72,17 @@ pub const DEFAULT_IPV4_PREFIX_BITS: u8 = 24;
 pub const DEFAULT_IPV6_PREFIX_BITS: u8 = 48;
 
 /// A compiled value transform for one native field.
+///
+/// The HMAC key lives behind an `Arc`: the backend key schedule is large (over
+/// a kilobyte on the FIPS module), and `Option<ValueTransform>` is embedded in
+/// every native `FieldSpec`, so an inline key would inflate every compiled
+/// field — transformed or not. The `Arc` is created once at compile time and
+/// only borrowed on the emit path.
 #[derive(Debug, Clone)]
 pub enum ValueTransform {
     Truncate { max_bytes: usize },
     IpPrefix { ipv4_bits: u8, ipv6_bits: u8 },
-    Hash(HashTransformKey),
+    Hash(Arc<HashTransformKey>),
 }
 
 /// Keyed HMAC-SHA-256 state for the `hash` transform. Never printed.
@@ -111,17 +118,15 @@ impl HashTransformKey {
     }
 
     /// Lowercase-hex HMAC-SHA-256 of `value`, written into a stack buffer.
-    fn hex_digest(&self, value: &str) -> [u8; 64] {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
+    /// `None` only if hex encoding into the fixed 64-byte buffer failed,
+    /// which a 32-byte tag cannot cause.
+    fn hex_digest(&self, value: &str) -> Option<[u8; 64]> {
         let mut mac = self.0.begin();
         mac.update(value.as_bytes());
         let tag = mac.finalize().into_bytes();
         let mut out = [0u8; 64];
-        for (pair, &byte) in out.chunks_exact_mut(2).zip(tag.iter()) {
-            pair[0] = HEX[usize::from(byte >> 4)];
-            pair[1] = HEX[usize::from(byte & 0x0f)];
-        }
-        out
+        hex::encode_to_slice(tag, &mut out).ok()?;
+        Some(out)
     }
 }
 
@@ -170,10 +175,13 @@ impl ValueTransform {
             },
             Self::Hash(key) => {
                 let digest = key.hex_digest(value);
-                match std::str::from_utf8(&digest) {
-                    Ok(hex) => map.serialize_entry(out_key, hex),
+                match digest
+                    .as_ref()
+                    .and_then(|digest| std::str::from_utf8(digest).ok())
+                {
+                    Some(hex) => map.serialize_entry(out_key, hex),
                     // Unreachable (the buffer is ASCII hex); fail closed.
-                    Err(_) => map.serialize_entry(out_key, &()),
+                    None => map.serialize_entry(out_key, &()),
                 }
             }
         }
@@ -384,10 +392,9 @@ fn parse_value_transform(
                      reference"
                 )
             })?;
-            Ok(ValueTransform::Hash(HashTransformKey::from_reference(
-                reference,
-                &field_label,
-            )?))
+            Ok(ValueTransform::Hash(Arc::new(
+                HashTransformKey::from_reference(reference, &field_label)?,
+            )))
         }
     }
 }

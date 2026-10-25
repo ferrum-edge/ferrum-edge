@@ -227,17 +227,36 @@ fn proxy_alerts_smtp_credential_env(name: &str) -> Value {
     }))
 }
 
+fn transaction_log_schema_hash_secret_ref(name: &str) -> Value {
+    json!({
+        "schemas": {
+            "pseudonymized": {
+                "transforms": {
+                    "consumer_username": {
+                        "type": "hash",
+                        "secret_ref": format!("${{{name}}}")
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Every plugin config field that names a process environment variable, as
 /// `(plugin, config builder)`. A new env-reference field belongs here.
 type ConfigBuilder = fn(&str) -> Value;
 
-const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 6] = [
+const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 7] = [
     ("api_chargeback_sink", api_chargeback_sink_password_ref),
     ("ai_semantic_firewall", ai_semantic_firewall_api_key_env),
     ("ai_stream_router", ai_stream_router_api_key_reference),
     ("workload_metrics", workload_metrics_lightstep_token_env),
     ("proxy_alerts", proxy_alerts_webhook_url_env),
     ("proxy_alerts", proxy_alerts_smtp_credential_env),
+    (
+        "transaction_log_schema",
+        transaction_log_schema_hash_secret_ref,
+    ),
 ];
 
 /// Admission (the same validator the admin API answers 400 from) refuses a

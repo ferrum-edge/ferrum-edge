@@ -213,8 +213,9 @@ against the static field metadata in `fields.rs`.
 Bounds (checked at construction, mirrored in `openapi.yaml`): `omit` and
 `order` take at most 256 entries and `rename` at most 256 pairs; rename
 targets, `static_fields` keys, and `derived_fields` names are at most 128
-bytes; `static_fields` takes at most 64 entries whose keys and values together
-serialize to at most 16384 bytes of JSON, with values nested at most 8
+bytes; `static_fields` takes at most 64 entries, and the whole object
+serialized as JSON (escaped keys and values, quotes, separators, and braces)
+is at most 16384 bytes, with values nested at most 8
 objects/arrays deep; `derived_fields` takes at most 32 entries; and
 `metadata.prefix` is at most 64 bytes. A `transaction_log_schema` config
 declares at most 256 named schemas with names of at most 128 bytes. Static
