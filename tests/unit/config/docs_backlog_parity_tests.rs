@@ -376,10 +376,18 @@ fn features_cli_section_counts_every_shipped_subcommand() {
 }
 
 #[test]
-fn rate_limiting_plugin_still_has_no_configurable_max_entries_key() {
+fn rate_limiting_plugin_cap_is_configurable_only_as_max_state_entries() {
     assert!(
         !RATE_LIMITING_SRC.contains("\"max_entries\""),
         "if rate_limiting ever gains a real `max_entries` config key, FEATURES.md's plugin-cache \
          bullet and docs/cache_management.md's rate-limiting paragraph must be updated together"
+    );
+    assert!(
+        RATE_LIMITING_SRC.contains("\"max_state_entries\""),
+        "rate_limiting's local key cap is the `max_state_entries` config key"
+    );
+    assert!(
+        FEATURES.contains("`rate_limiting` exposes its 100,000-key ceiling as `max_state_entries`"),
+        "FEATURES.md's plugin-cache bullet must name the one configurable rate-limit cap"
     );
 }

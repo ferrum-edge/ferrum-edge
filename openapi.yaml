@@ -31247,17 +31247,18 @@ components:
                 pattern: "^[rR][eE][dD][iI][sS]$"
           then:
             required: [redis_url]
-      description: "Plugin: rate_limiting — Per-IP, per-consumer, or per-SPIFFE-identity request rate limiting. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. Residual admission rules this schema cannot express, enforced by the plugin constructor alone: one consumer identity may not appear in two different `scope: consumers` rules (JSON Schema can only reject a duplicate inside one rule), and `redis_url` details noted on that field."
+      description: "Plugin: rate_limiting — Per-IP, per-consumer, per-SPIFFE-identity, or per-policy aggregate (`limit_by: service`) request rate limiting. Quota 429 responses carry a Retry-After header. On stream proxies, consumer mode uses the identified stream Consumer when available and otherwise falls back to client IP; `spiffe_identity` keys on the SPIFFE ID extracted by the `spiffe_identity` / `mtls_auth` mesh chain and falls back to client IP when no SPIFFE identity is present. Supports centralized Redis-backed mode for coordinating rate limits across multiple gateway instances. `limits` must contain exactly one `scope: default` rule for generic keys and fallback IPs, plus optional `scope: consumers` rules that apply the same rate rule to one or many consumer identities, each with an independent counter. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. Residual admission rules this schema cannot express, enforced by the plugin constructor alone: one consumer identity may not appear in two different `scope: consumers` rules (JSON Schema can only reject a duplicate inside one rule), and `redis_url` details noted on that field."
       properties:
         limit_by:
           type: [string, "null"]
-          pattern: "^([iI][pP]|[cC][oO][nN][sS][uU][mM][eE][rR]|[sS][pP][iI][fF][fF][eE](_[iI][dD][eE][nN][tT][iI][tT][yY])?)$"
+          pattern: "^([iI][pP]|[cC][oO][nN][sS][uU][mM][eE][rR]|[sS][pP][iI][fF][fF][eE](_[iI][dD][eE][nN][tT][iI][tT][yY])?|[sS][eE][rR][vV][iI][cC][eE])$"
           default: ip
           description: |
             Rate limit key. Parsed case-insensitively; `null` is the same as omitting the field:
             - `ip` (default) — client IP.
             - `consumer` — identified consumer (HTTP) or stream consumer (TCP/UDP); falls back to client IP when no consumer is present.
             - `spiffe_identity` — SPIFFE ID extracted from peer certificate (mesh authn). `spiffe` is accepted as an alias.
+            - `service` — one aggregate budget per policy shared by every caller (a total route/service rate), charged after authentication (authorize phase) on HTTP and once per connection/session on TCP/UDP. With `sync_mode: redis` the budget is shared by every gateway serving the policy. Compose it beside a per-caller instance to enforce both a per-caller and a total limit.
         ipv6_prefix:
           type: integer
           minimum: 1
@@ -31267,7 +31268,18 @@ components:
         expose_headers:
           type: boolean
           default: false
-          description: "Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting. The header names are one public set, so when several rate_limiting instances run on a route exactly one verdict is published: the limiter that refused the request, or — when all of them admitted — the tightest remaining budget. A refusing limiter with expose_headers=false, and any fail-closed 503, publish no rate-limit headers at all."
+          description: "Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including successful WebSocket handshake responses and gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting. The header names are one public set, so when several rate_limiting instances run on a route exactly one verdict is published: the limiter that refused the request, or — when all of them admitted — the tightest remaining budget. A refusing limiter with expose_headers=false, and any fail-closed 503, publish no rate-limit headers at all."
+        max_state_entries:
+          type: integer
+          minimum: 1
+          maximum: 10000000
+          default: 100000
+          description: >-
+            Hard cap on distinct keys this policy keeps in local (and
+            Redis-fallback) state. At the cap, keys already tracked keep their
+            budgets and a previously unseen key is refused with 429 until idle
+            keys are pruned. Read per admission and not part of the local-state
+            compatibility fingerprint, so changing it never resets live budgets.
         limits:
           type: array
           minItems: 1
@@ -31296,7 +31308,11 @@ components:
             with the media types mcp_gateway admits (application/json,
             application/json-rpc, +json, or no Content-Type); a body with
             duplicate member names, or a batch past 32 members / 1 MiB / 256 KiB
-            per member, is refused with JSON-RPC -32600. These recognizer bounds
+            per member, is refused with JSON-RPC -32600. So is an in-scope
+            request whose Content-Type declares a charset other than UTF-8, and
+            a body strict UTF-8 JSON cannot read (UTF-16/32, a byte-order mark,
+            NaN, comments, invalid UTF-8) that could still carry a tools/call
+            for a lenient upstream parser. These recognizer bounds
             are fixed at 32 members / 1 MiB / 256 KiB per member; setting
             mcp_gateway validation.max_batch_* above these values makes the
             limiter refuse the larger request with -32600. An in-scope request
@@ -31356,7 +31372,7 @@ components:
         redis_tls:
           type: boolean
           default: false
-          description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+          description: "Enable TLS for the Redis connection (upgrades redis:// to rediss://; the URL scheme is matched case-insensitively and stored lowercase). CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
         redis_key_prefix:
           type: string
           minLength: 1

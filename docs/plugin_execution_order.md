@@ -1005,9 +1005,10 @@ subprotocol, and appends any gateway-owned sticky cookie. `correlation_id`
 uses this boundary to echo generated and preserved IDs consistently,
 `oidc_relying_party` uses it to deliver the session cookie it rotated or slid
 while authenticating the handshake, so a refresh performed for a WebSocket
-never leaves the browser holding the spent refresh token, and `mesh_authz`
-uses it to apply an allowed CUSTOM check's `headersToDownstreamOnAllow`
-result.
+never leaves the browser holding the spent refresh token, `mesh_authz` uses
+it to apply an allowed CUSTOM check's `headersToDownstreamOnAllow` result, and
+`rate_limiting` uses it to publish the charged handshake's `x-ratelimit-*`
+headers (under `expose_headers`) and strip `x-ratelimit-identity`.
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -1718,7 +1719,7 @@ Given all built-in plugins enabled, the execution order is:
 | 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
 | 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
 | 32 | `graphql` | 2850 | before_proxy, on_final_request_body |
-| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
+| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames, on_ws_disconnect |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
