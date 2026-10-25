@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `api_chargeback` admission bounds and WebSocket billing basis**
+  (issue #6842). `max_retained_bytes` below `4096` and
+  `cleanup_interval_seconds` above `31536000` (one year, whose sleep deadline
+  could overflow and kill the cleanup task) are now refused. Ordinary billing
+  rows may use only three quarters of `max_retained_bytes`; the remaining
+  quarter is reserved for the aggregate overflow rows, so a flood of distinct
+  identities folds into overflow instead of dropping charges. A
+  bandwidth-priced instance now keeps its proxy's WebSocket sessions on the
+  parsed relay. WebSocket bandwidth is billed on payload bytes even with
+  `FERRUM_WEBSOCKET_TUNNEL_MODE=true`, and policy-stopped sessions now report
+  their bytes. Such an instance is refused on a
+  `websocket_permessage_deflate: passthrough` proxy. Calls whose gRPC
+  terminal status is present on the wire but unreadable by the gateway are
+  billed at the `500` tier (also in `api_chargeback_sink`), not the wire `200`.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +153,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`api_chargeback` eviction and `/charges` collection keep billing state
+  consistent** (#6842). Idle eviction retires a row only together with every
+  row sharing its consumer, proxy, and currency, so a live cumulative
+  Prometheus counter never shrinks, which `increase()` / `rate()` would misread
+  as a reset. `GET /charges` acknowledges collection only once the admin
+  connection has taken the complete document, not at render time, so a scrape
+  cancelled mid-render cannot authorize eviction of rows no collector
+  received. Renders run on the blocking pool and give up re-walking after three
+  generation-invalidated attempts instead of looping on an admin worker.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

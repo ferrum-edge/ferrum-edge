@@ -28,6 +28,31 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `api_chargeback` budget bounds and WebSocket billing basis (PR #6842)
+
+`api_chargeback` now refuses `max_retained_bytes` below `4096` and
+`cleanup_interval_seconds` above `31536000` (one year). Raise or lower such
+values before upgrading. To disable periodic cleanup, use `0`, not a huge
+interval. Ordinary billing rows may now use only three quarters of
+`max_retained_bytes`, with the rest reserved for the aggregate overflow rows.
+A deployment sized to fill the whole budget with per-identity rows should raise
+`max_retained_bytes` by a third to keep the same per-identity capacity.
+
+An instance with nonzero `bandwidth_pricing` now forces its proxy's WebSocket
+sessions onto the parsed relay. `FERRUM_WEBSOCKET_TUNNEL_MODE` raw copy no
+longer applies to that proxy, and bandwidth is billed on payload bytes rather
+than wire bytes. Invoices for tunnel-mode deployments therefore drop by the
+WebSocket framing overhead, and sessions stopped by gateway policy are no longer
+billed zero bytes. Such an instance is refused on a proxy with
+`websocket_permessage_deflate: passthrough`; switch that proxy to `strip` or
+`terminate`, or remove bandwidth pricing from the instance. gRPC calls whose
+terminal status the gateway cannot read (for example a compressed gRPC-Web
+trailer frame) are now billed at the `500` tier by both `api_chargeback` and
+`api_chargeback_sink`.
+
+Idle rows are now evicted only together with every row sharing their consumer,
+proxy, and currency. Collection is acknowledged only once a `/charges` response
+body has been handed to the admin connection. Neither change needs action.
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
