@@ -361,6 +361,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`ai_prompt_shield` no longer forwards prompts it could not inspect, and
+  reads tool-call arguments.** In `content` / `all` mode:
+  - A JSON-labelled `POST` whose body is not UTF-8 (UTF-16 / UTF-32 with or
+    without a BOM), that the strict parser refuses (`NaN`, comments, trailing
+    commas), or whose `Content-Type` declares a non-UTF-8 `charset` is now
+    refused with `400` by `reject` / `redact` and recorded by `warn`
+    (reasons `non_utf8_body`, `malformed_json`, `unsupported_charset`). Before, it was forwarded uninspected to an upstream whose decoder
+    may read it. An `all`-mode `redact` instance no longer forwards a malformed
+    body unchanged.
+  - Every `POST` that is not framed gRPC is buffered. A body with no or a
+    non-JSON `Content-Type` is inspected (and redacted) when it parses as JSON,
+    so relabelling the header no longer skips the shield. Non-JSON uploads
+    are left alone, but they are now buffered and held to the global
+    request-body limit.
+  - gRPC-Web framing is recognized by the proxy's own classifier rather than
+    an `application/grpc-web` prefix, so `application/grpc-webhook+json` is
+    inspected.
+  - `on_final_request_body` decides scope from the final headers, so a later
+    header rewrite (`text/plain` relabelled to `application/json`) can no
+    longer carry a request past it.
+  - Content mode scans and redacts tool-call arguments replayed in the
+    history: OpenAI `tool_calls[].function.arguments` and
+    `function_call.arguments`, Responses `function_call` items, Anthropic `tool_use` /
+    `server_tool_use` / `mcp_tool_use` `input`, and Gemini `functionCall.args`.
+  - Walking the matches of a custom pattern is work-bounded. An open-ended
+    pattern such as `.*[^A-Z]|[A-Z]` can no longer cost quadratic time in one
+    synchronous rewrite: an exhausted walk refuses redaction with `413`
+    (`redaction_budget_exceeded`) and counts as a match in detection.
+  - `before_proxy` redaction reuses the document it already parsed instead of
+    parsing the body again.
+
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their

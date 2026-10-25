@@ -307,8 +307,8 @@ impl LiveCapacityLedger {
 ///
 /// Growth is reserved explicitly (doubling, capped at `room`) rather than left
 /// to `push_str`, whose geometric growth could allocate past the bound before
-/// any length check sees it.
-fn push_within_capacity(output: &mut String, value: &str, room: usize) -> bool {
+/// any length check sees it. Shared with `ai_prompt_shield`.
+pub(crate) fn push_within_capacity(output: &mut String, value: &str, room: usize) -> bool {
     let Some(needed) = output.len().checked_add(value.len()) else {
         return false;
     };
@@ -335,7 +335,8 @@ fn push_within_capacity(output: &mut String, value: &str, room: usize) -> bool {
 /// rejects patterns that match the empty string, but a contextual assertion
 /// (`\b`) can still produce an empty span beside non-empty input. `None` is a
 /// refusal; the returned string is compacted to its length so no amplified
-/// intermediate capacity is retained. Shared with `ai_prompt_shield`.
+/// intermediate capacity is retained. `ai_prompt_shield` keeps the same
+/// allocation contract in its own variant, which also bounds match-walk work.
 pub(crate) fn replace_sequentially_bounded<'p>(
     text: &str,
     passes: impl Iterator<Item = (&'p Regex, &'p str)>,
