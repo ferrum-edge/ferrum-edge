@@ -9188,6 +9188,22 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         // The runtime lowercases the protocol, so uppercase is the same setting.
         json!({"mirror_host": "127.0.0.1", "mirror_protocol": "HTTPS"}),
         json!({"mirror_host": "[2001:db8::10]"}),
+        // The constructor strips one pair of brackets and parses an IP before
+        // refusing colons, so bare IPv6 (bracketed for the URL authority) and
+        // bracketed IPv4 (normalized to bare) are admitted. The schema models
+        // the same IP grammar exactly.
+        json!({"mirror_host": "2001:db8::10"}),
+        json!({"mirror_host": " 2001:db8::10 "}),
+        json!({"mirror_host": "::"}),
+        json!({"mirror_host": "::1"}),
+        json!({"mirror_host": "[::1]"}),
+        json!({"mirror_host": "1:2:3:4:5:6:7:8"}),
+        json!({"mirror_host": "1:2:3:4:5:6:7::"}),
+        json!({"mirror_host": "A:B:C:D:E:F:0:1"}),
+        json!({"mirror_host": "::ffff:192.0.2.1"}),
+        json!({"mirror_host": "1:2:3:4:5:6:1.2.3.4"}),
+        json!({"mirror_host": "[::ffff:192.0.2.1]"}),
+        json!({"mirror_host": "[127.0.0.1]"}),
         // Paired, fail-closed credential-forwarding opt-ins.
         json!({
             "mirror_host": "127.0.0.1",
@@ -9230,6 +9246,24 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         json!({"mirror_host": " "}),
         json!({"mirror_host": "https://example.test"}),
         json!({"mirror_host": "example.test:80"}),
+        // A hex-only hostname with a port is a host:port authority, not an
+        // IPv6 literal, so the bare-IPv6 alternative must not admit it.
+        json!({"mirror_host": "cafe:80"}),
+        json!({"mirror_host": "[cafe:80]"}),
+        // Malformed IP literals the runtime parser refuses: extra colons, two
+        // compression markers, an over-long hextet, too many groups, and
+        // out-of-range / zero-padded embedded or bracketed IPv4.
+        json!({"mirror_host": ":::1"}),
+        json!({"mirror_host": "1::2::3"}),
+        json!({"mirror_host": "12345::1"}),
+        json!({"mirror_host": "1:2:3:4:5:6:7:8::"}),
+        json!({"mirror_host": "1:2:3:4:5:6:7"}),
+        json!({"mirror_host": "1:2:3:4:5:6::1.2.3.4"}),
+        json!({"mirror_host": "::ffff:256.0.2.1"}),
+        json!({"mirror_host": "::ffff:01.2.3.4"}),
+        json!({"mirror_host": "[1.2.3.256]"}),
+        json!({"mirror_host": "[127.0.0.1"}),
+        json!({"mirror_host": "[mirror.local]"}),
         json!({"mirror_host": null}),
         // Half an opt-in is a configuration error, never a partial grant.
         json!({"mirror_host": "127.0.0.1", "forward_sensitive_headers": true}),
