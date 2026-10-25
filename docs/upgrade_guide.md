@@ -28,23 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `ai_prompt_compressor` refuses residual preserve markers (#6854)
+### `cors` method and header lists are bounded (#6844)
 
-With `preserve_tag` configured, the final request-body hook now refuses (`400`)
-an admitted Chat/Text Completions (or fixed-family) JSON `POST` whose final
-string values still contain a configured marker. Check for body transforms
-that run after the compressor (priority 4055), such as a `request_transformer`
-rule with a later `priority_override`, and make sure they never write
-`<TAG>` / `</TAG>` into prompt-bearing values.
-
-Content-coded candidate requests are now buffered and their decoded view is
-verified. An unsupported or malformed `Content-Encoding` on such a request is a
-`400` instead of passthrough. To keep compressing those uploads, configure
-`compression` with `decompress_request: true`. Otherwise make sure clients send
-only `gzip`, `br`, or `identity`.
-
-`compress_roles` now accepts at most 32 entries of at most 64 characters. Trim
-a longer list before upgrading; such a config is rejected at load.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
