@@ -17705,6 +17705,23 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
             "streaming_response": "inspect",
             "streaming": {"enforcement": "detect", "max_hold_ms": 100, "on_hold_timeout": "forward"}
         }),
+        // Provider concurrency/timeout ceilings and Azure-style credentials.
+        json!({
+            "provider": {
+                "type": "openai_compatible_embeddings",
+                "endpoint": ENDPOINT,
+                "request_timeout_ms": 60000,
+                "max_concurrent_requests": 1024,
+                "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS",
+                "auth_header": "api-key",
+                "auth_scheme": ""
+            }
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_bytes": 1048576, "max_inspections": 10000}
+        }),
     ];
     for config in &accepted {
         assert_component_validity(&spec, "AiSemanticFirewallConfig", config, true);
@@ -17779,6 +17796,37 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
             "streaming_response": "inspect",
             "streaming": {"overlap_tokens": 32}
         }),
+        // Admission ceilings.
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_window_bytes": 1048577}
+        }),
+        json!({
+            "provider": provider,
+            "streaming_response": "inspect",
+            "streaming": {"max_inspections": 10001}
+        }),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "request_timeout_ms": 60001}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "max_concurrent_requests": 0}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "max_concurrent_requests": 1025}}),
+        json!({
+            "provider": provider,
+            "custom_rules": (0..65).map(|i| json!({"id": format!("r{i}"), "examples": ["a"]})).collect::<Vec<_>>()
+        }),
+        json!({
+            "provider": provider,
+            "custom_rules": [{"id": "a", "examples": (0..65).map(|i| format!("e{i}")).collect::<Vec<_>>()}]
+        }),
+        json!({"provider": provider, "custom_rules": [{"id": "a", "examples": ["x".repeat(2049)]}]}),
+        // auth_header / auth_scheme need a credential, and auth_header may not
+        // name a framing/routing header.
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "auth_header": "api-key"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "auth_scheme": ""}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": " ", "auth_header": "api-key"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS", "auth_header": "HOST"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS", "auth_header": "bad header"}}),
+        json!({"provider": {"type": "openai_compatible_embeddings", "endpoint": ENDPOINT, "api_key_env": "FERRUM_PLUGIN_SECRET_EMBEDDINGS", "auth_scheme": "Bad Scheme"}}),
     ];
     for config in &rejected {
         assert_component_validity(&spec, "AiSemanticFirewallConfig", config, false);
@@ -17813,6 +17861,18 @@ fn ai_semantic_firewall_schema_matches_runtime_admission() {
                 {"id": "dup", "examples": ["a"]},
                 {"id": "dup", "examples": ["b"]}
             ]
+        }),
+        // Every list and every rule is within its own ceiling, but the total
+        // (9 x 60 = 540) exceeds the 512-example cap.
+        json!({
+            "provider": provider,
+            "builtins": {},
+            "custom_rules": (0..9)
+                .map(|rule| json!({
+                    "id": format!("r{rule}"),
+                    "examples": (0..60).map(|i| format!("e{i}")).collect::<Vec<_>>()
+                }))
+                .collect::<Vec<_>>()
         }),
     ];
     for config in &constructor_only {
