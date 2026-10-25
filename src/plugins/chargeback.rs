@@ -100,12 +100,26 @@ pub struct HttpBillingOutcome {
     pub grpc_status: Option<u32>,
 }
 
+/// Billable status for a gRPC exchange whose terminal status is present on the
+/// wire but unreadable by the gateway (for example a compressed gRPC-Web
+/// trailer frame). The documented mapping sends unknown terminal codes to
+/// `500`; billing the wire `200` would price a possibly failed call as success.
+const UNREADABLE_GRPC_STATUS_BILLING_CODE: u16 = 500;
+
 pub fn http_billing_outcome(summary: &TransactionSummary) -> HttpBillingOutcome {
     let grpc_status = summary.grpc_status();
     let status_code = grpc_status
         .map(crate::proxy::grpc_proxy::grpc_status_to_http_status)
         .unwrap_or_else(|| {
-            if is_websocket_handshake(summary) {
+            // `grpc_status` stays `None` for an unreadable status so logs never
+            // report an UNKNOWN the client did not receive; only the billable
+            // dimension is mapped.
+            if summary
+                .metadata
+                .contains_key(crate::proxy::grpc_proxy::GRPC_STATUS_UNREADABLE_METADATA_KEY)
+            {
+                UNREADABLE_GRPC_STATUS_BILLING_CODE
+            } else if is_websocket_handshake(summary) {
                 101
             } else {
                 summary.response_status_code

@@ -456,3 +456,26 @@ fn test_rename_rejects_deep_array_index() {
         .expect_err("expected rejection for numeric segment anywhere in the path");
     assert!(err.contains("does not support array indices"), "got: {err}");
 }
+
+#[test]
+fn parse_body_rules_rejects_empty_path_segments() {
+    // Shared by request_transformer and response_transformer: an empty
+    // dot-segment would silently read or write a `""` member.
+    for key in ["", "a.", ".a", "a..b"] {
+        for rule in [
+            json!({"operation": "remove", "target": "body", "key": key}),
+            json!({"operation": "rename", "target": "body", "key": "a", "new_key": key}),
+        ] {
+            let error = parse_body_rules(&json!({"rules": [rule]}))
+                .expect_err("an empty path segment must be rejected");
+            assert!(error.contains("empty path segment"), "{key:?}: {error}");
+        }
+    }
+    assert!(
+        parse_body_rules(&json!({"rules": [
+            {"operation": "remove", "target": "body", "key": "a\\.b"}
+        ]}))
+        .is_ok(),
+        "an escaped dot is part of one non-empty segment"
+    );
+}

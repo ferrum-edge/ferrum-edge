@@ -7560,6 +7560,7 @@ fn udp_ctx(payload: &[u8], kind: StreamBytesKind) -> UdpDatagramContext<'_> {
         payload,
         payload_kind: kind,
         metadata_sink: None,
+        admission_datagram: false,
     }
 }
 

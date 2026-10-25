@@ -136,7 +136,7 @@ fn unknown_config_keys_are_rejected_even_with_another_valid_policy() {
 }
 
 #[test]
-fn test_request_buffering_only_for_matching_json_requests() {
+fn test_request_buffering_covers_every_post_that_could_carry_json() {
     let plugin = AiRequestGuard::new(&json!({"max_messages": 2})).unwrap();
     assert!(plugin.requires_request_body_buffering());
 
@@ -147,11 +147,48 @@ fn test_request_buffering_only_for_matching_json_requests() {
     get_ctx.method = "GET".to_string();
     assert!(!plugin.should_buffer_request_body(&get_ctx));
 
-    let mut text_ctx = make_post_ctx(&json!({"messages": []}));
-    text_ctx
-        .headers
-        .insert("content-type".to_string(), "text/plain".to_string());
-    assert!(!plugin.should_buffer_request_body(&text_ctx));
+    // The client chooses `Content-Type`, so a missing, non-JSON, or joined value
+    // is still buffered and sniffed rather than passed through unevaluated.
+    for content_type in [
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        Some("text/plain, application/json"),
+        Some("multipart/form-data, application/json"),
+        Some(""),
+        None,
+    ] {
+        let mut ctx = make_post_ctx(&json!({"messages": []}));
+        match content_type {
+            Some(value) => {
+                ctx.headers
+                    .insert("content-type".to_string(), value.to_string());
+            }
+            None => {
+                ctx.headers.remove("content-type");
+            }
+        }
+        assert!(
+            plugin.should_buffer_request_body(&ctx),
+            "POST with content-type {content_type:?} must be buffered"
+        );
+    }
+
+    // Opaque uploads stay streaming.
+    for content_type in [
+        "multipart/form-data; boundary=x",
+        "application/octet-stream",
+        "audio/wav",
+        "image/png",
+        "video/mp4",
+    ] {
+        let mut ctx = make_post_ctx(&json!({"messages": []}));
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "{content_type} uploads must not be buffered"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3168,7 +3205,23 @@ async fn final_hook_enforces_clamp_and_default_after_later_body_transform() {
         "Missing output token cap after request transforms",
     );
 
-    for invalid_cap in [serde_json::Value::Null, json!("128")] {
+    // A `null` cap is "unset", so it does not satisfy the required default.
+    let mut null_ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
+    let mut headers = make_post_headers();
+    assert_continue(defaulted.before_proxy(&mut null_ctx, &mut headers).await);
+    let null_cap = json!({"model": "gpt-4", "messages": [], "max_tokens": null})
+        .to_string()
+        .into_bytes();
+    assert_reject_error(
+        defaulted
+            .on_final_request_body_with_context(&mut null_ctx, &headers, &null_cap)
+            .await,
+        400,
+        "Missing output token cap after request transforms",
+    );
+
+    // A cap that is not a non-negative integer fails closed as invalid.
+    for invalid_cap in [json!("many"), json!(true), json!(-1), json!(1.5)] {
         let mut invalid_ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
         let mut headers = make_post_headers();
         assert_continue(defaulted.before_proxy(&mut invalid_ctx, &mut headers).await);
@@ -3184,7 +3237,7 @@ async fn final_hook_enforces_clamp_and_default_after_later_body_transform() {
                 .on_final_request_body_with_context(&mut invalid_ctx, &headers, &invalid)
                 .await,
             400,
-            "Missing output token cap after request transforms",
+            "Invalid max_tokens field",
         );
     }
 
@@ -3193,7 +3246,7 @@ async fn final_hook_enforces_clamp_and_default_after_later_body_transform() {
     assert_continue(defaulted.before_proxy(&mut tgi_ctx, &mut headers).await);
     let invalid_tgi = json!({
         "inputs": "hello",
-        "parameters": {"max_new_tokens": "128"}
+        "parameters": {"max_new_tokens": "many"}
     })
     .to_string()
     .into_bytes();
@@ -3202,8 +3255,25 @@ async fn final_hook_enforces_clamp_and_default_after_later_body_transform() {
             .on_final_request_body_with_context(&mut tgi_ctx, &headers, &invalid_tgi)
             .await,
         400,
-        "Missing output token cap after request transforms",
+        "Invalid max_tokens field",
     );
+
+    // A quoted integer is a numeric cap (ProtoJSON / lax-server spelling), so it
+    // satisfies the required default.
+    for quoted in [
+        json!({"model": "gpt-4", "messages": [], "max_tokens": "128"}),
+        json!({"inputs": "hello", "parameters": {"max_new_tokens": "128"}}),
+    ] {
+        let mut quoted_ctx = make_post_ctx(&quoted);
+        let mut headers = make_post_headers();
+        assert_continue(defaulted.before_proxy(&mut quoted_ctx, &mut headers).await);
+        let encoded = quoted.to_string().into_bytes();
+        assert_continue(
+            defaulted
+                .on_final_request_body_with_context(&mut quoted_ctx, &headers, &encoded)
+                .await,
+        );
+    }
 
     let mut compliant_ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": []}));
     let mut headers = make_post_headers();
@@ -4031,10 +4101,11 @@ async fn prompt_characters_keep_typed_document_parts_out_of_map_accounting() {
 
 // ─── Numeric configuration contract parity (#5323) ───────────────────────
 
-/// The four unsigned limits the constructor reads through `Value::as_u64`.
-const UNSIGNED_LIMIT_FIELDS: [&str; 4] = [
+/// The five unsigned limits the constructor reads through `Value::as_u64`.
+const UNSIGNED_LIMIT_FIELDS: [&str; 5] = [
     "max_tokens_limit",
     "default_max_tokens",
+    "max_choices",
     "max_messages",
     "max_prompt_characters",
 ];
@@ -4403,5 +4474,1244 @@ fn ai_regex_diagnostics_omit_library_text_and_preserve_field_indexes() {
         assert!(rendered.contains("plugin `config` rejected"), "{rendered}");
         assert!(rendered.contains(field), "{rendered}");
         assert!(rendered.contains("invalid regex") || rendered.contains("invalid or too complex"));
+    }
+}
+
+// ─── Production-launch review hardening ─────────────────────────────────
+
+/// A POST context whose buffered body is `raw` exactly as given (so duplicate
+/// members and non-JSON bodies can be expressed), with `content_type` set on
+/// both the context and the `before_proxy` header map (or absent when `None`).
+fn make_raw_post_ctx(
+    raw: &str,
+    content_type: Option<&str>,
+) -> (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    let mut headers = HashMap::new();
+    if let Some(content_type) = content_type {
+        ctx.headers
+            .insert("content-type".to_string(), content_type.to_string());
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
+    ctx.metadata
+        .insert("request_body".to_string(), raw.to_string());
+    (ctx, headers)
+}
+
+/// A context this instance already admitted into scope, for driving the
+/// final-body pass directly.
+fn admitted_final_ctx(plugin: &AiRequestGuard) -> ferrum_edge::plugins::RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        plugin.final_inspection_marker_key().to_string(),
+        "true".to_string(),
+    );
+    ctx
+}
+
+/// The `(action, reason)` decision metadata the guard published.
+fn decision(ctx: &ferrum_edge::plugins::RequestContext) -> (Option<&str>, Option<&str>) {
+    (
+        ctx.metadata
+            .get("ai_request_guard.action")
+            .map(String::as_str),
+        ctx.metadata
+            .get("ai_request_guard.reason")
+            .map(String::as_str),
+    )
+}
+
+fn uninspectable_reason(ctx: &ferrum_edge::plugins::RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("ai_request_guard.uninspectable_body_reason")
+        .map(String::as_str)
+}
+
+fn request_body_json(ctx: &ferrum_edge::plugins::RequestContext) -> serde_json::Value {
+    serde_json::from_str(ctx.metadata.get("request_body").unwrap()).unwrap()
+}
+
+// MUSE-1: duplicate members are a parser differential, not a policy input.
+
+#[tokio::test]
+async fn duplicate_members_are_rejected_before_policy_evaluation() {
+    let plugin = AiRequestGuard::new(&json!({
+        "blocked_models": ["o3"],
+        "max_tokens_limit": 4096
+    }))
+    .unwrap();
+    for raw in [
+        // serde keeps the LAST value; a first-key-wins backend runs `o3`.
+        r#"{"model":"o3","model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"gpt-4o-mini","max_tokens":64000,"max_tokens":100,"messages":[]}"#,
+        // An escaped spelling of the same member name.
+        r#"{"model":"o3","mod\u0065l":"gpt-4o-mini","messages":[]}"#,
+        // A duplicate under any nested object is ambiguous too.
+        r#"{"model":"gpt-4o-mini","messages":[],"metadata":{"a":1,"a":2}}"#,
+    ] {
+        let (mut ctx, mut headers) = make_raw_post_ctx(raw, Some("application/json"));
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Request body uninspectable",
+        );
+        assert_eq!(uninspectable_reason(&ctx), Some("ambiguous_json"), "{raw}");
+        assert_eq!(decision(&ctx), (Some("reject"), Some("uninspectable_body")));
+        assert!(
+            !ctx.metadata
+                .contains_key(plugin.final_inspection_marker_key())
+        );
+    }
+
+    let (mut ctx, mut headers) = make_raw_post_ctx(
+        r#"{"model":"gpt-4o-mini","messages":[]}"#,
+        Some("application/json"),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn duplicate_members_follow_the_uninspectable_compatibility_switch() {
+    let plugin = AiRequestGuard::new(&json!({
+        "blocked_models": ["o3"],
+        "fail_on_uninspectable_body": false
+    }))
+    .unwrap();
+    let (mut ctx, mut headers) = make_raw_post_ctx(
+        r#"{"model":"o3","model":"gpt-4o-mini"}"#,
+        Some("application/json"),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(uninspectable_reason(&ctx), Some("ambiguous_json"));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_request_guard.uninspectable_body_action")
+            .map(String::as_str),
+        Some("allow")
+    );
+    assert_eq!(decision(&ctx), (None, None));
+}
+
+#[tokio::test]
+async fn final_hook_rejects_duplicate_members_introduced_by_a_later_transform() {
+    let plugin = AiRequestGuard::new(&json!({"blocked_models": ["o3"]})).unwrap();
+    let mut ctx = admitted_final_ctx(&plugin);
+    let headers = make_post_headers();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"model":"o3","model":"gpt-4o-mini","messages":[]}"#,
+        )
+        .await;
+    assert_reject_error(result, 400, "Request body uninspectable");
+    assert_eq!(uninspectable_reason(&ctx), Some("ambiguous_json"));
+}
+
+// SOL-1 / MUSE-2: every numeric spelling of a cap is evaluated by value, and an
+// unreadable cap fails closed instead of reading as "no cap".
+
+#[tokio::test]
+async fn provider_valid_cap_spellings_are_rejected_over_the_limit() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "reject",
+        "strict_schema": true,
+        "supported_schema": "provider_native"
+    }))
+    .unwrap();
+    let contents = json!([{"role": "user", "parts": [{"text": "Write a long article"}]}]);
+    for body in [
+        json!({"contents": contents, "generationConfig": {"maxOutputTokens": "8192"}}),
+        json!({"contents": contents, "generation_config": {"max_output_tokens": 8192}}),
+        json!({"contents": contents, "generationConfig": {"max_output_tokens": 8192}}),
+        json!({"contents": contents, "generation_config": {"maxOutputTokens": "8192"}}),
+        json!({"contents": contents, "generationConfig": {"maxOutputTokens": 8192.0}}),
+        json!({"contents": contents, "generationConfig": {"maxOutputTokens": "8.192e3"}}),
+        json!({"messages": [], "max_tokens": 5e5}),
+        json!({"messages": [], "max_tokens": "500000"}),
+        json!({"messages": [], "inferenceConfig": {"maxTokens": "8192"}}),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "max_tokens exceeds limit",
+        );
+        assert_eq!(
+            decision(&ctx),
+            (Some("reject"), Some("max_tokens_exceeded"))
+        );
+
+        let mut final_ctx = admitted_final_ctx(&plugin);
+        let encoded = serde_json::to_vec(&body).unwrap();
+        assert_reject_error(
+            plugin
+                .on_final_request_body_with_context(&mut final_ctx, &headers, &encoded)
+                .await,
+            400,
+            "max_tokens exceeds limit",
+        );
+    }
+
+    // Above `u64::MAX`: serde reads it as a float, which saturates.
+    let (mut ctx, mut headers) = make_raw_post_ctx(
+        r#"{"messages":[],"max_tokens":18446744073709551616}"#,
+        Some("application/json"),
+    );
+    assert_reject_error(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "max_tokens exceeds limit",
+    );
+
+    for under in [json!("50"), json!(50.0), json!("5e1")] {
+        let mut ctx = make_post_ctx(&json!({"messages": [], "max_tokens": under}));
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+#[tokio::test]
+async fn unreadable_caps_fail_closed_in_reject_and_clamp_modes() {
+    for mode in ["reject", "clamp"] {
+        let plugin = AiRequestGuard::new(&json!({
+            "max_tokens_limit": 100,
+            "enforce_max_tokens": mode
+        }))
+        .unwrap();
+        for invalid in [
+            json!(-1),
+            json!(1.5),
+            json!("lots"),
+            json!(" 50"),
+            json!("NaN"),
+            json!("inf"),
+            json!(true),
+            json!([100]),
+            json!({"value": 100}),
+        ] {
+            for body in [
+                json!({"model": "m", "messages": [], "max_tokens": invalid}),
+                json!({"contents": [], "generationConfig": {"maxOutputTokens": invalid}}),
+                json!({"contents": [], "generation_config": {"max_output_tokens": invalid}}),
+            ] {
+                let mut ctx = make_post_ctx(&body);
+                let mut headers = make_post_headers();
+                assert_reject_error(
+                    plugin.before_proxy(&mut ctx, &mut headers).await,
+                    400,
+                    "Invalid max_tokens field",
+                );
+                assert_eq!(decision(&ctx), (Some("reject"), Some("invalid_max_tokens")));
+            }
+        }
+
+        // JSON `null` is "unset", not an unreadable cap.
+        let mut ctx = make_post_ctx(&json!({"model": "m", "messages": [], "max_tokens": null}));
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+#[tokio::test]
+async fn clamp_rewrites_every_numeric_spelling_of_an_over_limit_cap() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+    let body = json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generation_config": {"max_output_tokens": "8192"},
+        "max_tokens": 5e5
+    });
+
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let updated = request_body_json(&ctx);
+    assert_eq!(updated["generation_config"]["max_output_tokens"], 100);
+    assert_eq!(updated["max_tokens"], 100);
+    assert_eq!(decision(&ctx), (Some("modify"), Some("max_tokens_clamped")));
+
+    let transformed = transform_post_json(&plugin, &serde_json::to_vec(&body).unwrap())
+        .await
+        .expect("over-limit spellings must be rewritten on the wire");
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["generation_config"]["max_output_tokens"], 100);
+    assert_eq!(transformed["max_tokens"], 100);
+
+    // A later transform that reintroduces a quoted over-limit cap is refused.
+    let mut final_ctx = admitted_final_ctx(&plugin);
+    let reintroduced = json!({"model": "m", "messages": [], "max_tokens": "8192"})
+        .to_string()
+        .into_bytes();
+    assert_reject_error(
+        plugin
+            .on_final_request_body_with_context(&mut final_ctx, &headers, &reintroduced)
+            .await,
+        400,
+        "max_tokens exceeds limit after request transforms",
+    );
+}
+
+#[tokio::test]
+async fn gemini_double_spellings_of_one_field_are_rejected_as_ambiguous() {
+    let plugin = AiRequestGuard::new(&json!({"max_tokens_limit": 100})).unwrap();
+    let contents = json!([{"role": "user", "parts": [{"text": "hi"}]}]);
+    for body in [
+        json!({
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 50},
+            "generation_config": {"max_output_tokens": 60}
+        }),
+        json!({
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 50, "max_output_tokens": 60}
+        }),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Conflicting field spellings",
+        );
+    }
+
+    let choices = AiRequestGuard::new(&json!({"max_choices": 4})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "contents": contents,
+        "generationConfig": {"candidateCount": 1, "candidate_count": 2}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        choices.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Conflicting field spellings",
+    );
+}
+
+#[tokio::test]
+async fn snake_case_gemini_temperature_is_range_checked() {
+    let plugin = AiRequestGuard::new(&json!({"temperature_range": [0.0, 1.0]})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generation_config": {"temperature": 1.5}
+    }));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Temperature out of range",
+    );
+}
+
+#[tokio::test]
+async fn default_cap_keeps_the_client_spelling_and_replaces_null_caps() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 128})).unwrap();
+
+    let snake = json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generation_config": {"temperature": 0.5}
+    });
+    let transformed = transform_post_json(&plugin, &serde_json::to_vec(&snake).unwrap())
+        .await
+        .unwrap();
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["generation_config"]["maxOutputTokens"], 128);
+    assert_eq!(transformed["generation_config"]["temperature"], 0.5);
+    assert!(
+        transformed.get("generationConfig").is_none(),
+        "injecting the other container spelling would duplicate the proto field"
+    );
+
+    let null_cap = json!({"model": "gpt-4", "messages": [], "max_tokens": null});
+    let mut ctx = make_post_ctx(&null_cap);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(request_body_json(&ctx)["max_tokens"], 128);
+    assert_eq!(
+        decision(&ctx),
+        (Some("modify"), Some("default_max_tokens_injected"))
+    );
+}
+
+// SOL-2: native tool payload text counts toward the prompt ceiling.
+
+#[tokio::test]
+async fn prompt_characters_count_bedrock_converse_tool_config_definitions() {
+    // "hi" (2) + "lookup" (6) + 40-character description + "object" (6).
+    let converse = json!({
+        "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+        "toolConfig": {"tools": [{"toolSpec": {
+            "name": "lookup",
+            "description": "d".repeat(40),
+            "inputSchema": {"json": {"type": "object", "properties": {}}}
+        }}]}
+    });
+    assert_counted_prompt_characters(&converse, 54, "converse toolConfig.tools").await;
+}
+
+#[tokio::test]
+async fn prompt_characters_count_gemini_function_response_results() {
+    // "hi" (2) + 30-character tool result; the call's empty args add nothing.
+    for (call_member, response_member) in [
+        ("functionCall", "functionResponse"),
+        ("function_call", "function_response"),
+    ] {
+        let gemini = json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "hi"}]},
+                {"role": "model", "parts": [{(call_member): {"name": "lookup", "args": {}}}]},
+                {"role": "user", "parts": [{(response_member): {
+                    "name": "lookup",
+                    "response": {"result": "r".repeat(30)}
+                }}]}
+            ]
+        });
+        assert_counted_prompt_characters(&gemini, 32, response_member).await;
+    }
+}
+
+// SOL-3: an operator-bound Converse dialect injects the native cap even when
+// the optional `inferenceConfig` is absent.
+
+#[tokio::test]
+async fn bedrock_converse_dialect_injects_the_native_cap_without_inference_config() {
+    let plugin = AiRequestGuard::new(&json!({
+        "default_max_tokens": 128,
+        "supported_schema": "bedrock_converse",
+        "strict_schema": true
+    }))
+    .unwrap();
+    let messages = json!([{"role": "user", "content": [{"text": "hi"}]}]);
+
+    let body = json!({"messages": messages});
+    let mut ctx = make_post_ctx(&body);
+    let mut headers = make_post_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let updated = request_body_json(&ctx);
+    assert_eq!(updated["inferenceConfig"]["maxTokens"], 128);
+    assert!(
+        updated.get("max_tokens").is_none(),
+        "Converse rejects an unexpected top-level max_tokens"
+    );
+
+    let transformed = transform_post_json(&plugin, &serde_json::to_vec(&body).unwrap())
+        .await
+        .unwrap();
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["inferenceConfig"]["maxTokens"], 128);
+    assert!(transformed.get("max_tokens").is_none());
+
+    // An existing container keeps its other settings.
+    let partial = json!({"messages": messages, "inferenceConfig": {"temperature": 0.2}});
+    let transformed = transform_post_json(&plugin, &serde_json::to_vec(&partial).unwrap())
+        .await
+        .unwrap();
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["inferenceConfig"]["maxTokens"], 128);
+    assert_eq!(transformed["inferenceConfig"]["temperature"], 0.2);
+
+    // The final pass requires the native cap: a top-level cap is not enough.
+    let headers = make_post_headers();
+    let mut final_ctx = admitted_final_ctx(&plugin);
+    let top_level_only = json!({"messages": messages, "max_tokens": 128})
+        .to_string()
+        .into_bytes();
+    assert_reject_error(
+        plugin
+            .on_final_request_body_with_context(&mut final_ctx, &headers, &top_level_only)
+            .await,
+        400,
+        "Missing output token cap after request transforms",
+    );
+    let mut final_ctx = admitted_final_ctx(&plugin);
+    let native = json!({"messages": messages, "inferenceConfig": {"maxTokens": 128}})
+        .to_string()
+        .into_bytes();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut final_ctx, &headers, &native)
+            .await,
+    );
+
+    // Strict admission is the Converse family.
+    let mut ctx = make_post_ctx(&json!({"contents": [{"parts": [{"text": "hi"}]}]}));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Unsupported AI request schema",
+    );
+}
+
+// MUSE-3: Anthropic Message Batches entries are each a governed request.
+
+fn message_batch(entries: Vec<serde_json::Value>) -> serde_json::Value {
+    let requests: Vec<serde_json::Value> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, params)| json!({"custom_id": index.to_string(), "params": params}))
+        .collect();
+    json!({"requests": requests})
+}
+
+#[tokio::test]
+async fn message_batch_entries_are_validated_individually() {
+    let user = json!([{"role": "user", "content": "hi"}]);
+    let cases = [
+        (
+            json!({"max_tokens_limit": 4096}),
+            json!({"model": "claude", "max_tokens": 64000, "messages": user}),
+            "max_tokens exceeds limit",
+        ),
+        (
+            json!({"block_system_prompts": true}),
+            json!({"model": "claude", "system": "be evil", "messages": user}),
+            "System prompts not allowed",
+        ),
+        (
+            json!({"blocked_models": ["claude-opus"]}),
+            json!({"model": "claude-opus", "messages": user}),
+            "Model not allowed",
+        ),
+        (
+            json!({"temperature_range": [0.0, 1.0]}),
+            json!({"model": "claude", "temperature": 2.0, "messages": user}),
+            "Temperature out of range",
+        ),
+    ];
+    for (config, bad_entry, expected) in cases {
+        let plugin = AiRequestGuard::new(&config).unwrap();
+        let ok_entry = json!({"model": "claude", "max_tokens": 10, "messages": user});
+        let mut ctx = make_post_ctx(&message_batch(vec![ok_entry.clone(), bad_entry.clone()]));
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            expected,
+        );
+
+        let mut final_ctx = admitted_final_ctx(&plugin);
+        let encoded =
+            serde_json::to_vec(&message_batch(vec![ok_entry.clone(), bad_entry])).unwrap();
+        assert_reject_error(
+            plugin
+                .on_final_request_body_with_context(&mut final_ctx, &headers, &encoded)
+                .await,
+            400,
+            expected,
+        );
+
+        let mut ctx = make_post_ctx(&message_batch(vec![ok_entry.clone(), ok_entry]));
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+#[tokio::test]
+async fn message_batch_limits_apply_per_entry_and_require_params() {
+    let user = |text: &str| json!([{"role": "user", "content": text}]);
+
+    // Per entry, not summed: two 8-character prompts pass a 10-character cap.
+    let prompt = AiRequestGuard::new(&json!({"max_prompt_characters": 10})).unwrap();
+    let mut ctx = make_post_ctx(&message_batch(vec![
+        json!({"messages": user("12345678")}),
+        json!({"messages": user("abcdefgh")}),
+    ]));
+    let mut headers = make_post_headers();
+    assert_continue(prompt.before_proxy(&mut ctx, &mut headers).await);
+    let mut ctx = make_post_ctx(&message_batch(vec![
+        json!({"messages": user("12345678")}),
+        json!({"messages": user("this prompt is too long")}),
+    ]));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        prompt.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Prompt too long",
+    );
+
+    // An allowlist is satisfied by each entry's own model.
+    let allow = AiRequestGuard::new(&json!({"allowed_models": ["claude-sonnet"]})).unwrap();
+    let mut ctx = make_post_ctx(&message_batch(vec![
+        json!({"model": "claude-sonnet", "messages": user("hi")}),
+    ]));
+    let mut headers = make_post_headers();
+    assert_continue(allow.before_proxy(&mut ctx, &mut headers).await);
+
+    // An entry without `params` cannot be skipped.
+    let mut ctx = make_post_ctx(&json!({"requests": [
+        {"custom_id": "1", "params": {"model": "claude-sonnet", "messages": user("hi")}},
+        {"custom_id": "2"}
+    ]}));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        allow.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Invalid batch request entry",
+    );
+
+    // A request field beside the batch is evaluated too.
+    let tokens = AiRequestGuard::new(&json!({"max_tokens_limit": 4096})).unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "requests": [{"custom_id": "1", "params": {"max_tokens": 10, "messages": user("hi")}}],
+        "max_tokens": 99999
+    }));
+    let mut headers = make_post_headers();
+    assert_reject_error(
+        tokens.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "max_tokens exceeds limit",
+    );
+
+    // Strict schema admits a batch of supported requests.
+    let strict = AiRequestGuard::new(&json!({"strict_schema": true})).unwrap();
+    let mut ctx = make_post_ctx(&message_batch(vec![
+        json!({"model": "claude", "max_tokens": 10, "messages": user("hi")}),
+    ]));
+    let mut headers = make_post_headers();
+    assert_continue(strict.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn message_batch_entries_are_clamped_and_defaulted_individually() {
+    let user = json!([{"role": "user", "content": "hi"}]);
+    let clamp = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+    let batch = message_batch(vec![
+        json!({"model": "claude", "max_tokens": 5000, "messages": user}),
+        json!({"model": "claude", "max_tokens": 50, "messages": user}),
+    ]);
+    let mut ctx = make_post_ctx(&batch);
+    let mut headers = make_post_headers();
+    assert_continue(clamp.before_proxy(&mut ctx, &mut headers).await);
+    let updated = request_body_json(&ctx);
+    assert_eq!(updated["requests"][0]["params"]["max_tokens"], 100);
+    assert_eq!(updated["requests"][1]["params"]["max_tokens"], 50);
+
+    let transformed = transform_post_json(&clamp, &serde_json::to_vec(&batch).unwrap())
+        .await
+        .unwrap();
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["requests"][0]["params"]["max_tokens"], 100);
+
+    let mut final_ctx = admitted_final_ctx(&clamp);
+    let encoded = serde_json::to_vec(&batch).unwrap();
+    assert_reject_error(
+        clamp
+            .on_final_request_body_with_context(&mut final_ctx, &headers, &encoded)
+            .await,
+        400,
+        "max_tokens exceeds limit after request transforms",
+    );
+
+    let defaulted = AiRequestGuard::new(&json!({"default_max_tokens": 64})).unwrap();
+    let uncapped = message_batch(vec![
+        json!({"model": "claude", "messages": user}),
+        json!({"model": "claude", "messages": user}),
+    ]);
+    let mut ctx = make_post_ctx(&uncapped);
+    let mut headers = make_post_headers();
+    assert_continue(defaulted.before_proxy(&mut ctx, &mut headers).await);
+    let updated = request_body_json(&ctx);
+    assert_eq!(updated["requests"][0]["params"]["max_tokens"], 64);
+    assert_eq!(updated["requests"][1]["params"]["max_tokens"], 64);
+    assert!(
+        updated.get("max_tokens").is_none(),
+        "the canonical envelope itself is not a request"
+    );
+}
+
+// MUSE-4: scope is not selected by the client's Content-Type alone.
+
+#[tokio::test]
+async fn json_bodies_under_non_json_content_types_are_still_evaluated() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini"]})).unwrap();
+    let blocked = r#"{"model":"o3","messages":[{"role":"user","content":"hi"}]}"#;
+    for content_type in [
+        Some("text/plain"),
+        None,
+        Some("text/plain, application/json"),
+        Some("application/x-www-form-urlencoded"),
+        Some(""),
+    ] {
+        let (mut ctx, mut headers) = make_raw_post_ctx(blocked, content_type);
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Model not allowed",
+        );
+    }
+
+    // A sniffed object behind a BOM is claimed, and fails closed as malformed
+    // JSON exactly like a declared-JSON body with a BOM.
+    let (mut ctx, mut headers) =
+        make_raw_post_ctx("\u{feff}\n  {\"model\":\"o3\"}", Some("text/plain"));
+    assert_reject_error(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Request body uninspectable",
+    );
+    assert_eq!(uninspectable_reason(&ctx), Some("malformed_json"));
+
+    // An admitted sniffed body is carried into the final-body pass.
+    let (mut ctx, mut headers) = make_raw_post_ctx(
+        r#"{"model":"gpt-4o-mini","messages":[]}"#,
+        Some("text/plain"),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        ctx.metadata
+            .contains_key(plugin.final_inspection_marker_key())
+    );
+
+    // A sniffed object that is not valid JSON fails closed.
+    let (mut ctx, mut headers) = make_raw_post_ctx("{\"model\": o3", Some("text/plain"));
+    assert_reject_error(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Request body uninspectable",
+    );
+    assert_eq!(uninspectable_reason(&ctx), Some("malformed_json"));
+}
+
+#[tokio::test]
+async fn non_json_bodies_under_non_json_content_types_pass_through() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gpt-4o-mini"]})).unwrap();
+    for raw in ["hello world", "model=o3&prompt=hi", "[\"o3\"]", ""] {
+        let (mut ctx, mut headers) = make_raw_post_ctx(raw, Some("text/plain"));
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            !ctx.metadata
+                .contains_key(plugin.final_inspection_marker_key()),
+            "{raw:?} must not enter the JSON scope"
+        );
+    }
+
+    // A non-UTF-8 sniffed body (no `request_body` view) is not claimed.
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "4".to_string());
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Opaque uploads and compressed non-JSON-labelled bodies are the documented
+    // residual and pass through.
+    let blocked = r#"{"model":"o3"}"#;
+    let (mut ctx, mut headers) =
+        make_raw_post_ctx(blocked, Some("multipart/form-data; boundary=x"));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let (mut ctx, mut headers) = make_raw_post_ctx(blocked, Some("text/plain"));
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata
+            .contains_key(plugin.final_inspection_marker_key())
+    );
+}
+
+#[tokio::test]
+async fn sniffed_json_bodies_are_clamped_on_the_wire() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "clamp"
+    }))
+    .unwrap();
+    let raw = r#"{"model":"m","messages":[],"max_tokens":5000}"#;
+    let (mut ctx, mut headers) = make_raw_post_ctx(raw, Some("text/plain"));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let transformed = plugin
+        .transform_request_body_with_context(&mut ctx, raw.as_bytes(), Some("text/plain"), &headers)
+        .await
+        .expect("an admitted sniffed body must be clamped on the wire");
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["max_tokens"], 100);
+}
+
+// MUSE-5: present-but-unusable required values do not satisfy the policy.
+
+#[tokio::test]
+async fn require_user_field_rejects_null_blank_and_non_string_values() {
+    let plugin = AiRequestGuard::new(&json!({"require_user_field": true})).unwrap();
+    for user in [serde_json::Value::Null, json!(""), json!("   "), json!(42)] {
+        let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "user": user}));
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Missing required field",
+        );
+        assert_eq!(decision(&ctx), (Some("reject"), Some("missing_user")));
+    }
+}
+
+#[tokio::test]
+async fn required_metadata_fields_reject_null_and_blank_values() {
+    let plugin = AiRequestGuard::new(&json!({"required_metadata_fields": ["tenant_id"]})).unwrap();
+    for value in [serde_json::Value::Null, json!(""), json!("  ")] {
+        let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "tenant_id": value}));
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Missing required field",
+        );
+    }
+    for value in [json!("acme"), json!(false), json!(0), json!({"id": 1})] {
+        let mut ctx = make_post_ctx(&json!({"model": "gpt-4", "messages": [], "tenant_id": value}));
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+// MUSE-6: model policy reads the model the request path selects.
+
+async fn before_proxy_at(
+    plugin: &AiRequestGuard,
+    path: &str,
+    body: &serde_json::Value,
+) -> PluginResult {
+    let mut ctx = make_post_ctx(body);
+    ctx.path = path.to_string();
+    let mut headers = make_post_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
+
+#[tokio::test]
+async fn model_policy_reads_gemini_and_vertex_path_models() {
+    let plugin = AiRequestGuard::new(&json!({"allowed_models": ["gemini-2.5-flash"]})).unwrap();
+    let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
+    for path in [
+        "/v1beta/models/gemini-2.5-flash:generateContent",
+        "/gemini/v1/projects/p/locations/us-central1/publishers/google/models/gemini-2.5-flash:streamGenerateContent",
+        "/v1beta/MODELS/Gemini-2.5-Flash:generateContent",
+    ] {
+        assert_continue(before_proxy_at(&plugin, path, &body).await);
+    }
+    for path in [
+        "/v1beta/models/gemini-2.5-pro:generateContent",
+        "/v1beta/tunedModels/custom-1:generateContent",
+    ] {
+        assert_reject_error(
+            before_proxy_at(&plugin, path, &body).await,
+            400,
+            "Model not allowed",
+        );
+    }
+    // No `:{method}` suffix is not a recognized model path.
+    assert_reject_error(
+        before_proxy_at(&plugin, "/v1beta/models/gemini-2.5-flash", &body).await,
+        400,
+        "Missing required model field",
+    );
+    // Body-model routes are unchanged.
+    assert_reject_error(
+        before_proxy_at(&plugin, "/v1/chat/completions", &json!({"messages": []})).await,
+        400,
+        "Missing required model field",
+    );
+
+    // The final-body pass reads the path too.
+    let mut ctx = admitted_final_ctx(&plugin);
+    ctx.path = "/v1beta/models/gemini-2.5-pro:generateContent".to_string();
+    let headers = make_post_headers();
+    let encoded = serde_json::to_vec(&body).unwrap();
+    assert_reject_error(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &encoded)
+            .await,
+        400,
+        "Model not allowed",
+    );
+}
+
+#[tokio::test]
+async fn model_policy_reads_bedrock_and_azure_path_models() {
+    let converse = json!({"messages": [{"role": "user", "content": [{"text": "hi"}]}]});
+    let bedrock = AiRequestGuard::new(&json!({"blocked_models": [
+        "anthropic.claude-3-opus-20240229-v1:0",
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude"
+    ]}))
+    .unwrap();
+    for path in [
+        "/model/anthropic.claude-3-opus-20240229-v1:0/converse",
+        "/bedrock/model/anthropic.claude-3-opus-20240229-v1:0/invoke-with-response-stream",
+        "/model/arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude/converse-stream",
+    ] {
+        assert_reject_error(
+            before_proxy_at(&bedrock, path, &converse).await,
+            400,
+            "Model not allowed",
+        );
+    }
+    assert_continue(
+        before_proxy_at(
+            &bedrock,
+            "/model/anthropic.claude-3-haiku-20240307-v1:0/converse",
+            &converse,
+        )
+        .await,
+    );
+
+    let azure = AiRequestGuard::new(&json!({"allowed_models": ["gpt4o-prod"]})).unwrap();
+    let chat = json!({"messages": [{"role": "user", "content": "hi"}]});
+    assert_continue(
+        before_proxy_at(
+            &azure,
+            "/openai/deployments/gpt4o-prod/chat/completions?api-version=2024-10-21",
+            &chat,
+        )
+        .await,
+    );
+    assert_reject_error(
+        before_proxy_at(
+            &azure,
+            "/openai/deployments/o3-prod/chat/completions",
+            &chat,
+        )
+        .await,
+        400,
+        "Model not allowed",
+    );
+    // Body and path must both satisfy policy: neither overrides the other.
+    assert_reject_error(
+        before_proxy_at(
+            &azure,
+            "/openai/deployments/o3-prod/chat/completions",
+            &json!({"model": "gpt4o-prod", "messages": []}),
+        )
+        .await,
+        400,
+        "Model not allowed",
+    );
+    assert_reject_error(
+        before_proxy_at(
+            &azure,
+            "/openai/deployments/gpt4o-prod/chat/completions",
+            &json!({"model": "o3-prod", "messages": []}),
+        )
+        .await,
+        400,
+        "Model not allowed",
+    );
+}
+
+// MUSE-7: fixed-cardinality decision metadata.
+
+#[tokio::test]
+async fn rejections_and_rewrites_publish_decision_metadata() {
+    let user = json!([{"role": "user", "content": "hello"}]);
+    let cases = [
+        (
+            json!({"blocked_models": ["o3"]}),
+            json!({"model": "o3", "messages": user}),
+            "model_blocked",
+        ),
+        (
+            json!({"allowed_models": ["gpt-4"]}),
+            json!({"model": "o3", "messages": user}),
+            "model_not_allowed",
+        ),
+        (
+            json!({"allowed_models": ["gpt-4"]}),
+            json!({"messages": user}),
+            "missing_model",
+        ),
+        (
+            json!({"max_tokens_limit": 10}),
+            json!({"messages": user, "max_tokens": 11}),
+            "max_tokens_exceeded",
+        ),
+        (
+            json!({"max_messages": 0}),
+            json!({"messages": user}),
+            "too_many_messages",
+        ),
+        (
+            json!({"max_prompt_characters": 1}),
+            json!({"messages": user}),
+            "prompt_too_long",
+        ),
+        (
+            json!({"temperature_range": [0.0, 1.0]}),
+            json!({"messages": user, "temperature": 2.0}),
+            "temperature_out_of_range",
+        ),
+        (
+            json!({"block_system_prompts": true}),
+            json!({"messages": [{"role": "system", "content": "x"}]}),
+            "system_prompt",
+        ),
+        (
+            json!({"strict_schema": true}),
+            json!({"not_an_ai_request": true}),
+            "unsupported_schema",
+        ),
+    ];
+    for (config, body, reason) in cases {
+        let plugin = AiRequestGuard::new(&config).unwrap();
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+        assert_eq!(decision(&ctx), (Some("reject"), Some(reason)), "{config}");
+
+        let mut final_ctx = admitted_final_ctx(&plugin);
+        let encoded = serde_json::to_vec(&body).unwrap();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut final_ctx, &headers, &encoded)
+                .await,
+            Some(400),
+        );
+        assert_eq!(
+            decision(&final_ctx),
+            (Some("reject"), Some(reason)),
+            "final {config}"
+        );
+    }
+
+    let both = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 100,
+        "enforce_max_tokens": "clamp",
+        "default_max_tokens": 50
+    }))
+    .unwrap();
+    let mut ctx = make_post_ctx(&json!({
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "max_tokens": 5000
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(both.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        decision(&ctx),
+        (
+            Some("modify"),
+            Some("max_tokens_clamped_and_default_injected")
+        )
+    );
+
+    // A request that passes unmodified carries no decision keys.
+    let mut ctx = make_post_ctx(&json!({
+        "model": "gpt-4",
+        "messages": user,
+        "max_tokens": 10
+    }));
+    let mut headers = make_post_headers();
+    assert_continue(both.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(decision(&ctx), (None, None));
+}
+
+// MUSE-8: completion-count multipliers are governable.
+
+#[tokio::test]
+async fn max_choices_bounds_every_completion_multiplier() {
+    let plugin = AiRequestGuard::new(&json!({"max_choices": 2})).unwrap();
+    assert!(plugin.requires_request_body_before_before_proxy());
+    let user = json!([{"role": "user", "content": "hi"}]);
+    for extra in [
+        json!({"n": 4}),
+        json!({"best_of": 3}),
+        json!({"num_generations": 5}),
+        json!({"n": "3"}),
+        json!({"generationConfig": {"candidateCount": 3}}),
+        json!({"generation_config": {"candidate_count": 3}}),
+        json!({"parameters": {"best_of": 3}}),
+    ] {
+        let mut body = json!({"model": "m", "messages": user});
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Too many completions requested",
+        );
+        assert_eq!(
+            decision(&ctx),
+            (Some("reject"), Some("max_choices_exceeded"))
+        );
+    }
+    for n in [json!("two"), json!(-1), json!(1.5)] {
+        let mut ctx = make_post_ctx(&json!({"model": "m", "messages": user, "n": n}));
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Invalid completion count field",
+        );
+    }
+    for body in [
+        json!({"model": "m", "messages": user}),
+        json!({"model": "m", "messages": user, "n": 2}),
+        json!({"model": "m", "messages": user, "n": null}),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+
+    assert!(AiRequestGuard::new(&json!({"max_choices": "2"})).is_err());
+    assert!(AiRequestGuard::new(&json!({"max_choices": -1})).is_err());
+}
+
+#[test]
+fn review_config_additions_agree_with_the_published_component() {
+    let validator = openapi_config_validator();
+    for config in [
+        json!({"max_choices": 4}),
+        json!({"supported_schema": "bedrock_converse", "default_max_tokens": 256}),
+    ] {
+        assert!(AiRequestGuard::new(&config).is_ok(), "{config}");
+        assert!(validator.is_valid(&config), "{config}");
+    }
+    let refused = json!({"supported_schema": "bedrock", "max_messages": 1});
+    assert!(AiRequestGuard::new(&refused).is_err());
+    assert!(!validator.is_valid(&refused));
+}
+
+// ─── PR #6849 review round 1 ────────────────────────────────────────────
+
+/// PR6849-SOL-1: a ProtoJSON parser maps both spellings onto one proto field
+/// and clears it on a trailing `null`, so a `null` alias beside a numeric cap
+/// is ambiguous and must be refused rather than read as "absent".
+#[tokio::test]
+async fn null_protojson_alias_beside_a_cap_is_rejected_as_ambiguous() {
+    let plugin = AiRequestGuard::new(&json!({
+        "max_tokens_limit": 128,
+        "default_max_tokens": 128,
+        "supported_schema": "provider_native",
+        "strict_schema": true
+    }))
+    .unwrap();
+    let contents = r#""contents":[{"role":"user","parts":[{"text":"Write a long article"}]}]"#;
+    for config in [
+        r#""generationConfig":{"maxOutputTokens":128,"max_output_tokens":null}"#,
+        r#""generationConfig":{"max_output_tokens":null,"maxOutputTokens":128}"#,
+        r#""generation_config":{"max_output_tokens":128,"maxOutputTokens":null}"#,
+        r#""generation_config":{"maxOutputTokens":null,"max_output_tokens":128}"#,
+        r#""generationConfig":{"maxOutputTokens":128},"generation_config":null"#,
+        r#""generation_config":null,"generationConfig":{"maxOutputTokens":128}"#,
+        r#""generation_config":{"max_output_tokens":128},"generationConfig":null"#,
+    ] {
+        let raw = format!("{{{contents},{config}}}");
+        let (mut ctx, mut headers) = make_raw_post_ctx(&raw, Some("application/json"));
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Conflicting field spellings",
+        );
+        assert_eq!(decision(&ctx), (Some("reject"), Some("conflicting_fields")));
+
+        // A later transform that introduces the null alias is refused too.
+        let mut final_ctx = admitted_final_ctx(&plugin);
+        assert_reject_error(
+            plugin
+                .on_final_request_body_with_context(&mut final_ctx, &headers, raw.as_bytes())
+                .await,
+            400,
+            "Conflicting field spellings",
+        );
+    }
+
+    // The same request with one spelling is admitted with the cap intact.
+    let clean = format!("{{{contents},\"generationConfig\":{{\"maxOutputTokens\":128}}}}");
+    let (mut ctx, mut headers) = make_raw_post_ctx(&clean, Some("application/json"));
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let mut final_ctx = admitted_final_ctx(&plugin);
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut final_ctx, &headers, clean.as_bytes())
+            .await,
+    );
+
+    // A null completion-count alias is ambiguous in the same way.
+    let choices = AiRequestGuard::new(&json!({"max_choices": 4})).unwrap();
+    let raw = format!(
+        "{{{contents},\"generationConfig\":{{\"candidateCount\":1,\"candidate_count\":null}}}}"
+    );
+    let (mut ctx, mut headers) = make_raw_post_ctx(&raw, Some("application/json"));
+    assert_reject_error(
+        choices.before_proxy(&mut ctx, &mut headers).await,
+        400,
+        "Conflicting field spellings",
+    );
+}
+
+/// A single `null` spelling is not ambiguous: it is "unset", and the default
+/// cap replaces it under the client's own spelling (never beside it).
+#[tokio::test]
+async fn single_null_cap_spelling_is_replaced_in_place_by_the_default() {
+    let plugin = AiRequestGuard::new(&json!({"default_max_tokens": 128})).unwrap();
+    let body = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"max_output_tokens":null}}"#;
+    let transformed = transform_post_json(&plugin, body)
+        .await
+        .expect("a null cap is replaced by the default");
+    let transformed: serde_json::Value = serde_json::from_slice(&transformed).unwrap();
+    assert_eq!(transformed["generationConfig"]["max_output_tokens"], 128);
+    assert!(
+        transformed["generationConfig"]
+            .get("maxOutputTokens")
+            .is_none(),
+        "injecting the other spelling would make the null alias ambiguous"
+    );
+}
+
+/// PR6849-SOL-2: `max_choices: 0` refuses every request, including one that
+/// relies on the provider's implicit single completion.
+#[tokio::test]
+async fn zero_max_choices_refuses_implicit_and_explicit_single_completions() {
+    let plugin = AiRequestGuard::new(&json!({"max_choices": 0})).unwrap();
+    let user = json!([{"role": "user", "content": "hi"}]);
+    for body in [
+        json!({"model": "m", "messages": user}),
+        json!({"model": "m", "messages": user, "n": null}),
+        json!({"model": "m", "messages": user, "n": 0}),
+        json!({"model": "m", "messages": user, "n": 1}),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_reject_error(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            400,
+            "Too many completions requested",
+        );
+
+        let mut final_ctx = admitted_final_ctx(&plugin);
+        let encoded = serde_json::to_vec(&body).unwrap();
+        assert_reject_error(
+            plugin
+                .on_final_request_body_with_context(&mut final_ctx, &headers, &encoded)
+                .await,
+            400,
+            "Too many completions requested",
+        );
+    }
+
+    // `max_choices: 1` admits the implicit and explicit single completion.
+    let one = AiRequestGuard::new(&json!({"max_choices": 1})).unwrap();
+    for body in [
+        json!({"model": "m", "messages": user}),
+        json!({"model": "m", "messages": user, "n": 1}),
+    ] {
+        let mut ctx = make_post_ctx(&body);
+        let mut headers = make_post_headers();
+        assert_continue(one.before_proxy(&mut ctx, &mut headers).await);
     }
 }

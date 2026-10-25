@@ -1,10 +1,12 @@
 use super::plugin_utils::create_test_proxy;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
+    finalize_plugin_rejection_parts_for_test, finalize_synthetic_response_for_test,
     install_pending_buffered_response_capacity_refusal_for_test,
     refine_stream_response_for_content_type_for_test, retry_response_decision_context_for_test,
     stamp_original_response_metadata_for_test,
     take_buffered_response_capacity_refusal_pending_for_test,
+    transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::sse::{
     LAST_EVENT_ID_METADATA_KEY, MAX_LAST_EVENT_ID_BYTES, SsePlugin, redact_sse_log_metadata,
@@ -12,7 +14,10 @@ use ferrum_edge::plugins::sse::{
 use ferrum_edge::plugins::utils::metadata_redaction::{
     REDACTED_PLACEHOLDER, is_sensitive_metadata_key_with_extras, serialize_redacted_metadata,
 };
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector, priority,
+};
 use ferrum_edge::proxy::headers::{
     apply_response_headers, strip_client_response_hop_by_hop_headers,
 };
@@ -1894,5 +1899,466 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         for withheld in ["UNREGISTERED_TRAFFIC_TOKEN", "918273641", "true", "false"] {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
+    }
+}
+
+// ── Plugin review fixes: admission fence, synthetic wrap, force consistency ───
+
+/// sse-SOL-2: the GET-only and Accept checks are route admission policy. The
+/// client selects the native-gRPC or WebSocket view by its own headers and
+/// those views omit this HTTP-only instance, so the instance must declare the
+/// bit the gateway's flavor fence refuses on.
+#[test]
+fn test_request_checks_gate_route_admission() {
+    for config in [
+        json!({}),
+        json!({"require_get_method": true, "require_accept_header": false}),
+        json!({"require_get_method": false, "require_accept_header": true}),
+    ] {
+        let plugin = make_plugin(config.clone());
+        assert!(plugin.gates_request_admission(), "{config}");
+    }
+    let permissive = make_plugin(json!({
+        "require_get_method": false,
+        "require_accept_header": false
+    }));
+    assert!(
+        !permissive.gates_request_admission(),
+        "an instance that refuses nothing is not admission policy"
+    );
+}
+
+/// sse-SOL-1: without `after_proxy`'s decision nothing published the
+/// `text/event-stream` label, so the context-aware transform must not frame
+/// the body under the producer's own media type.
+#[tokio::test]
+async fn test_context_transform_does_not_wrap_without_after_proxy_decision() {
+    let plugin = make_plugin(json!({"wrap_non_sse_responses": true, "retry_ms": 2500}));
+    let mut ctx = make_sse_ctx();
+    let headers = json_response_headers();
+    let body = br#"{"message":"hello"}"#;
+
+    let wrapped = plugin
+        .transform_response_body_with_context(&mut ctx, body, Some("application/json"), &headers)
+        .await;
+    assert!(
+        wrapped.is_none(),
+        "no header phase selected wrapping, so the body must stay unframed"
+    );
+}
+
+/// sse-SOL-1: a synthetic 200 (a `response_mock` reply, a serverless terminate
+/// reply) runs body transforms through the shared finalizer but skips this
+/// plugin's `after_proxy`. The client must never receive SSE-framed bytes
+/// under the producer's `application/json` label, with one wrapper or two.
+#[tokio::test]
+async fn test_synthetic_response_is_not_framed_under_its_own_media_type() {
+    let config = json!({"wrap_non_sse_responses": true, "retry_ms": 2500});
+    let one: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(config.clone()))];
+    let two: Vec<Arc<dyn Plugin>> = vec![
+        Arc::new(make_plugin(config.clone())),
+        Arc::new(make_plugin(config)),
+    ];
+    for plugins in [one, two] {
+        let original: &[u8] = br#"{"message":"hello"}"#;
+        let mut ctx = make_sse_ctx();
+        let mut status = 200u16;
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), original.len().to_string()),
+        ]);
+        let mut body = Bytes::from_static(br#"{"message":"hello"}"#);
+
+        finalize_synthetic_response_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+        )
+        .await;
+
+        assert_eq!(status, 200, "instances={}", plugins.len());
+        assert_eq!(
+            content_type_of(&headers),
+            Some("application/json"),
+            "instances={}",
+            plugins.len()
+        );
+        assert_eq!(&body[..], original, "instances={}", plugins.len());
+    }
+}
+
+/// sse-claude-2: forcing declines the same partial-content and content-coded
+/// representations whether or not wrapping is configured, so toggling the
+/// wrapper never changes what forcing does.
+#[tokio::test]
+async fn test_force_only_does_not_relabel_partial_content() {
+    for config in [
+        json!({"force_sse_content_type": true}),
+        json!({"force_sse_content_type": true, "wrap_non_sse_responses": true}),
+    ] {
+        let plugin = make_plugin(config.clone());
+        for status in [206, 226] {
+            let mut ctx = make_sse_ctx();
+            let mut headers = json_response_headers();
+            headers.insert("content-range".to_string(), "bytes 0-41/100".to_string());
+
+            let result = plugin.after_proxy(&mut ctx, status, &mut headers).await;
+            assert_continue(&result);
+            assert_eq!(
+                content_type_of(&headers),
+                Some("application/json"),
+                "{config} status={status}"
+            );
+            assert_eq!(
+                headers.get("content-length").map(String::as_str),
+                Some("42"),
+                "{config} status={status}"
+            );
+            assert!(!headers.contains_key("cache-control"), "{config} {status}");
+            assert!(!ctx.metadata.contains_key("sse:relabeled_non_sse"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_force_only_does_not_relabel_content_coded_body() {
+    for config in [
+        json!({"force_sse_content_type": true}),
+        json!({"force_sse_content_type": true, "wrap_non_sse_responses": true}),
+    ] {
+        let plugin = make_plugin(config.clone());
+        for coding in ["gzip", "br"] {
+            let (mut ctx, mut headers) =
+                stamped_origin_with("application/json", "content-encoding", coding);
+
+            let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+            assert_continue(&result);
+            assert_eq!(
+                content_type_of(&headers),
+                Some("application/json"),
+                "{config} coding={coding}"
+            );
+            assert!(!ctx.metadata.contains_key("sse:relabeled_non_sse"));
+        }
+    }
+}
+
+/// Forcing a complete identity-coded 200 is unchanged by the decline above.
+#[tokio::test]
+async fn test_force_only_still_relabels_identity_coded_full_response() {
+    let plugin = make_plugin(json!({"force_sse_content_type": true}));
+    let (mut ctx, mut headers) =
+        stamped_origin_with("application/json", "content-encoding", "identity");
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert_continue(&result);
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+}
+
+/// sse-claude-3: only the `Last-Event-ID` request header is honored. A cursor
+/// a polyfill sends as a query parameter stays in the query string and is not
+/// promoted to a backend header.
+#[tokio::test]
+async fn test_query_parameter_cursor_is_not_promoted_to_header() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_sse_ctx();
+    ctx.query_params
+        .insert("lastEventId".to_string(), "42".to_string());
+    ctx.query_params
+        .insert("last-event-id".to_string(), "42".to_string());
+
+    assert_continue(&plugin.on_request_received(&mut ctx).await);
+    assert!(!ctx.metadata.contains_key(LAST_EVENT_ID_METADATA_KEY));
+
+    let mut headers = HashMap::new();
+    assert_continue(&plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!headers.contains_key("last-event-id"));
+}
+
+// ── Fix round 1: stale wrap decisions and genuine-stream retry ────────────────
+
+const GUARD_REJECTION_BODY: &[u8] = br#"{"error":"response rejected by policy"}"#;
+
+/// Run the normal header phase over a complete JSON 200, then replace the
+/// response with a gateway JSON rejection exactly as an `on_response_body`
+/// rejection does. Returns the rejection the client would receive.
+async fn wrap_selected_then_rejected(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+) -> (u16, Bytes, HashMap<String, String>) {
+    let mut headers = json_response_headers();
+    stamp_original_response_metadata_for_test(ctx, 200, &headers);
+    for plugin in plugins {
+        assert_continue(&plugin.after_proxy(ctx, 200, &mut headers).await);
+    }
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+    assert_eq!(
+        ctx.metadata.get("sse:wrap_non_sse").map(String::as_str),
+        Some("1")
+    );
+
+    let (status, body, headers) = finalize_plugin_rejection_parts_for_test(
+        plugins,
+        ctx,
+        502,
+        Bytes::from_static(GUARD_REJECTION_BODY),
+        HashMap::new(),
+    )
+    .await;
+    assert_eq!(content_type_of(&headers), Some("application/json"));
+    (status, body, headers)
+}
+
+/// PR6831-SOL-1: a wrap decision belongs to the response `after_proxy` saw.
+/// Once gateway policy replaced that response, the transform must not frame
+/// the replacement's JSON error.
+#[tokio::test]
+async fn test_wrap_decision_is_dropped_when_the_response_is_replaced() {
+    let plugin: Arc<dyn Plugin> = Arc::new(make_plugin(json!({"wrap_non_sse_responses": true})));
+    let plugins = vec![Arc::clone(&plugin)];
+    let mut ctx = make_sse_ctx();
+    let (_, body, headers) = wrap_selected_then_rejected(&plugins, &mut ctx).await;
+
+    let wrapped = plugin
+        .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &headers)
+        .await;
+    assert!(wrapped.is_none(), "the replacement must not be framed");
+    assert!(
+        !ctx.metadata.contains_key("sse:wrap_non_sse"),
+        "the stale decision is consumed so no later instance can use it"
+    );
+}
+
+/// PR6831-SOL-1 through the shared buffered transform phase, with one and two
+/// wrapping instances: the client receives the rejection as valid JSON.
+#[tokio::test]
+async fn test_replaced_response_stays_valid_json_through_the_transform_phase() {
+    let config = json!({"wrap_non_sse_responses": true, "retry_ms": 2500});
+    for instances in [1usize, 2] {
+        let plugins: Vec<Arc<dyn Plugin>> = (0..instances)
+            .map(|_| Arc::new(make_plugin(config.clone())) as Arc<dyn Plugin>)
+            .collect();
+        let mut ctx = make_sse_ctx();
+        let (mut status, mut body, mut headers) =
+            wrap_selected_then_rejected(&plugins, &mut ctx).await;
+
+        transform_buffered_response_body_with_deadline_full_for_test(
+            &plugins,
+            &mut ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            None,
+            true,
+        )
+        .await;
+
+        assert_eq!(status, 502, "instances={instances}");
+        assert_eq!(
+            content_type_of(&headers),
+            Some("application/json"),
+            "instances={instances}"
+        );
+        assert_eq!(&body[..], GUARD_REJECTION_BODY, "instances={instances}");
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .unwrap_or_else(|error| panic!("instances={instances}: invalid JSON: {error}"));
+    }
+}
+
+fn forwarded(action: ResponseStreamAction) -> Vec<u8> {
+    match action {
+        ResponseStreamAction::Forward(bytes) => bytes.to_vec(),
+        other => panic!("expected Forward, got {other:?}"),
+    }
+}
+
+/// A genuine origin event stream after the normal header phase, plus the
+/// inspector this plugin attaches to it.
+async fn genuine_stream_inspector(
+    config: serde_json::Value,
+) -> Option<Box<dyn ResponseStreamInspector>> {
+    let plugin = make_plugin(config);
+    let (mut ctx, mut headers) = stamped_origin("text/event-stream");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    plugin.response_stream_inspector(&ctx, 200, content_type_of(&headers))
+}
+
+#[test]
+fn test_only_retry_configured_instances_request_stream_hooks() {
+    assert!(make_plugin(json!({"retry_ms": 2500})).requires_response_stream_hooks());
+    assert!(!make_plugin(json!({})).requires_response_stream_hooks());
+    assert!(!make_plugin(json!({"wrap_non_sse_responses": true})).requires_response_stream_hooks());
+}
+
+/// PR6831-SOL-2: `retry:` is written once, ahead of the first backend bytes,
+/// as its own line (no blank line, so no event dispatch), and every later
+/// chunk passes through unchanged.
+#[tokio::test]
+async fn test_retry_field_is_written_once_at_the_start_of_a_genuine_stream() {
+    let mut inspector = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("a genuine event stream gets the retry inspector");
+
+    let first = forwarded(inspector.on_chunk(b"id: 7\ndata: a\n\n").await);
+    assert_eq!(first, b"retry: 2500\nid: 7\ndata: a\n\n");
+    let second = forwarded(inspector.on_chunk(b"data: b\n\n").await);
+    assert_eq!(second, b"data: b\n\n");
+    let end = forwarded(inspector.on_end().await);
+    assert!(end.is_empty(), "nothing is held at the end");
+}
+
+/// A backend BOM split across chunks is held, then dropped, so the decoded
+/// stream still starts with the field rather than a BOM-prefixed field name.
+#[tokio::test]
+async fn test_retry_field_is_written_ahead_of_a_split_backend_bom() {
+    let mut inspector = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("inspector");
+
+    let held = forwarded(inspector.on_chunk(&[0xEF]).await);
+    assert!(held.is_empty(), "a possible BOM prefix is held");
+    let released = forwarded(inspector.on_chunk(b"\xBB\xBFdata: a\n\n").await);
+    assert_eq!(released, b"retry: 2500\ndata: a\n\n");
+}
+
+/// Bytes that only looked like a BOM start are released unchanged after the
+/// field, and a stream that ends before any byte still carries the field.
+#[tokio::test]
+async fn test_retry_field_releases_non_bom_bytes_and_empty_streams() {
+    let mut inspector = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("inspector");
+    assert!(forwarded(inspector.on_chunk(&[0xEF]).await).is_empty());
+    let released = forwarded(inspector.on_chunk(b"x").await);
+    assert_eq!(released, b"retry: 2500\n\xEFx");
+
+    let mut empty = genuine_stream_inspector(json!({"retry_ms": 2500}))
+        .await
+        .expect("inspector");
+    assert_eq!(forwarded(empty.on_end().await), b"retry: 2500\n");
+}
+
+/// The inspector attaches only to a 2xx genuine origin event stream on an
+/// instance that configured `retry_ms`.
+#[tokio::test]
+async fn test_retry_inspector_declines_non_genuine_streams() {
+    assert!(genuine_stream_inspector(json!({})).await.is_none());
+
+    let plugin = make_plugin(json!({"retry_ms": 2500, "force_sse_content_type": true}));
+    let (mut ctx, mut headers) = stamped_origin("application/json");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert_eq!(content_type_of(&headers), Some("text/event-stream"));
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, content_type_of(&headers))
+            .is_none(),
+        "a relabelled non-SSE response is not the origin's event stream"
+    );
+
+    let plugin = make_plugin(json!({"retry_ms": 2500}));
+    let unstamped = make_sse_ctx();
+    assert!(
+        plugin
+            .response_stream_inspector(&unstamped, 200, Some("text/event-stream"))
+            .is_none(),
+        "a gateway-authored stream has no origin stamp"
+    );
+
+    let (ctx, _) = stamped_origin("text/event-stream");
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 503, Some("text/event-stream"))
+            .is_none()
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("text/plain"))
+            .is_none()
+    );
+}
+
+// ── Fix round 2: retry injection never touches coded or protected streams ─────
+
+/// PR6831-SOL-3: a genuine event stream the backend sent under gzip/br is a
+/// compressed bitstream. Plaintext `retry:` written ahead of it would break the
+/// client's decoder, so no inspector attaches (directly or through the shared
+/// resolver every transport uses) and the bytes are forwarded unchanged.
+#[tokio::test]
+async fn test_retry_inspector_never_attaches_to_content_coded_streams() {
+    let plugin = Arc::new(make_plugin(json!({
+        "retry_ms": 2500,
+        "strip_accept_encoding": false
+    })));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    for coding in ["gzip", "br", "gzip, br"] {
+        let (mut ctx, mut headers) =
+            stamped_origin_with("text/event-stream", "content-encoding", coding);
+        assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+        assert_eq!(
+            headers.get("content-encoding").map(String::as_str),
+            Some(coding),
+            "the coding is preserved: {coding}"
+        );
+        let content_type = content_type_of(&headers);
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, 200, content_type)
+                .is_none(),
+            "no direct inspector for {coding}"
+        );
+        assert!(
+            ferrum_edge::plugins::create_response_stream_inspector(
+                &plugins,
+                &mut ctx,
+                200,
+                content_type,
+            )
+            .is_none(),
+            "the shared resolver must not attach one either: {coding}"
+        );
+    }
+}
+
+/// An explicit `identity` coding is not a transformation, so the field is
+/// still written.
+#[tokio::test]
+async fn test_retry_inspector_still_attaches_to_identity_coded_streams() {
+    let plugin = make_plugin(json!({"retry_ms": 2500}));
+    let (mut ctx, mut headers) =
+        stamped_origin_with("text/event-stream", "content-encoding", "identity");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, content_type_of(&headers))
+        .expect("identity bytes are the text an EventSource parses");
+    let first = forwarded(inspector.on_chunk(b"data: a\n\n").await);
+    assert_eq!(first, b"retry: 2500\ndata: a\n\n");
+}
+
+/// The other representation boundaries the wrapper honors apply to the
+/// stream field too: `no-transform` forbids adding content, and a `206`/`226`
+/// body is not the start of an event stream.
+#[tokio::test]
+async fn test_retry_inspector_respects_no_transform_and_partial_content() {
+    let plugin = make_plugin(json!({"retry_ms": 2500}));
+    let (mut ctx, mut headers) =
+        stamped_origin_with("text/event-stream", "cache-control", "no-transform");
+    assert_continue(&plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, content_type_of(&headers))
+            .is_none(),
+        "no-transform forbids the added field"
+    );
+
+    for status in [206, 226] {
+        let (ctx, _) = stamped_origin("text/event-stream");
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, status, Some("text/event-stream"))
+                .is_none(),
+            "status {status}"
+        );
     }
 }

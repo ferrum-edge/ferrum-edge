@@ -443,7 +443,7 @@ fn grpc_web_text_scanner_stops_counting_at_malformed_base64() {
 #[tokio::test]
 async fn complete_grpc_message_count_uses_fetch_max_not_additive_retry() {
     use ferrum_edge::plugins::mesh::prometheus_helpers::{
-        metadata_observes_grpc_messages, record_complete_grpc_message_count,
+        record_complete_grpc_message_count, request_observes_grpc_messages,
     };
 
     let prometheus = PrometheusMetrics::new(&serde_json::Value::Null, "default")
@@ -453,17 +453,18 @@ async fn complete_grpc_message_count_uses_fetch_max_not_additive_retry() {
         .metadata
         .insert("request_protocol".into(), "grpc".into());
     assert!(
-        !metadata_observes_grpc_messages(&request.metadata),
+        !request_observes_grpc_messages(&request),
         "protocol alone must not enable scanners without prometheus_metrics observation"
     );
     assert!(matches!(
         prometheus.on_request_received(&mut request).await,
         PluginResult::Continue
     ));
-    let mut metadata = request.metadata;
-    assert!(metadata_observes_grpc_messages(&metadata));
-    metadata.insert("request_protocol".into(), "http".into());
-    assert!(!metadata_observes_grpc_messages(&metadata));
+    assert!(request_observes_grpc_messages(&request));
+    request
+        .metadata
+        .insert("request_protocol".into(), "http".into());
+    assert!(!request_observes_grpc_messages(&request));
 
     let counter = Arc::new(AtomicU64::new(0));
     let body = [0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 2, 3]; // two messages

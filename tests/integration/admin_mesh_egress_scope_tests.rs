@@ -413,3 +413,49 @@ async fn mesh_egress_scope_test_endpoint_rejects_bad_request_bodies() {
         .unwrap();
     assert_eq!(response.status().as_u16(), 400);
 }
+
+#[tokio::test]
+async fn mesh_egress_scope_test_endpoint_denies_malformed_embedded_ports() {
+    let tc = TestConfig::default();
+    let token = generate_test_token(&tc);
+    let state = admin_state(create_test_jwt_manager(&tc));
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let client = reqwest::Client::new();
+
+    // An embedded port uses the data-plane grammar (decimal 1-65535). Anything
+    // else stays part of the host, which is then judged (denied) as written,
+    // even when an explicit `port` is also supplied.
+    for body in [
+        json!({"host": "reviews.alpha.svc.cluster.local:0"}),
+        json!({"host": "reviews.alpha.svc.cluster.local:0", "port": 8080}),
+        json!({"host": "reviews.alpha.svc.cluster.local:+8080"}),
+    ] {
+        let response = client
+            .post(format!("{base_url}/mesh/egress-scope/test"))
+            .header("authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200, "{body}");
+        let decision: Value = response.json().await.unwrap();
+        assert_eq!(decision["allowed"], false, "{body}");
+        assert_eq!(decision["decision"], "deny", "{body}");
+        assert_eq!(decision["host"], body["host"], "{body}");
+    }
+
+    // A well-formed embedded port is split off and admitted like `port`.
+    let admitted: Value = client
+        .post(format!("{base_url}/mesh/egress-scope/test"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({"host": "reviews.alpha.svc.cluster.local:08080"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(admitted["allowed"], true);
+    assert_eq!(admitted["host"], "reviews.alpha.svc.cluster.local");
+    assert_eq!(admitted["port"], 8080);
+}
