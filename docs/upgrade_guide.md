@@ -28,6 +28,25 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `a2a_gateway` rewrites GRPC and HTTP+JSON card interfaces (PR #6841)
+
+With `discovery.rewrite_agent_card_urls` enabled (the default), Agent Cards now
+advertise the gateway for every transport it fronts. `GRPC` interface URLs
+(and a `GRPC`-preferred top-level `url`) become `discovery.public_base_url` (or
+the admitted forwarded origin), and `HTTP+JSON` / `REST` URLs become that base
+plus `endpoint.path`, alongside the JSON-RPC URLs that were already rewritten.
+Card signatures are dropped whenever a URL changes, so cards that were
+previously forwarded still signed because only GRPC/REST interfaces differed
+are now re-served unsigned. Make sure your gateway listener serves gRPC and
+the REST binding at those addresses. Interfaces on any other transport are
+unchanged. To publish backend cards exactly as written, set
+`discovery.rewrite_agent_card_urls: false`.
+
+The same release also refuses a JSON-RPC request whose final backend-visible
+body changes Agent Card or streaming class after `a2a_gateway` admitted it (for
+example a `request_transformer` rule that rewrites `method`). A body rewrite
+that keeps the operation within one class is still admitted.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

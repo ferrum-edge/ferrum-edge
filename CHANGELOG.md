@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `a2a_gateway` rewrites GRPC and HTTP+JSON Agent Card interfaces
+  to the gateway** (issue/PR #6841). With `discovery.rewrite_agent_card_urls`
+  on, every advertised interface on a transport the gateway fronts now points
+  at the gateway: `JSONRPC` (or no transport) and `HTTP+JSON` / `REST` URLs
+  become the public base plus `endpoint.path`, `GRPC` URLs become the public
+  base, and the top-level `url` follows `preferredTransport` the same way, on
+  both the HTTP JSON and unary gRPC card paths. GRPC and HTTP+JSON URLs were
+  previously preserved, publishing the agent's direct addresses. Interfaces on
+  any other transport keep the backend URL; signatures are dropped on mutation
+  as before.
+- **`a2a_gateway` per-consumer method grants** (PR #6841).
+  `policy.methods.<name>` `allow` entries accept `allowed_groups` /
+  `denied_groups`, matched against the gateway-mapped Consumer's `acl_groups`
+  (no Consumer is never granted), decided in `before_proxy` on every binding
+  and re-decided on the final JSON-RPC body. An ungranted method is refused
+  like a `deny` rule.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +155,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`a2a_gateway` refuses a final request body that changes operation class**
+  (PR #6841). A later body transform that turned an admitted JSON-RPC request
+  into an Agent Card (or changed its streaming class) was dispatched under the
+  arrival-time response handling, so a card could be served with the backend's
+  internal URLs. Such a body is now refused with JSON-RPC `-32001` and
+  `a2a.error: operation_class_changed`; a same-class change refreshes
+  `a2a.method`. The final-body hook no longer runs where it cannot change an
+  outcome and skips re-parsing a body byte-identical to the one classified at
+  arrival.
+- **`a2a_gateway` bounds SSE semantic metadata when it is retained** (PR
+  #6841). Task ids, context ids, and task states observed on a long-lived SSE
+  stream are reduced to `observability.max_payload_size` (and the normalized
+  state) as each event completes, instead of being held at full event size
+  until the stream ends. Published values are unchanged.
+- **`a2a_gateway` derives the forwarded-origin scheme from the connection's
+  security** (PR #6841). With no `X-Forwarded-Proto`, the scheme is `https`
+  exactly when the client connection is TLS (or HTTP/3), not when the client
+  sent SNI, so SNI-less HTTPS clients are no longer handed (or refused) an
+  `http://` origin.
+- **`A2aGatewayConfig` OpenAPI rejects `discovery.public_base_url: null` as a
+  public-origin choice** (PR #6841), matching the constructor.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
@@ -361,6 +398,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`a2a_gateway` no longer forwards encoded or partial HTTP Agent Cards
+  un-rewritten** (PR #6841). A `gzip`/`br` card (which a backend may send
+  whatever `detection.strip_accept_encoding` negotiated) or a `206`/`226` card
+  slice failed to parse and passed through with the backend's internal URLs.
+  Such responses are now claimed by the shared buffered-response
+  representation gate: a supported coding is decoded and the card rewritten,
+  and anything uninspectable fails closed with `502`.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their
