@@ -59,13 +59,14 @@ use crate::modes::mesh::config::{
     bracketed_mesh_attribute_name, normalize_mesh_condition_values,
     normalize_request_match_host_pattern, policy_scope_applies_to_workload,
     policy_scope_applies_with_waypoint, policy_target_attachment_applies_to_service,
-    resolve_target_port, validate_mesh_condition, workload_selector_matches,
+    resolve_target_port, validate_mesh_condition, validate_mesh_policy_request_matchers,
+    workload_selector_matches,
 };
 use crate::modes::mesh::hbone::{BAGGAGE_HEADER, HboneIdentity};
 use crate::modes::mesh::policy::{
     MeshAuthzAttribute, MeshAuthzCustomDelegation, MeshAuthzDecision, MeshAuthzEvaluation,
     MeshAuthzProtocol, MeshAuthzRequest, evaluate_mesh_authorization_full,
-    evaluate_mesh_authorization_policies, istio_source_principal, mesh_policies_have_header_rules,
+    evaluate_mesh_authorization_policies, istio_source_principal, mesh_policies_header_rule_names,
     normalize_mesh_policy_header_names,
 };
 use crate::modes::mesh::policy_deny_log::{self, PolicyDenyEvent};
@@ -110,6 +111,26 @@ pub struct MeshAuthz {
     /// Empty whenever no provider inspects bodies, so an ordinary mesh pays
     /// nothing.
     body_inspecting_custom_rules: Vec<crate::modes::mesh::config::MeshRule>,
+    /// Union of every bound provider's `headersToUpstreamOnAllow` names,
+    /// precomputed at construction. Non-empty is what makes this instance a
+    /// request-header mutator (`modifies_request_headers`) and arms its
+    /// `before_proxy` hook; empty (the overwhelmingly common case) keeps both
+    /// a no-op.
+    ext_authz_upstream_allow_headers: Vec<String>,
+    /// `modified_request_header_names` for this instance: every spelling of
+    /// every provider-owned name that `before_proxy` can REMOVE (its removal
+    /// folds `_` and `-`, as CGI-style backends do), so the early route-total
+    /// preview — which compares names case-insensitively only — never treats an
+    /// underscore-spelled routing input as stable. `None` (any header may
+    /// change) when the spelling set would be too large to enumerate.
+    ext_authz_declared_modified_headers: Option<Vec<String>>,
+    /// Whether any bound provider declares `headersToDownstreamOnAllow`. Arms
+    /// the `after_proxy` / WebSocket handshake response hooks.
+    ext_authz_mutates_downstream: bool,
+    /// Process-unique id of this instance. Keys its allowed-check staging in
+    /// the per-request plugin state, so two effective `mesh_authz` instances
+    /// on one request never overwrite or consume each other's result.
+    instance_id: u64,
     /// Body-inspecting CUSTOM rules that ONLY the NodeWaypoint capture
     /// inventory carries, each kept inside its policy (scope + those rules).
     /// Unlike `body_inspecting_custom_rules`, these request a prebuffer only
@@ -150,8 +171,14 @@ pub struct MeshAuthz {
     destination_namespaced_service_backend_hosts: HashSet<NamespacedDestinationBackendHostKey>,
     destination_route_upstreams_requiring_scope: HashSet<String>,
     has_route_upstream_metadata: bool,
-    has_header_rules: bool,
-    relay_policy_superset_has_header_rules: bool,
+    /// Distinct lowercase request-header names referenced by any loaded
+    /// `to.headers` predicate, precomputed at construction. The request path
+    /// resolves ONLY these names (via [`http_request_header_value`]) instead of
+    /// copying the whole client header map, so the per-request cost scales with
+    /// what the policy reads, not with how many headers the client sent. Empty
+    /// when no policy carries a header predicate.
+    header_rule_names: Vec<String>,
+    relay_policy_superset_header_rule_names: Vec<String>,
     /// Additional SPIFFE trust domains accepted as equivalent to the peer
     /// cert's trust domain when authorising HBONE baggage `source.principal`.
     /// Default empty: strict same-trust-domain match.
@@ -1185,17 +1212,13 @@ fn evaluate_destination_policy_scopes(
     }
 }
 
-/// Resolve a `request.headers[<name>]` value. Reads the already-lowercased
-/// materialized `headers` map when header rules forced materialization;
-/// otherwise falls back to the raw header accessor so a `when:` header
-/// condition still works on a policy set whose `to.headers` were empty.
-/// Istio header names are matched case-insensitively, and the condition key
-/// name is lowercased to match the stored convention.
-fn http_header_attribute(
-    ctx: &RequestContext,
-    materialized_lowercased: &BTreeMap<String, String>,
-    name: &str,
-) -> Option<String> {
+/// Resolve a `request.headers[<name>]` value. Pseudo-headers come from the
+/// typed request facts; every ordinary name goes through
+/// [`http_request_header_value`], the ONE resolver `to.headers`, `when:` header
+/// conditions, and the CUSTOM check's forwarded headers share. Istio header
+/// names are matched case-insensitively, and the condition key name is
+/// lowercased to match the stored convention.
+fn http_header_attribute(ctx: &RequestContext, name: &str) -> Option<String> {
     // Envoy header matchers can address the HTTP pseudo-headers Istio itself
     // uses in generated authorization filters. Hyper does not expose those as
     // ordinary HeaderMap entries, so source them from the canonical typed
@@ -1230,19 +1253,79 @@ fn http_header_attribute(
         return Some(scheme.to_string());
     }
 
-    let lower = name.to_ascii_lowercase();
-    if let Some(value) = materialized_lowercased.get(&lower) {
+    // Plugin-inserted operator-cased keys are resolved case-insensitively by
+    // the shared resolver, so `when:` and `to.headers` cannot disagree.
+    http_request_header_value(ctx, &name.to_ascii_lowercase())
+}
+
+/// The single value mesh authorization judges for an ordinary request header
+/// `lower` (already ASCII-lowercase).
+///
+/// Every header-reading surface of this plugin — `to.headers` predicates,
+/// `when: request.headers[...]` conditions, and the headers forwarded to a
+/// CUSTOM provider — resolves through here, so one request can never be judged
+/// on two different readings of the same header. A header sent as several
+/// field lines resolves to ALL of them joined exactly as
+/// [`RequestContext::materialize_headers`] joins them (`, `, or `; ` for
+/// `cookie`) — the same view the backend-forwarding path is built from, and
+/// Envoy's own header-matcher reading of a repeated header. A first-value
+/// reading would let a client hide `x-tenant: banned` behind an earlier
+/// `x-tenant: ok` field line from a DENY that a later reader (or the backend)
+/// still sees.
+///
+/// The joined reading does not depend on whether something earlier forced
+/// header materialization:
+///
+/// * once headers ARE materialized, `ctx.headers` is the authoritative request
+///   view — an entry is the (joined) value, and an ABSENT name is absent. An
+///   earlier plugin that removed an untrusted client field (and perhaps
+///   publishes a vetted value later) must not have that removal undone here by
+///   reading the retained pristine raw block;
+/// * before materialization, an existing `ctx.headers` entry (gateway/plugin
+///   inserted) wins, and otherwise the raw field lines are folded exactly the
+///   way materialization would fold them, skipping a non-UTF-8 line as
+///   materialization does.
+///
+/// Header names are matched case-insensitively over `ctx.headers` too. Wire
+/// keys are always lowercase, so the exact lowercase probe is the hot path;
+/// only on a miss is the map scanned for a key an earlier plugin inserted in
+/// operator case (`X-Tenant: blocked`) — the egress builders parse such a key
+/// as the ordinary `x-tenant` field, so a `to.headers` DENY must see it. The
+/// scan compares in place and allocates nothing. When several case variants
+/// coexist without a lowercase key, the byte-wise smallest key wins, so the
+/// reading is deterministic rather than hash-order dependent.
+///
+/// Reserved gateway assertion headers are never read from the raw client block.
+fn http_request_header_value(ctx: &RequestContext, lower: &str) -> Option<String> {
+    if let Some(value) = ctx.headers.get(lower) {
         return Some(value.clone());
     }
-    if let Some(value) = ctx.headers.get(&lower).or_else(|| ctx.headers.get(name)) {
+    if let Some((_, value)) = ctx
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(lower))
+        .min_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()))
+    {
         return Some(value.clone());
     }
-    if RequestContext::is_reserved_gateway_assertion_header(&lower) {
+    if ctx.headers_are_materialized() || RequestContext::is_reserved_gateway_assertion_header(lower)
+    {
         return None;
     }
-    ctx.raw_header_get(&lower)
-        .or_else(|| ctx.raw_header_get(name))
-        .map(str::to_string)
+    let separator = crate::plugins::repeated_request_header_separator(lower);
+    let mut folded: Option<String> = None;
+    for bytes in ctx.raw_header_value_bytes(lower) {
+        let Ok(value) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        if let Some(existing) = folded.as_mut() {
+            existing.push_str(separator);
+            existing.push_str(value);
+        } else {
+            folded = Some(value.to_owned());
+        }
+    }
+    folded
 }
 
 /// Parse a context client-IP string into the canonical typed address used for
@@ -1982,6 +2065,7 @@ impl MeshAuthz {
         };
 
         validate_policy_ip_inputs(&slice.mesh_policies)?;
+        validate_policy_request_matchers(&slice.mesh_policies)?;
         validate_waypoint_target_ref_evidence(&slice)?;
         let ambient_udp_source_scoping = parse_scoping_flag(config, "ambient_udp_source_scoping")?;
         let mut relay_policy_superset = if ambient_udp_source_scoping {
@@ -2036,10 +2120,10 @@ impl MeshAuthz {
 
         normalize_authz_policies(&mut slice.mesh_policies);
         normalize_authz_policies(&mut relay_policy_superset);
-        let has_header_rules = mesh_policies_have_header_rules(&slice.mesh_policies);
+        let header_rule_names = mesh_policies_header_rule_names(&slice.mesh_policies);
         let condition_keys = ConditionAttributeKeys::from_policies(&slice.mesh_policies);
-        let relay_policy_superset_has_header_rules =
-            mesh_policies_have_header_rules(&relay_policy_superset);
+        let relay_policy_superset_header_rule_names =
+            mesh_policies_header_rule_names(&relay_policy_superset);
         let relay_policy_superset_condition_keys =
             ConditionAttributeKeys::from_policies(&relay_policy_superset);
         // Whether any namespace/selector-scoped (non-mesh-wide) policy is loaded.
@@ -2201,10 +2285,25 @@ impl MeshAuthz {
             _ => Vec::new(),
         };
 
+        let ext_authz_upstream_allow_headers = ext_authz
+            .as_ref()
+            .map(|executor| executor.upstream_allow_header_union())
+            .unwrap_or_default();
+        let ext_authz_mutates_downstream = ext_authz
+            .as_ref()
+            .is_some_and(|executor| executor.mutates_downstream_on_allow());
+        let ext_authz_declared_modified_headers =
+            backend_folded_header_spellings(&ext_authz_upstream_allow_headers);
+
         Ok(Self {
             slice,
             ext_authz,
             body_inspecting_custom_rules,
+            ext_authz_upstream_allow_headers,
+            ext_authz_declared_modified_headers,
+            ext_authz_mutates_downstream,
+            instance_id: NEXT_MESH_AUTHZ_INSTANCE_ID
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             capture_body_inspecting_custom_policies,
             relay_policy_superset,
             ambient_udp_source_scopes,
@@ -2227,8 +2326,8 @@ impl MeshAuthz {
                 .route_upstreams_requiring_scope,
             node_waypoint_capture_destination_scopes,
             has_route_upstream_metadata,
-            has_header_rules,
-            relay_policy_superset_has_header_rules,
+            header_rule_names,
+            relay_policy_superset_header_rule_names,
             trust_domain_aliases,
             trusted_hbone_assertors,
             per_pod_policy_scoping,
@@ -2314,7 +2413,6 @@ impl MeshAuthz {
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
         network: HttpConditionNetworkAttrs,
-        headers: &BTreeMap<String, String>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         if !keys.any {
@@ -2412,7 +2510,7 @@ impl MeshAuthz {
         for header_key in &keys.header_keys {
             if let Some(name) =
                 bracketed_mesh_attribute_name(header_key, ATTR_REQUEST_HEADERS_PREFIX)
-                && let Some(value) = http_header_attribute(ctx, headers, name)
+                && let Some(value) = http_header_attribute(ctx, name)
             {
                 attributes.insert(header_key.clone(), value.into());
             }
@@ -2717,6 +2815,8 @@ impl MeshAuthz {
         ctx: &mut RequestContext,
         delegation: &MeshAuthzCustomDelegation,
         authority: Option<String>,
+        source_principal: Option<&SpiffeId>,
+        request_principal: Option<&str>,
     ) -> Option<PluginResult> {
         let Some(executor) = self.ext_authz.as_ref() else {
             // An executor-unavailable denial is a MATCHED delegation that was
@@ -2748,7 +2848,7 @@ impl MeshAuthz {
         // `includeRequestHeadersInCheck`.
         let mut check_headers = HashMap::new();
         for name in executor.required_header_names(&delegation.provider) {
-            if let Some(value) = http_header_attribute(ctx, &BTreeMap::new(), name.as_str()) {
+            if let Some(value) = http_header_attribute(ctx, name.as_str()) {
                 check_headers.insert(name.as_str().to_string(), value);
             }
         }
@@ -2779,6 +2879,11 @@ impl MeshAuthz {
                     path: &path,
                     headers: &check_headers,
                     authority: authority.as_deref(),
+                    // The identity the local rules were judged on: the
+                    // authenticated peer, or the trusted assertor's verified
+                    // baggage identity. Never a client-supplied header.
+                    source_principal,
+                    request_principal,
                     body: body.as_deref(),
                     body_proven_empty: ctx.replay_request_body_empty_proven(),
                     proxy_hops: crate::proxy::hop_limit::plugin_call_proxy_hops(ctx),
@@ -2788,11 +2893,50 @@ impl MeshAuthz {
             .await;
 
         match outcome {
-            MeshExtAuthzOutcome::Allow { reason } => {
+            MeshExtAuthzOutcome::Allow {
+                reason,
+                upstream_headers,
+                downstream_headers,
+            } => {
                 ctx.metadata.insert(
                     "mesh_authz.ext_authz_outcome".to_string(),
                     reason.as_str().to_string(),
                 );
+                // `headersToUpstreamOnAllow` names are PROVIDER-OWNED on an
+                // allowed check: every one of them is staged, with the
+                // provider's value or `None`, so `before_proxy` strips the
+                // client's copy even when the provider returned nothing (or
+                // the allow came from `failOpen`, where no provider vouched
+                // for anything). Staged in typed request state, never in
+                // `metadata`, so an exchanged token cannot reach a log line.
+                let owned = executor.upstream_allow_header_names(&delegation.provider);
+                if !owned.is_empty() || !downstream_headers.is_empty() {
+                    let staged_upstream: crate::plugins::mesh::ext_authz::StagedUpstreamHeaders =
+                        owned
+                            .iter()
+                            .map(|name| {
+                                let name = name.as_str();
+                                let value = upstream_headers
+                                    .iter()
+                                    .find(|(returned, _)| returned == name)
+                                    .map(|(_, value)| value.clone());
+                                (name.to_string(), value)
+                            })
+                            .collect();
+                    // Keyed by THIS instance: another effective `mesh_authz`
+                    // on the same request stages (and consumes) its own entry.
+                    let state = ctx.plugin_state_mut();
+                    if !staged_upstream.is_empty() {
+                        state
+                            .mesh_ext_authz_upstream_headers
+                            .insert(self.instance_id, staged_upstream);
+                    }
+                    if !downstream_headers.is_empty() {
+                        state
+                            .mesh_ext_authz_downstream_headers
+                            .insert(self.instance_id, downstream_headers);
+                    }
+                }
                 None
             }
             MeshExtAuthzOutcome::Deny {
@@ -3405,22 +3549,31 @@ impl Plugin for MeshAuthz {
             .raw_header_get("host")
             .or_else(|| ctx.raw_header_get(":authority"))
             .map(str::to_string);
-        let has_header_rules = if connect_relay {
-            false
+        let header_rule_names: &[String] = if connect_relay {
+            &[]
         } else if relay_policy_superset_request {
-            self.relay_policy_superset_has_header_rules
+            &self.relay_policy_superset_header_rule_names
         } else {
-            self.has_header_rules
+            &self.header_rule_names
         };
-        let headers = if has_header_rules {
+        let headers = if !header_rule_names.is_empty() {
             ctx.materialize_headers();
             if host.is_none() {
                 host = ctx.headers.get("host").cloned();
             }
-            ctx.headers
-                .iter()
-                .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
-                .collect()
+            // Resolve ONLY the names a `to.headers` predicate reads, through
+            // the same resolver `when: request.headers[...]` and the CUSTOM
+            // check use, so all three surfaces judge one value for a repeated
+            // header (the materialized `, `-joined form). Copying the whole
+            // client map here cost two allocations per client header on every
+            // request for a policy that names one or two of them.
+            let mut headers = BTreeMap::new();
+            for name in header_rule_names {
+                if let Some(value) = http_request_header_value(ctx, name) {
+                    headers.insert(name.clone(), value);
+                }
+            }
+            headers
         } else {
             if host.is_none() {
                 host = ctx.headers.get("host").cloned();
@@ -3462,7 +3615,6 @@ impl Plugin for MeshAuthz {
                 remote_ip,
                 destination_ip,
             },
-            &headers,
         );
         // Issue #5948: a parameter-stripping backend (Tomcat, Spring) executes
         // the path without its `;` parameters, so `paths:` / `notPaths:` and
@@ -3840,7 +3992,13 @@ impl Plugin for MeshAuthz {
             }
             Some(delegation) => {
                 match self
-                    .run_custom_delegation(ctx, &delegation, request.host.clone())
+                    .run_custom_delegation(
+                        ctx,
+                        &delegation,
+                        request.host.clone(),
+                        request.source_principal.as_ref(),
+                        request.request_principal.as_deref(),
+                    )
                     .await
                 {
                     None => evaluation.decision,
@@ -4073,6 +4231,112 @@ impl Plugin for MeshAuthz {
             .as_ref()
             .map(|executor| executor.warmup_hostnames())
             .unwrap_or_default()
+    }
+
+    /// A provider declaring `headersToUpstreamOnAllow` makes this instance a
+    /// backend-request header mutator (issue #6008 declares authorize-phase
+    /// and `before_proxy` changes alike). Without such a provider the instance
+    /// never touches request headers.
+    fn modifies_request_headers(&self) -> bool {
+        !self.ext_authz_upstream_allow_headers.is_empty()
+    }
+
+    /// The provider-owned `headersToUpstreamOnAllow` names in EVERY `_` / `-`
+    /// spelling `before_proxy` removes — the only request headers this
+    /// instance can ever change. `None` (conservatively "any header") when
+    /// that spelling set is too large to enumerate.
+    fn modified_request_header_names(&self) -> Option<Vec<String>> {
+        self.ext_authz_declared_modified_headers.clone()
+    }
+
+    /// Apply an allowed CUSTOM check's `headersToUpstreamOnAllow` result.
+    ///
+    /// Runs at this plugin's own priority in the ordinary `before_proxy`
+    /// chain, which every HTTP-family dispatcher (H1/H2, the H3 bridge, gRPC,
+    /// and the WebSocket handshake) builds its backend request from — so the
+    /// ordering is the same on every ingress path: after authentication and
+    /// authorization, BEFORE `mesh_route_dispatch` (2995) and every request
+    /// transformer (3000), which can therefore still observe or override a
+    /// provider-asserted header exactly as they would a client one.
+    ///
+    /// Every provider-owned name is removed first — case-insensitively and
+    /// with `_` folded to `-`, the way CGI-style backends read it — so a
+    /// client-forged `x-auth-request-user` (or `X_Auth_Request_User`) can
+    /// never reach the backend beside, or instead of, the provider's value.
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if self.ext_authz_upstream_allow_headers.is_empty() {
+            return PluginResult::Continue;
+        }
+        let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .mesh_ext_authz_upstream_headers
+                .remove(&self.instance_id)
+        }) else {
+            return PluginResult::Continue;
+        };
+        if staged.is_empty() {
+            return PluginResult::Continue;
+        }
+        headers.retain(|name, _| {
+            !staged.iter().any(|(owned, _)| {
+                crate::proxy::headers::field_names_equivalent_for_backends(name, owned)
+            })
+        });
+        for (name, value) in staged {
+            if let Some(value) = value {
+                headers.insert(name, value);
+            }
+        }
+        PluginResult::Continue
+    }
+
+    /// Apply an allowed CUSTOM check's `headersToDownstreamOnAllow` result to
+    /// the backend response (a session-refresh `Set-Cookie` is the canonical
+    /// use). Not applied to a gateway-generated rejection: the provider's
+    /// allow did not produce that response.
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.ext_authz_mutates_downstream {
+            return PluginResult::Continue;
+        }
+        if let Some(staged) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .mesh_ext_authz_downstream_headers
+                .remove(&self.instance_id)
+        }) {
+            apply_ext_authz_downstream_allow_headers(response_headers, &staged);
+        }
+        PluginResult::Continue
+    }
+
+    /// H1 Upgrade and H2/H3 Extended CONNECT bypass `after_proxy`; apply the
+    /// same `headersToDownstreamOnAllow` result to the successful handshake.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if !self.ext_authz_mutates_downstream {
+            return;
+        }
+        // Read-only (`&RequestContext`), but only THIS instance's entry, so
+        // each provider's cookie is applied exactly once per handshake.
+        if let Some(staged) = ctx.plugin_state().and_then(|state| {
+            state
+                .mesh_ext_authz_downstream_headers
+                .get(&self.instance_id)
+        }) {
+            apply_ext_authz_downstream_allow_headers(response_headers, staged);
+        }
     }
 
     async fn on_stream_connect(&self, ctx: &mut StreamConnectionContext) -> PluginResult {
@@ -4576,6 +4840,102 @@ fn validate_policy_ip_inputs(policies: &[MeshPolicy]) -> Result<(), String> {
                     ));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Source of [`MeshAuthz::instance_id`].
+static NEXT_MESH_AUTHZ_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Upper bound on the `_` / `-` spellings enumerated per provider-owned name
+/// (2^6: six separators). A longer name makes the declaration `None`.
+const MAX_DECLARED_SPELLINGS_PER_HEADER: usize = 64;
+
+/// Every spelling of `names` that differs only by `_` vs `-` at a separator
+/// position — exactly the set `before_proxy` removes via
+/// `field_names_equivalent_for_backends` (case is already compared
+/// case-insensitively by the consumers of the declaration). Sorted and
+/// deduplicated; `None` when any name has more than
+/// [`MAX_DECLARED_SPELLINGS_PER_HEADER`] spellings, which a consumer reads as
+/// "any header may change" — the conservative answer.
+fn backend_folded_header_spellings(names: &[String]) -> Option<Vec<String>> {
+    let mut spellings: Vec<String> = Vec::new();
+    for name in names {
+        let separators: Vec<usize> = name
+            .bytes()
+            .enumerate()
+            .filter(|(_, byte)| matches!(*byte, b'-' | b'_'))
+            .map(|(index, _)| index)
+            .collect();
+        let count = 1usize.checked_shl(u32::try_from(separators.len()).ok()?)?;
+        if count > MAX_DECLARED_SPELLINGS_PER_HEADER {
+            return None;
+        }
+        for mask in 0..count {
+            let mut bytes = name.as_bytes().to_vec();
+            for (bit, index) in separators.iter().enumerate() {
+                bytes[*index] = if mask & (1 << bit) == 0 { b'-' } else { b'_' };
+            }
+            // Only ASCII `-` / `_` bytes were replaced, so the result is still
+            // valid UTF-8; the lossy conversion never actually substitutes.
+            spellings.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    spellings.sort();
+    spellings.dedup();
+    Some(spellings)
+}
+
+/// Merge an allowed check's `headersToDownstreamOnAllow` result into a client
+/// response header map.
+///
+/// `Set-Cookie` is APPENDED (newline-joined, the proxy's multi-cookie
+/// representation), so a backend cookie survives beside the provider's
+/// refreshed session cookie. Every other name REPLACES the response's
+/// same-named field, case-insensitively.
+fn apply_ext_authz_downstream_allow_headers(
+    response_headers: &mut HashMap<String, String>,
+    staged: &[(String, String)],
+) {
+    for (name, value) in staged {
+        if name.eq_ignore_ascii_case("set-cookie") {
+            for cookie in value.split('\n') {
+                crate::proxy::headers::append_set_cookie_header(
+                    response_headers,
+                    cookie.to_string(),
+                );
+            }
+        } else {
+            response_headers.retain(|existing, _| !existing.eq_ignore_ascii_case(name));
+            response_headers.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+/// Fail-closed construction gate for every `from` / `to` matcher the plugin is
+/// asked to enforce.
+///
+/// The flat `mesh_policies` form (file / database / admin plugin config) never
+/// passes through `MeshConfig::validate`, so without this a documented-invalid
+/// matcher — a `to.headers` pseudo-header, an invalid host pattern, an
+/// impossible port pattern, an empty `from[{}]` / `to[{}]` entry — was accepted
+/// and then silently never matched. For a DENY rule that is fail-open. It runs
+/// on the embedded `mesh_slice` form too, for the same reason as
+/// [`validate_policy_ip_inputs`]: a slice a mesh data plane builds has already
+/// passed the native validator (of which this is a strict subset), and any
+/// other slice source has not.
+fn validate_policy_request_matchers(policies: &[MeshPolicy]) -> Result<(), String> {
+    for policy in policies {
+        if let Some(error) = validate_mesh_policy_request_matchers(policy)
+            .into_iter()
+            .next()
+        {
+            return Err(format!(
+                "mesh_authz: invalid policy {:?}/{:?}: {error}",
+                policy.namespace, policy.name
+            ));
         }
     }
     Ok(())

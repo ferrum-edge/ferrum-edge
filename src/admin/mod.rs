@@ -1436,6 +1436,13 @@ impl Drop for AdminActivityGuard {
 /// has finished writing the response and dropped the body.
 struct GuardedAdminBody {
     inner: Full<Bytes>,
+    /// `GET /charges` delivery acknowledgement, fired once hyper has taken
+    /// the complete document from this body (issue #5276). A response dropped
+    /// before then — a scrape cancelled while the registry was rendering, or a
+    /// stream reset before the body was polled — acknowledges nothing. Taking
+    /// the body is not proof the peer received it, so the registry confirms
+    /// collection only after two such deliveries.
+    delivery_ack: Option<plugins::api_chargeback::ChargesDeliveryAck>,
     _guard: AdminActivityGuard,
 }
 
@@ -1443,8 +1450,27 @@ impl GuardedAdminBody {
     fn new(inner: Full<Bytes>, guard: AdminActivityGuard) -> Self {
         Self {
             inner,
+            delivery_ack: None,
             _guard: guard,
         }
+    }
+
+    /// Wrap a dispatched admin response, moving a `/charges` delivery
+    /// acknowledgement out of the response extensions into the body so it
+    /// fires only once the body has been taken.
+    fn wrap_response(response: Response<Full<Bytes>>, guard: AdminActivityGuard) -> Response<Self> {
+        let (mut parts, inner) = response.into_parts();
+        let delivery_ack = parts
+            .extensions
+            .remove::<plugins::api_chargeback::ChargesDeliveryAck>();
+        Response::from_parts(
+            parts,
+            Self {
+                inner,
+                delivery_ack,
+                _guard: guard,
+            },
+        )
     }
 }
 
@@ -1456,8 +1482,20 @@ impl http_body::Body for GuardedAdminBody {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
         // `Full<Bytes>` is `Unpin`, so the projection is a plain reborrow.
-        http_body::Body::poll_frame(std::pin::Pin::new(&mut self.get_mut().inner), cx)
+        let polled = http_body::Body::poll_frame(std::pin::Pin::new(&mut this.inner), cx);
+        if this.delivery_ack.is_some() {
+            let body_taken = match &polled {
+                std::task::Poll::Ready(None) => true,
+                std::task::Poll::Ready(Some(Ok(_))) => http_body::Body::is_end_stream(&this.inner),
+                _ => false,
+            };
+            if body_taken && let Some(ack) = this.delivery_ack.take() {
+                ack.acknowledge();
+            }
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
@@ -1467,6 +1505,33 @@ impl http_body::Body for GuardedAdminBody {
     fn size_hint(&self) -> http_body::SizeHint {
         http_body::Body::size_hint(&self.inner)
     }
+}
+
+/// Drive an admin response through the connection body wrapper exactly as
+/// [`serve_admin_io`] does and collect its body, so tests can observe what the
+/// wrapper does once hyper takes the document (issue #5276).
+///
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
+pub(crate) async fn collect_guarded_admin_response_for_test(
+    response: Response<Full<Bytes>>,
+) -> Bytes {
+    let guard = AdminActivityGuard::new(Arc::new(AdminConnActivity::new()));
+    let guarded = GuardedAdminBody::wrap_response(response, guard);
+    match guarded.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(never) => match never {},
+    }
+}
+
+/// Wrap an admin response as [`serve_admin_io`] does, then drop it without
+/// polling its body: a connection that went away before writing the response.
+///
+/// Reached through `_test_support`; the binary target has no consumer.
+#[allow(dead_code)]
+pub(crate) fn drop_guarded_admin_response_unpolled_for_test(response: Response<Full<Bytes>>) {
+    let guard = AdminActivityGuard::new(Arc::new(AdminConnActivity::new()));
+    drop(GuardedAdminBody::wrap_response(response, guard));
 }
 
 /// Drive one accepted admin connection (plaintext or TLS-terminated) to
@@ -1531,7 +1596,7 @@ async fn serve_admin_io<I>(
                 return Ok::<_, hyper::Error>(guarded);
             }
             let response = handle_admin_request(req, state, client_ip).await?;
-            let guarded = response.map(|inner| GuardedAdminBody::new(inner, guard));
+            let guarded = GuardedAdminBody::wrap_response(response, guard);
             Ok::<_, hyper::Error>(guarded)
         }
     });
@@ -1970,6 +2035,45 @@ pub fn advancing_u32_offset(offset: u32, item_count: usize, total: i64) -> Optio
 enum ChargebackFormat {
     Prometheus,
     Json,
+}
+
+/// A rendered `/charges` document plus the acknowledgement its delivery owes
+/// the registry.
+type RenderedCharges = (String, Option<plugins::api_chargeback::ChargesDeliveryAck>);
+
+/// Render `/charges` from the process-global registry on the blocking pool.
+///
+/// An uncached render walks the whole registry (up to `max_entries` rows, and
+/// up to [`plugins::api_chargeback::MAX_RENDER_ATTEMPTS`] walks under reload
+/// churn) and serializes it synchronously; running it inline would occupy an
+/// async worker shared with the data plane for the whole walk. The returned
+/// receipt is not acknowledged here — see
+/// [`plugins::api_chargeback::ChargesDeliveryAck`].
+async fn render_charges_off_worker(
+    registry: Arc<plugins::api_chargeback::ChargebackRegistry>,
+    format: ChargebackFormat,
+) -> Result<RenderedCharges, String> {
+    let rendered = tokio::task::spawn_blocking(move || {
+        let rendered = match format {
+            ChargebackFormat::Json => registry.render_json_pending(),
+            ChargebackFormat::Prometheus => registry.render_prometheus_pending(),
+        };
+        rendered.map(|(output, receipt)| {
+            (
+                output,
+                Some(plugins::api_chargeback::ChargesDeliveryAck::new(
+                    registry, receipt,
+                )),
+            )
+        })
+    })
+    .await;
+    match rendered {
+        Ok(result) => result,
+        Err(join_error) => Err(format!(
+            "api_chargeback: /charges render task failed: {join_error}"
+        )),
+    }
 }
 
 fn parse_chargeback_format(
@@ -3982,50 +4086,53 @@ async fn handle_admin_request_inner(
     if path == "/charges" && method == Method::GET {
         let registry = crate::plugins::api_chargeback::try_global_registry();
         match parse_chargeback_format(req.uri().query()) {
-            Ok(ChargebackFormat::Json) => {
-                let json_result = match registry.as_ref() {
-                    Some(registry) => registry.render_json(),
-                    None => crate::plugins::api_chargeback::empty_charges_json(),
+            Ok(format) => {
+                let rendered = match registry {
+                    Some(registry) => render_charges_off_worker(registry, format).await,
+                    None => {
+                        let empty = match format {
+                            ChargebackFormat::Json => {
+                                crate::plugins::api_chargeback::empty_charges_json()
+                            }
+                            ChargebackFormat::Prometheus => {
+                                crate::plugins::api_chargeback::empty_charges_prometheus()
+                            }
+                        };
+                        empty.map(|output| (output, None))
+                    }
                 };
-                match json_result {
-                    Ok(json_output) => {
-                        let resp = Response::builder()
+                match rendered {
+                    Ok((output, delivery_ack)) => {
+                        let content_type = match format {
+                            ChargebackFormat::Json => "application/json",
+                            ChargebackFormat::Prometheus => {
+                                "text/plain; version=0.0.4; charset=utf-8"
+                            }
+                        };
+                        let resp = match Response::builder()
                             .status(StatusCode::OK)
-                            .header("Content-Type", "application/json")
+                            .header("Content-Type", content_type)
                             .header("X-Content-Type-Options", "nosniff")
                             .header("Cache-Control", "no-store")
-                            .body(Full::new(Bytes::from(json_output)))
-                            .unwrap_or_else(|_| admin_builder_failure_response());
+                            .body(Full::new(Bytes::from(output)))
+                        {
+                            Ok(mut resp) => {
+                                // Collection is acknowledged by the connection's
+                                // body wrapper once it has taken this document,
+                                // never here at render time (issue #5276).
+                                if let Some(ack) = delivery_ack {
+                                    resp.extensions_mut().insert(ack);
+                                }
+                                resp
+                            }
+                            Err(_) => admin_builder_failure_response(),
+                        };
                         return Ok(resp);
                     }
                     Err(err) => {
                         // Fail closed: never serialize non-finite monetary values as
-                        // JSON null (serde_json's default for Inf/NaN).
-                        return Ok(json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &json!({"error": err}),
-                        ));
-                    }
-                }
-            }
-            Ok(ChargebackFormat::Prometheus) => {
-                let prom_result = match registry.as_ref() {
-                    Some(registry) => registry.render_prometheus(),
-                    None => crate::plugins::api_chargeback::empty_charges_prometheus(),
-                };
-                match prom_result {
-                    Ok(prom_output) => {
-                        let resp = Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-                            .header("X-Content-Type-Options", "nosniff")
-                            .header("Cache-Control", "no-store")
-                            .body(Full::new(Bytes::from(prom_output)))
-                            .unwrap_or_else(|_| admin_builder_failure_response());
-                        return Ok(resp);
-                    }
-                    Err(err) => {
-                        // Fail closed: never publish non-finite Prometheus samples.
+                        // JSON null (serde_json's default for Inf/NaN) or publish
+                        // non-finite Prometheus samples.
                         return Ok(json_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             &json!({"error": err}),

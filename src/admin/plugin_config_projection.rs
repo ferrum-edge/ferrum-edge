@@ -232,7 +232,13 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ),
     ("jwt_auth", NONE),
     ("key_auth", NONE),
-    ("ldap_auth", &[endpoint_url(&["ldap_url"])]),
+    (
+        "ldap_auth",
+        &[
+            endpoint_url(&["ldap_url"]),
+            endpoint_url(&["failover_ldap_urls"]),
+        ],
+    ),
     ("basic_auth", NONE),
     ("hmac_auth", NONE),
     ("soap_ws_security", NONE),

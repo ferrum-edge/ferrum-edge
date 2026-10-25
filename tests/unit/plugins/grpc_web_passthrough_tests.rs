@@ -28,9 +28,7 @@ use ferrum_edge::_test_support::{
     retain_grpc_web_client_content_type_for_test, set_request_grpc_web_upload_for_test,
 };
 use ferrum_edge::plugins::TransactionSummary;
-use ferrum_edge::plugins::mesh::prometheus_helpers::{
-    GrpcMessageFraming, MESH_PROMETHEUS_METRICS_OBSERVED_METADATA,
-};
+use ferrum_edge::plugins::mesh::prometheus_helpers::GrpcMessageFraming;
 use ferrum_edge::proxy::body::ProxyBodyError;
 use futures_util::stream;
 use http::{HeaderMap, HeaderValue};
@@ -486,10 +484,7 @@ fn buffered_passthrough_response_messages_are_counted_on_decoded_frames() {
         ),
     ] {
         let mut ctx = create_test_context();
-        ctx.metadata.insert(
-            MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-            "true".to_string(),
-        );
+        ctx.mark_prometheus_metrics_observed();
         ctx.metadata
             .insert("request_protocol".to_string(), "grpc".to_string());
         retain_grpc_web_client_content_type_for_test(&mut ctx, content_type);
@@ -506,10 +501,7 @@ fn buffered_passthrough_response_messages_are_counted_on_decoded_frames() {
 /// `prometheus_metrics` hook leaves it.
 fn observing_request_context() -> ferrum_edge::plugins::RequestContext {
     let mut ctx = create_test_context();
-    ctx.metadata.insert(
-        MESH_PROMETHEUS_METRICS_OBSERVED_METADATA.to_string(),
-        "true".to_string(),
-    );
+    ctx.mark_prometheus_metrics_observed();
     ctx.metadata
         .insert("request_protocol".to_string(), "grpc".to_string());
     ctx

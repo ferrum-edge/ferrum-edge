@@ -254,3 +254,90 @@ fn consumer_namespace_remove_and_response_side_modifiers_stay_admitted() {
         }
     }
 }
+
+/// PR #6858: `mesh_route_dispatch` also refuses `request_transform` writes into
+/// the router's `x-path-param-*` route-capture namespace, so the translator
+/// must refuse only the offending route here too instead of emitting a plugin
+/// config that fails the whole plugin-cache build.
+#[test]
+fn path_param_request_header_modifier_refuses_only_its_own_route() {
+    let objects = snapshot(vec![
+        http_route(
+            "capture",
+            request_header_modifier("set", "x-path-param-account"),
+        ),
+        http_route("tenant", request_header_modifier("set", "x-tenant")),
+    ]);
+
+    let (translation, skipped) =
+        translate_k8s_objects_collecting_skips(&objects, options()).expect("translate snapshot");
+
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    let (key, error) = skipped.iter().next().expect("one skipped route");
+    assert_eq!(
+        (key.kind.as_str(), key.name.as_str()),
+        ("HTTPRoute", "capture")
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("requestHeaderModifier.set[0].name")
+            && message.contains("`x-path-param-*`")
+            && message.contains(UNSUPPORTED_SHAPE_MARKER),
+        "{message}"
+    );
+    for plugin in &translation.config.plugin_configs {
+        ferrum_edge::plugins::validate_plugin_config(&plugin.plugin_name, &plugin.config)
+            .unwrap_or_else(|error| panic!("{}: {error}", plugin.plugin_name));
+    }
+    assert!(
+        translation
+            .config
+            .plugin_configs
+            .iter()
+            .all(|plugin| !plugin
+                .config
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("x-path-param-account")),
+        "no emitted plugin may carry the refused destination"
+    );
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &[]);
+    assert_eq!(
+        route_condition_field(&updates, "capture", "Accepted", "status").as_deref(),
+        Some("False")
+    );
+    assert_eq!(
+        route_condition_field(&updates, "capture", "Accepted", "reason").as_deref(),
+        Some("UnsupportedValue")
+    );
+    assert_eq!(
+        route_condition_field(&updates, "tenant", "Accepted", "status").as_deref(),
+        Some("True")
+    );
+
+    for (field, header) in [
+        ("add", "X-Path-Param-Id"),
+        ("set", "X_Path_Param_Account"),
+        ("add", "x_path-param-tenant"),
+    ] {
+        let objects = snapshot(vec![http_route(
+            "capture",
+            request_header_modifier(field, header),
+        )]);
+        let error = translate_k8s_objects(&objects, options())
+            .expect_err("a path-capture request header modifier must be refused");
+        assert!(
+            error.to_string().contains("`x-path-param-*`"),
+            "{field} {header}: {error}"
+        );
+    }
+
+    // Removal stays admitted.
+    let remove = json!({
+        "type": "RequestHeaderModifier",
+        "requestHeaderModifier": {"remove": ["x-path-param-account"]}
+    });
+    let objects = snapshot(vec![http_route("allowed", remove)]);
+    translate_k8s_objects(&objects, options()).expect("remove stays admitted");
+}

@@ -733,6 +733,9 @@ fn representative_exposition() -> String {
     tcp_summary.bytes_received = 2048;
     registry.record_stream(&tcp_summary);
 
+    // Pre-routing rejections never reach a plugin; seeding one route miss pins
+    // the family's HELP/TYPE/label keys.
+    registry.record_unmatched_request(ferrum_edge::diagnostic_ref::ROUTE_NOT_FOUND_PHASE, 404);
     registry.record_rate_limit_exceeded();
     registry.record_rate_limit_local_fallback_decision();
     registry.record_rate_limit_enforcement_unavailable();
@@ -1125,6 +1128,9 @@ fn representative_metrics_exposition_matches_contract() {
 
     for required in [
         "ferrum_database_delta_consecutive_identical_rejections",
+        "ferrum_request_body_bytes_total",
+        "ferrum_response_body_bytes_total",
+        "ferrum_unmatched_requests_total",
         "ferrum_mesh_tcp_egress_connections_total",
         "ferrum_mesh_hbone_inner_pool_events_total",
         "ferrum_mesh_remote_discovery_poll_failures_total",

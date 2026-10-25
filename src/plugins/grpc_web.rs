@@ -3691,7 +3691,7 @@ pub(crate) fn record_backend_response_grpc_message_count(
     body: &[u8],
 ) {
     use crate::plugins::mesh::prometheus_helpers as helpers;
-    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+    if !helpers::request_observes_grpc_messages(ctx) {
         return;
     }
     let Some(framing) = passthrough_response_framing(ctx, response_headers) else {
@@ -3741,7 +3741,7 @@ fn record_request_messages(counter: &AtomicU64, passthrough_text_mode: Option<bo
 /// backend-visible body, when the transaction observes gRPC messages. See
 /// [`record_request_messages`] for how a pass-through gRPC-Web upload counts.
 pub(crate) fn record_request_grpc_message_count(ctx: &RequestContext, body: &[u8]) {
-    if crate::plugins::mesh::prometheus_helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+    if crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages(ctx) {
         record_request_messages(
             &ctx.grpc_request_messages_observed,
             passthrough_request_text_mode(ctx),
@@ -3762,7 +3762,7 @@ impl RequestGrpcMessageCounter {
     /// `None` when the transaction does not observe gRPC messages.
     pub(crate) fn for_request(ctx: &RequestContext) -> Option<Self> {
         use crate::plugins::mesh::prometheus_helpers as helpers;
-        if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+        if !helpers::request_observes_grpc_messages(ctx) {
             return None;
         }
         Some(Self {
@@ -3802,7 +3802,7 @@ pub(crate) fn request_stream_grpc_message_tap(
     ctx: &RequestContext,
 ) -> Option<crate::plugins::mesh::prometheus_helpers::GrpcMessageTap> {
     use crate::plugins::mesh::prometheus_helpers as helpers;
-    if !helpers::metadata_observes_grpc_messages(&ctx.metadata) {
+    if !helpers::request_observes_grpc_messages(ctx) {
         return None;
     }
     Some(helpers::GrpcMessageTap::new(
