@@ -5261,6 +5261,115 @@ fn streaming_ai_federation_deduplication_gate_fires_in_candidate_and_runtime() {
         .expect("buffered ai_federation must still compose with request_deduplication at runtime");
 }
 
+/// `ai_semantic_cache` answers a HIT from its final-request-body hook and the
+/// final-body chain stops at the first `RejectBinary`, so a fail-closed
+/// final-request-body policy ordered at or after the cache — by a
+/// `priority_override` on either side — would be bypassed by every hit. Both
+/// candidate admission and runtime cache construction must refuse that, while
+/// the default ordering (and the documented `ai_federation` dispatcher after
+/// the cache) stays admitted.
+#[tokio::test]
+async fn ai_semantic_cache_must_follow_every_final_request_body_policy() {
+    let cache = |priority_override: Option<u16>| {
+        let mut config = make_plugin_config(
+            "cache",
+            "ai_semantic_cache",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        );
+        config.priority_override = priority_override;
+        config
+    };
+    let waf = |priority_override: Option<u16>| {
+        let mut config = make_plugin_config("waf", "waf", PluginScope::Proxy, Some("p1"), true);
+        config.priority_override = priority_override;
+        config
+    };
+    let compose = |plugins: Vec<PluginConfig>| {
+        let ids: Vec<String> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
+        make_config(
+            vec![make_proxy(
+                "p1",
+                "/api",
+                ids.iter().map(String::as_str).collect(),
+            )],
+            plugins,
+        )
+    };
+
+    for (label, config) in [
+        (
+            "cache overridden ahead of waf",
+            compose(vec![cache(Some(2000)), waf(None)]),
+        ),
+        (
+            "waf overridden after the cache",
+            compose(vec![cache(None), waf(Some(5000))]),
+        ),
+        (
+            "waf at the cache's priority",
+            compose(vec![
+                cache(None),
+                waf(Some(ferrum_edge::plugins::priority::AI_SEMANTIC_CACHE)),
+            ]),
+        ),
+    ] {
+        let candidate_error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+                .expect_err(label);
+        assert!(
+            candidate_error.contains("must run before every ai_semantic_cache instance"),
+            "{label}: {candidate_error}"
+        );
+        let runtime_error = PluginCache::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: runtime cache must repeat the refusal"));
+        assert!(
+            runtime_error.contains("must run before every ai_semantic_cache instance"),
+            "{label}: {runtime_error}"
+        );
+    }
+
+    let federation = |streaming: bool| {
+        let mut config = json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "api_key": "sk-test-key",
+                "model_patterns": ["gpt-*"]
+            }]
+        });
+        if streaming {
+            config["streaming"] = json!({"enabled": true});
+        }
+        make_plugin_config_with_json(
+            "federation",
+            "ai_federation",
+            config,
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+    for (label, config) in [
+        ("default ordering", compose(vec![waf(None), cache(None)])),
+        (
+            "buffered federation after the cache",
+            compose(vec![waf(None), cache(None), federation(false)]),
+        ),
+        (
+            "streaming federation after the cache",
+            compose(vec![waf(None), cache(None), federation(true)]),
+        ),
+    ] {
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&config, None)
+            .unwrap_or_else(|error| panic!("{label} must be admitted: {error}"));
+        if let Err(error) = PluginCache::new(&config) {
+            panic!("{label} must build at runtime: {error}");
+        }
+    }
+}
+
 #[test]
 fn candidate_security_validation_constructs_custom_capabilities_without_builtin_gate() {
     let source = include_str!("../../../src/plugin_cache.rs");
