@@ -28,6 +28,920 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `waf` governs bodies on every method and inspects gRPC per message (PR #6813)
+
+- Request bodies are no longer gated by `body_methods`: a request on any
+  method except `CONNECT` is buffered and scanned whenever a body may follow
+  its head (a `Content-Type`, HTTP/1.1 `Content-Length` > 0 /
+  `Transfer-Encoding`, an HTTP/2 HEADERS frame without END_STREAM, or any
+  HTTP/3 request), and any non-empty finalized body is decided. Under an
+  enforcing body policy this buffers HTTP/3 `GET`s too. A `GET` / `SEARCH` / `PROPFIND` body that an enforcing rule (or
+  `on_unlisted_content_type`) would refuse on `POST` is now refused too.
+- Framed gRPC / gRPC-Web bodies the WAF scans (`application/grpc+json`,
+  `application/grpc-web+json`, or every gRPC type with `inspect_binary_body`)
+  are inspected per message. Under an enforcing body policy a
+  `grpc-encoding`-compressed message is refused (`403` /
+  `PERMISSION_DENIED`); have clients of those routes send uncompressed
+  messages, or exempt the route. A body under such a type that is not a
+  well-formed frame sequence is refused the same way rather than scanned as
+  one document.
+- A response relabeled `text/event-stream` by the `sse` plugin's
+  `wrap_non_sse_responses` (or a response transformer) is now scanned by the
+  response-body rules instead of skipped.
+- `global_exemptions.header_present` now also suppresses the `block` values of
+  `on_body_too_large`, `on_unlisted_content_type`,
+  `on_unlisted_response_content_type`, and `on_scan_timeout`.
+- Non-canonical exact or `prefix*` `global_exemptions.paths` entries (a percent
+  escape, `\`, a dot segment, or `//`) are refused at load. They never matched;
+  replace them with the canonical path.
+
+### `ai_federation`: unrepresentable generation controls are refused, provider timeouts capped (PR #6816)
+
+The translating providers (`anthropic`, `google_gemini`, `google_vertex`,
+`aws_bedrock`) used to drop OpenAI fields they could not express and still
+answer `200`. They now map what they can (Gemini/Vertex: `response_format`
+JSON modes, `n > 1`, `seed`, non-zero penalties; Anthropic:
+`parallel_tool_calls: false`) and refuse the rest before any provider call.
+With `fallback_enabled` the next matching provider is tried; when none can
+represent the control the client receives `400` with
+`code: provider_translation_failed` naming the field. Clients that sent, for
+example, `response_format` to Anthropic, `seed` to Bedrock, `logprobs: true`,
+`tools[].function.strict: true`, `reasoning_effort`, `reasoning`, `verbosity`,
+or a schema-less `json_schema` must drop the field for those providers, route
+the model to a provider that supports it (OpenAI-compatible providers and
+Cohere still receive the body unchanged), or add such a provider as a
+fallback. A `strict: true` JSON schema routed to Gemini/Vertex must stay
+inside the enforced keyword subset listed in `docs/plugins.md`; set
+`strict: false` to forward any schema as guidance. Neutral values (`n: 1`,
+zero penalties, `logprobs: false`, `parallel_tool_calls: true`) are unaffected.
+
+Per-provider `connect_timeout_seconds` and `read_timeout_seconds` now accept
+`1`–`86400`. A configuration with a larger value fails validation and
+admission; lower it (use `streaming.read_timeout_seconds: 0` for an unbounded
+streaming budget).
+
+### `request_deduplication`: live in-flight ceiling and `v7` logical keys (#6818)
+
+`request_deduplication` now hard-caps live local in-flight markers with the new
+`max_inflight_entries`, which defaults to `max_entries`. When the ceiling is
+reached, a request with a **new** idempotency key is refused with `503`
+(`Idempotency in-flight capacity is saturated`); keys already tracked still
+replay or conflict. If an instance sets a small `max_entries` to bound
+completed-response retention while serving more concurrent idempotent requests
+than that, set `max_inflight_entries` explicitly to the concurrency the route
+must admit before upgrading.
+
+Logical keys move from `v6:` to `v7:`, because the matched route's
+response-header policy left the key for the request fingerprint. Local state
+starts empty after a restart anyway; in `sync_mode: redis`, records written by
+the previous binary under `v6:` keys are not consulted. Any cutover, including
+an atomic, fully drained replacement of every gateway, therefore loses
+coordination with every still-valid old record: a retry of an operation that
+completed under a `v6:` key within its replay TTL executes again on the new
+binary. Draining only settles in-flight work; it does not protect retries of
+completed operations. Deployments that need that protection must keep old-key
+retries on the old deployment until the longest replay TTL has elapsed, rely on
+backend idempotency for that window, or explicitly accept the re-execution
+window. The old records expire on their own TTL.
+
+### `soap_ws_security`: `${...}` passwords, evicting shared Redis, SAML conditions (#6820)
+
+- A `username_token.credentials[].password` of exactly
+  `${FERRUM_PLUGIN_SECRET_<NAME>}` is now resolved from that environment
+  variable at admission. A literal password of the shape `${...}`, or a
+  reference to any other variable, is refused at admission. Change such a
+  literal password, or move the secret into a `FERRUM_PLUGIN_SECRET_<NAME>`
+  variable (directly or through `_FILE` / `_VAULT` / `_AWS` / `_AZURE` /
+  `_GCP`) set on every node that constructs the plugin, CP included.
+- `nonce.replay_scope: shared` now requires a Redis that cannot evict claims:
+  `maxmemory: 0` or `maxmemory_policy: noeviction`, proven with `INFO MEMORY`
+  (grant `INFO` to the ACL user). An evicting endpoint fails every SOAP replay
+  claim closed (`401`) until its policy is fixed and the plugin is reloaded.
+- SAML assertions carrying a condition other than a standard-shape
+  `AudienceRestriction`, `OneTimeUse`, or `ProxyRestriction` (including
+  `xsi:type`-derived or extended standard conditions) are now rejected.
+- Governed envelopes with more than 64 attributes on one element, an
+  attribute name over 128 bytes, a namespace declaration name over 70 bytes,
+  a namespace URI over 2048 bytes, more than 256 namespace declarations in
+  scope at one element, more than 256 distinct namespace bindings, or parser
+  comparison work beyond 32 × envelope length
+  are now refused with
+  `400` (`xml_namespace_bounds`) before parsing.
+
+### `ai_stream_router`: refused configurations, requests, and provider TLS isolation (#6824)
+
+Re-run `ferrum-edge validate` on every `ai_stream_router` config. These were
+admitted before and are now configuration errors: `anthropic_version: ""`
+(omit it or use `null` for the default), an endpoint with `user:password@`
+userinfo or a `#fragment`, `default_max_tokens` on any provider other than
+`anthropic`, and a `google_gemini` endpoint without `{model}` whose
+`model_patterns` is anything but the single model name the URL path names —
+add `{model}` to the endpoint or narrow the patterns.
+
+Clients that relied on silently dropped parameters now receive an
+OpenAI-shaped `400` naming the parameter: a non-integer or non-positive
+`max_tokens` / `max_completion_tokens`; `logit_bias` (non-empty),
+`logprobs: true`, or `top_logprobs`; for Anthropic, `n > 1`, non-zero
+`presence_penalty` / `frequency_penalty`, `seed`, or a JSON `response_format`;
+for Gemini, `parallel_tool_calls: false` with callable tools or a strict
+`json_schema` that uses keywords Gemini does not enforce. Anthropic extended
+thinking (`enabled` or `adaptive`) is refused with callable tools or on a
+tool-result continuation; send `tool_choice: "none"` or disable thinking for
+tool turns. Anthropic requests without an output bound still forward `4096`
+unless the provider sets `default_max_tokens`.
+
+A claimed Anthropic `2xx` response that is not `text/event-stream` now fails
+closed with a `502` instead of streaming provider-native bytes. An `https`
+provider without `inherit_backend_tls: true` is verified against the built-in
+public roots only: a private `FERRUM_TLS_CA_BUNDLE_PATH` no longer applies, so
+an internal provider behind private PKI must set `inherit_backend_tls: true`
+(which keeps the proxy's resolved TLS and its global fallbacks), and the
+global backend client certificate is no longer presented to third-party
+providers.
+
+### `jwks_auth`: issuer-less `require_mtls_binding` providers need bound siblings (#6828)
+
+A `jwks_auth` provider that sets `require_mtls_binding: true` but no `issuer`
+is now rejected at configuration load when any other provider in the same
+plugin instance does not also set `require_mtls_binding`. Without an issuer
+realm, the unbound sibling could accept the bound provider's tokens without
+the client certificate. Before upgrading, run `ferrum-edge validate` against
+your configuration; to fix a refused instance, pin the exact `issuer` on the
+mTLS-bound provider (recommended), set `require_mtls_binding` on every
+provider, or move the providers into separate plugin instances on their own
+routes. Instances whose providers all pin an issuer, or that have a single
+provider, are unaffected.
+
+### `response_caching` no longer admits `401` / `407` as cacheable statuses (#6830)
+
+`cacheable_status_codes` now refuses `401` and `407` at admission, alongside
+`1xx`, `206`, and `304`. A cached `401` / `407` could only be replayed without
+its authentication challenge (`WWW-Authenticate` is stripped from retained
+entries as per-response state, and `Proxy-Authenticate` is hop-scoped), which
+clients cannot act on. Remove `401` and `407` from every `response_caching`
+`cacheable_status_codes` list before upgrading; a config that still lists
+either fails validation and, under `KeepLastKnownGood`, is not applied on
+reload. No other migration is needed — these responses are simply forwarded
+uncached.
+
+### `oidc_relying_party` session context, logout, discovery, and redirects (PR #6833)
+
+- **Users sign in again once.** The session and pending-login encryption
+  context now covers only what a session asserts, so every cookie issued by the
+  previous release is refused and the browser is sent through login. After the
+  upgrade, changing presentation or admission settings (challenge statuses,
+  redirect allowlist, cache sizes, logout settings, `max_cookie_bytes`) no
+  longer signs users out.
+- **Logout needs a same-origin request.** Link to `logout_path` from pages on
+  the same origin or submit a same-origin `POST`. A `GET`/`HEAD` without
+  `Sec-Fetch-Site: same-origin` or `none`, or a cross-site `POST`, now answers
+  `403` and changes nothing; non-browser clients should `POST`.
+- **Discovery must report the configured issuer.** Set `providers[].issuer` to
+  exactly the `issuer` member of the discovery document (including any trailing
+  slash). HTTPS endpoints on other origins are now accepted.
+- **Paths and redirect entries are validated.** `callback_path` and
+  `logout_path` must be canonical request paths (no percent-escapes, `//`, dot
+  segments, or backslashes); update `redirect_uri` to match.
+  `trusted_redirect_hosts` entries must be `host` or `host:port`; list
+  `host:8443` explicitly for a non-default port, and keep the redirect target
+  on `redirect_uri`'s scheme.
+
+### `ai_tool_governor`: cleartext approval endpoints need an explicit opt-in (#6835)
+
+An `ai_tool_governor` `approval.endpoint_url` that uses `http://` is now
+admitted only when its host is a loopback IP literal (`127.d.d.d` or `[::1]`, a
+co-located sidecar; URL userinfo is ignored for this check). A configuration
+whose cleartext approval endpoint points anywhere else is rejected at admission
+(admin API `400`, file-mode startup failure). Before upgrading, move the
+approval service to `https://`, or set `approval.allow_plaintext: true` to keep
+the cleartext channel knowingly. No other approval field changes meaning.
+
+### `oauth2_introspection` `private_key_jwt` assertion audience (#6840)
+
+A `private_key_jwt` client assertion now carries `aud` = the resolved
+introspection endpoint URL (the configured `introspection_endpoint`, or the
+endpoint OIDC discovery resolved) unless the new
+`providers[].client_auth.client_assertion_audience` is set. It no longer
+follows `providers[].issuer`. Providers without `issuer` already used the
+endpoint and are unaffected. If a provider pins `issuer`, uses
+`private_key_jwt`, and its authorization server expects the issuer
+identifier as the assertion audience, add
+`client_assertion_audience: "<issuer>"` to its `client_auth` before
+upgrading; otherwise every uncached introspection call is refused by the
+authorization server and the gateway answers `503`.
+
+### `a2a_gateway` rewrites GRPC and HTTP+JSON card interfaces (PR #6841)
+
+With `discovery.rewrite_agent_card_urls` enabled (the default), Agent Cards now
+advertise the gateway for every transport it fronts. `GRPC` interface URLs
+(and a `GRPC`-preferred top-level `url`) become `discovery.public_base_url` (or
+the admitted forwarded origin), and `HTTP+JSON` / `REST` URLs become that base
+plus `endpoint.path`, alongside the JSON-RPC URLs that were already rewritten.
+Card signatures are dropped whenever a URL changes, so cards that were
+previously forwarded still signed because only GRPC/REST interfaces differed
+are now re-served unsigned. Make sure your gateway listener serves gRPC and
+the REST binding at those addresses. Interfaces on any other transport are
+unchanged. To publish backend cards exactly as written, set
+`discovery.rewrite_agent_card_urls: false`.
+
+The same release also refuses a JSON-RPC request whose final backend-visible
+body changes Agent Card or streaming class after `a2a_gateway` admitted it (for
+example a `request_transformer` rule that rewrites `method`), or whose final
+body grows past `detection.max_request_body_size` or stops being a JSON
+document. A body rewrite that keeps the operation within one class is still
+admitted.
+
+`a2a_gateway`'s replay-provenance digest moved to a new version, so
+`request_deduplication` / `response_caching` representations retained before
+the upgrade on a proxy with `a2a_gateway` no longer replay: a retry under a
+previous idempotency key answers `409 Conflict` until the record expires, and a
+cached response is re-fetched.
+
+### `api_chargeback` budget bounds and WebSocket billing basis (PR #6842)
+
+`api_chargeback` now refuses `cleanup_interval_seconds` above `31536000`
+(one year). To disable periodic cleanup, use `0`, not a huge interval.
+
+The aggregate overflow rows the configured proxies and pricing tiers can
+create are now reserved, plus equal headroom for a pricing reload. That covers
+one row per priced status, one shared status-`0` row when bandwidth is priced,
+and one row per stream proxy. Admission refuses a `max_retained_bytes` smaller
+than twice that matrix: a validation error names both numbers, so raise the
+budget if it appears. A reload is also refused when its new overflow rows do
+not fit beside the billing state the live registry already retains, for
+example a repricing while the registry is saturated. Raise
+`max_retained_bytes`, or let retained rows be collected and evicted, then
+retry. The check runs where each node builds the plugin generation it serves,
+so `ferrum-edge validate` and control-plane validation do not report it. A
+reload that only lowers `max_retained_bytes`, while every reserved overflow row
+already exists, is not refused; occupancy drains through eviction as before.
+The reserved bytes are no longer available to per-identity rows. In the overflow row, bandwidth recorded at a status no tier
+prices is filed under status `0`.
+
+An instance with nonzero `bandwidth_pricing` now forces its proxy's WebSocket
+sessions onto the parsed relay. `FERRUM_WEBSOCKET_TUNNEL_MODE` raw copy no
+longer applies to that proxy, and bandwidth is billed on payload bytes rather
+than wire bytes. Invoices for tunnel-mode deployments therefore drop by the
+WebSocket framing overhead, and sessions stopped by gateway policy are no longer
+billed zero bytes. Such an instance is refused on a proxy with
+`websocket_permessage_deflate: passthrough`; switch that proxy to `strip` or
+`terminate`, or remove bandwidth pricing from the instance. gRPC calls whose
+terminal status the gateway cannot read (for example a compressed gRPC-Web
+trailer frame) are now billed at the `500` tier by both `api_chargeback` and
+`api_chargeback_sink`.
+
+Idle rows are now evicted only together with every row sharing their consumer,
+proxy, and currency. They become evictable only after two delivered `/charges`
+responses have included their current counters, so expect idle rows to linger
+one collection interval longer. Neither change needs action.
+
+### `serverless_function` Lambda errors, AWS credentials, and ceilings (PR #6843)
+
+- **Lambda Invoke API failures follow `on_error`.** For `provider: aws_lambda`,
+  a non-2xx Invoke API status (429 throttling, 403 access denied, 404 missing
+  function, 413 oversized payload, 5xx) is now the invocation failure
+  `lambda_service_error` in every mode. Terminate mode no longer returns the
+  AWS status and error body to the client: `on_error: reject` answers the
+  configured `error_status_code` (default 502) with the fixed error body, and
+  `on_error: continue` proxies to the backend. Clients or alerts that keyed on
+  a passed-through Lambda 429/403 should key on the configured status or the
+  `serverless_function.<id>.error_class` metadata instead. Native gRPC
+  terminate now honors `on_error: continue` for these failures. Azure and GCP
+  HTTP triggers are unchanged.
+- **AWS header-bearing credentials are validated at admission.** An
+  `aws_access_key_id` or `aws_session_token` — in the config or in
+  `AWS_ACCESS_KEY_ID` / `AWS_SESSION_TOKEN` — containing NUL, CR, LF, or another
+  control byte other than horizontal tab is refused at load. Such a value
+  previously failed every invocation; strip the stray newline (a common
+  copy-paste artifact) from the secret.
+- **Bounded ceilings.** `timeout_ms` above 900000 (15 minutes) and
+  `max_response_body_bytes` above 67108864 (64 MiB) are refused at load. Lower
+  any larger value before upgrading.
+- **Optional, no action needed:** `aws_credentials: default_chain` (builds with
+  `secrets-aws` / `cloud-secrets`) lets IRSA, ECS task role, or EC2 instance
+  profile deployments drop static keys, and `payload_format:
+  aws_api_gateway_v2` fronts existing API Gateway HTTP API Lambda handlers.
+
+### `body_validator`: response status scope, media-type defaults, per-method entries (#6845)
+
+- **Response validation is limited to `2XX` by default.** A backend error
+  document (`4xx` / `5xx`) is no longer judged against the success schema and
+  replaced by a `502`. To keep validating error statuses, set
+  `response_status_codes`, for example `["2XX", "4XX"]` or `[200, 422]`.
+  Partial (`206`) and delta (`226`) responses are never validated.
+- **Structured-suffix media types are validated by default.** The defaults now
+  include `application/*+json` and `application/*+xml`, so
+  `application/problem+json`, `application/vnd.*+json`, and
+  `application/soap+xml` bodies are validated where they previously passed
+  through. To restore the old set, list it explicitly:
+  `["application/json", "application/xml", "text/xml"]`.
+- **An empty `content_types` / `response_content_types` list is refused.** It
+  used to mean "every valid media type". Omit the field for the defaults, or
+  list the media types to validate.
+- **`protobuf_method_messages` entries are direction-authoritative.** An entry
+  that sets only `response` (or only `request`) no longer validates the other
+  direction against `protobuf_request_type` / `protobuf_response_type`. To keep
+  the old behavior, name the type for both directions in that entry.
+- **Protobuf validation is broader and bounded.** It now also covers gRPC-Web
+  (binary and text) in both directions, so translated gRPC-Web responses are
+  validated. Per-method request rules now apply on HTTP/3 and generic
+  dispatch. Unenrolled gRPC methods now keep streaming. A message over 50000
+  nested messages, 1048576 field values, or 32 levels is refused for every
+  descriptor pool. A proto2 closed-enum number outside the declared set no
+  longer satisfies `required`. When the aggregate decode budget is exhausted,
+  the plugin answers `503` / `RESOURCE_EXHAUSTED`.
+- **New options.** `enforcement_mode: log_only` lets you roll out a schema
+  without rejecting traffic. `reject_unsupported_media_types: true` refuses
+  ungoverned request bodies with `415`. Violations are recorded as
+  `body_validator.{request,response}_{outcome,status,detail}` metadata, and
+  these keys are on the built-in log allowlist.
+
+### `ldap_auth`: authoritative group attribute and stricter admission (PR #6846)
+
+`group_attribute` now decides required-group membership on its own. A group
+entry whose returned `group_attribute` value does not match no longer passes
+through its CN, and a configured non-`cn` attribute that the directory omits
+fails closed. Before upgrading, check that your directory returns
+`group_attribute` for every required group and that its value equals the
+`required_groups` entry (for Active Directory, prefer the domain-unique
+`sAMAccountName`). A deployment that relied on the CN fallback with
+`group_attribute: sAMAccountName` must either list the `sAMAccountName` values
+in `required_groups` or switch to `group_attribute: cn`. Users who reach a
+required AD group only through nested groups also need
+`group_membership_mode: ad_in_chain`.
+
+`search_base_dn`, `group_base_dn`, and DN-shaped `bind_dn_template` /
+`service_account_dn` must be RFC 4514 DNs, and attribute fields must be
+RFC 4512 attribute descriptions. Escape any `=`, `<`, `>`, or `"` inside a DN
+value (`\=` or `\3D`), remove stray spaces from attribute names, and replace an
+`ldap_url` port of `0`. Run `ferrum-edge validate` to find affected
+configurations.
+
+### `ai_rate_limiter`: body-based classification and AI-only budget scope (#6847)
+
+`ai_rate_limiter` now buffers and classifies every uncompressed `POST` from
+its body, not its `Content-Type`. On a route that mixes AI and non-AI traffic,
+review these effects before upgrading:
+
+- AI bodies sent with a non-JSON label (or none) are now reserved and charged.
+  Clients that relied on that gap will start receiving `429`s at the budget.
+- A JSON `POST` the gateway cannot parse is now a fail-closed AI candidate:
+  under the default `on_unmetered_response: charge_estimate` a `2xx` without
+  token usage is answered with `502`. Upstreams normally reject malformed JSON
+  with a `4xx`, which still just releases; scope the limiter to AI routes if a
+  backend legitimately accepts such bodies.
+- `GET` and other out-of-scope requests no longer consult the budget, so they
+  are no longer refused with `429` once AI traffic exhausts it, or with `503`
+  during a Redis outage.
+- With the new `model_limits`, an AI call whose model cannot be read before
+  dispatch is refused (`415` for a still-compressed body, `400` for an
+  unparseable one); co-locate `compression` with `decompress_request: true` on
+  such routes.
+
+Budget `429`s now carry `Retry-After: <window_seconds>`. The new optional
+`consumer_limits`, `model_limits`, and `media_token_estimate` fields default to
+the previous behavior. Existing configurations need no edits.
+
+### `compression`: stricter list admission and length-gated large-limit behavior (#6848)
+
+Plugin config validation now refuses a `compression` instance whose
+`algorithms` repeats an algorithm (`["br", "brotli"]` included), whose
+`content_types` repeats a rule (compared case-insensitively) or lists more
+than 64 rules, or whose `content_types` contains `*` anywhere other than a
+whole subtype (`*/*`, `*/json`, `application/vnd.*+json`). Remove the
+duplicates; replace a `*/*` rule with the explicit types to compress, or with
+`type/*` ranges such as `text/*`, which are now matched. Validate configs with
+`ferrum-edge validate` before cutover.
+
+Deployments with `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` or above 32 MiB used
+to get no gateway compression at all. Compression now applies to responses
+whose backend declares a `Content-Length` within the ceiling, so client-visible
+`Content-Encoding` and response sizes change for those responses; chunked or
+larger responses still stream uncompressed. To keep the old behavior, remove
+the `compression` plugin from those proxies. Expect a construction-time
+warning naming the limit.
+
+Negotiation now ignores `request_transformer` rewrites of `Accept-Encoding`
+for the client response. A rule that set or removed that header to steer the
+gateway's response coding no longer does; use the `compression` `algorithms`
+order or remove the plugin instead. The rule still changes what the backend
+receives (with `remove_accept_encoding: false`).
+
+### `ai_request_guard` evaluates more request shapes (PR #6849)
+
+- Duplicate JSON object members are rejected (HTTP 400, reason
+  `ambiguous_json`). Clients must send each member once.
+- `POST` bodies with a missing, non-JSON (`text/plain`, form), or joined
+  `Content-Type` are now buffered. If the body opens a JSON object it is
+  evaluated (and malformed JSON fails closed). Uploads that must keep streaming
+  should use `multipart/*`, `application/octet-stream`, or an
+  `audio/` / `image/` / `video/` type.
+- An output cap that is not a non-negative integer (negative, fractional,
+  boolean, unparseable string) is rejected whenever `max_tokens_limit` or
+  `default_max_tokens` is set. Quoted or float integers are now evaluated by
+  value, so an over-limit `"8192"` is rejected or clamped instead of passing.
+- `require_user_field` needs a non-empty string `user`. `required_metadata_fields`
+  rejects `null` and blank strings.
+- Model policy also checks models named in Gemini/Vertex
+  (`models/{model}:{method}`), Bedrock (`model/{id}/converse|invoke`), and Azure
+  (`openai/deployments/{deployment}`) paths. Every path and body model must
+  pass. List Azure deployment names in `allowed_models` / `blocked_models`.
+- Bedrock Converse deployments that want `default_max_tokens` without a
+  top-level cap should set `supported_schema: bedrock_converse`.
+- Log pipelines with closed metadata columns must accept
+  `ai_request_guard.action` and `ai_request_guard.reason`.
+
+### `kafka_logging` producer and SASL admission is stricter (#6850)
+
+A `kafka_logging` config that previously started a sink which could never
+deliver is now refused at admission. File mode fails startup, admin writes
+return `400`, and a data plane keeps its previous generation. Before you
+upgrade, check every `kafka_logging` row:
+
+- Move `producer_config` `acks` / `request.required.acks` to top-level `acks`,
+  `message.timeout.ms` / `delivery.timeout.ms` to `message_timeout_ms`, and
+  `compression.type` / `compression.codec` to `compression`. Every spelling of
+  these properties, including `topic.`-prefixed and re-cased forms, is refused
+  in `producer_config`.
+- Set queue and message budgets only under their own names: for example
+  `message.max.bytes`, not `topic.message.max.bytes`.
+- Keep one spelling per librdkafka property. For example, use `linger.ms` or
+  `queue.buffering.max.ms`, not both.
+- If you set `producer_config.message.max.bytes`, make it at least
+  `max_entry_bytes` + 128, or remove it and let the default fit.
+- `enable.idempotence: "true"` requires `acks: all` (or omit `acks`).
+- On `sasl_plaintext` / `sasl_ssl`, set `sasl_mechanism` to the exact
+  uppercase name (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`).
+  PLAIN and SCRAM need `sasl_username` and `sasl_password`; remove them for
+  `OAUTHBEARER`. `GSSAPI` is accepted only on Windows builds.
+
+To keep the gateway's backend egress policy on while you use `kafka_logging`,
+list the cluster's brokers in `FERRUM_KAFKA_ALLOWED_BROKERS` on every node that
+admits or runs the plugin. Include every broker the cluster advertises, or
+their subnet. See
+[`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies).
+
+### `ws_logging`: collector credentials move to `custom_headers`; disconnect records gain fields (#6852)
+
+`ws_logging` now refuses an `endpoint_url` whose query carries a
+credential-shaped parameter name (exact `jwt`, `pass`, `pwd`, `sid`,
+`sig`, `signature`; any name ending in `key`; or any name containing `token`,
+`secret`, `password`, `passwd`, `passphrase`, `api_key` / `apikey` /
+`api-key`, `access_key` / `accesskey`, `assertion`, `auth` (so also `authorization`, `x-auth`), `bearer`,
+`cookie`, `credential`, or `session`), a name that is still percent-encoded
+after one decode, an explicit port `0`, or a fragment. Such a config fails
+validation (Admin API `400`, file-mode/`validate` failure; `KeepLastKnownGood`
+keeps the previous instance). Move the credential into the new
+`custom_headers` object, preferably through the plugin-secret namespace. The
+reference is only shape-checked at admission, so a control plane does not need
+the variable; set it on every serving node, where an unset or empty value
+rejects the config reload (the previous configuration keeps serving) or aborts
+gateway startup:
+
+```yaml
+plugin_name: ws_logging
+config:
+  endpoint_url: "wss://collector.example.com/ingest"
+  custom_headers:
+    Authorization: "Bearer ${FERRUM_PLUGIN_SECRET_LOG_COLLECTOR_TOKEN}"
+```
+
+The collector must accept the credential as a handshake header. Non-credential
+query parameters (`?stream=edge`) are still admitted.
+
+WebSocket disconnect records now include `http_method`, `request_path`,
+`handshake_status_code`, and `connection_id`. Log pipelines with a closed
+column set must accept them (or drop them with a `schema` `omit`).
+Flattened disconnect metadata keys named `http_method` or `request_path` now
+yield to the native values under `on_collision: skip`. An existing schema
+`order` needs no change: disconnect-only fields it does not list are appended.
+
+### `hmac_auth` `replay_max_entries` bounds (#6853)
+
+`replay_max_entries` now accepts `1`–`10000000`, and it is refused on a
+`signing_profile: ferrum-hmac-v1` policy, where it never had an effect. Before
+upgrading, remove `replay_max_entries` from every `ferrum-hmac-v1` `hmac_auth`
+config, and lower any larger value to at most `10000000`. When one process
+needs more replay state, move the policy to `replay_scope: shared` with
+`sync_mode: redis`, and still remove `replay_max_entries` (or keep it within
+the admitted range): it is validated in every scope, though shared scope
+ignores it. A config that still carries either is rejected at admission
+and at startup. No other `hmac_auth` setting changes: `signed_headers`,
+`required_components`, `max_body_bytes`, and `signing_profile: rfc9421` are
+new opt-ins, and a policy that sets none of them keeps its signing base
+byte-for-byte.
+
+### `ai_prompt_compressor` refuses residual preserve markers (#6854)
+
+With `preserve_tag` configured, the final request-body hook now refuses (`400`)
+an admitted Chat/Text Completions (or fixed-family) JSON `POST` whose final
+string values still contain a configured marker. Check for body transforms
+that run after the compressor (priority 4055), such as a `request_transformer`
+rule with a later `priority_override`, and make sure they never write
+`<TAG>` / `</TAG>` into prompt-bearing values.
+
+Content-coded candidate requests are now buffered and their decoded view is
+verified. An unsupported or malformed `Content-Encoding` on such a request is a
+`400` instead of passthrough. To keep compressing those uploads, configure
+`compression` with `decompress_request: true`. Otherwise make sure clients send
+only `gzip`, `br`, or `identity`.
+
+`compress_roles` now accepts at most 32 entries of at most 64 characters. Trim
+a longer list before upgrading; such a config is rejected at load.
+
+### `load_testing` cleartext fan-out peers and acknowledgments (PR #6856)
+
+`load_testing` now refuses an `http://` `gateway_addresses` entry at load time
+unless its host is a loopback IP literal written as `127.d.d.d` or `[::1]`,
+because fan-out carries the trigger key and the triggering request's
+credentials. Before upgrading, for each such peer either switch it to
+`https://`, or set `allow_plaintext: true` on the plugin when cleartext to that
+peer is intended.
+
+Fan-out peers now acknowledge an admitted trigger with `204` plus
+`X-Loadtesting-Ack` echoing the controller's `X-Loadtesting-Run-Id`, and a
+fan-out request whose key fails is refused with `403` instead of reaching the
+peer's backend. Upgrade every node that takes part in fan-out together: a
+controller reports a peer on an older build as not acknowledged.
+
+### `ai_token_metrics`: priority 4070 and default streaming metering (#6857)
+
+`ai_token_metrics` now runs at priority 4070 instead of 4100: after
+`ai_federation` (4060) and before `ai_response_guard` (4075) and
+`security_headers` (4080). Custom plugins or `priority_override` values in the
+4070–4099 range that relied on running before token metrics (for example, to
+rewrite a response body it reads) must move below 4070. When a guard rejects a
+2xx generation, that generation's `ai_*` token metadata, estimated cost, and
+Prometheus counters are now kept; before this change the request recorded
+nothing.
+
+Streamed `text/event-stream` and AWS `application/vnd.amazon.eventstream`
+responses are now metered by default without buffering, including on
+retry-enabled routes. A collected SSE or event-stream body is metered whether
+or not `buffer_streaming_responses` is set. With an unchanged configuration,
+`ferrum_ai_*_tokens_total` and `ferrum_ai_estimated_cost_currency_units_total`
+therefore now include streamed traffic that previously contributed nothing,
+and those transactions gain `ai_*` metadata and `ai_streaming: "true"`.
+Rebaseline cost dashboards and alert thresholds. You only need
+`buffer_streaming_responses: true` to meter content-coded (`gzip`/`br`) SSE
+origins, which the incremental observer cannot read. A 2xx JSON or streamed
+response that yields no usable usage now carries `{prefix}_unmetered_reason`.
+A backend model longer than 256 bytes or containing control characters is no
+longer copied into `{prefix}_model`.
+
+### `request_transformer`: stricter admission, WebSocket handshakes, request digests (#6858)
+
+Check every `request_transformer` config with `ferrum-edge validate` before
+upgrading:
+
+- Header add/update/rename destinations under `x-path-param-*` are refused, and
+  so are `_` spellings of gateway-owned destinations (`X_Forwarded_For`,
+  `x_forwarded_proto`, `content_length`, `transfer_encoding`, …). Remove those
+  rules; the router owns path captures and the gateway owns forwarding
+  identity and framing.
+- Body `key` / `new_key` paths with an empty dot-segment (`""`, `user.`,
+  `.user`, `a..b`) are refused in `request_transformer` and
+  `response_transformer`. Fix the typo, or escape a literal dot as `\.`.
+- A header or query `value` containing `$(` is now a template. Replace a
+  literal `$(` with `$$(`; an unknown variable, or a credential-class source
+  name (`$(header.authorization)`, `$(query.access_token)`, …), is refused at
+  load.
+- `mesh_route_dispatch` `request_transform` add/update destinations under
+  `x-path-param-*` are refused. The translators refuse the offending resource
+  only: an HTTPRoute/GRPCRoute `RequestHeaderModifier` `set`/`add` of such a
+  name reports `Accepted=False` (`UnsupportedValue`), and a VirtualService
+  `headers.request.set`/`add` of an `x-path-param-*` or `x-consumer-*` name
+  is refused at translation; the rest of the cluster's config still loads.
+
+Behaviour changes that need no config edit but may matter downstream:
+
+- Header and query rules, and `mesh_route_dispatch` route-header transforms,
+  now apply to WebSocket upgrade handshakes on the same route. A transformer
+  meant only for plain HTTP requests needs a route that does not serve
+  WebSocket.
+- When an instance has body rules, `Content-Digest`, `Repr-Digest`,
+  `Digest`, and `Content-MD5` are removed from any request whose FINAL
+  outbound `Content-Type` is JSON (or absent) and whose body is not proven
+  empty by `Content-Length: 0` (including a lengthless HTTP/2 or HTTP/3
+  `GET`) — even when the rules end up not changing it. A backend that requires request digests cannot sit behind body
+  rules.
+- Transaction logs gain `request_transformer.rule_skipped` and
+  `request_transformer.body_skipped` metadata when a rule or body pass did not
+  apply.
+
+### `opa`: identity realms, repeated headers, credential redaction, and empty bodies (#6860)
+
+- **Realm-aware policies.** For an external identity (no mapped Consumer),
+  `input.consumer` now includes `realm: {mechanism, authority}`. Policies that
+  authorize on `input.consumer.identity` should also match `realm` (and
+  require it to be non-null): read each authority's digest from OPA's
+  decision log for a test request and pin it in Rego. Existing fields are
+  unchanged.
+- **Repeated headers are denied by default.** A request that repeats a
+  non-list header (for example two `X-Role` lines) now receives
+  `deny_status` before OPA is called (`opa.reason` `ambiguous_header`).
+  Clients that legitimately send such duplicates must fold them, or set
+  `header_ambiguity_policy: delegate` and deny on
+  `input.header_ambiguity` in Rego. List-valued fields (`Accept*`,
+  `Cache-Control`, `Cookie`, `Via`, `X-Forwarded-*`, …) are unaffected.
+- **More names are redacted.** Headers and query parameters that the shared
+  sensitive-name classifier recognizes as credentials (`x-vault-token`,
+  `x-session-id`, `refresh_token`, `client_secret`, `password`,
+  `X-Amz-Signature`, …) no longer reach `input.headers`, `input.query`, or
+  the pair lists. A policy that read one must stop relying on it; for query
+  names, `include_query_credentials: true` restores them.
+- **Empty bodies.** With `include_body: true`, a bodiless HTTP/1.1 or HTTP/2
+  request now has `input.body == ""` (it was `null`), matching HTTP/3 and
+  `Content-Length: 0`. `null` now only means no body was collected (for
+  example a WebSocket handshake). Rules that tested `input.body == null` for
+  an empty request must test `""`.
+- New opt-in keys `decision_request_headers`, `decision_deny_response`, and
+  `max_concurrent_decisions` change nothing unless configured.
+
+### WebSocket decision observers and `ws_frame_logging` records (#6862)
+
+Custom plugins that implement `Plugin::prepare_ws_frame_delivery` must add the
+new `connection_id: u64` and `direction: WebSocketFrameDirection` parameters
+before `message`. Custom plugins that return `true` from
+`observes_ws_frame_decisions()` and recorded the terminal Close from
+`on_ws_frame` must move that logic to the new `on_ws_policy_close(proxy_id,
+connection_id, direction, close)` hook. The relay no longer invokes any plugin,
+observers included, for a message after a terminal Close. It reports the final
+decision to every observer exactly once, also for fragment-budget and parser
+rejections. Observers still receive ordinary messages through `on_ws_frame`.
+
+`ws_frame_logging` configs need no change. Log consumers will see:
+
+- a new `plugin_id` field on every record;
+- a new `termination_reason` field on disconnect records;
+- `outcome=policy_close` for parser, fragment, and priority-reordered
+  rejections that previously produced no record.
+
+The new `sample_rate`, `direction`, and `max_records_per_connection` options
+default to the previous behavior (everything is logged).
+
+### `stdout_logging`: keep-last-known-good, unsatisfiable filters, route-miss logging (#6863)
+
+`stdout_logging` is now registered `KeepLastKnownGood`. An enabled config the
+constructor refuses (for example a typo such as `filtr:`) fails file-mode
+startup and `ferrum-edge validate`, and a reload carrying it is refused while
+the previous generation keeps serving. It is no longer omitted with a
+warning, and database mode no longer quarantines the row. Fix or disable such
+rows before upgrading. Status-code bounds now accept `0..=999`, and a filter
+that can never match is refused: an `and` conjunction in `filter.expression`
+whose `status_code_min` exceeds its `status_code_max`, or a mesh Telemetry
+`accessLogging.filter.expression` with a `response.code` bound above 999 or
+crossed bounds (the Telemetry resource becomes invalid). A global
+`stdout_logging` without an execution trigger, including the mesh-injected
+`__mesh_access_log`, now also logs route-miss `404`s
+(`metadata.rejection_phase = "route_not_found"`). Add a `filter` or the new
+`sampling` block if that volume is unwanted. On the WebSocket session-end line,
+latency fields other than `latency_total_ms` are now `-1.0` instead of `0.0`.
+
+### `security_headers`: gateway-owned names, HSTS grammar, and size caps (#6864)
+
+`set` and `remove` now refuse `Content-Type`, `Content-Encoding`,
+`Content-Range`, and the protocol-managed framing names (`Connection`,
+`Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`,
+`TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`), case-insensitively. Before
+upgrading, delete such entries. Use `response_transformer` if a backend's
+content type really must change, and remove `remove` entries for framing
+names, which never had an effect. An `hsts` string or a
+`Strict-Transport-Security` `set` value must contain exactly one
+`max-age=<seconds>` directive and at most one valueless `includeSubDomains`
+(duplicates of other directives, such as `preload`, are not checked). Replace a value such as `includeSubDomains; preload`
+with `max-age=31536000; includeSubDomains; preload`, or use the `hsts` object
+form. A policy with more than 64 `set` entries, more than 64 `remove` names,
+or a value longer than 8192 bytes is refused: split it across instances or
+shorten it. Validate the edited configuration with `ferrum-edge validate`
+before rollout. With `override_existing: false`, a backend value for a built-in
+security header that browsers ignore entirely (empty, or ineffective for that
+header) is now replaced by the configured value; any value a browser acts on is
+still kept.
+
+### Consumer JWT secrets: unique per namespace, 32 non-whitespace characters (#6865)
+
+Each Consumer now needs its own `jwt` secret within a namespace. Writes and
+file-mode loading refuse a secret that another Consumer in the namespace
+already has. On a database, CP, or DP load, every Consumer that shares a JWT
+secret loses its `jwt` credential and gets `401` from `jwt_auth` until you
+rotate the secret. Each removal is logged at `error` as `Quarantined jwt
+credential of consumer ...`. The same happens to stored `jwt` secrets with
+fewer than 32 non-whitespace characters (whitespace no longer counts toward the
+floor) and to malformed stored `jwt` values, which previously loaded with only
+a validation warning. Before upgrading:
+- give every Consumer a distinct CSPRNG secret of at least 32 non-whitespace
+  characters;
+- rotate any secret that was copied across Consumers.
+
+A running gateway remembers a secret it has seen shared until it restarts,
+so replace it on **every** Consumer that held it rather than only on one.
+Database-mode and control-plane polling now take a full reload for any changed
+Consumer that carries `jwt`. Rotation entries inside one Consumer and reuse
+across namespaces are still allowed. `jwt_auth` also gains `algorithm` (`HS256` default) and
+`hide_credentials` (default `false`); existing configurations keep their
+behavior. See [plugins.md](plugins.md#jwt_auth).
+
+### `request_termination`: stricter trigger and content-type admission (#6866)
+
+A `request_termination` config is now rejected at load, reload, or admin
+write when:
+
+- `content_type` contains a character other than visible ASCII, space, or
+  tab (for example `text/pläin` or a leading newline);
+- `trigger.header_value` contains a control character other than tab, or is
+  made only of spaces/tabs;
+- `trigger.path_prefix` contains `<`, `>`, or a backtick.
+
+None of these could ever match a live request, apart from the `content_type`
+case, which the admin API schema already refused. Fix each value: spell the
+media type in ASCII, omit `header_value` (or set it to `""`) for a presence
+match, and drop the unreachable character from the prefix. A non-empty
+`header_value` now matches after surrounding spaces/tabs are stripped from
+each field line. A client that previously slipped past an exact-value
+trigger on HTTP/2 or HTTP/3 by padding the value is now terminated, as it
+always was on HTTP/1.1. The new optional `headers` object needs no
+migration. See [plugins.md](plugins.md#request_termination).
+
+### `udp_rate_limiting`: UDP/DTLS-only attachments and session retirement on hook reloads (#6868)
+
+A proxy- or proxy-group-scoped `udp_rate_limiting` plugin config whose targets
+include a TCP/TCP+TLS or HTTP-family proxy is now refused at configuration
+admission (admin API, file load, database/CP snapshot) and plugin-cache
+validation. Such an attachment never enforced anything — the plugin only runs
+on UDP/DTLS datagrams — so remove it, attach it to the UDP/DTLS proxies only,
+or make it a global policy (globals keep applying to UDP/DTLS listeners only).
+Use `tcp_connection_throttle` for TCP connection admission and `rate_limiting`
+for HTTP-family requests.
+
+A reload that changes a UDP/DTLS proxy's datagram-hook plugin configs (adding,
+removing, reordering, or reconfiguring `udp_rate_limiting`, `waf`,
+`fault_injection`, or another datagram plugin, including its trigger or
+priority override) now ends that
+proxy's established sessions at their next datagram, which is dropped; the
+client's following datagram opens a new session under the current policy.
+Plain-UDP backends see the client arrive from a new gateway source port, and
+DTLS-terminating clients must complete a new handshake (DTLS passthrough clients
+must reconnect: their next record is not a new ClientHello). Local rate-limit
+budgets carry over for a compatible policy. If a protocol cannot tolerate that,
+schedule datagram-plugin changes for those proxies in a maintenance window.
+Reloads that leave the proxy's datagram-hook configs unchanged do not end
+sessions, including full reloads (file-mode `SIGHUP`, a DP full snapshot, a
+database-mode full reload). A global `udp_rate_limiting` with no UDP/DTLS proxy
+logs a warning that it is inert.
+The new optional `ipv6_prefix` (default 64) and `direction` (default `both`)
+keys keep the previous behavior when omitted. See
+[plugins.md](plugins.md#udp_rate_limiting).
+
+### `response_mock` delays, statuses, and config sizes are bounded (#6869)
+
+`response_mock` `delay_ms` now accepts at most `60000` (one minute, the same
+ceiling as `fault_injection`); a rule above it fails startup/reload and admin
+API writes. Lower any larger delay before upgrading. Delays also count against
+`FERRUM_MAX_CONCURRENT_FAULT_DELAYS` (default 256, shared with
+`fault_injection`): when that budget is exhausted, or the gateway is shutting
+down, the mock is served without its delay, so raise the budget if a latency
+test parks more concurrent requests than that.
+
+`status_code: 101` is no longer accepted. Previously it produced a synthetic
+handshake that no client could use (and that HTTP/2 / HTTP/3 cannot carry).
+A `2xx` rule that matches a WebSocket handshake now answers `500` on every
+frontend; mock a refused handshake with a non-`2xx` status (for example `401`,
+`403`, `418`, or `503`) instead, or set `passthrough_on_no_match: true` and
+let the real backend answer.
+
+Configs are bounded to 1024 rules, a 262144-byte `body` per rule, 64 response
+`headers` per rule, and 8192-byte header values. Split oversized rule sets
+across proxies or trim fixture bodies. Configs within these bounds need no
+change.
+
+### `grpc_deadline`: `headroom_ms` and stalled streaming readers (#6870)
+
+No migration is required. `grpc_deadline` accepts an optional `headroom_ms`
+(positive, less than `max_deadline_ms`). A gRPC client on HTTP/1.1 or HTTP/2
+that stops reading a streaming response past its RPC deadline now has its
+connection closed after a 2 s grace (on HTTP/2 after a `GOAWAY`), instead of
+holding the backend stream indefinitely.
+
+### `spiffe_identity` on non-terminating stream proxies (#6871)
+
+A proxy- or proxy-group-scoped `spiffe_identity` PluginConfig associated with
+a `tcp`/`udp` stream proxy must now be paired with `frontend_tls: true` and
+`passthrough: false` on that proxy. Configs that violate this are refused at
+Admin API write, API-spec create/replace, batch, restore, and file/database/CP
+load (``Proxy "<id>" cannot use `spiffe_identity` PluginConfig "<id>": stream
+SPIFFE identity extraction requires `frontend_tls=true` with TLS/DTLS
+termination (`passthrough=false`)``). Such an attachment never extracted an
+identity, so to migrate either enable TLS/DTLS termination on the proxy or
+remove the scoped association. A global `spiffe_identity` (including the
+mesh-injected `__mesh_spiffe_identity`) is not affected.
+
+### `ip_restriction` rules must use canonical spellings (#6872)
+
+A CIDR prefix must be written in canonical unsigned decimal: write
+`10.0.0.0/8`, not `10.0.0.0/08` or `10.0.0.0/+8`, and `::ffff:192.0.2.0/96`,
+not `/096`. An IPv6 rule's zone identifier, if present, must be non-empty and
+contain no whitespace, `/`, or `]`. Drop a trailing `%` (`fe80::1%` →
+`fe80::1`). Each such spelling meant the same rule as its canonical form, so
+rewriting it does not change the policy. Run `ferrum-edge validate` to find
+offending rules before upgrading; a rejected reload keeps the previous plugin
+generation.
+
+### `access_control`: Consumer renames and live HBONE tunnels (#6873)
+
+- **Consumer renames referenced by `access_control`.** Edit the
+  `access_control` plugin configs that name the old username first (for
+  example, replace it with the new username), then rename the Consumer. In
+  file mode, change the rule and the Consumer in the same reload. Updates that
+  keep the username are unaffected.
+- **Live HBONE tunnels follow Consumer edits.** In mesh deployments that map
+  HBONE peers to Consumers (for example `mtls_auth`), removing a Consumer from
+  an allowed group or deleting it now resets its live tunnels on the next
+  config publication. Peers reconnect under the current policy. No
+  configuration change is needed.
+
+### `request_size_limiting` `413` body (#6875)
+
+Clients that parsed `limit` from the plugin's `413` (`{"error":"Request body
+too large","limit":N}`) or its ambiguous-`Content-Length` `400` will no longer
+find it. Every request-body-size `413` now has the body `{"error":"Request
+body exceeds maximum size"}`, whichever enforcement point fired. Match on
+status `413` (gRPC `RESOURCE_EXHAUSTED`) rather than the body text. To see
+which limit fired, read `request_size_limiting.limit_bytes`,
+`.observed_bytes`, `.reason`, and `.instance` from the transaction log
+metadata. These keys are present for plugin header-phase and buffered-body
+refusals. They are absent for proxy-core streaming overruns. For final-body
+refusals, on any protocol, they are present only when the hook receives a
+request context: always on the native HTTP/3 preparation and HTTP/3 bridge
+paths, and elsewhere (H1/H2 and the native HTTP/3 buffered ladder) only when
+another plugin on the route requests the final-body context. `.observed_bytes`
+is absent for an ambiguous `Content-Length`.
+
+### `correlation_id` refuses `x-geo-country` and `x-real-ip` as `header_name` (#6876)
+
+Configs using either name (including `X_Geo_Country` and other case/separator
+variants of `x-geo-country`) are now rejected at admin admission, file/DB
+load, and reload, with keep-last-known-good on reload. Neither config ever
+delivered the ID to the backend, because the proxy strips or replaces those
+fields before dispatch. Pick a dedicated name such as `x-request-id` or
+`x-correlation-id`. Custom plugins whose `correlation_id_header_name()`
+returns either name are refused at plugin-chain composition.
+
+### `bot_detection`: blank and non-UTF-8 User-Agents (#6878)
+
+A `User-Agent` field line that is not valid UTF-8 is now rejected with
+`custom_response_code` instead of being treated as missing (and allowed under
+the default `allow_missing_user_agent: true`). The allow-list doesn't change
+this. With `allow_missing_user_agent: false`, an empty or whitespace-only
+`User-Agent` is now rejected like a missing one. No config migration is
+needed. Clients that send non-UTF-8 bytes in `User-Agent`, or send a blank
+`User-Agent` to a route with `allow_missing_user_agent: false`, must send a
+valid UTF-8, non-blank User-Agent (or omit it where missing UAs are allowed).
+If a probe or internal client sends `User-Agent:` with no value and should
+keep passing, leave `allow_missing_user_agent` at `true`.
+
+### `response_size_limiting` strict mode and aggregate MCP SSE (#6880)
+
+A route that combines `response_size_limiting` with `require_buffered_check:
+true` and `mcp_gateway` aggregate SSE multiplexing now answers the session
+`GET` listener with HTTP 502 instead of streaming it, because the listener's
+complete size cannot be proven. To keep the listener, use a non-strict
+instance (`require_buffered_check: false`). Its `max_bytes` then bounds the
+listener's cumulative bytes, and the stream is reset once the next event or
+keepalive would cross the limit. Size `max_bytes` accordingly, or rely on
+`sessions.sse_listener_max_lifetime_seconds` rotation. Known-length SSE
+responses within `max_bytes` are no longer refused under strict mode on routes
+with no streaming response inspector. Routes with such an inspector, for
+example `sse` with `retry_ms`, keep the refusal.
+
+### Custom plugins: `WebSocketSizeLimits` is directional (#6881)
+
+Custom plugins that implement `Plugin::websocket_size_limits()` must return
+`WebSocketSizeLimits { client_to_backend, backend_to_client }`, where each
+field is a `WebSocketDirectionSizeLimits` with the former `max_frame_bytes`,
+`max_message_bytes` and `close_reason` fields. To keep the old symmetric
+behavior, put the same value in both fields. `ws_message_size_limiting`
+configs need no change. The new `client_to_backend` / `backend_to_client`
+override objects are optional.
+
+### Multiple `Authorization` credentials and `key_auth` `;` query aliases are refused (#6882)
+
+- **Multiple `Authorization` credentials.** `Authorization` is a single
+  credential (RFC 9110 §11.6.2). Ferrum now refuses, on every route, a request
+  that sends `Authorization` as more than one field line or whose value
+  carries a second credential after a top-level comma (`Bearer x, Basic …`).
+  Ordinary HTTP/1.1, HTTP/2, HTTP/3 and WebSocket requests get `400`. Native
+  gRPC and gRPC-Web receive the protocol-error framing for their flavor (on
+  HTTP/3, a trailers-only `INVALID_ARGUMENT` status) rather than a literal
+  `400`. Clients or intermediaries that duplicate or comma-fold
+  `Authorization` must send exactly one credential. `auth-param` lists such as
+  Digest, AWS SigV4, or Ferrum `hmac` are unaffected.
+- **`key_auth` query aliases behind `;`.** With `key_location: query:<name>`,
+  a request whose name also appears as a `;`-separated sub-parameter
+  (`?carrier=;api_key=k`) now returns `401 {"error":"Ambiguous API key query
+  parameter"}` instead of being treated as missing. Send the key as an
+  ordinary `&`-separated parameter. A `;` inside the value is unaffected.
+
 ### `cors` method and header lists are bounded (#6844)
 
 `cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
