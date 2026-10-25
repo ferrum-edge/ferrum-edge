@@ -6954,6 +6954,9 @@ fn proto3_review_set() -> Vec<u8> {
 /// enum Mode { SAFE = 0; }
 /// message Request { required Mode mode = 1; }
 /// message Tags { repeated Mode modes = 1; }
+/// message Holder { optional Request child = 1; }
+/// message Ided { required int32 id = 1; }
+/// message Choice { oneof choice { Ided child = 1; Mode mode = 2; } }
 /// ```
 fn proto2_enum_set() -> Vec<u8> {
     let mode = pb_enum("Mode", &[("SAFE", 0)]);
@@ -6965,6 +6968,32 @@ fn proto2_enum_set() -> Vec<u8> {
         "Tags",
         &[pb_enum_field("modes", 1, PB_LABEL_REPEATED, ".e2.Mode")],
     );
+    let holder = pb_message(
+        "Holder",
+        &[pb_message_field(
+            "child",
+            1,
+            PB_LABEL_OPTIONAL,
+            ".e2.Request",
+        )],
+    );
+    let ided = pb_message(
+        "Ided",
+        &[pb_field("id", 1, PB_LABEL_REQUIRED, PB_TYPE_INT32)],
+    );
+    let choice = pb_with_oneof(
+        pb_message(
+            "Choice",
+            &[
+                pb_in_oneof(
+                    pb_message_field("child", 1, PB_LABEL_OPTIONAL, ".e2.Ided"),
+                    0,
+                ),
+                pb_in_oneof(pb_enum_field("mode", 2, PB_LABEL_OPTIONAL, ".e2.Mode"), 0),
+            ],
+        ),
+        "choice",
+    );
     pb_file(
         "e2.proto",
         "e2",
@@ -6973,6 +7002,9 @@ fn proto2_enum_set() -> Vec<u8> {
             (PB_FILE_ENUM, mode),
             (PB_FILE_MESSAGE, request),
             (PB_FILE_MESSAGE, tags),
+            (PB_FILE_MESSAGE, holder),
+            (PB_FILE_MESSAGE, ided),
+            (PB_FILE_MESSAGE, choice),
         ],
     )
 }
@@ -8166,4 +8198,140 @@ fn excluded_origin_statuses_do_not_claim_the_origin_encoding_gate() {
     }))
     .unwrap();
     assert!(scoped.enforces_response_body_policy(&encoded(422), Some("application/json"), b""));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PR #6845 fix round 2
+// ═══════════════════════════════════════════════════════════════════════
+
+/// PR6845-SOL-4: closed-enum initialization is decided over the MERGED message
+/// a conforming proto2 reader builds, where an undeclared number is an unknown
+/// field that neither overwrites a declared value nor selects a oneof member.
+#[tokio::test]
+async fn closed_enum_initialization_follows_submessage_merging_and_oneofs() {
+    let dir = review_descriptor_dir(proto2_enum_set());
+    let headers = grpc_request_headers();
+    let holder = review_plugin(&dir, json!({"protobuf_request_type": "e2.Holder"}));
+
+    // Two singular `child` occurrences merge: SAFE survives the unknown 7 in
+    // either order, so the merged child is initialized.
+    for payload in [
+        [0x0a, 0x02, 0x08, 0x00, 0x0a, 0x02, 0x08, 0x07],
+        [0x0a, 0x02, 0x08, 0x07, 0x0a, 0x02, 0x08, 0x00],
+    ] {
+        assert_continue(
+            holder
+                .on_final_request_body(&headers, &grpc_frame(&payload))
+                .await,
+        );
+    }
+    // A child whose only `mode` is undeclared is uninitialized.
+    assert_reject(
+        holder
+            .on_final_request_body(&headers, &grpc_frame(&[0x0a, 0x02, 0x08, 0x07]))
+            .await,
+        Some(400),
+    );
+
+    // An undeclared closed-enum oneof member does not replace the selected
+    // `child`, so that child's missing `required id` is still enforced...
+    let choice = review_plugin(&dir, json!({"protobuf_request_type": "e2.Choice"}));
+    assert_reject(
+        choice
+            .on_final_request_body(&headers, &grpc_frame(&[0x0a, 0x00, 0x10, 0x07]))
+            .await,
+        Some(400),
+    );
+    // ...and an initialized child stays initialized.
+    assert_continue(
+        choice
+            .on_final_request_body(&headers, &grpc_frame(&[0x0a, 0x02, 0x08, 0x05, 0x10, 0x07]))
+            .await,
+    );
+    // The response direction uses the same inspection representation.
+    let response = review_plugin(&dir, json!({"protobuf_response_type": "e2.Choice"}));
+    let mut ctx = grpc_ctx();
+    assert_reject(
+        response
+            .finalize_client_visible_response_body(
+                &mut ctx,
+                200,
+                &grpc_response_headers(),
+                &grpc_frame(&[0x0a, 0x00, 0x10, 0x07]),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Strict mode still refuses the unknown occurrence itself.
+    let strict = review_plugin(
+        &dir,
+        json!({"protobuf_request_type": "e2.Holder", "protobuf_reject_unknown_fields": true}),
+    );
+    assert_reject(
+        strict
+            .on_final_request_body(
+                &headers,
+                &grpc_frame(&[0x0a, 0x02, 0x08, 0x00, 0x0a, 0x02, 0x08, 0x07]),
+            )
+            .await,
+        Some(400),
+    );
+}
+
+/// PR6845-SOL-2: a method-scoped configuration opts into backend-path
+/// resolution, so a prefix REPLACEMENT (`/v1.Greeter` stripped, `/v2.Greeter`
+/// prepended) is selected by the bound backend method, and both ladders re-ask
+/// the buffering vote once that path is bound.
+#[tokio::test]
+async fn a_service_prefix_replacement_selects_the_backend_method() {
+    use ferrum_edge::_test_support::bind_authorized_backend_path_for_test;
+
+    let plugin = BodyValidator::new(&json!({
+        "protobuf_descriptor_path": test_descriptor_path(),
+        "protobuf_method_messages": {
+            "/v2.Greeter/SayHello": {"request": "test.HelloRequest"}
+        },
+        "protobuf_reject_unknown_fields": true
+    }))
+    .unwrap();
+    assert!(plugin.requires_backend_path_resolution());
+    assert!(!protobuf_plugin().requires_backend_path_resolution());
+
+    let mut unknown = encode_hello_request("Eve", 25);
+    unknown.extend_from_slice(&[0x98, 0x06, 0x01]);
+    let unknown = grpc_frame(&unknown);
+
+    // Before the backend path is bound the client method is not enrolled...
+    let mut ctx = hello_ctx("/v1.Greeter/SayHello");
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    // ...once it is, the vote and the final selector both use it, even with
+    // the native ladder's client-path `:path` in the hook headers.
+    bind_authorized_backend_path_for_test(&mut ctx, "/v2.Greeter/SayHello");
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let mut headers = content_type_headers("application/grpc");
+    headers.insert(":path".to_string(), "/v1.Greeter/SayHello".to_string());
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &unknown)
+            .await,
+        Some(400),
+    );
+
+    for (name, source) in [
+        ("H1/H2", include_str!("../../../src/proxy/mod.rs")),
+        ("H3", include_str!("../../../src/http3/server.rs")),
+    ] {
+        let bind = source
+            .find("ctx.bind_authorized_backend_path(backend_path);")
+            .unwrap_or_else(|| panic!("{name} must bind the backend path"));
+        let window: String = source[bind..].chars().take(2600).collect();
+        assert!(
+            window.contains("if backend_path_is_policy_bound &&")
+                && window.contains("final_request_body_requirements("),
+            "{name}: the body requirements must be recomputed after the backend path is bound"
+        );
+    }
 }
