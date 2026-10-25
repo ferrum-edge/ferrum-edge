@@ -28624,7 +28624,9 @@ components:
         `decision_pointer`. Fails closed by default; `fail_open: true` is the
         opt-in availability mode. Unknown configuration keys are rejected.
         Request headers and query-located credentials are redacted before
-        being sent to OPA.
+        being sent to OPA. The decision binds the request as of the authorize
+        phase; later request transforms are outside it. Each decision records
+        opa.decision and opa.reason transaction metadata.
       properties:
         opa_host:
           type: string
@@ -28801,19 +28803,32 @@ components:
           type: boolean
           default: false
           description: >-
-            Unsafe opt-in to include built-in and authentication-plugin-marked
-            query credentials in input.query and input.query_pairs. Keys
-            listed in redact_query_keys remain redacted from both views.
+            Unsafe opt-in to include built-in, classifier-recognized, and
+            authentication-plugin-marked query credentials in input.query and
+            input.query_pairs. Keys listed in redact_query_keys remain
+            redacted from both views.
         include_headers:
           type: boolean
           default: true
+          description: >-
+            Include request headers as input.headers (one folded value per
+            lowercase name), input.header_pairs (every field line the backend
+            may receive, as {name, value}, grouped by name in sorted order with
+            repeated lines in wire order), and input.header_ambiguity. Built-in
+            and redact_headers names, active authentication credential headers,
+            and names the shared sensitive-name classifier recognizes as
+            credentials are omitted from all three.
         include_body:
           type: boolean
           default: false
           description: >-
             After authentication succeeds, buffer and forward the request
             body. UTF-8 bodies use `body`; non-UTF-8 raw bytes use
-            `body_base64`.
+            `body_base64`. A transport-proven empty body is `body: ""` on
+            every frontend protocol; `body: null` means no body
+            representation was collected (for example a WebSocket handshake).
+            The body is read only from the gateway-owned buffered bytes,
+            never from plugin metadata.
         max_body_bytes:
           type: [integer, "null"]
           format: uint64
@@ -28828,6 +28843,15 @@ components:
         include_consumer:
           type: boolean
           default: true
+          description: >-
+            Include input.consumer: the mapped Consumer (id, username,
+            acl_groups, custom_id) or, for an external identity, identity,
+            auth_method, and realm. realm is {mechanism, authority}, where
+            authority is the opaque, stable lowercase-hex digest of the
+            verifying authority (null for a single-authority mechanism), and
+            realm itself is null when the identity was not committed by the
+            authentication boundary. Equal identity strings from different
+            realms are different principals.
         include_client_ip:
           type: boolean
           default: true
@@ -28860,6 +28884,70 @@ components:
             makes a deny-style Rego rule undefined rather than true, so a
             'delegate' policy must deny on any input.query_ambiguity
             classification it does not handle.
+        header_ambiguity_policy:
+          type: string
+          enum:
+            - reject
+            - delegate
+          default: reject
+          description: >-
+            When include_headers is enabled, controls what happens to a request
+            that repeats a header whose grammar is not a list (for example two
+            X-Role field lines, or two map keys differing only in case): the
+            backend may read the first line, the last, or the fold, while the
+            folded input.headers value matches none of them. 'reject' denies
+            with the configured deny_status and deny_body before calling OPA.
+            'delegate' calls OPA with input.header_ambiguity set to
+            ["duplicate_field_lines"], every line in input.header_pairs, and
+            the ambiguous names omitted from input.headers; the policy must
+            then deny on any classification it does not handle. List-valued
+            fields (Accept*, Cache-Control, Cookie, Forwarded, Via,
+            X-Forwarded-*, and the other RFC 9110 lists) are never ambiguous.
+        max_concurrent_decisions:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 1000000
+          description: >-
+            Optional per-instance bound on in-flight OPA decision calls. A
+            request over the bound is not queued: it takes the configured
+            failure posture immediately (fail_closed_status by default,
+            continue under fail_open) and records opa.reason
+            opa_concurrency_limit. Omit for no bound.
+        decision_request_headers:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            minLength: 1
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+          default: []
+          description: >-
+            Opt-in allow obligations. Upstream request headers an allow
+            decision object ({"allow": true, "headers": {...}} at
+            decision_pointer) may set. Every listed name becomes gateway-owned
+            for requests this instance lets through: client copies (any ASCII
+            case, `_` or `-`) are removed, and only a policy-supplied value is
+            forwarded. A decision whose headers name an unlisted header, repeat
+            a name, or carry a non-string, invalid, or over-8192-byte value is
+            refused as a policy denial. Names must be distinct (ASCII case and
+            `_`/`-` folded). The constructor also refuses gateway-owned
+            (x-consumer-*, x-ferrum-*, x-forwarded-*, x-geo-country, path-param
+            assertions), hop-by-hop, framing, representation (content-type,
+            content-encoding, content-range), and credential-bearing names
+            (the built-in redact_headers list and the shared sensitive-name
+            classifier). Empty disables allow obligations.
+        decision_deny_response:
+          type: boolean
+          default: false
+          description: >-
+            Opt-in deny obligations. A deny decision object at
+            decision_pointer may set `status` (400-599), `body` (string, at
+            most 65536 bytes), and `headers` (at most 16 string values, merged
+            over deny_headers; protocol-managed and gateway-owned diagnostic
+            names refused). Absent members fall back to deny_status, deny_body,
+            and deny_headers. A malformed obligation still denies, with the
+            static response.
         redact_headers:
           type: array
           items:
@@ -28880,9 +28968,11 @@ components:
             - x-loadtesting-key
             - x-loadtesting-fanout
           description: >-
-            Additional request headers to redact from `input.headers`. Built-in
-            sensitive headers and active authentication credential headers are
-            always omitted.
+            Additional request headers to redact from `input.headers` and
+            `input.header_pairs`. Built-in sensitive headers, active
+            authentication credential headers, and names the shared
+            sensitive-name classifier recognizes as credentials are always
+            omitted.
         redact_query_keys:
           type: array
           items:
@@ -28892,9 +28982,11 @@ components:
           description: >-
             Additional query parameter names to omit from input.query and
             input.query_pairs, matched case-insensitively. Built-in credential
-            names and query locations marked by authentication plugins are
-            already omitted unless include_query_credentials is explicitly
-            enabled.
+            names, names the shared sensitive-name classifier recognizes as
+            credentials (for example refresh_token, client_secret, password,
+            X-Amz-Signature), and query locations marked by authentication
+            plugins are already omitted unless include_query_credentials is
+            explicitly enabled.
 
     AccessControlConfig:
       type: object

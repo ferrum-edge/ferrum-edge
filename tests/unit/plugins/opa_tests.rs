@@ -8,7 +8,7 @@ use ferrum_edge::plugins::{
     opa::Opa, priority, validate_plugin_config,
 };
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{
@@ -1826,5 +1826,822 @@ fn opa_cleartext_host_needs_opt_in_off_loopback() {
             Err(error) => error,
         };
         assert!(error.contains("allow_plaintext"), "{config}: {error}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Production-launch review fixes: identity realm, header field lines, body
+// representation, credential classification, obligations, bulkhead, and
+// decision observability.
+// ---------------------------------------------------------------------------
+
+/// Commits `alice` as an external identity through the shared authentication
+/// boundary, vouched for by the authority digest it was built with.
+struct RealmProbe([u8; 32]);
+
+#[async_trait::async_trait]
+impl ferrum_edge::plugins::utils::auth_flow::AuthMechanism for RealmProbe {
+    fn mechanism_name(&self) -> &'static str {
+        "realm_probe"
+    }
+
+    fn authentication_challenge(&self) -> &'static str {
+        "Bearer"
+    }
+
+    fn extract(
+        &self,
+        _ctx: &RequestContext,
+    ) -> ferrum_edge::plugins::utils::auth_flow::ExtractedCredential {
+        ferrum_edge::plugins::utils::auth_flow::ExtractedCredential::BearerToken(
+            "probe-secret-token".to_string(),
+        )
+    }
+
+    fn identity_realm_authority(&self) -> Option<[u8; 32]> {
+        Some(self.0)
+    }
+
+    async fn verify(
+        &self,
+        _credential: ferrum_edge::plugins::utils::auth_flow::ExtractedCredential,
+        _consumer_index: &ferrum_edge::consumer_index::ConsumerIndex,
+    ) -> ferrum_edge::plugins::utils::auth_flow::VerifyOutcome {
+        ferrum_edge::plugins::utils::auth_flow::VerifyOutcome::success(
+            None,
+            Some("alice".to_string()),
+            None,
+        )
+    }
+}
+
+async fn external_alice_ctx(authority: [u8; 32]) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/admin".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Bearer probe-secret-token".to_string(),
+    );
+    // A client cannot claim a realm through a header.
+    ctx.headers
+        .insert("x-identity-realm".to_string(), "corporate".to_string());
+    let result = ferrum_edge::plugins::utils::auth_flow::run_auth_external_identity(
+        &RealmProbe(authority),
+        &mut ctx,
+        &ferrum_edge::consumer_index::ConsumerIndex::new(&[]),
+    )
+    .await;
+    assert_continue(result);
+    assert_eq!(ctx.authenticated_identity.as_deref(), Some("alice"));
+    assert!(ctx.identified_consumer.is_none());
+    ctx
+}
+
+/// opa-SOL-1: equal subjects verified by different authorities are different
+/// principals, so the OPA input carries the verified realm and a
+/// realm-specific policy allows one and denies the other.
+#[tokio::test]
+async fn opa_input_distinguishes_equal_subjects_from_different_realms() {
+    let corporate = [0x11; 32];
+    let partner = [0x22; 32];
+    let corporate_hex = hex::encode(corporate);
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(DECISION_PATH))
+        .and(body_partial_json(json!({
+            "input": {"consumer": {
+                "identity": "alice",
+                "realm": {"mechanism": "realm_probe", "authority": corporate_hex}
+            }}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": true})))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(DECISION_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"result": false})))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut corporate_ctx = external_alice_ctx(corporate).await;
+    assert_continue(plugin.authorize(&mut corporate_ctx).await);
+    let mut partner_ctx = external_alice_ctx(partner).await;
+    assert_reject(plugin.authorize(&mut partner_ctx).await, Some(403));
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(requests.len(), 2);
+    let corporate_input: Value = requests[0].body_json().expect("JSON input");
+    let partner_input: Value = requests[1].body_json().expect("JSON input");
+    assert_eq!(corporate_input["input"]["consumer"]["identity"], "alice");
+    assert_eq!(partner_input["input"]["consumer"]["identity"], "alice");
+    assert_eq!(
+        corporate_input["input"]["consumer"]["realm"],
+        json!({"mechanism": "realm_probe", "authority": corporate_hex})
+    );
+    assert_eq!(
+        partner_input["input"]["consumer"]["realm"]["authority"],
+        json!(hex::encode(partner))
+    );
+    for input in [&corporate_input, &partner_input] {
+        let serialized = serde_json::to_string(input).expect("serialize input");
+        assert!(!serialized.contains("probe-secret-token"), "{serialized}");
+    }
+}
+
+/// An identity a plugin wrote without the authentication boundary carries no
+/// realm, so a policy can refuse to trust it.
+#[tokio::test]
+async fn opa_external_identity_without_a_committed_realm_has_null_realm() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = make_ctx();
+    ctx.identified_consumer = None;
+    ctx.authenticated_identity = Some("alice".to_string());
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(payload["input"]["consumer"]["identity"], "alice");
+    assert!(payload["input"]["consumer"]["realm"].is_null());
+    assert!(
+        payload["input"]["consumer"]
+            .as_object()
+            .expect("consumer object")
+            .contains_key("realm")
+    );
+}
+
+/// opa-SOL-2 / opa-claude-3: the policy body is never read from
+/// plugin-writable metadata; with no byte view it is `null`.
+#[tokio::test]
+async fn opa_body_is_never_sourced_from_request_body_metadata() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"include_body": true}));
+
+    let mut ctx = make_ctx();
+    ctx.request_body_bytes = None;
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        "METADATA_BODY_CANARY".to_string(),
+    );
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert!(payload["input"]["body"].is_null());
+    assert!(
+        payload["input"]
+            .as_object()
+            .expect("input object")
+            .contains_key("body")
+    );
+    let serialized = serde_json::to_string(&payload).expect("serialize payload");
+    assert!(!serialized.contains("METADATA_BODY_CANARY"), "{serialized}");
+}
+
+/// The empty byte view every frontend publishes for a proven-empty upload
+/// serializes as `body: ""`, the same as a collected `Content-Length: 0`.
+#[tokio::test]
+async fn opa_empty_body_view_is_an_empty_string() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"include_body": true}));
+
+    let mut ctx = make_ctx();
+    ctx.request_body_bytes = Some(bytes::Bytes::new());
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(payload["input"]["body"], json!(""));
+    assert!(payload["input"].get("body_base64").is_none());
+}
+
+fn raw_header_ctx(lines: &[(&'static str, &'static str)]) -> RequestContext {
+    let mut ctx = make_ctx();
+    ctx.headers.clear();
+    let mut raw = http::HeaderMap::new();
+    for &(name, value) in lines {
+        raw.append(name, http::HeaderValue::from_static(value));
+    }
+    ctx.set_raw_headers(raw);
+    ctx
+}
+
+/// opa-claude-1: a repeated non-list header is ambiguous — the folded value
+/// matches none of the lines a backend may execute — so the default rejects
+/// before OPA is called.
+#[tokio::test]
+async fn opa_rejects_a_repeated_singleton_header_before_calling_opa() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = raw_header_ctx(&[("x-role", "banned"), ("x-role", "user")]);
+    assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+    assert_eq!(
+        ctx.metadata
+            .get(ferrum_edge::plugins::opa::OPA_REASON_METADATA_KEY)
+            .map(String::as_str),
+        Some("ambiguous_header")
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .is_empty(),
+        "an ambiguous header must be refused before the decision call"
+    );
+}
+
+/// Under `delegate` OPA sees every line, the classification, and no flat
+/// value for the ambiguous name.
+#[tokio::test]
+async fn opa_delegate_mode_reports_repeated_header_lines() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"header_ambiguity_policy": "delegate"}));
+
+    let mut ctx = raw_header_ctx(&[
+        ("x-role", "banned"),
+        ("x-role", "user"),
+        ("x-request-id", "req-1"),
+    ]);
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let input = &payload["input"];
+    assert_eq!(input["header_ambiguity"], json!(["duplicate_field_lines"]));
+    assert!(input["headers"].get("x-role").is_none());
+    assert_eq!(input["headers"]["x-request-id"], "req-1");
+    assert_eq!(
+        input["header_pairs"],
+        json!([
+            {"name": "x-request-id", "value": "req-1"},
+            {"name": "x-role", "value": "banned"},
+            {"name": "x-role", "value": "user"}
+        ])
+    );
+}
+
+/// List-valued fields mean the same thing repeated or folded, so they are
+/// never ambiguous; a single line reports no ambiguity either.
+#[tokio::test]
+async fn opa_repeated_list_valued_headers_are_not_ambiguous() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = raw_header_ctx(&[
+        ("accept", "text/html"),
+        ("accept", "application/json"),
+        ("x-role", "user"),
+    ]);
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    let input = &payload["input"];
+    assert_eq!(input["header_ambiguity"], json!([]));
+    assert_eq!(input["headers"]["accept"], "text/html, application/json");
+    assert_eq!(input["headers"]["x-role"], "user");
+    assert_eq!(
+        input["header_pairs"],
+        json!([
+            {"name": "accept", "value": "text/html"},
+            {"name": "accept", "value": "application/json"},
+            {"name": "x-role", "value": "user"}
+        ])
+    );
+}
+
+/// An earlier plugin's rewrite replaces every raw line with one value, so the
+/// rewritten header is forwarded once and is not ambiguous.
+#[tokio::test]
+async fn opa_rewritten_repeated_header_is_reported_once() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = raw_header_ctx(&[("x-role", "banned"), ("x-role", "user")]);
+    ctx.materialize_headers();
+    ctx.headers.insert("x-role".to_string(), "user".to_string());
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(payload["input"]["headers"]["x-role"], "user");
+    assert_eq!(
+        payload["input"]["header_pairs"],
+        json!([{"name": "x-role", "value": "user"}])
+    );
+}
+
+/// opa-claude-2: credential-shaped names outside the exact built-in lists are
+/// withheld by the shared sensitive-name classifier.
+#[tokio::test]
+async fn opa_redacts_classifier_recognized_header_and_query_credentials() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = make_ctx();
+    ctx.headers.clear();
+    ctx.headers
+        .insert("x-vault-token".to_string(), "VAULT_CANARY".to_string());
+    ctx.headers.insert(
+        "x-amz-security-token".to_string(),
+        "AMZ_TOKEN_CANARY".to_string(),
+    );
+    ctx.headers
+        .insert("x-request-id".to_string(), "req-9".to_string());
+    ctx.set_raw_query_string(
+        "action=read&refresh_token=REFRESH_CANARY&X-Amz-Signature=SIG_CANARY&password=PW_CANARY"
+            .to_string(),
+    );
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(payload["input"]["headers"]["x-request-id"], "req-9");
+    assert_eq!(payload["input"]["query"]["action"], "read");
+    let serialized = serde_json::to_string(&payload).expect("serialize payload");
+    for canary in [
+        "VAULT_CANARY",
+        "AMZ_TOKEN_CANARY",
+        "REFRESH_CANARY",
+        "SIG_CANARY",
+        "PW_CANARY",
+    ] {
+        assert!(
+            !serialized.contains(canary),
+            "{canary} leaked: {serialized}"
+        );
+    }
+
+    // The explicit query opt-in still forwards classifier-recognized names.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let opted_in = self::plugin(&server, json!({"include_query_credentials": true}));
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("refresh_token=REFRESH_CANARY".to_string());
+    assert_continue(opted_in.authorize(&mut ctx).await);
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(payload["input"]["query"]["refresh_token"], "REFRESH_CANARY");
+}
+
+/// opa-claude-5: authentication-marked query names are collected once per
+/// request and still match case-insensitively.
+#[tokio::test]
+async fn opa_marked_query_credentials_match_case_insensitively() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({}));
+
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("Carrier_Ref=MARKED_CANARY&page=2".to_string());
+    ctx.metadata.insert(
+        "auth.query_credential_param.carrier_ref".to_string(),
+        "true".to_string(),
+    );
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    let payload = received_opa_payload(&server).await;
+    assert_eq!(payload["input"]["query"]["page"], "2");
+    let serialized = serde_json::to_string(&payload).expect("serialize payload");
+    assert!(!serialized.contains("MARKED_CANARY"), "{serialized}");
+}
+
+/// opa-claude-6: allow obligations set listed upstream headers, and every
+/// client copy of a listed name (any case, `_` or `-`) is removed.
+#[tokio::test]
+async fn opa_allow_obligation_installs_listed_upstream_headers() {
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "headers": {"X-Tenant": "blue"}}}),
+    )
+    .await;
+    let plugin = plugin(&server, json!({"decision_request_headers": ["x-tenant"]}));
+    assert!(plugin.modifies_request_headers());
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-tenant".to_string(), "spoofed".to_string());
+    ctx.headers
+        .insert("X_Tenant".to_string(), "spoofed-underscore".to_string());
+    assert_continue(plugin.authorize(&mut ctx).await);
+
+    assert_eq!(
+        ctx.headers.get("x-tenant").map(String::as_str),
+        Some("blue")
+    );
+    assert!(!ctx.headers.contains_key("X_Tenant"));
+    assert_eq!(
+        ctx.headers.get("x-request-id").map(String::as_str),
+        Some("req-123")
+    );
+}
+
+/// A bare `true` decision carries no obligation, but a listed destination is
+/// still gateway-owned and the client copy is removed.
+#[tokio::test]
+async fn opa_listed_destinations_are_stripped_without_an_obligation() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let plugin = plugin(&server, json!({"decision_request_headers": ["x-tenant"]}));
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("x-tenant".to_string(), "spoofed".to_string());
+    assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(!ctx.headers.contains_key("x-tenant"));
+}
+
+/// An obligation the gateway cannot honor exactly is a denial, never an allow
+/// with the obligation dropped.
+#[tokio::test]
+async fn opa_invalid_allow_obligations_deny() {
+    for decision in [
+        json!({"allow": true, "headers": {"x-unlisted": "v"}}),
+        json!({"allow": true, "headers": {"x-tenant": 7}}),
+        json!({"allow": true, "headers": ["x-tenant"]}),
+        json!({"allow": true, "headers": {"x-tenant": "a", "X-Tenant": "b"}}),
+        json!({"allow": true, "headers": {"x-tenant": "line\nbreak"}}),
+    ] {
+        let server = MockServer::start().await;
+        mount_opa(&server, 200, json!({"result": decision.clone()})).await;
+        let plugin = plugin(
+            &server,
+            json!({"decision_request_headers": ["x-tenant", "x-user"]}),
+        );
+        let mut ctx = make_ctx();
+        assert_reject(plugin.authorize(&mut ctx).await, Some(403));
+        assert_eq!(
+            ctx.metadata
+                .get(ferrum_edge::plugins::opa::OPA_REASON_METADATA_KEY)
+                .map(String::as_str),
+            Some("invalid_obligation"),
+            "{decision}"
+        );
+        assert!(!ctx.headers.contains_key("x-tenant"), "{decision}");
+    }
+}
+
+/// Without the opt-in, decision-document headers are ignored exactly as
+/// before.
+#[tokio::test]
+async fn opa_allow_obligations_are_ignored_by_default() {
+    let server = MockServer::start().await;
+    mount_opa(
+        &server,
+        200,
+        json!({"result": {"allow": true, "headers": {"x-tenant": "blue"}}}),
+    )
+    .await;
+    let plugin = plugin(&server, json!({}));
+    assert!(!plugin.modifies_request_headers());
+
+    let mut ctx = make_ctx();
+    assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(!ctx.headers.contains_key("x-tenant"));
+}
+
+#[test]
+fn opa_decision_request_headers_refuse_owned_and_credential_names() {
+    for name in [
+        "authorization",
+        "Proxy-Authorization",
+        "cookie",
+        "host",
+        "content-length",
+        "content-type",
+        "transfer-encoding",
+        "connection",
+        "x-consumer-username",
+        "X_Consumer_Role",
+        "x-ferrum-hops",
+        "x-forwarded-for",
+        "x-geo-country",
+        "x-api-key",
+        "x-vault-token",
+        "x-session-id",
+        "Bad Header",
+        "",
+    ] {
+        let config = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": POLICY_PATH,
+            "decision_request_headers": [name],
+        });
+        assert!(
+            Opa::new(&config, default_client()).is_err(),
+            "{name:?} must be refused"
+        );
+        assert!(validate_plugin_config("opa", &config).is_err(), "{name:?}");
+    }
+
+    let duplicate = json!({
+        "opa_host": "http://127.0.0.1:8181",
+        "policy_path": POLICY_PATH,
+        "decision_request_headers": ["x-tenant", "X_Tenant"],
+    });
+    assert!(Opa::new(&duplicate, default_client()).is_err());
+
+    let too_many: Vec<String> = (0..33)
+        .map(|index| format!("x-obligation-{index}"))
+        .collect();
+    let config = json!({
+        "opa_host": "http://127.0.0.1:8181",
+        "policy_path": POLICY_PATH,
+        "decision_request_headers": too_many,
+    });
+    assert!(Opa::new(&config, default_client()).is_err());
+
+    let ordinary = json!({
+        "opa_host": "http://127.0.0.1:8181",
+        "policy_path": POLICY_PATH,
+        "decision_request_headers": ["x-tenant", "X-User-Id"],
+        "decision_deny_response": true,
+    });
+    assert!(Opa::new(&ordinary, default_client()).is_ok());
+}
+
+/// Deny obligations shape the rejection only when opted in; a malformed one
+/// still denies with the static response.
+#[tokio::test]
+async fn opa_deny_obligation_shapes_the_rejection_when_enabled() {
+    let decision = json!({
+        "result": {
+            "allow": false,
+            "status": 429,
+            "body": "{\"error\":\"slow down\"}",
+            "headers": {"Retry-After": "5"}
+        }
+    });
+
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, decision.clone()).await;
+    let plugin = plugin(&server, json!({"decision_deny_response": true}));
+    let mut ctx = make_ctx();
+    match plugin.authorize(&mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(body, "{\"error\":\"slow down\"}");
+            assert_eq!(headers.get("retry-after").map(String::as_str), Some("5"));
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
+
+    // Default: the static response, whatever the decision says.
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, decision).await;
+    let plugin = self::plugin(&server, json!({}));
+    let mut ctx = make_ctx();
+    match plugin.authorize(&mut ctx).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(body, r#"{"error":"forbidden by policy"}"#);
+        }
+        other => panic!("expected reject, got {other:?}"),
+    }
+
+    for malformed in [
+        json!({"allow": false, "status": 200}),
+        json!({"allow": false, "status": "429"}),
+        json!({"allow": false, "body": 5}),
+        json!({"allow": false, "headers": {"Content-Length": "3"}}),
+        json!({"allow": false, "headers": {"Retry-After": 5}}),
+    ] {
+        let server = MockServer::start().await;
+        mount_opa(&server, 200, json!({"result": malformed.clone()})).await;
+        let plugin = self::plugin(&server, json!({"decision_deny_response": true}));
+        let mut ctx = make_ctx();
+        match plugin.authorize(&mut ctx).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 403, "{malformed}");
+                assert_eq!(body, r#"{"error":"forbidden by policy"}"#, "{malformed}");
+            }
+            other => panic!("{malformed}: expected reject, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.metadata
+                .get(ferrum_edge::plugins::opa::OPA_REASON_METADATA_KEY)
+                .map(String::as_str),
+            Some("invalid_obligation"),
+            "{malformed}"
+        );
+    }
+}
+
+/// opa-claude-7: over the per-instance bound a request takes the failure
+/// posture immediately instead of queueing behind a slow policy service.
+#[tokio::test]
+async fn opa_concurrency_bulkhead_applies_the_failure_posture() {
+    for fail_open in [false, true] {
+        let server = MockServer::start().await;
+        mount_opa_with_delay(&server, Duration::from_millis(1500)).await;
+        let plugin = Arc::new(plugin(
+            &server,
+            json!({
+                "max_concurrent_decisions": 1,
+                "timeout_ms": 5000,
+                "fail_open": fail_open,
+            }),
+        ));
+
+        let in_flight = {
+            let plugin = Arc::clone(&plugin);
+            tokio::spawn(async move {
+                let mut ctx = make_ctx();
+                plugin.authorize(&mut ctx).await
+            })
+        };
+        for _ in 0..80 {
+            if server
+                .received_requests()
+                .await
+                .is_some_and(|requests| !requests.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let mut ctx = make_ctx();
+        let result = plugin.authorize(&mut ctx).await;
+        if fail_open {
+            assert_continue(result);
+            assert_eq!(
+                ctx.metadata
+                    .get(ferrum_edge::plugins::opa::OPA_DECISION_METADATA_KEY)
+                    .map(String::as_str),
+                Some("error_fail_open")
+            );
+        } else {
+            assert_reject(result, Some(503));
+            assert_eq!(
+                ctx.metadata
+                    .get(ferrum_edge::plugins::opa::OPA_DECISION_METADATA_KEY)
+                    .map(String::as_str),
+                Some("error_fail_closed")
+            );
+        }
+        assert_eq!(
+            ctx.metadata
+                .get(ferrum_edge::plugins::opa::OPA_REASON_METADATA_KEY)
+                .map(String::as_str),
+            Some("opa_concurrency_limit")
+        );
+
+        assert_continue(in_flight.await.expect("in-flight decision task"));
+        // The permit is released once the decision completes.
+        let mut ctx = make_ctx();
+        assert_continue(plugin.authorize(&mut ctx).await);
+    }
+}
+
+#[test]
+fn opa_max_concurrent_decisions_is_bounded() {
+    for (value, valid) in [
+        (json!(0), false),
+        (json!(1), true),
+        (json!(1_000_000), true),
+        (json!(1_000_001), false),
+        (json!(-1), false),
+        (json!("8"), false),
+    ] {
+        let config = json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": POLICY_PATH,
+            "max_concurrent_decisions": value,
+        });
+        assert_eq!(
+            Opa::new(&config, default_client()).is_ok(),
+            valid,
+            "{config}"
+        );
+    }
+}
+
+fn outcome(ctx: &RequestContext) -> (Option<&str>, Option<&str>) {
+    (
+        ctx.metadata
+            .get(ferrum_edge::plugins::opa::OPA_DECISION_METADATA_KEY)
+            .map(String::as_str),
+        ctx.metadata
+            .get(ferrum_edge::plugins::opa::OPA_REASON_METADATA_KEY)
+            .map(String::as_str),
+    )
+}
+
+/// opa-claude-8: every decision records a fixed-cardinality outcome that the
+/// transaction-log metadata gate emits.
+#[tokio::test]
+async fn opa_records_decision_outcome_metadata() {
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": true})).await;
+    let mut ctx = make_ctx();
+    assert_continue(plugin(&server, json!({})).authorize(&mut ctx).await);
+    assert_eq!(outcome(&ctx), (Some("allow"), Some("policy_allowed")));
+
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"result": false})).await;
+    let mut ctx = make_ctx();
+    assert_reject(
+        plugin(&server, json!({})).authorize(&mut ctx).await,
+        Some(403),
+    );
+    assert_eq!(outcome(&ctx), (Some("deny"), Some("policy_denied")));
+
+    let server = MockServer::start().await;
+    mount_opa(&server, 200, json!({"other": true})).await;
+    let mut ctx = make_ctx();
+    assert_reject(
+        plugin(&server, json!({})).authorize(&mut ctx).await,
+        Some(403),
+    );
+    assert_eq!(outcome(&ctx), (Some("deny"), Some("decision_undefined")));
+
+    let server = MockServer::start().await;
+    mount_opa(&server, 500, json!({})).await;
+    let mut ctx = make_ctx();
+    assert_reject(
+        plugin(&server, json!({})).authorize(&mut ctx).await,
+        Some(503),
+    );
+    assert_eq!(
+        outcome(&ctx),
+        (Some("error_fail_closed"), Some("opa_non_success_status"))
+    );
+
+    let server = MockServer::start().await;
+    mount_opa(&server, 500, json!({})).await;
+    let mut ctx = make_ctx();
+    assert_continue(
+        plugin(&server, json!({"fail_open": true}))
+            .authorize(&mut ctx)
+            .await,
+    );
+    assert_eq!(
+        outcome(&ctx),
+        (Some("error_fail_open"), Some("opa_non_success_status"))
+    );
+
+    let server = MockServer::start().await;
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("a=1&a=2".to_string());
+    assert_reject(
+        plugin(&server, json!({})).authorize(&mut ctx).await,
+        Some(403),
+    );
+    assert_eq!(outcome(&ctx), (Some("deny"), Some("ambiguous_query")));
+
+    for key in [
+        ferrum_edge::plugins::opa::OPA_DECISION_METADATA_KEY,
+        ferrum_edge::plugins::opa::OPA_REASON_METADATA_KEY,
+    ] {
+        assert!(
+            !ferrum_edge::plugins::utils::metadata_redaction::metadata_value_is_redacted(key),
+            "{key} must be emitted in transaction logs"
+        );
+    }
+}
+
+#[test]
+fn opa_new_config_keys_are_typed_and_closed() {
+    for (key, value) in [
+        ("header_ambiguity_policy", json!("allow")),
+        ("header_ambiguity_policy", json!(true)),
+        ("decision_deny_response", json!("yes")),
+        ("decision_request_headers", json!("x-tenant")),
+        ("decision_request_headers", json!([7])),
+    ] {
+        let mut config = base_config("http://127.0.0.1:8181");
+        config[key] = value.clone();
+        assert!(
+            Opa::new(&config, default_client()).is_err(),
+            "{key}: {value} must be refused"
+        );
+    }
+    for policy in ["reject", "delegate"] {
+        let mut config = base_config("http://127.0.0.1:8181");
+        config["header_ambiguity_policy"] = json!(policy);
+        assert!(Opa::new(&config, default_client()).is_ok(), "{policy}");
     }
 }
