@@ -381,7 +381,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ai_semantic_cache` populates from `ai_federation` and tolerates replica
   clock skew.** A provider-backed `ai_federation` 2xx answer (proven by
   federation's internal external-operation provenance) is now stored, so the
-  documented cache-before-federation chain hits on repeats; fabricated
+  documented cache-before-federation chain hits on repeats, but only when
+  federation recorded that the provider's original headers carried no
+  `Cache-Control: no-store`/`private` or `Set-Cookie`, and only from the
+  committed-response hook once the final synthetic headers (late
+  `after_proxy` header rules, rotated cookies) also allow it; fabricated
   synthetic bodies remain ineligible. An authenticated Redis envelope sealed up
   to 60 seconds in the reader's future is admitted, and an authentic envelope
   that is expired or further in the future is a plain miss instead of being

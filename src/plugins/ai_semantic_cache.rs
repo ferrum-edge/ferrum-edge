@@ -456,6 +456,29 @@ struct CachedResponse {
     body: Bytes,
 }
 
+/// An admitted response waiting to be retained: the decoded body, sanitized
+/// headers, and this instance's staged key/semantic state. Ordinary backend
+/// responses are published immediately; a provider-backed synthetic
+/// (`ai_federation`) response is held in request state until the committed
+/// response shows its final client-visible status and headers.
+#[derive(Clone)]
+pub(crate) struct PendingSemanticCacheStore {
+    cache_key: String,
+    status_code: u16,
+    headers: HashMap<String, String>,
+    body: Bytes,
+    semantic_scope_key: Option<String>,
+    embedding: Option<EmbeddingPoint>,
+}
+
+impl std::fmt::Debug for PendingSemanticCacheStore {
+    // Never render the cache key (an offline-checkable prompt fingerprint),
+    // headers, or body.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingSemanticCacheStore(<redacted>)")
+    }
+}
+
 /// Complete response-side policy provenance for one lookup (see
 /// `ResponsePolicyProvenance`): the pinned RTDS gate-content fingerprint and
 /// the static presentation-policy digest. Only a *complete* provenance can be
@@ -2581,6 +2604,89 @@ impl AiSemanticCache {
         }
         if Self::run_cleanup(&self.cache, self.ttl, self.max_entries) {
             self.mark_vector_index_dirty();
+        }
+    }
+
+    /// Retain an admitted response locally and, when configured, in Redis,
+    /// under the byte budget.
+    async fn publish_retained_response(&self, pending: PendingSemanticCacheStore) {
+        let PendingSemanticCacheStore {
+            cache_key,
+            status_code,
+            headers: safe_headers,
+            body,
+            semantic_scope_key,
+            embedding,
+        } = pending;
+        let approx_size = cache_entry_approx_size(
+            body.len(),
+            &safe_headers,
+            semantic_scope_key.as_ref(),
+            embedding.as_ref(),
+        );
+
+        // Hard total-size enforcement via lock-free byte leases. Concurrent
+        // distinct-key admits race on `ByteBudget::try_acquire`; losers skip
+        // retention so published + in-flight HNSW generations and entries
+        // cannot permanently exceed `max_total_size_bytes`.
+        let Some(budget_lease) = self.cache_budget.try_acquire(approx_size) else {
+            debug!(
+                entry_size = approx_size,
+                max_total = self.max_total_size_bytes,
+                "ai_semantic_cache: total cache size would exceed limit, skipping"
+            );
+            return;
+        };
+
+        // Optional test rendezvous: park here after admission so concurrent
+        // stores can observe lease ownership before insert. Production keeps
+        // the hook empty (lock-free no-op).
+        self.run_store_post_admit_hook();
+
+        let entry = CacheEntry {
+            status_code,
+            headers: safe_headers.clone(),
+            body: body.clone(),
+            inserted_at: Instant::now(),
+            generation: self.next_entry_generation.fetch_add(1, Ordering::Relaxed),
+            approx_size,
+            semantic_scope_key: semantic_scope_key.clone(),
+            embedding: embedding.clone(),
+            _budget_lease: budget_lease,
+        };
+
+        // Insert. `DashMap::insert` is atomic per key and returns any
+        // displaced value; dropping that value releases its byte lease so
+        // same-key races never leave phantom retained bytes.
+        let mut replaced_semantic_entry = false;
+        if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
+            replaced_semantic_entry = old.embedding.is_some();
+        }
+        if replaced_semantic_entry || embedding.is_some() {
+            self.mark_vector_index_dirty();
+            self.signal_vector_index_refresh_if_due();
+        }
+
+        // Also store in Redis if configured
+        if let Some(ref redis) = self.redis_client
+            && redis.is_available()
+        {
+            let redis_key = redis.make_key(&[&cache_key]);
+            if let Some(serializable) =
+                self.seal_redis_entry(&redis_key, status_code, &safe_headers, &body)
+                && let Ok(data) = serde_json::to_vec(&serializable)
+            {
+                let ttl_seconds = self.ttl.as_secs().max(1);
+                if let Ok(()) = redis
+                    .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
+                    .await
+                {
+                    // A successful repair/replacement must be visible on the
+                    // next Redis lookup without waiting out a prior
+                    // quarantine-delete suppressor.
+                    self.redis_quarantine.clear(&cache_key);
+                }
+            }
         }
     }
 
@@ -5724,12 +5830,26 @@ impl Plugin for AiSemanticCache {
         // fabricated short-circuits (mocks, fault injection, terminations,
         // cache replays) never set it. Store admission below still applies in
         // full (2xx, JSON, size, decoding, retention directives).
-        if ctx
+        //
+        // Federation sanitizes the provider's headers before normalization, so
+        // the origin's `Cache-Control` / `Set-Cookie` are not visible here; it
+        // therefore also records `PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY`
+        // only when those ORIGINAL headers allowed retention, and nothing is
+        // stored without it. And because the synthetic path runs its reject
+        // `after_proxy` header hooks only AFTER this body hook, the admitted
+        // body is staged here and published by `on_response_committed`, which
+        // re-checks the final client-visible status and headers.
+        let synthetic_response = ctx
             .metadata
-            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
-            && !ctx
+            .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
+        if synthetic_response
+            && !(ctx
                 .metadata
                 .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
+                && ctx
+                    .metadata
+                    .get(super::ai_federation::PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY)
+                    .is_some_and(|value| value == "true"))
         {
             debug!(
                 "ai_semantic_cache: skipping store of synthetic short-circuit response (no model tokens / upstream body)"
@@ -5856,78 +5976,80 @@ impl Plugin for AiSemanticCache {
         // markers intact if a later retry path re-enters the hook.
         ctx.metadata.remove(&self.meta_cache_key);
         let (semantic_scope_key, embedding) = self.take_staged_semantic(ctx);
-        let approx_size = cache_entry_approx_size(
-            body.len(),
-            &safe_headers,
-            semantic_scope_key.as_ref(),
-            embedding.as_ref(),
-        );
-
-        // Hard total-size enforcement via lock-free byte leases. Concurrent
-        // distinct-key admits race on `ByteBudget::try_acquire`; losers skip
-        // retention so published + in-flight HNSW generations and entries
-        // cannot permanently exceed `max_total_size_bytes`.
-        let Some(budget_lease) = self.cache_budget.try_acquire(approx_size) else {
-            debug!(
-                entry_size = approx_size,
-                max_total = self.max_total_size_bytes,
-                "ai_semantic_cache: total cache size would exceed limit, skipping"
-            );
-            return PluginResult::Continue;
-        };
-
-        // Optional test rendezvous: park here after admission so concurrent
-        // stores can observe lease ownership before insert. Production keeps
-        // the hook empty (lock-free no-op).
-        self.run_store_post_admit_hook();
-
-        let entry = CacheEntry {
+        let pending = PendingSemanticCacheStore {
+            cache_key,
             status_code: response_status,
-            headers: safe_headers.clone(),
-            body: Bytes::from(body.to_vec()),
-            inserted_at: Instant::now(),
-            generation: self.next_entry_generation.fetch_add(1, Ordering::Relaxed),
-            approx_size,
-            semantic_scope_key: semantic_scope_key.clone(),
-            embedding: embedding.clone(),
-            _budget_lease: budget_lease,
+            headers: safe_headers,
+            body: Bytes::copy_from_slice(body),
+            semantic_scope_key,
+            embedding,
         };
-
-        // Insert. `DashMap::insert` is atomic per key and returns any
-        // displaced value; dropping that value releases its byte lease so
-        // same-key races never leave phantom retained bytes.
-        let mut replaced_semantic_entry = false;
-        if let Some(old) = self.cache.insert(cache_key.clone(), entry) {
-            replaced_semantic_entry = old.embedding.is_some();
+        if synthetic_response {
+            ctx.plugin_state_mut()
+                .ai_semantic_cache_pending_stores
+                .insert(self.instance_id, pending);
+            return PluginResult::Continue;
         }
-        if replaced_semantic_entry || embedding.is_some() {
-            self.mark_vector_index_dirty();
-            self.signal_vector_index_refresh_if_due();
-        }
-
-        // Also store in Redis if configured
-        if let Some(ref redis) = self.redis_client
-            && redis.is_available()
-        {
-            let redis_key = redis.make_key(&[&cache_key]);
-            if let Some(serializable) =
-                self.seal_redis_entry(&redis_key, response_status, &safe_headers, body)
-                && let Ok(data) = serde_json::to_vec(&serializable)
-            {
-                let ttl_seconds = self.ttl.as_secs().max(1);
-                if let Ok(()) = redis
-                    .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
-                    .await
-                {
-                    // A successful repair/replacement must be visible on the
-                    // next Redis lookup without waiting out a prior
-                    // quarantine-delete suppressor.
-                    self.redis_quarantine.clear(&cache_key);
-                }
-            }
-        }
+        self.publish_retained_response(pending).await;
 
         PluginResult::Continue
+    }
+
+    /// Needed only to publish a staged provider-backed synthetic response; a
+    /// request with nothing staged pays one per-instance map lookup.
+    fn requires_response_committed_hook(&self) -> bool {
+        true
+    }
+
+    /// Publish (or drop) a provider-backed synthetic response staged by
+    /// [`Plugin::on_final_response_body`].
+    ///
+    /// On the synthetic path the reject `after_proxy` header hooks — late
+    /// `response_transformer` header rules, a rotated session cookie — run only
+    /// after the body hooks, so retention is decided here, over the final
+    /// client-visible status and headers: a non-2xx or replaced status, a
+    /// late `Cache-Control: no-store` / `private`, a `Set-Cookie`, a
+    /// non-JSON or event-stream content type, or an RTDS publication during
+    /// the request drops the staged entry instead of retaining it.
+    async fn on_response_committed(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        _body: &[u8],
+    ) {
+        let Some(pending) = ctx.plugin_state_opt_mut().and_then(|state| {
+            state
+                .ai_semantic_cache_pending_stores
+                .remove(&self.instance_id)
+        }) else {
+            return;
+        };
+        if pending.status_code != response_status || response_forbids_retention(response_headers) {
+            debug!(
+                "ai_semantic_cache: final synthetic response forbids retention; dropping staged store"
+            );
+            return;
+        }
+        let content_type = response_headers.iter().find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                .then_some(value.as_str())
+        });
+        if !content_type
+            .is_some_and(|ct| is_json_content_type(ct) && !is_event_stream_content_type(ct))
+        {
+            debug!(
+                "ai_semantic_cache: final synthetic response is not JSON; dropping staged store"
+            );
+            return;
+        }
+        if !ctx.response_policy_stamp_stable() {
+            debug!(
+                "ai_semantic_cache: response-side policy changed mid-request; dropping staged store"
+            );
+            return;
+        }
+        self.publish_retained_response(pending).await;
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

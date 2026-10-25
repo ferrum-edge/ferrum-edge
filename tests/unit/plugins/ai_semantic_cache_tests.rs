@@ -60,6 +60,11 @@ const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circu
 // (mirrors the `pub(crate)` `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`).
 const EXTERNAL_OPERATION_COMPLETED_METADATA_KEY: &str = "ferrum:external_operation_completed";
 
+// Marker `ai_federation` records only when the provider's original response
+// headers allowed shared-cache retention (mirrors the `pub(crate)`
+// `ai_federation::PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY`).
+const PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY: &str = "ferrum:provider_response_retainable";
+
 /// Static response-presentation policy digest every test context carries, as
 /// the protocol entry paths copy it from the request's plugin-cache view. A
 /// context without one has an unprovable policy and bypasses the cache.
@@ -6994,7 +6999,7 @@ fn redis_quarantine_found_hit_admits_before_fingerprint() {
         "Ok(BoundedRedisValue::Oversized{length})=>{",
     );
     let admit = found
-        .find("admit_redis_hit(")
+        .find("self.classify_redis_hit(entry,&redis_key)")
         .expect("Found path must admit before fingerprinting");
     let fingerprint = found
         .find("redis_quarantine_fingerprint_content(&data)")
@@ -7010,14 +7015,35 @@ fn redis_quarantine_found_hit_admits_before_fingerprint() {
     let dial = after
         .find("quarantine_invalid_redis_entry(")
         .expect("inadmissible Found values must be quarantined");
+    let invalid = found
+        .find("RedisHitVerdict::Invalid=>{")
+        .expect("inadmissible Found values must take the Invalid arm");
     assert!(
-        found.contains("None=>{") && claim < dial,
+        invalid < fingerprint && claim < dial,
         "inadmissible Found values must fingerprint, then claim the key before any DEL dial"
     );
     assert!(
         !found[..admit].contains("redis_quarantine_fingerprint_content"),
-        "quarantine fingerprint must not precede admit_redis_hit on the Found path"
+        "quarantine fingerprint must not precede classify_redis_hit on the Found path"
     );
+    // An authentic but not-fresh envelope (expired, or sealed beyond the
+    // clock-skew allowance) is a plain miss: its arm must neither fingerprint,
+    // claim, nor dial a compare-and-delete.
+    let not_fresh = source_region(
+        found,
+        "RedisHitVerdict::NotFresh=>{",
+        "RedisHitVerdict::Invalid=>{",
+    );
+    for forbidden in [
+        "redis_quarantine_fingerprint_content",
+        "try_claim",
+        "quarantine_invalid_redis_entry",
+    ] {
+        assert!(
+            !not_fresh.contains(forbidden),
+            "the NotFresh arm must not quarantine ({forbidden})"
+        );
+    }
 }
 
 #[test]
@@ -9087,42 +9113,51 @@ async fn cohere_conversation_id_requests_bypass_lookup_and_storage() {
 
 /// SOL-4: a provider-backed `ai_federation` answer travels the synthetic
 /// response pipeline, but it is a genuine model response. With federation's
-/// external-operation provenance it is retained, so the documented
-/// cache-before-federation chain populates; a fabricated synthetic body
-/// without that provenance still is not.
+/// external-operation provenance AND its origin-retention eligibility marker it
+/// is retained once the committed response is final, so the documented
+/// cache-before-federation chain populates. A fabricated synthetic body, or a
+/// provider answer whose origin headers forbade retention (no eligibility
+/// marker), is not.
 #[tokio::test]
 async fn provider_backed_federation_response_populates_the_cache() {
-    use ferrum_edge::_test_support::finalize_synthetic_response_for_test;
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
 
     let provider_body: &'static [u8] =
         br#"{"id":"chatcmpl-1","choices":[{"message":{"content":"Paris"}}]}"#;
-    for provider_backed in [true, false] {
+    for (external_operation, origin_retainable, expect_cached) in [
+        (true, true, true),
+        (true, false, false),
+        (false, false, false),
+    ] {
         let cache = Arc::new(make_plugin(json!({"ttl_seconds": 300})));
         let plugins = vec![Arc::clone(&cache) as Arc<dyn Plugin>];
         let (mut ctx, result) = run_lookup(&cache, REPLAY_BODY, None).await;
         assert!(matches!(result, PluginResult::Continue));
         assert_eq!(staged_status(&cache, &ctx), Some("MISS"));
-        if provider_backed {
+        if external_operation {
             // Recorded by `ai_federation` once a provider returned headers.
             ctx.metadata.insert(
                 EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
                 "true".to_string(),
             );
         }
-        let mut status = 200u16;
-        let mut headers = json_request_headers();
-        let mut body = bytes::Bytes::from_static(provider_body);
-        finalize_synthetic_response_for_test(
-            &plugins,
-            &mut ctx,
-            &mut status,
-            &mut headers,
-            &mut body,
-        )
-        .await;
+        if origin_retainable {
+            // Recorded by `ai_federation` when the provider's ORIGINAL headers
+            // carried no `no-store` / `private` / `Set-Cookie`.
+            ctx.metadata.insert(
+                PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY.to_string(),
+                "true".to_string(),
+            );
+        }
+        let rejection = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from_static(provider_body),
+            headers: json_request_headers(),
+        };
+        let _ = finalize_plugin_rejection_for_test(&plugins, &mut ctx, rejection).await;
 
         let (_, replay) = run_lookup(&cache, REPLAY_BODY, None).await;
-        if provider_backed {
+        if expect_cached {
             assert_eq!(cache.tracked_keys_count(), Some(1));
             match replay {
                 PluginResult::RejectBinary { body, .. } => {
@@ -9134,10 +9169,78 @@ async fn provider_backed_federation_response_populates_the_cache() {
             assert_eq!(
                 cache.tracked_keys_count(),
                 Some(0),
-                "a fabricated synthetic body must not be retained"
+                "external={external_operation} retainable={origin_retainable}: must not retain"
             );
             assert!(matches!(replay, PluginResult::Continue));
         }
+    }
+}
+
+/// PR6822-SOL-2: on the synthetic path the reject `after_proxy` header hooks
+/// run after the body hooks. A late `Cache-Control: no-store` / `private` or
+/// `Set-Cookie` on the final client-visible response must drop the staged
+/// provider-backed entry; without a late header it is retained (control).
+#[tokio::test]
+async fn late_synthetic_response_headers_decide_federation_retention() {
+    use ferrum_edge::_test_support::finalize_plugin_rejection_for_test;
+    use ferrum_edge::plugins::response_transformer::ResponseTransformer;
+
+    let provider_body: &'static [u8] = br#"{"id":"chatcmpl-1","answer":"Paris"}"#;
+    for late_header in [
+        None,
+        Some(("cache-control", "no-store")),
+        Some(("cache-control", "private")),
+        Some(("set-cookie", "sid=rotated")),
+    ] {
+        let cache = Arc::new(make_plugin(json!({"ttl_seconds": 300})));
+        let mut plugins = vec![Arc::clone(&cache) as Arc<dyn Plugin>];
+        if let Some((name, value)) = late_header {
+            plugins.push(Arc::new(
+                ResponseTransformer::new(&json!({
+                    "rules": [{
+                        "target": "header",
+                        "operation": "add",
+                        "key": name,
+                        "value": value
+                    }]
+                }))
+                .expect("late header rule must be valid"),
+            ) as Arc<dyn Plugin>);
+        }
+        plugins.sort_by_key(|plugin| plugin.priority());
+        let (mut ctx, _) = run_lookup(&cache, REPLAY_BODY, None).await;
+        for key in [
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY,
+            PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY,
+        ] {
+            ctx.metadata.insert(key.to_string(), "true".to_string());
+        }
+        let rejection = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::from_static(provider_body),
+            headers: json_request_headers(),
+        };
+        let finalized = finalize_plugin_rejection_for_test(&plugins, &mut ctx, rejection).await;
+        if let (Some((name, value)), PluginResult::RejectBinary { headers, .. }) =
+            (late_header, &finalized)
+        {
+            assert_eq!(
+                headers.get(name).map(String::as_str),
+                Some(value),
+                "the late header rule must reach the client-visible response"
+            );
+        }
+        let expect_cached = late_header.is_none();
+        assert_eq!(
+            cache.tracked_keys_count(),
+            Some(usize::from(expect_cached)),
+            "late header {late_header:?}"
+        );
+        assert_eq!(
+            run_lookup_get_status(&cache, REPLAY_BODY, None).await,
+            expect_cached,
+            "late header {late_header:?}"
+        );
     }
 }
 
