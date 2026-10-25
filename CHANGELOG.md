@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `compression` refuses repeated and wildcard-inert config
+  entries, and length-gates instead of disabling under large response limits**
+  (issue/PR #6848). `algorithms` may list each algorithm once (`br` and
+  `brotli` count as one), `content_types` may not repeat a rule
+  (case-insensitive), is capped at 64 rules, and refuses `*/*`, `*/json`, and
+  any other `*` outside a whole-subtype `type/*` range (which is now honored).
+  Configs that relied on these being silently admitted fail validation. When
+  `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` (or a route ceiling) is `0` or above
+  32 MiB, compression no longer turns off for every response: a response whose
+  backend declares a `Content-Length` within min(32 MiB, the buffered-response
+  fallback) is compressed, other responses stream identity, and plugin
+  construction logs a warning. Negotiation now reads the client's own
+  `Accept-Encoding` captured at request init, so a `request_transformer` rule
+  on that header no longer changes which coding the client receives.
+- **`compression` adds opt-in `zstd` and `weaken_strong_etag`** (#6848).
+  `algorithms` accepts `zstd` (RFC 9659; never in the default) with a new
+  `zstd_level` (1–19); an instance that lists it also decodes `zstd` uploads
+  through the charged strict decoder (one frame per layer, 8 MB window cap).
+  The representation gates still treat `zstd` as unsupported. With
+  `weaken_strong_etag: true`, a strong-`ETag` response is compressed and keeps
+  the weak form of its validator. A later hook relabeling a committed coding
+  to one the instance cannot produce now aborts the encode to identity (or
+  `406`).
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

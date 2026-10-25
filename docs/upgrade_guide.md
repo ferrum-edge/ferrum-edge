@@ -28,6 +28,31 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `compression`: stricter list admission and length-gated large-limit behavior (#6848)
+
+Plugin config validation now refuses a `compression` instance whose
+`algorithms` repeats an algorithm (`["br", "brotli"]` included), whose
+`content_types` repeats a rule (compared case-insensitively) or lists more
+than 64 rules, or whose `content_types` contains `*` anywhere other than a
+whole subtype (`*/*`, `*/json`, `application/vnd.*+json`). Remove the
+duplicates; replace a `*/*` rule with the explicit types to compress, or with
+`type/*` ranges such as `text/*`, which are now matched. Validate configs with
+`ferrum-edge validate` before cutover.
+
+Deployments with `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` or above 32 MiB used
+to get no gateway compression at all. Compression now applies to responses
+whose backend declares a `Content-Length` within the ceiling, so client-visible
+`Content-Encoding` and response sizes change for those responses; chunked or
+larger responses still stream uncompressed. To keep the old behavior, remove
+the `compression` plugin from those proxies. Expect a construction-time
+warning naming the limit.
+
+Negotiation now ignores `request_transformer` rewrites of `Accept-Encoding`
+for the client response. A rule that set or removed that header to steer the
+gateway's response coding no longer does; use the `compression` `algorithms`
+order or remove the plugin instead. The rule still changes what the backend
+receives (with `remove_accept_encoding: false`).
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
