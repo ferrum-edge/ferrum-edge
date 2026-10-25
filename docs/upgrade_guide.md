@@ -28,30 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `compression`: stricter list admission and length-gated large-limit behavior (#6848)
+### `cors` method and header lists are bounded (#6844)
 
-Plugin config validation now refuses a `compression` instance whose
-`algorithms` repeats an algorithm (`["br", "brotli"]` included), whose
-`content_types` repeats a rule (compared case-insensitively) or lists more
-than 64 rules, or whose `content_types` contains `*` anywhere other than a
-whole subtype (`*/*`, `*/json`, `application/vnd.*+json`). Remove the
-duplicates; replace a `*/*` rule with the explicit types to compress, or with
-`type/*` ranges such as `text/*`, which are now matched. Validate configs with
-`ferrum-edge validate` before cutover.
-
-Deployments with `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` or above 32 MiB used
-to get no gateway compression at all. Compression now applies to responses
-whose backend declares a `Content-Length` within the ceiling, so client-visible
-`Content-Encoding` and response sizes change for those responses; chunked or
-larger responses still stream uncompressed. To keep the old behavior, remove
-the `compression` plugin from those proxies. Expect a construction-time
-warning naming the limit.
-
-Negotiation now ignores `request_transformer` rewrites of `Accept-Encoding`
-for the client response. A rule that set or removed that header to steer the
-gateway's response coding no longer does; use the `compression` `algorithms`
-order or remove the plugin instead. The rule still changes what the backend
-receives (with `remove_accept_encoding: false`).
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
@@ -186,6 +173,36 @@ A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
 answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
+
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
 
 ### Backend idle connections: higher default ceiling (#6793)
 

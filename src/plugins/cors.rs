@@ -110,6 +110,17 @@ pub(crate) const MAX_ALLOWED_ORIGIN_ENTRIES: usize = 64;
 /// into every proxy's plugin cache.
 pub(crate) const MAX_ORIGIN_MATCHER_BYTES: usize = 512;
 
+/// Maximum number of entries in ONE `allowed_methods`, `allowed_headers`, or
+/// `exposed_headers` list. Like the origin list, these are scanned per
+/// cross-origin request, intersected pairwise when policies compose, and
+/// serialized into every allowed response, so they carry an explicit budget
+/// instead of inheriting only the gateway-wide plugin-config size cap. Shared
+/// with the Istio translator and the mesh validator.
+pub(crate) const MAX_CORS_TOKEN_LIST_ENTRIES: usize = 128;
+
+/// Maximum byte length of one method or header-name token in those lists.
+pub(crate) const MAX_CORS_TOKEN_BYTES: usize = 256;
+
 /// Compiled-program byte ceiling for one origin regex. The regex crate is
 /// finite-automaton based (no catastrophic backtracking), but an adversarial
 /// pattern can still compile to a very large program; bound it explicitly
@@ -619,6 +630,7 @@ const CORS_CONFIG_KEYS: &[&str] = &[
     "allowed_headers",
     "exposed_headers",
     "allow_credentials",
+    "allow_private_network",
     "max_age",
     "preflight_continue",
     "unmatched_preflights",
@@ -659,7 +671,13 @@ pub(crate) struct CorsRequestState {
     allowed_method_union: Option<CorsTokenSet>,
     allowed_headers: Option<CorsTokenSet>,
     allowed_header_union: Option<CorsTokenSet>,
-    exposed_headers: Option<Arc<Vec<String>>>,
+    exposed_headers: Option<CorsTokenSet>,
+    /// Every matching policy opted into Private Network Access (AND).
+    allow_private_network: bool,
+    /// The preflight carried `Access-Control-Request-Private-Network: true`.
+    /// Captured when the CORS chain runs so a later request mutation cannot
+    /// change the answer on a forwarded (`preflight_continue`) preflight.
+    private_network_requested: bool,
     max_age: Option<Option<u64>>,
     forward_preflight: bool,
     ignore_preflight: bool,
@@ -676,6 +694,7 @@ impl CorsRequestState {
             self.response_allowed = true;
             self.all_wildcard = true;
             self.allow_credentials = true;
+            self.allow_private_network = true;
         }
         self.policy_count += 1;
     }
@@ -684,6 +703,7 @@ impl CorsRequestState {
         self.sanitize_response = true;
         self.all_wildcard &= matches!(&plugin.allowed_origins, AllowedOrigins::Wildcard);
         self.allow_credentials &= plugin.allow_credentials;
+        self.allow_private_network &= plugin.allow_private_network;
         intersect_only(&mut self.exposed_headers, &plugin.exposed_headers);
         if is_preflight {
             intersect_values(
@@ -707,15 +727,15 @@ impl CorsRequestState {
     }
 }
 
-fn intersect_only(intersection: &mut Option<Arc<Vec<String>>>, values: &Arc<Vec<String>>) {
-    match intersection.take() {
-        None => *intersection = Some(Arc::clone(values)),
-        Some(existing) => {
-            let mut narrowed = existing.as_ref().clone();
-            narrowed.retain(|value| contains_ascii_case(values, value));
-            *intersection = Some(Arc::new(narrowed));
-        }
-    }
+/// Intersect without tracking a union (actual-request exposure policy). Uses
+/// the wildcard-aware [`CorsTokenSet::combine`], so an uncredentialed
+/// `exposed_headers: ["*"]` intersected with an explicit list keeps that list
+/// instead of collapsing to nothing.
+fn intersect_only(intersection: &mut Option<CorsTokenSet>, values: &CorsTokenSet) {
+    *intersection = Some(match intersection.take() {
+        None => values.clone(),
+        Some(existing) => existing.combine(values, true),
+    });
 }
 
 fn contains_ascii_case(values: &[String], candidate: &str) -> bool {
@@ -727,20 +747,26 @@ fn contains_ascii_case(values: &[String], candidate: &str) -> bool {
 #[derive(Debug, Clone, Copy)]
 enum CorsTokenKind {
     Method,
+    /// Preflight request header (`Access-Control-Allow-Headers`). The Fetch
+    /// wildcard never covers `Authorization`.
     Header,
+    /// Exposed response header (`Access-Control-Expose-Headers`). The Fetch
+    /// wildcard covers every name; there is no `Authorization` carve-out on
+    /// the response side.
+    ResponseHeader,
 }
 
 impl CorsTokenKind {
     fn contains(self, values: &[String], candidate: &str) -> bool {
         match self {
             Self::Method => values.iter().any(|value| value == candidate),
-            Self::Header => contains_ascii_case(values, candidate),
+            Self::Header | Self::ResponseHeader => contains_ascii_case(values, candidate),
         }
     }
 
     fn wildcard_covers(self, candidate: &str) -> bool {
         match self {
-            Self::Method => true,
+            Self::Method | Self::ResponseHeader => true,
             Self::Header => !candidate.eq_ignore_ascii_case("authorization"),
         }
     }
@@ -929,8 +955,9 @@ pub struct CorsPlugin {
     allowed_origins: AllowedOrigins,
     allowed_methods: CorsTokenSet,
     allowed_headers: CorsTokenSet,
-    exposed_headers: Arc<Vec<String>>,
+    exposed_headers: CorsTokenSet,
     allow_credentials: bool,
+    allow_private_network: bool,
     max_age: Option<u64>,
     preflight_continue: bool,
     unmatched_preflights: UnmatchedPreflights,
@@ -997,6 +1024,7 @@ impl CorsPlugin {
             Self::parse_string_array(config, "exposed_headers", &[], true, validate_header_name)?;
 
         let mut allow_credentials = bool_config(config, "allow_credentials", false)?;
+        let allow_private_network = bool_config(config, "allow_private_network", false)?;
         let max_age = match object.get("max_age") {
             Some(_) => Some(u64_config(config, "max_age", 86400)?),
             None if istio_semantics => None,
@@ -1055,8 +1083,13 @@ impl CorsPlugin {
                 CorsTokenKind::Header,
                 allow_credentials,
             ),
-            exposed_headers: Arc::new(exposed_headers),
+            exposed_headers: CorsTokenSet::new(
+                exposed_headers,
+                CorsTokenKind::ResponseHeader,
+                allow_credentials,
+            ),
             allow_credentials,
+            allow_private_network,
             max_age,
             preflight_continue,
             unmatched_preflights,
@@ -1274,6 +1307,7 @@ impl CorsPlugin {
                 if arr.is_empty() && !allow_empty {
                     return Err(format!("cors: `{key}` must contain at least one value"));
                 }
+                validate_token_list_count(key, arr.len())?;
                 let mut values = Vec::with_capacity(arr.len());
                 for value in arr {
                     let value = value.as_str().ok_or_else(|| {
@@ -1398,6 +1432,12 @@ impl Plugin for CorsPlugin {
             ctx.method == "OPTIONS" && ctx.headers.contains_key("access-control-request-method");
 
         ctx.cors_state.begin_policy(is_preflight);
+        if is_preflight {
+            ctx.cors_state.private_network_requested = ctx
+                .headers
+                .get("access-control-request-private-network")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+        }
         let origin_allowed = self.is_origin_allowed(origin);
         if !is_preflight {
             if !origin_allowed {
@@ -1743,12 +1783,9 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
     if let Some(exposed) = state
         .exposed_headers
         .as_ref()
-        .filter(|values| !values.is_empty())
+        .and_then(|values| values.response_value(state.allow_credentials))
     {
-        headers.insert(
-            "access-control-expose-headers".to_string(),
-            exposed.join(", "),
-        );
+        headers.insert("access-control-expose-headers".to_string(), exposed);
     }
     if preflight {
         if let Some(methods) = state
@@ -1767,6 +1804,16 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
         }
         if let Some(Some(max_age)) = state.max_age {
             headers.insert("access-control-max-age".to_string(), max_age.to_string());
+        }
+        // Private Network Access opt-in: only on a preflight that asked for it,
+        // and only when every matching policy enabled `allow_private_network`.
+        // The backend's own field is always stripped first, so this is the
+        // only way the response can carry it.
+        if state.allow_private_network && state.private_network_requested {
+            headers.insert(
+                "access-control-allow-private-network".to_string(),
+                "true".to_string(),
+            );
         }
     }
 
@@ -1815,9 +1862,38 @@ fn merge_vary_tokens(existing: Option<&str>, required: &[&str]) -> String {
 /// admission the plugin applies at construction, so a policy that passes those
 /// boundaries can never fail `CorsPlugin` construction later. Do not fork.
 pub(crate) fn validate_method(key: &str, value: &str) -> Result<(), String> {
+    validate_token_len(key, value)?;
     Method::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| format!("cors: `{key}` contains an invalid HTTP method: {value:?}"))
+}
+
+/// Shared bound on how many entries one `allowed_methods` / `allowed_headers` /
+/// `exposed_headers` list may carry ([`MAX_CORS_TOKEN_LIST_ENTRIES`]).
+/// `pub(crate)` for the same reason as [`validate_method`]: the Istio
+/// translator and the native/file mesh validator admit against this exact
+/// predicate. Do not fork.
+pub(crate) fn validate_token_list_count(key: &str, count: usize) -> Result<(), String> {
+    if count > MAX_CORS_TOKEN_LIST_ENTRIES {
+        return Err(format!(
+            "cors: `{key}` must contain at most {MAX_CORS_TOKEN_LIST_ENTRIES} entries, got: {count}"
+        ));
+    }
+    Ok(())
+}
+
+/// Byte bound for one method/header token ([`MAX_CORS_TOKEN_BYTES`]). Applied
+/// inside [`validate_method`] and [`validate_header_name`] so every boundary
+/// that shares those predicates enforces it. The diagnostic reports only the
+/// length, never the supplied value.
+fn validate_token_len(key: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_CORS_TOKEN_BYTES {
+        return Err(format!(
+            "cors: `{key}` entries must be at most {MAX_CORS_TOKEN_BYTES} bytes (got {} bytes)",
+            value.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Shared bound on how many `allowed_origins` entries one policy may carry.
@@ -1930,6 +2006,7 @@ pub(crate) fn compile_origin_regex(pattern: &str) -> Result<Regex, String> {
 
 /// Shared admission gate — see [`validate_method`].
 pub(crate) fn validate_header_name(key: &str, value: &str) -> Result<(), String> {
+    validate_token_len(key, value)?;
     HeaderName::from_bytes(value.as_bytes())
         .map(|_| ())
         .map_err(|_| format!("cors: `{key}` contains an invalid HTTP header name: {value:?}"))

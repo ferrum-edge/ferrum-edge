@@ -67931,6 +67931,9 @@ mod tests {
         // Lookup lives in on_final_request_body (priority 4057), after final
         // request transforms and before provider I/O — not in before_proxy.
         let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
+        // Stand in for the entry path's plugin-cache-view presentation digest;
+        // without one the cache treats the response policy as unprovable.
+        miss_ctx.set_response_presentation_policy_digest(Some([0x5c; 32]));
         assert!(matches!(
             cache
                 .on_final_request_body_with_context(
@@ -67953,6 +67956,7 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
+        hit_ctx.set_response_presentation_policy_digest(Some([0x5c; 32]));
         let synthetic = cache
             .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
             .await;
@@ -67984,6 +67988,9 @@ mod tests {
         // Lookup lives in on_final_request_body (priority 4057), after final
         // request transforms and before provider I/O — not in before_proxy.
         let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
+        // Stand in for the entry path's plugin-cache-view presentation digest;
+        // without one the cache treats the response policy as unprovable.
+        miss_ctx.set_response_presentation_policy_digest(Some([0x5c; 32]));
         assert!(matches!(
             cache
                 .on_final_request_body_with_context(
@@ -68006,6 +68013,7 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
+        hit_ctx.set_response_presentation_policy_digest(Some([0x5c; 32]));
         let synthetic = cache
             .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
             .await;
