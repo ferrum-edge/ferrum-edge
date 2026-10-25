@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — `kafka_logging` refuses producer settings that could never
+  deliver** (issue #6850). `producer_config` now refuses every spelling of a
+  property that a top-level field owns: `acks` / `request.required.acks`,
+  `message.timeout.ms` / `delivery.timeout.ms`, and `compression.type` /
+  `compression.codec`, including `topic.`-prefixed and re-cased forms. Use
+  `acks`, `message_timeout_ms` or `compression` instead. Two keys that name the
+  same librdkafka property (for example `linger.ms` and
+  `queue.buffering.max.ms`) are refused, because rust-rdkafka applies its
+  config map in hash order. An explicit `message.max.bytes` must be at least
+  `max_entry_bytes` + 128; the default now grows to fit. `enable.idempotence`
+  requires `acks: all`. On `sasl_plaintext` / `sasl_ssl`, `sasl_mechanism` is
+  now required and is matched exactly against `PLAIN`, `SCRAM-SHA-256`,
+  `SCRAM-SHA-512`, `OAUTHBEARER` and `GSSAPI` (Windows only). PLAIN and SCRAM
+  need `sasl_username` / `sasl_password`, and OAUTHBEARER and GSSAPI refuse
+  them.
+- **`kafka_logging` can run under a restrictive egress policy when the broker
+  cluster is attested** (#6850). The new node setting
+  `FERRUM_KAFKA_ALLOWED_BROKERS` takes `host:port`, IP or CIDR entries. Under
+  a policy that can deny addresses, including the default posture, the plugin
+  is admitted when every `broker_list` entry is listed. Without the setting it
+  is still refused. librdkafka still resolves broker hostnames and dials
+  metadata-advertised brokers without Ferrum screening them, so the
+  attestation must cover every broker the cluster advertises. A listed
+  literal broker IP is still subject to the dangerous-range baseline.
+- **`kafka_logging` reload disposal, queue saturation and health** (#6850).
+  When a reload drops the last handle to a live generation, its ordered
+  flush now runs on a tracked background task. Before, it ran in whichever
+  request released the handle, which held that response for up to
+  `flush_timeout_seconds`. Graceful shutdown still joins the flush. The
+  worker now hands librdkafka up to 256 records per turn. A librdkafka
+  `QueueFull` waits for queue space, backing off for up to 5 s per record,
+  instead of dropping at once. Channel or byte-budget saturation now clears
+  `ferrum_kafka_logging_healthy`. `key_field: consumer_username` keys records
+  by the effective identity.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB

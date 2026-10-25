@@ -28,6 +28,34 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `kafka_logging` producer and SASL admission is stricter (#6850)
+
+A `kafka_logging` config that previously started a sink which could never
+deliver is now refused at admission. File mode fails startup, admin writes
+return `400`, and a data plane keeps its previous generation. Before you
+upgrade, check every `kafka_logging` row:
+
+- Move `producer_config` `acks` / `request.required.acks` to top-level `acks`,
+  `message.timeout.ms` / `delivery.timeout.ms` to `message_timeout_ms`, and
+  `compression.type` / `compression.codec` to `compression`. Every spelling of
+  these properties, including `topic.`-prefixed and re-cased forms, is refused
+  in `producer_config`.
+- Keep one spelling per librdkafka property. For example, use `linger.ms` or
+  `queue.buffering.max.ms`, not both.
+- If you set `producer_config.message.max.bytes`, make it at least
+  `max_entry_bytes` + 128, or remove it and let the default fit.
+- `enable.idempotence: "true"` requires `acks: all` (or omit `acks`).
+- On `sasl_plaintext` / `sasl_ssl`, set `sasl_mechanism` to the exact
+  uppercase name (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `OAUTHBEARER`).
+  PLAIN and SCRAM need `sasl_username` and `sasl_password`; remove them for
+  `OAUTHBEARER`. `GSSAPI` is accepted only on Windows builds.
+
+To keep the gateway's backend egress policy on while you use `kafka_logging`,
+list the cluster's brokers in `FERRUM_KAFKA_ALLOWED_BROKERS` on every node that
+admits or runs the plugin. Include every broker the cluster advertises, or
+their subnet. See
+[`kafka_logging` and restrictive egress policies](configuration.md#kafka_logging-and-restrictive-egress-policies).
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`
