@@ -1,17 +1,22 @@
 //! Tests for ai_token_metrics plugin
 
+use base64::Engine;
 use ferrum_edge::plugins::{
-    Plugin, PluginResult, ProxyProtocol, RequestContext,
+    Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
+    ai_response_guard::AiResponseGuard,
     ai_token_metrics::AiTokenMetrics,
+    create_response_stream_inspector,
     prometheus_metrics::MetricsRegistry,
     utils::ai_providers::{AiProvider, parse_ai_provider},
     utils::content_encoding::{DecodeLimits, decode_content_encoding},
     validate_plugin_config,
 };
+use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 
 use super::plugin_utils::{create_test_context, create_test_transaction_summary};
 
@@ -216,9 +221,37 @@ async fn buffered_sse_event_framing_preserves_usage_and_prometheus_values() {
 async fn buffered_sse_does_not_parse_data_fields_as_independent_events() {
     let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": true})).unwrap();
     let usage = r#"{"usage":{"prompt_tokens":11,"completion_tokens":7}}"#;
+    let body = format!("data: {usage}\ndata: {usage}\n\n");
+    let mut ctx = create_test_context();
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
+            .await,
+    );
+    assert!(ctx.authoritative_ai_usage_export().is_none());
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+}
+
+/// ai_token_metrics-claude-2: a final usage event whose terminating blank line
+/// (or newline) is missing is dispatched at end of body, exactly as the shared
+/// streaming extractor does, and stacked leading BOMs are stripped.
+#[tokio::test]
+async fn buffered_sse_dispatches_an_unterminated_final_event_and_strips_stacked_boms() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "buffer_streaming_responses": true,
+        "cost_per_prompt_token": 0.000001,
+        "cost_per_completion_token": 0.000002
+    }))
+    .unwrap();
+    let usage = r#"{"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}"#;
     for body in [
-        format!("data: {usage}\ndata: {usage}\n\n"),
         format!("data: {usage}\n"),
+        format!("data: {usage}"),
+        format!("data: {usage}\r"),
+        format!("data: [DONE]\n\ndata: {usage}\r\n"),
+        format!("\u{feff}\u{feff}data: {usage}\n\n"),
     ] {
         let mut ctx = create_test_context();
         let mut headers =
@@ -228,8 +261,8 @@ async fn buffered_sse_does_not_parse_data_fields_as_independent_events() {
                 .on_response_body(&mut ctx, 200, &mut headers, body.as_bytes())
                 .await,
         );
-        assert!(ctx.authoritative_ai_usage_export().is_none());
-        assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+        assert_eq!(ctx.metadata["ai_streaming"], "true", "{body:?}");
+        assert_usage_and_metrics(&ctx, "openai", Some(11), 7, Some(18), "0.000025");
     }
 }
 
@@ -331,9 +364,10 @@ async fn tgi_json_and_terminal_sse_keep_completion_only_usage_partial() {
 async fn test_plugin_name_and_priority() {
     let plugin = AiTokenMetrics::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_token_metrics");
-    assert_eq!(plugin.priority(), 4100);
+    assert_eq!(plugin.priority(), 4070);
     assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
     assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.requires_response_stream_hooks());
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
         "POST",
@@ -372,6 +406,38 @@ fn test_response_buffering_is_narrowed_by_response_content_type() {
         &HashMap::new()
     ));
     assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &HashMap::new()));
+}
+
+/// ai_token_metrics-claude-3: `on_response_body` never inspects a non-2xx
+/// body, so the content-type refinement must release it instead of collecting
+/// an error body only to discard it.
+#[test]
+fn non_2xx_responses_are_never_collected_for_inspection() {
+    for config in [json!({}), json!({"buffer_streaming_responses": true})] {
+        let plugin = AiTokenMetrics::new(&config).unwrap();
+        let ctx = ctx_with_content_type("POST", "application/json");
+        for content_type in ["application/json", "text/event-stream"] {
+            for status in [199, 300, 404, 429, 500, 503] {
+                assert!(
+                    !plugin.should_buffer_response_body_for_content_type(
+                        &ctx,
+                        Some(content_type),
+                        status,
+                        &HashMap::new()
+                    ),
+                    "{config} {content_type} {status}"
+                );
+            }
+        }
+        for status in [200, 201, 299] {
+            assert!(plugin.should_buffer_response_body_for_content_type(
+                &ctx,
+                Some("application/json"),
+                status,
+                &json_headers()
+            ));
+        }
+    }
 }
 
 #[test]
@@ -1601,8 +1667,11 @@ async fn encoded_json_supports_gzip_brotli_and_coding_chains_without_mutation() 
     }
 }
 
+/// A collected SSE body never reaches the stream observer, so it is metered
+/// from the buffered body even when a sibling (not this instance's opt-in)
+/// caused the collection; otherwise that sibling would silently drop usage.
 #[tokio::test]
-async fn encoded_sse_is_inspected_only_when_stream_buffering_is_enabled() {
+async fn collected_encoded_sse_is_metered_with_or_without_the_buffering_opt_in() {
     let event = b"data: {\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10}}\n\ndata: [DONE]\n\n";
     let encoded = gzip(event);
     let mut headers = HashMap::from([
@@ -1610,7 +1679,7 @@ async fn encoded_sse_is_inspected_only_when_stream_buffering_is_enabled() {
         ("content-encoding".to_string(), "gzip".to_string()),
     ]);
 
-    for (enabled, expected) in [(false, None), (true, Some("10"))] {
+    for (enabled, expected) in [(false, Some("10")), (true, Some("10"))] {
         let plugin = AiTokenMetrics::new(&json!({"buffer_streaming_responses": enabled})).unwrap();
         let mut ctx = create_test_context();
         plugin
@@ -1685,6 +1754,7 @@ fn every_unknown_root_config_key_is_rejected_with_allowed_key_list() {
         "buffer_streaming_response",
         "cost_per_prompt_tokn",
         "cost_per_completion_tokn",
+        "model_pricng",
     ] {
         let err = AiTokenMetrics::new(&json!({(key): true})).err().unwrap();
         assert!(err.contains(key), "got: {err}");
@@ -1937,4 +2007,619 @@ async fn standalone_invocation_metrics_event_merges_under_auto_detection() {
         ctx.metadata.get("ai_provider").map(String::as_str),
         Some("anthropic")
     );
+}
+
+// ─── Production-launch review regressions ───────────────────────────────
+
+/// ai_token_metrics-SOL-1: a reject-mode `ai_response_guard` refusing a 2xx
+/// generation the provider already produced must not erase that generation's
+/// usage. The plugins run in priority order exactly as the proxy's
+/// `on_response_body` loop does, which stops at the first rejection.
+#[tokio::test]
+async fn usage_survives_a_response_guard_rejection_of_a_consumed_generation() {
+    let guard =
+        AiResponseGuard::new(&json!({"pii_patterns": ["ssn"], "action": "reject"})).unwrap();
+    let metrics = AiTokenMetrics::new(&json!({
+        "cost_per_prompt_token": 0.01,
+        "cost_per_completion_token": 0.02
+    }))
+    .unwrap();
+    assert!(
+        metrics.priority() < guard.priority(),
+        "token metrics must observe before a rejecting response guard"
+    );
+    let mut chain: Vec<Arc<dyn Plugin>> = vec![Arc::new(guard), Arc::new(metrics)];
+    chain.sort_by_key(|plugin| plugin.priority());
+
+    let body = serde_json::to_vec(&json!({
+        "model": "example-model",
+        "choices": [{"message": {"content": "Your SSN is 123-45-6789"}}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    }))
+    .unwrap();
+    let mut ctx = ctx_with_content_type("POST", "application/json");
+    let mut headers = json_headers();
+    let mut rejected = false;
+    for plugin in &chain {
+        match plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await
+        {
+            PluginResult::Continue => {}
+            PluginResult::Reject { status_code, .. } => {
+                assert_eq!(status_code, 502);
+                rejected = true;
+                break;
+            }
+            other => panic!("unexpected response-body result: {other:?}"),
+        }
+    }
+    assert!(rejected, "the guard must still refuse the SSN response");
+    assert_eq!(ctx.metadata["ai_total_tokens"], "15");
+    assert_eq!(ctx.metadata["ai_model"], "example-model");
+    assert_eq!(ctx.metadata["ai_estimated_cost"], "0.200000");
+    let export = ctx.authoritative_ai_usage_export().unwrap();
+    assert_eq!(export.provider, "openai");
+    assert_eq!(export.prompt_tokens, Some(10));
+    assert_eq!(export.completion_tokens, Some(5));
+    assert_eq!(export.total_tokens, Some(15));
+    assert!(export.cost.is_some());
+}
+
+/// Drive one streamed response through the shared inspector entry point used
+/// by every H1/H2, native H3, and cross-protocol dispatcher, then the terminal
+/// hook. Returns the bytes forwarded for each chunk, or `None` when no
+/// inspector attached.
+async fn drive_token_stream(
+    plugin: &Arc<AiTokenMetrics>,
+    ctx: &mut RequestContext,
+    status: u16,
+    content_type: &str,
+    chunks: &[&[u8]],
+    complete: bool,
+) -> Option<Vec<Vec<u8>>> {
+    let chain: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut forwarded = None;
+    if let Some(mut inspector) =
+        create_response_stream_inspector(&chain, ctx, status, Some(content_type))
+    {
+        let mut per_chunk = Vec::new();
+        for chunk in chunks {
+            match inspector.on_chunk(chunk).await {
+                ResponseStreamAction::Forward(bytes) => per_chunk.push(bytes.to_vec()),
+                ResponseStreamAction::Terminate(_) => {
+                    panic!("ai_token_metrics must never truncate a response stream")
+                }
+            }
+        }
+        if complete {
+            match inspector.on_end().await {
+                ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
+                ResponseStreamAction::Terminate(_) => {
+                    panic!("ai_token_metrics must never truncate a response stream")
+                }
+            }
+        }
+        drop(inspector);
+        forwarded = Some(per_chunk);
+    }
+    let outcome = if complete {
+        BodyOutcome::success(0)
+    } else {
+        BodyOutcome::client_disconnect(0)
+    };
+    plugin
+        .on_response_stream_terminated(ctx, status, &outcome)
+        .await;
+    forwarded
+}
+
+fn priced_streaming_plugin(mut config: serde_json::Value) -> Arc<AiTokenMetrics> {
+    config["cost_per_prompt_token"] = json!(0.000001);
+    config["cost_per_completion_token"] = json!(0.000002);
+    Arc::new(AiTokenMetrics::new(&config).unwrap())
+}
+
+const OPENAI_USAGE_STREAM: &str = concat!(
+    "data: {\"object\":\"chat.completion.chunk\",\"model\":\"stream-model\",",
+    "\"choices\":[{\"delta\":{\"content\":\"he\"}}],\"usage\":null}\n\n",
+    "data: {\"object\":\"chat.completion.chunk\",\"model\":\"stream-model\",\"choices\":[],",
+    "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+/// ai_token_metrics-SOL-2 / ai_token_metrics-claude-1: a live SSE stream is
+/// metered without buffering under the DEFAULT configuration. Every chunk is
+/// forwarded unchanged at `on_chunk` time (first-token delivery is not
+/// delayed), and the terminal hook publishes the same metadata, cost, and
+/// Prometheus values the buffered path would, wherever the chunk boundaries
+/// fall.
+#[tokio::test]
+async fn default_config_meters_a_live_sse_stream_without_buffering() {
+    let body = OPENAI_USAGE_STREAM.as_bytes();
+    for split in (1..body.len()).step_by(17) {
+        let plugin = priced_streaming_plugin(json!({}));
+        let mut ctx = create_test_context();
+        ctx.headers
+            .insert("accept".to_string(), "text/event-stream".to_string());
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "a streamed request must stay unbuffered"
+        );
+        let (first, rest) = body.split_at(split);
+        let forwarded = drive_token_stream(
+            &plugin,
+            &mut ctx,
+            200,
+            "text/event-stream",
+            &[first, rest],
+            true,
+        )
+        .await
+        .expect("a 2xx SSE stream attaches the usage observer");
+        assert_eq!(
+            forwarded,
+            vec![first.to_vec(), rest.to_vec()],
+            "split={split}"
+        );
+        assert_eq!(ctx.metadata["ai_model"], "stream-model");
+        assert_eq!(ctx.metadata["ai_streaming"], "true");
+        assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+        assert_usage_and_metrics(&ctx, "openai", Some(11), 7, Some(18), "0.000025");
+    }
+}
+
+/// A stream the client abandons after the provider already reported usage
+/// still publishes it: the observer hands its state back before the terminal
+/// hook runs.
+#[tokio::test]
+async fn client_disconnect_after_the_usage_event_still_publishes_usage() {
+    let plugin = priced_streaming_plugin(json!({}));
+    let mut ctx = create_test_context();
+    let body = OPENAI_USAGE_STREAM.as_bytes();
+    let cut = OPENAI_USAGE_STREAM
+        .find("data: [DONE]")
+        .expect("fixture carries a terminal sentinel");
+    drive_token_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[&body[..cut]],
+        false,
+    )
+    .await
+    .expect("observer attaches");
+    assert_usage_and_metrics(&ctx, "openai", Some(11), 7, Some(18), "0.000025");
+}
+
+/// AWS Bedrock `InvokeModelWithResponseStream` binary framing is observed
+/// incrementally too (it was previously never parsed by this plugin).
+#[tokio::test]
+async fn bedrock_event_stream_is_metered_incrementally() {
+    let inner = serde_json::to_vec(&json!({
+        "type": "message_stop",
+        "amazon-bedrock-invocationMetrics": {"inputTokenCount": 30, "outputTokenCount": 20}
+    }))
+    .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(inner);
+    let payload = serde_json::to_vec(&json!({"bytes": encoded})).unwrap();
+    let message =
+        ferrum_edge::_test_support::encode_aws_event_stream_message_for_test(b"", &payload);
+    let (first, rest) = message.split_at(message.len() / 2);
+
+    let plugin = priced_streaming_plugin(json!({}));
+    let mut ctx = create_test_context();
+    drive_token_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "application/vnd.amazon.eventstream",
+        &[first, rest],
+        true,
+    )
+    .await
+    .expect("observer attaches to AWS event-stream framing");
+    assert_usage_and_metrics(&ctx, "bedrock", Some(30), 20, Some(50), "0.000070");
+}
+
+/// A configured provider labels streamed usage, as it does buffered usage.
+#[tokio::test]
+async fn configured_provider_labels_streamed_usage() {
+    let plugin = priced_streaming_plugin(json!({"provider": "mistral"}));
+    let mut ctx = create_test_context();
+    drive_token_stream(
+        &plugin,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[OPENAI_USAGE_STREAM.as_bytes()],
+        true,
+    )
+    .await
+    .expect("observer attaches");
+    assert_usage_and_metrics(&ctx, "mistral", Some(11), 7, Some(18), "0.000025");
+}
+
+/// Streams that must not be metered get no observer: non-2xx, synthetic
+/// short-circuit bodies, non-stream media types, and content-coded origin
+/// streams (whose octets the incremental parser cannot read).
+#[tokio::test]
+async fn ineligible_streams_attach_no_observer() {
+    let plugin = priced_streaming_plugin(json!({}));
+    let body = OPENAI_USAGE_STREAM.as_bytes();
+
+    for (status, content_type) in [
+        (500, "text/event-stream"),
+        (429, "text/event-stream"),
+        (200, "application/octet-stream"),
+        (200, "text/plain"),
+    ] {
+        let mut ctx = create_test_context();
+        assert!(
+            drive_token_stream(&plugin, &mut ctx, status, content_type, &[body], true)
+                .await
+                .is_none(),
+            "{status} {content_type}"
+        );
+        assert!(ctx.authoritative_ai_usage_export().is_none());
+        assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+        assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+    }
+
+    let mut synthetic = create_test_context();
+    synthetic.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    assert!(
+        drive_token_stream(
+            &plugin,
+            &mut synthetic,
+            200,
+            "text/event-stream",
+            &[body],
+            true
+        )
+        .await
+        .is_none()
+    );
+    assert!(synthetic.authoritative_ai_usage_export().is_none());
+    assert!(!synthetic.metadata.contains_key("ai_unmetered_reason"));
+
+    // A gzip origin stream is delivered untouched and labelled, never parsed.
+    let mut encoded = create_test_context();
+    let origin_headers = HashMap::from([
+        ("content-type".to_string(), "text/event-stream".to_string()),
+        ("content-encoding".to_string(), "gzip".to_string()),
+    ]);
+    ferrum_edge::_test_support::stamp_original_response_metadata_for_test(
+        &mut encoded,
+        200,
+        &origin_headers,
+    );
+    let compressed = gzip(body);
+    assert!(
+        drive_token_stream(
+            &plugin,
+            &mut encoded,
+            200,
+            "text/event-stream",
+            &[compressed.as_slice()],
+            true,
+        )
+        .await
+        .is_none()
+    );
+    assert!(encoded.authoritative_ai_usage_export().is_none());
+    assert_eq!(
+        encoded.metadata["ai_unmetered_reason"],
+        "stream_not_inspected"
+    );
+}
+
+/// ai_token_metrics-claude-5: a stream that ends without any usage report is
+/// labelled rather than silently looking like zero usage.
+#[tokio::test]
+async fn stream_without_usage_is_labelled_unmetered() {
+    let plugin = priced_streaming_plugin(json!({}));
+    let mut ctx = create_test_context();
+    let body: &[u8] =
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\ndata: [DONE]\n\n";
+    drive_token_stream(&plugin, &mut ctx, 200, "text/event-stream", &[body], true)
+        .await
+        .expect("observer attaches");
+    assert!(ctx.authoritative_ai_usage_export().is_none());
+    assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+    assert_eq!(ctx.metadata["ai_unmetered_reason"], "stream_without_usage");
+}
+
+/// `(plugin, content-encoding, body, expected unmetered reason)`.
+type UnmeteredCase<'a> = (&'a AiTokenMetrics, Option<&'a str>, Vec<u8>, &'a str);
+
+/// ai_token_metrics-claude-5: every buffered 2xx skip path names its reason;
+/// a later successful extraction clears it; non-2xx, synthetic, and non-JSON
+/// responses are not labelled.
+#[tokio::test]
+async fn buffered_unmetered_responses_name_their_reason() {
+    let auto = AiTokenMetrics::new(&json!({})).unwrap();
+    let fixed = AiTokenMetrics::new(&json!({"provider": "openai"})).unwrap();
+    let oversized = vec![b' '; 4 * 1024 * 1024 + 1];
+    let cases: Vec<UnmeteredCase<'_>> = vec![
+        (&auto, None, oversized, "body_too_large"),
+        (&auto, Some("gzip"), b"not-gzip".to_vec(), "decode_failed"),
+        (&auto, Some("zstd"), b"{}".to_vec(), "decode_failed"),
+        (&auto, None, b"not valid json".to_vec(), "malformed_body"),
+        (
+            &auto,
+            None,
+            br#"{"id":"chatcmpl-123"}"#.to_vec(),
+            "provider_undetected",
+        ),
+        (
+            &fixed,
+            None,
+            br#"{"id":"chatcmpl-123"}"#.to_vec(),
+            "no_usage",
+        ),
+        (&auto, None, Vec::new(), "no_usage"),
+    ];
+    for (plugin, encoding, body, reason) in cases {
+        let mut headers = json_headers();
+        if let Some(encoding) = encoding {
+            headers.insert("content-encoding".to_string(), encoding.to_string());
+        }
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
+                .await,
+        );
+        assert_eq!(ctx.metadata["ai_unmetered_reason"], reason);
+        assert!(!ctx.metadata.contains_key("ai_total_tokens"));
+    }
+
+    // Buffered SSE without a usage event.
+    let mut ctx = create_test_context();
+    let mut sse_headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+    auto.on_response_body(&mut ctx, 200, &mut sse_headers, b"data: {\"x\":1}\n\n")
+        .await;
+    assert_eq!(ctx.metadata["ai_unmetered_reason"], "no_usage");
+
+    // A successful extraction clears a stale reason.
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_unmetered_reason".to_string(), "no_usage".to_string());
+    let body = br#"{"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+    auto.on_response_body(&mut ctx, 200, &mut json_headers(), body)
+        .await;
+    assert_eq!(ctx.metadata["ai_total_tokens"], "3");
+    assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+
+    // Deliberate exclusions are not "unmetered".
+    for (status, content_type) in [(500, "application/json"), (200, "text/html")] {
+        let mut ctx = create_test_context();
+        let mut headers = HashMap::from([("content-type".to_string(), content_type.to_string())]);
+        auto.on_response_body(&mut ctx, status, &mut headers, b"not json")
+            .await;
+        assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+    }
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    auto.on_response_body(&mut ctx, 200, &mut json_headers(), b"not json")
+        .await;
+    assert!(!ctx.metadata.contains_key("ai_unmetered_reason"));
+
+    // The reason key follows `metadata_prefix`.
+    let prefixed = AiTokenMetrics::new(&json!({"metadata_prefix": "tenant"})).unwrap();
+    let mut ctx = create_test_context();
+    prefixed
+        .on_response_body(&mut ctx, 200, &mut json_headers(), b"not valid json")
+        .await;
+    assert_eq!(ctx.metadata["tenant_unmetered_reason"], "malformed_body");
+}
+
+/// ai_token_metrics-claude-4: the backend-controlled model string is bounded
+/// before it reaches metadata (and every log sink); token counts still export.
+#[tokio::test]
+async fn oversized_or_control_bearing_model_names_are_not_published() {
+    let plugin = AiTokenMetrics::new(&json!({})).unwrap();
+    let at_limit = "m".repeat(256);
+    for (model, published) in [
+        (at_limit.as_str(), true),
+        ("gpt-4o", true),
+        (&*"m".repeat(257), false),
+        ("gpt\n-4o", false),
+        ("gpt\u{0}4o", false),
+        ("", false),
+    ] {
+        let body = serde_json::to_vec(&json!({
+            "model": model,
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        }))
+        .unwrap();
+        let mut ctx = create_test_context();
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await;
+        assert_eq!(ctx.metadata["ai_total_tokens"], "7");
+        assert_eq!(
+            ctx.metadata.get("ai_model").map(String::as_str),
+            published.then_some(model),
+            "model of {} bytes",
+            model.len()
+        );
+    }
+
+    // The streaming observer applies the same bound.
+    let streaming = priced_streaming_plugin(json!({}));
+    let long_model = "s".repeat(300);
+    let stream = format!(
+        "data: {}\n\n",
+        json!({
+            "model": long_model,
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        })
+    );
+    let mut ctx = create_test_context();
+    drive_token_stream(
+        &streaming,
+        &mut ctx,
+        200,
+        "text/event-stream",
+        &[stream.as_bytes()],
+        true,
+    )
+    .await
+    .expect("observer attaches");
+    assert_eq!(ctx.metadata["ai_total_tokens"], "7");
+    assert!(!ctx.metadata.contains_key("ai_model"));
+}
+
+fn usage_body(model: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": model,
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    }))
+    .unwrap()
+}
+
+/// ai_token_metrics-claude-6: one instance prices each model with its own
+/// rates (first matching glob wins) and falls back to the flat rates.
+#[tokio::test]
+async fn model_pricing_selects_the_first_matching_glob_and_falls_back_to_flat_rates() {
+    let plugin = AiTokenMetrics::new(&json!({
+        "cost_per_prompt_token": 0.0001,
+        "cost_per_completion_token": 0.0002,
+        "model_pricing": [
+            {"model": "gpt-4o-mini*", "cost_per_prompt_token": 0.001, "cost_per_completion_token": 0.002},
+            {"model": "gpt-4o*", "cost_per_prompt_token": 0.01, "cost_per_completion_token": 0.02},
+            {"model": "claude-*", "cost_per_completion_token": 0.02}
+        ]
+    }))
+    .unwrap();
+    for (model, cost) in [
+        ("gpt-4o-mini-2024-07-18", Some("0.020000")),
+        ("gpt-4o-2024-08-06", Some("0.200000")),
+        ("gpt-4o", Some("0.200000")),
+        // Omitted entry rate: only the completion side is priced.
+        ("claude-sonnet", Some("0.100000")),
+        // No match: flat rates.
+        ("mistral-large", Some("0.002000")),
+        // An unpublishable model never selects an entry.
+        (
+            &*format!("gpt-4o-mini{}", "x".repeat(300)),
+            Some("0.002000"),
+        ),
+    ] {
+        let mut ctx = create_test_context();
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &usage_body(model))
+            .await;
+        assert_eq!(
+            ctx.metadata.get("ai_estimated_cost").map(String::as_str),
+            cost,
+            "{model}"
+        );
+        assert!(ctx.authoritative_ai_usage_export().unwrap().cost.is_some());
+    }
+
+    // A response without a model is priced at the flat rates too.
+    let mut ctx = create_test_context();
+    let body = br#"{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+    plugin
+        .on_response_body(&mut ctx, 200, &mut json_headers(), body)
+        .await;
+    assert_eq!(ctx.metadata["ai_estimated_cost"], "0.002000");
+
+    // Without flat rates an unmatched model is unpriced.
+    let per_model_only = AiTokenMetrics::new(&json!({
+        "model_pricing": [{"model": "gpt-4o*", "cost_per_prompt_token": 0.01}]
+    }))
+    .unwrap();
+    let mut ctx = create_test_context();
+    per_model_only
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &usage_body("o3"))
+        .await;
+    assert!(!ctx.metadata.contains_key("ai_estimated_cost"));
+    assert!(ctx.authoritative_ai_usage_export().unwrap().cost.is_none());
+}
+
+#[test]
+fn model_pricing_admission_matches_openapi() {
+    let schema = token_metrics_schema();
+    let validator = jsonschema::draft202012::options().build(&schema).unwrap();
+    let too_many: Vec<_> = (0..129)
+        .map(|index| json!({"model": format!("m{index}"), "cost_per_prompt_token": 1}))
+        .collect();
+    let max: Vec<_> = (0..128)
+        .map(|index| json!({"model": format!("m{index}"), "cost_per_prompt_token": 1}))
+        .collect();
+    for (pricing, accepted) in [
+        (json!([]), true),
+        (json!(max), true),
+        (
+            json!([{"model": "gpt-4o*", "cost_per_prompt_token": 0.0000025}]),
+            true,
+        ),
+        (
+            json!([{"model": "claude-*", "cost_per_prompt_token": null, "cost_per_completion_token": 0.00001}]),
+            true,
+        ),
+        (
+            json!([{"model": "a.b:c/d+e_f-*", "cost_per_completion_token": 0}]),
+            true,
+        ),
+        (json!(too_many), false),
+        (json!({}), false),
+        (json!(null), false),
+        (json!([{"model": "gpt-4o"}]), false),
+        (
+            json!([{"model": "gpt-4o", "cost_per_prompt_token": null}]),
+            false,
+        ),
+        (json!([{"cost_per_prompt_token": 1}]), false),
+        (json!([{"model": "", "cost_per_prompt_token": 1}]), false),
+        (
+            json!([{"model": "a..b", "cost_per_prompt_token": 1}]),
+            false,
+        ),
+        (
+            json!([{"model": "gpt 4", "cost_per_prompt_token": 1}]),
+            false,
+        ),
+        (
+            json!([{"model": "m".repeat(257), "cost_per_prompt_token": 1}]),
+            false,
+        ),
+        (
+            json!([{"model": "gpt", "cost_per_prompt_token": -1}]),
+            false,
+        ),
+        (
+            json!([{"model": "gpt", "cost_per_prompt_token": 18_446_744_073_710.0}]),
+            false,
+        ),
+        (
+            json!([{"model": "gpt", "cost_per_prompt_token": "free"}]),
+            false,
+        ),
+        (
+            json!([{"model": "gpt", "cost_per_prompt_token": 1, "currency": "usd"}]),
+            false,
+        ),
+        (json!(["gpt-4o"]), false),
+    ] {
+        let config = json!({"model_pricing": pricing});
+        assert_eq!(
+            AiTokenMetrics::new(&config).is_ok(),
+            accepted,
+            "runtime {config}"
+        );
+        assert_eq!(validator.is_valid(&config), accepted, "schema {config}");
+    }
 }

@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`ai_token_metrics` meters streamed responses without buffering and runs
+  before `ai_response_guard`.** A streamed 2xx `text/event-stream` or AWS
+  `application/vnd.amazon.eventstream` response is now metered by default
+  through a pass-through stream inspector built on the shared bounded usage
+  extractor: chunks are forwarded unchanged and immediately, and the observed
+  usage (metadata, estimated cost, and the typed Prometheus snapshot) is
+  published once from the terminal stream hook before the transaction is
+  logged, including when the client disconnects after the provider reported
+  usage. Previously a streamed response produced no token metrics unless
+  `buffer_streaming_responses: true` collected the whole stream. At most 4,096
+  streams are observed concurrently; content-coded origin streams are left
+  unobserved. The plugin's priority moves from 4100 to 4070 (after
+  `ai_federation`, before `ai_response_guard` at 4075), so a guard rejection of
+  a 2xx generation the provider already produced no longer erases that
+  generation's tokens and cost. A collected SSE body is now metered whether or
+  not this instance opted into buffering, since a sibling's buffering would
+  otherwise drop its usage.
+- **`ai_token_metrics` adds per-model pricing and an unmetered-reason label.**
+  `model_pricing` is an ordered list (at most 128) of anchored `*`-only model
+  globs, each with its own `cost_per_prompt_token` / `cost_per_completion_token`;
+  the first match prices the response and the flat rates are the fallback. A
+  2xx JSON or streamed response that yields no usage now records
+  `{prefix}_unmetered_reason` (`body_too_large`, `decode_failed`,
+  `malformed_body`, `provider_undetected`, `no_usage`, `stream_not_inspected`,
+  or `stream_without_usage`), so "unmetered" is distinguishable from zero usage.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +164,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`ai_token_metrics` buffered SSE no longer drops an unterminated final
+  usage event.** A final event missing its terminating blank line (or newline)
+  is dispatched at end of body, matching the streaming extractor, and stacked
+  leading BOMs are stripped. Non-2xx responses are no longer collected for
+  inspection the plugin always skips, and a backend-reported model longer than
+  256 bytes or containing control characters is no longer copied into
+  `{prefix}_model` (token counts are still recorded). H1/H2 streamed
+  transaction summaries now carry typed AI usage staged by terminal stream
+  hooks, so `prometheus_metrics` counts it.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

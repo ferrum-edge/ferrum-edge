@@ -622,6 +622,14 @@ impl DeferredTransactionLogger {
                 summary.timestamp_received = ctx.timestamp_received.to_rfc3339();
             }
             summary.metadata = crate::proxy::clone_log_metadata(&ctx);
+            // The typed AI usage snapshot is finalized the same way: a stream
+            // observer publishes its usage from a terminal hook, after the
+            // header-commit skeleton captured the (then empty) snapshot. The
+            // context still holds everything staged before header commit, so
+            // it only ever extends what the skeleton carried.
+            if ctx.ai_usage_export.is_some() {
+                summary.ai_usage_export = ctx.ai_usage_export.clone();
+            }
             log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
         };
         #[cfg(test)]

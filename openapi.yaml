@@ -35721,11 +35721,14 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: ai_token_metrics — Extracts token usage from HTTP JSON/SSE LLM
-        response bodies. Native gRPC protobuf messages are unsupported and the
-        plugin is not registered for the Grpc protocol view. Unknown keys are
-        rejected. SSE accounting requires explicit full-response buffering and
-        disables live delivery. Cohere counts come from usage.tokens,
+        Plugin: ai_token_metrics — Extracts token usage from HTTP JSON LLM
+        response bodies and from streamed SSE / AWS event-stream responses.
+        Native gRPC protobuf messages are unsupported and the plugin is not
+        registered for the Grpc protocol view. Unknown keys are rejected.
+        Streamed responses are metered incrementally without buffering;
+        buffer_streaming_responses instead collects SSE before inspection and
+        disables live delivery. A collected body above 4 MiB (before decoding)
+        is not inspected. Cohere counts come from usage.tokens,
         delta.usage.tokens, or meta.tokens, not billed_units; configured cost
         rates estimate cost from those token counts, not provider billing units.
       properties:
@@ -35752,7 +35755,7 @@ components:
         buffer_streaming_responses:
           type: boolean
           default: false
-          description: Buffer text/event-stream responses so final SSE usage events can be parsed; disables streaming delivery for those responses
+          description: Buffer text/event-stream responses and meter them after the full response is collected; disables streaming delivery for those responses. Not required for SSE token accounting, which observes streams incrementally by default.
         cost_per_prompt_token:
           type: [number, "null"]
           format: double
@@ -35765,6 +35768,44 @@ components:
           minimum: 0
           maximum: 18446744073709.55
           description: Calculate estimated cost per request from completion tokens; range 0 through 18446744073709.55. Omitted or null disables this rate.
+        model_pricing:
+          type: array
+          maxItems: 128
+          default: []
+          description: "Ordered per-model rate overrides. The first entry whose `model` glob matches the response's reported model supplies the rates (an omitted entry rate leaves that side unpriced); when none matches, or no publishable model is reported, the flat rates apply. Federation usage is priced at the flat rates."
+          items:
+            type: object
+            additionalProperties: false
+            required: [model]
+            anyOf:
+              - required: [cost_per_prompt_token]
+                properties:
+                  cost_per_prompt_token:
+                    type: number
+              - required: [cost_per_completion_token]
+                properties:
+                  cost_per_completion_token:
+                    type: number
+            properties:
+              model:
+                type: string
+                minLength: 1
+                maxLength: 256
+                pattern: '^[A-Za-z0-9._:/+*-]+$'
+                not: { pattern: '\.\.' }
+                description: "Anchored glob matched against the response's model; `*` is the only wildcard and never matches URL-structural separators (`/ ? # & \\`) or whitespace."
+              cost_per_prompt_token:
+                type: [number, "null"]
+                format: double
+                minimum: 0
+                maximum: 18446744073709.55
+                description: Prompt-token rate for matching models; null or omitted leaves the prompt side unpriced.
+              cost_per_completion_token:
+                type: [number, "null"]
+                format: double
+                minimum: 0
+                maximum: 18446744073709.55
+                description: Completion-token rate for matching models; null or omitted leaves the completion side unpriced.
 
     AiRequestGuardConfig:
       type: object
