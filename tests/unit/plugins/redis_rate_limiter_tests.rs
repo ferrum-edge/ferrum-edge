@@ -9761,7 +9761,7 @@ async fn deduplication_refuses_an_over_cap_record_without_downloading_it() {
     .expect("redis-mode deduplication");
 
     assert_eq!(
-        request_deduplication_redis_record_state_for_test(&plugin, "v6:probe").await,
+        request_deduplication_redis_record_state_for_test(&plugin, "v7:probe").await,
         "unreadable",
         "an over-cap record is a fail-closed conflict, not a miss"
     );

@@ -41,6 +41,7 @@ fn source_upstream_tls() -> BackendTlsConfig {
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
         tls_refused: false,
+        suppress_global_client_identity: false,
     }
 }
 
@@ -663,6 +664,7 @@ fn explicit_tls_override_wins_over_destination_snapshot() {
         san_allow_list: Vec::new(),
         san_allow_list_key_digest: None,
         tls_refused: false,
+        suppress_global_client_identity: false,
     }));
 
     let effective = ctx.apply_route_overrides_with_upstreams(Arc::clone(&proxy), &upstreams);

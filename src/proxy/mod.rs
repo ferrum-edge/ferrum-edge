@@ -10837,6 +10837,7 @@ impl ProxyState {
             env_config_arc.compression_brotli_enabled,
         )
         .with_max_request_body_size_bytes(env_config_arc.max_request_body_size_bytes)
+        .with_max_response_body_size_bytes(env_config_arc.max_response_body_size_bytes)
         .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone())
         .with_live_crls(shared_crls.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
@@ -37087,6 +37088,20 @@ async fn handle_proxy_request_inner(
         );
         std::mem::swap(&mut ctx.headers, transformed_headers);
         requirements
+    } else if ctx.route_override_path.is_some() {
+        // A path-only route rewrite (`mesh_route_dispatch` without a header
+        // change) can select a different gRPC method or operation than the one
+        // the pre-`before_proxy` vote saw. A per-method body policy that voted
+        // "not mine" for the client path must be asked again, or the rewritten
+        // request would stream past it.
+        final_request_body_requirements(
+            &plugins,
+            &ctx,
+            request_may_need_buffering,
+            has_terminal_body_dispatch,
+            has_contextual_final_body_hook,
+            has_finalized_request_egress_before_dispatch,
+        )
     } else {
         (
             initial_requires_request_body_buffering,
@@ -37390,6 +37405,48 @@ async fn handle_proxy_request_inner(
         }
         ctx.bind_authorized_backend_path(backend_path);
     }
+
+    // A per-method gRPC body policy (`body_validator` method entries) selects on
+    // the BACKEND-effective method, which exists only now: listen-path
+    // stripping plus a proxy/target base path can replace the service segment
+    // the earlier votes saw. Native gRPC consumes these requirements only after
+    // this point, so re-ask them against the bound path before choosing between
+    // the streaming fast path and the collect-and-validate path.
+    let (
+        requires_request_body_buffering,
+        final_body_before_backend_dispatch,
+        needs_final_request_body_context,
+    ) = if backend_path_is_policy_bound && is_grpc_request {
+        match owned_proxy_headers.as_mut() {
+            Some(transformed_headers) => {
+                std::mem::swap(&mut ctx.headers, transformed_headers);
+                let requirements = final_request_body_requirements(
+                    &plugins,
+                    &ctx,
+                    request_may_need_buffering,
+                    has_terminal_body_dispatch,
+                    has_contextual_final_body_hook,
+                    has_finalized_request_egress_before_dispatch,
+                );
+                std::mem::swap(&mut ctx.headers, transformed_headers);
+                requirements
+            }
+            None => final_request_body_requirements(
+                &plugins,
+                &ctx,
+                request_may_need_buffering,
+                has_terminal_body_dispatch,
+                has_contextual_final_body_hook,
+                has_finalized_request_egress_before_dispatch,
+            ),
+        }
+    } else {
+        (
+            requires_request_body_buffering,
+            final_body_before_backend_dispatch,
+            needs_final_request_body_context,
+        )
+    };
 
     if has_deferred_routing_header_hooks {
         // These hooks moved later for authorization ordering, but their
@@ -41165,6 +41222,18 @@ async fn handle_proxy_request_inner(
                             grpc_streaming_unbounded_trailer_policy,
                         ));
                 }
+                // The RPC deadline carries this client connection's close
+                // signal (`Some` on the hyper-driven H1/H2 frontends), so the
+                // adapter moves the backend body into the gateway-owned
+                // response pump: a client that withholds response credit parks
+                // hyper before it polls the body, and only a gateway-scheduled
+                // timer can then release the backend stream at the deadline.
+                let grpc_response_deadline = grpc_total_deadline.map(|at| {
+                    crate::proxy::body::ClientGrpcResponseDeadline::new(
+                        at,
+                        ctx.authorization_connection_closer.clone(),
+                    )
+                });
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && effective_max_response_body_size_bytes == 0
                 {
@@ -41172,7 +41241,7 @@ async fn handle_proxy_request_inner(
                         grpc_streaming.body,
                         advertised_content_length,
                         grpc_read_timeout_ms,
-                        grpc_total_deadline,
+                        grpc_response_deadline,
                         grpc_streaming_trailer_governor.take(),
                     )
                 } else if effective_max_response_body_size_bytes > 0 {
@@ -41186,7 +41255,7 @@ async fn handle_proxy_request_inner(
                         advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
-                        grpc_total_deadline,
+                        grpc_response_deadline,
                         grpc_streaming_trailer_governor.take(),
                     )
                 } else {
@@ -41195,7 +41264,7 @@ async fn handle_proxy_request_inner(
                         advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
-                        grpc_total_deadline,
+                        grpc_response_deadline,
                         grpc_streaming_trailer_governor.take(),
                     )
                 };
@@ -45551,8 +45620,11 @@ async fn handle_proxy_request_inner(
                     );
                 }
                 if let Some(deadline) = ctx.grpc_deadline_at() {
-                    inspected = inspected
-                        .with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+                    inspected = inspected.with_client_grpc_deadline(
+                        deadline,
+                        grpc_web_response_content_type,
+                        ctx.authorization_connection_closer.clone(),
+                    );
                 }
                 inspected
             } else {
@@ -45670,7 +45742,11 @@ async fn handle_proxy_request_inner(
                     base
                 };
                 if let Some(deadline) = ctx.grpc_deadline_at() {
-                    base.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+                    base.with_client_grpc_deadline(
+                        deadline,
+                        grpc_web_response_content_type,
+                        ctx.authorization_connection_closer.clone(),
+                    )
                 } else {
                     base
                 }
@@ -45898,7 +45974,11 @@ async fn handle_proxy_request_inner(
             // returning empty Forward; only bytes yielded by this outer body
             // are client-visible for the clean-status-4 versus reset decision.
             if let Some(deadline) = h2_total_deadline {
-                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+                body = body.with_client_grpc_deadline(
+                    deadline,
+                    grpc_web_response_content_type,
+                    ctx.authorization_connection_closer.clone(),
+                );
             }
             // Deferred admission/dispatch outcomes stay on the client-visible
             // body. The least-connections guard moves into the inspection task
@@ -46061,7 +46141,11 @@ async fn handle_proxy_request_inner(
                 body.with_lb_connection_guard(lb_connection_guard)
             };
             if let Some(deadline) = grpc_request_deadline {
-                body = body.with_client_grpc_deadline(deadline, grpc_web_response_content_type);
+                body = body.with_client_grpc_deadline(
+                    deadline,
+                    grpc_web_response_content_type,
+                    ctx.authorization_connection_closer.clone(),
+                );
             }
             body = body.with_success_on_drop_after_response_bytes(success_on_drop_after_bytes);
             if let Some(permits) = backend_admission_permits.take() {
@@ -61916,6 +62000,10 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
     if let Some(write_timeout) = pipe_write_timeout.as_ref() {
         parts.extensions.insert(write_timeout.clone());
     }
+    // Same client RPC upload deadline as the native gRPC streaming dispatch:
+    // hyper's body pipe resets a still-open upload at the deadline even while
+    // parked on backend flow control (hyper patch 007).
+    grpc_proxy::attach_grpc_upload_deadline(&mut parts.extensions, client_grpc_deadline_at);
     parts.uri = tunneled_uri;
     parts.version = hyper::Version::HTTP_2;
     parts.method = match parse_hyper_method(method) {
@@ -62244,6 +62332,24 @@ async fn proxy_to_backend_mesh_mtls_after_ready(
                             resolved_ip,
                         )
                     },
+                    None,
+                    None,
+                );
+            }
+            // hyper's body pipe resets the stream at the client RPC deadline
+            // (hyper patch 007), the instant the header wait expires: a failure
+            // at or after it is that deadline, not a backend fault.
+            if is_grpc_flavored
+                && grpc_send_deadline_is_client
+                && client_grpc_deadline_at
+                    .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return (
+                    client_grpc_deadline_exceeded_response_for_request(
+                        request_ctx,
+                        headers,
+                        resolved_ip,
+                    ),
                     None,
                     None,
                 );
@@ -63094,6 +63200,9 @@ async fn proxy_to_backend_http2(
     if let Some(write_timeout) = passthrough_write_timeout.as_ref() {
         parts.extensions.insert(write_timeout.clone());
     }
+    // A gRPC upload relayed over direct H2 carries the same client RPC upload
+    // deadline as the native gRPC dispatch (hyper patch 007).
+    grpc_proxy::attach_grpc_upload_deadline(&mut parts.extensions, grpc_deadline_at);
     let backend_req = Request::from_parts(parts, body);
 
     // Post-EOS transport-drain bound (issue #4411): publish the backend socket
@@ -68887,6 +68996,7 @@ mod tests {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         };
 
         let sources = collect_backend_tls_watched_sources(&config, &env_config);
@@ -68931,6 +69041,7 @@ mod tests {
                 san_allow_list: Vec::new(),
                 san_allow_list_key_digest: None,
                 tls_refused: false,
+                suppress_global_client_identity: false,
             })
         }
         let env_config = EnvConfig::default();
@@ -73687,6 +73798,7 @@ mod tests {
             san_allow_list: Vec::new(),
             san_allow_list_key_digest: None,
             tls_refused: false,
+            suppress_global_client_identity: false,
         };
 
         let now = chrono::Utc::now();

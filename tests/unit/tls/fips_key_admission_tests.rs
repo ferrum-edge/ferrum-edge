@@ -312,6 +312,27 @@ fn p521_jwks_are_refused_because_es512_is_refused() {
     );
 }
 
+/// `jwks_auth`, `oidc_relying_party`, and DPoP proofs accept Ed25519 (OKP)
+/// keys on the default profile. While FIPS mode is enforced the key gate must
+/// agree with the algorithm gate, which deliberately omits `EdDSA`.
+#[test]
+fn okp_eddsa_jwks_are_refused_because_eddsa_is_refused() {
+    let error = keys::check_jwk_okp_public_key_enforced().expect_err("Ed25519 JWK must be refused");
+    assert!(error.contains("EdDSA"), "{error}");
+    assert!(
+        error.contains("PS256"),
+        "the diagnostic names the approved set: {error}"
+    );
+    assert!(
+        !policy::is_approved_jwt_algorithm("EdDSA"),
+        "the key gate and the algorithm gate must agree"
+    );
+    // RSASSA-PSS is approved, so admitting PS* JWKS needs no key-form gate.
+    for alg in ["PS256", "PS384", "PS512"] {
+        assert!(policy::is_approved_jwt_algorithm(alg), "{alg}");
+    }
+}
+
 #[test]
 fn jwk_ec_curve_and_coordinate_form_are_both_required() {
     let p256 = vec![1u8; 32];
@@ -784,6 +805,7 @@ fn gated_wrappers_are_inert_without_bootstrap() {
         .expect("inert when FIPS mode is off");
     keys::check_jwk_rsa_modulus(&[0xFFu8; 64]).expect("inert when FIPS mode is off");
     keys::check_jwk_ec_curve("secp256k1").expect("inert when FIPS mode is off");
+    keys::check_jwk_okp_public_key().expect("inert when FIPS mode is off");
     policy::check_external_secret_sources().expect("inert when FIPS mode is off");
 
     let config = GatewayConfig {

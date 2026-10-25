@@ -421,6 +421,8 @@ where
     cb: Callback<Request<B>, Response<IncomingBody>>,
     // FERRUM PATCH 004: the request's `Http2BodyWriteTimeout`, if any.
     write_timeout: Option<crate::ext::Http2BodyWriteTimeout>,
+    // FERRUM PATCH 007: the request's `Http2BodyDeadline`, if any.
+    body_deadline: Option<crate::ext::Http2BodyDeadline>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -473,6 +475,8 @@ pin_project! {
         #[pin]
         ping: Option<Recorder>,
         cancel_rx: Option<oneshot::Receiver<()>>,
+        // FERRUM PATCH 007: the request's absolute body deadline, if any.
+        deadline: Option<Pin<Box<dyn crate::rt::Sleep>>>,
     }
 }
 
@@ -504,6 +508,19 @@ where
                 *this.cancel_rx = None;
             }
             Some(Poll::Pending) | None => {}
+        }
+
+        // FERRUM PATCH 007: the request's absolute body deadline. Polled here,
+        // ahead of the pipe, so it fires whatever the pipe is parked on: the
+        // body, or peer flow control with a chunk it cannot yet send.
+        if let Some(deadline) = this.deadline.as_mut() {
+            if deadline.as_mut().poll(cx).is_ready() {
+                debug!("client request body deadline elapsed, resetting stream");
+                this.pipe.as_mut().send_reset(h2::Reason::CANCEL);
+                drop(this.conn_drop_ref.take().expect("Future polled twice"));
+                drop(this.ping.take().expect("Future polled twice"));
+                return Poll::Ready(());
+            }
         }
 
         match Pin::new(&mut this.pipe).poll(cx) {
@@ -560,11 +577,23 @@ where
                         // still sending...
                         let ping = ping.clone();
 
+                        // FERRUM PATCH 007: arm the body deadline from the
+                        // connection's timer. Extraction already dropped it on
+                        // a connection without one.
+                        let deadline = f.body_deadline.map(|deadline| {
+                            self.timer.sleep(
+                                deadline
+                                    .deadline()
+                                    .saturating_duration_since(self.timer.now()),
+                            )
+                        });
+
                         let pipe = PipeMap {
                             pipe,
                             conn_drop_ref: Some(conn_drop_ref),
                             ping: Some(ping),
                             cancel_rx: Some(cancel_rx),
+                            deadline,
                         };
                         // Clear send task
                         self.executor
@@ -764,6 +793,13 @@ where
                         continue;
                     }
 
+                    // FERRUM PATCH 007: an absolute body deadline is armed from
+                    // the connection's timer; without one it is ignored.
+                    let body_deadline = req
+                        .extensions_mut()
+                        .remove::<crate::ext::Http2BodyDeadline>()
+                        .filter(|_| !matches!(self.timer, Time::Empty));
+
                     let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
                         Ok(ok) => ok,
                         Err(err) => {
@@ -784,6 +820,7 @@ where
                         body,
                         cb,
                         write_timeout,
+                        body_deadline,
                     };
 
                     // Check poll_ready() again.

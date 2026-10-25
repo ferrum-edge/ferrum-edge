@@ -39,19 +39,27 @@
 //!
 //! ## MVP scope
 //!
-//! - `openai` / `openai_compatible`: route + header rewrite; body is passed
-//!   through untranslated except optional `stream_options.include_usage`
-//!   injection. Provider SSE is already OpenAI-shaped, so it streams through
-//!   unchanged (zero-overhead — no inspector).
+//! - `openai` / `openai_compatible` / `azure_openai`: route + header rewrite;
+//!   body is passed through untranslated except optional
+//!   `stream_options.include_usage` injection. Provider SSE is already
+//!   OpenAI-shaped, so it streams through unchanged (zero-overhead — no
+//!   inspector). `azure_openai` authenticates with the `api-key` header.
+//! - For both translated providers, OpenAI request parameters are mapped
+//!   exactly (`response_format` / `n` / penalties / `seed` for Gemini,
+//!   `parallel_tool_calls` for Anthropic) or refused with an OpenAI-shaped
+//!   `400`, never silently dropped; user-message base64 data-URL images become
+//!   native image parts; and a 2xx response whose media type is not a
+//!   supported stream framing fails closed.
 //! - `anthropic`: OpenAI Chat Completions request is translated to the Anthropic
 //!   Messages API streaming request (including assistant `tool_calls` /
 //!   matching `role: "tool"` results and legacy assistant `function_call` /
 //!   matching `role: "function"` results); Anthropic SSE events are normalized
 //!   back to OpenAI `chat.completion.chunk` SSE. OpenAI `tool_choice: "none"`
 //!   becomes Anthropic `{"type":"none"}` with the tools list retained;
-//!   unsupported tool_choice values and forced tool use with manual extended
-//!   thinking (`thinking.type: "enabled"`) are rejected at admission. Adaptive
-//!   thinking may combine with OpenAI `required` / named choices. Provider
+//!   unsupported tool_choice values, and extended thinking (manual or
+//!   adaptive) combined with callable tools or a tool-result continuation, are
+//!   rejected at admission: signed thinking blocks cannot round-trip through
+//!   the OpenAI representation. Provider
 //!   `tool_use` under a none constraint fails closed instead of becoming OpenAI
 //!   `tool_calls`. Normalization requires Anthropic `message_stop` (or an
 //!   explicit provider `error`) before emitting a success-shaped terminal
@@ -64,7 +72,9 @@
 //! - `google_gemini`: OpenAI Chat Completions request is translated to the
 //!   Gemini/`streamGenerateContent` (Vertex-compatible) request body; native
 //!   Gemini SSE (`alt=sse`) and Vertex-compatible JSON array / object streams
-//!   are normalized to OpenAI `chat.completion.chunk` SSE. Message content is
+//!   are normalized to OpenAI `chat.completion.chunk` SSE. Gemini thought
+//!   signatures round-trip through the OpenAI tool call's
+//!   `extra_content.google.thought_signature`. Message content is
 //!   closed-shape at claim (string or array of text-part objects with exactly
 //!   `type` and `text`; mixed/extra/unknown fields, non-object members,
 //!   non-text/malformed parts, and null system/developer/user content reject
@@ -142,12 +152,14 @@
 //! final boundary re-asserts or re-checks, ALL of:
 //!
 //! - **Headers** — the owned credential / gateway-identity / provider-protocol
-//!   set listed on [`apply_provider_boundary_headers`]. Headers OUTSIDE that
-//!   fixed set are deliberately untouched, so intended operator transforms still
-//!   reach the provider. Ferrum does not attempt to classify an arbitrary
-//!   unknown custom header as a credential; an operator who routes a bespoke
-//!   secret header to a normal backend must not also configure that rule on a
-//!   proxy that routes to a third-party provider.
+//!   set listed on [`apply_provider_boundary_headers`]: every canonical
+//!   credential header name (shared with replay partitioning), the route's own
+//!   configured authentication header locations, and provider-protocol
+//!   headers. Headers OUTSIDE that set are deliberately untouched, so intended
+//!   operator transforms still reach the provider. Ferrum does not attempt to
+//!   classify an arbitrary unknown custom header as a credential; an operator
+//!   who routes a bespoke secret header to a normal backend must not also
+//!   configure that rule on a proxy that routes to a third-party provider.
 //! - **Model** — the exact model string that matched `model_patterns` and chose
 //!   this provider, this price, and (for `{model}` endpoints) this backend URL.
 //!   Final body enforcement compares against THIS copy, and the claim-owned
@@ -163,9 +175,11 @@
 //!   routing identity: `route_override_upstream_id` is cleared at claim time and
 //!   must still be clear, so no load balancer can pick the dial target.
 //! - **Transport security** — the exact `route_override_resolved_tls` committed
-//!   at claim time, compared for equality (verification flag, SNI, CA, and mTLS
-//!   client materials). `None` means plaintext HTTP and is a distinct committed
-//!   state.
+//!   at claim time, compared for equality (verification flag, SNI, CA, mTLS
+//!   client materials, and the provider-isolation marker). Without
+//!   `inherit_backend_tls` this is [`BackendTlsConfig::isolated_public_verify`]:
+//!   public roots only, no gateway-global CA / no-verify / client identity.
+//!   `None` means plaintext HTTP and is a distinct committed state.
 //! - **DNS** — the claim revokes any inherited `Proxy.dns_override` through the
 //!   typed `RouteOverrideDnsPolicy::ClearInherited` route override, because a
 //!   same-host pin would otherwise send the provider credential to an operator
@@ -229,6 +243,7 @@ use super::utils::content_encoding::{
 };
 use super::utils::openai_error::openai_error_body;
 use super::utils::plugin_secret_env::resolve_plugin_secret_env;
+use super::utils::replay_partition::CREDENTIAL_CONTEXT_HEADERS;
 use super::utils::sse::{sse_event_end, sse_lines};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
@@ -278,6 +293,9 @@ pub const AI_STREAM_ROUTER_CONFIG_KEYS: &[&str] = &[
     "fail_on_missing_model",
     "fail_on_no_matching_provider",
     "inject_usage_options",
+    "max_normalized_stream_bytes",
+    "max_stream_bytes",
+    "max_stream_events",
     "normalize_response_stream",
     "providers",
 ];
@@ -292,11 +310,32 @@ pub const AI_STREAM_ROUTER_PROVIDER_KEYS: &[&str] = &[
     "priority",
     "allow_plaintext",
     "anthropic_version",
+    "default_max_tokens",
     "inherit_backend_tls",
 ];
 
 /// `anthropic-version` header value used when a provider omits the field.
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// Anthropic `max_tokens` forwarded when the OpenAI request sets neither
+/// `max_tokens` nor `max_completion_tokens` and the provider configures no
+/// `default_max_tokens`. Anthropic requires the field; OpenAI does not.
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 4096;
+
+/// Upper bound on a configured provider `default_max_tokens`.
+const MAX_CONFIGURED_DEFAULT_MAX_TOKENS: u64 = u32::MAX as u64;
+
+/// Admitted range for the `max_stream_bytes` override (cumulative provider
+/// plaintext one normalizer accepts).
+const MIN_CONFIGURED_STREAM_BYTES: u64 = MAX_SSE_EVENT_BYTES as u64;
+const MAX_CONFIGURED_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+/// Admitted range for the `max_normalized_stream_bytes` override (cumulative
+/// OpenAI-shaped output one normalizer may emit).
+const MIN_CONFIGURED_NORMALIZED_STREAM_BYTES: u64 = 1024 * 1024;
+const MAX_CONFIGURED_NORMALIZED_STREAM_BYTES: u64 = 512 * 1024 * 1024;
+/// Admitted range for the `max_stream_events` override.
+const MIN_CONFIGURED_STREAM_EVENTS: u64 = 1_000;
+const MAX_CONFIGURED_STREAM_EVENTS: u64 = 10_000_000;
 
 /// UTF-8 byte-order mark. Legal as the very first bytes of an event stream, and
 /// stripped before framing is decided (issue #5299).
@@ -402,6 +441,11 @@ const _: () = {
 enum ProviderType {
     OpenAi,
     OpenAiCompatible,
+    /// Azure OpenAI deployment endpoint. OpenAI-shaped request and SSE, but
+    /// key authentication uses the `api-key` header instead of `Authorization:
+    /// Bearer`. Entra ID (OAuth2) tokens expire and are not static config, so
+    /// they are out of scope here.
+    AzureOpenAi,
     Anthropic,
     GoogleGemini,
 }
@@ -411,10 +455,11 @@ impl ProviderType {
         match s {
             "openai" => Ok(Self::OpenAi),
             "openai_compatible" => Ok(Self::OpenAiCompatible),
+            "azure_openai" => Ok(Self::AzureOpenAi),
             "anthropic" => Ok(Self::Anthropic),
             "google_gemini" => Ok(Self::GoogleGemini),
             other => Err(format!(
-                "ai_stream_router: unknown `provider_type` {other:?} (expected `openai`, `openai_compatible`, `anthropic`, `google_gemini`)"
+                "ai_stream_router: unknown `provider_type` {other:?} (expected `openai`, `openai_compatible`, `azure_openai`, `anthropic`, `google_gemini`)"
             )),
         }
     }
@@ -423,6 +468,7 @@ impl ProviderType {
         match self {
             Self::OpenAi => "openai",
             Self::OpenAiCompatible => "openai_compatible",
+            Self::AzureOpenAi => "azure_openai",
             Self::Anthropic => "anthropic",
             Self::GoogleGemini => "google_gemini",
         }
@@ -474,6 +520,9 @@ struct StreamProvider {
     auth: ProviderAuth,
     /// Anthropic API version header value.
     anthropic_version: String,
+    /// Anthropic `max_tokens` forwarded when the client sets no output bound
+    /// (`default_max_tokens`, else [`DEFAULT_ANTHROPIC_MAX_TOKENS`]).
+    anthropic_default_max_tokens: u64,
     path_has_model_placeholder: bool,
     /// Keep the proxy's own resolved backend TLS (custom CA / SNI / mTLS
     /// client cert) for this HTTPS provider instead of resetting it to
@@ -507,6 +556,9 @@ pub struct AiStreamRouter {
     inject_usage_options: bool,
     normalize_response_stream: bool,
     providers: Vec<StreamProvider>,
+    /// Bounds every response normalizer this instance installs (cumulative
+    /// provider plaintext, event count, cumulative normalized output).
+    normalize_limits: NormalizeLimits,
     /// Precomputed config-time flag: does any provider need response-stream
     /// normalization (and is normalization enabled)?
     response_stream_hooks: bool,
@@ -618,6 +670,45 @@ pub(crate) struct AiStreamRouterClaim {
     /// external capacity. Deliberately `dyn Any` so the claim type carries no
     /// knowledge of any particular owner's accounting.
     lifecycle: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// The client body this claim parsed and VALIDATED in `before_proxy`, kept
+    /// only for Anthropic / Gemini translation so the transform hook does not
+    /// re-parse and re-validate the same bytes. Consumed (taken) by the
+    /// transform, and reused only when the transform's body is byte-identical
+    /// to the one parsed here (length plus a keyed fingerprint); any earlier
+    /// body rewrite falls back to a fresh parse and full validation.
+    client_body_memo: Option<Arc<ClientBodyMemo>>,
+    /// Length and keyed fingerprint of the provider body this instance's own
+    /// transform produced. When the final backend-visible body is still exactly
+    /// those bytes, `on_final_request_body_with_context` already knows its
+    /// model (the committed one, written by the translator) and that it holds
+    /// no duplicate members (serialized from a `Value`), so it skips the
+    /// re-parse. Any later transform changes the bytes and restores the full
+    /// revalidation.
+    translated_body_fingerprint: Option<(usize, u64)>,
+}
+
+/// The parsed, already-validated client body a claim hands to its transform.
+pub(crate) struct ClientBodyMemo {
+    len: usize,
+    fingerprint: u64,
+    value: Value,
+}
+
+/// Process-local keyed hasher for request-body fingerprints. SipHash with a
+/// random per-process key: a plugin that rewrites the body cannot choose bytes
+/// that collide with the memoized fingerprint without knowing the key.
+static BODY_FINGERPRINT_STATE: std::sync::LazyLock<std::collections::hash_map::RandomState> =
+    std::sync::LazyLock::new(std::collections::hash_map::RandomState::new);
+
+fn body_fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::BuildHasher;
+    BODY_FINGERPRINT_STATE.hash_one(bytes)
+}
+
+fn body_matches_fingerprint(bytes: &[u8], expected: Option<(usize, u64)>) -> bool {
+    expected.is_some_and(|(len, fingerprint)| {
+        bytes.len() == len && body_fingerprint(bytes) == fingerprint
+    })
 }
 
 impl AiStreamRouterClaim {
@@ -738,6 +829,8 @@ pub(crate) fn mint_external_provider_claim(
         committed_connect_timeout_ms: parts.committed_connect_timeout_ms,
         committed_read_timeout_ms: parts.committed_read_timeout_ms,
         lifecycle: parts.lifecycle,
+        client_body_memo: None,
+        translated_body_fingerprint: None,
     }
 }
 
@@ -790,6 +883,29 @@ impl AiStreamRouter {
         let inject_usage_options = optional_bool(config, "inject_usage_options")?.unwrap_or(true);
         let normalize_response_stream =
             optional_bool(config, "normalize_response_stream")?.unwrap_or(true);
+        let normalize_limits = NormalizeLimits {
+            max_plaintext_bytes: bounded_usize_option(
+                config,
+                "max_stream_bytes",
+                MIN_CONFIGURED_STREAM_BYTES,
+                MAX_CONFIGURED_STREAM_BYTES,
+            )?
+            .unwrap_or(MAX_SSE_NORMALIZED_BODY_BYTES),
+            max_events: bounded_usize_option(
+                config,
+                "max_stream_events",
+                MIN_CONFIGURED_STREAM_EVENTS,
+                MAX_CONFIGURED_STREAM_EVENTS,
+            )?
+            .unwrap_or(MAX_SSE_EVENTS),
+            max_output_bytes: bounded_usize_option(
+                config,
+                "max_normalized_stream_bytes",
+                MIN_CONFIGURED_NORMALIZED_STREAM_BYTES,
+                MAX_CONFIGURED_NORMALIZED_STREAM_BYTES,
+            )?
+            .unwrap_or(MAX_SSE_NORMALIZED_OUTPUT_BYTES),
+        };
 
         let providers_val = config
             .get("providers")
@@ -867,6 +983,26 @@ impl AiStreamRouter {
             ))?;
             let allow_plaintext = optional_bool(pv, "allow_plaintext")?.unwrap_or(false);
             let parsed = parse_endpoint(&name, endpoint, allow_plaintext, &backend_allow_ips)?;
+            // Gemini carries the model ONLY in the URL. A fixed-model endpoint
+            // would generate every admitted model with whatever model the
+            // endpoint hard-codes while the claim and every normalized chunk
+            // stamp the requested one. Without `{model}`, the provider may
+            // therefore admit exactly one exact model name, and it must be the
+            // model the endpoint path itself names (`.../models/<model>:...`).
+            if provider_type == ProviderType::GoogleGemini && !parsed.has_model_placeholder {
+                let fixed_model_matches = match model_patterns.as_slice() {
+                    [pattern] => {
+                        !pattern.contains('*')
+                            && parsed.path.contains(&format!("/models/{pattern}:"))
+                    }
+                    _ => false,
+                };
+                if !fixed_model_matches {
+                    return Err(format!(
+                        "ai_stream_router: provider {name:?} is `google_gemini` with an `endpoint` that has no `{{model}}` placeholder; Gemini routes the model only through the URL, so either add `{{model}}` to the endpoint or set `model_patterns` to the single exact model the endpoint path names (`.../models/<model>:...`)"
+                    ));
+                }
+            }
 
             let api_key = config_or_env_str(pv, &name, "api_key")?.ok_or(format!(
                 "ai_stream_router: provider {name:?} missing `api_key`"
@@ -879,7 +1015,29 @@ impl AiStreamRouter {
 
             let anthropic_version = optional_str(pv, "anthropic_version")?
                 .unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string());
+            // An explicit empty string is not omission (`null` is): it would
+            // send an empty `anthropic-version` header on every request.
+            if anthropic_version.is_empty() {
+                return Err(format!(
+                    "ai_stream_router: provider {name:?} `anthropic_version` must not be empty; omit it (or use null) to send the default {DEFAULT_ANTHROPIC_VERSION:?}"
+                ));
+            }
             validate_provider_header_value(&name, "anthropic_version", &anthropic_version)?;
+
+            let anthropic_default_max_tokens = match optional_u64(pv, "default_max_tokens")? {
+                None => DEFAULT_ANTHROPIC_MAX_TOKENS,
+                Some(_) if provider_type != ProviderType::Anthropic => {
+                    return Err(format!(
+                        "ai_stream_router: provider {name:?} `default_max_tokens` is only supported for `anthropic` providers (Anthropic requires an output bound; other providers apply their own model default)"
+                    ));
+                }
+                Some(value) if (1..=MAX_CONFIGURED_DEFAULT_MAX_TOKENS).contains(&value) => value,
+                Some(_) => {
+                    return Err(format!(
+                        "ai_stream_router: provider {name:?} `default_max_tokens` must be between 1 and {MAX_CONFIGURED_DEFAULT_MAX_TOKENS}"
+                    ));
+                }
+            };
 
             let inherit_backend_tls = optional_bool(pv, "inherit_backend_tls")?.unwrap_or(false);
 
@@ -896,6 +1054,7 @@ impl AiStreamRouter {
                 model_patterns,
                 auth,
                 anthropic_version,
+                anthropic_default_max_tokens,
                 path_has_model_placeholder: parsed.has_model_placeholder,
                 inherit_backend_tls,
             });
@@ -917,6 +1076,7 @@ impl AiStreamRouter {
             inject_usage_options,
             normalize_response_stream,
             providers,
+            normalize_limits,
             response_stream_hooks,
             owner_id: NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed),
         })
@@ -1015,6 +1175,11 @@ fn build_auth(provider_type: ProviderType, api_key: String) -> ProviderAuth {
             name: "x-goog-api-key".to_string(),
             api_key,
         },
+        // Azure OpenAI key authentication.
+        ProviderType::AzureOpenAi => ProviderAuth::Header {
+            name: "api-key".to_string(),
+            api_key,
+        },
         // Build the complete `Bearer <key>` header value once, here, so the
         // final-policy hot path never formats a credential per pass.
         ProviderType::OpenAi | ProviderType::OpenAiCompatible => ProviderAuth::Bearer {
@@ -1060,6 +1225,22 @@ fn parse_endpoint(
     let parsed = Url::parse(&parse_src).map_err(|_| {
         format!("ai_stream_router: provider {provider_name:?} invalid `endpoint`: invalid URL")
     })?;
+
+    // Embedded userinfo is never sent (only host/port/path/query are routed),
+    // so an operator who put Basic-style credentials in the URL would get
+    // silent provider 401s; and a fragment is never part of a request target,
+    // so it would be dropped without a word. Both are configuration errors.
+    // Neither the userinfo nor the fragment is echoed.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "ai_stream_router: provider {provider_name:?} `endpoint` must not embed userinfo credentials; configure the provider credential through `api_key`"
+        ));
+    }
+    if parsed.fragment().is_some() {
+        return Err(format!(
+            "ai_stream_router: provider {provider_name:?} `endpoint` must not contain a `#` fragment; fragments are never sent to the provider"
+        ));
+    }
 
     let scheme = match parsed.scheme() {
         "https" => BackendScheme::Https,
@@ -1163,6 +1344,26 @@ fn optional_bool(config: &Value, field: &str) -> Result<Option<bool>, String> {
             .map(Some)
             .ok_or_else(|| format!("ai_stream_router: `{field}` must be a boolean")),
     }
+}
+
+/// Read an optional positive integer config field bounded to `[min, max]`.
+fn bounded_usize_option(
+    config: &Value,
+    field: &str,
+    min: u64,
+    max: u64,
+) -> Result<Option<usize>, String> {
+    let Some(value) = optional_u64(config, field)? else {
+        return Ok(None);
+    };
+    if !(min..=max).contains(&value) {
+        return Err(format!(
+            "ai_stream_router: `{field}` must be between {min} and {max}"
+        ));
+    }
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| format!("ai_stream_router: `{field}` is too large for this platform"))
 }
 
 fn optional_u64(config: &Value, field: &str) -> Result<Option<u64>, String> {
@@ -1403,11 +1604,294 @@ fn anthropic_message_content_text(content: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// Image media types both translated providers accept inline.
+const SUPPORTED_INLINE_IMAGE_MEDIA_TYPES: &[&str] =
+    &["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Upper bound on one base64 data-URL image payload (bytes of base64 text).
+const MAX_INLINE_IMAGE_BASE64_BYTES: usize = 20 * 1024 * 1024;
+
+/// A base64 data-URL image from an OpenAI `image_url` content part.
+struct InlineImage {
+    media_type: &'static str,
+    data: String,
+}
+
+/// One translatable part of an OpenAI USER message `content` array.
+enum UserContentPart {
+    Text(String),
+    Image(InlineImage),
+}
+
+/// Whether `data` is structurally valid standard-alphabet base64: decoded by a
+/// real decoder, so padding placement, final-quantum length, and trailing bits
+/// are all checked (an alphabet-only scan admitted `=` or `AA=A`). Padding may
+/// be present or stripped; a URL-safe alphabet is rejected. The caller bounds
+/// `data` first, so the transient decode buffer is bounded too.
+fn is_base64_payload(data: &str) -> bool {
+    use base64::Engine as _;
+    use base64::alphabet;
+    use base64::engine::DecodePaddingMode;
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+
+    const DECODER: GeneralPurpose = GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(true)
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    !data.is_empty()
+        && DECODER
+            .decode(data.as_bytes())
+            .is_ok_and(|decoded| !decoded.is_empty())
+}
+
+/// Closed OpenAI `{"type":"image_url","image_url":{"url":...,"detail"?}}`
+/// part carrying a base64 `data:` URL of a supported image media type.
+///
+/// Remote `http(s)` image URLs are not fetched or forwarded: they fail closed
+/// with a fixed diagnostic. Neither the URL nor any payload byte is echoed.
+fn parse_inline_image_part(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+    provider_label: &str,
+) -> Result<InlineImage, String> {
+    let malformed = || format!("content[{index}] image_url part is malformed");
+    if object.len() != 2 {
+        return Err(malformed());
+    }
+    let image_url = object
+        .get("image_url")
+        .and_then(Value::as_object)
+        .ok_or_else(malformed)?;
+    if image_url.keys().any(|key| key != "url" && key != "detail") {
+        return Err(malformed());
+    }
+    match image_url.get("detail") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(detail)) if matches!(detail.as_str(), "auto" | "low" | "high") => {}
+        Some(_) => return Err(malformed()),
+    }
+    let url = image_url
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(malformed)?;
+    let has_prefix = |prefix: &str| {
+        url.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    let Some(rest) = url.get(5..).filter(|_| has_prefix("data:")) else {
+        if has_prefix("http://") || has_prefix("https://") {
+            return Err(format!(
+                "content[{index}] remote image URLs are not supported for {provider_label} translation; send the image as a base64 data URL"
+            ));
+        }
+        return Err(format!(
+            "content[{index}] image_url must be a base64 data URL"
+        ));
+    };
+    if url.len() > MAX_INLINE_IMAGE_BASE64_BYTES + 64 {
+        return Err(format!(
+            "content[{index}] image exceeds the maximum inline image size"
+        ));
+    }
+    let (meta, payload) = rest.split_once(',').ok_or_else(malformed)?;
+    let (mime, encoding) = meta.split_once(';').ok_or_else(malformed)?;
+    if !encoding.eq_ignore_ascii_case("base64") {
+        return Err(format!(
+            "content[{index}] image_url must be a base64 data URL"
+        ));
+    }
+    let media_type = SUPPORTED_INLINE_IMAGE_MEDIA_TYPES
+        .iter()
+        .copied()
+        .find(|supported| supported.eq_ignore_ascii_case(mime))
+        .ok_or_else(|| {
+            format!(
+                "content[{index}] image media type is not supported (expected image/jpeg, image/png, image/gif, or image/webp)"
+            )
+        })?;
+    if payload.len() > MAX_INLINE_IMAGE_BASE64_BYTES {
+        return Err(format!(
+            "content[{index}] image exceeds the maximum inline image size"
+        ));
+    }
+    if !is_base64_payload(payload) {
+        return Err(format!("content[{index}] image data is not valid base64"));
+    }
+    Ok(InlineImage {
+        media_type,
+        data: payload.to_string(),
+    })
+}
+
+/// Closed OpenAI USER message content: a string, or an array of closed text
+/// parts (`type` + `text`) and closed base64 data-URL `image_url` parts.
+/// Everything else (audio, files, remote image URLs, extra fields, non-object
+/// members, null) fails closed.
+fn user_message_content_parts(
+    content: &Value,
+    provider_label: &str,
+) -> Result<Vec<UserContentPart>, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(vec![UserContentPart::Text(text.to_string())]);
+    }
+    let parts = content
+        .as_array()
+        .ok_or_else(|| "content must be a string or content-parts array".to_string())?;
+    let mut out = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let Some(object) = part.as_object() else {
+            return Err(format!(
+                "content[{index}] is not a {provider_label}-representable text or image part (image parts must be base64 data URLs)"
+            ));
+        };
+        match object.get("type").and_then(Value::as_str) {
+            Some("text") if object.len() == 2 => {
+                let text = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("content[{index}] text part is malformed"))?;
+                out.push(UserContentPart::Text(text.to_string()));
+            }
+            Some("image_url") => {
+                out.push(UserContentPart::Image(parse_inline_image_part(
+                    object,
+                    index,
+                    provider_label,
+                )?));
+            }
+            _ => {
+                return Err(format!(
+                    "content[{index}] is not a {provider_label}-representable text or image part (image parts must be base64 data URLs)"
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn has_inline_image(parts: &[UserContentPart]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, UserContentPart::Image(_)))
+}
+
+/// Anthropic `content` for an OpenAI user message. Text-only content keeps the
+/// historical joined-string translation; content with images becomes ordered
+/// Anthropic `text` / base64 `image` blocks.
+fn anthropic_user_content(content: &Value) -> Result<Value, String> {
+    let parts = user_message_content_parts(content, "Anthropic")?;
+    if !has_inline_image(&parts) {
+        return anthropic_message_content_text(content).map(Value::String);
+    }
+    let mut blocks = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            UserContentPart::Text(text) if text.is_empty() => {}
+            UserContentPart::Text(text) => blocks.push(json!({ "type": "text", "text": text })),
+            UserContentPart::Image(image) => blocks.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.media_type,
+                    "data": image.data,
+                }
+            })),
+        }
+    }
+    Ok(Value::Array(blocks))
+}
+
+/// Gemini `parts` for an OpenAI user message. Text-only content keeps the
+/// historical single joined text part; content with images becomes ordered
+/// Gemini `text` / `inlineData` parts.
+fn gemini_user_parts(content: &Value) -> Result<Vec<Value>, String> {
+    let parts = user_message_content_parts(content, "Gemini")?;
+    if !has_inline_image(&parts) {
+        let text = gemini_message_content_text(content)?;
+        return Ok(if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "text": text })]
+        });
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            UserContentPart::Text(text) if text.is_empty() => {}
+            UserContentPart::Text(text) => out.push(json!({ "text": text })),
+            UserContentPart::Image(image) => out.push(json!({
+                "inlineData": {
+                    "mimeType": image.media_type,
+                    "data": image.data,
+                }
+            })),
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone)]
 struct ParsedToolCall {
     id: String,
     name: String,
     arguments: Value,
+}
+
+/// Upper bound on one Gemini thought signature (base64 text bytes).
+const MAX_THOUGHT_SIGNATURE_BYTES: usize = 64 * 1024;
+
+/// A Gemini thought signature: opaque, non-empty, bounded base64 text.
+fn valid_thought_signature(signature: &str) -> bool {
+    !signature.is_empty()
+        && signature.len() <= MAX_THOUGHT_SIGNATURE_BYTES
+        && signature.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_')
+        })
+}
+
+/// The Gemini thought signature an OpenAI client round-tripped on an assistant
+/// tool call, in Google's OpenAI-compatibility shape
+/// `tool_calls[i].extra_content.google.thought_signature`.
+///
+/// Absent/`null` at any level means no signature. A present value of the wrong
+/// shape, or a malformed signature, fails closed rather than being dropped:
+/// Gemini 3 rejects a function-call continuation whose signature is missing.
+fn openai_tool_call_thought_signature(
+    message: &Value,
+    message_index: usize,
+    tool_index: usize,
+) -> Result<Option<String>, String> {
+    let malformed = || {
+        format!(
+            "messages[{message_index}].tool_calls[{tool_index}].extra_content.google.thought_signature is malformed"
+        )
+    };
+    let Some(extra) = message
+        .get("tool_calls")
+        .and_then(|calls| calls.get(tool_index))
+        .and_then(|call| call.get("extra_content"))
+        .filter(|extra| !extra.is_null())
+    else {
+        return Ok(None);
+    };
+    let extra = extra.as_object().ok_or_else(malformed)?;
+    let Some(google) = extra.get("google").filter(|google| !google.is_null()) else {
+        return Ok(None);
+    };
+    let google = google.as_object().ok_or_else(malformed)?;
+    let Some(signature) = google
+        .get("thought_signature")
+        .filter(|signature| !signature.is_null())
+    else {
+        return Ok(None);
+    };
+    signature
+        .as_str()
+        .filter(|signature| valid_thought_signature(signature))
+        .map(|signature| Some(signature.to_string()))
+        .ok_or_else(malformed)
 }
 
 /// Upper bound on a tool/function-call `arguments` JSON string (bytes).
@@ -1777,7 +2261,10 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
+fn validate_anthropic_translation(
+    openai_body: &Value,
+    default_max_tokens: u64,
+) -> Result<(), String> {
     let messages = openai_body
         .get("messages")
         .and_then(Value::as_array)
@@ -1793,7 +2280,17 @@ fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
         if matches!(role, "tool" | "function") {
             continue;
         }
-        if role != "user" && role != "assistant" {
+        if role == "user" {
+            if message["content"].is_null() {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+            anthropic_user_content(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?;
+            continue;
+        }
+        if role != "assistant" {
             continue;
         }
         let tool_calls = if role == "assistant" {
@@ -1826,7 +2323,43 @@ fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
         }
     }
     let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
-    resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?;
+    let tool_choice_kind = tool_choice.as_ref().map(|(kind, _)| *kind);
+    let thinking = resolve_anthropic_thinking(openai_body, tool_choice_kind, default_max_tokens)?;
+    if matches!(
+        thinking
+            .as_ref()
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str),
+        Some("enabled" | "adaptive")
+    ) {
+        // Extended thinking (manual or adaptive) with tool use requires the
+        // provider's signed thinking blocks emitted in a tool-use turn to be
+        // replayed, complete and unmodified, when that turn's `tool_result`s
+        // come back. The OpenAI Chat Completions representation has no carrier
+        // for those blocks: manual mode would be rejected by the provider, and
+        // adaptive mode would silently lose the reasoning state the turn was
+        // built on. Refuse the combination up front with a clear diagnostic
+        // instead of letting the agent loop degrade or fail on its second turn.
+        let tools_callable = openai_declared_tool_names(openai_body)?.is_some()
+            && tool_choice_kind != Some(ToolChoiceKind::None);
+        let continues_tool_turn = messages
+            .iter()
+            .rev()
+            .find(|message| message["role"].as_str() == Some("assistant"))
+            .is_some_and(|message| {
+                message
+                    .get("tool_calls")
+                    .is_some_and(|value| !value.is_null())
+                    || message
+                        .get("function_call")
+                        .is_some_and(|value| !value.is_null())
+            });
+        if tools_callable || continues_tool_turn {
+            return Err(
+                "extended thinking (thinking.type \"enabled\" or \"adaptive\") cannot be combined with callable tools or a tool-result continuation: signed thinking blocks cannot be round-tripped through the OpenAI representation; use tool_choice \"none\" or disable thinking for tool turns".to_string(),
+            );
+        }
+    }
     resolve_anthropic_effort(openai_body)?;
     Ok(())
 }
@@ -1867,13 +2400,387 @@ fn openai_declared_tool_names(openai_body: &Value) -> Result<Option<Vec<&str>>, 
     Ok(Some(names))
 }
 
+/// The client's OpenAI output bound (`max_tokens`, else
+/// `max_completion_tokens`). A present non-null value of either field must be a
+/// positive integer; a string, float, negative, or zero is rejected rather than
+/// silently treated as omission.
+fn openai_max_output_tokens(openai_body: &Value) -> Result<Option<u64>, String> {
+    let mut resolved = None;
+    for field in ["max_tokens", "max_completion_tokens"] {
+        match openai_body.get(field) {
+            None | Some(Value::Null) => {}
+            Some(value) => {
+                let tokens = value
+                    .as_u64()
+                    .filter(|tokens| *tokens > 0)
+                    .ok_or_else(|| format!("{field} must be a positive integer"))?;
+                resolved = resolved.or(Some(tokens));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 /// Effective Anthropic `max_tokens` this route forwards (OpenAI `max_tokens`,
-/// else `max_completion_tokens`, else the translation default).
-fn anthropic_effective_max_tokens(openai_body: &Value) -> u64 {
-    openai_body["max_tokens"]
-        .as_u64()
-        .or_else(|| openai_body["max_completion_tokens"].as_u64())
-        .unwrap_or(4096)
+/// else `max_completion_tokens`, else the provider's `default_max_tokens`).
+fn anthropic_effective_max_tokens(
+    openai_body: &Value,
+    default_max_tokens: u64,
+) -> Result<u64, String> {
+    Ok(openai_max_output_tokens(openai_body)?.unwrap_or(default_max_tokens))
+}
+
+/// A request-parameter refusal with the OpenAI `param` it concerns.
+struct ParamRejection {
+    param: &'static str,
+    code: &'static str,
+    message: String,
+}
+
+impl ParamRejection {
+    fn unsupported(param: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            param,
+            code: "unsupported_parameter",
+            message: message.into(),
+        }
+    }
+
+    fn invalid(param: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            param,
+            code: "invalid_parameter",
+            message: message.into(),
+        }
+    }
+}
+
+fn present<'a>(openai_body: &'a Value, field: &str) -> Option<&'a Value> {
+    openai_body.get(field).filter(|value| !value.is_null())
+}
+
+/// Shared closed-shape checks for OpenAI parameters neither translated provider
+/// can represent in a streamed generation (`logit_bias`, `logprobs`,
+/// `top_logprobs`) plus the output bound and `parallel_tool_calls` typing.
+fn validate_common_request_params(
+    openai_body: &Value,
+    provider_label: &str,
+) -> Result<(), ParamRejection> {
+    openai_max_output_tokens(openai_body)
+        .map_err(|message| ParamRejection::invalid("max_tokens", message))?;
+    if let Some(bias) = present(openai_body, "logit_bias") {
+        let Some(bias) = bias.as_object() else {
+            return Err(ParamRejection::invalid(
+                "logit_bias",
+                "logit_bias must be an object",
+            ));
+        };
+        if !bias.is_empty() {
+            return Err(ParamRejection::unsupported(
+                "logit_bias",
+                format!("logit_bias has no {provider_label} equivalent"),
+            ));
+        }
+    }
+    match present(openai_body, "logprobs") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => {
+            return Err(ParamRejection::unsupported(
+                "logprobs",
+                format!("logprobs are not supported for {provider_label} stream normalization"),
+            ));
+        }
+        Some(_) => {
+            return Err(ParamRejection::invalid(
+                "logprobs",
+                "logprobs must be a boolean",
+            ));
+        }
+    }
+    if present(openai_body, "top_logprobs").is_some() {
+        return Err(ParamRejection::unsupported(
+            "top_logprobs",
+            format!("top_logprobs are not supported for {provider_label} stream normalization"),
+        ));
+    }
+    if present(openai_body, "parallel_tool_calls").is_some_and(|value| !value.is_boolean()) {
+        return Err(ParamRejection::invalid(
+            "parallel_tool_calls",
+            "parallel_tool_calls must be a boolean",
+        ));
+    }
+    Ok(())
+}
+
+/// `n`, as a positive integer, when present.
+fn openai_choice_count(openai_body: &Value) -> Result<Option<u64>, ParamRejection> {
+    match present(openai_body, "n") {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|count| *count > 0)
+            .map(Some)
+            .ok_or_else(|| ParamRejection::invalid("n", "n must be a positive integer")),
+    }
+}
+
+/// `response_format` as a closed shape: `None` for absent / `{"type":"text"}`,
+/// otherwise the JSON-object or JSON-schema request.
+enum ResponseFormat<'a> {
+    JsonObject,
+    JsonSchema { schema: &'a Value, strict: bool },
+}
+
+/// JSON Schema keywords Gemini `responseJsonSchema` documents as enforced.
+/// Deliberately conservative: an unlisted keyword (`minLength`, `pattern`,
+/// `uniqueItems`, `oneOf`, `const`, ...) is treated as unenforced, so a strict
+/// schema using it is refused rather than silently weakened.
+const GEMINI_STRICT_SCHEMA_KEYWORDS: &[&str] = &[
+    "type",
+    "title",
+    "description",
+    "enum",
+    "format",
+    "anyOf",
+    "$ref",
+    "$defs",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "prefixItems",
+    "minItems",
+    "maxItems",
+    "minimum",
+    "maximum",
+];
+
+/// String `format` values Gemini documents as enforced.
+const GEMINI_STRICT_SCHEMA_FORMATS: &[&str] = &["date-time", "date", "time"];
+
+/// Non-`$` keywords that may sit beside `$ref`: annotations that change no
+/// constraint. `$`-prefixed siblings (`$defs`) are reference/definition
+/// metadata Gemini permits beside `$ref`; every keyword still has to pass
+/// [`GEMINI_STRICT_SCHEMA_KEYWORDS`], and `$defs` entries are screened too.
+const GEMINI_REF_SIBLING_ANNOTATIONS: &[&str] = &["title", "description"];
+
+/// Nesting bound for the strict-schema screen; deeper schemas are refused
+/// rather than walked, so hostile nesting cannot grow the stack.
+const MAX_STRICT_SCHEMA_DEPTH: usize = 32;
+
+/// Check one strict JSON Schema node (and every nested subschema) against the
+/// Gemini-enforced subset. Diagnostics are fixed and never echo schema keys or
+/// values.
+fn screen_gemini_strict_schema(schema: &Value, depth: usize) -> Result<(), &'static str> {
+    if depth > MAX_STRICT_SCHEMA_DEPTH {
+        return Err("strict response_format json_schema nests too deeply for Gemini translation");
+    }
+    let object = match schema {
+        // Boolean subschemas (`true` / `false`) carry no keywords.
+        Value::Bool(_) => return Ok(()),
+        Value::Object(object) => object,
+        _ => return Err("strict response_format json_schema contains a non-object subschema"),
+    };
+    if object.contains_key("$ref")
+        && object.keys().any(|keyword| {
+            !keyword.starts_with('$') && !GEMINI_REF_SIBLING_ANNOTATIONS.contains(&keyword.as_str())
+        })
+    {
+        return Err(
+            "strict response_format json_schema combines `$ref` with sibling constraints, which Gemini does not apply",
+        );
+    }
+    for (keyword, value) in object {
+        if !GEMINI_STRICT_SCHEMA_KEYWORDS.contains(&keyword.as_str()) {
+            return Err(
+                "strict response_format json_schema uses a keyword Gemini does not enforce",
+            );
+        }
+        match keyword.as_str() {
+            "format" => {
+                if !value
+                    .as_str()
+                    .is_some_and(|format| GEMINI_STRICT_SCHEMA_FORMATS.contains(&format))
+                {
+                    return Err(
+                        "strict response_format json_schema uses a `format` Gemini does not enforce (supported: date-time, date, time)",
+                    );
+                }
+            }
+            "$ref" => {
+                // Only document-local references resolve inside the schema the
+                // provider receives.
+                if !value
+                    .as_str()
+                    .is_some_and(|reference| reference.starts_with('#'))
+                {
+                    return Err(
+                        "strict response_format json_schema `$ref` must be a local `#...` reference",
+                    );
+                }
+            }
+            "properties" | "$defs" => {
+                let members = value.as_object().ok_or(
+                    "strict response_format json_schema `properties` / `$defs` must be an object",
+                )?;
+                for member in members.values() {
+                    screen_gemini_strict_schema(member, depth + 1)?;
+                }
+            }
+            "anyOf" | "prefixItems" => {
+                let members = value.as_array().ok_or(
+                    "strict response_format json_schema `anyOf` / `prefixItems` must be an array",
+                )?;
+                for member in members {
+                    screen_gemini_strict_schema(member, depth + 1)?;
+                }
+            }
+            "items" | "additionalProperties" => {
+                screen_gemini_strict_schema(value, depth + 1)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn openai_response_format(
+    openai_body: &Value,
+) -> Result<Option<ResponseFormat<'_>>, ParamRejection> {
+    let invalid = || {
+        ParamRejection::invalid(
+            "response_format",
+            "response_format must be {\"type\":\"text\"}, {\"type\":\"json_object\"}, or {\"type\":\"json_schema\",\"json_schema\":{\"name\":...,\"schema\":{...}}}",
+        )
+    };
+    let Some(format) = present(openai_body, "response_format") else {
+        return Ok(None);
+    };
+    let format = format.as_object().ok_or_else(invalid)?;
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") if format.len() == 1 => Ok(None),
+        Some("json_object") if format.len() == 1 => Ok(Some(ResponseFormat::JsonObject)),
+        Some("json_schema") if format.len() == 2 => {
+            let spec = format
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .ok_or_else(invalid)?;
+            if spec
+                .keys()
+                .any(|key| !matches!(key.as_str(), "name" | "schema" | "strict" | "description"))
+            {
+                return Err(invalid());
+            }
+            if !spec.get("name").is_some_and(Value::is_string) {
+                return Err(invalid());
+            }
+            let strict = match spec.get("strict") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(strict)) => *strict,
+                Some(_) => return Err(invalid()),
+            };
+            if spec
+                .get("description")
+                .is_some_and(|description| !description.is_string() && !description.is_null())
+            {
+                return Err(invalid());
+            }
+            let schema = spec
+                .get("schema")
+                .filter(|schema| schema.is_object())
+                .ok_or_else(invalid)?;
+            Ok(Some(ResponseFormat::JsonSchema { schema, strict }))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+/// OpenAI request parameters the Anthropic translator either maps exactly or
+/// must refuse. Fields with no Anthropic equivalent are rejected with an
+/// OpenAI-shaped `400` instead of being silently dropped.
+fn validate_anthropic_request_params(openai_body: &Value) -> Result<(), ParamRejection> {
+    validate_common_request_params(openai_body, "Anthropic")?;
+    if openai_choice_count(openai_body)?.is_some_and(|count| count > 1) {
+        return Err(ParamRejection::unsupported(
+            "n",
+            "n > 1 is not supported for Anthropic translation",
+        ));
+    }
+    for penalty in ["presence_penalty", "frequency_penalty"] {
+        if let Some(value) = present(openai_body, penalty) {
+            let Some(number) = value.as_f64() else {
+                return Err(ParamRejection::invalid(
+                    penalty,
+                    format!("{penalty} must be a number"),
+                ));
+            };
+            if number != 0.0 {
+                return Err(ParamRejection::unsupported(
+                    penalty,
+                    format!("{penalty} has no Anthropic equivalent"),
+                ));
+            }
+        }
+    }
+    if present(openai_body, "seed").is_some() {
+        return Err(ParamRejection::unsupported(
+            "seed",
+            "seed has no Anthropic equivalent",
+        ));
+    }
+    if openai_response_format(openai_body)?.is_some() {
+        return Err(ParamRejection::unsupported(
+            "response_format",
+            "JSON response_format is not supported for Anthropic translation; use an openai_compatible provider or describe the output format in the prompt",
+        ));
+    }
+    Ok(())
+}
+
+/// OpenAI request parameters the Gemini translator maps exactly or must
+/// refuse.
+fn validate_gemini_request_params(openai_body: &Value) -> Result<(), ParamRejection> {
+    validate_common_request_params(openai_body, "Gemini")?;
+    openai_choice_count(openai_body)?;
+    for penalty in ["presence_penalty", "frequency_penalty"] {
+        if present(openai_body, penalty).is_some_and(|value| !value.is_number()) {
+            return Err(ParamRejection::invalid(
+                penalty,
+                format!("{penalty} must be a number"),
+            ));
+        }
+    }
+    if present(openai_body, "seed").is_some_and(|seed| seed.as_i64().is_none()) {
+        return Err(ParamRejection::invalid("seed", "seed must be an integer"));
+    }
+    // A STRICT schema is a contract the client relies on: every constraint in
+    // it must be one Gemini enforces, or the request is refused rather than
+    // answered with output that may violate it. Non-strict schemas are
+    // best-effort in OpenAI's own contract and are forwarded as-is.
+    if let Some(ResponseFormat::JsonSchema {
+        schema,
+        strict: true,
+    }) = openai_response_format(openai_body)?
+    {
+        screen_gemini_strict_schema(schema, 0)
+            .map_err(|message| ParamRejection::unsupported("response_format", message))?;
+    }
+    // Gemini has no switch that limits a turn to one function call, so a
+    // client that disabled parallel calls for callable tools cannot have that
+    // contract honored.
+    if present(openai_body, "parallel_tool_calls") == Some(&Value::Bool(false))
+        && gemini_declared_function_names(openai_body)
+            .ok()
+            .flatten()
+            .is_some()
+        && openai_body.get("tool_choice").and_then(Value::as_str) != Some("none")
+    {
+        return Err(ParamRejection::unsupported(
+            "parallel_tool_calls",
+            "parallel_tool_calls: false has no Gemini equivalent",
+        ));
+    }
+    Ok(())
 }
 
 /// Map supported OpenAI `tool_choice` values to Anthropic's object form.
@@ -1943,12 +2850,15 @@ fn resolve_anthropic_tool_choice(
 }
 
 /// Forward closed Anthropic thinking shapes when present. Manual extended
-/// thinking (`type: "enabled"`) cannot combine with forced tool use; adaptive
-/// thinking may. Budget must satisfy Anthropic's ordinary contract relative to
-/// the effective `max_tokens` this route forwards.
+/// thinking (`type: "enabled"`) cannot combine with forced tool use (the
+/// broader tools/continuation refusal for both manual and adaptive thinking
+/// lives in [`validate_anthropic_translation`]). Budget must satisfy
+/// Anthropic's ordinary contract relative to the effective `max_tokens` this
+/// route forwards.
 fn resolve_anthropic_thinking(
     openai_body: &Value,
     tool_choice_kind: Option<ToolChoiceKind>,
+    default_max_tokens: u64,
 ) -> Result<Option<Value>, String> {
     let Some(thinking) = openai_body.get("thinking") else {
         return Ok(None);
@@ -1979,7 +2889,8 @@ fn resolve_anthropic_thinking(
             let budget = budget_value
                 .as_u64()
                 .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
-            let max_tokens = anthropic_effective_max_tokens(openai_body);
+            let max_tokens = anthropic_effective_max_tokens(openai_body, default_max_tokens)
+                .map_err(|_| "unsupported or malformed thinking".to_string())?;
             // Ordinary Anthropic contract: budget_tokens >= 1024 and strictly
             // less than the forwarded max_tokens (this route does not opt into
             // interleaved manual thinking via anthropic-beta).
@@ -2052,12 +2963,25 @@ fn resolve_anthropic_effort(openai_body: &Value) -> Result<Option<&'static str>,
 /// matching `role: "tool"` results, plus legacy assistant `function_call` and
 /// matching `role: "function"` results; rejects malformed history instead of
 /// dropping it.
-fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, String> {
+///
+/// `prevalidated` is true only when `openai_body` is the exact value the claim
+/// already ran [`validate_anthropic_request_params`] and
+/// [`validate_anthropic_translation`] over (same bytes, see
+/// [`ClientBodyMemo`]); any other input is validated here first.
+fn translate_to_anthropic(
+    openai_body: &Value,
+    model: &str,
+    default_max_tokens: u64,
+    prevalidated: bool,
+) -> Result<Vec<u8>, String> {
     let messages = openai_body
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
-    validate_anthropic_translation(openai_body)?;
+    if !prevalidated {
+        validate_anthropic_request_params(openai_body).map_err(|rejection| rejection.message)?;
+        validate_anthropic_translation(openai_body, default_max_tokens)?;
+    }
 
     let mut system_parts = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
@@ -2148,20 +3072,27 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
                 "messages[{message_index}] has unsupported role '{role}'"
             ));
         }
+        if role == "user" {
+            if message["content"].is_null() {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+            let content = anthropic_user_content(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?;
+            translated_messages.push(json!({
+                "role": "user",
+                "content": content,
+            }));
+            message_index += 1;
+            continue;
+        }
 
-        let tool_calls = if role == "assistant" {
-            parse_openai_tool_calls(message, message_index)?
-        } else {
-            Vec::new()
-        };
-        let legacy_call = if role == "assistant" {
-            parse_openai_function_call(message, message_index)?
-        } else {
-            None
-        };
+        let tool_calls = parse_openai_tool_calls(message, message_index)?;
+        let legacy_call = parse_openai_function_call(message, message_index)?;
         let has_tool_representation = !tool_calls.is_empty() || legacy_call.is_some();
         let text = if message["content"].is_null() {
-            if role == "assistant" && has_tool_representation {
+            if has_tool_representation {
                 String::new()
             } else {
                 return Err(format!(
@@ -2211,7 +3142,7 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         return Err("assistant function_call is missing its function result".to_string());
     }
 
-    let max_tokens = anthropic_effective_max_tokens(openai_body);
+    let max_tokens = anthropic_effective_max_tokens(openai_body, default_max_tokens)?;
 
     let mut body = json!({
         "model": model,
@@ -2239,9 +3170,26 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
     if let Some((_, choice)) = &tool_choice {
         body["tool_choice"] = choice.clone();
     }
-    if let Some(thinking) =
-        resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?
+    // OpenAI `parallel_tool_calls: false` is Anthropic
+    // `tool_choice.disable_parallel_tool_use: true`. It only means something
+    // when tools are callable: Anthropic's `none` choice takes no options, and
+    // a choice without tools would be rejected by the provider.
+    if openai_body.get("parallel_tool_calls") == Some(&Value::Bool(false))
+        && body.get("tools").is_some()
+        && !matches!(&tool_choice, Some((ToolChoiceKind::None, _)))
     {
+        let mut choice = tool_choice
+            .as_ref()
+            .map(|(_, choice)| choice.clone())
+            .unwrap_or_else(|| json!({ "type": "auto" }));
+        choice["disable_parallel_tool_use"] = Value::Bool(true);
+        body["tool_choice"] = choice;
+    }
+    if let Some(thinking) = resolve_anthropic_thinking(
+        openai_body,
+        tool_choice.as_ref().map(|(kind, _)| *kind),
+        default_max_tokens,
+    )? {
         body["thinking"] = thinking;
     }
     if let Some(effort) = resolve_anthropic_effort(openai_body)? {
@@ -2343,7 +3291,26 @@ fn validate_gemini_translation(openai_body: &Value) -> Result<(), String> {
         if let Some(call) = legacy_call {
             pending_legacy_by_name.insert(call.name.clone(), call.id.clone());
         }
+        for tool_index in 0..tool_calls.len() {
+            openai_tool_call_thought_signature(message, message_index, tool_index)?;
+        }
         let has_tool_representation = !tool_calls.is_empty() || had_legacy;
+        if role == "user" {
+            if message["content"].is_null() {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+            let parts = gemini_user_parts(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?;
+            if parts.is_empty() {
+                return Err(format!(
+                    "messages[{message_index}] has no Gemini-representable content"
+                ));
+            }
+            message_index += 1;
+            continue;
+        }
         // Null is fail-closed for system/developer/user. Assistant null/empty is
         // intentional only when a valid modern or legacy tool representation exists.
         let text = if message["content"].is_null() {
@@ -2480,12 +3447,17 @@ fn resolve_gemini_tool_choice(openai_body: &Value) -> Result<Option<Value>, Stri
 /// Map OpenAI Chat Completions into a Gemini/Vertex `generateContent` body.
 /// The model is URL-scoped (`…/models/{model}:streamGenerateContent`), so it is
 /// intentionally omitted from the JSON body.
-fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
+///
+/// `prevalidated` has the same meaning as for [`translate_to_anthropic`].
+fn translate_to_gemini(openai_body: &Value, prevalidated: bool) -> Result<Vec<u8>, String> {
     let messages = openai_body
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
-    validate_gemini_translation(openai_body)?;
+    if !prevalidated {
+        validate_gemini_request_params(openai_body).map_err(|rejection| rejection.message)?;
+        validate_gemini_translation(openai_body)?;
+    }
 
     let mut system_parts = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
@@ -2585,6 +3557,23 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
         }
 
         let native_role = if role == "assistant" { "model" } else { role };
+        if role == "user" {
+            if message["content"].is_null() {
+                return Err(format!(
+                    "messages[{message_index}] content must be a string or text-parts array"
+                ));
+            }
+            let parts = gemini_user_parts(&message["content"])
+                .map_err(|error| format!("messages[{message_index}] {error}"))?;
+            if parts.is_empty() {
+                return Err(format!(
+                    "messages[{message_index}] has no Gemini-representable content"
+                ));
+            }
+            contents.push(json!({ "role": "user", "parts": parts }));
+            message_index += 1;
+            continue;
+        }
         let tool_calls = if role == "assistant" {
             parse_openai_tool_calls(message, message_index)?
         } else {
@@ -2612,14 +3601,22 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
         if !text.is_empty() {
             parts.push(json!({ "text": text }));
         }
-        for call in tool_calls {
+        for (tool_index, call) in tool_calls.into_iter().enumerate() {
+            let thought_signature =
+                openai_tool_call_thought_signature(message, message_index, tool_index)?;
             tool_names_by_id.insert(call.id.clone(), call.name.clone());
-            parts.push(json!({
+            let mut part = json!({
                 "functionCall": {
                     "name": call.name,
                     "args": call.arguments,
                 }
-            }));
+            });
+            // Gemini 3 requires the signature it issued on a function-call part
+            // to come back on that same part when the call's result is sent.
+            if let Some(signature) = thought_signature {
+                part["thoughtSignature"] = Value::String(signature);
+            }
+            parts.push(part);
         }
         if let Some(call) = legacy_call {
             pending_legacy_by_name.insert(call.name.clone(), call.id.clone());
@@ -2649,11 +3646,36 @@ fn translate_to_gemini(openai_body: &Value) -> Result<Vec<u8>, String> {
     }
 
     let mut gen_config = serde_json::Map::new();
-    if let Some(max_tokens) = openai_body
-        .get("max_tokens")
-        .or_else(|| openai_body.get("max_completion_tokens"))
-    {
-        gen_config.insert("maxOutputTokens".to_string(), max_tokens.clone());
+    if let Some(max_tokens) = openai_max_output_tokens(openai_body)? {
+        gen_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
+    }
+    if let Some(count) = openai_choice_count(openai_body).map_err(|rejection| rejection.message)? {
+        gen_config.insert("candidateCount".to_string(), json!(count));
+    }
+    for (openai_field, gemini_field) in [
+        ("presence_penalty", "presencePenalty"),
+        ("frequency_penalty", "frequencyPenalty"),
+        ("seed", "seed"),
+    ] {
+        if let Some(value) = present(openai_body, openai_field) {
+            gen_config.insert(gemini_field.to_string(), value.clone());
+        }
+    }
+    match openai_response_format(openai_body).map_err(|rejection| rejection.message)? {
+        None => {}
+        Some(ResponseFormat::JsonObject) => {
+            gen_config.insert(
+                "responseMimeType".to_string(),
+                Value::String("application/json".to_string()),
+            );
+        }
+        Some(ResponseFormat::JsonSchema { schema, .. }) => {
+            gen_config.insert(
+                "responseMimeType".to_string(),
+                Value::String("application/json".to_string()),
+            );
+            gen_config.insert("responseJsonSchema".to_string(), schema.clone());
+        }
     }
     if let Some(temp) = openai_body.get("temperature") {
         gen_config.insert("temperature".to_string(), temp.clone());
@@ -3003,10 +4025,39 @@ impl Plugin for AiStreamRouter {
             );
         }
 
+        // Fail closed on OpenAI request parameters the selected provider can
+        // neither map exactly nor honor (instead of silently dropping them),
+        // before the route override commits.
+        let param_rejection = match provider.provider_type {
+            ProviderType::Anthropic => validate_anthropic_request_params(&openai_body).err(),
+            ProviderType::GoogleGemini => validate_gemini_request_params(&openai_body).err(),
+            ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::AzureOpenAi => {
+                None
+            }
+        };
+        if let Some(rejection) = param_rejection {
+            let provider_label = if provider.provider_type == ProviderType::Anthropic {
+                "Anthropic"
+            } else {
+                "Gemini"
+            };
+            return openai_error_response(
+                400,
+                &format!(
+                    "Invalid request for {provider_label} translation: {}",
+                    rejection.message
+                ),
+                "invalid_request_error",
+                Some(rejection.param),
+                Some(rejection.code),
+            );
+        }
+
         // Fail closed on Anthropic / Gemini tool-history / tool_choice shapes
         // that cannot be represented safely before the route override commits.
         if provider.provider_type == ProviderType::Anthropic
-            && let Err(message) = validate_anthropic_translation(&openai_body)
+            && let Err(message) =
+                validate_anthropic_translation(&openai_body, provider.anthropic_default_max_tokens)
         {
             let (param, code) = if message.contains("thinking") {
                 (Some("thinking"), Some("invalid_thinking"))
@@ -3142,7 +4193,14 @@ impl Plugin for AiStreamRouter {
                     .as_ref()
                     .map(|proxy| Arc::new(proxy.resolved_tls.clone()))
             } else {
-                Some(Arc::new(BackendTlsConfig::default_verify()))
+                // Not `default_verify()`: its unset CA / client fields are
+                // filled from gateway-global settings by the backend TLS
+                // builder (a private `FERRUM_TLS_CA_BUNDLE_PATH`,
+                // `FERRUM_TLS_NO_VERIFY`, and the global backend client
+                // certificate). A third-party provider gets public roots only,
+                // verification that no global opt-out can disable, and no
+                // gateway client identity.
+                Some(Arc::new(BackendTlsConfig::isolated_public_verify()))
             };
         } else {
             // Plaintext HTTP provider: no committed TLS configuration at all.
@@ -3158,7 +4216,7 @@ impl Plugin for AiStreamRouter {
         // the same policy over the finalized backend-visible map after every
         // later generic header transform (`GHSA-xhp5-hqj8-3mwg`).
         let normalizes = provider.normalizes_response(self.normalize_response_stream);
-        apply_provider_boundary_headers(provider, normalizes, headers);
+        apply_provider_boundary_headers(ctx, provider, normalizes, headers);
 
         // --- Private claim: the complete witness of what was committed. ---
         // Everything the credential boundary depends on lives here, in typed
@@ -3179,6 +4237,24 @@ impl Plugin for AiStreamRouter {
             ProviderType::Anthropic | ProviderType::GoogleGemini
         ) && openai_body.get("tool_choice").and_then(Value::as_str)
             == Some("none");
+        // Hand the parsed, validated client body to this claim's own transform
+        // so it is not parsed and validated a second time. The fingerprint is
+        // taken over the exact bytes parsed above; the transform reuses the
+        // value only when its body is still those bytes.
+        let client_body_memo = if matches!(
+            provider.provider_type,
+            ProviderType::Anthropic | ProviderType::GoogleGemini
+        ) {
+            ctx.metadata.get("request_body").map(|raw| {
+                Arc::new(ClientBodyMemo {
+                    len: raw.len(),
+                    fingerprint: body_fingerprint(raw.as_bytes()),
+                    value: openai_body,
+                })
+            })
+        } else {
+            None
+        };
         ctx.ai_stream_router_claim = Some(Box::new(AiStreamRouterClaim {
             owner: self.owner_id,
             provider_index,
@@ -3201,6 +4277,8 @@ impl Plugin for AiStreamRouter {
             committed_read_timeout_ms: ctx.route_override_backend_read_timeout_ms,
             // No external capacity is reserved for an `ai_stream_router` claim.
             lifecycle: None,
+            client_body_memo,
+            translated_body_fingerprint: None,
         }));
 
         // --- Metadata (observability + downstream-hook coordination ONLY). ---
@@ -3266,23 +4344,53 @@ impl Plugin for AiStreamRouter {
         // never from `ai_stream_router.model`: this hook runs at 2984 but a
         // later plugin's metadata write must not be able to decide which
         // generation the provider request is translated for.
-        let (provider_type, model) = {
+        let (provider_type, model, default_max_tokens) = {
             let (claim, provider) = self.owned_claim(ctx)?;
-            (provider.provider_type, claim.model.clone())
+            (
+                provider.provider_type,
+                claim.model.clone(),
+                provider.anthropic_default_max_tokens,
+            )
         };
 
         match provider_type {
-            ProviderType::Anthropic => {
-                let openai_body: Value = serde_json::from_slice(body).ok()?;
-                let translated = translate_to_anthropic(&openai_body, &model).ok()?;
+            ProviderType::Anthropic | ProviderType::GoogleGemini => {
+                // Reuse the claim's parsed, validated client body only when this
+                // transform sees exactly the bytes the claim parsed; otherwise
+                // parse and validate afresh.
+                let memo = ctx
+                    .ai_stream_router_claim
+                    .as_deref_mut()
+                    .and_then(|claim| claim.client_body_memo.take())
+                    .filter(|memo| {
+                        body_matches_fingerprint(body, Some((memo.len, memo.fingerprint)))
+                    });
+                let reparsed;
+                let (openai_body, prevalidated) = match memo.as_deref() {
+                    Some(memo) => (&memo.value, true),
+                    None => {
+                        reparsed = serde_json::from_slice::<Value>(body).ok()?;
+                        (&reparsed, false)
+                    }
+                };
+                let translated = if provider_type == ProviderType::Anthropic {
+                    translate_to_anthropic(openai_body, &model, default_max_tokens, prevalidated)
+                        .ok()?
+                } else {
+                    translate_to_gemini(openai_body, prevalidated).ok()?
+                };
+                let tool_choice_none =
+                    openai_body.get("tool_choice").and_then(Value::as_str) == Some("none");
                 // The decisive witness: private claim state on the very context
                 // `on_final_request_body_with_context` reads.
                 if let Some(claim) = ctx.ai_stream_router_claim.as_deref_mut() {
                     claim.request_translated = true;
+                    claim.translated_body_fingerprint =
+                        Some((translated.len(), body_fingerprint(&translated)));
                 }
                 ctx.metadata
                     .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
-                if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+                if tool_choice_none {
                     ctx.metadata
                         .insert(META_TOOL_CHOICE_NONE.to_string(), "true".to_string());
                 } else {
@@ -3290,23 +4398,7 @@ impl Plugin for AiStreamRouter {
                 }
                 Some(translated)
             }
-            ProviderType::GoogleGemini => {
-                let openai_body: Value = serde_json::from_slice(body).ok()?;
-                let translated = translate_to_gemini(&openai_body).ok()?;
-                if let Some(claim) = ctx.ai_stream_router_claim.as_deref_mut() {
-                    claim.request_translated = true;
-                }
-                ctx.metadata
-                    .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
-                if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
-                    ctx.metadata
-                        .insert(META_TOOL_CHOICE_NONE.to_string(), "true".to_string());
-                } else {
-                    ctx.metadata.remove(META_TOOL_CHOICE_NONE);
-                }
-                Some(translated)
-            }
-            ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
+            ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::AzureOpenAi => {
                 if self.inject_usage_options {
                     inject_include_usage(body)
                 } else {
@@ -3343,7 +4435,7 @@ impl Plugin for AiStreamRouter {
             return;
         };
         let normalizes = provider.normalizes_response(self.normalize_response_stream);
-        apply_provider_boundary_headers(provider, normalizes, headers);
+        apply_provider_boundary_headers(ctx, provider, normalizes, headers);
     }
 
     /// Revalidate the FINAL provider-visible body and route against the policy
@@ -3370,6 +4462,7 @@ impl Plugin for AiStreamRouter {
             destination_intact,
             committed_model,
             request_translated,
+            translated_body_fingerprint,
         ) = {
             // Not this instance's claim — either the request was never claimed,
             // or a second effective `ai_stream_router` owns it and runs the
@@ -3384,6 +4477,7 @@ impl Plugin for AiStreamRouter {
                 route_override_still_targets(ctx, claim),
                 claim.model.clone(),
                 claim.request_translated,
+                claim.translated_body_fingerprint,
             )
         };
 
@@ -3418,6 +4512,27 @@ impl Plugin for AiStreamRouter {
             return provider_policy_violation(
                 "The routed AI provider destination changed after provider selection",
             );
+        }
+
+        // Still exactly the bytes this instance's own translator produced: the
+        // translator wrote the committed model (Anthropic) or a URL-scoped body
+        // with `contents` (Gemini), and serialized it from a `Value`, so it has
+        // no duplicate members. Only the policy re-check remains; any later
+        // body transform changes the bytes and takes the full path below.
+        if (provider_is_anthropic || provider_is_gemini)
+            && body_matches_fingerprint(body, translated_body_fingerprint)
+        {
+            return match self.providers.get(provider_index) {
+                Some(provider) if provider.matches_model(&committed_model) => {
+                    PluginResult::Continue
+                }
+                Some(_) => model_policy_violation(
+                    "The final AI provider request model does not match the routed model policy",
+                ),
+                None => provider_policy_violation(
+                    "The routed AI provider could not be revalidated before dispatch",
+                ),
+            };
         }
 
         // A duplicate `model` member makes the provider-visible generation
@@ -3559,6 +4674,7 @@ impl Plugin for AiStreamRouter {
             model,
             encoding,
             tools_forbidden,
+            self.normalize_limits,
         ))
     }
 
@@ -3602,7 +4718,7 @@ impl Plugin for AiStreamRouter {
                         "upstream provider returned a successful response unsuitable for stream normalization",
                     );
                 let ceiling = ctx.retained_response_body_ceiling();
-                return bounded_upstream_sse_error_body(message, ceiling);
+                return Some(bounded_upstream_sse_error_body(message, ceiling));
             }
         }
         // Every replacement this normalizer produces is materialised inside a
@@ -3623,7 +4739,7 @@ impl Plugin for AiStreamRouter {
                     ProviderContentEncoding::Supported(coding) => Some(coding),
                     ProviderContentEncoding::Identity => None,
                     ProviderContentEncoding::Unsupported(reason) => {
-                        return bounded_upstream_sse_error_body(reason.as_str(), ceiling);
+                        return Some(bounded_upstream_sse_error_body(reason.as_str(), ceiling));
                     }
                 }
             }
@@ -3631,27 +4747,34 @@ impl Plugin for AiStreamRouter {
                 ProviderContentEncoding::Supported(coding) => Some(coding),
                 ProviderContentEncoding::Identity => None,
                 ProviderContentEncoding::Unsupported(reason) => {
-                    return bounded_upstream_sse_error_body(reason.as_str(), ceiling);
+                    return Some(bounded_upstream_sse_error_body(reason.as_str(), ceiling));
                 }
             },
         };
         let plaintext = match prepare_sse_bytes_for_normalization(body, encoding.as_deref()) {
             Ok(bytes) => bytes,
             Err(message) => {
-                return bounded_upstream_sse_error_body(
+                return Some(bounded_upstream_sse_error_body(
                     safe_residual_decode_diagnostic(&message),
                     ceiling,
-                );
+                ));
             }
         };
-        normalize_provider_stream_buffered(
-            provider_type,
-            model,
-            &plaintext,
-            tools_forbidden,
-            ceiling,
+        // Always a replacement once media classification chose normalization:
+        // `None` would leave the RAW provider body (provider-native framing,
+        // and possibly a tool call the claim forbids) in place under the
+        // already-repaired OpenAI representation headers.
+        Some(
+            normalize_provider_stream_buffered(
+                provider_type,
+                model,
+                &plaintext,
+                tools_forbidden,
+                ceiling,
+                self.normalize_limits,
+            )
+            .await,
         )
-        .await
     }
 
     /// Bind every field normalized provider SSE invalidates.
@@ -3737,36 +4860,73 @@ impl Plugin for AiStreamRouter {
     }
 }
 
+/// Provider-protocol request headers a client must not be able to set toward a
+/// third-party provider (they select provider API behavior or bill a provider
+/// organization). The selected provider's own values are re-installed.
+const PROVIDER_PROTOCOL_HEADERS: &[&str] = &[
+    "anthropic-version",
+    "anthropic-beta",
+    "openai-beta",
+    "openai-organization",
+    "openai-project",
+];
+
+/// Header-name equality that ignores ASCII case and treats `_` as `-`.
+///
+/// `_` is a legal header-name byte, and CGI-style stacks and several provider
+/// front ends fold `x_api_key` onto `x-api-key`, so an underscore spelling of a
+/// credential name is the same credential.
+fn header_name_matches_folded(name: &str, candidate: &str) -> bool {
+    name.len() == candidate.len()
+        && name.bytes().zip(candidate.bytes()).all(|(left, right)| {
+            let fold = |byte: u8| {
+                if byte == b'_' {
+                    b'-'
+                } else {
+                    byte.to_ascii_lowercase()
+                }
+            };
+            fold(left) == fold(right)
+        })
+}
+
 /// Strip client-supplied credential headers so they never leak to the provider.
 ///
 /// Unlike `ai_federation` (which builds a fresh provider request), this
-/// route-override path forwards the client's own header map, so
-/// session-bearing headers (`cookie`, `proxy-authorization`) must be stripped
-/// alongside the API-key/auth headers or browser/application session
-/// credentials would reach the third-party provider.
+/// route-override path forwards the client's own header map, so every header
+/// Ferrum classifies as a credential — the canonical
+/// [`CREDENTIAL_CONTEXT_HEADERS`] set shared with replay partitioning
+/// (`authorization`, `proxy-authorization`, `cookie`, `x-api-key`, `api-key`,
+/// `apikey`, `x-goog-api-key`, `x-access-token`, `x-auth-token`,
+/// `x-amz-security-token`, `x-forwarded-authorization`) — plus the
+/// provider-protocol headers are removed, in any case and with `_` spelled as
+/// `-`. A hand-maintained subset here previously let `x-auth-token` or an AWS
+/// session token reach the third party.
 pub(crate) fn strip_client_credentials(headers: &mut HashMap<String, String>) {
-    const CREDENTIAL_HEADERS: &[&str] = &[
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "x-api-key",
-        "api-key",
-        "x-goog-api-key",
-        "anthropic-version",
-        "anthropic-beta",
-        "openai-beta",
-        "openai-organization",
-        "openai-project",
-    ];
-    // Header keys in the map are already lowercased by the proxy, but match
-    // case-insensitively to be safe against any future change. This runs on
-    // every final-policy pass (once per `before_proxy` pass, per deferred
-    // routing pass, per egress overlay, and per retry attempt), so compare in
-    // place rather than allocating a lowercased copy of every header name.
-    headers.retain(|k, _| {
-        !CREDENTIAL_HEADERS
+    // This runs on every final-policy pass (once per `before_proxy` pass, per
+    // deferred routing pass, per egress overlay, and per retry attempt), so
+    // compare in place rather than allocating a folded copy of every name.
+    headers.retain(|name, _| {
+        !CREDENTIAL_CONTEXT_HEADERS
             .iter()
-            .any(|candidate| k.eq_ignore_ascii_case(candidate))
+            .chain(PROVIDER_PROTOCOL_HEADERS)
+            .any(|candidate| header_name_matches_folded(name, candidate))
+    });
+}
+
+/// Strip the route's own custom credential locations — the JWT/JWKS, OAuth,
+/// and API-key header names this proxy's authentication plugins read
+/// (`RequestContext::request_headers_requiring_redaction`). A credential a
+/// client presented to Ferrum is never a provider credential.
+fn strip_route_credential_locations(ctx: &RequestContext, headers: &mut HashMap<String, String>) {
+    let locations = ctx.request_headers_requiring_redaction();
+    if locations.is_empty() {
+        return;
+    }
+    headers.retain(|name, _| {
+        !locations
+            .iter()
+            .any(|location| header_name_matches_folded(name, location))
     });
 }
 
@@ -3788,9 +4948,11 @@ pub(crate) fn strip_gateway_identity_assertions(headers: &mut HashMap<String, St
 /// (`enforce_final_backend_header_policy`) after every later generic header
 /// transform. It is idempotent, allocation-light, and never logs a value.
 ///
-/// The owned set is FIXED and closed: the standard client/proxy credential and
-/// session headers ([`strip_client_credentials`]), the gateway's own consumer /
-/// geo assertions ([`strip_gateway_identity_assertions`]), and the provider
+/// The owned set is closed: every canonical credential / session header and
+/// provider-protocol header ([`strip_client_credentials`], case- and
+/// `_`/`-`-insensitive), this route's own custom credential locations
+/// ([`strip_route_credential_locations`]), the gateway's own consumer / geo
+/// assertions ([`strip_gateway_identity_assertions`]), and the provider
 /// protocol headers installed below (`host`, `content-type`, `accept`, the
 /// provider credential header, `anthropic-version`, and `accept-encoding` when
 /// normalizing).
@@ -3798,15 +4960,18 @@ pub(crate) fn strip_gateway_identity_assertions(headers: &mut HashMap<String, St
 /// Headers outside that set are left untouched, so intended non-credential
 /// operator transforms still reach the provider. This is a deliberate limit, not
 /// an omission: Ferrum cannot decide that an arbitrary unknown custom header
-/// carries a secret, so a bespoke normal-backend credential header configured on
-/// the same proxy WILL still be forwarded. Do not configure such a rule on a
-/// proxy that routes to a third-party provider.
+/// carries a secret, so a bespoke normal-backend credential header that is
+/// neither a canonical credential name nor a configured authentication location
+/// WILL still be forwarded. Do not configure such a rule on a proxy that routes
+/// to a third-party provider.
 fn apply_provider_boundary_headers(
+    ctx: &RequestContext,
     provider: &StreamProvider,
     normalizes_response: bool,
     headers: &mut HashMap<String, String>,
 ) {
     strip_client_credentials(headers);
+    strip_route_credential_locations(ctx, headers);
     strip_gateway_identity_assertions(headers);
     match &provider.auth {
         ProviderAuth::Bearer { header_value } => {
@@ -4083,14 +5248,19 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
 /// body is SERIALIZED THROUGH the bounded sink rather than built as a complete
 /// `Vec` that a bounded copy would only measure afterwards: the JSON string is
 /// written by `serde_json` straight into the sink, which stops at the ceiling
-/// (GHSA-pwcm-6rh8-f2gh). `None` (leave the response alone) is the fail-closed
-/// answer if a pathologically small ceiling cannot hold it.
+/// (GHSA-pwcm-6rh8-f2gh). If a pathologically small ceiling cannot hold even
+/// the envelope, the replacement is EMPTY: leaving the response alone would
+/// deliver the raw provider body, so it is never the fail-closed answer.
 ///
 /// The bytes are identical to `upstream_sse_error_body`'s: `serde_json`'s
 /// compact object rendering emits `message` before `type` under both insertion
 /// and lexicographic member ordering, and `to_writer` applies the same string
 /// escaping `Value`'s `Display` does.
-fn bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Option<Vec<u8>> {
+fn bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Vec<u8> {
+    try_bounded_upstream_sse_error_body(message, ceiling).unwrap_or_default()
+}
+
+fn try_bounded_upstream_sse_error_body(message: &str, ceiling: usize) -> Option<Vec<u8>> {
     use crate::proxy::response_buffer_budget::BoundedResponseBodySink;
     let mut sink = BoundedResponseBodySink::with_ceiling(ceiling);
     if !sink.push(br#"data: {"error":{"message":"#) {
@@ -4123,15 +5293,16 @@ fn wrap_provider_normalizer(
     model: String,
     encoding: Option<String>,
     tools_forbidden: bool,
+    limits: NormalizeLimits,
 ) -> Box<dyn ResponseStreamInspector> {
     let engine = match provider_type {
         ProviderType::Anthropic => {
-            NormalizeEngine::Anthropic(AnthropicSseNormalizer::new(model, tools_forbidden))
+            NormalizeEngine::Anthropic(AnthropicSseNormalizer::new(model, tools_forbidden, limits))
         }
         ProviderType::GoogleGemini => {
-            NormalizeEngine::Gemini(GeminiStreamNormalizer::new(model, tools_forbidden))
+            NormalizeEngine::Gemini(GeminiStreamNormalizer::new(model, tools_forbidden, limits))
         }
-        ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::AzureOpenAi => {
             // Unreachable: only normalizing providers install an inspector.
             return Box::new(ImmediateUpstreamErrorNormalizer::new(
                 "internal error: non-normalizing provider requested a stream normalizer"
@@ -4166,10 +5337,12 @@ fn wrap_provider_normalizer(
 
 /// How a claimed normalizing provider response's `Content-Type` is handled.
 ///
-/// Anthropic keeps the historical PassThrough posture when the response is not
-/// `text/event-stream`. Gemini must not stream raw 2xx provider bytes past the
-/// adapter when the media type is missing or unexpected: those cases fail
-/// closed through after_proxy / inspector / buffered normalization.
+/// Neither translated provider may stream raw 2xx provider bytes past the
+/// adapter under the OpenAI contract the client asked for: a missing or
+/// unexpected media type fails closed through after_proxy / inspector /
+/// buffered normalization. Anthropic streaming is always `text/event-stream`
+/// (the translation forces `stream: true`); Gemini additionally admits the
+/// Vertex-compatible JSON stream framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProviderStreamMediaDecision {
     Normalize,
@@ -4183,13 +5356,11 @@ fn classify_provider_stream_media(
     content_type: Option<&str>,
 ) -> ProviderStreamMediaDecision {
     match provider_type {
-        ProviderType::Anthropic => {
-            if content_type.is_some_and(is_event_stream_content_type) {
-                ProviderStreamMediaDecision::Normalize
-            } else {
-                ProviderStreamMediaDecision::PassThrough
-            }
-        }
+        ProviderType::Anthropic => match content_type {
+            Some(ct) if is_event_stream_content_type(ct) => ProviderStreamMediaDecision::Normalize,
+            None => ProviderStreamMediaDecision::FailClosedMissingContentType,
+            Some(_) => ProviderStreamMediaDecision::FailClosedUnexpectedContentType,
+        },
         ProviderType::GoogleGemini => match content_type {
             Some(ct) if is_event_stream_content_type(ct) || is_json_content_type(ct) => {
                 ProviderStreamMediaDecision::Normalize
@@ -4197,7 +5368,7 @@ fn classify_provider_stream_media(
             None => ProviderStreamMediaDecision::FailClosedMissingContentType,
             Some(_) => ProviderStreamMediaDecision::FailClosedUnexpectedContentType,
         },
-        ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::AzureOpenAi => {
             ProviderStreamMediaDecision::PassThrough
         }
     }
@@ -4209,10 +5380,10 @@ fn provider_stream_media_fail_closed_message(
 ) -> Option<&'static str> {
     match decision {
         ProviderStreamMediaDecision::FailClosedMissingContentType => Some(
-            "Upstream provider returned a successful response without a Content-Type suitable for Gemini stream normalization",
+            "Upstream provider returned a successful response without a Content-Type suitable for provider stream normalization",
         ),
         ProviderStreamMediaDecision::FailClosedUnexpectedContentType => Some(
-            "Upstream provider returned a successful response with an unexpected Content-Type for Gemini stream normalization",
+            "Upstream provider returned a successful response with an unexpected Content-Type for provider stream normalization",
         ),
         ProviderStreamMediaDecision::Normalize | ProviderStreamMediaDecision::PassThrough => None,
     }
@@ -4396,6 +5567,31 @@ const _: () = assert!(
 /// against tiny-event floods that stay under the per-event and body-byte caps.
 pub const MAX_SSE_EVENTS: usize = 100_000;
 
+/// Per-instance normalizer stream bounds. The defaults are the published
+/// constants; the `max_stream_bytes`, `max_stream_events`, and
+/// `max_normalized_stream_bytes` config fields override them within admitted
+/// ranges. The per-event byte cap and JSON depth stay fixed, and a residual
+/// provider `Content-Encoding` is still decoded under the fixed
+/// [`NORMALIZE_DECODE_LIMITS`].
+#[derive(Clone, Copy, Debug)]
+struct NormalizeLimits {
+    /// Cumulative provider plaintext one normalizer accepts.
+    max_plaintext_bytes: usize,
+    /// Complete provider events one normalizer accepts.
+    max_events: usize,
+    /// Cumulative OpenAI-shaped output one normalizer may emit.
+    max_output_bytes: usize,
+}
+
+#[cfg(test)]
+impl NormalizeLimits {
+    const DEFAULT: Self = Self {
+        max_plaintext_bytes: MAX_SSE_NORMALIZED_BODY_BYTES,
+        max_events: MAX_SSE_EVENTS,
+        max_output_bytes: MAX_SSE_NORMALIZED_OUTPUT_BYTES,
+    };
+}
+
 /// Maximum JSON nesting depth accepted in an SSE `data:` payload before
 /// `serde_json` parse/transcode. Anthropic protocol frames are shallow; this
 /// is well below serde_json's own recursion ceiling and fails with a stable
@@ -4557,6 +5753,7 @@ struct AnthropicSseNormalizer {
     events_seen: usize,
     /// Cumulative OpenAI SSE bytes already forwarded to the client.
     normalized_out_bytes: usize,
+    limits: NormalizeLimits,
     model: String,
     stream_id: Option<String>,
     synthetic_id: String,
@@ -4581,7 +5778,7 @@ struct AnthropicSseNormalizer {
 }
 
 impl AnthropicSseNormalizer {
-    fn new(model: String, tools_forbidden: bool) -> Self {
+    fn new(model: String, tools_forbidden: bool, limits: NormalizeLimits) -> Self {
         Self {
             buf: Vec::new(),
             cursor: 0,
@@ -4589,6 +5786,7 @@ impl AnthropicSseNormalizer {
             bytes_ingested: 0,
             events_seen: 0,
             normalized_out_bytes: 0,
+            limits,
             model,
             stream_id: None,
             synthetic_id: format!("chatcmpl-stream-{}", uuid::Uuid::new_v4().simple()),
@@ -5125,7 +6323,7 @@ impl AnthropicSseNormalizer {
                 );
                 return true;
             }
-            if self.events_seen >= MAX_SSE_EVENTS {
+            if self.events_seen >= self.limits.max_events {
                 self.fail_bound(
                     "upstream provider SSE stream exceeded the event count limit; stream terminated",
                     out,
@@ -5155,9 +6353,10 @@ impl AnthropicSseNormalizer {
     fn normalized_output_exceeded(&mut self, out: &mut NormalizedSseOut, terminal: bool) -> bool {
         let total = self.normalized_out_bytes.saturating_add(out.len());
         let allowed = if terminal {
-            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+            self.limits.max_output_bytes
         } else {
-            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+            self.limits
+                .max_output_bytes
                 .saturating_sub(SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES)
         };
         if total <= allowed {
@@ -5188,7 +6387,7 @@ impl AnthropicSseNormalizer {
                 "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
             );
         };
-        if next > MAX_SSE_NORMALIZED_BODY_BYTES {
+        if next > self.limits.max_plaintext_bytes {
             return Err(
                 "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
             );
@@ -5247,7 +6446,7 @@ impl AnthropicSseNormalizer {
                 );
                 return;
             }
-            if self.events_seen >= MAX_SSE_EVENTS {
+            if self.events_seen >= self.limits.max_events {
                 self.fail_bound(
                     "upstream provider SSE stream exceeded the event count limit; stream terminated",
                     out,
@@ -5432,6 +6631,7 @@ struct GeminiStreamNormalizer {
     bytes_ingested: usize,
     events_seen: usize,
     normalized_out_bytes: usize,
+    limits: NormalizeLimits,
     framing: GeminiFraming,
     json_array_state: GeminiJsonArrayState,
     model: String,
@@ -5449,7 +6649,7 @@ struct GeminiStreamNormalizer {
 }
 
 impl GeminiStreamNormalizer {
-    fn new(model: String, tools_forbidden: bool) -> Self {
+    fn new(model: String, tools_forbidden: bool, limits: NormalizeLimits) -> Self {
         Self {
             buf: Vec::new(),
             cursor: 0,
@@ -5458,6 +6658,7 @@ impl GeminiStreamNormalizer {
             bytes_ingested: 0,
             events_seen: 0,
             normalized_out_bytes: 0,
+            limits,
             framing: GeminiFraming::Undecided,
             json_array_state: GeminiJsonArrayState::Inactive,
             model,
@@ -5721,7 +6922,7 @@ impl GeminiStreamNormalizer {
                 "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
             );
         };
-        if next > MAX_SSE_NORMALIZED_BODY_BYTES {
+        if next > self.limits.max_plaintext_bytes {
             return Err(
                 "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
             );
@@ -5733,9 +6934,10 @@ impl GeminiStreamNormalizer {
     fn normalized_output_exceeded(&mut self, out: &mut NormalizedSseOut, terminal: bool) -> bool {
         let total = self.normalized_out_bytes.saturating_add(out.len());
         let allowed = if terminal {
-            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+            self.limits.max_output_bytes
         } else {
-            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+            self.limits
+                .max_output_bytes
                 .saturating_sub(SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES)
         };
         if total <= allowed {
@@ -5998,9 +7200,29 @@ impl GeminiStreamNormalizer {
                     "upstream provider sent a non-object Gemini content part; stream terminated",
                 );
             };
+            // Gemini thinking models attach an opaque `thoughtSignature` to
+            // function-call parts (and to text parts, including an empty final
+            // text part while streaming). It is the one recognized sibling
+            // field; every other extra member still fails closed.
+            let thought_signature = match part_obj.get("thoughtSignature") {
+                None => None,
+                Some(Value::String(signature)) if valid_thought_signature(signature) => {
+                    Some(signature.as_str())
+                }
+                Some(_) => {
+                    return Err(
+                        "upstream provider sent a malformed Gemini thoughtSignature; stream terminated",
+                    );
+                }
+            };
+            let representable_fields = 1 + usize::from(thought_signature.is_some());
             match (part_obj.get("text"), part_obj.get("functionCall")) {
                 (Some(text_value), None) => {
-                    if part_obj.len() != 1 {
+                    // A text-part signature is not required for continuation
+                    // (only function-call signatures are), and OpenAI content
+                    // deltas have no carrier for it, so it is accepted and not
+                    // surfaced.
+                    if part_obj.len() != representable_fields {
                         return Err(
                             "upstream provider sent a Gemini content part with unrepresentable additional fields; stream terminated",
                         );
@@ -6017,7 +7239,7 @@ impl GeminiStreamNormalizer {
                     self.write_chunk_line(choice_index, json!({ "content": text }), None, out);
                 }
                 (None, Some(function_call)) => {
-                    if part_obj.len() != 1 {
+                    if part_obj.len() != representable_fields {
                         return Err(
                             "upstream provider sent a Gemini content part with unrepresentable additional fields; stream terminated",
                         );
@@ -6060,24 +7282,32 @@ impl GeminiStreamNormalizer {
                         "call_gemini_{}_{choice_index}_{tool_index}",
                         self.call_id_prefix
                     );
+                    let mut tool_call = json!({
+                        "index": tool_index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": args_json },
+                    });
+                    // Round-trip carrier in Google's OpenAI-compatibility shape:
+                    // the client echoes `extra_content.google.thought_signature`
+                    // on this assistant tool call, and request translation
+                    // restores it onto the same Gemini `functionCall` part.
+                    if let Some(signature) = thought_signature {
+                        tool_call["extra_content"] =
+                            json!({ "google": { "thought_signature": signature } });
+                    }
                     self.ensure_role(choice_index, out);
                     self.write_chunk_line(
                         choice_index,
-                        json!({
-                            "tool_calls": [{
-                                "index": tool_index,
-                                "id": call_id,
-                                "type": "function",
-                                "function": { "name": name, "arguments": args_json },
-                            }]
-                        }),
+                        json!({ "tool_calls": [tool_call] }),
                         None,
                         out,
                     );
                 }
-                (None, None) if part_obj.is_empty() => {
-                    // Sole metadata-only exception: an empty object carries no
-                    // provider output and cannot hide media/code/unknown parts.
+                (None, None) if part_obj.len() == usize::from(thought_signature.is_some()) => {
+                    // Metadata-only parts carry no provider output and cannot
+                    // hide media/code/unknown parts: an empty object, or a
+                    // part holding only a thought signature.
                 }
                 (None, None) => {
                     return Err(
@@ -6114,7 +7344,7 @@ impl GeminiStreamNormalizer {
                 );
                 return true;
             }
-            if self.events_seen >= MAX_SSE_EVENTS {
+            if self.events_seen >= self.limits.max_events {
                 self.fail_bound(
                     "upstream provider SSE stream exceeded the event count limit; stream terminated",
                     out,
@@ -6285,7 +7515,7 @@ impl GeminiStreamNormalizer {
                 );
                 return true;
             }
-            if self.events_seen >= MAX_SSE_EVENTS {
+            if self.events_seen >= self.limits.max_events {
                 self.fail_bound(
                     "upstream provider SSE stream exceeded the event count limit; stream terminated",
                     out,
@@ -7008,24 +8238,43 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
     }
 }
 
+/// Fixed diagnostic for a buffered normalization whose OpenAI-shaped output no
+/// longer fits this response's retained ceiling.
+const BUFFERED_NORMALIZED_CEILING_MESSAGE: &str = "upstream provider stream normalization exceeded the retained response size limit; stream terminated";
+
 /// Buffered provider→OpenAI SSE normalization, written into a
 /// `ceiling`-bounded accumulator from the FIRST normalized byte
 /// (GHSA-pwcm-6rh8-f2gh).
+///
+/// Always returns the replacement. When the normalized output cannot fit the
+/// ceiling (OpenAI chunk envelopes are larger than Anthropic deltas, so a raw
+/// body that fits can normalize past it), the partial output is discarded and
+/// the bounded upstream-error terminal replaces it — never the raw provider
+/// bytes, which could carry provider-native framing or a tool call the claim
+/// forbids.
 async fn normalize_provider_stream_buffered(
     provider_type: ProviderType,
     model: String,
     body: &[u8],
     tools_forbidden: bool,
     ceiling: usize,
-) -> Option<Vec<u8>> {
+    limits: NormalizeLimits,
+) -> Vec<u8> {
     let mut engine = match provider_type {
         ProviderType::Anthropic => {
-            NormalizeEngine::Anthropic(AnthropicSseNormalizer::new(model, tools_forbidden))
+            NormalizeEngine::Anthropic(AnthropicSseNormalizer::new(model, tools_forbidden, limits))
         }
         ProviderType::GoogleGemini => {
-            NormalizeEngine::Gemini(GeminiStreamNormalizer::new(model, tools_forbidden))
+            NormalizeEngine::Gemini(GeminiStreamNormalizer::new(model, tools_forbidden, limits))
         }
-        ProviderType::OpenAi | ProviderType::OpenAiCompatible => return None,
+        ProviderType::OpenAi | ProviderType::OpenAiCompatible | ProviderType::AzureOpenAi => {
+            // Unreachable: only normalizing providers reach the buffered
+            // normalizer. Fail closed rather than leave the body in place.
+            return bounded_upstream_sse_error_body(
+                "internal error: non-normalizing provider requested a stream normalizer",
+                ceiling,
+            );
+        }
     };
     let mut out = NormalizedSseOut::with_ceiling(ceiling);
     for slice in body.chunks(BUFFERED_NORMALIZE_CHUNK_BYTES) {
@@ -7033,17 +8282,17 @@ async fn normalize_provider_stream_buffered(
             break;
         }
         let terminate = engine.drive_chunk(slice, &mut out);
-        if out.refused() {
-            return None;
-        }
-        if terminate {
-            return out.finish();
+        if out.refused() || terminate {
+            break;
         }
     }
-    if !engine.done_emitted() {
+    if !out.refused() && !engine.done_emitted() {
         engine.drive_end(&mut out);
     }
-    out.finish()
+    match out.finish() {
+        Some(normalized) => normalized,
+        None => bounded_upstream_sse_error_body(BUFFERED_NORMALIZED_CEILING_MESSAGE, ceiling),
+    }
 }
 
 fn is_known_anthropic_event(event_type: &str) -> bool {
@@ -7151,7 +8400,8 @@ mod sse_buffer_tests {
     /// O(total_input).
     #[test]
     fn cursor_compaction_stays_linear_for_many_small_events() {
-        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        let mut normalizer =
+            AnthropicSseNormalizer::new("claude-test".to_string(), false, NormalizeLimits::DEFAULT);
         let event = b"data: {\"type\":\"ping\"}\n\n";
         let mut out = NormalizedSseOut::unbounded();
         let iterations = 4_096usize;
@@ -7247,7 +8497,8 @@ mod sse_buffer_tests {
     /// must never describe bytes outside the unread window.
     #[test]
     fn gemini_json_framing_memo_is_incremental_and_never_stale() {
-        let mut normalizer = GeminiStreamNormalizer::new("gemini-test".to_string(), false);
+        let mut normalizer =
+            GeminiStreamNormalizer::new("gemini-test".to_string(), false, NormalizeLimits::DEFAULT);
         let event =
             br#"{"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"hi"}]}}]}"#;
         let mut out = NormalizedSseOut::unbounded();
