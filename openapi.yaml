@@ -25312,7 +25312,13 @@ components:
         attribute, reject ambiguous or duplicate values, and export the authenticated
         entry's canonical value rather than the presented username: direct bind reads
         it with a base-scope search on the bound DN, and search-then-bind takes it
-        from the uniquely selected search entry.
+        from the uniquely selected search entry. A returned group entry satisfies
+        `required_groups` through its `group_attribute` values alone whenever the
+        directory returns that attribute; only an omitted `cn` falls back to the
+        entry's own `cn` RDN. DNs and attribute names are validated at admission.
+        `failover_ldap_urls` adds directory endpoints tried in order when one is
+        unreachable or answers busy/unavailable; credential rejections never fail
+        over.
       required:
         - ldap_url
       allOf:
@@ -25369,26 +25375,85 @@ components:
                 pattern: "^ldaps://"
               starttls:
                 const: true
+        - if:
+            required: [ldap_url, failover_ldap_urls]
+            properties:
+              ldap_url:
+                pattern: "^ldaps://"
+          then:
+            properties:
+              failover_ldap_urls:
+                items:
+                  pattern: "^ldaps://"
+          else:
+            properties:
+              failover_ldap_urls:
+                items:
+                  pattern: "^ldap://"
+        - if:
+            required: [failover_ldap_urls]
+            not:
+              anyOf:
+                - required: [starttls]
+                  properties:
+                    starttls:
+                      const: true
+                - required: [allow_plaintext]
+                  properties:
+                    allow_plaintext:
+                      const: true
+          then:
+            properties:
+              failover_ldap_urls:
+                items:
+                  anyOf:
+                    - pattern: "^ldaps://"
+                    - pattern: '^ldap://(?:127(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}|\[::1\]|(?:[^/?#@]+\.)?[lL][oO][cC][aA][lL][hH][oO][sS][tT]\.?)(?::[0-9]+)?(?:[/?#]|$)'
+        - not:
+            required: [group_filter, group_membership_mode]
+            properties:
+              group_membership_mode:
+                const: member_of
+        - if:
+            required: [service_connection_max_age_seconds]
+            properties:
+              service_connection_max_age_seconds:
+                minimum: 1
+          then:
+            required: [service_account_dn, service_account_password]
       properties:
         ldap_url:
           type: string
           minLength: 1
-          pattern: '^ldaps?://(?:[^/?#@]*@)?(?:\[[0-9A-Fa-f:.]+\]|[^\s/?#:@\[\]]+)(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[0-9]{1,4})?)?(?:[\s/?#]|$)'
+          pattern: '^ldaps?://(?:[^/?#@]*@)?(?:\[[0-9A-Fa-f:.]+\]|[^\s/?#:@\[\]]+)(?::(?:0*(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?)?(?:[\s/?#]|$)'
           not:
             pattern: '^ldaps?://[^/?#]*[^/?#@]@'
-          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. The scheme is matched case-sensitively and the value must carry no leading or trailing whitespace. A hostname is required and an explicit port must be 0-65535. Embedded URL credentials are rejected; a bare '@' with empty userinfo carries none and is accepted. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification."
+          description: "LDAP server URL. Use ldaps:// or ldap:// with starttls=true; non-loopback plaintext ldap:// requires the explicit development-only allow_plaintext override. The scheme is matched case-sensitively and the value must carry no leading or trailing whitespace. A hostname is required and an explicit port must be 1-65535 (port 0 can never be dialed). Embedded URL credentials are rejected; a bare '@' with empty userinfo carries none and is accepted. Each connection freshly resolves and policy-screens all A/AAAA candidates while retaining this hostname for TLS/SNI verification. The connection-establishment budget is split across the screened candidates, so a candidate that stalls during TCP or TLS setup, or fails TLS, leaves time to try the next one."
           example: "ldaps://ldap.example.com:636"
+        failover_ldap_urls:
+          type: array
+          minItems: 1
+          maxItems: 8
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            pattern: '^ldaps?://(?:[^/?#@]*@)?(?:\[[0-9A-Fa-f:.]+\]|[^\s/?#:@\[\]]+)(?::(?:0*(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?)?(?:[\s/?#]|$)'
+            not:
+              pattern: '^ldaps?://[^/?#]*[^/?#@]@'
+          description: "Further directory endpoints (replicas) tried in order after ldap_url, each validated like ldap_url and using the same scheme. A flow moves to the next endpoint only when the current one cannot be reached, its connection or TLS setup fails, an operation fails at the transport level, or it answers busy (51) / unavailable (52); a credential rejection, a group non-membership, or any other directory error is final. Every attempt shares request_timeout_seconds. The replicas join the identity realm digest."
+          example: ["ldaps://ldap2.example.com:636"]
         bind_dn_template:
           type: string
           minLength: 1
           pattern: '\{username\}'
-          description: "Direct bind DN template with {username} placeholder"
+          description: "Direct bind DN template with {username} placeholder. A DN-shaped template (one containing '=') must, with the placeholder substituted, be an RFC 4514 distinguished name; an Active Directory userPrincipalName ({username}@corp.example.com) or down-level (CORP\\{username}) template is accepted as-is."
           example: "uid={username},ou=users,dc=example,dc=com"
         search_base_dn:
           type: string
           minLength: 1
           pattern: '\S'
-          description: "Base DN for search-then-bind user search. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
+          description: "Base DN for search-then-bind user search. Surrounding whitespace is trimmed; a whitespace-only value is rejected, and the value must be an RFC 4514 distinguished name (an unescaped '=' inside a value is refused as a likely missing comma)"
         search_filter:
           type: string
           minLength: 1
@@ -25398,13 +25463,15 @@ components:
         canonical_identity_attribute:
           type: string
           minLength: 1
-          pattern: '\S'
-          description: "Required in both bind modes. Exactly one value from the authenticated entry (the uniquely selected search entry, or a base-scope read of the directly bound DN) becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive."
+          pattern: '^\s*(?:[A-Za-z][A-Za-z0-9-]*|(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))+)(?:;[A-Za-z0-9-]+)*\s*$'
+          not:
+            pattern: '^\s*1\.1\s*$'
+          description: "Required in both bind modes. Exactly one value from the authenticated entry (the uniquely selected search entry, or a base-scope read of the directly bound DN) becomes the authenticated identity, Consumer mapping key, custom group-filter {username}, and default memberUid value (for example uid or sAMAccountName). Choose the authoritative attribute whose value username-based groups store; mismatches fail closed and never fall back to the presented login. Attribute-name matching is LDAP case-insensitive. The value must be an RFC 4512 attribute description (a name or numeric OID with optional ;options); 1.1 is refused."
         service_account_dn:
           type: string
           minLength: 1
           pattern: '\S'
-          description: "DN for the service account used in search-then-bind. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
+          description: "DN for the service account used in search-then-bind. Surrounding whitespace is trimmed; a whitespace-only value is rejected. A DN-shaped value (one containing '=') must be an RFC 4514 distinguished name; an Active Directory userPrincipalName or down-level logon name is accepted as-is."
         service_account_password:
           type: string
           minLength: 1
@@ -25415,25 +25482,39 @@ components:
           type: string
           minLength: 1
           pattern: '\S'
-          description: "Base DN for group membership search. Surrounding whitespace is trimmed; a whitespace-only value is rejected"
+          description: "Base DN for group membership search. Surrounding whitespace is trimmed; a whitespace-only value is rejected, and the value must be an RFC 4514 distinguished name"
         group_filter:
           type: string
           minLength: 1
           pattern: '\S'
-          description: "Group search filter. The value must parse as an RFC 4515 search filter; a malformed filter is rejected at load. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN using member, uniqueMember, and memberUid so a static branch cannot fabricate membership."
+          description: "Group search filter. The value must parse as an RFC 4515 search filter; a malformed filter is rejected at load. When required_groups is non-empty, a custom filter must contain {user_dn} or {username}. {username} is the authenticated canonical identity read from canonical_identity_attribute in both bind modes, never the presented login. Before authorization, every custom-filter match is rechecked against the exact returned group DN with the membership predicate (member, uniqueMember, and memberUid by default; group_member_attribute and group_membership_mode change it) so a static branch cannot fabricate membership."
         required_groups:
           type: array
           items:
             type: string
             minLength: 1
             pattern: '\S'
-          description: "LDAP/AD group names the user must belong to (OR logic). A returned group entry matches when its group_attribute value matches, or when the entry's OWN first RDN is typed cn or group_attribute and its RFC 4514-decoded value matches; an entry merely nested under a required group never matches"
+          description: "LDAP/AD group names the user must belong to (OR logic). Names compare like LDAP caseIgnoreMatch: case-insensitively, ignoring surrounding whitespace and collapsing interior whitespace runs. When the directory returns group_attribute for a group entry, only those values decide; a present non-matching value never falls back to the DN. Only when group_attribute is cn and the directory omits it does the entry's OWN first RDN stand in, and then only a cn-typed component with a matching RFC 4514-decoded value; any other omitted group_attribute fails closed. An entry merely nested under a required group never matches"
         group_attribute:
           type: string
           minLength: 1
-          pattern: '\S'
           default: "cn"
-          description: "Attribute containing the group name; returned LDAP attribute names are matched case-insensitively"
+          pattern: '^\s*(?:[A-Za-z][A-Za-z0-9-]*|(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))+)(?:;[A-Za-z0-9-]+)*\s*$'
+          not:
+            pattern: '^\s*1\.1\s*$'
+          description: "Authoritative attribute containing the group name (for Active Directory prefer the domain-unique sAMAccountName over cn, which may repeat across OUs); returned LDAP attribute names are matched case-insensitively. Must be an RFC 4512 attribute description; 1.1 is refused."
+        group_member_attribute:
+          type: string
+          minLength: 1
+          pattern: '^\s*(?:[A-Za-z][A-Za-z0-9-]*|(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))+)(?:;[A-Za-z0-9-]+)*\s*$'
+          not:
+            pattern: '^\s*1\.1\s*$'
+          description: "DN-valued attribute on group entries that lists members, used for the default group search and for the custom-filter membership recheck instead of the built-in member/uniqueMember/memberUid predicate (for example member or a custom appMember). With group_membership_mode ad_in_chain it names the link attribute evaluated transitively (default member); with member_of it names the attribute on the user's entry listing group DNs (default memberOf). Must be an RFC 4512 attribute description."
+        group_membership_mode:
+          type: string
+          enum: [direct, ad_in_chain, member_of]
+          default: direct
+          description: "member_of finds the required groups under group_base_dn by their group_attribute value and accepts one only when a base-scope equality search on the authenticated user's entry confirms that its group_member_attribute (default memberOf) lists that exact group DN, so DN matching follows the directory schema; it cannot be combined with group_filter. direct proves membership from the group entry's own membership attribute. ad_in_chain (Active Directory only) uses LDAP_MATCHING_RULE_IN_CHAIN (1.2.840.113556.1.4.1941) on group_member_attribute (default member), so a user who is a member through nested groups matches; the directory evaluates the chain under the group search's size and time limits, and custom-filter matches are rechecked with the same in-chain predicate."
         starttls:
           type: boolean
           default: false
@@ -25482,7 +25563,35 @@ components:
           default: 10000
           minimum: 1
           maximum: 1000000
-          description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan."
+          description: "Strict maximum entries in the auth result cache (1-1,000,000). At capacity, one existing entry is replaced without a full-cache scan. Cache keys use the exact presented username and password. The same cap bounds the rejected-credential cache and the per-username failure tracker; the tracker never evicts live failure state, so when it is full an untracked username gets 500."
+        negative_cache_ttl_seconds:
+          type: integer
+          format: uint64
+          default: 0
+          minimum: 0
+          maximum: 300
+          description: "How long an exact username/password pair the directory rejected (wrong password or unknown user) is answered 401 without contacting the directory (0 = disabled, maximum 300). A different password for the same username is still checked."
+        max_failed_attempts_per_user:
+          type: integer
+          format: uint64
+          default: 0
+          minimum: 0
+          maximum: 1000
+          description: "After this many consecutive directory credential rejections for one presented username, that username is answered 401 without contacting the directory for failed_attempt_backoff_seconds, even with the correct password (0 = disabled, maximum 1000). This keeps a spray from reaching directory lockout counters; a successful bind resets the count. The count folds the username's case and whitespace, survives a compatible reload of the same plugin config, and is never evicted while live (a full tracker answers an untracked username 500)."
+        failed_attempt_backoff_seconds:
+          type: integer
+          format: uint64
+          default: 60
+          minimum: 1
+          maximum: 3600
+          description: "How long a username stays refused after max_failed_attempts_per_user consecutive failures; also the quiet period after which its failure count starts over."
+        service_connection_max_age_seconds:
+          type: integer
+          format: uint64
+          default: 0
+          minimum: 0
+          maximum: 300
+          description: "Reuse one connection bound as the service account, per directory endpoint, for user and group searches for at most this many seconds (0 = a fresh connection per flow). New shared connections are resolved, screened, dialed, and bound exactly like fresh ones; a shared connection that failed at the transport level is retired. End-user binds always use their own connection. Requires service_account_dn and service_account_password."
         hide_credentials:
           type: boolean
           default: true

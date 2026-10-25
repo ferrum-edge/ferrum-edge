@@ -13628,9 +13628,12 @@ pub fn create_plugin_with_http_client_and_config_id(
         "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)?))),
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)?))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)?))),
-        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new(
+        // The stable plugin-config id owns the rejected-credential cache and the
+        // per-username failure backoff, so a compatible reload inherits them.
+        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new_with_config_id(
             config,
             http_client,
+            plugin_config_id,
         )?))),
         // Same reasoning as `jwks_auth`: the stable plugin-config id is the
         // `ferrum-hmac-v2` nonce protection domain.
@@ -14216,7 +14219,8 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 }
             }
         }
-        // ldap_url is a single ldap:// / ldaps:// URL.
+        // ldap_url is a single ldap:// / ldaps:// URL; failover_ldap_urls
+        // lists further endpoints dialed the same way.
         "ldap_auth" => {
             if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())
                 && let Ok(parsed) = url::Url::parse(url.trim())
@@ -14227,6 +14231,20 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 return Err(format!(
                     "ldap_url IP {ip} denied by backend egress policy: {reason}"
                 ));
+            }
+            if let Some(urls) = config.get("failover_ldap_urls").and_then(Value::as_array) {
+                for (index, url) in urls.iter().enumerate() {
+                    if let Some(url) = url.as_str()
+                        && let Ok(parsed) = url::Url::parse(url.trim())
+                        && let Some(host) = parsed.host_str()
+                        && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                    {
+                        return Err(format!(
+                            "failover_ldap_urls[{index}] IP {ip} denied by backend egress policy: {reason}"
+                        ));
+                    }
+                }
             }
         }
         // broker_list is parsed with the pinned librdkafka grammar
