@@ -1,8 +1,11 @@
 //! JWKS (JSON Web Key Set) key store with background refresh.
 //!
 //! Fetches public keys from a remote JWKS endpoint and caches them
-//! for JWT validation. Supports RSA (RS256, RS384, RS512) and
-//! EC (ES256, ES384) key types.
+//! for JWT validation. Supports RSA (RS256, RS384, RS512, PS256, PS384,
+//! PS512), EC (ES256, ES384), and OKP Ed25519 (EdDSA) key types. EdDSA keys
+//! are refused while FIPS mode is enforced (see
+//! [`crate::fips::policy::APPROVED_JWT_ALGORITHMS`]). `ES512` is not
+//! supported: the `jsonwebtoken` backend exposes no P-521 JWS path.
 
 use arc_swap::ArcSwap;
 use base64::Engine;
@@ -29,6 +32,8 @@ const MAX_JWKS_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_JWKS_KEYS: usize = 256;
 const MAX_JWK_ID_BYTES: usize = 1024;
 const MAX_JWK_COMPONENT_BYTES: usize = 16 * 1024;
+/// RFC 8032 §5.1.5: an Ed25519 public key is exactly 32 octets.
+const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 
 /// Default maximum age of the last validated non-empty remote JWKS.
 pub const DEFAULT_JWKS_MAX_STALE_SECONDS: u64 = 3_600;
@@ -246,7 +251,7 @@ struct JwksResponse {
 struct JwkKey {
     /// Key ID — used to match against the `kid` in JWT headers.
     kid: Option<String>,
-    /// Key type: "RSA" or "EC".
+    /// Key type: "RSA", "EC", or "OKP".
     kty: String,
     /// Algorithm hint: "RS256", "ES256", etc.
     alg: Option<String>,
@@ -262,10 +267,10 @@ struct JwkKey {
     /// RSA exponent (base64url-encoded).
     e: Option<String>,
 
-    // EC parameters
-    /// EC curve name: "P-256", "P-384".
+    // EC / OKP parameters
+    /// EC curve name ("P-256", "P-384") or OKP subtype ("Ed25519").
     crv: Option<String>,
-    /// EC x coordinate (base64url-encoded).
+    /// EC x coordinate, or the OKP public key (base64url-encoded).
     x: Option<String>,
     /// EC y coordinate (base64url-encoded).
     y: Option<String>,
@@ -871,6 +876,7 @@ impl JwksKeyStore {
         match jwk.kty.as_str() {
             "RSA" => Self::parse_rsa_jwk(jwk),
             "EC" => Self::parse_ec_jwk(jwk),
+            "OKP" => Self::parse_okp_jwk(jwk),
             other => Err(format!("unsupported key type: {}", other)),
         }
     }
@@ -903,11 +909,16 @@ impl JwksKeyStore {
         // issuer's key material. Only an absent `alg` falls back to RS256; any
         // present value must name a supported RSA signature algorithm, and it
         // then binds verification to exactly that algorithm because
-        // `build_validation` seeds `Validation::new` from it.
+        // `build_validation` seeds `Validation::new` from it. A PSS key is
+        // therefore a PSS-only verification key: a PKCS#1 v1.5 token naming
+        // its `kid` is rejected, and so is a PSS token naming an RS* key.
         let algorithm = match jwk.alg.as_deref() {
             None | Some("RS256") => Algorithm::RS256,
             Some("RS384") => Algorithm::RS384,
             Some("RS512") => Algorithm::RS512,
+            Some("PS256") => Algorithm::PS256,
+            Some("PS384") => Algorithm::PS384,
+            Some("PS512") => Algorithm::PS512,
             Some(other) => {
                 return Err(format!(
                     "JWK alg '{other}' is not a supported RSA signature algorithm"
@@ -964,6 +975,44 @@ impl JwksKeyStore {
 
         Ok(CachedJwk {
             algorithm,
+            decoding_key,
+        })
+    }
+
+    /// Parse an RFC 8037 OKP JWK. Only `Ed25519` (verified as `EdDSA`) is
+    /// admitted; X25519/X448 are key-agreement keys and Ed448 has no verifier
+    /// in the selected backend.
+    fn parse_okp_jwk(jwk: &JwkKey) -> Result<CachedJwk, String> {
+        if jwk.crv.as_deref() != Some("Ed25519") {
+            return Err("unsupported OKP curve".to_string());
+        }
+        // RFC 8037 §3.1 registers `EdDSA` as the JWS algorithm for Ed25519.
+        // Any other present `alg` names a different purpose for the key.
+        match jwk.alg.as_deref() {
+            None | Some("EdDSA") => {}
+            Some(other) => {
+                return Err(format!(
+                    "JWK alg '{other}' is not a supported OKP signature algorithm"
+                ));
+            }
+        }
+        // Ed25519 is approved by FIPS 186-5, but it is not in the algorithm
+        // set Ferrum routes through the selected FIPS module, so an EdDSA key
+        // is refused while FIPS mode is enforced.
+        crate::fips::keys::check_jwk_okp_public_key()?;
+
+        let x = jwk.x.as_deref().ok_or("missing OKP public key 'x'")?;
+        let x_bytes = URL_SAFE_NO_PAD
+            .decode(x)
+            .map_err(|e| format!("invalid base64url in 'x': {e}"))?;
+        if x_bytes.len() != ED25519_PUBLIC_KEY_BYTES {
+            return Err("Ed25519 public key must be exactly 32 bytes".to_string());
+        }
+        let decoding_key = DecodingKey::from_ed_components(x)
+            .map_err(|e| format!("invalid OKP key components: {e}"))?;
+
+        Ok(CachedJwk {
+            algorithm: Algorithm::EdDSA,
             decoding_key,
         })
     }

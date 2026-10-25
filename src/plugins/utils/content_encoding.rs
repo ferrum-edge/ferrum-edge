@@ -62,6 +62,22 @@ fn is_http_token(value: &str) -> bool {
 /// members, and parameters are rejected. Supported tokens are `gzip`, `x-gzip`
 /// (normalized to `gzip`), `br`, and `identity` (case-insensitive).
 pub fn parse_content_codings(header: &str) -> Result<Vec<String>, String> {
+    parse_content_codings_with(header, false)
+}
+
+/// [`parse_content_codings`] that also admits `zstd` (RFC 9659) as a canonical
+/// member.
+///
+/// Only for callers that hand the result to
+/// [`crate::plugins::charged_decode::decode_charged_content_coding_chain`],
+/// which can decode `zstd` — the `compression` plugin's request classification.
+/// The inspection decoder in this module ([`decode_content_encoding`]) does not
+/// decode `zstd`, so it keeps the narrower grammar.
+pub fn parse_content_codings_including_zstd(header: &str) -> Result<Vec<String>, String> {
+    parse_content_codings_with(header, true)
+}
+
+fn parse_content_codings_with(header: &str, accept_zstd: bool) -> Result<Vec<String>, String> {
     let mut codings = Vec::new();
     for raw in header.split(',') {
         let coding = raw.trim();
@@ -79,6 +95,7 @@ pub fn parse_content_codings(header: &str) -> Result<Vec<String>, String> {
         let canonical = match coding.as_str() {
             "gzip" | "x-gzip" => "gzip".to_string(),
             "br" => "br".to_string(),
+            "zstd" if accept_zstd => "zstd".to_string(),
             "identity" => "identity".to_string(),
             // Fixed-cardinality: never interpolate the unsupported token.
             _ => return Err("unsupported content-encoding coding".to_string()),
