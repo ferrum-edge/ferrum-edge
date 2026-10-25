@@ -747,6 +747,18 @@ fn compile_transform_field(
                             rule.key
                         ));
                     }
+                    // The router's trusted path captures are not re-asserted
+                    // after the route-header finalizer, so a route list must
+                    // not overwrite or mint one either (same admission as
+                    // `request_transformer` static destinations).
+                    if crate::proxy::headers::is_path_param_assertion_header(&rule.key) {
+                        return Err(format!(
+                            "`{context}[{idx}].key` {:?} is in the gateway-owned `x-path-param-*` \
+                             route-capture namespace and cannot be a `request_transform` \
+                             destination",
+                            rule.key
+                        ));
+                    }
                 }
             }
         }

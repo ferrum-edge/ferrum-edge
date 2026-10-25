@@ -143,11 +143,11 @@ and WebSocket application messages under `mode: enforce` even if every rule
 stays monitor-only. `fail_closed` (the default), `scan_truncated`, and `skip`
 do not count, because they cannot reject unless some other enforcing body
 policy already exists. An empty `body_methods` does not remove this path:
+a request that declares a body is governed on every method, and
 client-to-backend WebSocket messages ignore `body_methods` and still apply the
 cap. `on_unlisted_content_type: block` counts the same way when the
 request-body hook can run and some HTTP request body can be unlisted, which
-needs at least one `body_methods` entry and not both `inspect_multipart` and
-`inspect_binary_body` (see
+needs not both `inspect_multipart` and `inspect_binary_body` (see
 [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type));
 its `fail_closed` does not.
 
@@ -573,12 +573,22 @@ NUL-removed bytes otherwise assemble an array or object no parser here
 accepts. Scope `body_json_path` rules away from such RPC traffic (or from
 compressed JSON-codec RPC traffic) with `conditions` if it must pass. A
 non-JSON codec (`+proto`, a bare gRPC type) has no JSON reading and is not
-inspected by `body_json_path` rules. A look-alike media type, or a body whose
-framing does not validate, is judged as an ordinary body.
+inspected by `body_json_path` rules. A look-alike media type is judged as an
+ordinary body. Under a gRPC or gRPC-Web media type, a body whose framing does
+not validate is read up to its framing defect: every complete message before
+it is a document of its own, and the unreadable remainder (like a compressed
+message, or a message past the 1024-message cap) fails closed (see
+[gRPC bodies are inspected message by message](#body-and-response-inspection)).
+Only the message the `max_scan_bytes` window cuts short is not judged. A
+Connect streaming body whose framing does not validate is judged as an
+ordinary body.
 
 A body scanned only up to `max_scan_bytes` (`on_body_too_large:
 scan_truncated`, or a prefix scan in a configuration that cannot block) is cut
-short by construction and is not judged. WebSocket messages carry no
+short by construction and is not judged — except a complete gRPC / gRPC-Web
+message inside the window, which is a whole document of its own and fails
+closed when it cannot be read, whatever the window did to a later message.
+WebSocket messages carry no
 `Content-Type`, so only the opening rules apply to them.
 
 What remains outside `body_json_path` inspection is a part of a body that is
@@ -849,10 +859,17 @@ An exemption with no `paths`/`methods`/`ips`/`consumers` exempts nothing.
   prefix match, and `~regex` is start-anchored (an implicit leading `^`). So
   `~/internal/` exempts only paths beginning with `/internal/`, not every path
   containing it. Use `~^/a|^/b` for alternation, or `~.*pattern` if you really
-  need a floating substring match.
+  need a floating substring match. Exemptions match the canonical request path
+  just like rule conditions, so an exact or `prefix*` entry that is not itself
+  canonical (a percent escape, a `\`, a `.`/`..` segment, or `//`) is rejected
+  at construction rather than silently exempting nothing; `~regex` entries are
+  not checked this way.
 - `methods`, `consumers`, `ips` (CIDR)
-- `header_present` — suppress every rule for a request that carries the header
-  with **exactly** the configured value. **Clients choose their own headers**,
+- `header_present` — suppress every rule, and every disposition that would
+  otherwise refuse (`fail_closed` and `block` for `on_body_too_large`,
+  `on_unlisted_content_type`, `on_unlisted_response_content_type`, and
+  `on_scan_timeout`), for a
+  request that carries the header with **exactly** the configured value. **Clients choose their own headers**,
   so the value is a shared secret: it must be a string of at least 16
   characters, it is compared in constant time, and presence-only (`null`)
   entries are rejected at admission. Have a trusted component in front of the
@@ -895,8 +912,23 @@ suppresses the hit while an ordinary `<script>…</script>` payload still blocks
 
 ## Body and response inspection
 
-Request-body inspection is on by default for `POST`/`PUT`/`PATCH` with an
-inspectable `Content-Type` (`body_methods`, `body_content_types`). Multipart and
+Request-body inspection is on by default for an inspectable `Content-Type`
+(`body_content_types`). Body governance is **not** a method allowlist: a
+backend that parses a body regardless of method (a servlet reading a `GET`
+body, a search API taking `GET` with JSON, WebDAV `SEARCH`/`PROPFIND`) must not
+receive a payload an enforcing rule refuses on `POST` just because the client
+picked another method. Requests on a `body_methods` method (`POST`, `PUT`,
+`PATCH`, `DELETE` by default) are always buffered for inspection; a request on
+any other method (except `CONNECT`, a tunnel) is governed whenever a body may
+follow its head — it carries a `Content-Type`, or the **transport** could not
+prove the request ended with its head — and the final decision covers any
+non-empty finalized body whatever the method. Omitting `Content-Length` and
+`Content-Type` is not proof of an empty body: an HTTP/1.1 request is governed
+when it declares framing (`Content-Length` > 0 or `Transfer-Encoding`), an
+HTTP/2 request when its HEADERS frame did not carry END_STREAM, and an HTTP/3
+request always (the request stream exposes no end-of-stream signal before the
+first read), so under an enforcing body policy HTTP/3 requests on such methods
+are buffered too (a body-less one passes as an empty body). Multipart and
 binary bodies are opt-in (`inspect_multipart`, `inspect_binary_body`).
 
 The `Content-Type` is matched on its lowercased base media type with parameters
@@ -946,8 +978,9 @@ could not be refused keep the streaming path.
 Scope: the setting governs **HTTP request bodies only** — HTTP/1.1, HTTP/2,
 HTTP/3, native gRPC, and gRPC-Web requests — and among those only:
 
-- methods listed in `body_methods` (so `body_methods: []` turns it off, and
-  `block` then no longer satisfies `mode: enforce` admission);
+- requests that carry a body: any method in `body_methods`, and any other
+  method once the request declares a body (see
+  [Body and response inspection](#body-and-response-inspection));
 - requests no `global_exemptions` entry short-circuits;
 - instances whose request-body hook runs at all (request and request-body
   inspection on, with an active request-body rule or `FE-ENCODING-001` /
@@ -1012,13 +1045,13 @@ from the request's declared framing (`Content-Length` > 0 or
 shows which routes carry unlisted bodies, but undercounts such clients.
 
 Under `mode: enforce`, `block` is itself a reachable admission enforcement
-path when the request-body hook can run (as above), `body_methods` is not
-empty, and at least one content type is left unscanned. With both
-`inspect_multipart` and `inspect_binary_body` on, every body is scanned; with
-`body_methods: []`, no HTTP request body is governed. Either way `block` can
-never fire, and it does not satisfy admission (the configuration is still
-accepted when some other enforcement path exists). `fail_closed` never
-satisfies admission.
+path when the request-body hook can run (as above) and at least one content
+type is left unscanned. With both `inspect_multipart` and
+`inspect_binary_body` on, every body is scanned, so `block` can never fire and
+does not satisfy admission (the configuration is still accepted when some
+other enforcement path exists). `body_methods: []` no longer turns the setting
+off: a request that declares a body is governed on every method.
+`fail_closed` never satisfies admission.
 
 Before switching to `block`, or enabling enforcing body rules under the `fail_closed` default, list every type your backends
 legitimately accept: add them to `body_content_types` (scanned as text), turn
@@ -1036,9 +1069,36 @@ the rejection mapped to a gRPC status (`PERMISSION_DENIED` for the default
 `application/grpc-web+json` map to the JSON family through their `+json`
 suffix, so they are **scanned** as JSON whenever `application/json` is in
 `body_content_types`, not refused as unlisted.
-Bodies on methods outside `body_methods` (for example a `GET` with a body)
-are not governed; add the method to `body_methods` if a backend reads such
-bodies. The default list includes `DELETE`, which may carry content.
+
+**gRPC bodies are inspected message by message.** A framed gRPC or gRPC-Web
+body the WAF scans (the `+json` codecs by default, every gRPC type with
+`inspect_binary_body`) is split into its length-prefixed messages — a gRPC-Web
+text body is base64-decoded first — and the body rules run over each message
+payload: `body_json_path` rules parse each `+json` message as its own JSON
+document, and text, Luhn, and CIDR rules and the encoding specials read each
+payload **in addition to** the complete wire body (the framing and media type
+are client-controlled, so a backend that ignores them reads the raw bytes, and
+a token may straddle a frame header there). The same applies to response
+bodies. The wire bytes are never rewritten. At most 1024 non-empty messages
+are inspected per body. The WAF does not decode `grpc-encoding`, so a
+**compressed message** (frame flag 1), or a body with more messages than the
+cap, cannot be inspected: when that direction carries an enforcing body policy
+the request or response is refused (`waf.action=blocked`,
+`waf.block_reason=grpc_message_uninspectable`), and otherwise it is recorded
+(`waf.body_uninspected=grpc_compressed`, `grpc_malformed_framing`, or
+`grpc_message_count`, with
+`waf.body_uninspected_target`) while the uncompressed messages are still
+scanned. Clients of routes under enforcing body rules must therefore send
+uncompressed messages (`grpc-encoding: identity`). A governed gRPC body is
+never scanned as one document: every complete message before a **framing
+defect** — an unknown frame flag, a truncated header, a frame overrunning the
+body, or a gRPC-Web text body that is not decodable base64 — is still scanned
+(a streaming handler consumes those messages before it ever reads the defect),
+and the defect is refused under an enforcing body policy or recorded as
+`waf.body_uninspected=grpc_malformed_framing` otherwise. Bytes cut off by the
+WAF's own `max_scan_bytes` prefix scan are not a defect: the messages inside
+the window, and the retained part of the one it cuts, are scanned, and the cut
+is reported as `waf.scan_truncated`.
 
 Response inspection is **off by default**. Enable `response_inspection` (and
 `response_body_inspection` for body rules) to run the disclosure and
@@ -1073,7 +1133,8 @@ body-scoped `FE-ENCODING-001` / `FE-ENCODING-002` specials when those rules
 are themselves enforce (they read both directions). A rule is applicable only
 when its path, method, header, and consumer conditions
 match the current request. A request-wide `global_exemptions.header_present`
-match also suppresses both rule hits and this fail-closed decision. Built-in
+match also suppresses both rule hits and this fail-closed decision, and the
+strict `block` value too. Built-in
 rules are monitor-only unless you set `default_rule_action` or `rule_modes`.
 Encoding-evasion specials additionally stay monitor under bulk
 `default_rule_action: enforce` until an explicit per-rule action promotes them,
@@ -1116,7 +1177,7 @@ control, not a coverage control.
 | `log_and_allow` (default) | Forward, with a sampled warning and `waf.scan_timed_out` metadata |
 | `allow` | Forward silently |
 | `fail_closed` | Reject when the governed body direction carries an enforcing body policy, and log and allow otherwise |
-| `block` | Reject every over-budget scan, on every surface, independently of global mode |
+| `block` | Reject every over-budget scan, on every surface, independently of global mode — except for a request a `global_exemptions.header_present` secret exempts |
 
 `fail_closed` is the opt-in strict-latency posture, sharing the vocabulary and
 the shape of `on_body_too_large: fail_closed`. It asks the same *question* —
@@ -1127,7 +1188,9 @@ well as an applicable enforcing body rule (or anomaly scoring), they count an
 `on_body_too_large: block` size cap while globally enforcing, because that cap is
 itself a blocking body disposition. `mode: monitor` and monitor-only rule sets
 without that cap therefore never start blocking. `block` rejects unconditionally,
-including when no rule in that direction could have refused anything.
+including when no rule in that direction could have refused anything; the one
+exception is a trusted hop whose `global_exemptions.header_present` secret
+matched, for which every rule and every refusing disposition is suppressed.
 
 **Size `scan_budget_ms` before reaching for `fail_closed`.** The scan cost is
 `O(active_rules × max_scan_bytes)`, and body normalization multiplies it: a
@@ -1173,6 +1236,13 @@ logging enabled, WAF writes `waf.response_stream_uninspectable=true` plus either
 because no bounded scan starts. Missing, ambiguous, or later-relabeled response
 types are never treated as proven SSE; the ordinary WAF content-type eligibility
 rules still apply, including release of types outside the configured scan scope.
+In particular, a finite body that a later hook relabels `text/event-stream` —
+the `sse` plugin's `wrap_non_sse_responses`, or a response transformer — is
+judged in the final response-body phase by the scan scope of the media type
+the **origin** selected: a `text/plain` origin body wrapped into SSE events is
+scanned by the response-body rules, and an unlisted origin type gets
+`on_unlisted_response_content_type`, rather than either escaping because the
+client-visible type is an event stream.
 
 ### Detection limits
 
@@ -1432,14 +1502,32 @@ logging sinks are configured (stdout, http, tcp, kafka, loki, …):
 `waf.paranoia`, `waf.detection_rule_hits` / `waf.detection_paranoia` (see
 [Detection paranoia level](#detection-paranoia-level)), plus `waf.scan_truncated` / `waf.scan_timed_out` /
 `waf.body_too_large` / `waf.body_too_large_target` (`request_body` or
-`response_body`) / `waf.body_uninspected` (`content_type`) /
+`response_body`) / `waf.body_uninspected` (`content_type`, `grpc_compressed`,
+`grpc_malformed_framing`, or `grpc_message_count`) /
 `waf.body_uninspected_target` (`request_body` or `response_body`). All of these are
-fixed-cardinality; body bytes are never logged. Blocked requests reject before
+fixed-cardinality; body bytes are never logged.
+
+`waf.matched_fields` names the fields that matched rule hits came from, so a
+false positive can be tuned with `rule_overrides.<id>.exclude` without
+reproducing the request: a comma-separated list of `query:<name>`,
+`header:<name>`, `cookie:<name>`, and `response_header:<name>` entries. It
+carries field **names only — never a value**. Query parameter names are
+reported as the application reads them (percent-decoded once, the form
+`exclude.query_params` compares), header names lowercased, cookie names as
+sent. Every byte outside `A-Z a-z 0-9 - . _ ~` is percent-encoded, a name is
+cut at 128 encoded bytes and then ends in a bare `*`, and at most 16 distinct
+fields are recorded per scan. Path, method, whole-URL, and body hits have no
+field name and are not listed; the `x-http-method-override` special is listed
+as `header:x-http-method-override`. Hits of detection-only (paranoia band)
+rules are listed separately in `waf.detection_matched_fields`, beside
+`waf.detection_rule_hits`, so each list names only the fields its own rule-hit
+list came from. Blocked requests reject before
 backend dispatch and still produce a transaction summary carrying these fields,
 so blocks are visible in the same per-request log line as allowed traffic.
 
 `waf.block_reason` names why a request was blocked: `rule`, `score`,
-`body_too_large`, `content_type`, or `scan_timeout` for HTTP-family traffic, and
+`body_too_large`, `content_type`, `grpc_message_uninspectable`, or
+`scan_timeout` for HTTP-family traffic, and
 `tcp_require_tls`, `first_bytes_unavailable`, or `signature` for stream (TCP/UDP)
 traffic. Stream
 inspection additionally records `waf.would_block_reason` (the same stream value
@@ -1489,7 +1577,7 @@ fire, then switch to `enforce`.
 | `on_body_too_large` | enum | `fail_closed` | `fail_closed` / `scan_truncated` / `skip` / `block` |
 | `on_unlisted_content_type` | enum | `fail_closed` | `allow` / `fail_closed` / `block`; request bodies whose `Content-Type` is outside the scan scope (see [Bodies outside the scan scope](#bodies-outside-the-scan-scope-on_unlisted_content_type)) |
 | `on_unlisted_response_content_type` | enum | `fail_closed` | `allow` / `fail_closed` / `block`; the same for response bodies (see [Responses](#responses-on_unlisted_response_content_type)) |
-| `body_methods` | string[] | `[POST,PUT,PATCH,DELETE]` | methods whose HTTP request bodies are scanned and governed by `on_unlisted_content_type`; WebSocket messages ignore it |
+| `body_methods` | string[] | `[POST,PUT,PATCH,DELETE]` | methods whose HTTP request bodies are always buffered and scanned; a request on any other method is governed once it declares a body (`Content-Length` > 0, `Transfer-Encoding`, or `Content-Type`), and any non-empty finalized body is decided; WebSocket messages ignore it |
 | `body_content_types` | string[] | `[application/json, text/json, application/x-www-form-urlencoded, application/xml, text/xml, text/plain, text/html]` | inspectable base content types; `+json` / `+xml` suffixed types match via their base family |
 | `inspect_multipart` | bool | `false` | scan multipart bodies |
 | `inspect_binary_body` | bool | `false` | scan bodies with unknown/binary type |

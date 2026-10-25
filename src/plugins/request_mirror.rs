@@ -92,6 +92,10 @@
 //!    active
 //! 4. else the original request path
 //!
+//! The mirror method is the backend-effective one: a plugin-selected backend
+//! method (`mcp_gateway`'s OpenAPI bridge) wins over the client method, so the
+//! shadow replays the same operation the primary backend receives.
+//!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
 //! it inherits the gateway's DNS cache, connection pool keepalive, TLS
 //! settings (CA bundle, skip-verify), egress screening, and redacted logging.
@@ -1244,7 +1248,11 @@ impl MirrorRouteCredentials {
         }
 
         let raw_query = ctx.raw_query_string();
-        let outbound_query = ctx.outbound_query_string();
+        // An outbound query byte-identical to the raw query yields exactly the
+        // same names and digests, so classify it only when it differs.
+        let outbound_query = ctx
+            .outbound_query_string()
+            .filter(|outbound| Some(*outbound) != raw_query);
         for query in [raw_query, outbound_query].into_iter().flatten() {
             for pair in query.split('&').filter(|pair| !pair.is_empty()) {
                 let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -1255,11 +1263,18 @@ impl MirrorRouteCredentials {
                     continue;
                 }
                 push(&mut value_digests, raw_value.as_bytes());
-                let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
-                push(&mut value_digests, &decoded);
-                let form = raw_value.replace('+', " ");
-                let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
-                push(&mut value_digests, &form_decoded);
+                // Without a `%` the percent-decoded form is the raw bytes, and
+                // without a `+` the form-decoded form is the percent-decoded
+                // one, so those digests would only repeat an earlier one.
+                if raw_value.contains('%') {
+                    let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
+                    push(&mut value_digests, &decoded);
+                }
+                if raw_value.contains('+') {
+                    let form = raw_value.replace('+', " ");
+                    let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
+                    push(&mut value_digests, &form_decoded);
+                }
             }
         }
         Self {
@@ -1295,13 +1310,21 @@ impl MirrorRouteCredentials {
         if self.carries_credential_value(raw_value.as_bytes()) {
             return true;
         }
-        let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
-        if self.carries_credential_value(&decoded) {
-            return true;
+        // Skip decoded forms that are byte-identical to one already checked:
+        // no `%` means percent-decoding is the identity, and no `+` means the
+        // form-decoded value equals the percent-decoded one.
+        if raw_value.contains('%') {
+            let decoded: Vec<u8> = percent_decode_str(raw_value).collect();
+            if self.carries_credential_value(&decoded) {
+                return true;
+            }
         }
-        let form = raw_value.replace('+', " ");
-        let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
-        self.carries_credential_value(&form_decoded)
+        if raw_value.contains('+') {
+            let form = raw_value.replace('+', " ");
+            let form_decoded: Vec<u8> = percent_decode_str(&form).collect();
+            return self.carries_credential_value(&form_decoded);
+        }
+        false
     }
 }
 
@@ -1390,40 +1413,50 @@ fn apply_mirror_query_credential_policy<'a>(
 
     // Retain-all is the common path: classify names in place and borrow the
     // original bytes so a query with no sensitive pairs is not copied, decoded,
-    // or re-encoded. Rebuild only after a pair is actually dropped.
-    let needs_strip = query.split('&').any(|pair| {
-        !pair.is_empty()
-            && !mirror_query_pair_allowed(
-                pair,
-                forward_sensitive_query,
-                allowlist,
-                operator_patterns,
-                route,
-            )
-    });
-    if !needs_strip {
-        return Cow::Borrowed(query);
-    }
-
-    let mut kept = String::with_capacity(query.len());
+    // or re-encoded. Each pair is classified exactly once: the rebuild starts
+    // at the first dropped pair, copying the already-allowed prefix (minus
+    // empty segments) without re-deciding it.
+    let mut kept: Option<String> = None;
+    let mut pair_start = 0usize;
     for pair in query.split('&') {
-        if pair.is_empty()
-            || !mirror_query_pair_allowed(
-                pair,
-                forward_sensitive_query,
-                allowlist,
-                operator_patterns,
-                route,
-            )
-        {
+        let start = pair_start;
+        // `&` is one ASCII byte, so this always lands on a pair boundary.
+        pair_start = pair_start.saturating_add(pair.len() + 1);
+        if pair.is_empty() {
             continue;
         }
-        if !kept.is_empty() {
-            kept.push('&');
+        let allowed = mirror_query_pair_allowed(
+            pair,
+            forward_sensitive_query,
+            allowlist,
+            operator_patterns,
+            route,
+        );
+        if let Some(out) = kept.as_mut() {
+            if allowed {
+                if !out.is_empty() {
+                    out.push('&');
+                }
+                out.push_str(pair);
+            }
+            continue;
         }
-        kept.push_str(pair);
+        if allowed {
+            continue;
+        }
+        // First dropped pair: every earlier non-empty pair was allowed, so
+        // copy them in order and keep rebuilding from here.
+        let mut rebuilt = String::with_capacity(query.len());
+        let prefix = query.get(..start).unwrap_or_default();
+        for prior in prefix.split('&').filter(|prior| !prior.is_empty()) {
+            if !rebuilt.is_empty() {
+                rebuilt.push('&');
+            }
+            rebuilt.push_str(prior);
+        }
+        kept = Some(rebuilt);
     }
-    Cow::Owned(kept)
+    kept.map_or(Cow::Borrowed(query), Cow::Owned)
 }
 
 #[derive(Debug)]
@@ -1756,6 +1789,14 @@ struct MirrorMetrics {
     /// exceeded the per-request `max_mirrored_request_body_bytes` ceiling. The
     /// published `mirror_error` names which of the two refused the attempt.
     budget_drops: AtomicU64,
+    /// Attempts that passed every admission refusal (sampling, `max_in_flight`,
+    /// the per-request ceiling, and the aggregate byte budget) and then paid
+    /// the synchronous egress preparation: credential provenance, mirror
+    /// query policy, header sanitization, and the owned body copy. Every
+    /// prepared attempt is dispatched, so this always equals `dispatched`; it
+    /// is kept per instance only (not exported to Prometheus) so tests can pin
+    /// that a refused attempt never pays that work on the primary request path.
+    egress_preparations: AtomicU64,
 }
 
 /// Plain-`u64` snapshot of [`MirrorMetrics`] for external assertion in tests.
@@ -1771,6 +1812,7 @@ pub struct MirrorMetricsSnapshot {
     pub cancellations: u64,
     pub concurrency_drops: u64,
     pub budget_drops: u64,
+    pub egress_preparations: u64,
 }
 
 impl MirrorMetrics {
@@ -1786,6 +1828,7 @@ impl MirrorMetrics {
             cancellations: self.cancellations.load(Ordering::Relaxed),
             concurrency_drops: self.concurrency_drops.load(Ordering::Relaxed),
             budget_drops: self.budget_drops.load(Ordering::Relaxed),
+            egress_preparations: self.egress_preparations.load(Ordering::Relaxed),
         }
     }
 
@@ -1802,6 +1845,10 @@ impl MirrorMetrics {
     fn bump_budget_drop(&self) {
         self.budget_drops.fetch_add(1, Ordering::Relaxed);
         super::prometheus_metrics::global_registry().record_request_mirror_budget_drop();
+    }
+
+    fn bump_egress_preparation(&self) {
+        self.egress_preparations.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2404,6 +2451,7 @@ impl RequestMirror {
     /// available (tests / already-decoded contexts); that fallback still applies
     /// the same deny-by-default query policy and does not round-trip remaining
     /// pairs through `application/x-www-form-urlencoded`.
+    #[cfg(test)]
     fn build_mirror_url(
         &self,
         original_path: &str,
@@ -2411,6 +2459,16 @@ impl RequestMirror {
         query_params: &HashMap<String, String>,
         route: &MirrorRouteCredentials,
     ) -> String {
+        let mut url = self.mirror_url_base(original_path);
+        self.append_mirror_query(&mut url, raw_query, query_params, route);
+        url
+    }
+
+    /// `protocol://host:port` plus the configured or gateway-selected path,
+    /// with no query. Cheap enough to build before admission so every refusal
+    /// can publish its attributable (query-free) target without paying the
+    /// query credential policy.
+    fn mirror_url_base(&self, original_path: &str) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
 
         let mut url = String::with_capacity(
@@ -2422,7 +2480,19 @@ impl RequestMirror {
         url.push(':');
         let _ = write!(&mut url, "{}", self.mirror_port);
         url.push_str(path);
+        url
+    }
 
+    /// Append the credential-filtered mirror query to a URL built by
+    /// [`Self::mirror_url_base`]. The query source precedence is the one
+    /// described on `build_mirror_url` (the test-only composition of the two).
+    fn append_mirror_query(
+        &self,
+        url: &mut String,
+        raw_query: Option<&str>,
+        query_params: &HashMap<String, String>,
+        route: &MirrorRouteCredentials,
+    ) {
         if let Some(query) = raw_query {
             // `Some("")` is authoritative: an auth strip may have removed the
             // entire raw query, so falling back to the materialised map here
@@ -2452,8 +2522,6 @@ impl RequestMirror {
                 url.push_str(&filtered);
             }
         }
-
-        url
     }
 
     /// Should this request be mirrored (deterministic evenly spaced sampling)?
@@ -3056,15 +3124,152 @@ impl Plugin for RequestMirror {
 
         // Mirror the final route-selected path without consuming the override
         // that primary dispatch still needs. An explicit operator mirror_path
-        // remains authoritative.
+        // remains authoritative. Only the query-free base is built here: every
+        // admission refusal below publishes this attributable target, and logs
+        // omit the query anyway, so a refused attempt never pays the query
+        // credential policy.
         let mirror_path = self.select_mirror_path(ctx);
+        let mut mirror_url = self.mirror_url_base(mirror_path);
+        // Omit the query from every log/metrics URL. The dispatched URL drops
+        // deny-by-default sensitive pairs; logging still omits the entire
+        // query so remaining application parameters are not echoed either.
+        // Computed before the drop paths, so every log site uses the stripped
+        // form.
+        let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
+        // Replay the method the primary backend receives, not the client's.
+        // `mcp_gateway`'s OpenAPI bridge turns a `POST` MCP `tools/call` into,
+        // for example, `GET /pets/7`; mirroring the client `POST` with the
+        // bridge's finalized REST body would shadow a different operation.
+        // `ctx.method` keeps the client method for policy and logging.
+        let method = ctx
+            .backend_method_override
+            .map_or_else(|| ctx.method.clone(), |backend| backend.to_owned());
+
+        // Decide capacity BEFORE any per-request egress preparation. A
+        // saturated or over-budget mirror is exactly when the gateway is
+        // shedding mirror work, so the refusal must not first pay credential
+        // provenance, query policy, header sanitization, or a body copy on the
+        // primary request path.
+        //
+        // An admitted request already owns the permit and a pre-buffer byte
+        // reservation from the authorize phase; the legacy path (body
+        // mirroring disabled or a direct invocation) acquires the permit here.
+        let (permit, prereserved_lease) = match staged_state {
+            Some(MirrorAdmissionState::Admitted { permit, lease }) => (permit, Some(lease)),
+            Some(MirrorAdmissionState::Dropped(reason)) => {
+                // Refused before the body was collected. The primary request
+                // was unaffected and stayed streaming; publish the attributable
+                // failure now that the target URL is known.
+                warn_sampled!(
+                    "request_mirror: dropped mirror request for {} {} at pre-buffer admission: {}",
+                    method,
+                    mirror_url_for_log,
+                    reason
+                );
+                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                    self.plugin_config_id.clone(),
+                    mirror_url_for_log,
+                    reason,
+                )));
+                return PluginResult::Continue;
+            }
+            // Handled above; kept exhaustive so a future state cannot silently
+            // fall through to an unadmitted dispatch.
+            Some(MirrorAdmissionState::NotSelected | MirrorAdmissionState::Consumed { .. }) => {
+                return PluginResult::Continue;
+            }
+            None => match self.mirror_in_flight.clone().try_acquire_owned() {
+                Ok(permit) => (permit, None),
+                Err(_) => {
+                    self.metrics.bump_concurrency_drop();
+                    warn_sampled!(
+                        "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
+                        method,
+                        mirror_url_for_log
+                    );
+                    ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                        self.plugin_config_id.clone(),
+                        mirror_url_for_log,
+                        MIRROR_CONCURRENCY_DROP_ERROR,
+                    )));
+                    return PluginResult::Continue;
+                }
+            },
+        };
+
+        // Measure the finalized body from the borrowed slice; the owned copy is
+        // taken only after both byte refusals below have passed, so a body the
+        // ceiling rejects (for example one request decompression inflated) is
+        // never allocated and copied a second time.
+        let observed_body_bytes = if self.mirror_request_body {
+            body.len() as u64
+        } else {
+            0
+        };
+        // Reconcile the pre-buffer reservation with the real length: shrink the
+        // full-ceiling admission charge back into the budget, and refuse rather
+        // than retain unbudgeted bytes if the body somehow exceeds what was
+        // reserved or the plugin-local per-request ceiling.
+        //
+        // The two refusals are attributed separately. The proxy enforces the
+        // combined request-body limit on the *collected* body, but a buffered
+        // body normalizer runs after that check — configured request
+        // decompression can inflate the stored buffer past this instance's
+        // per-request ceiling. Reporting that as an exhausted aggregate budget
+        // would point the operator at `max_retained_request_body_bytes` when
+        // only `max_mirrored_request_body_bytes` can fix it.
+        let body_lease = if observed_body_bytes > self.max_mirrored_request_body_bytes {
+            // Release the staged full-ceiling reservation now rather than
+            // holding it while the failure summary is published.
+            drop(prereserved_lease);
+            Err(MIRROR_BODY_CEILING_DROP_ERROR)
+        } else {
+            match prereserved_lease {
+                Some(mut lease) => {
+                    if lease.reconcile(observed_body_bytes) {
+                        Ok(lease)
+                    } else {
+                        Err(MIRROR_BODY_BUDGET_DROP_ERROR)
+                    }
+                }
+                None => self
+                    .body_budget
+                    .try_reserve(observed_body_bytes)
+                    .ok_or(MIRROR_BODY_BUDGET_DROP_ERROR),
+            }
+        };
+        let body_lease = match body_lease {
+            Ok(lease) => lease,
+            Err(reason) => {
+                self.metrics.bump_budget_drop();
+                warn_sampled!(
+                    "request_mirror: dropped mirror request for {} {} after body collection: {}",
+                    method,
+                    mirror_url_for_log,
+                    reason
+                );
+                drop(permit);
+                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                    self.plugin_config_id.clone(),
+                    mirror_url_for_log,
+                    reason,
+                )));
+                return PluginResult::Continue;
+            }
+        };
+
+        // Admitted past every refusal: from here on the attempt is always
+        // dispatched, so the synchronous preparation below is paid only for
+        // work that will actually reach the shadow destination.
+        self.metrics.bump_egress_preparation();
+
         // Snapshot the canonical backend-visible query through the same
-        // funnel as primary dispatch. `build_mirror_url` copies retained pair
-        // bytes into the owned mirror URL immediately, before any later plugin
-        // mutation of `ctx` can change the request-target. Sensitive pairs are
-        // dropped from this URL only; the primary backend target is never
-        // rewritten. Borrow the funnel `Cow` so a query that needs no strip is
-        // not cloned before that copy.
+        // funnel as primary dispatch. `append_mirror_query` copies retained
+        // pair bytes into the owned mirror URL immediately, before any later
+        // plugin mutation of `ctx` can change the request-target. Sensitive
+        // pairs are dropped from this URL only; the primary backend target is
+        // never rewritten. Borrow the funnel `Cow` so a query that needs no
+        // strip is not cloned before that copy.
         let effective_query =
             if ctx.outbound_query_string().is_some() || ctx.raw_query_string().is_some() {
                 Some(crate::proxy::effective_backend_query_string(ctx))
@@ -3081,13 +3286,12 @@ impl Plugin for RequestMirror {
             &self.sensitive_header_patterns,
             &self.sensitive_query_patterns,
         );
-        let mirror_url = self.build_mirror_url(
-            mirror_path,
+        self.append_mirror_query(
+            &mut mirror_url,
             effective_query.as_deref(),
             &ctx.query_params,
             &route_credentials,
         );
-        let method = ctx.method.clone();
 
         // Mirror destinations are an egress boundary just like the primary
         // backend. Apply the canonical secondary-request sanitizer (hop-by-hop,
@@ -3149,122 +3353,15 @@ impl Plugin for RequestMirror {
         let proxy_hops = crate::proxy::hop_limit::plugin_call_proxy_hops(ctx);
         crate::proxy::hop_limit::strip_copied_proxy_hops(&mut mirror_headers, proxy_hops);
 
-        // Omit the query from every log/metrics URL. The dispatched URL has
-        // already dropped deny-by-default sensitive pairs; logging still
-        // omits the entire query so remaining application parameters are not
-        // echoed either. Computed here, before the permit-exhaustion drop
-        // path, so every log site uses the stripped form.
-        let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
-
-        // Resolve the concurrency permit and any pre-buffer byte reservation.
-        // An admitted request already owns both from the authorize phase; the
-        // legacy path (body mirroring disabled or a direct invocation) acquires
-        // the permit here exactly as before.
-        let (permit, prereserved_lease) = match staged_state {
-            Some(MirrorAdmissionState::Admitted { permit, lease }) => (permit, Some(lease)),
-            Some(MirrorAdmissionState::Dropped(reason)) => {
-                // Refused before the body was collected. The primary request
-                // was unaffected and stayed streaming; publish the attributable
-                // failure now that the target URL is known.
-                warn_sampled!(
-                    "request_mirror: dropped mirror request for {} {} at pre-buffer admission: {}",
-                    method,
-                    mirror_url_for_log,
-                    reason
-                );
-                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
-                    self.plugin_config_id.clone(),
-                    mirror_url_for_log,
-                    reason,
-                )));
-                return PluginResult::Continue;
-            }
-            // Handled above; kept exhaustive so a future state cannot silently
-            // fall through to an unadmitted dispatch.
-            Some(MirrorAdmissionState::NotSelected | MirrorAdmissionState::Consumed { .. }) => {
-                return PluginResult::Continue;
-            }
-            None => match self.mirror_in_flight.clone().try_acquire_owned() {
-                Ok(permit) => (permit, None),
-                Err(_) => {
-                    self.metrics.bump_concurrency_drop();
-                    warn_sampled!(
-                        "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
-                        method,
-                        mirror_url_for_log
-                    );
-                    ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
-                        self.plugin_config_id.clone(),
-                        mirror_url_for_log,
-                        MIRROR_CONCURRENCY_DROP_ERROR,
-                    )));
-                    return PluginResult::Continue;
-                }
-            },
-        };
-
         // The finalized backend-visible body, not `ctx.request_body_bytes` /
         // `ctx.metadata["request_body"]` — those hold the PRE-transform client
         // body, and replaying them is exactly the disclosure this advisory
-        // describes. One `Bytes` allocation for the detached task; the primary
-        // buffer is untouched.
-        let body_bytes: Option<Bytes> = if self.mirror_request_body {
-            Some(Bytes::copy_from_slice(body))
-        } else {
-            None
-        };
-        let observed_body_bytes = body_bytes.as_ref().map_or(0, |body| body.len() as u64);
-        // Reconcile the pre-buffer reservation with the real length: shrink the
-        // full-ceiling admission charge back into the budget, and refuse rather
-        // than retain unbudgeted bytes if the body somehow exceeds what was
-        // reserved or the plugin-local per-request ceiling.
-        //
-        // The two refusals are attributed separately. The proxy enforces the
-        // combined request-body limit on the *collected* body, but a buffered
-        // body normalizer runs after that check — configured request
-        // decompression can inflate the stored buffer past this instance's
-        // per-request ceiling. Reporting that as an exhausted aggregate budget
-        // would point the operator at `max_retained_request_body_bytes` when
-        // only `max_mirrored_request_body_bytes` can fix it.
-        let body_lease = if observed_body_bytes > self.max_mirrored_request_body_bytes {
-            // Release the staged full-ceiling reservation now rather than
-            // holding it while the failure summary is published.
-            drop(prereserved_lease);
-            Err(MIRROR_BODY_CEILING_DROP_ERROR)
-        } else {
-            match prereserved_lease {
-                Some(mut lease) => {
-                    if lease.reconcile(observed_body_bytes) {
-                        Ok(lease)
-                    } else {
-                        Err(MIRROR_BODY_BUDGET_DROP_ERROR)
-                    }
-                }
-                None => self
-                    .body_budget
-                    .try_reserve(observed_body_bytes)
-                    .ok_or(MIRROR_BODY_BUDGET_DROP_ERROR),
-            }
-        };
-        let body_lease = match body_lease {
-            Ok(lease) => lease,
-            Err(reason) => {
-                self.metrics.bump_budget_drop();
-                warn_sampled!(
-                    "request_mirror: dropped mirror request for {} {} after body collection: {}",
-                    method,
-                    mirror_url_for_log,
-                    reason
-                );
-                drop(permit);
-                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
-                    self.plugin_config_id.clone(),
-                    mirror_url_for_log,
-                    reason,
-                )));
-                return PluginResult::Continue;
-            }
-        };
+        // describes. One `Bytes` allocation for the detached task, taken only
+        // now that the body is admitted and budgeted; the primary buffer is
+        // untouched.
+        let body_bytes: Option<Bytes> = self
+            .mirror_request_body
+            .then(|| Bytes::copy_from_slice(body));
 
         let backend_timeout_ms = ctx
             .matched_proxy

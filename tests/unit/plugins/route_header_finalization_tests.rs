@@ -953,7 +953,8 @@ fn websocket_route_transform_config() -> GatewayConfig {
                 "match": {"methods": ["GET"]},
                 "destination": {"backend_host": "ws.internal", "backend_port": 8080},
                 "request_transform": [
-                    {"operation": "remove", "target": "header", "key": "X-Internal-Role"}
+                    {"operation": "remove", "target": "header", "key": "X-Internal-Role"},
+                    {"operation": "add", "target": "header", "key": "X-Route-Add", "value": "once"}
                 ],
                 "response_transform": [
                     {"operation": "update", "target": "header", "key": "X-Route", "value": "ws"}
@@ -967,22 +968,39 @@ fn websocket_route_transform_config() -> GatewayConfig {
 
 #[tokio::test]
 async fn websocket_view_applies_route_request_policy_to_the_handshake() {
-    // PR6821-SOL-2: the transformers run on HTTP/gRPC only, so the WebSocket
-    // view used to lose the consumer and forward the stripped header.
+    // PR6821-SOL-2: the WebSocket view used to lose the route consumers and
+    // forward the stripped header. `request_transformer` now runs on WebSocket
+    // handshakes itself (#6858), so it is the request list's only consumer
+    // there; only the HTTP/gRPC-only `response_transformer` needs a stand-in.
+    // The route request list must still apply exactly once, not once for the
+    // transformer and again for a stand-in.
     let cache = PluginCache::new(&websocket_route_transform_config()).expect("cache");
     let plugins =
         plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::WebSocket);
     assert!(
-        plugins
-            .iter()
-            .all(|p| p.name() != "request_transformer" && p.name() != "response_transformer"),
-        "the transformers themselves never run on WebSocket"
+        plugins.iter().any(|p| p.name() == "request_transformer"),
+        "request_transformer runs on WebSocket handshakes"
+    );
+    assert!(
+        plugins.iter().all(|p| p.name() != "response_transformer"),
+        "response_transformer never runs on WebSocket"
+    );
+    let request_consumers: Vec<&str> = plugins
+        .iter()
+        .filter(|p| p.participates_in_route_request_header_finalization())
+        .map(|p| p.name())
+        .collect();
+    assert_eq!(
+        request_consumers,
+        vec!["request_transformer"],
+        "request_transformer is the WebSocket view's only route request consumer; \
+         no request stand-in may be added beside it"
     );
     assert!(
         plugins
             .iter()
-            .any(|p| p.participates_in_route_request_header_finalization()),
-        "the WebSocket view keeps an eligible route request consumer"
+            .any(|p| p.participates_in_route_response_header_finalization()),
+        "the WebSocket view keeps an eligible route response consumer"
     );
 
     let mut ctx = make_ctx();
@@ -996,6 +1014,12 @@ async fn websocket_view_applies_route_request_policy_to_the_handshake() {
         !headers.contains_key("x-internal-role"),
         "route remove must apply to the WebSocket handshake"
     );
+    assert_eq!(
+        headers.get("x-route-add").map(String::as_str),
+        Some("once"),
+        "a non-idempotent route add must apply to the handshake exactly once"
+    );
+    assert!(ctx.route_override_request_transform.is_none());
 
     let mut response_headers = HashMap::new();
     ferrum_edge::_test_support::finalize_successful_websocket_response_headers_for_test(
@@ -1013,8 +1037,9 @@ async fn websocket_view_applies_route_request_policy_to_the_handshake() {
 
 #[tokio::test]
 async fn websocket_view_keeps_rtds_disabled_consumers_ineligible() {
-    // A disabled RTDS transformer is not eligible on HTTP, so its WebSocket
-    // stand-in must not exist either: the route list stays unused.
+    // A disabled RTDS transformer is not eligible on HTTP, and it stays
+    // ineligible in the WebSocket view, where no stand-in replaces it either:
+    // the route list stays unused.
     let config = make_config(vec![
         plugin_config(
             "rt-disabled",

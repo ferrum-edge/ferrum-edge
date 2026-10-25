@@ -3,8 +3,9 @@
 //! Issues #2554 / #2556: frame events must describe the final post-plugin,
 //! post-control-guard representation only after successful delivery. Peer Close
 //! is observed on the delivery path (mutating hooks never see it). Plugin
-//! policy Close is recorded once as `outcome=policy_close` inside the
-//! applicator and is not double-counted as a delivered frame.
+//! policy Close is reported once to decision observers (`on_ws_policy_close`)
+//! after the full applicator pass — whatever the observer's priority — and is
+//! recorded as `outcome=policy_close`, never double-counted as delivered.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +25,7 @@ use tracing_subscriber::registry::LookupSpan;
 struct CapturedFrame {
     outcome: Option<String>,
     frame_type: Option<String>,
+    direction: Option<String>,
     close_code: Option<u64>,
     close_reason_len: Option<u64>,
     size_bytes: Option<u64>,
@@ -63,6 +65,7 @@ where
         self.events.lock().unwrap().push(CapturedFrame {
             outcome: visitor.outcome,
             frame_type: visitor.frame_type,
+            direction: visitor.direction,
             close_code: visitor.close_code,
             close_reason_len: visitor.close_reason_len,
             size_bytes: visitor.size_bytes,
@@ -74,6 +77,7 @@ where
 struct Visitor {
     outcome: Option<String>,
     frame_type: Option<String>,
+    direction: Option<String>,
     close_code: Option<u64>,
     close_reason_len: Option<u64>,
     size_bytes: Option<u64>,
@@ -99,6 +103,7 @@ impl tracing::field::Visit for Visitor {
         match field.name() {
             "outcome" => self.outcome = Some(value.to_string()),
             "frame_type" => self.frame_type = Some(value.to_string()),
+            "direction" => self.direction = Some(value.to_string()),
             _ => {}
         }
     }
@@ -108,6 +113,7 @@ impl tracing::field::Visit for Visitor {
         match field.name() {
             "outcome" => self.outcome = Some(rendered),
             "frame_type" => self.frame_type = Some(rendered),
+            "direction" => self.direction = Some(rendered),
             "close_code" | "close_reason_len" | "size_bytes" => {
                 if let Ok(parsed) = rendered.parse::<u64>() {
                     self.record_u64(field, parsed);
@@ -304,8 +310,12 @@ async fn peer_close_delivery_helper_logs_both_directions() {
         }));
         // Peer Close never enters apply_ws_frame_plugins; the relay prepares
         // and emits after a successful forward only.
-        let prepared =
-            ferrum_edge::_test_support::prepare_ws_frame_deliveries_for_test(&plugins, &msg);
+        let prepared = ferrum_edge::_test_support::prepare_ws_frame_deliveries_for_test(
+            &plugins,
+            connection_id,
+            direction,
+            &msg,
+        );
         ferrum_edge::_test_support::emit_ws_frame_deliveries_for_test(
             &plugins,
             "ws-proxy",
@@ -348,8 +358,12 @@ async fn cancelled_delivery_drops_prepared_observation() {
         Message::Text("will-cancel".into()),
     )
     .await;
-    let prepared =
-        ferrum_edge::_test_support::prepare_ws_frame_deliveries_for_test(&plugins, &outgoing);
+    let prepared = ferrum_edge::_test_support::prepare_ws_frame_deliveries_for_test(
+        &plugins,
+        5,
+        WebSocketFrameDirection::ClientToBackend,
+        &outgoing,
+    );
     assert!(!prepared.is_empty());
     // Simulate cancel / write failure: discard without emit.
     drop(prepared);
@@ -357,4 +371,54 @@ async fn cancelled_delivery_drops_prepared_observation() {
         capture.events().is_empty(),
         "failed/cancelled sends must not emit delivered frame events"
     );
+}
+
+/// ws_frame_logging-SOL-1 / M1: an accepted `priority_override` can order the
+/// logger BEFORE the rejecting plugin. The logger then sees only the original
+/// Text at its chain position, so the decision must reach it after the full
+/// pass — exactly once, in both directions, with no `delivered` record.
+#[tokio::test(flavor = "current_thread")]
+async fn policy_close_is_recorded_when_logger_precedes_the_rejecting_plugin() {
+    for (connection_id, direction, label) in [
+        (
+            20u64,
+            WebSocketFrameDirection::ClientToBackend,
+            "client->backend",
+        ),
+        (
+            21u64,
+            WebSocketFrameDirection::BackendToClient,
+            "backend->client",
+        ),
+    ] {
+        let capture = Capture::default();
+        crate::diagnostic_test_interest::ensure_interest_floor();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.layer()));
+
+        let size = Arc::new(SizeReject {
+            invocations: AtomicU64::new(0),
+        });
+        let logger = Arc::new(WsFrameLogging::new(&json!({})).unwrap());
+        // Logger first: the order a `priority_override` below 2810 produces.
+        let plugins: Vec<Arc<dyn Plugin>> = vec![logger, size.clone()];
+
+        let outgoing =
+            ferrum_edge::_test_support::apply_ws_frame_plugins_and_emit_delivery_for_test(
+                &plugins,
+                "ws-proxy",
+                connection_id,
+                direction,
+                Message::Text("oversized!".into()),
+            )
+            .await;
+        assert!(matches!(outgoing, Message::Close(Some(_))), "{outgoing:?}");
+        assert_eq!(size.invocations.load(Ordering::SeqCst), 1);
+
+        let events = capture.events();
+        assert_eq!(events.len(), 1, "{label}: {events:?}");
+        assert_eq!(events[0].outcome.as_deref(), Some("policy_close"));
+        assert_eq!(events[0].close_code, Some(1009));
+        assert_eq!(events[0].direction.as_deref(), Some(label));
+    }
 }

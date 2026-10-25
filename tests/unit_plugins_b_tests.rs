@@ -112,6 +112,7 @@ mod unit {
         mod validator_diagnostic_redaction_tests;
         mod waf_body_charset_parity_tests;
         mod waf_normalization_evasion_tests;
+        mod waf_review_hardening_tests;
         mod waf_rule_pack_coverage_tests;
         mod waf_tests;
         mod waf_tuning_controls_tests;

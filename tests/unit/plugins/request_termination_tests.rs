@@ -1,16 +1,38 @@
 //! Tests for request_termination plugin
 
 use ferrum_edge::_test_support::{
-    normalize_reject_response, set_request_http_flavor_for_test, set_request_wire_protocol_for_test,
+    finalize_plugin_rejection_for_test, normalize_reject_response,
+    set_request_http_flavor_for_test, set_request_wire_protocol_for_test,
 };
 use ferrum_edge::HttpFlavor;
 use ferrum_edge::config::types::HttpWireTransport;
 use ferrum_edge::plugins::request_termination::{
-    REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
+    REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES,
+    REQUEST_TERMINATION_MAX_HEADERS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
 };
 use ferrum_edge::plugins::{HTTP_FAMILY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use http::{HeaderMap, StatusCode};
 use serde_json::json;
+
+/// Dispatch the plugin and project its shared-`Bytes` result into the text
+/// `Reject` shape most assertions in this file read. The plugin itself always
+/// returns `RejectBinary` (pinned by
+/// `test_canned_body_shares_one_allocation_across_requests_including_head`);
+/// a text `Reject` coming back unchanged here fails that test, not this helper.
+async fn run(plugin: &RequestTermination, ctx: &mut RequestContext) -> PluginResult {
+    match plugin.on_request_received(ctx).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => PluginResult::Reject {
+            status_code,
+            body: String::from_utf8(body.to_vec()).expect("canned body is UTF-8"),
+            headers,
+        },
+        other => other,
+    }
+}
 
 fn make_ctx(method: &str, path: &str) -> RequestContext {
     RequestContext::new(
@@ -60,7 +82,7 @@ async fn test_always_trigger_rejects() {
     let plugin = RequestTermination::new(&json!({})).unwrap();
     let mut ctx = make_ctx("GET", "/anything");
 
-    let result = plugin.on_request_received(&mut ctx).await;
+    let result = run(&plugin, &mut ctx).await;
     match result {
         PluginResult::Reject {
             status_code,
@@ -83,7 +105,7 @@ async fn test_custom_status_code() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -249,7 +271,7 @@ async fn test_trigger_accepts_asterisk_form_path_prefix() {
     let mut asterisk_ctx = make_ctx("OPTIONS", "*");
     assert!(
         matches!(
-            plugin.on_request_received(&mut asterisk_ctx).await,
+            run(&plugin, &mut asterisk_ctx).await,
             PluginResult::Reject { .. }
         ),
         "path_prefix \"*\" should terminate an asterisk-form request"
@@ -258,10 +280,7 @@ async fn test_trigger_accepts_asterisk_form_path_prefix() {
     // Does not match ordinary origin-form paths.
     let mut origin_ctx = make_ctx("GET", "/admin");
     assert!(
-        matches!(
-            plugin.on_request_received(&mut origin_ctx).await,
-            PluginResult::Continue
-        ),
+        matches!(run(&plugin, &mut origin_ctx).await, PluginResult::Continue),
         "path_prefix \"*\" must not terminate origin-form requests"
     );
 }
@@ -291,7 +310,7 @@ async fn test_custom_body() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert_eq!(body, "Custom maintenance page");
         }
@@ -307,7 +326,7 @@ async fn test_custom_message_in_json() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert!(body.contains("Under maintenance"));
             assert!(body.contains("503"));
@@ -328,7 +347,7 @@ async fn test_json_escaping_in_message() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             // Body should be valid JSON with properly escaped characters
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
@@ -347,7 +366,7 @@ async fn test_xml_response_body() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, headers, .. } => {
             assert_eq!(headers.get("content-type").unwrap(), "application/xml");
             assert!(body.contains("<?xml version=\"1.0\"?>"));
@@ -367,7 +386,7 @@ async fn test_xml_escaping() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert!(body.contains("&lt;b&gt;bad&lt;/b&gt;"));
             assert!(body.contains("&amp;"));
@@ -386,7 +405,7 @@ async fn test_plain_text_response() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert_eq!(body, "Maintenance");
         }
@@ -406,7 +425,7 @@ async fn test_json_object_message_is_emitted_as_body() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject {
             status_code,
             body,
@@ -433,7 +452,7 @@ async fn test_json_array_message_is_emitted_as_body() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, headers, .. } => {
             assert_eq!(
                 headers.get("content-type").unwrap(),
@@ -455,7 +474,7 @@ async fn test_malformed_json_message_fails_safe_to_envelope() {
     .expect("malformed JSON message must not panic or reject construction");
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject {
             status_code,
             body,
@@ -481,7 +500,7 @@ async fn test_duplicate_key_json_message_fails_safe_to_envelope() {
     .expect("duplicate-key JSON must not panic or reject construction");
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).expect("fail-safe body must be valid JSON");
@@ -501,7 +520,7 @@ async fn test_pretty_printed_json_message_is_compacted() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert_eq!(body, r#"{"error":"scheduled-maintenance"}"#);
         }
@@ -520,7 +539,7 @@ async fn test_json_looking_plain_text_is_not_parsed() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, headers, .. } => {
             assert_eq!(headers.get("content-type").unwrap(), "text/plain");
             assert_eq!(body, r#"{"error":"scheduled-maintenance"}"#);
@@ -538,7 +557,7 @@ async fn test_xml_json_looking_message_stays_in_xml_envelope() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, headers, .. } => {
             assert_eq!(headers.get("content-type").unwrap(), "application/xml");
             assert!(body.contains("<?xml version=\"1.0\"?>"));
@@ -562,7 +581,7 @@ async fn test_path_prefix_trigger_matches() {
 
     let mut ctx = make_ctx("GET", "/admin/settings");
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Reject { .. }
     ));
 }
@@ -576,7 +595,7 @@ async fn test_path_prefix_trigger_no_match() {
 
     let mut ctx = make_ctx("GET", "/api/users");
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Continue
     ));
 }
@@ -590,7 +609,7 @@ async fn test_path_prefix_exact_match() {
 
     let mut ctx = make_ctx("GET", "/maintenance");
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Reject { .. }
     ));
 }
@@ -609,7 +628,7 @@ async fn test_header_trigger_matches() {
 
     let mut ctx = make_ctx_with_header("GET", "/", "x-debug", "true");
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Reject { .. }
     ));
 }
@@ -626,7 +645,7 @@ async fn test_header_trigger_value_mismatch() {
 
     let mut ctx = make_ctx_with_header("GET", "/", "x-debug", "false");
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Continue
     ));
 }
@@ -643,7 +662,7 @@ async fn test_header_trigger_missing_header() {
 
     let mut ctx = make_ctx("GET", "/");
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Continue
     ));
 }
@@ -660,7 +679,7 @@ async fn test_header_trigger_any_value() {
 
     let mut ctx = make_ctx_with_header("GET", "/", "x-maintenance", "anything");
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Reject { .. }
     ));
 }
@@ -672,7 +691,7 @@ async fn test_boundary_status_codes() {
     // Minimum valid final status code
     let plugin = RequestTermination::new(&json!({ "status_code": 200 })).unwrap();
     let mut ctx = make_ctx("GET", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 200),
         _ => panic!("Expected Reject"),
     }
@@ -680,7 +699,7 @@ async fn test_boundary_status_codes() {
     // Maximum valid status code
     let plugin = RequestTermination::new(&json!({ "status_code": 599 })).unwrap();
     let mut ctx = make_ctx("GET", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 599),
         _ => panic!("Expected Reject"),
     }
@@ -691,7 +710,7 @@ async fn test_empty_message_uses_default() {
     let plugin = RequestTermination::new(&json!({})).unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert!(body.contains("Service unavailable"));
         }
@@ -716,7 +735,7 @@ async fn test_repeated_calls_return_identical_body() {
     let mut bodies = Vec::with_capacity(3);
     for _ in 0..3 {
         let mut ctx = make_ctx("GET", "/");
-        match plugin.on_request_received(&mut ctx).await {
+        match run(&plugin, &mut ctx).await {
             PluginResult::Reject { body, .. } => bodies.push(body),
             other => panic!("Expected Reject, got {:?}", other),
         }
@@ -734,7 +753,7 @@ async fn test_pre_rendered_json_body_is_parseable() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).expect("body must be valid JSON");
@@ -754,7 +773,7 @@ async fn test_pre_rendered_xml_body_well_formed_with_special_chars() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             // Must escape '<', '>', and '&' so the XML stays well-formed.
             assert!(
@@ -783,7 +802,7 @@ async fn test_content_type_structured_suffix_json() {
     }))
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(parsed["message"], "hi");
@@ -802,7 +821,7 @@ async fn test_content_type_bogus_substring_not_json() {
     }))
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert_eq!(body, "hi");
         }
@@ -821,7 +840,7 @@ async fn test_json_body_escapes_control_chars_and_unicode() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).expect("body must be valid JSON");
@@ -843,7 +862,7 @@ async fn test_explicit_body_takes_precedence_over_message() {
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => assert_eq!(body, "literal payload"),
         other => panic!("Expected Reject, got {:?}", other),
     }
@@ -922,7 +941,7 @@ async fn test_no_body_statuses_force_empty_response() {
         let plugin = RequestTermination::new(&json!({ "status_code": code }))
             .unwrap_or_else(|e| panic!("status {code} with generated body must force empty: {e}"));
         let mut ctx = make_ctx("GET", "/");
-        match plugin.on_request_received(&mut ctx).await {
+        match run(&plugin, &mut ctx).await {
             PluginResult::Reject {
                 status_code, body, ..
             } => {
@@ -950,7 +969,7 @@ async fn test_explicit_empty_body_suppresses_message() {
     }))
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             assert_eq!(body, "");
             assert!(!body.contains("maintenance"));
@@ -966,7 +985,7 @@ async fn test_omitted_body_uses_message() {
     }))
     .unwrap();
     let mut ctx = make_ctx("GET", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => assert!(body.contains("maintenance")),
         other => panic!("Expected Reject, got {other:?}"),
     }
@@ -980,7 +999,7 @@ async fn test_connect_with_2xx_fails_closed() {
     }))
     .unwrap();
     let mut ctx = make_ctx("CONNECT", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -1005,7 +1024,7 @@ async fn test_header_presence_matches_non_utf8_raw_value() {
     );
     let mut ctx = make_ctx_with_raw_headers("GET", "/", raw);
     assert!(matches!(
-        plugin.on_request_received(&mut ctx).await,
+        run(&plugin, &mut ctx).await,
         PluginResult::Reject { .. }
     ));
 }
@@ -1024,10 +1043,7 @@ async fn test_header_exact_matches_individual_field_line_not_folded() {
     raw.append("x-policy", "true".parse().unwrap());
     let mut ctx = make_ctx_with_raw_headers("GET", "/", raw);
     assert!(
-        matches!(
-            plugin.on_request_received(&mut ctx).await,
-            PluginResult::Reject { .. }
-        ),
+        matches!(run(&plugin, &mut ctx).await, PluginResult::Reject { .. }),
         "exact match must succeed against an individual appended field line"
     );
 
@@ -1038,7 +1054,7 @@ async fn test_header_exact_matches_individual_field_line_not_folded() {
     // Without raw headers the harness falls back to the materialized map, which
     // does not equal "true" — documenting that raw evaluation is required.
     assert!(matches!(
-        plugin.on_request_received(&mut folded_only).await,
+        run(&plugin, &mut folded_only).await,
         PluginResult::Continue
     ));
 }
@@ -1061,7 +1077,7 @@ async fn test_xml_message_rejects_illegal_controls_and_keeps_whitespace() {
     }))
     .expect("tab/LF/CR and markup must be accepted for +xml");
     let mut ctx = make_ctx("GET", "/");
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject { body, .. } => {
             roxmltree::Document::parse(&body).expect("generated XML must parse");
             assert!(body.contains("&amp;"));
@@ -1075,7 +1091,14 @@ async fn test_xml_message_rejects_illegal_controls_and_keeps_whitespace() {
 fn test_config_key_constants_match_documented_surface() {
     assert_eq!(
         REQUEST_TERMINATION_CONFIG_KEYS,
-        ["status_code", "content_type", "body", "message", "trigger"]
+        [
+            "status_code",
+            "content_type",
+            "body",
+            "message",
+            "headers",
+            "trigger"
+        ]
     );
     assert_eq!(
         REQUEST_TERMINATION_TRIGGER_KEYS,
@@ -1092,7 +1115,7 @@ async fn test_native_grpc_maps_to_trailers_only_error() {
         status_code,
         body,
         headers,
-    } = plugin.on_request_received(&mut ctx).await
+    } = run(&plugin, &mut ctx).await
     else {
         panic!("expected Reject");
     };
@@ -1121,7 +1144,7 @@ async fn test_native_grpc_maps_to_trailers_only_error() {
         status_code,
         body,
         headers,
-    } = plugin.on_request_received(&mut ctx).await
+    } = run(&plugin, &mut ctx).await
     else {
         panic!("expected Reject");
     };
@@ -1143,7 +1166,7 @@ async fn test_websocket_extended_connect_2xx_termination_is_forced_to_403() {
     set_request_http_flavor_for_test(&mut ctx, HttpFlavor::WebSocket);
     set_request_wire_protocol_for_test(&mut ctx, HttpWireTransport::Http2, false);
 
-    match plugin.on_request_received(&mut ctx).await {
+    match run(&plugin, &mut ctx).await {
         PluginResult::Reject {
             status_code, body, ..
         } => {
@@ -1188,6 +1211,26 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             "`trigger.path_prefix`",
             "fragment delimiter (`#`)",
         ),
+        (
+            json!({"headers": {token: "value"}}),
+            "`headers`",
+            "not a valid HTTP field name",
+        ),
+        (
+            json!({"headers": {"set-cookie": token}}),
+            "`headers`",
+            "carries credentials",
+        ),
+        (
+            json!({"headers": {"retry-after": "UNREGISTERED_TRAFFIC_TOKEN\n"}}),
+            "`headers`",
+            "visible ASCII",
+        ),
+        (
+            json!({"trigger": {"header": "x-policy", "header_value": "UNREGISTERED_TRAFFIC_TOKEN\n"}}),
+            "`trigger.header_value`",
+            "not permitted in an HTTP field value",
+        ),
     ] {
         let error = ferrum_edge::plugins::validate_plugin_config("request_termination", &config)
             .expect_err("invalid configuration must still be rejected");
@@ -1204,4 +1247,460 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
             assert!(!rendered.contains(withheld), "{withheld}: {rendered}");
         }
     }
+}
+
+// === Shared canned body (request_termination-SOL-1) ===
+
+#[tokio::test]
+async fn test_canned_body_shares_one_allocation_across_requests_including_head() {
+    // 128 KiB: far past any small-buffer threshold, so a per-request copy is an
+    // unmistakable pointer change rather than an allocator coincidence.
+    let page = "m".repeat(128 * 1024);
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 503,
+        "content_type": "text/html",
+        "body": page
+    }))
+    .unwrap();
+
+    // Retain every result at once so a copy could not reuse a freed buffer.
+    let mut results = Vec::new();
+    for method in ["GET", "GET", "HEAD", "HEAD"] {
+        let mut ctx = make_ctx(method, "/");
+        results.push(plugin.on_request_received(&mut ctx).await);
+    }
+
+    let mut pointers = Vec::new();
+    for result in &results {
+        let PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } = result
+        else {
+            panic!("termination must return the shared-Bytes RejectBinary, got {result:?}");
+        };
+        assert_eq!(*status_code, 503);
+        assert_eq!(body.len(), 128 * 1024);
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("text/html")
+        );
+        pointers.push(body.as_ptr() as usize);
+    }
+    assert!(
+        pointers.windows(2).all(|pair| pair[0] == pair[1]),
+        "every GET and HEAD result must share the pre-rendered allocation: {pointers:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_finalized_get_keeps_shared_body_and_head_omits_bytes() {
+    let page = "p".repeat(64 * 1024);
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 503,
+        "content_type": "text/plain",
+        "body": page
+    }))
+    .unwrap();
+
+    let mut get_ctx = make_ctx("GET", "/");
+    let get = plugin.on_request_received(&mut get_ctx).await;
+    let PluginResult::RejectBinary { body: raw_body, .. } = &get else {
+        panic!("expected RejectBinary, got {get:?}");
+    };
+    let raw_ptr = raw_body.as_ptr() as usize;
+    match finalize_plugin_rejection_for_test(&[], &mut get_ctx, get).await {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(body.len(), 64 * 1024);
+            assert_eq!(
+                body.as_ptr() as usize,
+                raw_ptr,
+                "the GET finalizer must carry the shared allocation, not a copy"
+            );
+        }
+        other => panic!("expected finalized RejectBinary, got {other:?}"),
+    }
+
+    let mut head_ctx = make_ctx("HEAD", "/");
+    let head = plugin.on_request_received(&mut head_ctx).await;
+    match finalize_plugin_rejection_for_test(&[], &mut head_ctx, head).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(body.is_empty(), "HEAD must not carry content bytes");
+            let expected_len = (64 * 1024).to_string();
+            assert_eq!(
+                headers.get("content-length").map(String::as_str),
+                Some(expected_len.as_str()),
+                "HEAD keeps the representation length of the GET body"
+            );
+        }
+        other => panic!("expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+// === Header trigger OWS normalization (request_termination-CLAUDE-1) ===
+
+#[tokio::test]
+async fn test_header_exact_match_compares_the_rfc9110_field_value() {
+    // HTTP/1.1 parsing strips surrounding OWS; HPACK/QPACK deliver it verbatim.
+    // The same logical header must fire on every transport.
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 403,
+        "trigger": {"header": "x-kill-switch", "header_value": "true"}
+    }))
+    .unwrap();
+    for wire in ["true", "true ", " true", "\ttrue\t", "  true \t"] {
+        let mut ctx = make_ctx_with_header("GET", "/", "x-kill-switch", wire);
+        assert!(
+            matches!(run(&plugin, &mut ctx).await, PluginResult::Reject { .. }),
+            "wire value {wire:?} is the field value \"true\" and must terminate"
+        );
+    }
+    for wire in ["tr ue", "true,", "truex", "false"] {
+        let mut ctx = make_ctx_with_header("GET", "/", "x-kill-switch", wire);
+        assert!(
+            matches!(run(&plugin, &mut ctx).await, PluginResult::Continue),
+            "wire value {wire:?} must not match \"true\""
+        );
+    }
+
+    // Each repeated field line is trimmed independently, never folded.
+    let mut raw = HeaderMap::new();
+    raw.append("x-kill-switch", "false".parse().unwrap());
+    raw.append("x-kill-switch", http::HeaderValue::from_static("true "));
+    let mut ctx = make_ctx_with_raw_headers("GET", "/", raw);
+    assert!(matches!(
+        run(&plugin, &mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+
+    // A padded configured value is normalized to its field value as well.
+    let padded = RequestTermination::new(&json!({
+        "trigger": {"header": "x-kill-switch", "header_value": " true\t"}
+    }))
+    .unwrap();
+    let mut ctx = make_ctx_with_header("GET", "/", "x-kill-switch", "true");
+    assert!(matches!(
+        run(&padded, &mut ctx).await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[test]
+fn test_header_value_config_must_be_a_reachable_field_value() {
+    for bad in ["true\n", "a\r\nb", "x\u{0001}", "del\u{007F}"] {
+        let err = RequestTermination::new(&json!({
+            "trigger": {"header": "x-policy", "header_value": bad}
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("unreachable header_value {bad:?} must be rejected"));
+        assert!(err.contains("trigger.header_value"), "{bad:?}: {err}");
+        assert!(err.contains("never match"), "{bad:?}: {err}");
+    }
+
+    for whitespace_only in [" ", "\t", " \t "] {
+        let err = RequestTermination::new(&json!({
+            "trigger": {"header": "x-policy", "header_value": whitespace_only}
+        }))
+        .err()
+        .unwrap_or_else(|| {
+            panic!("whitespace-only header_value {whitespace_only:?} must not become presence")
+        });
+        assert!(
+            err.contains("only whitespace"),
+            "{whitespace_only:?}: {err}"
+        );
+    }
+
+    // Empty stays presence; obs-text (UTF-8) is a legal, reachable field value.
+    for ok in ["", "1", " padded ", "caf\u{e9}", "a\tb"] {
+        RequestTermination::new(&json!({
+            "trigger": {"header": "x-policy", "header_value": ok}
+        }))
+        .unwrap_or_else(|error| panic!("header_value {ok:?} must be admitted: {error}"));
+    }
+}
+
+// === Residual unreachable path prefixes (request_termination-CLAUDE-2) ===
+
+#[test]
+fn test_trigger_rejects_path_prefix_bytes_the_request_target_parser_refuses() {
+    for prefix in ["/a<b", "/a>b", "/a`b", "/<script>"] {
+        let err = RequestTermination::new(&json!({
+            "trigger": {"path_prefix": prefix}
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("unreachable path_prefix {prefix:?} must be rejected"));
+        assert!(err.contains("path_prefix"), "{prefix:?}: {err}");
+        assert!(err.contains("backtick"), "{prefix:?}: {err}");
+    }
+
+    // `http::uri::PathAndQuery` admits these literally (the H2/H3 parser admits
+    // UTF-8 too), and the canonicalizer keeps them, so they are reachable and
+    // must stay valid.
+    for prefix in [
+        "/users/{id}",
+        "/caf\u{e9}",
+        "/a\"b",
+        "/a[0]",
+        "/a^b",
+        "/a|b",
+    ] {
+        RequestTermination::new(&json!({
+            "trigger": {"path_prefix": prefix}
+        }))
+        .unwrap_or_else(|error| {
+            panic!("reachable path_prefix {prefix:?} must be admitted: {error}")
+        });
+    }
+}
+
+// === Runtime / schema alphabet parity (request_termination-CLAUDE-3) ===
+
+#[test]
+fn test_content_type_alphabet_matches_published_schema() {
+    for bad in ["text/pl\u{e4}in", "\ntext/plain", "text/plain\u{00A0}"] {
+        let err = RequestTermination::new(&json!({"content_type": bad}))
+            .err()
+            .unwrap_or_else(|| panic!("content_type {bad:?} must be rejected"));
+        assert!(err.contains("content_type"), "{bad:?}: {err}");
+    }
+    for ok in [
+        "text/plain",
+        " text/plain\t",
+        "application/json; charset=utf-8",
+    ] {
+        RequestTermination::new(&json!({"content_type": ok}))
+            .unwrap_or_else(|error| panic!("content_type {ok:?} must be admitted: {error}"));
+    }
+}
+
+#[test]
+fn test_path_prefix_c1_controls_are_rejected() {
+    let err = RequestTermination::new(&json!({
+        "trigger": {"path_prefix": "/a\u{0085}b"}
+    }))
+    .err()
+    .expect("C1 control in path_prefix must be rejected");
+    assert!(err.contains("control characters"), "{err}");
+}
+
+// === Configured response headers (request_termination-CLAUDE-5) ===
+
+#[tokio::test]
+async fn test_configured_response_headers_are_emitted() {
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 503,
+        "content_type": "text/plain",
+        "message": "maintenance",
+        "headers": {
+            "Retry-After": "120",
+            "cache-control": "no-store",
+            "X-Maintenance-Window": "02:00-03:00 UTC"
+        }
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match run(&plugin, &mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 503);
+            assert_eq!(body, "maintenance");
+            assert_eq!(headers.len(), 4);
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("text/plain")
+            );
+            assert_eq!(headers.get("retry-after").map(String::as_str), Some("120"));
+            assert_eq!(
+                headers.get("cache-control").map(String::as_str),
+                Some("no-store")
+            );
+            assert_eq!(
+                headers.get("x-maintenance-window").map(String::as_str),
+                Some("02:00-03:00 UTC")
+            );
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
+
+    // No-body statuses may still carry headers.
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 204,
+        "headers": {"cache-control": "no-store"}
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("GET", "/");
+    match run(&plugin, &mut ctx).await {
+        PluginResult::Reject { body, headers, .. } => {
+            assert!(body.is_empty());
+            assert_eq!(
+                headers.get("cache-control").map(String::as_str),
+                Some("no-store")
+            );
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_connect_refusal_does_not_carry_configured_headers() {
+    let plugin = RequestTermination::new(&json!({
+        "status_code": 200,
+        "headers": {"cache-control": "public, max-age=3600"}
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("CONNECT", "/");
+    match run(&plugin, &mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(!headers.contains_key("cache-control"), "{headers:?}");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        other => panic!("expected Reject, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_native_grpc_keeps_trailers_only_contract_with_configured_headers() {
+    let plugin = RequestTermination::new(&json!({
+        "headers": {"retry-after": "30"}
+    }))
+    .unwrap();
+    let mut ctx = make_ctx("POST", "/pkg.Service/Method");
+    set_request_http_flavor_for_test(&mut ctx, HttpFlavor::Grpc);
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = run(&plugin, &mut ctx).await
+    else {
+        panic!("expected Reject");
+    };
+    let normalized = normalize_reject_response(
+        StatusCode::from_u16(status_code).unwrap(),
+        body.as_bytes(),
+        &headers,
+        true,
+    );
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert!(normalized.body.is_empty());
+    assert_eq!(normalized.grpc_status, Some(14));
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+}
+
+#[test]
+fn test_response_headers_refuse_reserved_names() {
+    for (name, needle) in [
+        ("Content-Length", "protocol-managed"),
+        ("transfer-encoding", "protocol-managed"),
+        ("Connection", "protocol-managed"),
+        ("upgrade", "protocol-managed"),
+        ("trailer", "protocol-managed"),
+        ("Content-Type", "`content_type`"),
+        ("Set-Cookie", "carries credentials"),
+        ("set-cookie2", "carries credentials"),
+        ("WWW-Authenticate", "carries credentials"),
+        ("authorization", "carries credentials"),
+        ("proxy-authorization", "carries credentials"),
+        ("authentication-info", "carries credentials"),
+        ("x-ferrum-diagnostic-ref", "gateway-owned"),
+        ("X-Ferrum-Grpc-Web-Accept-Rejected", "gateway-owned"),
+        ("grpc-status", "gateway-owned"),
+        ("Grpc-Message", "gateway-owned"),
+        ("x-gateway-error", "gateway-owned"),
+        ("x-gateway-upstream-status", "gateway-owned"),
+    ] {
+        let err = RequestTermination::new(&json!({"headers": {name: "x"}}))
+            .err()
+            .unwrap_or_else(|| panic!("reserved response header {name:?} must be rejected"));
+        assert!(err.contains("`headers` key"), "{name:?}: {err}");
+        assert!(err.contains(needle), "{name:?}: {err}");
+    }
+}
+
+#[test]
+fn test_response_headers_validate_shape_values_and_bounds() {
+    for (config, needle) in [
+        (json!({"headers": []}), "must be an object"),
+        (json!({"headers": "retry-after: 1"}), "must be an object"),
+        (json!({"headers": null}), "must be an object"),
+        (
+            json!({"headers": {"bad name": "1"}}),
+            "not a valid HTTP field name",
+        ),
+        (json!({"headers": {"": "1"}}), "not a valid HTTP field name"),
+        (json!({"headers": {"retry-after": 120}}), "must be a string"),
+        (
+            json!({"headers": {"retry-after": null}}),
+            "must be a string",
+        ),
+        (json!({"headers": {"x-a": "a\r\nx-b: b"}}), "visible ASCII"),
+        (json!({"headers": {"x-a": "caf\u{e9}"}}), "visible ASCII"),
+        (
+            json!({"headers": {"x-a": " 1"}}),
+            "leading or trailing whitespace",
+        ),
+        (
+            json!({"headers": {"x-a": "1\t"}}),
+            "leading or trailing whitespace",
+        ),
+        (
+            json!({"headers": {"Retry-After": "1", "retry-after": "2"}}),
+            "more than once",
+        ),
+    ] {
+        let err = RequestTermination::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("invalid headers config must be rejected: {config}"));
+        assert!(err.contains("`headers`"), "{config}: {err}");
+        assert!(err.contains(needle), "{config}: {err}");
+    }
+
+    let at_limit = "v".repeat(REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES);
+    RequestTermination::new(&json!({"headers": {"x-a": at_limit}}))
+        .unwrap_or_else(|error| panic!("value at the byte limit must be admitted: {error}"));
+    let over_limit = "v".repeat(REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES + 1);
+    let err = RequestTermination::new(&json!({"headers": {"x-a": over_limit}}))
+        .err()
+        .expect("value over the byte limit must be rejected");
+    assert!(err.contains("4096-byte limit"), "{err}");
+
+    let headers_at = |count: usize| {
+        let map: serde_json::Map<String, serde_json::Value> = (0..count)
+            .map(|i| (format!("x-h{i}"), json!("1")))
+            .collect();
+        json!({"headers": map})
+    };
+    RequestTermination::new(&headers_at(REQUEST_TERMINATION_MAX_HEADERS))
+        .unwrap_or_else(|error| panic!("headers at the entry limit must be admitted: {error}"));
+    let err = RequestTermination::new(&headers_at(REQUEST_TERMINATION_MAX_HEADERS + 1))
+        .err()
+        .expect("headers over the entry limit must be rejected");
+    assert!(err.contains("at most"), "{err}");
+
+    // Empty values and interior whitespace are legal field values.
+    RequestTermination::new(&json!({"headers": {"x-empty": "", "x-inner": "a  b\tc"}}))
+        .unwrap_or_else(|error| panic!("legal values must be admitted: {error}"));
 }

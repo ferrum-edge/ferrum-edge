@@ -89,6 +89,11 @@ fn test_http_family_plugins() {
         ("basic_auth", json!({})),
         ("bot_detection", json!({})),
         ("request_termination", json!({"status_code": 503})),
+        // Header/query rules apply to WebSocket handshakes too.
+        (
+            "request_transformer",
+            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
+        ),
     ];
 
     for (name, config) in plugins {
@@ -150,10 +155,6 @@ fn test_http_family_and_stream_plugins() {
 fn test_http_grpc_plugins() {
     // Plugins that support HTTP and gRPC only (modify headers/body)
     let plugins = vec![
-        (
-            "request_transformer",
-            json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
-        ),
         (
             "response_transformer",
             json!({"rules": [{"operation": "add", "target": "header", "key": "x-test", "value": "1"}]}),
