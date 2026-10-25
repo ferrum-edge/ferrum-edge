@@ -305,7 +305,7 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     than letting a response schema, WAF response rule, AI guard, or route
     response-size ceiling restate it. The metadata reason beside them is
     plugin-writable and authorizes nothing.
-6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy.
+6. `on_final_request_body`: body validator, gRPC-Web validation, WAF body rules, OpenAPI request schema (backend-final fallback), post-transform request-size ceiling, `ai_prompt_compressor` staged marker-sanitization rejection (4055), and `ai_semantic_cache` exact/semantic lookup (4057). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and fully transformed request body, and a hit cannot bypass fail-closed final-body policy. `validate_plugin_security_composition` refuses any `enforces_finalized_request_policy()` plugin (except the `ai_federation` dispatcher) at or after an `ai_semantic_cache` instance's effective priority, so `priority_override` cannot reorder that. Its exact keys and semantic scopes bind the complete `ResponsePolicyProvenance` (an unprovable presentation policy bypasses), and it stores a synthetic body only when `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY` proves a provider-backed `ai_federation` answer and `ai_federation::PROVIDER_RESPONSE_RETAINABLE_METADATA_KEY` proves the provider's original headers allowed retention; that entry is staged and published from `on_response_committed` over the final synthetic headers.
    - `waf`'s `scan_budget_ms` is a POST-HOC deadline on EVERY surface: the scan
      always runs and its hits always decide first, so an enforcing hit found
      over budget still rejects (issue #5528 — do not reintroduce a pre-scan
@@ -1021,9 +1021,12 @@ on a native-gRPC request.
 - The standard AWS credential fallbacks (`AWS_ACCESS_KEY_ID` /
   `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) in `serverless_function`
   (`aws_lambda`) and `ai_federation` (`aws_bedrock`) are the only remaining
-  ambient credential fallbacks; neither plugin uses the AWS SDK default chain
-  (IMDS, ECS, web identity, SSO, profiles), so keep it that way or extend the
-  scope. Whenever the key id or secret resolves from the environment, the
+  ambient credential fallbacks. `serverless_function` additionally offers an
+  explicit opt-in `aws_credentials: default_chain` (AWS SDK chain: IMDS, ECS,
+  web identity, SSO, profiles; `secrets-aws` builds only), cached and refreshed
+  off the request path by `utils::aws_refreshing_credentials`; it is held to the
+  same endpoint scope below. `ai_federation` does not use the SDK chain.
+  Whenever the key id or secret resolves from the environment, the
   region must pass the partition grammar
   (`ambient_cloud_credentials::aws_region_partition`, mirroring the SDK
   `aws` / `aws-cn` / `aws-us-gov` regexes with lowercase letters) and the
