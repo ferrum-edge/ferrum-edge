@@ -157,46 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`ai_semantic_firewall` production-launch review hardening.** A `warn`
-  rule match no longer short-circuits the mandatory `allow_topics` check: a
-  request with no allowed-topic match is rejected even when an advisory rule
-  also matched (the warn diagnostics are kept beside `allow_topics:no_match`).
-  Request inspection now reads Anthropic `tool_use` / `server_tool_use` /
-  `mcp_tool_use` blocks in `messages[].content` history (`name` as
-  `ToolCall`, `input` as `ToolArguments`), and Cohere `documents[]` carrying a
-  `type` member are still read member-wise. Response inspection adds legacy
-  Chat Completions `function_call` paths (buffered and streamed, reassembled
-  per choice), Cohere v2 `/v2/chat` SSE reassembly (`content-delta`,
-  `tool-plan-delta`, `tool-call-*`) plus the `$.message.content` /
-  `.tool_plan` / `.tool_calls[*].function.*` paths (also Ollama `/api/chat`),
-  Cohere v2 citation sources (`$.message.citations[*].sources`, each its own
-  segment; a `debug` event with a payload fails the stream closed), and Ollama
-  reasoning text (`$.message.thinking`, `$.thinking`).
-  Streams the request did not declare with `stream: true` are governed too:
-  Gemini `:streamGenerateContent` and Bedrock `converse-stream` /
-  `invoke-with-response-stream` request targets count as declared streams, an
-  undeclared `text/event-stream` response to a governed AI request is
-  buffered (`buffer` / `reject`) or windowed (`inspect`), Ollama NDJSON is
-  buffered and reassembled, Gemini JSON-array streams are reassembled, and
-  Bedrock binary event streams fail closed. Request bodies are buffered for
-  `POST` / `PUT` / `PATCH` regardless of `Content-Type` and sniffed, so a
-  mislabeled JSON prompt is inspected. The 10 MiB inspection ceiling is
-  enforced in `before_proxy` before any parsing or embedding and ahead of the
-  final-body hash skip, is declared as the request buffer limit when an
-  oversized body would be refused anyway, and bodies yielding more than 1024
-  segments are refused as `too_many_segments`. Embedding calls are batched by
-  the learned vector dimension (the response bound rises to 4 MiB) and bounded
-  per instance by the new `provider.max_concurrent_requests` (default 32,
-  admission wait bounded by `provider.request_timeout_ms`, now at most 60000).
-  New `provider.auth_header` / `provider.auth_scheme` support Azure OpenAI
-  `api-key` style credentials. Each instance keeps a private decision record
-  and the published decision metadata is derived from all of them (most
-  severe decision, unioned rule lists), so a sibling's later or re-evaluated
-  clean decision cannot erase another instance's warn. Gzip/Brotli NDJSON
-  keeps its stream parser after the bounded decode.
-  Admission now caps rules (64 per list), examples (64 per rule, 2048
-  characters each, 512 total), `streaming.max_window_bytes` (1 MiB), and
-  `streaming.max_inspections` (10000, no longer saturated).
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
