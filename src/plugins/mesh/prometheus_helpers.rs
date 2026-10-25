@@ -2691,15 +2691,18 @@ pub fn render_mesh_histogram_named(
 ) {
     let base_labels = mesh_label_base_fragment(key);
     let le_separator = if base_labels.is_empty() { "" } else { "," };
-    for (i, boundary) in histogram.boundaries.iter().enumerate() {
-        let count = histogram.counts[i].load(Ordering::Relaxed);
+    let mut finite_total = 0u64;
+    for (boundary, count) in histogram.cumulative_buckets() {
+        finite_total = count;
         let _ = writeln!(
             output,
             "{metric_name}_bucket{{{}{le_separator}le=\"{}\"{}}} {}",
             base_labels, boundary, gateway_ns_label, count
         );
     }
-    let total_count = histogram.count.load(Ordering::Relaxed);
+    // Never below the last finite cumulative bucket, so a scrape racing an
+    // observation cannot expose a non-monotonic bucket series.
+    let total_count = histogram.count.load(Ordering::Relaxed).max(finite_total);
     let _ = writeln!(
         output,
         "{metric_name}_bucket{{{}{le_separator}le=\"+Inf\"{}}} {}",

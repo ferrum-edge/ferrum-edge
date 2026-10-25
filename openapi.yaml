@@ -22393,6 +22393,35 @@ components:
           maximum: 18446744073709551615
           default: 500
           description: Minimum age (ms) of the render cache before record() will invalidate it. Under extreme load this prevents an allocation per request
+        request_duration_buckets_ms:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: number
+            exclusiveMinimum: 0
+          default: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000, 300000]
+          description: >
+            Finite bucket upper bounds (milliseconds) for the request-scoped
+            duration histograms ferrum_request_duration_ms,
+            ferrum_backend_duration_ms, ferrum_edge_overhead_ms, and
+            ferrum_mesh_request_duration_ms. Must be strictly increasing
+            (enforced by the plugin constructor); the +Inf bucket is implicit.
+            Changing the layout drops the affected histogram series, which
+            restart under the new layout.
+        session_duration_buckets_ms:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: number
+            exclusiveMinimum: 0
+          default: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 300000, 900000, 1800000, 3600000]
+          description: >
+            Finite bucket upper bounds (milliseconds) for the session-scoped
+            duration histograms ferrum_stream_duration_ms (TCP/UDP) and
+            ferrum_websocket_session_duration_ms. Same rules as
+            request_duration_buckets_ms.
 
     ProxyAlertsConfig:
       type: object

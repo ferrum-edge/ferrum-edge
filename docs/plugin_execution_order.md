@@ -205,7 +205,10 @@ A matched request using a different method is rejected at its protocol
 admission gate before either kind of hook, even if `allowed_methods` permits
 that method. H1, H2, and H3 share the ordinary-hook blind spots for unmatched
 404 and gRPC non-POST admission; matched-proxy `allowed_methods` 405 responses
-are included in transaction logs. Terminal transaction logging is separate from
+are included in transaction logs. Unmatched-route 404s (and mesh
+`REGISTRY_ONLY` route-miss refusals) are still counted on `/metrics` by the
+shared route-miss path as `ferrum_unmatched_requests_total`, independent of any
+plugin. Terminal transaction logging is separate from
 ordinary request hooks; whether a terminal summary exists must not be inferred
 from whether `on_request_received` ran.
 

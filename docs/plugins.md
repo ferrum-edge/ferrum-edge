@@ -1991,10 +1991,55 @@ labelled by `proxy_id`, relay `direction`, and `error_class`.
 | `stale_entry_ttl_seconds` | Integer | `3600` | How long idle metric entries live before eviction (prevents unbounded memory growth from deleted/recreated proxies) |
 | `mesh_series_budget_per_family` | Integer | `10000` | Hard ceiling (`1`–`1000000`) on live `MeshRequestKey` series retained **per mesh metric family**. Shared by ordinary mesh identity dimensions and CEL-derived dimensions: newly observed keys beyond the budget are dropped for that family until `stale_entry_ttl_seconds` eviction frees capacity, and counted on `ferrum_mesh_metric_series_overflow_total{family}`. `0` is rejected — there is no unlimited mode. See [mesh.md](mesh.md#telemetry-api) |
 | `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Under extreme load this prevents an allocation per request — the render TTL is the real freshness guarantee |
+| `request_duration_buckets_ms` | Array of numbers | `[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000, 300000]` | Finite bucket upper bounds (ms) for `ferrum_request_duration_ms`, `ferrum_backend_duration_ms`, `ferrum_edge_overhead_ms`, and `ferrum_mesh_request_duration_ms`. 1–64 finite, positive, strictly increasing values; `+Inf` is implicit |
+| `session_duration_buckets_ms` | Array of numbers | `[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 300000, 900000, 1800000, 3600000]` | Finite bucket upper bounds (ms) for `ferrum_stream_duration_ms` (TCP/UDP) and `ferrum_websocket_session_duration_ms`. Same rules as `request_duration_buckets_ms` |
 
 Unknown top-level keys are rejected at construction (for example a misspelled `render_cache_ttl_secnds` cannot silently leave the default TTL). Registration is `OptionalFailOpen`: Admin create/update still returns HTTP 400 for an invalid enabled config, while file-mode `validate`/load and plugin-cache rebuild warn, naming the unknown key, and omit this instance rather than failing the gateway. `schema` / `schema_ref` remain unsupported and fail with an explicit diagnostic.
 
 **Hooks:** `on_request_received` and `on_stream_connect` mark the transaction as observed so mesh TCP lifecycle accounting and gRPC message counters can complete later; they always return Continue. `log`, `on_stream_disconnect`, and `on_ws_disconnect` record the terminal HTTP/gRPC, stream, and WebSocket series.
+
+**What the plugin owns on `/metrics`.** The authenticated admin `/metrics`
+endpoint is built in and always renders the process registry; it does not
+require this plugin. Process-wide families (rate-limit, request-mirror,
+service-discovery, TLS, data-path, log-sink, and similar counters) are recorded
+by their own subsystems whether or not the plugin is configured. The plugin
+adds the per-proxy request/stream/WebSocket RED families
+(`ferrum_requests_total`, the duration histograms, body-byte counters,
+`ferrum_client_disconnects_total`, `ferrum_stream_*`, `ferrum_websocket_*`),
+gates mesh workload-metric observation, and owns the process-wide tunables
+above. Removing the plugin stops those families from recording but leaves the
+last committed tunables and namespace label in place until the process
+restarts or another instance is committed.
+
+**Duration buckets.** Request-scoped and session-scoped duration histograms
+use separate layouts (defaults above), so long AI/SSE requests and long-lived
+TCP/UDP/WebSocket sessions resolve to a finite bucket instead of `+Inf`.
+Histograms store one count per bucket and the cumulative `le` series is
+computed at scrape time. A layout is published only when the plugin-cache
+generation commits; changing it drops the affected families' retained series
+(they restart from zero under the new layout, which Prometheus treats as a
+counter reset) so a family never exposes two `le` layouts at once. Each extra
+bucket adds one exposition line per series.
+
+**HTTP body bandwidth.** `ferrum_request_body_bytes_total{proxy_id}` and
+`ferrum_response_body_bytes_total{proxy_id}` accumulate the transaction
+summary's `bytes_sent` (client → backend request body) and `bytes_received`
+(backend → client response body) for every non-mirror HTTP-family transaction,
+mesh or not.
+
+**Pre-routing rejections.** Requests refused before routing — no proxy matched
+(`404`) or the mesh `REGISTRY_ONLY` policy refused an outbound route miss —
+never reach any plugin, so they are absent from `ferrum_requests_total`. They
+are counted on `ferrum_unmatched_requests_total{reason,status_code}` with
+`reason` in `route_not_found`, `mesh_registry_only`, and `other`, recorded by
+the shared H1/H2/H3 route-miss path regardless of plugin configuration. Paths,
+hosts, and methods are never labels.
+
+**Scrape consistency.** Cache hits share one cached body without locking. A
+cache miss takes a scrape-only single-flight lock and re-checks the cache, so
+concurrent scrapers coalesce onto one rebuild and a slower rebuild can never
+publish an older snapshot over a newer one (cached counters never move
+backwards between scrapes).
 
 `ferrum_requests_total` labels standard HTTP methods individually and maps every
 extension/unknown method to `method="OTHER"`, keeping request-controlled method

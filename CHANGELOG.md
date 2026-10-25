@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`prometheus_metrics` duration histograms extend past 10 s and are
+  configurable.** Request-scoped histograms (`ferrum_request_duration_ms`,
+  `ferrum_backend_duration_ms`, `ferrum_edge_overhead_ms`,
+  `ferrum_mesh_request_duration_ms`) now default to finite buckets up to
+  `300000` ms, and session-scoped ones (`ferrum_stream_duration_ms`,
+  `ferrum_websocket_session_duration_ms`) up to `3600000` ms, so long AI/SSE
+  requests and long-lived sessions no longer saturate `histogram_quantile` at
+  `+Inf`. New `request_duration_buckets_ms` / `session_duration_buckets_ms`
+  config keys (1–64 finite, positive, strictly increasing bounds) override
+  them; changing a layout drops that family's retained series, which restart
+  under the new layout. Histograms now store one count per bucket and
+  prefix-sum at scrape time, and established series update under a shared
+  read lock instead of the exclusive `entry()` lock.
+- **`prometheus_metrics` adds HTTP body bandwidth and pre-routing rejection
+  families.** `ferrum_request_body_bytes_total{proxy_id}` and
+  `ferrum_response_body_bytes_total{proxy_id}` export per-proxy body bytes for
+  ordinary HTTP-family traffic. `ferrum_unmatched_requests_total{reason,status_code}`
+  counts requests refused before routing (unmatched-route `404`s and mesh
+  `REGISTRY_ONLY` refusals), which never reach a plugin and were previously
+  invisible on `/metrics`.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -139,6 +159,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`/metrics` cache rebuilds are single-flight.** Concurrent scrapes that
+  missed the render cache rebuilt independently, so a slower renderer could
+  overwrite a newer cached body with older counter values and make cached
+  counters go backwards (read by `rate()` as a reset). Rebuilds are now
+  serialized behind a scrape-only lock with a cache re-check; cache hits stay
+  lock-free and share one body.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy
