@@ -2218,6 +2218,11 @@ async fn ws_logging_refuses_credential_query_parameters_port_zero_and_fragments(
         "ws://localhost:9300/logs?sessionid=abc",
         "ws://localhost:9300/logs?password=abc",
         "ws://localhost:9300/logs?key=abc",
+        "ws://localhost:9300/logs?auth_key=abc",
+        "ws://localhost:9300/logs?private_key=abc",
+        "ws://localhost:9300/logs?passphrase=abc",
+        "ws://localhost:9300/logs?assertion=abc",
+        "ws://localhost:9300/logs?cookie=abc",
         "ws://localhost:9300/logs?sig=abc",
         "ws://localhost:9300/logs?Authorization=Bearer%20abc",
         // Percent-encoded once: decodes to `token`.
@@ -2354,6 +2359,7 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
     let addr = listener.local_addr().expect("local_addr");
     let endpoint = format!("ws://{addr}/logs?stream=edge");
     let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, String, String)>();
+    let (batch_tx, batch_rx) = tokio::sync::oneshot::channel::<String>();
 
     let server = tokio::spawn(async move {
         use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -2382,14 +2388,19 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
             .await
             .expect("handshake");
         let (_sink, mut read) = ws.split();
-        let _ = read.next().await;
+        let _ = batch_tx.send(match read.next().await {
+            Some(Ok(Message::Text(payload))) => payload.to_string(),
+            other => format!("unexpected collector read: {other:?}"),
+        });
     });
 
-    // Resolution happens at construction; release the env lock before any await.
+    // The secret resolves in `start_background_tasks` on the serving node;
+    // hold the env lock across construction and start, then release it before
+    // any await.
     let plugin = {
         let env = crate::unit::env_lock::EnvGuard::new(&[]);
         env.set("FERRUM_PLUGIN_SECRET_WS_LOGGING_TEST_TOKEN", SECRET_CANARY);
-        WsLogging::new(
+        let plugin = WsLogging::new(
             &json!({
                 "endpoint_url": endpoint,
                 "custom_headers": {
@@ -2404,9 +2415,10 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
             }),
             default_client(),
         )
-        .expect("build plugin")
+        .expect("build plugin");
+        plugin.start_background_tasks().expect("live start");
+        plugin
     };
-    plugin.start_background_tasks().expect("live start");
     plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
 
@@ -2417,9 +2429,18 @@ async fn ws_logging_custom_headers_reach_the_collector_handshake() {
     assert_eq!(tenant, "acme");
     assert_eq!(target, "/logs?stream=edge");
     assert!(!target.contains(SECRET_CANARY));
+    let batch = await_within("authenticated batch", batch_rx)
+        .await
+        .expect("batch channel closed");
+    assert!(
+        batch.starts_with('['),
+        "authenticated upgrade must deliver a batch: {batch}"
+    );
 
     drop(plugin);
-    let _ = await_within("custom-headers server shutdown", server).await;
+    await_within("custom-headers server shutdown", server)
+        .await
+        .expect("collector task");
 }
 
 // ---------------------------------------------------------------------------
@@ -2644,4 +2665,124 @@ async fn ws_logging_candidate_screen_refusal_fails_the_whole_dial() {
     .err()
     .expect("a screen refusal must fail the dial");
     assert!(error.contains("denied"), "{error}");
+}
+
+/// Admission is shape-only: a control plane (or `validate`) admits a
+/// well-shaped `custom_headers` reference without the variable, while the
+/// serving node's activation fails closed until the variable exists.
+#[tokio::test]
+async fn ws_logging_header_secret_resolves_on_the_serving_node_not_at_admission() {
+    const REFERENCE: &str = "FERRUM_PLUGIN_SECRET_WS_LOGGING_ACTIVATION_TOKEN";
+    let config = json!({
+        "endpoint_url": "ws://collector.example.com/ingest",
+        "custom_headers": {
+            "Authorization": format!("Bearer ${{{REFERENCE}}}")
+        }
+    });
+    let env = crate::unit::env_lock::EnvGuard::new(&[]);
+
+    ferrum_edge::plugins::validate_plugin_config("ws_logging", &config)
+        .expect("admission must not need the collector credential");
+    let plugin = WsLogging::new(&config, default_client())
+        .expect("construction must not read the referenced variable");
+
+    let error = plugin
+        .start_background_tasks()
+        .err()
+        .expect("activation without the variable must fail closed");
+    assert!(error.contains("is not set"), "{error}");
+    assert!(
+        !error.contains(REFERENCE),
+        "diagnostic named the referenced variable: {error}"
+    );
+
+    // Out-of-namespace references are still refused at admission.
+    let refused = json!({
+        "endpoint_url": "ws://collector.example.com/ingest",
+        "custom_headers": { "Authorization": "Bearer ${FERRUM_ADMIN_JWT_SECRET}" }
+    });
+    let error = ferrum_edge::plugins::validate_plugin_config("ws_logging", &refused)
+        .expect_err("an out-of-namespace reference must be refused at admission");
+    assert!(error.contains("FERRUM_PLUGIN_SECRET_<NAME>"), "{error}");
+
+    // The failed activation restored its pending config, so it retries once
+    // the serving node has the variable; a header-invalid value still fails.
+    env.set(REFERENCE, "line\nbreak");
+    let error = plugin
+        .start_background_tasks()
+        .err()
+        .expect("a header-invalid secret must fail activation");
+    assert!(error.contains("not a valid HTTP header value"), "{error}");
+    assert!(
+        !error.contains("break"),
+        "diagnostic echoed the secret: {error}"
+    );
+    env.set(REFERENCE, "collector-token");
+    plugin
+        .start_background_tasks()
+        .expect("activation succeeds once the variable is set");
+    drop(plugin);
+    drop(env);
+}
+
+/// A kept connection charges its codec output buffer against the process
+/// retained-byte ceiling after the batch's own leases are released.
+#[tokio::test]
+async fn ws_logging_kept_connection_charges_codec_output_capacity() {
+    use ferrum_edge::plugins::utils::byte_budget::process_retained_bytes;
+    use ferrum_edge::plugins::ws_logging::{WS_MAX_PERSISTENT_FRAME_BYTES, codec_output_charge};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let (server, mut batches) = spawn_counting_collector(listener, false);
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://{addr}/logs"),
+            "batch_size": 1,
+            "flush_interval_ms": 600000,
+            "max_retries": 1,
+            "retry_delay_ms": 50,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16,
+            "max_entry_bytes": 1048576,
+            "buffer_max_bytes": 16777216
+        }),
+        default_client(),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // ~400 KiB: below the persistent-frame ceiling, so the connection is kept.
+    let mut large = test_ws_disconnect_context();
+    large.proxy_name = Some("p".repeat(400 * 1024));
+    plugin.on_ws_disconnect(&large).await;
+    let (first_connection, first_len) = next_batch(&mut batches, "large kept batch").await;
+    assert_eq!(first_connection, 1);
+    assert!(first_len < WS_MAX_PERSISTENT_FRAME_BYTES);
+
+    // The single worker builds the next batch only after the first send
+    // returned, so once this arrives the first batch's leases are gone and
+    // only the connection's codec charge still covers that frame.
+    plugin.on_ws_disconnect(&test_ws_disconnect_context()).await;
+    let (second_connection, _) = next_batch(&mut batches, "small batch").await;
+    assert_eq!(second_connection, 1, "the connection must be kept");
+    let retained = process_retained_bytes();
+    assert!(
+        retained >= codec_output_charge(first_len),
+        "codec output capacity of the kept connection is uncharged: {retained} < {}",
+        codec_output_charge(first_len)
+    );
+
+    drop(plugin);
+    server.abort();
+}
+
+#[test]
+fn codec_output_charge_covers_twice_the_frame() {
+    use ferrum_edge::plugins::ws_logging::codec_output_charge;
+    assert!(codec_output_charge(0) > 0);
+    assert!(codec_output_charge(400 * 1024) >= 2 * (400 * 1024 + 14));
+    assert_eq!(codec_output_charge(usize::MAX), usize::MAX);
 }

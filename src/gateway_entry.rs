@@ -342,9 +342,8 @@ fn init_logging() -> Result<LoggingGuards, String> {
     // double-charge events that count once and surface twice. Only the
     // visible fmt filter responds to `ferrum.log.level`.
     let installed = if log_counter_enabled {
-        let fmt_filter = logging::suppress_credential_dumping_log_targets(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
-        );
+        let fmt_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
         let (fmt_reload_layer, fmt_handle) = reload::Layer::new(fmt_filter);
         let log_counter_level_filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
@@ -354,7 +353,10 @@ fn init_logging() -> Result<LoggingGuards, String> {
                 stdout: stdout_writer.clone(),
                 stderr: stderr_writer.clone(),
             })
-            .with_filter(fmt_reload_layer);
+            .with_filter(fmt_reload_layer)
+            // AND-ed with the reloadable filter: credential-dumping dependency
+            // records stay off whatever directive or RTDS reload is applied.
+            .with_filter(logging::credential_dumping_log_filter());
         let log_counter_filter = filter_fn(|metadata| {
             crate::runtime_metrics_tracing_layer::should_count_target(metadata.target())
         });
@@ -378,9 +380,8 @@ fn init_logging() -> Result<LoggingGuards, String> {
     };
 
     if !installed {
-        let env_filter = logging::suppress_credential_dumping_log_targets(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)),
-        );
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
         let (reload_layer, fallback_handle) = reload::Layer::new(env_filter);
         let fmt_layer = tracing_subscriber::fmt::layer()
             .json()
@@ -388,7 +389,10 @@ fn init_logging() -> Result<LoggingGuards, String> {
                 stdout: stdout_writer,
                 stderr: stderr_writer,
             })
-            .with_filter(reload_layer);
+            .with_filter(reload_layer)
+            // AND-ed with the reloadable filter: credential-dumping dependency
+            // records stay off whatever directive or RTDS reload is applied.
+            .with_filter(logging::credential_dumping_log_filter());
         if tracing_subscriber::registry()
             .with(fmt_layer)
             .try_init()
@@ -446,7 +450,6 @@ where
 {
     fn reload(&self, directive: &str) -> Result<(), String> {
         let filter = EnvFilter::try_new(directive)
-            .map(logging::suppress_credential_dumping_log_targets)
             .map_err(|_| format!("invalid filter directive {directive:?}"))?;
         self.handle
             .reload(filter)

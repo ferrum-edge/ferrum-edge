@@ -21664,12 +21664,14 @@ components:
             include a hostname, an explicit port (if any) of 1-65535, and no
             URL user information or fragment. A query parameter whose decoded
             name marks a credential is refused at runtime: exactly `auth`,
-            `jwt`, `key`, `pass`, `pwd`, `sid`, `sig`, or `signature`, or any
-            name containing `access_key`, `accesskey`, `api-key`, `api_key`,
-            `apikey`, `authorization`, `bearer`, `credential`, `passwd`,
-            `password`, `secret`, `session`, or `token` (case-insensitive; a
-            name still percent-encoded after one decode is refused too). Send
-            collector credentials in `custom_headers`. Operational diagnostics
+            `jwt`, `pass`, `pwd`, `sid`, `sig`, or `signature`; any name
+            ending in `key`; or any name containing `access_key`,
+            `accesskey`, `api-key`, `api_key`, `apikey`, `assertion`,
+            `authorization`, `bearer`, `cookie`, `credential`, `passphrase`,
+            `passwd`, `password`, `secret`, `session`, or `token`
+            (case-insensitive; a name still percent-encoded after one decode
+            is refused too). The screen is a name heuristic; send collector
+            credentials in `custom_headers`. Operational diagnostics
             always use a structurally redacted form
             (`scheme://host[:port]/redacted`). Malformed or
             non-WebSocket schemes are rejected at config load time. The
@@ -21684,9 +21686,11 @@ components:
           description: >-
             Header name to string value pairs added to every WebSocket upgrade
             request; the supported channel for collector credentials. A value
-            may embed one `${FERRUM_PLUGIN_SECRET_<NAME>}` reference, resolved
-            from the process environment at config load; any other variable,
-            or an unset/empty one, is refused. Handshake-owned headers (`Host`,
+            may embed one `${FERRUM_PLUGIN_SECRET_<NAME>}` reference. Admission
+            checks only its shape and refuses any other variable, so a control
+            plane needs no collector credential; the serving node reads the
+            variable when it starts the plugin generation; an unset/empty
+            value rejects that config reload or aborts gateway startup. Handshake-owned headers (`Host`,
             `Connection`, `Upgrade`, `Sec-WebSocket-Key`,
             `Sec-WebSocket-Version`, `Sec-WebSocket-Extensions`,
             `Sec-WebSocket-Accept`, `Content-Length`, `Transfer-Encoding`,

@@ -47,7 +47,9 @@ use tokio::time::Duration;
 use tracing::warn;
 use url::{Host, Url};
 
-use super::utils::byte_budget::ProcessByteReservation;
+use super::utils::byte_budget::{
+    GrowableProcessReservation, ProcessByteReservation, process_ceiling,
+};
 use super::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
 };
@@ -55,7 +57,7 @@ use super::utils::log_schema::{
     DerivedKind, EmittedKeys, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
     SummarySchema, TimestampFormat, resolve_schema,
 };
-use super::utils::plugin_secret_env::resolve_plugin_secret_env;
+use super::utils::plugin_secret_env::{resolve_plugin_secret_env, validate_plugin_secret_env_name};
 use super::utils::sink_loss::{self, SinkLossReason};
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
@@ -123,6 +125,25 @@ const MAX_RETRIES: u64 = MAX_BATCH_RETRIES;
 /// of output capacity, independent of `batch_size` and `max_entry_bytes`.
 pub const WS_MAX_PERSISTENT_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Per-frame slack in [`codec_output_charge`]: the frame header (at most 14
+/// bytes) plus control frames (Pong / Close, at most 139 bytes each) that may
+/// share the output buffer with a batch frame.
+const WS_CODEC_FRAME_SLACK_BYTES: usize = 512;
+
+/// Conservative upper bound on the output-buffer capacity tungstenite's codec
+/// keeps after sending a `payload_len`-byte batch frame.
+///
+/// The codec reserves room for the whole frame and drains the buffer on write
+/// without shrinking it. `Vec` growth at most doubles the largest single
+/// reservation, so the capacity never exceeds twice the largest frame (plus
+/// slack) the connection has sent. A kept connection holds this much against
+/// the process retained-byte ceiling until it is dropped.
+pub fn codec_output_charge(payload_len: usize) -> usize {
+    payload_len
+        .saturating_add(WS_CODEC_FRAME_SLACK_BYTES)
+        .saturating_mul(2)
+}
+
 /// Upper bound on configured `custom_headers` entries.
 pub const WS_MAX_CUSTOM_HEADERS: usize = 32;
 
@@ -147,28 +168,25 @@ const WS_RESERVED_HANDSHAKE_HEADERS: &[&str] = &[
 
 /// Exact (lowercased, decoded) `endpoint_url` query parameter names refused
 /// because they carry a reusable credential.
-const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] = &[
-    "auth",
-    "jwt",
-    "key",
-    "pass",
-    "pwd",
-    "sid",
-    "sig",
-    "signature",
-];
+const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] =
+    &["auth", "jwt", "pass", "pwd", "sid", "sig", "signature"];
 
 /// Substrings that mark a credential-bearing `endpoint_url` query parameter
 /// name (`access_token`, `x-api-key`, `client_secret`, `sessionid`, ...).
+/// Any name ending in `key` is refused as well (`auth_key`, `private_key`,
+/// `routing_key`, ...).
 const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
     "access_key",
     "accesskey",
     "api-key",
     "api_key",
     "apikey",
+    "assertion",
     "authorization",
     "bearer",
+    "cookie",
     "credential",
+    "passphrase",
     "passwd",
     "password",
     "secret",
@@ -401,8 +419,12 @@ struct WsConfig {
     /// Active backend egress policy, rechecked immediately before each dial.
     backend_egress_policy: BackendEgressPolicy,
     connector: Option<tokio_tungstenite::Connector>,
-    /// Operator handshake headers (`custom_headers`), values marked sensitive.
-    /// Carried on the upgrade request only, never in the request URI.
+    /// Admitted `custom_headers` shapes. A plugin-secret reference is resolved
+    /// only on the serving node, in `start_background_tasks`.
+    custom_header_specs: Vec<WsCustomHeaderSpec>,
+    /// Resolved handshake headers, values marked sensitive. Empty until
+    /// `start_background_tasks` resolves `custom_header_specs`. Carried on the
+    /// upgrade request only, never in the request URI.
     custom_headers: Vec<(http::HeaderName, http::HeaderValue)>,
     /// `inbound_message_policy: ignore` — discard collector Text/Binary
     /// frames instead of invalidating the connection.
@@ -791,7 +813,7 @@ impl WsLogging {
         let endpoint_port = parsed_url.port_or_known_default().ok_or_else(|| {
             "ws_logging: `endpoint_url` has no port and no default port for its scheme".to_string()
         })?;
-        let custom_headers = parse_ws_custom_headers(config)?;
+        let custom_header_specs = parse_ws_custom_headers(config)?;
         let ignore_inbound_messages = match config.get("inbound_message_policy").map(Value::as_str)
         {
             None | Some(Some("invalidate")) => false,
@@ -812,7 +834,8 @@ impl WsLogging {
             dns_cache,
             backend_egress_policy,
             connector,
-            custom_headers,
+            custom_header_specs,
+            custom_headers: Vec::new(),
             ignore_inbound_messages,
             batch_size,
             flush_interval: Duration::from_millis(flush_interval_ms),
@@ -1091,6 +1114,7 @@ fn screen_endpoint_query_credentials(parsed_url: &Url) -> Result<(), String> {
             );
         }
         if CREDENTIAL_QUERY_PARAM_NAMES.contains(&lowered.as_str())
+            || lowered.ends_with("key")
             || CREDENTIAL_QUERY_PARAM_MARKERS
                 .iter()
                 .any(|marker| lowered.contains(marker))
@@ -1105,17 +1129,38 @@ fn screen_endpoint_query_credentials(parsed_url: &Url) -> Result<(), String> {
     Ok(())
 }
 
+/// One admitted `custom_headers` entry.
+#[derive(Clone)]
+struct WsCustomHeaderSpec {
+    name: http::HeaderName,
+    value: WsCustomHeaderValue,
+}
+
+#[derive(Clone)]
+enum WsCustomHeaderValue {
+    /// A literal value, already validated and marked sensitive.
+    Literal(http::HeaderValue),
+    /// `prefix${reference}suffix`: `reference` is an admitted
+    /// `FERRUM_PLUGIN_SECRET_<NAME>` name whose value is read only on the
+    /// serving node.
+    SecretReference {
+        prefix: String,
+        reference: String,
+        suffix: String,
+    },
+}
+
 /// Parse `custom_headers`: a bounded object of header name to string value
 /// added to the WebSocket upgrade request.
 ///
-/// A value may embed one `${FERRUM_PLUGIN_SECRET_<NAME>}` reference, resolved
-/// at construction through the plugin-secret namespace (any other variable is
-/// refused before anything is read). Names the handshake owns are refused, as
-/// are case-insensitive duplicates. Diagnostics name the header, never its
-/// value; resolved values are marked sensitive.
-fn parse_ws_custom_headers(
-    config: &Value,
-) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, String> {
+/// Admission is shape-only, so a control plane or `validate` run needs no
+/// collector credential. Names the handshake owns, case-insensitive
+/// duplicates, invalid names, and literal text that cannot form a header value
+/// are refused. A value may embed one `${FERRUM_PLUGIN_SECRET_<NAME>}`
+/// reference; its name is checked against the plugin-secret namespace here,
+/// but the environment is not read (see [`resolve_ws_custom_headers`]).
+/// Diagnostics name the header, never its value.
+fn parse_ws_custom_headers(config: &Value) -> Result<Vec<WsCustomHeaderSpec>, String> {
     let Some(raw) = config.get("custom_headers") else {
         return Ok(Vec::new());
     };
@@ -1127,7 +1172,7 @@ fn parse_ws_custom_headers(
             "ws_logging: `custom_headers` may hold at most {WS_MAX_CUSTOM_HEADERS} headers"
         ));
     }
-    let mut headers: Vec<(http::HeaderName, http::HeaderValue)> = Vec::with_capacity(map.len());
+    let mut specs: Vec<WsCustomHeaderSpec> = Vec::with_capacity(map.len());
     for (key, value) in map {
         let name = http::HeaderName::from_bytes(key.as_bytes()).map_err(|_| {
             format!("ws_logging: `custom_headers` name {key:?} is not a valid HTTP header name")
@@ -1138,7 +1183,7 @@ fn parse_ws_custom_headers(
                  that header"
             ));
         }
-        if headers.iter().any(|(existing, _)| *existing == name) {
+        if specs.iter().any(|existing| existing.name == name) {
             return Err(format!(
                 "ws_logging: `custom_headers` sets `{name}` more than once (header names are \
                  case-insensitive)"
@@ -1147,25 +1192,23 @@ fn parse_ws_custom_headers(
         let raw_value = value.as_str().ok_or_else(|| {
             format!("ws_logging: `custom_headers` value for `{name}` must be a string")
         })?;
-        let resolved = resolve_custom_header_value(name.as_str(), raw_value)?;
-        let mut header_value = http::HeaderValue::from_str(&resolved).map_err(|_| {
-            format!(
-                "ws_logging: `custom_headers` value for `{name}` is not a valid HTTP header value"
-            )
-        })?;
-        header_value.set_sensitive(true);
-        headers.push((name, header_value));
+        let value = parse_custom_header_value(name.as_str(), raw_value)?;
+        specs.push(WsCustomHeaderSpec { name, value });
     }
-    Ok(headers)
+    Ok(specs)
 }
 
-/// Resolve at most one embedded `${FERRUM_PLUGIN_SECRET_<NAME>}` reference in
-/// a `custom_headers` value, keeping the literal text around it (so
-/// `Bearer ${FERRUM_PLUGIN_SECRET_COLLECTOR_TOKEN}` works). A value without
-/// `${` is used verbatim.
-fn resolve_custom_header_value(name: &str, raw: &str) -> Result<String, String> {
+fn invalid_custom_header_value(name: &str) -> String {
+    format!("ws_logging: `custom_headers` value for `{name}` is not a valid HTTP header value")
+}
+
+/// Shape-check one `custom_headers` value without reading the environment.
+fn parse_custom_header_value(name: &str, raw: &str) -> Result<WsCustomHeaderValue, String> {
     let Some(start) = raw.find("${") else {
-        return Ok(raw.to_string());
+        let mut literal =
+            http::HeaderValue::from_str(raw).map_err(|_| invalid_custom_header_value(name))?;
+        literal.set_sensitive(true);
+        return Ok(WsCustomHeaderValue::Literal(literal));
     };
     let label = format!("ws_logging: `custom_headers` value for `{name}`");
     let after_open = &raw[start + 2..];
@@ -1179,12 +1222,48 @@ fn resolve_custom_header_value(name: &str, raw: &str) -> Result<String, String> 
             "{label} may contain at most one `${{FERRUM_PLUGIN_SECRET_<NAME>}}` reference"
         ));
     }
-    let secret = resolve_plugin_secret_env(&label, reference)?;
-    let mut value = String::with_capacity(start + secret.len() + suffix.len());
-    value.push_str(&raw[..start]);
-    value.push_str(&secret);
-    value.push_str(suffix);
-    Ok(value)
+    validate_plugin_secret_env_name(&label, reference)?;
+    let prefix = &raw[..start];
+    // The literal text around the reference must already be header-safe.
+    http::HeaderValue::from_str(&format!("{prefix}{suffix}"))
+        .map_err(|_| invalid_custom_header_value(name))?;
+    Ok(WsCustomHeaderValue::SecretReference {
+        prefix: prefix.to_string(),
+        reference: reference.to_string(),
+        suffix: suffix.to_string(),
+    })
+}
+
+/// Materialize admitted `custom_headers` on the serving node.
+///
+/// Called from `start_background_tasks`, before the worker is staged, so a
+/// missing, empty, or header-invalid secret fails that plugin generation's
+/// start (a config reload is rejected and the previous configuration keeps
+/// serving; startup aborts) instead of sending a substituted credential.
+/// Diagnostics never echo the referenced name or its value.
+fn resolve_ws_custom_headers(
+    specs: &[WsCustomHeaderSpec],
+) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, String> {
+    let mut headers = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let value = match &spec.value {
+            WsCustomHeaderValue::Literal(value) => value.clone(),
+            WsCustomHeaderValue::SecretReference {
+                prefix,
+                reference,
+                suffix,
+            } => {
+                let label = format!("ws_logging: `custom_headers` value for `{}`", spec.name);
+                let secret = resolve_plugin_secret_env(&label, reference)?;
+                let mut value = http::HeaderValue::from_str(&format!("{prefix}{secret}{suffix}"))
+                    .map_err(|_| invalid_custom_header_value(spec.name.as_str()))?;
+                value.set_sensitive(true);
+                value
+            }
+        };
+        headers.push((spec.name.clone(), value));
+    }
+    Ok(headers)
 }
 
 /// Build a `tokio_tungstenite::Connector::Rustls` that follows the gateway's
@@ -1325,7 +1404,7 @@ impl Plugin for WsLogging {
 
         // Take pending config under the start lock. On any failure before the
         // sender is staged, restore it so activation remains retryable.
-        let ws_config = {
+        let mut ws_config = {
             let mut pending = self
                 .pending_config
                 .lock()
@@ -1335,6 +1414,18 @@ impl Plugin for WsLogging {
                     .to_string()
             })?
         };
+        // Collector credentials are materialized here, on the serving node,
+        // never during shared admission. A failure restores the pending config
+        // so activation stays retryable.
+        match resolve_ws_custom_headers(&ws_config.custom_header_specs) {
+            Ok(headers) => ws_config.custom_headers = headers,
+            Err(error) => {
+                if let Ok(mut pending) = self.pending_config.lock() {
+                    *pending = Some(ws_config);
+                }
+                return Err(error);
+            }
+        }
 
         let (sender, receiver) = mpsc::channel(self.buffer_capacity);
         let (commit_tx, commit_rx) = watch::channel(false);
@@ -1572,6 +1663,11 @@ struct WsConnection {
     sink: WsSink,
     drain: tokio::task::AbortHandle,
     drain_done: watch::Receiver<bool>,
+    /// Charge for the codec's retained output buffer against the process
+    /// retained-byte ceiling ([`codec_output_charge`] of the largest frame this
+    /// connection sent). It only grows, matching the buffer, and is released
+    /// when the connection (and with it the buffer) drops.
+    codec_charge: GrowableProcessReservation,
 }
 
 impl WsConnection {
@@ -1669,11 +1765,20 @@ async fn send_batch(
             let msg = tokio_tungstenite::tungstenite::protocol::Message::Text(payload.json.clone());
             match tokio::time::timeout(cfg.write_timeout, ws.sink.send(msg)).await {
                 Ok(Ok(())) => {
-                    if payload.json.len() > WS_MAX_PERSISTENT_FRAME_BYTES {
-                        // The codec's output buffer now holds an allocation at
-                        // least this frame's size that no lease charges once
-                        // `payload` drops. Close the connection so that
-                        // allocation is freed; the next batch reconnects.
+                    // The batch's byte leases end with `payload`; from here
+                    // only the codec's output buffer still holds this frame's
+                    // worth of capacity. Keep the connection only when that
+                    // capacity is charged against the process ceiling;
+                    // otherwise (frame above the persistent ceiling, or the
+                    // ceiling refuses the growth) close it, which frees the
+                    // buffer, and the next batch reconnects.
+                    let sent_len = payload.json.len();
+                    drop(payload);
+                    let retained = codec_output_charge(sent_len);
+                    let charged = ws.codec_charge.held();
+                    let keep = sent_len <= WS_MAX_PERSISTENT_FRAME_BYTES
+                        && (retained <= charged || ws.codec_charge.try_grow(retained - charged));
+                    if !keep {
                         let _ = tokio::time::timeout(cfg.write_timeout, ws.sink.close()).await;
                         return None;
                     }
@@ -1950,6 +2055,7 @@ async fn connect(cfg: &WsConfig) -> Option<WsConnection> {
                 sink,
                 drain: drain.abort_handle(),
                 drain_done: done_rx,
+                codec_charge: GrowableProcessReservation::new(process_ceiling()),
             })
         }
         // No back-off here: the caller (`send_batch`) owns the retry ladder and
