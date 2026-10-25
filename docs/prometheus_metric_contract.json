@@ -3046,6 +3046,20 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_mesh_ext_authz_check_duration_seconds",
+    "type": "histogram",
+    "help": "Time from dispatching a CUSTOM external authorization check to the provider's response headers (or the failure that ended it), per admitted extension provider.",
+    "labels": [
+      "provider",
+      "le",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_ext_authz_check_failures_total",
     "type": "counter",
     "help": "Failed CUSTOM external authorization checks by how the failure was resolved.",
@@ -3063,6 +3077,20 @@
     "type": "counter",
     "help": "Istio AuthorizationPolicy CUSTOM external authorization check outcomes.",
     "labels": [
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_ext_authz_provider_checks_total",
+    "type": "counter",
+    "help": "CUSTOM external authorization check outcomes per admitted extension provider.",
+    "labels": [
+      "provider",
       "outcome",
       "gateway_namespace"
     ],

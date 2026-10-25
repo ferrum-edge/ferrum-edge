@@ -402,7 +402,11 @@ policy itself, at admission:
   enforcement. `P-521` is refused here because its only JWS use is `ES512`,
   which is refused above; admitting the curve while refusing every algorithm
   that could use it would only move the failure later. Padding on `n` contrary
-  to RFC 7518 §6.3.1.1 is not credited toward the floor.
+  to RFC 7518 §6.3.1.1 is not credited toward the floor. `OKP` (Ed25519 /
+  `EdDSA`) JWKS keys and `EdDSA` DPoP proofs, which `jwks_auth` and
+  `oidc_relying_party` accept on the default profile, are refused for the same
+  reason `EdDSA` JWTs are. RSASSA-PSS (`PS256`/`PS384`/`PS512`) JWKS keys are
+  admitted under the same RSA key-form rules as PKCS#1 v1.5 keys.
 - The upper RSA bound is not a security floor but a denial-of-service bound: an
   oversized modulus costs every handshake that touches it, and no approved
   profile needs one.

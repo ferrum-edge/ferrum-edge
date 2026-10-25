@@ -344,3 +344,90 @@ async fn custom_location_rejects_expired_token() {
         .await;
     assert_reject(result, Some(401));
 }
+
+/// An explicit `Authorization` location on one provider must not hide a
+/// default-location sibling that reads the very same `Authorization: Bearer`
+/// credential. Before the fix the custom-location pass returned only the
+/// explicit provider, issuer routing dropped it, and the default provider was
+/// never tried — a valid token got the generic 401 in either provider order.
+#[tokio::test]
+async fn explicit_authorization_location_keeps_default_provider_with_same_token_eligible() {
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .to_string();
+    let explicit = json!({
+        "issuer": "https://a.example.com",
+        "jwks": jwks,
+        "from_headers": [{"name": "Authorization"}]
+    });
+    let default_location = json!({
+        "issuer": "https://b.example.com",
+        "jwks": jwks
+    });
+
+    for providers in [
+        json!([explicit.clone(), default_location.clone()]),
+        json!([default_location.clone(), explicit.clone()]),
+    ] {
+        let plugin = JwksAuth::new(&json!({ "providers": providers }), default_client())
+            .expect("explicit and default Authorization providers are a valid mix");
+        let mut ctx = make_ctx();
+        ctx.headers.insert(
+            "authorization".to_string(),
+            format!(
+                "Bearer {}",
+                token_for_issuer("https://b.example.com", "default-provider-user")
+            ),
+        );
+
+        let result = plugin
+            .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+            .await;
+        assert_continue(result);
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("default-provider-user"),
+            "the default-location provider must verify its own token: {providers}"
+        );
+    }
+}
+
+/// The default-location sibling is added only when `Authorization: Bearer`
+/// actually carries the identical credential. A token presented solely in a
+/// custom header stays scoped to the providers that read that header.
+#[tokio::test]
+async fn custom_header_token_does_not_reach_default_provider_without_authorization() {
+    let jwks = build_rsa_jwks_from_pem(include_bytes!(
+        "../../../tests/fixtures/test_rsa_public.pem"
+    ))
+    .to_string();
+    let plugin = JwksAuth::new(
+        &json!({
+            "providers": [
+                {
+                    "issuer": "https://a.example.com",
+                    "jwks": jwks,
+                    "from_headers": [{"name": "X-Token"}]
+                },
+                {
+                    "issuer": "https://b.example.com",
+                    "jwks": jwks
+                }
+            ]
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "x-token".to_string(),
+        token_for_issuer("https://b.example.com", "custom-header-user"),
+    );
+
+    let result = plugin
+        .authenticate(&mut ctx, &ConsumerIndex::new(&[]))
+        .await;
+    assert_reject(result, Some(401));
+    assert!(ctx.authenticated_identity.is_none());
+}
