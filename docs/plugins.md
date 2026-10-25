@@ -2071,7 +2071,9 @@ UDP drop, and WebSocket policy close produced by `rate_limiting`,
 `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`; `rate_limiting`
 refusals and `ws_rate_limiting` closes caused by unavailable centralized enforcement under
 `redis_failure_policy: fail_closed` count in
-`ferrum_rate_limit_enforcement_unavailable_total` instead. Process-wide
+`ferrum_rate_limit_enforcement_unavailable_total` instead.
+`tcp_connection_throttle` refusals are not rate-limit rejections; they count on
+`ferrum_tcp_connection_throttle_rejections_total{proxy_id}` instead. Process-wide
 compression codec admission is exported as
 `ferrum_compression_codec_admitted_total`,
 `ferrum_compression_codec_saturated_total`,
@@ -4447,17 +4449,22 @@ Limits concurrent TCP connections per observed client identity on a per-proxy ba
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key in this ferrum-edge process |
+| `max_connections_per_key` | u64 | **(required, > 0)** | Maximum active TCP connections for one key in this ferrum-edge process. For IP keys the gateway-wide `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` accept-time bound (default `256`) also applies; see **Interaction with the core per-IP bound** below |
+| `ipv6_prefix_length` | integer (32–128) | `64` | Prefix length that groups native IPv6 client addresses into one IP key. With the default `64`, every host in one `/64` shares a budget; `128` keys each IPv6 address separately. IPv4 and IPv4-mapped IPv6 clients are always keyed per address, and Consumer keys are unaffected. Independent of `FERRUM_PER_IP_IPV6_PREFIX`, which only groups the gateway-wide `FERRUM_*_PER_IP` caps |
 | `cleanup_interval_seconds` | u64 (0–86400) | `60` | Defensive background sweep interval for residual zero-count entries. Normal completion and later plugin rejection release the exact connection permit and remove zero-count entries inline. The sweep never repairs a missed positive decrement. Set to `0` to disable only this residual sweep; inline release/removal remains enabled |
 
 **Key selection:**
 - If a prior stream auth plugin identified a Consumer, the key is `proxy:{namespace}|{proxy_id}:consumer:{username}`
-- Otherwise the key is `proxy:{namespace}|{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form
+- Otherwise the key is `proxy:{namespace}|{proxy_id}:ip:{client_ip}`, with IPv4-mapped IPv6 addresses canonicalized to their IPv4 form. IPv4 stays per address. A native IPv6 source is masked to `ipv6_prefix_length` (default `/64`), so `2001:db8:abcd:12::1` and `2001:db8:abcd:12::2` share one budget by default. NAT64 sources (`64:ff9b::/96`) are native IPv6 and are grouped the same way, so with the default `/64` a whole translated IPv4 population shares one budget. Set `ipv6_prefix_length: 128` when independently addressed IPv6 hosts (or NAT64 clients) must each get their own budget
 
 Proxy IDs are unique only within a namespace, so every key includes the namespace-qualified proxy identity (`namespace|proxy_id`). That keeps the same bare proxy id in two tenants on independent budgets and lets one identity hold separate budgets across distinct proxies — useful for shared upstreams reached through differently-scoped listeners. Each successful admission owns an opaque permit for the exact plugin instance and counter entry it incremented. Multiple throttle instances, priority/authentication boundaries, later plugin rejection, and config reloads do not share mutable metadata or release one another's entries.
 IPv4-mapped IPv6 client addresses are canonicalized to native IPv4 once when the stream client identity is resolved, before plugin execution, so the two textual forms share one connection budget without per-plugin reparsing.
 
 Accounting is **process-local**. Each replica independently permits up to `max_connections_per_key`, so a deployment with _N_ replicas can collectively admit as many as _N × max_connections_per_key_ connections for one identity when traffic is distributed across them. There is no distributed synchronization mode. Compatible cache generations share accounting by plugin namespace and configuration ID, so reload does not reset live counts; removing a policy and later recreating it starts a new generation whose permits cannot be decremented by old connections.
+
+**Interaction with the core per-IP bound:** For IP keys, the gateway-wide `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` bound (default `256`, `0` disables it) runs first. It is enforced at accept time, before the frontend TLS handshake and before any `on_stream_connect` plugin, counts one source's connections across every TCP stream listener, and groups IPv6 sources by `FERRUM_PER_IP_IPV6_PREFIX`. An over-cap connection is closed there and never reaches this plugin or its rejection counter. The effective per-IP ceiling for one proxy is therefore the smaller of `max_connections_per_key` and what that source still has left under the core bound: a `max_connections_per_key` of `256` or more can never bind in a default deployment, and this plugin can only tighten the core bound, never raise it. Raise `FERRUM_TCP_MAX_CONNECTIONS_PER_IP` when a larger per-IP plugin limit is intended. A Consumer-keyed budget is not capped by it directly, but each of that Consumer's connections still counts against its source address at accept time.
+
+**Observability:** Each refusal increments the Prometheus counter `ferrum_tcp_connection_throttle_rejections_total{proxy_id}` (exported on authenticated `/metrics`; no Consumer or IP label is emitted, so cardinality is bounded by the number of TCP proxies). The refusal's disconnect summary `connection_error` and the debug log name the rejecting plugin (for example `rejected by plugin tcp_connection_throttle (TCP)`, or `(TCP/TLS)` on a TLS listener), so throttle refusals are distinguishable from ACL, WAF, or other stream-policy refusals. Authenticated `GET /admin/metrics` reports `tcp_connection_throttle.active_connections`, the live connection count summed across every configured throttle policy and key in this process.
 
 This makes plaintext TCP listeners IP-scoped, while TCP+TLS listeners can be scoped by the Consumer identified by [`mtls_auth`](#mtls_auth). Pair it with [`ip_restriction`](#ip_restriction) for IP authorization on plaintext TCP and [`access_control`](#access_control) for consumer allow/deny on TCP+TLS.
 

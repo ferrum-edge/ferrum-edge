@@ -2,7 +2,9 @@
 //!
 //! Tracks active TCP connections per proxy and observed identity:
 //! - authenticated consumer identity when a prior stream auth plugin set one
-//! - otherwise the canonical client IP address
+//! - otherwise the canonical client IP address; native IPv6 sources are
+//!   grouped to `ipv6_prefix_length` (default `/64`, `128` = per host), while
+//!   IPv4 (including IPv4-mapped IPv6) stays per address
 //!
 //! Accounting is process-local. Each admitted connection owns an opaque permit
 //! for the exact map entry it incremented; dropping that permit releases the
@@ -21,6 +23,22 @@ use tokio::task::JoinHandle;
 use super::{Plugin, PluginResult, StreamAdmissionPermit, StreamConnectionContext};
 
 const MAX_CLEANUP_INTERVAL_SECONDS: u64 = 86_400;
+const DEFAULT_CLEANUP_INTERVAL_SECONDS: u64 = 60;
+/// Default IPv6 grouping for anonymous (IP-keyed) budgets: one `/64` is the
+/// conventional single-site allocation, so a host cannot mint fresh budgets by
+/// rotating addresses inside its own subnet.
+const DEFAULT_IPV6_PREFIX_LENGTH: u8 = 64;
+/// Shortest accepted prefix (widest grouping). Anything shorter than `/32`
+/// would fold whole provider allocations into one budget.
+const MIN_IPV6_PREFIX_LENGTH: u64 = 32;
+const MAX_IPV6_PREFIX_LENGTH: u64 = 128;
+
+/// Effective configuration after parsing and defaulting.
+struct ParsedConfig {
+    max_connections_per_key: u64,
+    cleanup_interval_seconds: u64,
+    ipv6_prefix_length: u8,
+}
 
 struct ConnectionCounter {
     active: AtomicU64,
@@ -103,6 +121,16 @@ impl TcpConnectionThrottleState {
         }
     }
 
+    /// Live connections admitted under this policy across every key.
+    ///
+    /// Read-side only (admin metrics): it walks the counter map one shard at a
+    /// time and adds nothing to the admission or release path.
+    pub(crate) fn active_connections(&self) -> u64 {
+        self.active_counts.iter().fold(0u64, |total, entry| {
+            total.saturating_add(entry.value().active.load(Ordering::Relaxed))
+        })
+    }
+
     fn sweep_residual_zero_entries(&self) {
         self.active_counts
             .retain(|_, counter| counter.active.load(Ordering::Relaxed) > 0);
@@ -157,6 +185,7 @@ impl Drop for TcpConnectionThrottleState {
 pub struct TcpConnectionThrottle {
     max_connections_per_key: u64,
     cleanup_interval_seconds: u64,
+    ipv6_prefix_length: u8,
     state: Arc<TcpConnectionThrottleState>,
 }
 
@@ -165,12 +194,13 @@ impl TcpConnectionThrottle {
         config: &Value,
         pool_shard_amount: usize,
     ) -> Result<Self, String> {
-        let (max_connections_per_key, cleanup_interval_seconds) = parse_config(config)?;
+        let parsed = parse_config(config)?;
         let state = TcpConnectionThrottleState::new(pool_shard_amount);
-        state.set_cleanup_interval(cleanup_interval_seconds);
+        state.set_cleanup_interval(parsed.cleanup_interval_seconds);
         Ok(Self {
-            max_connections_per_key,
-            cleanup_interval_seconds,
+            max_connections_per_key: parsed.max_connections_per_key,
+            cleanup_interval_seconds: parsed.cleanup_interval_seconds,
+            ipv6_prefix_length: parsed.ipv6_prefix_length,
             state,
         })
     }
@@ -179,10 +209,11 @@ impl TcpConnectionThrottle {
         config: &Value,
         state: Arc<TcpConnectionThrottleState>,
     ) -> Result<Self, String> {
-        let (max_connections_per_key, cleanup_interval_seconds) = parse_config(config)?;
+        let parsed = parse_config(config)?;
         Ok(Self {
-            max_connections_per_key,
-            cleanup_interval_seconds,
+            max_connections_per_key: parsed.max_connections_per_key,
+            cleanup_interval_seconds: parsed.cleanup_interval_seconds,
+            ipv6_prefix_length: parsed.ipv6_prefix_length,
             state,
         })
     }
@@ -215,9 +246,11 @@ impl TcpConnectionThrottle {
                 key
             }
             None => {
-                let canonical_ip =
-                    crate::util::client_identity::rate_limit_client_ip_string(&ctx.client_ip, 64)
-                        .unwrap_or_else(|| ctx.client_ip.clone());
+                let canonical_ip = crate::util::client_identity::rate_limit_client_ip_string(
+                    &ctx.client_ip,
+                    self.ipv6_prefix_length,
+                )
+                .unwrap_or_else(|| ctx.client_ip.clone());
                 let mut key = String::with_capacity(
                     "proxy::ip:".len() + proxy_key.len() + canonical_ip.len(),
                 );
@@ -231,7 +264,7 @@ impl TcpConnectionThrottle {
     }
 }
 
-fn parse_config(config: &Value) -> Result<(u64, u64), String> {
+fn parse_config(config: &Value) -> Result<ParsedConfig, String> {
     let object = config.as_object().ok_or_else(|| {
         format!(
             "tcp_connection_throttle: config must be an object, got: {config:?}",
@@ -244,15 +277,32 @@ fn parse_config(config: &Value) -> Result<(u64, u64), String> {
             "tcp_connection_throttle: `max_connections_per_key` must be greater than 0".to_string(),
         );
     }
-    let cleanup_interval_seconds =
-        parse_optional_u64(object, "cleanup_interval_seconds")?.unwrap_or(60);
+    let cleanup_interval_seconds = parse_optional_u64(object, "cleanup_interval_seconds")?
+        .unwrap_or(DEFAULT_CLEANUP_INTERVAL_SECONDS);
     if cleanup_interval_seconds > MAX_CLEANUP_INTERVAL_SECONDS {
         return Err(format!(
             "tcp_connection_throttle: `cleanup_interval_seconds` must be at most {MAX_CLEANUP_INTERVAL_SECONDS}"
         ));
     }
+    let ipv6_prefix_length = match parse_optional_u64(object, "ipv6_prefix_length")? {
+        None => DEFAULT_IPV6_PREFIX_LENGTH,
+        Some(value) => u8::try_from(value)
+            .ok()
+            .filter(|prefix| {
+                (MIN_IPV6_PREFIX_LENGTH..=MAX_IPV6_PREFIX_LENGTH).contains(&u64::from(*prefix))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "tcp_connection_throttle: `ipv6_prefix_length` must be between {MIN_IPV6_PREFIX_LENGTH} and {MAX_IPV6_PREFIX_LENGTH}"
+                )
+            })?,
+    };
     reject_unknown_fields(object)?;
-    Ok((max_connections_per_key, cleanup_interval_seconds))
+    Ok(ParsedConfig {
+        max_connections_per_key,
+        cleanup_interval_seconds,
+        ipv6_prefix_length,
+    })
 }
 
 fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), String> {
@@ -262,7 +312,7 @@ fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), 
         .filter(|field| {
             !matches!(
                 *field,
-                "max_connections_per_key" | "cleanup_interval_seconds"
+                "max_connections_per_key" | "cleanup_interval_seconds" | "ipv6_prefix_length"
             )
         })
         .collect();
@@ -319,6 +369,9 @@ impl Plugin for TcpConnectionThrottle {
             .state
             .admit(self.throttle_key(ctx), self.max_connections_per_key)
         else {
+            // Refusals only: admission never touches the metrics registry.
+            super::prometheus_metrics::global_registry()
+                .record_tcp_connection_throttle_rejection(&ctx.proxy_id);
             return PluginResult::Reject {
                 status_code: 429,
                 body: r#"{"error":"TCP connection limit exceeded"}"#.into(),

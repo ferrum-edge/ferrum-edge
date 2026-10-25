@@ -11818,6 +11818,58 @@ async fn test_tcp_connection_throttle_partial_rejection_rolls_back_all_instances
     assert_eq!(cache.total_rate_limiter_keys(), 0);
 }
 
+/// `/admin/metrics` reports live occupancy, not just distinct keys: one key
+/// holding two connections counts two, across every configured policy.
+#[tokio::test]
+async fn test_tcp_connection_throttle_active_connections_counts_live_permits() {
+    let config = make_config(
+        vec![make_tcp_proxy("p1", vec!["wide", "strict"])],
+        vec![
+            make_plugin_config_with_json(
+                "wide",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 2, "cleanup_interval_seconds": 0}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+            make_plugin_config_with_json(
+                "strict",
+                "tcp_connection_throttle",
+                json!({"max_connections_per_key": 5, "cleanup_interval_seconds": 0}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 0);
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Tcp);
+    assert_eq!(plugins.len(), 2);
+
+    let mut first = make_tcp_stream_context("10.0.0.1");
+    assert!(run_tcp_connect_chain(&plugins, &mut first).await);
+    let mut second = make_tcp_stream_context("10.0.0.1");
+    assert!(run_tcp_connect_chain(&plugins, &mut second).await);
+    // Two connections under one key in each of two policies: four permits,
+    // while the distinct-key view sees only one key per policy.
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 4);
+    assert_eq!(cache.total_rate_limiter_keys(), 2);
+
+    // A refused connection holds nothing.
+    let mut refused = make_tcp_stream_context("10.0.0.1");
+    assert!(!run_tcp_connect_chain(&plugins, &mut refused).await);
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 4);
+
+    let mut other = make_tcp_stream_context("10.0.0.2");
+    assert!(run_tcp_connect_chain(&plugins, &mut other).await);
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 6);
+
+    first.release_admission_permits();
+    second.release_admission_permits();
+    other.release_admission_permits();
+    assert_eq!(cache.tcp_connection_throttle_active_connections(), 0);
+}
+
 #[tokio::test]
 async fn test_tcp_connection_throttle_full_reload_preserves_live_admissions() {
     let initial = make_config(

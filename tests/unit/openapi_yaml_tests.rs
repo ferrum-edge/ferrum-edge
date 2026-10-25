@@ -15518,6 +15518,59 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         status_schema["properties"]["replica_limit_behavior"]["enum"][0],
         "configured_limit_per_replica"
     );
+    assert!(
+        status_schema["required"]
+            .as_array()
+            .expect("required list")
+            .contains(&json!("active_connections")),
+        "admin metrics must always report live throttle occupancy"
+    );
+    assert_eq!(
+        status_schema["properties"]["active_connections"]["type"],
+        "integer"
+    );
+    assert!(metrics_source.contains("pub active_connections: u64"));
+
+    // IPv6 grouping is an explicit, validated contract shared by the schema,
+    // the runtime parser, and the docs (default /64, range 32..=128).
+    let prefix = &schema["properties"]["ipv6_prefix_length"];
+    assert_eq!(prefix["type"], "integer");
+    assert_eq!(prefix["default"], json!(64));
+    assert_eq!(prefix["minimum"], json!(32));
+    assert_eq!(prefix["maximum"], json!(128));
+    for (value, expected_valid) in [
+        (json!(32), true),
+        (json!(64), true),
+        (json!(128), true),
+        (json!(31), false),
+        (json!(129), false),
+        (json!("64"), false),
+    ] {
+        let config = json!({"max_connections_per_key": 1, "ipv6_prefix_length": value});
+        assert_component_validity(
+            &spec,
+            "TcpConnectionThrottleConfig",
+            &config,
+            expected_valid,
+        );
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &config)
+                .is_ok(),
+            expected_valid,
+            "runtime and schema must agree on {config}"
+        );
+    }
+    for text in [schema_text.as_str(), plugin_docs] {
+        assert!(text.contains("ipv6_prefix_length"), "missing IPv6 grouping");
+        assert!(
+            text.contains("FERRUM_TCP_MAX_CONNECTIONS_PER_IP"),
+            "missing the accept-time per-IP bound interaction"
+        );
+        assert!(
+            text.contains("ferrum_tcp_connection_throttle_rejections_total"),
+            "missing the refusal counter"
+        );
+    }
 }
 
 #[test]

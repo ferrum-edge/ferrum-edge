@@ -560,3 +560,388 @@ fn configuration_diagnostics_keep_schema_and_withhold_supplied_values() {
         }
     }
 }
+
+#[test]
+fn ipv6_prefix_length_is_validated_to_the_documented_range() {
+    for accepted in [32, 48, 64, 96, 128] {
+        assert!(
+            make_plugin(&json!({
+                "max_connections_per_key": 1,
+                "ipv6_prefix_length": accepted
+            }))
+            .is_ok(),
+            "ipv6_prefix_length {accepted} must be admitted"
+        );
+    }
+    for rejected in [
+        json!(0),
+        json!(31),
+        json!(129),
+        json!(256),
+        json!(-1),
+        json!(64.5),
+        json!("64"),
+        json!(null),
+    ] {
+        let error = match make_plugin(&json!({
+            "max_connections_per_key": 1,
+            "ipv6_prefix_length": rejected.clone()
+        })) {
+            Ok(_) => panic!("ipv6_prefix_length {rejected} must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("ipv6_prefix_length"), "{error}");
+    }
+}
+
+/// Two independently addressed hosts in one `/64` share a budget under the
+/// default grouping and keep separate budgets at `/128`.
+#[tokio::test]
+async fn same_slash_64_ipv6_hosts_share_by_default_and_split_at_128() {
+    for config in [
+        json!({"max_connections_per_key": 1}),
+        json!({"max_connections_per_key": 1, "ipv6_prefix_length": 64}),
+    ] {
+        let plugin = make_plugin(&config).unwrap();
+        let mut first = make_ctx("tcp-proxy", "2001:db8:abcd:12::1", None);
+        assert!(matches!(
+            plugin.on_stream_connect(&mut first).await,
+            PluginResult::Continue
+        ));
+        let mut neighbour = make_ctx("tcp-proxy", "2001:db8:abcd:12::2", None);
+        assert!(
+            matches!(
+                plugin.on_stream_connect(&mut neighbour).await,
+                PluginResult::Reject {
+                    status_code: 429,
+                    ..
+                }
+            ),
+            "{config}: hosts in one /64 share one budget"
+        );
+        let mut other_subnet = make_ctx("tcp-proxy", "2001:db8:abcd:13::1", None);
+        assert!(matches!(
+            plugin.on_stream_connect(&mut other_subnet).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(plugin.tracked_keys_count(), Some(2));
+    }
+
+    let per_host = make_plugin(&json!({
+        "max_connections_per_key": 1,
+        "ipv6_prefix_length": 128
+    }))
+    .unwrap();
+    let mut first = make_ctx("tcp-proxy", "2001:db8:abcd:12::1", None);
+    let mut neighbour = make_ctx("tcp-proxy", "2001:db8:abcd:12::2", None);
+    assert!(matches!(
+        per_host.on_stream_connect(&mut first).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        matches!(
+            per_host.on_stream_connect(&mut neighbour).await,
+            PluginResult::Continue
+        ),
+        "/128 gives each IPv6 host its own budget"
+    );
+    let mut same_host = make_ctx("tcp-proxy", "2001:db8:abcd:12::1", None);
+    assert!(matches!(
+        per_host.on_stream_connect(&mut same_host).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(per_host.tracked_keys_count(), Some(2));
+}
+
+/// NAT64 sources are native IPv6: the default `/64` folds a translated IPv4
+/// population into one budget, `/128` keeps each translated client separate.
+#[tokio::test]
+async fn nat64_clients_follow_the_configured_ipv6_grouping() {
+    let grouped = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+    let mut first = make_ctx("tcp-proxy", "64:ff9b::c000:201", None);
+    let mut second = make_ctx("tcp-proxy", "64:ff9b::c000:202", None);
+    assert!(matches!(
+        grouped.on_stream_connect(&mut first).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        grouped.on_stream_connect(&mut second).await,
+        PluginResult::Reject { .. }
+    ));
+
+    let per_host = make_plugin(&json!({
+        "max_connections_per_key": 1,
+        "ipv6_prefix_length": 128
+    }))
+    .unwrap();
+    let mut first = make_ctx("tcp-proxy", "64:ff9b::c000:201", None);
+    let mut second = make_ctx("tcp-proxy", "64:ff9b::c000:202", None);
+    assert!(matches!(
+        per_host.on_stream_connect(&mut first).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        per_host.on_stream_connect(&mut second).await,
+        PluginResult::Continue
+    ));
+}
+
+/// IPv4 stays per address and IPv4-mapped IPv6 still folds onto it, whatever
+/// the IPv6 grouping: the prefix applies to native IPv6 only.
+#[tokio::test]
+async fn ipv6_prefix_length_never_groups_ipv4_or_mapped_ipv4() {
+    for prefix in [32, 64, 128] {
+        let plugin = make_plugin(&json!({
+            "max_connections_per_key": 1,
+            "ipv6_prefix_length": prefix
+        }))
+        .unwrap();
+        let mut native = make_ctx("tcp-proxy", "192.0.2.10", None);
+        assert!(matches!(
+            plugin.on_stream_connect(&mut native).await,
+            PluginResult::Continue
+        ));
+        let mut mapped = make_ctx("tcp-proxy", "::ffff:192.0.2.10", None);
+        assert!(
+            matches!(
+                plugin.on_stream_connect(&mut mapped).await,
+                PluginResult::Reject { .. }
+            ),
+            "/{prefix}: the mapped form is the same IPv4 principal"
+        );
+        let mut neighbour = make_ctx("tcp-proxy", "192.0.2.11", None);
+        assert!(
+            matches!(
+                plugin.on_stream_connect(&mut neighbour).await,
+                PluginResult::Continue
+            ),
+            "/{prefix}: IPv4 neighbours are never grouped"
+        );
+        assert_eq!(plugin.tracked_keys_count(), Some(2));
+    }
+}
+
+/// Each admitted slot releases the exact key it was admitted under, so under
+/// `/128` releasing one host frees only that host and under `/64` a slot
+/// released by one host is reusable by its neighbour.
+#[tokio::test]
+async fn ipv6_grouped_keys_release_exactly_the_admitted_slot() {
+    let per_host = make_plugin(&json!({
+        "max_connections_per_key": 1,
+        "ipv6_prefix_length": 128,
+        "cleanup_interval_seconds": 0
+    }))
+    .unwrap();
+    let mut first = make_ctx("tcp-proxy", "2001:db8::1", None);
+    let mut second = make_ctx("tcp-proxy", "2001:db8::2", None);
+    assert!(matches!(
+        per_host.on_stream_connect(&mut first).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        per_host.on_stream_connect(&mut second).await,
+        PluginResult::Continue
+    ));
+    first.release_admission_permits();
+    assert_eq!(per_host.tracked_keys_count(), Some(1));
+    let mut second_again = make_ctx("tcp-proxy", "2001:db8::2", None);
+    assert!(
+        matches!(
+            per_host.on_stream_connect(&mut second_again).await,
+            PluginResult::Reject { .. }
+        ),
+        "releasing one host must not free another host's slot"
+    );
+    let mut first_again = make_ctx("tcp-proxy", "2001:db8::1", None);
+    assert!(matches!(
+        per_host.on_stream_connect(&mut first_again).await,
+        PluginResult::Continue
+    ));
+    first_again.release_admission_permits();
+    second.release_admission_permits();
+    assert_eq!(per_host.tracked_keys_count(), Some(0));
+
+    let grouped = make_plugin(&json!({
+        "max_connections_per_key": 1,
+        "cleanup_interval_seconds": 0
+    }))
+    .unwrap();
+    let mut holder = make_ctx("tcp-proxy", "2001:db8::1", None);
+    assert!(matches!(
+        grouped.on_stream_connect(&mut holder).await,
+        PluginResult::Continue
+    ));
+    holder.release_admission_permits();
+    assert_eq!(grouped.tracked_keys_count(), Some(0));
+    let mut neighbour = make_ctx("tcp-proxy", "2001:db8::2", None);
+    assert!(matches!(
+        grouped.on_stream_connect(&mut neighbour).await,
+        PluginResult::Continue
+    ));
+    neighbour.release_admission_permits();
+    assert_eq!(grouped.tracked_keys_count(), Some(0));
+}
+
+/// Every refusal, and only a refusal, increments the per-proxy Prometheus
+/// counter.
+#[tokio::test]
+async fn refusals_increment_the_per_proxy_rejection_counter() {
+    // The registry is process-global; proxy ids unique to this test keep the
+    // assertions independent of every other test in the binary.
+    const PROXY: &str = "throttle-rejection-counter-proxy";
+    const OTHER_PROXY: &str = "throttle-rejection-counter-other-proxy";
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+    assert_eq!(
+        registry.tcp_connection_throttle_rejections_for_proxy(PROXY),
+        0
+    );
+
+    let mut admitted = make_ctx(PROXY, "10.20.0.1", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut admitted).await,
+        PluginResult::Continue
+    ));
+    let mut other_admitted = make_ctx(OTHER_PROXY, "10.20.0.1", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut other_admitted).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        registry.tcp_connection_throttle_rejections_for_proxy(PROXY),
+        0,
+        "an admission must not count as a refusal"
+    );
+
+    for expected in 1..=2 {
+        let mut refused = make_ctx(PROXY, "10.20.0.1", None);
+        assert!(matches!(
+            plugin.on_stream_connect(&mut refused).await,
+            PluginResult::Reject { .. }
+        ));
+        assert_eq!(
+            registry.tcp_connection_throttle_rejections_for_proxy(PROXY),
+            expected
+        );
+    }
+    assert_eq!(
+        registry.tcp_connection_throttle_rejections_for_proxy(OTHER_PROXY),
+        0,
+        "refusals are attributed to the refusing proxy only"
+    );
+
+    let exposition = registry.render_uncached();
+    assert!(
+        exposition.contains(&format!(
+            "ferrum_tcp_connection_throttle_rejections_total{{proxy_id=\"{PROXY}\""
+        )),
+        "the refusal counter must be exported per proxy"
+    );
+    admitted.release_admission_permits();
+    other_admitted.release_admission_permits();
+}
+
+struct DenyAllStreamPolicy;
+
+#[async_trait::async_trait]
+impl Plugin for DenyAllStreamPolicy {
+    fn name(&self) -> &str {
+        "test_deny_all_stream_policy"
+    }
+
+    async fn on_stream_connect(&self, _ctx: &mut StreamConnectionContext) -> PluginResult {
+        PluginResult::Reject {
+            status_code: 403,
+            body: r#"{"error":"denied"}"#.into(),
+            headers: HashMap::new(),
+        }
+    }
+}
+
+async fn connected_tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let (accepted, _) = listener.accept().await.expect("accept");
+    (accepted, client)
+}
+
+/// The production TCP `on_stream_connect` runner names the refusing plugin in
+/// the setup error that becomes the disconnect summary's `connection_error`,
+/// so a throttle refusal is distinguishable from another policy's refusal.
+#[tokio::test]
+async fn stream_runner_names_the_refusing_plugin() {
+    use ferrum_edge::_test_support::tcp_stream_connect_chain_under_trust_fence_for_test;
+    use ferrum_edge::proxy::stream_error::{StreamSetupKind, find_stream_setup_error};
+    use std::sync::atomic::AtomicBool;
+
+    const PROXY: &str = "throttle-runner-attribution-proxy";
+    let (accepted, _client) = connected_tcp_pair().await;
+    let throttle = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+    let chain = vec![Arc::clone(&throttle)];
+
+    let mut holder = make_ctx(PROXY, "10.30.0.1", None);
+    let latch = AtomicBool::new(false);
+    tcp_stream_connect_chain_under_trust_fence_for_test(
+        &chain,
+        &mut holder,
+        &accepted,
+        None,
+        &latch,
+    )
+    .await
+    .expect("the first connection is admitted");
+
+    let mut refused = make_ctx(PROXY, "10.30.0.1", None);
+    let error = tcp_stream_connect_chain_under_trust_fence_for_test(
+        &chain,
+        &mut refused,
+        &accepted,
+        None,
+        &latch,
+    )
+    .await
+    .expect_err("the second connection exceeds the limit");
+    assert_eq!(
+        find_stream_setup_error(&error)
+            .expect("typed stream-setup refusal")
+            .kind,
+        StreamSetupKind::RejectedByPlugin
+    );
+    assert_eq!(
+        error.to_string(),
+        "rejected by plugin tcp_connection_throttle (TCP/TLS)"
+    );
+    assert!(refused.admission_permits.is_empty());
+
+    let registry = ferrum_edge::plugins::prometheus_metrics::global_registry();
+    let throttle_refusals = registry.tcp_connection_throttle_rejections_for_proxy(PROXY);
+    assert_eq!(throttle_refusals, 1);
+
+    // A different stream policy's refusal names that policy and is not
+    // counted as a throttle refusal.
+    let policy: Arc<dyn Plugin> = Arc::new(DenyAllStreamPolicy);
+    let mut denied = make_ctx(PROXY, "10.30.0.2", None);
+    let error = tcp_stream_connect_chain_under_trust_fence_for_test(
+        &[policy],
+        &mut denied,
+        &accepted,
+        None,
+        &latch,
+    )
+    .await
+    .expect_err("the deny-all policy refuses");
+    assert_eq!(
+        error.to_string(),
+        "rejected by plugin test_deny_all_stream_policy (TCP/TLS)"
+    );
+    assert_eq!(
+        registry.tcp_connection_throttle_rejections_for_proxy(PROXY),
+        throttle_refusals
+    );
+
+    holder.release_admission_permits();
+    assert_eq!(throttle.tracked_keys_count(), Some(0));
+}
