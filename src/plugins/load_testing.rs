@@ -22,9 +22,10 @@
 //! applied exactly once to the synthetic cohort as well.
 //!
 //! The triggering request itself proceeds normally through the proxy pipeline
-//! and is not blocked by the load test. A matching trigger whose declared
-//! `Content-Length` exceeds the 10 MiB replay ceiling is not buffered: the
-//! request streams to the backend as usual and no load test starts.
+//! and is not blocked by the load test. A trigger body above the 10 MiB
+//! replay ceiling is forwarded under the ordinary request-body limits and no
+//! load test starts; a declared oversized `Content-Length` is not even
+//! buffered.
 //!
 //! ## Multi-node fan-out
 //!
@@ -122,9 +123,10 @@ pub const MAX_GATEWAY_ADDRESSES: usize = 32;
 const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
 
 /// A matching trigger may retain one shared request body for its local cohort
-/// and bounded fan-out work. Keep that body bounded even when the global
-/// request-body limit is configured as unlimited, and cap aggregate retained
-/// replay bodies across plugin instances.
+/// and bounded fan-out work. Keep that retained body bounded even when the
+/// global request-body limit is configured as unlimited, and cap aggregate
+/// retained replay bodies across plugin instances. This bounds replay
+/// retention only: a larger trigger body is still forwarded, without a run.
 pub const MAX_REPLAY_REQUEST_BODY_BYTES: usize = 10_485_760;
 const MAX_PROCESS_RETAINED_BODY_BYTES: u64 = 67_108_864;
 
@@ -1085,21 +1087,27 @@ impl Plugin for LoadTesting {
         false
     }
 
-    /// Replay-retention ceiling, applied only to requests this plugin buffers.
-    /// A trigger that already declares a larger body is never selected for
-    /// buffering (see `should_buffer_request_body`), so this ceiling cannot
-    /// turn into a client-visible `413` for it; an undeclared (chunked) body
-    /// can only be bounded while it is collected.
+    /// Deliberately no plugin-local buffering ceiling. The 10 MiB replay
+    /// ceiling bounds what a run RETAINS, never what the gateway forwards: a
+    /// plugin ceiling here would be folded into the pre-`before_proxy` collect
+    /// limit and turn an oversized trigger body without a declared length
+    /// (chunked H1, H2/H3 DATA without `Content-Length`) into a client-visible
+    /// `413` for the primary request. Collection is therefore bounded by the
+    /// same global/route request-body limit the request faces when streamed
+    /// (with `FERRUM_REQUEST_BUFFER_FALLBACK_MAX_BYTES` and the aggregate
+    /// request-buffer budget when that limit is unlimited), and `before_proxy`
+    /// skips the run for a body above the replay ceiling. A trigger that
+    /// declares a larger body is not buffered at all.
     fn request_body_buffer_limit(&self) -> Option<usize> {
-        Some(MAX_REPLAY_REQUEST_BODY_BYTES)
+        None
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         // Preserve the ordinary and wrong-key hot paths: an unauthenticated
         // caller must not force body retention merely by naming the header.
-        // A matching trigger that declares more than the replay ceiling keeps
-        // streaming like any other request instead of being rejected with 413
-        // by the plugin-local buffering cap; `before_proxy` then skips the run.
+        // A matching trigger that declares more than the replay ceiling can
+        // never be replayed, so it keeps streaming like any other request
+        // instead of being retained; `before_proxy` then skips the run.
         self.trigger_key_present_and_matches(&ctx.headers)
             && !declared_body_exceeds_replay_ceiling(&ctx.headers)
     }
@@ -1266,6 +1274,9 @@ impl Plugin for LoadTesting {
 
         // Originating controllers fan out once. Peer fan-out receivers never
         // re-forward, which collapses the previous quadratic mesh amplification.
+        // Every peer call shares one admission-time deadline, so a task first
+        // polled late still cannot outlive the run.
+        let fanout_deadline = tokio::time::Instant::now() + duration;
         if !is_fanout && !gateway_addresses.is_empty() {
             for addr in &gateway_addresses {
                 let fanout_url = build_url(addr, &path, raw_query.as_deref());
@@ -1322,8 +1333,8 @@ impl Plugin for LoadTesting {
                             );
                             return;
                         }
-                        outcome = tokio::time::timeout(
-                            duration,
+                        outcome = tokio::time::timeout_at(
+                            fanout_deadline,
                             client.execute_http1_redacted_single_attempt(req, "load_testing_fanout", &remote_label),
                         ) => outcome,
                     };

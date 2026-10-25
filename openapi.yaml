@@ -32784,10 +32784,9 @@ components:
         applied exactly once to the synthetic cohort as well. Synthetic and
         fan-out requests are sent over HTTP/1.1 so the preserved Host is the
         request authority; over HTTP/2 the two would disagree and ingress
-        validation would correctly reject every replay. A matching trigger
-        whose declared Content-Length exceeds the 10 MiB replay ceiling is not
-        buffered: the request streams to the backend unchanged and no load
-        test starts. Fan-out peers acknowledge an admitted trigger with 204
+        validation would correctly reject every replay. The 10 MiB ceiling
+        bounds replay retention only: a trigger body above it is forwarded
+        under the ordinary request-body limits and no load test starts. Fan-out peers acknowledge an admitted trigger with 204
         plus X-Loadtesting-Ack echoing the controller's X-Loadtesting-Run-Id;
         a request carrying X-Loadtesting-Fanout whose key fails is refused
         with 403 before backend dispatch.

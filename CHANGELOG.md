@@ -155,9 +155,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fan-out call is a single attempt (never replayed by
   `FERRUM_PLUGIN_HTTP_MAX_RETRIES`), bounded by `duration_seconds`, and
   cancelled with the local run when the last plugin owner is removed. A
-  matching trigger that declares a body above the 10 MiB replay ceiling now
-  streams to the backend normally and starts no run instead of being refused
-  with `413`. Start/finish records carry a `run_id` shared with fan-out
+  matching trigger whose body exceeds the 10 MiB replay ceiling (declared or
+  not) is now forwarded under the ordinary request-body limits and starts no
+  run instead of being refused with `413`. Start/finish records carry a `run_id` shared with fan-out
   peers, a `key_fingerprint`, and the cohort size, plus the triggering client
   and consumer on start.
 - **`workload_metrics` (mesh telemetry) review hardening.**

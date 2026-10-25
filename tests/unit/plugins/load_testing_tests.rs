@@ -259,10 +259,14 @@ fn test_declares_header_mutation_and_trigger_redaction() {
         ],
         "every backend-folded spelling of the trigger key must be redacted"
     );
+    // The replay ceiling bounds retention in `before_proxy`, never the
+    // collect limit: a plugin-local buffering ceiling would answer an
+    // oversized trigger body without a declared length with a 413 for the
+    // primary request (load_testing-claude-1, PR6856-SOL-2).
     assert_eq!(
         plugin.request_body_buffer_limit(),
-        Some(MAX_REPLAY_REQUEST_BODY_BYTES),
-        "load-testing replay bodies must remain bounded when the global limit is unlimited"
+        None,
+        "load_testing must not shorten the bytes the gateway forwards"
     );
 }
 
@@ -3114,7 +3118,7 @@ fn test_cleartext_remote_fanout_peer_requires_allow_plaintext() {
     for address in [
         "https://node2:8443",
         "http://127.0.0.1:8001",
-        "http://127.0.0.2:8000",
+        "http://127.0.0.2:8001",
         "http://[::1]:8001",
     ] {
         assert!(
@@ -3280,7 +3284,15 @@ async fn test_fanout_trigger_is_never_retried_by_the_shared_client() {
         1,
         "the fan-out trigger must be sent exactly once"
     );
+    // The fan-out call cannot outlive the run, so once the run is idle no
+    // late retry can still be pending.
     wait_until_idle(&plugin).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no retry may follow after the run ends"
+    );
     peer_task.abort();
 }
 
