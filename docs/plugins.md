@@ -6673,10 +6673,11 @@ Enforcement happens in four places:
 
 **Streaming rewrites are charged on the bytes the client receives.** A response
 rewrite that changes the byte count while streaming cannot use an in-limit
-source to deliver more than the effective ceiling. Both streaming
-response-inspector drivers (the H1/H2 reqwest path and the direct-H2/native-H3
-path) count every released `Forward` window, every `Terminate` payload, and the
-end-of-stream flush. Incremental gRPC-Web translation counts base64 text
+source to deliver more than the effective ceiling. Every streaming
+response-inspector driver counts every released `Forward` window, every
+`Terminate` payload, and the end-of-stream flush. That covers the H1/H2 reqwest
+path, the direct-H2 proxy-body path, the native HTTP/3 frontend relay, and the
+HTTP/3 cross-protocol relay. Incremental gRPC-Web translation counts base64 text
 expansion and the generated trailer frame, on the H1/H2 funnels and the native-H3
 cross-protocol relay alike. The gateway-generated `mcp_gateway` aggregate SSE
 listener counts its greeting, every replayed or live event, and every keepalive

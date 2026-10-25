@@ -1223,6 +1223,72 @@ async fn grpc_web_translation_cannot_expand_past_the_response_ceiling() {
     assert_size_terminated(error);
 }
 
+/// Every production response-inspector driver charges each release — every
+/// `Forward`, every `Terminate` payload, on chunk and at end of stream —
+/// against the output ceiling BEFORE writing it: the reqwest and proxy-body
+/// drivers, the native H3 → native H3 relay, and the H3 cross-protocol relay
+/// (PR6880-SOL-3). The H3 relays write straight to QUIC streams with no live
+/// harness here, so the invariant is pinned per release site: between each
+/// `ResponseStreamAction` arm and its first write, the file's charge must run.
+/// A new driver or a new arm without the charge fails this table.
+#[test]
+fn every_inspector_release_is_charged_before_it_is_written() {
+    let drivers: [(&str, &str, &str, &str); 3] = [
+        (
+            "src/proxy/body.rs",
+            include_str!("../../../src/proxy/body.rs"),
+            "response_output_crosses_ceiling(",
+            "tx.send(Ok(Frame::data(",
+        ),
+        (
+            "src/http3/server.rs",
+            include_str!("../../../src/http3/server.rs"),
+            "inspected_output_exceeds_ceiling!(",
+            "send_data(",
+        ),
+        (
+            "src/http3/cross_protocol.rs",
+            include_str!("../../../src/http3/cross_protocol.rs"),
+            "inspected_emitted_response_limit_exceeded(",
+            "send_data(",
+        ),
+    ];
+    for (path, source, charge, write) in drivers {
+        let mut releases = 0;
+        for arm in [
+            "ResponseStreamAction::Forward(",
+            "ResponseStreamAction::Terminate(",
+        ] {
+            for (start, _) in source.match_indices(arm) {
+                let line = source[..start].matches('\n').count() + 1;
+                let release = &source[start..];
+                let end = release
+                    .find(write)
+                    .unwrap_or_else(|| panic!("{path}:{line}: release arm with no write"));
+                assert!(
+                    release[..end].contains(charge),
+                    "{path}:{line}: inspector release is written without the output-ceiling charge"
+                );
+                releases += 1;
+            }
+        }
+        assert!(
+            releases >= 4,
+            "{path}: inspector release arms moved ({releases})"
+        );
+    }
+    // The cross-protocol helper is the shared boundary, not a second copy.
+    let cross = include_str!("../../../src/http3/cross_protocol.rs");
+    let helper = cross
+        .split("fn inspected_emitted_response_limit_exceeded(")
+        .nth(1)
+        .expect("cross-protocol emitted-limit helper")
+        .split("\n}\n")
+        .next()
+        .expect("helper body");
+    assert!(helper.contains("crate::proxy::body::response_output_crosses_ceiling("));
+}
+
 /// The native-H3 cross-protocol gRPC-Web relay writes straight to the QUIC
 /// stream, so its output-side ceiling is pinned structurally: every translated
 /// write and the generated terminal frame go through the shared boundary.

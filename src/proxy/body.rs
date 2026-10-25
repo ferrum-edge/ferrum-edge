@@ -6432,7 +6432,8 @@ pub(crate) async fn run_response_inspection(
 /// `max_response_body_size_bytes` (`0` = unlimited).
 ///
 /// This is the OUTPUT-side boundary every response rewrite that can change the
-/// byte count shares: both response-inspector drivers, the incremental
+/// byte count shares: every response-inspector driver (reqwest, proxy-body,
+/// the native H3 frontend relay, the H3 cross-protocol relay), the incremental
 /// gRPC-Web translator (base64 text expansion and the generated terminal
 /// trailer frame), the native-H3 cross-protocol gRPC-Web relay, and the
 /// gateway-generated aggregate MCP SSE body. The source adapters still bound

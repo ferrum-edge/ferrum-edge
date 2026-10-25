@@ -11719,8 +11719,12 @@ fn inspected_emitted_response_limit_exceeded(
     next_len: usize,
     max_response_body_size_bytes: usize,
 ) -> bool {
-    max_response_body_size_bytes > 0
-        && bytes_streamed.saturating_add(next_len as u64) > max_response_body_size_bytes as u64
+    // The one shared output-side boundary every inspector driver uses.
+    crate::proxy::body::response_output_crosses_ceiling(
+        max_response_body_size_bytes,
+        bytes_streamed,
+        next_len,
+    )
 }
 
 /// Drive a response-stream [`ResponseStreamInspector`] over a reqwest backend

@@ -9271,6 +9271,35 @@ async fn handle_h3_request(
                 }
             };
         }
+        // Output-side response ceiling for inspector releases. `total_streamed`
+        // bounds the backend's own DATA; an inspector may release more than it
+        // received (an `sse` `retry:` prefix, an `ai_*` envelope, a terminal
+        // event), so every `Forward`, `Terminate` payload, and end-of-stream
+        // release is charged against the bytes already written through the
+        // shared boundary before it is sent. On crossing, the release is
+        // withheld and the committed stream is reset with
+        // `ResponseBodyTooLarge` — no clean FIN, no trailers. `true` means the
+        // caller must leave the relay loop.
+        macro_rules! inspected_output_exceeds_ceiling {
+            ($len:expr) => {{
+                if crate::proxy::body::response_output_crosses_ceiling(
+                    effective_max_response_body_size_bytes,
+                    bytes_streamed,
+                    $len,
+                ) {
+                    warn!(
+                        "Inspected HTTP/3 response exceeded {} byte limit during streaming",
+                        effective_max_response_body_size_bytes
+                    );
+                    coalesce_buf.clear();
+                    stream.abort_committed();
+                    body_error_class = Some(crate::retry::ErrorClass::ResponseBodyTooLarge);
+                    true
+                } else {
+                    false
+                }
+            }};
+        }
         // Skipped entirely when send_response already failed or the
         // authorization bound cancelled the HEADERS write — the relay loop
         // would only rediscover the dead stream on its first send_data and
@@ -9387,6 +9416,9 @@ async fn handle_h3_request(
                                 match inspector.on_chunk(&chunk_bytes).await {
                                     ResponseStreamAction::Forward(out) => {
                                         if !out.is_empty() {
+                                            if inspected_output_exceeds_ceiling!(out.len()) {
+                                                break 'outer;
+                                            }
                                             let out_len = out.len() as u64;
                                             if let Some(observer) = grpc_web_passthrough.as_mut() {
                                                 observer.push(&out);
@@ -9410,6 +9442,9 @@ async fn handle_h3_request(
                                         if let Some(fb) = final_bytes
                                             && !fb.is_empty()
                                         {
+                                            if inspected_output_exceeds_ceiling!(fb.len()) {
+                                                break 'outer;
+                                            }
                                             let fb_len = fb.len() as u64;
                                             if let Some(observer) = grpc_web_passthrough.as_mut() {
                                                 observer.push(&fb);
@@ -9553,6 +9588,9 @@ async fn handle_h3_request(
                     match inspector.on_end().await {
                         ResponseStreamAction::Forward(out) => {
                             if !out.is_empty() {
+                                if inspected_output_exceeds_ceiling!(out.len()) {
+                                    break 'outer;
+                                }
                                 let out_len = out.len() as u64;
                                 if let Some(observer) = grpc_web_passthrough.as_mut() {
                                     observer.push(&out);
@@ -9567,6 +9605,9 @@ async fn handle_h3_request(
                             if let Some(fb) = final_bytes
                                 && !fb.is_empty()
                             {
+                                if inspected_output_exceeds_ceiling!(fb.len()) {
+                                    break 'outer;
+                                }
                                 let fb_len = fb.len() as u64;
                                 if let Some(observer) = grpc_web_passthrough.as_mut() {
                                     observer.push(&fb);
