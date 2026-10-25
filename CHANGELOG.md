@@ -139,6 +139,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`oidc_relying_party` production-launch hardening.** Successful WebSocket
+  handshakes now receive the rotated or slid session cookie (they bypass
+  `after_proxy`). A claims-freshness re-challenge after a spent or
+  indeterminate refresh no longer deletes the browser's session cookie, which
+  could erase a newer rotated cookie from another replica. A refresh the
+  provider accepted (`2xx`) but whose response cannot be validated drops the
+  consumed refresh token instead of republishing and retrying it. Sessions too
+  large for one browser cookie are split across bounded `<cookie_name>.N`
+  chunk cookies, an over-cap session is refused at the callback with a named
+  error, and every session cookie carries `Max-Age` equal to its remaining
+  absolute lifetime. Callback/logout paths must be canonical request paths.
+  The per-source pending-login cap holds when the replay cache is full (beyond
+  one extra cache-worth of sealed-only flows, login starts answer `503`).
+  Discovery documents must carry the configured `issuer`, and their HTTPS
+  endpoints may now be cross-origin (Google, Microsoft Entra ID). Post-login
+  redirects are checked as origins (scheme, port, userinfo). Logout requires
+  `Sec-Fetch-Site: same-origin`/`none` for `GET`/`HEAD` and refuses cross-site
+  `POST`s (issue #6660). New `providers[].max_age_secs`,
+  `providers[].authorization_params`, and `providers[].forward_access_token`
+  options. **Breaking:** the session context no longer binds presentation and
+  admission settings, so existing sessions and in-flight logins are
+  invalidated once on upgrade; GET logout links from other sites stop working;
+  discovery documents without a matching `issuer` and non-canonical
+  callback/logout paths are refused; `trusted_redirect_hosts` entries without a
+  port no longer admit non-default ports.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

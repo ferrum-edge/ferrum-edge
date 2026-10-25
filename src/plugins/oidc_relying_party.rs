@@ -1,4 +1,5 @@
 use crate::fips::approved::Sha256;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
@@ -61,6 +62,56 @@ const DEFAULT_SESSION_MAX_COOKIE_BYTES: u64 = 8000;
 /// minimum: every login answers 503 instead of the configuration being refused
 /// (issue #5029).
 const MIN_SESSION_MAX_COOKIE_BYTES: u64 = 1024;
+/// Largest complete session `Set-Cookie` line — `name=value` plus every
+/// attribute — the plugin emits.
+///
+/// Browsers discard, without any server-visible signal, a cookie whose
+/// name+value exceeds 4096 bytes (Chromium also bounds each attribute), and
+/// RFC 6265 §6.1 only promises 4096 bytes per cookie. `session.max_cookie_bytes`
+/// bounds the whole sealed session value; a value that does not fit one line of
+/// this size is split across `<name>.0` … `<name>.N` chunk cookies so every
+/// individual cookie stays storable (SOL-4 / MUSE-1).
+const MAX_BROWSER_COOKIE_LINE_BYTES: usize = 4000;
+/// Upper bound on the chunk cookies one sealed session is split across. Kept to
+/// one decimal digit so the chunk index and the count prefix have fixed width.
+const MAX_SESSION_COOKIE_CHUNKS: usize = 9;
+/// Smallest per-chunk value budget the configured cookie name and attributes
+/// may leave inside `MAX_BROWSER_COOKIE_LINE_BYTES`.
+const MIN_SESSION_COOKIE_CHUNK_VALUE_BYTES: usize = 1024;
+/// Width reserved in every session cookie line for the per-seal `Max-Age`
+/// attribute: the digits of `MAX_SESSION_TTL_SECS`.
+const SESSION_COOKIE_MAX_AGE_ATTR_BYTES: usize = "; Max-Age=31536000".len();
+/// Width of a chunk cookie's name suffix (`.0` … `.8`) plus its `=`.
+const SESSION_COOKIE_CHUNK_SUFFIX_BYTES: usize = ".0=".len();
+/// Width of the `<count>.` prefix carried by chunk `0`.
+const SESSION_COOKIE_CHUNK_COUNT_PREFIX_BYTES: usize = "2.".len();
+/// Carries the session's current access token from `authenticate` to
+/// `before_proxy` when `providers[].forward_access_token` is enabled. The key
+/// contains "authorization" and "bearer", so transaction-log metadata
+/// redaction masks its value.
+const UPSTREAM_ACCESS_TOKEN_METADATA_KEY: &str = "oidc_rp.upstream_bearer_authorization";
+/// Authorization-request parameters the plugin owns. A static
+/// `providers[].authorization_params` entry may not replace any of them:
+/// overriding these would break PKCE, state/nonce binding, the registered
+/// redirect, the query response mode the callback reads, or `max_age_secs`.
+const RESERVED_AUTHORIZATION_PARAMS: &[&str] = &[
+    "response_type",
+    "client_id",
+    "redirect_uri",
+    "scope",
+    "state",
+    "nonce",
+    "code_challenge",
+    "code_challenge_method",
+    "max_age",
+    "response_mode",
+    "request",
+    "request_uri",
+];
+/// Upper bound on static `providers[].authorization_params` entries.
+const MAX_AUTHORIZATION_PARAMS: usize = 16;
+/// Upper bound on one static authorization parameter name or value, in bytes.
+const MAX_AUTHORIZATION_PARAM_BYTES: usize = 512;
 const STATE_CACHE_FULL_ERROR: &str = r#"{"error":"OIDC state cache full"}"#;
 const DEFAULT_STATE_TTL_SECS: u64 = 600;
 const DEFAULT_STATE_CACHE_MAX_ENTRIES: usize = 10_000;
@@ -85,6 +136,11 @@ const MAX_SESSION_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 const MAX_ID_TOKEN_CLOCK_SKEW_SECS: u64 = 3600;
 const STATE_EXPIRY_BUCKET_SECS: u64 = 1;
 const SESSION_PAYLOAD_VERSION: u8 = 2;
+/// Version of the normalized configuration the session/pending-flow AEAD
+/// context is derived from. Version 3 binds only fields that change what a
+/// sealed session asserts; presentation and admission knobs no longer
+/// invalidate every outstanding session (MUSE-5).
+const SESSION_CONTEXT_SEED_VERSION: u8 = 3;
 const PENDING_FLOW_PAYLOAD_VERSION: u8 = 1;
 const MAX_PENDING_FLOW_ORIGINAL_URL_BYTES: usize = 2048;
 const MAX_PENDING_CORRELATION_COOKIES: usize = 2;
@@ -116,6 +172,9 @@ const PROVIDER_FIELDS: &[&str] = &[
     "consumer_header_claim",
     "claim_headers",
     "id_token_clock_skew_secs",
+    "authorization_params",
+    "max_age_secs",
+    "forward_access_token",
 ];
 const CLIENT_AUTH_FIELDS: &[&str] = &[
     "method",
@@ -245,6 +304,16 @@ struct ProviderRuntime {
     scope_claim: String,
     role_claim: String,
     id_token_clock_skew: Duration,
+    /// Static extra authorization-request parameters (`prompt`,
+    /// `acr_values`, `login_hint`, …), appended after the plugin-owned ones.
+    authorization_params: Vec<(String, String)>,
+    /// OIDC Core §3.1.2.1 `max_age`: when set, the authorization request
+    /// carries it, the callback requires an ID token `auth_time` inside it,
+    /// and a session whose authentication is older re-challenges.
+    max_age_secs: Option<u64>,
+    /// Relay the session's current access token to the backend as
+    /// `Authorization: Bearer`, replacing any client-supplied value.
+    forward_access_token: bool,
     http_client: PluginHttpClient,
     warmup_hostnames: Vec<String>,
 }
@@ -286,6 +355,9 @@ struct SessionRuntime {
     /// receives the verified identity and claim headers.
     hide_session_cookie: bool,
     max_cookie_bytes: usize,
+    /// Largest sealed-value slice one session chunk cookie may carry so its
+    /// complete `Set-Cookie` line stays within `MAX_BROWSER_COOKIE_LINE_BYTES`.
+    chunk_value_bytes: usize,
     ttl: Duration,
     idle_ttl: Duration,
     state_cache: Arc<StateCache>,
@@ -360,6 +432,13 @@ struct FlowState {
 
 struct StateCache {
     entries: DashMap<String, FlowState>,
+    /// Sealed-only login starts admitted while `entries` is full. They carry no
+    /// replay protection (the sealed cookie and the provider's one-time code
+    /// still do), but each one stays charged to its source until it expires or
+    /// its callback arrives, so the per-source cap holds even when the replay
+    /// cache is saturated (MUSE-2). Bounded by `max_entries`.
+    overflow: DashMap<String, FlowState>,
+    active_overflow: AtomicUsize,
     /// States already accepted for callback processing on this instance. This
     /// is a bounded, best-effort local replay aid; the provider's one-time
     /// authorization code remains the cross-replica replay authority.
@@ -412,14 +491,27 @@ struct SessionPayload {
     last_touch_unix: i64,
     nonce: String,
     claims: Value,
+    /// The login's ID token `auth_time`, kept across refreshes (a refresh never
+    /// re-authenticates the user). Present only when the callback had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_time_unix: Option<i64>,
 }
 
+/// The configuration a sealed session or pending flow is cryptographically
+/// bound to.
+///
+/// Only fields that change what a sealed value *means* belong here: who issued
+/// it and through which endpoints, which client it was minted for, which
+/// claims grant identity, scopes, roles, and headers, and the cookie scope and
+/// lifetimes it was issued under. Presentation and admission knobs (challenge
+/// statuses, the redirect allowlist, pending-flow cache sizes, logout
+/// behavior, `max_cookie_bytes`) are deliberately absent: changing one of them
+/// must not log every user out (MUSE-5).
 #[derive(Serialize)]
 struct NormalizedSessionContextSeed {
     version: u8,
     provider: NormalizedProviderContext,
     session: NormalizedSessionContext,
-    behavior: NormalizedBehaviorContext,
 }
 
 #[derive(Serialize)]
@@ -435,8 +527,6 @@ struct NormalizedProviderContext {
     client_auth: NormalizedClientAuthContext,
     redirect_uri: String,
     callback_path: String,
-    logout_path: String,
-    post_logout_redirect_uri: Option<String>,
     scopes: Vec<String>,
     audiences: Vec<String>,
     required_scopes: Vec<String>,
@@ -467,27 +557,11 @@ struct NormalizedSessionContext {
     store: String,
     ttl_secs: u64,
     idle_ttl_secs: u64,
-    max_cookie_bytes: u64,
     secure: bool,
     http_only: bool,
     same_site: String,
     domain: Option<String>,
     path: String,
-}
-
-#[derive(Serialize)]
-struct NormalizedBehaviorContext {
-    state_ttl_secs: u64,
-    state_cache_max_entries: u64,
-    state_cache_max_entries_per_source: u64,
-    post_login_redirect_param: Option<String>,
-    trusted_redirect_hosts: Vec<String>,
-    refresh_skew_secs: u64,
-    challenge_html_status: u64,
-    challenge_api_status: u64,
-    html_accept_substrings: Vec<String>,
-    rp_initiated_logout: bool,
-    post_login_default_path: String,
 }
 
 #[derive(Deserialize)]
@@ -559,8 +633,16 @@ enum RefreshFailure {
     /// itself (spent by an earlier rotation, revoked, or expired). Re-submitting
     /// it can never succeed, and re-sealing it may overwrite a rotated cookie.
     InvalidGrant,
-    /// Any other failure (transport, non-2xx without `invalid_grant`, malformed
-    /// response, ID token validation). The token is not known to be spent, so
+    /// The token endpoint answered the grant with a 2xx, but the response could
+    /// not be adopted: an unreadable or malformed body, a non-bearer token
+    /// type, or a refreshed ID token / UserInfo result that failed validation
+    /// (for example an ID token signed by a key the JWKS store has not
+    /// published yet). The provider has already consumed — and with rotation,
+    /// replaced — the submitted refresh token, so it must never be republished
+    /// or resubmitted as live (SOL-3, RFC 9700 §4.14.2).
+    Consumed(String),
+    /// Any failure before the provider accepted the grant (transport error,
+    /// non-2xx without `invalid_grant`). The token is not known to be spent, so
     /// the retry is deferred by `REFRESH_RETRY_BACKOFF_SECS`.
     Other(String),
 }
@@ -582,8 +664,11 @@ struct TokenErrorResponse {
 /// Outcome of one refresh transition, published to every request that carries
 /// the refresh token the transition spent.
 enum RefreshFlightResult {
-    /// The grant rotated the session. `sealed` is the codec-sealed refreshed
-    /// payload (ciphertext, never the raw tokens) that followers open and adopt.
+    /// The grant moved the session to a new credential state that every
+    /// request carrying the spent token must adopt: either a validated
+    /// rotation, or (after a consumed-but-unadoptable grant) the same session
+    /// with its refresh token dropped. `sealed` is the codec-sealed payload
+    /// (ciphertext, never the raw tokens) that followers open and adopt.
     Rotated {
         sealed: String,
         claims_refreshed: bool,
@@ -981,7 +1066,7 @@ impl OidcRelyingParty {
         };
         let discovery = Arc::new(ArcSwap::from_pointee(discovery_doc.clone()));
 
-        let context_seed = session_context_seed(provider_obj, session_obj, behavior_obj)?;
+        let context_seed = session_context_seed(provider_obj, session_obj)?;
         let domain = optional_string(session_obj, "domain", "session")?;
         let path =
             optional_string(session_obj, "path", "session")?.unwrap_or_else(|| "/".to_string());
@@ -1086,6 +1171,23 @@ impl OidcRelyingParty {
         }
         let cookie_attrs =
             build_cookie_attrs(secure, http_only, &same_site, domain.as_deref(), &path);
+        // Every session cookie line — a single cookie or one chunk of a split
+        // session — must fit a browser's per-cookie limit with its name, the
+        // per-seal `Max-Age`, and every attribute included. A long explicit
+        // name, domain, or path that leaves too little room for a usable chunk
+        // is refused here instead of producing cookies a browser discards.
+        let chunk_overhead = cookie_name
+            .len()
+            .saturating_add(SESSION_COOKIE_CHUNK_SUFFIX_BYTES)
+            .saturating_add(SESSION_COOKIE_MAX_AGE_ATTR_BYTES)
+            .saturating_add("; ".len())
+            .saturating_add(cookie_attrs.len());
+        let chunk_value_bytes = MAX_BROWSER_COOKIE_LINE_BYTES.saturating_sub(chunk_overhead);
+        if chunk_value_bytes < MIN_SESSION_COOKIE_CHUNK_VALUE_BYTES {
+            return Err(format!(
+                "oidc_relying_party: `session.cookie_name`, `session.domain`, and `session.path` leave fewer than {MIN_SESSION_COOKIE_CHUNK_VALUE_BYTES} bytes for the sealed session inside a {MAX_BROWSER_COOKIE_LINE_BYTES}-byte browser cookie"
+            ));
+        }
         let state_ttl = Duration::from_secs(optional_behavior_u64(
             behavior_obj,
             "state_ttl_secs",
@@ -1138,6 +1240,7 @@ impl OidcRelyingParty {
             correlation_cookie_attrs: build_correlation_cookie_attrs(secure, &callback_path),
             hide_session_cookie: optional_bool(session_obj, "hide_session_cookie")?.unwrap_or(true),
             max_cookie_bytes: max_cookie_bytes as usize,
+            chunk_value_bytes,
             ttl: Duration::from_secs(ttl_secs),
             idle_ttl: Duration::from_secs(idle_ttl_secs),
             state_cache: Arc::new(StateCache::new(
@@ -1151,8 +1254,15 @@ impl OidcRelyingParty {
 
         let post_login_redirect_param =
             optional_behavior_string(behavior_obj, "post_login_redirect_param")?;
+        // `Url::host_str` lowercases a parsed DNS host, so entries are
+        // normalized the same way; a mixed-case entry used to match nothing.
+        // An entry may name an explicit port (`host:8443`); see
+        // `sanitize_redirect` for the origin rules.
         let trusted_redirect_hosts =
-            parse_behavior_string_array(behavior_obj, "trusted_redirect_hosts")?;
+            parse_behavior_string_array(behavior_obj, "trusted_redirect_hosts")?
+                .into_iter()
+                .map(|host| host.to_ascii_lowercase())
+                .collect::<Vec<_>>();
         if post_login_redirect_param.is_some() && trusted_redirect_hosts.is_empty() {
             return Err("oidc_relying_party: `behavior.trusted_redirect_hosts` is required when `post_login_redirect_param` is set".to_string());
         }
@@ -1242,6 +1352,7 @@ impl OidcRelyingParty {
                     Arc::clone(&jwks_publication_gate),
                     http_client.clone(),
                     url,
+                    issuer.clone(),
                     explicit_userinfo_endpoint,
                     explicit_end_session_endpoint,
                 )
@@ -1258,6 +1369,27 @@ impl OidcRelyingParty {
         )?;
         let claim_header_destinations =
             ClaimHeaderDestinations::from_mapping_groups(std::iter::once(claim_headers.as_slice()));
+
+        let authorization_params = parse_authorization_params(provider_obj)?;
+        let max_age_secs = match provider_obj.get("max_age_secs") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let max_age = value.as_u64().ok_or_else(|| {
+                    "oidc_relying_party: `provider[0].max_age_secs` must be an unsigned integer"
+                        .to_string()
+                })?;
+                // Added to a Unix timestamp on every authenticated request, so
+                // it carries the same bound as the session lifetimes.
+                if max_age > MAX_SESSION_TTL_SECS {
+                    return Err(format!(
+                        "oidc_relying_party: `provider[0].max_age_secs` must be <= {MAX_SESSION_TTL_SECS}"
+                    ));
+                }
+                Some(max_age)
+            }
+        };
+        let forward_access_token =
+            optional_bool(provider_obj, "forward_access_token")?.unwrap_or(false);
 
         let consumer_identity_claim =
             optional_string(provider_obj, "consumer_identity_claim", "provider[0]")?
@@ -1302,6 +1434,9 @@ impl OidcRelyingParty {
             role_claim: optional_string(provider_obj, "role_claim", "provider[0]")?
                 .unwrap_or_else(|| "roles".to_string()),
             id_token_clock_skew: Duration::from_secs(id_token_clock_skew_secs),
+            authorization_params,
+            max_age_secs,
+            forward_access_token,
             http_client,
             warmup_hostnames: discovery_url
                 .and_then(|url| hostname_from_url(&url))
@@ -1391,6 +1526,30 @@ impl OidcRelyingParty {
             Ok(claims) => claims,
             Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
+        let now = chrono::Utc::now().timestamp();
+        // `auth_time` is a protected claim, so it is read from the verified ID
+        // token itself, never from UserInfo.
+        let auth_time = claims
+            .get("auth_time")
+            .and_then(|value| numeric_date_seconds(value, NumericDateBound::Upper));
+        if let Some(max_age) = self.provider.max_age_secs {
+            // OIDC Core §3.1.2.1 / §3.1.3.7: with `max_age` requested the ID
+            // token must carry `auth_time`, and an authentication older than
+            // the requested age is refused rather than silently accepted.
+            let leeway = self.provider.id_token_clock_skew.as_secs() as i64;
+            let fresh = auth_time.is_some_and(|authenticated_at| {
+                now <= authenticated_at
+                    .saturating_add(max_age as i64)
+                    .saturating_add(leeway)
+            });
+            if !fresh {
+                return self.callback_reject(
+                    400,
+                    r#"{"error":"Invalid ID token auth_time"}"#.to_string(),
+                    Some(&state),
+                );
+            }
+        }
         let merged_claims = if let Some(userinfo_endpoint) = &discovery.userinfo_endpoint {
             match self
                 .fetch_userinfo(userinfo_endpoint, &token.access_token, proxy_hops)
@@ -1415,7 +1574,6 @@ impl OidcRelyingParty {
         } else {
             claims
         };
-        let now = chrono::Utc::now().timestamp();
         let expires_at = expires_at_from_expires_in(token.expires_in, now, self.session.ttl);
         let claims_expires_at = claim_expiry(&merged_claims).unwrap_or(expires_at);
         let Ok(sub) = required_subject(&merged_claims, "ID token") else {
@@ -1443,8 +1601,12 @@ impl OidcRelyingParty {
             last_touch_unix: now,
             nonce: flow.nonce,
             claims: merged_claims,
+            auth_time_unix: auth_time,
         };
-        let cookie = match self.seal_session_cookie(&payload) {
+        let cookie = match self.seal_session_cookie_for_request(
+            &payload,
+            ctx.headers.get("cookie").map(String::as_str),
+        ) {
             Ok(cookie) => cookie,
             Err(body) => return self.callback_reject(400, body, Some(&state)),
         };
@@ -1677,10 +1839,15 @@ impl OidcRelyingParty {
         ctx: &mut RequestContext,
         consumer_index: &ConsumerIndex,
     ) -> PluginResult {
-        let Some(cookie_value) = cookie_value(ctx, &self.session.cookie_name) else {
+        // Scope the (possibly reassembled) cookie value so its borrow of `ctx`
+        // ends before a challenge needs `ctx` mutably.
+        let opened = self
+            .session_cookie_value(ctx)
+            .map(|value| self.open_session(&value));
+        let Some(opened) = opened else {
             return self.challenge(ctx, false);
         };
-        let Some(mut payload) = self.open_session(cookie_value) else {
+        let Some(mut payload) = opened else {
             return self.challenge(ctx, true);
         };
         let now = chrono::Utc::now().timestamp();
@@ -1697,6 +1864,19 @@ impl OidcRelyingParty {
         }
 
         let leeway = self.provider.id_token_clock_skew.as_secs() as i64;
+        // `max_age_secs` bounds how old the user's authentication may be, not
+        // the session: a refresh never re-authenticates, so a session whose
+        // login is older than the policy re-challenges instead of refreshing.
+        if let Some(max_age) = self.provider.max_age_secs {
+            let authenticated_recently = payload.auth_time_unix.is_some_and(|authenticated_at| {
+                now <= authenticated_at
+                    .saturating_add(max_age as i64)
+                    .saturating_add(leeway)
+            });
+            if !authenticated_recently {
+                return self.challenge(ctx, true);
+            }
+        }
         let claims_expires_at = effective_claims_expires_at(&payload);
         let backfilled_claims_expiry = payload.claims_expires_at_unix <= 0;
         if backfilled_claims_expiry {
@@ -1739,9 +1919,17 @@ impl OidcRelyingParty {
         // effective expiry. If they are still expired after any forced/due
         // refresh attempt, fail closed and force re-auth rather than emitting
         // stale claim headers and scope/role decisions.
+        //
+        // The challenge clears the session cookie only when this request may
+        // publish session state at all. After a spent or indeterminate refresh
+        // the browser may already hold a newer rotated cookie (from another
+        // replica, or from the winner of this generation's flight); deleting
+        // "the" session cookie by name would delete that successor too when
+        // this response is applied last (SOL-2). The request still fails
+        // closed; it just leaves the browser's cookie alone.
         let claims_expires_at = effective_claims_expires_at(&payload);
         if now > claims_expires_at.saturating_add(leeway) {
-            return self.challenge(ctx, true);
+            return self.challenge(ctx, !refresh.must_not_reseal);
         }
 
         // A spent (or indeterminate) refresh transition forbids publishing ANY
@@ -1756,7 +1944,10 @@ impl OidcRelyingParty {
             mutated
         };
         let rolling_cookie = if session_mutated {
-            match self.seal_session_cookie(&payload) {
+            match self.seal_session_cookie_for_request(
+                &payload,
+                ctx.headers.get("cookie").map(String::as_str),
+            ) {
                 Ok(cookie) => Some(cookie),
                 Err(error) => {
                     warn!(
@@ -1799,6 +1990,22 @@ impl OidcRelyingParty {
             if let Some(cookie) = rolling_cookie {
                 attempt
                     .stage_principal_metadata(SESSION_SET_COOKIE_METADATA_KEY.to_string(), cookie);
+            }
+            // Staged with the principal so it only reaches `before_proxy` when
+            // this session is the accepted credential. A token that is not a
+            // plain RFC 6750 `b64token`-shaped visible-ASCII string is never
+            // turned into a header value.
+            if self.provider.forward_access_token
+                && is_relayable_access_token(&payload.access_token_b64)
+            {
+                let mut authorization =
+                    String::with_capacity("Bearer ".len() + payload.access_token_b64.len());
+                authorization.push_str("Bearer ");
+                authorization.push_str(&payload.access_token_b64);
+                attempt.stage_principal_metadata(
+                    UPSTREAM_ACCESS_TOKEN_METADATA_KEY.to_string(),
+                    authorization,
+                );
             }
         } else if refresh.mutated
             && let Some(cookie) = rolling_cookie
@@ -1970,6 +2177,38 @@ impl OidcRelyingParty {
                                 RefreshFlightResult::SpentCredential,
                             )
                         }
+                        Err(RefreshFailure::Consumed(error)) => {
+                            warn!(
+                                plugin = "oidc_relying_party",
+                                error = %error,
+                                "OIDC token refresh was accepted by the provider but its response could not be adopted; the spent refresh token is dropped from the session and the freshness gate decides whether the existing claims may keep serving"
+                            );
+                            // The provider consumed the submitted token, so it
+                            // must never be republished or resubmitted. The
+                            // session keeps its existing, still-validated
+                            // claims without a refresh token: it serves until
+                            // those claims expire and then re-challenges. This
+                            // request ran the grant that spent the token, so
+                            // no successor exists for this cookie to overwrite.
+                            payload.refresh_token_b64 = None;
+                            match self.seal_session_value(payload) {
+                                Ok(sealed) => (
+                                    RefreshOutcome {
+                                        mutated: true,
+                                        refreshed: false,
+                                        must_not_reseal: false,
+                                    },
+                                    RefreshFlightResult::Rotated {
+                                        sealed,
+                                        claims_refreshed: false,
+                                    },
+                                ),
+                                Err(_) => (
+                                    RefreshOutcome::SPENT_OR_UNKNOWN,
+                                    RefreshFlightResult::SpentCredential,
+                                ),
+                            }
+                        }
                         Err(RefreshFailure::Other(error)) => {
                             warn!(
                                 plugin = "oidc_relying_party",
@@ -2092,11 +2331,30 @@ impl OidcRelyingParty {
         if !response.status().is_success() {
             return Err(classify_refresh_failure(response).await);
         }
+        // From here on the provider has accepted the grant: the submitted
+        // refresh token is spent (and, with rotation, already replaced), so no
+        // failure below may be retried with it.
+        self.adopt_refresh_response(discovery, response, payload, now, proxy_hops)
+            .await
+            .map_err(RefreshFailure::Consumed)
+    }
+
+    /// Validate and adopt a 2xx refresh-grant response. Any `Err` means the
+    /// grant was consumed but its result cannot be used; `payload` is mutated
+    /// only after every fallible step has succeeded.
+    async fn adopt_refresh_response(
+        &self,
+        discovery: &DiscoveryDoc,
+        response: reqwest::Response,
+        payload: &mut SessionPayload,
+        now: i64,
+        proxy_hops: Option<u8>,
+    ) -> Result<bool, String> {
         let token: RefreshTokenResponse = read_bounded_json(response, MAX_TOKEN_RESPONSE_BYTES)
             .await
             .map_err(|_| r#"{"error":"Token refresh response parse failed"}"#.to_string())?;
         if !token.token_type.eq_ignore_ascii_case("bearer") {
-            return Err(r#"{"error":"Invalid refresh token type"}"#.to_string().into());
+            return Err(r#"{"error":"Invalid refresh token type"}"#.to_string());
         }
         let existing_claims_expires_at = stored_claims_expires_at(payload);
         let expires_at = expires_at_for_token(&token, now, self.session.ttl);
@@ -2224,7 +2482,10 @@ impl OidcRelyingParty {
                 }
             }
             if clear {
-                cookie = join_set_cookies(cookie, self.clear_cookie());
+                cookie = join_set_cookies(
+                    cookie,
+                    self.clear_session_cookies(ctx.headers.get("cookie").map(String::as_str)),
+                );
             }
             redirect(self.behavior.challenge_html_status, &location, Some(cookie))
         } else {
@@ -2234,7 +2495,10 @@ impl OidcRelyingParty {
                 OIDC_INVALID_SESSION_CHALLENGE.to_string(),
             );
             if clear {
-                headers.insert("set-cookie".to_string(), self.clear_cookie());
+                headers.insert(
+                    "set-cookie".to_string(),
+                    self.clear_session_cookies(ctx.headers.get("cookie").map(String::as_str)),
+                );
             }
             PluginResult::Reject {
                 status_code: self.behavior.challenge_api_status,
@@ -2288,15 +2552,24 @@ impl OidcRelyingParty {
         let discovery = self.provider.discovery.load().as_ref().as_ref().cloned()?;
         let challenge = pkce_challenge(code_verifier);
         let mut url = Url::parse(&discovery.authorization_endpoint).ok()?;
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &self.provider.client_id)
-            .append_pair("redirect_uri", &self.provider.redirect_uri)
-            .append_pair("scope", &self.provider.scopes.join(" "))
-            .append_pair("state", state)
-            .append_pair("nonce", nonce)
-            .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256");
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("response_type", "code")
+                .append_pair("client_id", &self.provider.client_id)
+                .append_pair("redirect_uri", &self.provider.redirect_uri)
+                .append_pair("scope", &self.provider.scopes.join(" "))
+                .append_pair("state", state)
+                .append_pair("nonce", nonce)
+                .append_pair("code_challenge", &challenge)
+                .append_pair("code_challenge_method", "S256");
+            if let Some(max_age) = self.provider.max_age_secs {
+                query.append_pair("max_age", &max_age.to_string());
+            }
+            for (name, value) in &self.provider.authorization_params {
+                query.append_pair(name, value);
+            }
+        }
         Some(url.to_string())
     }
 
@@ -2349,11 +2622,160 @@ impl OidcRelyingParty {
     }
 
     fn seal_session_cookie(&self, payload: &SessionPayload) -> Result<String, String> {
+        self.seal_session_cookie_for_request(payload, None)
+    }
+
+    /// Seal `payload` into the newline-joined `Set-Cookie` line(s) that install
+    /// it in the browser.
+    ///
+    /// Every line carries `Max-Age` = the session's remaining absolute
+    /// lifetime, so `session.ttl_secs` survives a browser restart instead of
+    /// ending with the browser session (MUSE-4). A sealed value whose single
+    /// line would exceed `MAX_BROWSER_COOKIE_LINE_BYTES` is split into
+    /// `<name>.0` … `<name>.N-1` chunk cookies (chunk `0` carries the `N.`
+    /// count prefix); the AEAD tag over the whole value authenticates the
+    /// reassembly, so a missing, reordered, or substituted chunk fails closed.
+    /// `request_cookie` is the request's `Cookie` header: the representation
+    /// not being emitted, and any chunk beyond the new count that the browser
+    /// still holds, are expired in the same response so a stale form can never
+    /// shadow the new one.
+    fn seal_session_cookie_for_request(
+        &self,
+        payload: &SessionPayload,
+        request_cookie: Option<&str>,
+    ) -> Result<String, String> {
         let value = self.seal_session_value(payload)?;
-        Ok(format!(
-            "{}={}; {}",
-            self.session.cookie_name, value, self.session.cookie_attrs
-        ))
+        let now = chrono::Utc::now().timestamp();
+        let remaining = payload
+            .issued_at_unix
+            .saturating_add(self.session.ttl.as_secs() as i64)
+            .saturating_sub(now)
+            .clamp(0, MAX_SESSION_TTL_SECS as i64);
+        let name = self.session.cookie_name.as_str();
+        let attrs = self.session.cookie_attrs.as_str();
+        let single_line_len = name
+            .len()
+            .saturating_add("=".len())
+            .saturating_add(value.len())
+            .saturating_add(SESSION_COOKIE_MAX_AGE_ATTR_BYTES)
+            .saturating_add("; ".len())
+            .saturating_add(attrs.len());
+        let mut lines: Vec<String> = Vec::new();
+        if single_line_len <= MAX_BROWSER_COOKIE_LINE_BYTES {
+            lines.push(format!("{name}={value}; Max-Age={remaining}; {attrs}"));
+            for index in present_session_chunk_indices(request_cookie, name) {
+                lines.push(format!(
+                    "{}=; Max-Age=0; {attrs}",
+                    session_chunk_cookie_name(name, index)
+                ));
+            }
+            return Ok(lines.join("\n"));
+        }
+
+        let chunk_capacity = self.session.chunk_value_bytes;
+        let first_capacity = chunk_capacity.saturating_sub(SESSION_COOKIE_CHUNK_COUNT_PREFIX_BYTES);
+        if first_capacity == 0 {
+            return Err(r#"{"error":"OIDC session exceeds browser cookie limits"}"#.to_string());
+        }
+        // The sealed value is base64url, so every byte is ASCII and any byte
+        // offset is a character boundary.
+        let bytes = value.as_bytes();
+        let mut parts: Vec<&str> = Vec::new();
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let capacity = if parts.is_empty() {
+                first_capacity
+            } else {
+                chunk_capacity
+            };
+            let end = offset.saturating_add(capacity).min(bytes.len());
+            let part = value.get(offset..end).ok_or_else(|| {
+                r#"{"error":"OIDC session exceeds browser cookie limits"}"#.to_string()
+            })?;
+            parts.push(part);
+            offset = end;
+        }
+        let count = parts.len();
+        if !(2..=MAX_SESSION_COOKIE_CHUNKS).contains(&count) {
+            warn!(
+                plugin = "oidc_relying_party",
+                chunks = count,
+                max_chunks = MAX_SESSION_COOKIE_CHUNKS,
+                "OIDC sealed session does not fit the bounded chunk-cookie count"
+            );
+            return Err(r#"{"error":"OIDC session exceeds browser cookie limits"}"#.to_string());
+        }
+        for (index, part) in parts.iter().enumerate() {
+            let chunk_name = session_chunk_cookie_name(name, index);
+            if index == 0 {
+                lines.push(format!(
+                    "{chunk_name}={count}.{part}; Max-Age={remaining}; {attrs}"
+                ));
+            } else {
+                lines.push(format!("{chunk_name}={part}; Max-Age={remaining}; {attrs}"));
+            }
+        }
+        // Expire the unchunked form and any longer previous chunk set.
+        lines.push(format!("{name}=; Max-Age=0; {attrs}"));
+        for index in present_session_chunk_indices(request_cookie, name) {
+            if index >= count {
+                lines.push(format!(
+                    "{}=; Max-Age=0; {attrs}",
+                    session_chunk_cookie_name(name, index)
+                ));
+            }
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// The request's sealed session value: the unchunked `<name>` cookie, or the
+    /// value reassembled from `<name>.0` … `<name>.N-1`.
+    ///
+    /// `None` means the browser presented no session cookie at all. A chunk set
+    /// that is incomplete, malformed, or over `session.max_cookie_bytes`
+    /// yields an empty value, which never opens, so the caller challenges and
+    /// clears it exactly like any other invalid session cookie. Reassembly
+    /// allocates only for a chunked session.
+    fn session_cookie_value<'a>(&self, ctx: &'a RequestContext) -> Option<Cow<'a, str>> {
+        let header = ctx.headers.get("cookie")?;
+        let name = self.session.cookie_name.as_str();
+        let unchunked = cookie_value_in(header, name);
+        if let Some(value) = unchunked.filter(|value| !value.is_empty()) {
+            return Some(Cow::Borrowed(value));
+        }
+        let first_name = session_chunk_cookie_name(name, 0);
+        let Some(first) = cookie_value_in(header, &first_name) else {
+            return unchunked.map(Cow::Borrowed);
+        };
+        let Some(value) = self.reassemble_session_chunks(header, name, first) else {
+            return Some(Cow::Borrowed(""));
+        };
+        Some(Cow::Owned(value))
+    }
+
+    fn reassemble_session_chunks(&self, header: &str, name: &str, first: &str) -> Option<String> {
+        let (count, first_part) = first.split_once('.')?;
+        if count.len() != 1 || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let count: usize = count.parse().ok()?;
+        if !(2..=MAX_SESSION_COOKIE_CHUNKS).contains(&count) {
+            return None;
+        }
+        let max = self.session.max_cookie_bytes;
+        if first_part.len() > max {
+            return None;
+        }
+        let mut value = String::with_capacity(max.min(first_part.len().saturating_mul(count)));
+        value.push_str(first_part);
+        for index in 1..count {
+            let part = cookie_value_in(header, &session_chunk_cookie_name(name, index))?;
+            if part.is_empty() || value.len().saturating_add(part.len()) > max {
+                return None;
+            }
+            value.push_str(part);
+        }
+        Some(value)
     }
 
     /// Seal a payload to its cookie value (without name and attributes). Also
@@ -2363,6 +2785,18 @@ impl OidcRelyingParty {
         let bytes = serde_json::to_vec(payload)
             .map_err(|_| r#"{"error":"Session creation failed"}"#.to_string())?;
         let estimated_cookie_value_len = encoded_session_cookie_len(bytes.len());
+        if estimated_cookie_value_len > self.session.max_cookie_bytes {
+            // Refuse with a named cause rather than minting a session the
+            // browser cannot hold. The callback answers this instead of
+            // redirecting into a login loop (SOL-4).
+            warn!(
+                plugin = "oidc_relying_party",
+                estimated_cookie_value_len,
+                max_cookie_bytes = self.session.max_cookie_bytes,
+                "OIDC sealed session exceeds session.max_cookie_bytes; raise the cap or reduce the provider's token and claim sizes"
+            );
+            return Err(r#"{"error":"OIDC session exceeds session.max_cookie_bytes"}"#.to_string());
+        }
         if estimated_cookie_value_len.saturating_mul(4) >= self.session.max_cookie_bytes * 3 {
             warn!(
                 plugin = "oidc_relying_party",
@@ -2451,6 +2885,9 @@ impl OidcRelyingParty {
             issued_at_unix: now - touch_age,
             last_touch_unix: now - touch_age,
             nonce: "test-nonce".to_string(),
+            auth_time_unix: claims
+                .get("auth_time")
+                .and_then(|value| numeric_date_seconds(value, NumericDateBound::Upper)),
             claims,
         })
     }
@@ -2512,11 +2949,19 @@ impl OidcRelyingParty {
         Some(payload)
     }
 
-    fn clear_cookie(&self) -> String {
-        format!(
-            "{}=; Max-Age=0; {}",
-            self.session.cookie_name, self.session.cookie_attrs
-        )
+    /// Expire the session cookie, plus every chunk cookie of a split session
+    /// that the request carried.
+    fn clear_session_cookies(&self, request_cookie: Option<&str>) -> String {
+        let name = self.session.cookie_name.as_str();
+        let attrs = self.session.cookie_attrs.as_str();
+        let mut cleared = format!("{name}=; Max-Age=0; {attrs}");
+        for index in present_session_chunk_indices(request_cookie, name) {
+            cleared.push('\n');
+            cleared.push_str(&session_chunk_cookie_name(name, index));
+            cleared.push_str("=; Max-Age=0; ");
+            cleared.push_str(attrs);
+        }
+        cleared
     }
 
     /// Remove this plugin's own cookies from the backend-visible `Cookie`
@@ -2570,6 +3015,7 @@ impl OidcRelyingParty {
         let segment = segment.trim();
         let name = segment.split_once('=').map_or(segment, |(name, _)| name);
         name == self.session.cookie_name
+            || session_chunk_index(name, &self.session.cookie_name).is_some()
             || name
                 .strip_prefix(self.session.correlation_cookie_name_prefix.as_str())
                 .is_some_and(is_derived_correlation_cookie_suffix)
@@ -2632,22 +3078,46 @@ impl OidcRelyingParty {
         }
     }
 
+    /// Decide where the browser lands after a successful callback.
+    ///
+    /// A target is trusted only as an origin, not just a host name (MUSE-6):
+    /// it must use the same scheme as `redirect_uri` (so an `https` login can
+    /// never be sent on to `http`), carry no userinfo, and match a
+    /// `behavior.trusted_redirect_hosts` entry by host *and* port — an entry
+    /// without a port admits only the scheme's default port, and `host:port`
+    /// admits exactly that port. Anything else lands on
+    /// `behavior.post_login_default_path`.
     fn sanitize_redirect(&self, original: &str) -> String {
+        let fallback = || self.behavior.post_login_default_path.clone();
         let Ok(parsed) = Url::parse(original) else {
-            return self.behavior.post_login_default_path.clone();
+            return fallback();
         };
         let Some(host) = parsed.host_str() else {
-            return self.behavior.post_login_default_path.clone();
+            return fallback();
+        };
+        let callback_scheme = Url::parse(&self.provider.redirect_uri)
+            .map(|callback| callback.scheme().to_string())
+            .unwrap_or_default();
+        if parsed.scheme() != callback_scheme
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return fallback();
+        }
+        // `Url::port` is `None` for the scheme's default port.
+        let authority = match parsed.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
         };
         if self
             .behavior
             .trusted_redirect_hosts
             .iter()
-            .any(|trusted| trusted == host)
+            .any(|trusted| *trusted == authority)
         {
             original.to_string()
         } else {
-            self.behavior.post_login_default_path.clone()
+            fallback()
         }
     }
 }
@@ -2699,10 +3169,24 @@ impl super::Plugin for OidcRelyingParty {
             ctx.materialize_query_params();
             self.handle_callback(ctx).await
         } else if ctx.path == self.provider.logout_path {
+            // Logout deletes the session, revokes its refresh token, and ends
+            // the provider session, so a cross-site link or form must not be
+            // able to trigger it (issue #6660). GET/HEAD require a browser
+            // `Sec-Fetch-Site` proving a same-origin or user-initiated
+            // navigation; POST is refused only when the browser reports a
+            // cross-site or same-site (sibling-host) origin, so a non-browser
+            // client can still POST. Nothing is cleared or contacted on refusal.
+            if let Some(refusal) = logout_request_refusal(ctx) {
+                return refusal;
+            }
             let mut headers = HashMap::new();
-            headers.insert("set-cookie".to_string(), self.clear_cookie());
-            let payload = cookie_value(ctx, &self.session.cookie_name)
-                .and_then(|value| self.open_session(value));
+            headers.insert(
+                "set-cookie".to_string(),
+                self.clear_session_cookies(ctx.headers.get("cookie").map(String::as_str)),
+            );
+            let payload = self
+                .session_cookie_value(ctx)
+                .and_then(|value| self.open_session(&value));
             let discovery = self.provider.discovery.load_full();
             if self.behavior.rp_initiated_logout
                 && let Some(payload) = payload
@@ -2764,10 +3248,13 @@ impl super::Plugin for OidcRelyingParty {
         self.run_session_auth(ctx, consumer_index).await
     }
     fn modifies_request_headers(&self) -> bool {
-        self.session.hide_session_cookie || !self.provider.claim_headers.is_empty()
+        self.session.hide_session_cookie
+            || !self.provider.claim_headers.is_empty()
+            || self.provider.forward_access_token
     }
     /// The owned claim destinations, plus `Cookie` when the session cookie is
-    /// hidden from the backend (issue #6022).
+    /// hidden from the backend (issue #6022) and `Authorization` when the
+    /// session's access token is relayed upstream.
     fn modified_request_header_names(&self) -> Option<Vec<String>> {
         let mut names: Vec<String> = self
             .provider
@@ -2777,6 +3264,9 @@ impl super::Plugin for OidcRelyingParty {
             .collect();
         if self.session.hide_session_cookie {
             names.push("cookie".to_string());
+        }
+        if self.provider.forward_access_token {
+            names.push("authorization".to_string());
         }
         Some(names)
     }
@@ -2792,6 +3282,17 @@ impl super::Plugin for OidcRelyingParty {
             self.strip_plugin_cookies(headers);
         }
         apply_claim_headers_from_context(ctx, headers, &self.provider.claim_header_destinations);
+        if self.provider.forward_access_token {
+            // The backend `Authorization` header is gateway-owned on this
+            // route: every client copy (any case) is removed first, so a
+            // request whose accepted principal is not this session — or a
+            // session without a relayable token — never forwards
+            // client-supplied credentials in its place.
+            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+            if let Some(authorization) = ctx.metadata.get(UPSTREAM_ACCESS_TOKEN_METADATA_KEY) {
+                headers.insert("authorization".to_string(), authorization.clone());
+            }
+        }
         PluginResult::Continue
     }
     async fn after_proxy(
@@ -2813,6 +3314,36 @@ impl super::Plugin for OidcRelyingParty {
                 .or_insert(cookie);
         }
         PluginResult::Continue
+    }
+    /// Successful H1 Upgrade and H2/H3 Extended CONNECT handshakes bypass
+    /// `after_proxy`, but `authenticate` may already have rotated the refresh
+    /// token or slid the idle window for this handshake. Deliver the staged
+    /// session cookie here so the browser does not keep the spent credential
+    /// (SOL-1). Appended, so any other `Set-Cookie` on the handshake survives.
+    fn apply_websocket_handshake_response_headers(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(cookie) = ctx.metadata.get(SESSION_SET_COOKIE_METADATA_KEY) {
+            // The staged cookie is request-scoped, not instance-scoped, and
+            // this hook cannot consume it, so a second instance on the same
+            // route must not append it again.
+            if response_headers
+                .get("set-cookie")
+                .is_some_and(|existing| existing.contains(cookie.as_str()))
+            {
+                return;
+            }
+            response_headers
+                .entry("set-cookie".to_string())
+                .and_modify(|existing| {
+                    existing.push('\n');
+                    existing.push_str(cookie);
+                })
+                .or_insert_with(|| cookie.clone());
+        }
     }
     fn applies_after_proxy_on_reject(&self) -> bool {
         // A successful OIDC attempt may have rotated the upstream refresh token
@@ -2893,6 +3424,8 @@ impl StateCache {
     ) -> Self {
         Self {
             entries: DashMap::with_shard_amount(shard_amount),
+            overflow: DashMap::with_shard_amount(shard_amount),
+            active_overflow: AtomicUsize::new(0),
             spent: DashMap::with_shard_amount(shard_amount),
             expiry_buckets: DashMap::with_shard_amount(shard_amount),
             per_source_entries: DashMap::with_shard_amount(shard_amount),
@@ -2933,10 +3466,50 @@ impl StateCache {
             .insert(state, ());
         Ok(())
     }
+    /// Admit a login start while the replay cache is full (MUSE-2).
+    ///
+    /// The per-source cap is evaluated first and the slot stays charged until
+    /// the flow expires or its callback arrives, so a saturated replay cache
+    /// can no longer let one source start unbounded flows. The sealed-only
+    /// allowance is itself bounded by `max_entries`; once both are full a new
+    /// login start is refused.
+    fn admit_sealed_only(&self, state: String, flow: FlowState) -> Result<(), String> {
+        if !self.reserve_source(&flow.source_ip) {
+            return Err(r#"{"error":"Too many pending OIDC logins"}"#.to_string());
+        }
+        if self
+            .active_overflow
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.max_entries).then_some(active + 1)
+            })
+            .is_err()
+        {
+            self.release_source(&flow.source_ip);
+            return Err(STATE_CACHE_FULL_ERROR.to_string());
+        }
+        let expiry_bucket = self.bucket_for(flow.expires_at);
+        if let Some(replaced) = self.overflow.insert(state.clone(), flow) {
+            decrement_atomic(&self.active_overflow);
+            self.release_source(&replaced.source_ip);
+            self.remove_expiry_record(&state, replaced.expires_at);
+        }
+        self.expiry_buckets
+            .entry(expiry_bucket)
+            .or_insert_with(|| Arc::new(DashMap::with_shard_amount(self.shard_amount)))
+            .insert(state, ());
+        Ok(())
+    }
+
     fn take(&self, state: &str) -> Option<FlowState> {
-        let (_, flow) = self.entries.remove(state)?;
+        if let Some((_, flow)) = self.entries.remove(state) {
+            self.remove_expiry_record(state, flow.expires_at);
+            decrement_atomic(&self.active_entries);
+            self.release_source(&flow.source_ip);
+            return (flow.expires_at > Instant::now()).then_some(flow);
+        }
+        let (_, flow) = self.overflow.remove(state)?;
         self.remove_expiry_record(state, flow.expires_at);
-        decrement_atomic(&self.active_entries);
+        decrement_atomic(&self.active_overflow);
         self.release_source(&flow.source_ip);
         (flow.expires_at > Instant::now()).then_some(flow)
     }
@@ -2974,6 +3547,16 @@ impl StateCache {
             // Present but binding mismatch: leave the entry for the
             // legitimate browser and reject this attempt.
             return Err(());
+        }
+        // A sealed-only admission carries no replay authority; its matching
+        // callback just returns the source's admission slot early.
+        if let Some((_, flow)) = self.overflow.remove_if(state, |_, flow| {
+            flow.expires_at <= now
+                || constant_time_eq(&flow.sealed_binding_hash, sealed_binding_hash)
+        }) {
+            self.remove_expiry_record(state, flow.expires_at);
+            decrement_atomic(&self.active_overflow);
+            self.release_source(&flow.source_ip);
         }
 
         self.record_spent_best_effort(state, now + self.ttl);
@@ -3051,6 +3634,13 @@ impl StateCache {
                 decrement_atomic(&self.active_entries);
                 self.release_source(&flow.source_ip);
             }
+            if let Some((_, flow)) = self
+                .overflow
+                .remove_if(state.key(), |_, flow| flow.expires_at <= now)
+            {
+                decrement_atomic(&self.active_overflow);
+                self.release_source(&flow.source_ip);
+            }
             if self
                 .spent
                 .remove_if(state.key(), |_, expires_at| *expires_at <= now)
@@ -3114,14 +3704,15 @@ fn insert_pending_flow_or_use_sealed_cookie(
     state: String,
     flow: FlowState,
 ) -> Result<(), String> {
-    match cache.insert(state, flow) {
+    match cache.insert(state.clone(), flow.clone()) {
         Ok(()) => Ok(()),
         Err(error) if error == STATE_CACHE_FULL_ERROR => {
             // The sealed cookie carries the complete pending flow, and
             // callbacks intentionally accept a missing local entry for
             // cross-replica completion. Preserve browser login availability
-            // when this replica's optional replay cache is full.
-            Ok(())
+            // when this replica's optional replay cache is full — but still
+            // charge the flow to its source, so the per-source cap holds.
+            cache.admit_sealed_only(state, flow)
         }
         Err(error) => Err(error),
     }
@@ -3374,7 +3965,6 @@ fn reject_unknown_fields(
 fn session_context_seed(
     provider: &Map<String, Value>,
     session: &Map<String, Value>,
-    behavior: Option<&Map<String, Value>>,
 ) -> Result<[u8; 32], String> {
     let mut claim_headers = parse_claim_headers(
         provider,
@@ -3394,10 +3984,8 @@ fn session_context_seed(
             .then_with(|| left.metadata_key.cmp(&right.metadata_key))
     });
 
-    let html_accept_substrings = parse_behavior_string_array(behavior, "html_accept_substrings")?
-        .pipe_default(vec!["text/html".to_string()]);
     let normalized = NormalizedSessionContextSeed {
-        version: SESSION_PAYLOAD_VERSION,
+        version: SESSION_CONTEXT_SEED_VERSION,
         provider: NormalizedProviderContext {
             issuer: required_string(provider, "issuer", "provider[0]")?,
             discovery_url: optional_string(provider, "discovery_url", "provider[0]")?,
@@ -3415,13 +4003,6 @@ fn session_context_seed(
             redirect_uri: required_string(provider, "redirect_uri", "provider[0]")?,
             callback_path: optional_string(provider, "callback_path", "provider[0]")?
                 .unwrap_or_else(|| "/oauth/callback".to_string()),
-            logout_path: optional_string(provider, "logout_path", "provider[0]")?
-                .unwrap_or_else(|| "/oauth/logout".to_string()),
-            post_logout_redirect_uri: optional_string(
-                provider,
-                "post_logout_redirect_uri",
-                "provider[0]",
-            )?,
             scopes: parse_string_array(provider, "scopes", "provider[0]")?,
             audiences: parse_string_array(provider, "audiences", "provider[0]")?,
             required_scopes: parse_string_array(provider, "required_scopes", "provider[0]")?,
@@ -3454,11 +4035,6 @@ fn session_context_seed(
                 .unwrap_or_else(|| "cookie".to_string()),
             ttl_secs: optional_u64(session, "ttl_secs", DEFAULT_SESSION_TTL_SECS)?,
             idle_ttl_secs: optional_u64(session, "idle_ttl_secs", DEFAULT_SESSION_IDLE_TTL_SECS)?,
-            max_cookie_bytes: optional_u64(
-                session,
-                "max_cookie_bytes",
-                DEFAULT_SESSION_MAX_COOKIE_BYTES,
-            )?,
             secure: optional_bool(session, "secure")?.unwrap_or(true),
             http_only: optional_bool(session, "http_only")?.unwrap_or(true),
             same_site: optional_string(session, "same_site", "session")?
@@ -3466,51 +4042,6 @@ fn session_context_seed(
                 .to_ascii_lowercase(),
             domain: optional_string(session, "domain", "session")?,
             path: optional_string(session, "path", "session")?.unwrap_or_else(|| "/".to_string()),
-        },
-        behavior: NormalizedBehaviorContext {
-            state_ttl_secs: optional_behavior_u64(
-                behavior,
-                "state_ttl_secs",
-                DEFAULT_STATE_TTL_SECS,
-            )?,
-            state_cache_max_entries: optional_behavior_u64(
-                behavior,
-                "state_cache_max_entries",
-                DEFAULT_STATE_CACHE_MAX_ENTRIES as u64,
-            )?,
-            state_cache_max_entries_per_source: optional_behavior_u64(
-                behavior,
-                "state_cache_max_entries_per_source",
-                DEFAULT_STATE_CACHE_MAX_ENTRIES_PER_SOURCE as u64,
-            )?,
-            post_login_redirect_param: optional_behavior_string(
-                behavior,
-                "post_login_redirect_param",
-            )?,
-            trusted_redirect_hosts: parse_behavior_string_array(
-                behavior,
-                "trusted_redirect_hosts",
-            )?,
-            refresh_skew_secs: optional_behavior_u64(
-                behavior,
-                "refresh_skew_secs",
-                DEFAULT_REFRESH_SKEW_SECS,
-            )?,
-            challenge_html_status: optional_behavior_u64(
-                behavior,
-                "challenge_html_status",
-                DEFAULT_CHALLENGE_HTML_STATUS,
-            )?,
-            challenge_api_status: optional_behavior_u64(
-                behavior,
-                "challenge_api_status",
-                DEFAULT_CHALLENGE_API_STATUS,
-            )?,
-            html_accept_substrings,
-            rp_initiated_logout: optional_behavior_bool(behavior, "rp_initiated_logout")?
-                .unwrap_or(true),
-            post_login_default_path: optional_behavior_string(behavior, "post_login_default_path")?
-                .unwrap_or_else(|| "/".to_string()),
         },
     };
     // Struct field order plus the sorted claim-header list make the byte
@@ -3846,6 +4377,19 @@ fn validate_url_string(raw: &str, field: &str) -> Result<String, String> {
     Ok(raw.trim().to_string())
 }
 
+/// Validate one endpoint a discovery document advertises.
+///
+/// The discovery document is fetched over TLS from the operator-configured
+/// `discovery_url` and is trusted only after its `issuer` matched the
+/// configured issuer exactly (see `fetch_discovery`). Its HTTPS endpoints may
+/// then live on any origin: Google publishes its token, JWKS, and UserInfo
+/// endpoints on hosts other than its issuer, and Microsoft Entra ID publishes
+/// UserInfo on Microsoft Graph (MUSE-11). Plain HTTP stays confined to the
+/// loopback development case, on the discovery URL's own origin, so a
+/// discovery document can never steer a token or credential POST onto
+/// plaintext or onto a different local service. Every provider call still goes
+/// through the shared `PluginHttpClient`, whose backend egress policy screens
+/// the resolved address at dial time.
 fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Result<String, String> {
     let discovery = Url::parse(discovery_url)
         .map_err(|e| format!("oidc_relying_party: discovery_url invalid: {e}"))?;
@@ -3854,36 +4398,88 @@ fn validate_discovered_url(discovery_url: &str, raw: &str, field: &str) -> Resul
     let endpoint_host = parsed
         .host_str()
         .ok_or_else(|| format!("oidc_relying_party: discovery {field} must include a hostname"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!(
+            "oidc_relying_party: discovery {field} must not carry URL userinfo"
+        ));
+    }
     match parsed.scheme() {
-        "https" => {}
-        "http" if is_local_auth_host(endpoint_host) => {}
-        "http" => {
-            return Err(format!(
-                "oidc_relying_party: discovery {field} must use https except for literal loopback or localhost"
-            ));
+        "https" => Ok(raw.trim().to_string()),
+        "http" if is_local_auth_host(endpoint_host) => {
+            let discovery_host = discovery.host_str().ok_or_else(|| {
+                "oidc_relying_party: discovery_url must include a hostname".to_string()
+            })?;
+            if discovery.scheme() != "http"
+                || !endpoint_host.eq_ignore_ascii_case(discovery_host)
+                || parsed.port_or_known_default() != discovery.port_or_known_default()
+            {
+                return Err(format!(
+                    "oidc_relying_party: discovery {field} may use http only on the loopback discovery_url's own origin"
+                ));
+            }
+            Ok(raw.trim().to_string())
         }
-        scheme => {
-            return Err(format!(
-                "oidc_relying_party: discovery {field} must use http or https, got {scheme:?}"
-            ));
-        }
+        "http" => Err(format!(
+            "oidc_relying_party: discovery {field} must use https except for literal loopback or localhost"
+        )),
+        scheme => Err(format!(
+            "oidc_relying_party: discovery {field} must use http or https, got {scheme:?}"
+        )),
     }
-    let discovery_host = discovery
-        .host_str()
-        .ok_or_else(|| "oidc_relying_party: discovery_url must include a hostname".to_string())?;
-    if !endpoint_host.eq_ignore_ascii_case(discovery_host) {
+}
+
+/// Parse `providers[].authorization_params`: static extra authorization-request
+/// parameters such as `prompt`, `acr_values`, or `login_hint` (MUSE-14).
+fn parse_authorization_params(
+    provider: &Map<String, Value>,
+) -> Result<Vec<(String, String)>, String> {
+    let object = match provider.get("authorization_params") {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Object(object)) => object,
+        Some(_) => {
+            return Err(
+                "oidc_relying_party: `provider[0].authorization_params` must be an object"
+                    .to_string(),
+            );
+        }
+    };
+    if object.len() > MAX_AUTHORIZATION_PARAMS {
         return Err(format!(
-            "oidc_relying_party: discovery {field} host must match discovery_url host"
+            "oidc_relying_party: `provider[0].authorization_params` allows at most {MAX_AUTHORIZATION_PARAMS} entries"
         ));
     }
-    if parsed.scheme() != discovery.scheme()
-        || parsed.port_or_known_default() != discovery.port_or_known_default()
-    {
-        return Err(format!(
-            "oidc_relying_party: discovery {field} scheme and port must match discovery_url"
-        ));
+    let mut params = Vec::with_capacity(object.len());
+    for (name, value) in object {
+        if name.is_empty()
+            || name.len() > MAX_AUTHORIZATION_PARAM_BYTES
+            || !name.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(
+                "oidc_relying_party: `provider[0].authorization_params` names must be non-empty visible ASCII"
+                    .to_string(),
+            );
+        }
+        if RESERVED_AUTHORIZATION_PARAMS
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        {
+            return Err(format!(
+                "oidc_relying_party: `provider[0].authorization_params.{name}` is set by the plugin and cannot be overridden"
+            ));
+        }
+        let Some(value) = value.as_str() else {
+            return Err(format!(
+                "oidc_relying_party: `provider[0].authorization_params.{name}` must be a string"
+            ));
+        };
+        if value.len() > MAX_AUTHORIZATION_PARAM_BYTES || value.chars().any(char::is_control) {
+            return Err(format!(
+                "oidc_relying_party: `provider[0].authorization_params.{name}` must be at most {MAX_AUTHORIZATION_PARAM_BYTES} bytes with no control characters"
+            ));
+        }
+        params.push((name.clone(), value.to_string()));
     }
-    Ok(raw.trim().to_string())
+    Ok(params)
 }
 
 fn is_local_auth_host(hostname: &str) -> bool {
@@ -3909,6 +4505,16 @@ fn validate_path_only(path: &str, field: &str) -> Result<(), String> {
     if !is_cookie_path_value(path) {
         return Err(format!(
             "oidc_relying_party: `provider[0].{field}` must not contain control characters, spaces, commas, or `;`"
+        ));
+    }
+    // The frontend canonicalizes every request path before any plugin runs
+    // and this path is compared against that canonical `ctx.path`. A spelling
+    // canonicalization would change (`/oauth/%63allback`) can never match, and
+    // one the frontend refuses outright (`/oauth//callback`, dot segments,
+    // backslashes) is unreachable, so both are dead configuration (SOL-5).
+    if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(path) {
+        return Err(format!(
+            "oidc_relying_party: `provider[0].{field}` must be a canonical request path ({reason})"
         ));
     }
     Ok(())
@@ -4203,6 +4809,40 @@ fn stored_claims_expires_at(payload: &SessionPayload) -> i64 {
     }
 }
 
+/// Request-forgery screen for the state-changing logout endpoint (issue
+/// #6660).
+///
+/// Browsers send `Sec-Fetch-Site` on every request. A logout `GET`/`HEAD` must
+/// prove a `same-origin` request or a user-initiated `none` navigation (typed
+/// URL, bookmark); without the header a navigation cannot be told apart from a
+/// cross-site link, so it is refused. A `POST` is refused only when the browser
+/// reports `cross-site` or `same-site` (a sibling host), which keeps
+/// non-browser clients working. Every other method is `405`.
+fn logout_request_refusal(ctx: &RequestContext) -> Option<PluginResult> {
+    let fetch_site = ctx
+        .headers
+        .get("sec-fetch-site")
+        .map(|value| value.trim().to_ascii_lowercase());
+    let same_origin = matches!(fetch_site.as_deref(), Some("same-origin") | Some("none"));
+    let refused = || {
+        reject(
+            403,
+            r#"{"error":"Logout must be a same-origin request"}"#.to_string(),
+        )
+    };
+    match ctx.method.as_str() {
+        "GET" | "HEAD" if same_origin => None,
+        "GET" | "HEAD" => Some(refused()),
+        "POST" if fetch_site.is_none() || same_origin => None,
+        "POST" => Some(refused()),
+        _ => Some(PluginResult::Reject {
+            status_code: 405,
+            body: r#"{"error":"Method not allowed"}"#.to_string(),
+            headers: HashMap::from([("allow".to_string(), "GET, HEAD, POST".to_string())]),
+        }),
+    }
+}
+
 fn is_browser_request(ctx: &RequestContext, behavior: &BehaviorConfig) -> bool {
     matches!(ctx.method.as_str(), "GET" | "HEAD")
         && ctx.headers.get("accept").is_some_and(|accept| {
@@ -4214,7 +4854,11 @@ fn is_browser_request(ctx: &RequestContext, behavior: &BehaviorConfig) -> bool {
 }
 
 fn cookie_value<'a>(ctx: &'a RequestContext, name: &str) -> Option<&'a str> {
-    let cookie = ctx.headers.get("cookie")?;
+    cookie_value_in(ctx.headers.get("cookie")?, name)
+}
+
+/// First value of cookie `name` in a `Cookie` header value.
+fn cookie_value_in<'a>(cookie: &'a str, name: &str) -> Option<&'a str> {
     for part in cookie.split(';') {
         // Skip segments without '=' (valueless cookies, trailing separators)
         // instead of aborting the scan: a sibling cookie lacking '=' before the
@@ -4227,6 +4871,52 @@ fn cookie_value<'a>(ctx: &'a RequestContext, name: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Name of chunk `index` of a split session cookie: `<name>.<index>`.
+fn session_chunk_cookie_name(name: &str, index: usize) -> String {
+    format!("{name}.{index}")
+}
+
+/// The chunk index `cookie_name` denotes for session cookie `session_name`, or
+/// `None` when it is not one of that session's chunk cookies.
+fn session_chunk_index(cookie_name: &str, session_name: &str) -> Option<usize> {
+    let suffix = cookie_name.strip_prefix(session_name)?.strip_prefix('.')?;
+    let mut digits = suffix.bytes();
+    let digit = digits.next()?;
+    if digits.next().is_some() || !digit.is_ascii_digit() {
+        return None;
+    }
+    let index = usize::from(digit - b'0');
+    (index < MAX_SESSION_COOKIE_CHUNKS).then_some(index)
+}
+
+/// Distinct chunk indices of session cookie `name` present in a request
+/// `Cookie` header, so a response can expire exactly the chunks the browser
+/// holds.
+fn present_session_chunk_indices(header: Option<&str>, name: &str) -> Vec<usize> {
+    let Some(header) = header else {
+        return Vec::new();
+    };
+    let mut indices = Vec::new();
+    for segment in header.split(';') {
+        let Some((cookie_name, _)) = segment.trim().split_once('=') else {
+            continue;
+        };
+        if let Some(index) = session_chunk_index(cookie_name, name)
+            && !indices.contains(&index)
+        {
+            indices.push(index);
+        }
+    }
+    indices
+}
+
+/// Whether an access token may be relayed verbatim as an RFC 6750 bearer
+/// credential: non-empty visible ASCII with no spaces, so it can neither
+/// split nor inject header content.
+fn is_relayable_access_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 fn original_url(ctx: &RequestContext, behavior: &BehaviorConfig) -> String {
@@ -4413,6 +5103,7 @@ fn spawn_oidc_discovery(
     publication_gate: Arc<Mutex<()>>,
     http_client: PluginHttpClient,
     discovery_url: String,
+    expected_issuer: String,
     explicit_userinfo_endpoint: Option<String>,
     explicit_end_session_endpoint: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
@@ -4432,6 +5123,7 @@ fn spawn_oidc_discovery(
             match fetch_discovery(
                 &http_client,
                 &discovery_url,
+                &expected_issuer,
                 explicit_userinfo_endpoint.is_some(),
                 explicit_end_session_endpoint.is_some(),
             )
@@ -4498,10 +5190,17 @@ fn spawn_oidc_discovery(
 /// validating it first made a valid explicit override unusable, because the
 /// whole discovery fetch failed on an advertisement that was about to be
 /// discarded (issue #5033). Endpoints that are actually selected keep their
-/// fail-closed same-origin validation.
+/// fail-closed validation in [`validate_discovered_url`].
+///
+/// OpenID Connect Discovery §4.3: the document's `issuer` must be exactly the
+/// configured issuer, or nothing it advertises is used. Without that check a
+/// copy-paste error pairing one tenant's issuer with another tenant's
+/// discovery URL sent users — and the client credential — to the wrong
+/// tenant's endpoints before ID-token validation failed (MUSE-3).
 async fn fetch_discovery(
     http_client: &PluginHttpClient,
     discovery_url: &str,
+    expected_issuer: &str,
     userinfo_overridden: bool,
     end_session_overridden: bool,
 ) -> Result<DiscoveryDoc, String> {
@@ -4522,6 +5221,13 @@ async fn fetch_discovery(
     let body: Value = read_bounded_json(response, MAX_DISCOVERY_RESPONSE_BYTES)
         .await
         .map_err(|e| format!("discovery parse failed: {e}"))?;
+    match body.get("issuer").and_then(Value::as_str) {
+        Some(issuer) if issuer == expected_issuer => {}
+        Some(_) => {
+            return Err("discovery issuer does not match the configured issuer".to_string());
+        }
+        None => return Err("missing discovery issuer".to_string()),
+    }
     let authorization_endpoint = body
         .get("authorization_endpoint")
         .and_then(Value::as_str)
@@ -4610,12 +5316,14 @@ pub(crate) mod discovery_test_seams {
     pub(crate) async fn resolve_discovery_for_test(
         http_client: &PluginHttpClient,
         discovery_url: &str,
+        expected_issuer: &str,
         explicit_userinfo_endpoint: Option<String>,
         explicit_end_session_endpoint: Option<String>,
     ) -> Result<ResolvedDiscoveryEndpoints, String> {
         let doc = fetch_discovery(
             http_client,
             discovery_url,
+            expected_issuer,
             explicit_userinfo_endpoint.is_some(),
             explicit_end_session_endpoint.is_some(),
         )
@@ -4756,7 +5464,7 @@ pub(crate) mod refresh_flight_test_seams {
     pub(crate) fn refresh_failure_from_string(error: String) -> Option<String> {
         match RefreshFailure::from(error) {
             RefreshFailure::Other(error) => Some(error),
-            RefreshFailure::InvalidGrant => None,
+            RefreshFailure::InvalidGrant | RefreshFailure::Consumed(_) => None,
         }
     }
 }
@@ -4875,42 +5583,54 @@ mod tests {
     }
 
     #[test]
-    fn discovered_urls_must_stay_on_discovery_host() {
-        assert!(
-            validate_discovered_url(
-                "https://issuer.example.com/.well-known/openid-configuration",
-                "https://evil.example.com/token",
-                "token_endpoint",
-            )
-            .is_err()
-        );
-        assert!(
-            validate_discovered_url(
-                "https://issuer.example.com/.well-known/openid-configuration",
-                "file:///etc/passwd",
-                "jwks_uri",
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn discovered_urls_cannot_change_scheme_or_effective_port() {
+    fn discovered_urls_may_leave_the_discovery_origin_only_over_https() {
         let discovery = "https://issuer.example.com/.well-known/openid-configuration";
+        // Issuer-validated HTTPS endpoints may live on another origin, as
+        // Google's and Microsoft Entra ID's discovery documents require.
+        for endpoint in [
+            "https://oauth2.googleapis.com/token",
+            "https://issuer.example.com:8443/token",
+            "https://issuer.example.com/token",
+        ] {
+            assert_eq!(
+                validate_discovered_url(discovery, endpoint, "token_endpoint")
+                    .expect("HTTPS discovered endpoint"),
+                endpoint
+            );
+        }
         for endpoint in [
             "http://issuer.example.com/token",
-            "https://issuer.example.com:8443/token",
+            "http://evil.example.com/token",
+            "file:///etc/passwd",
+            "https://user:pass@issuer.example.com/token",
         ] {
             assert!(validate_discovered_url(discovery, endpoint, "token_endpoint").is_err());
         }
-        assert_eq!(
+    }
+
+    #[test]
+    fn discovered_plaintext_endpoints_stay_on_the_loopback_discovery_origin() {
+        let discovery = "http://127.0.0.1:8080/.well-known/openid-configuration";
+        assert!(
+            validate_discovered_url(discovery, "http://127.0.0.1:8080/token", "token_endpoint")
+                .is_ok()
+        );
+        for endpoint in [
+            "http://127.0.0.1:6379/token",
+            "http://localhost:8080/token",
+            "http://idp.example.com/token",
+        ] {
+            assert!(validate_discovered_url(discovery, endpoint, "token_endpoint").is_err());
+        }
+        // An HTTPS discovery document cannot downgrade to a loopback HTTP
+        // endpoint either.
+        assert!(
             validate_discovered_url(
-                discovery,
-                "https://issuer.example.com/token",
+                "https://issuer.example.com/.well-known/openid-configuration",
+                "http://127.0.0.1:8080/token",
                 "token_endpoint",
             )
-            .expect("same-origin HTTPS endpoint"),
-            "https://issuer.example.com/token"
+            .is_err()
         );
     }
 
@@ -5461,6 +6181,7 @@ mod tests {
             last_touch_unix: last_touch,
             nonce: "nonce-1".to_string(),
             claims: json!({"sub": "user-1"}),
+            auth_time_unix: None,
         }
     }
 
@@ -5904,6 +6625,7 @@ mod tests {
             fetch_discovery(
                 &PluginHttpClient::default(),
                 &format!("{}/.well-known/openid-configuration", server.uri()),
+                "https://idp.example.com",
                 false,
                 false,
             )
