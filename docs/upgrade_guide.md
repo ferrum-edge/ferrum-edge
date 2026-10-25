@@ -28,39 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `body_validator`: response status scope, media-type defaults, per-method entries (#6845)
+### `cors` method and header lists are bounded (#6844)
 
-- **Response validation is limited to `2XX` by default.** A backend error
-  document (`4xx` / `5xx`) is no longer judged against the success schema and
-  replaced by a `502`. To keep validating error statuses, set
-  `response_status_codes`, for example `["2XX", "4XX"]` or `[200, 422]`.
-  Partial (`206`) and delta (`226`) responses are never validated.
-- **Structured-suffix media types are validated by default.** The defaults now
-  include `application/*+json` and `application/*+xml`, so
-  `application/problem+json`, `application/vnd.*+json`, and
-  `application/soap+xml` bodies are validated where they previously passed
-  through. To restore the old set, list it explicitly:
-  `["application/json", "application/xml", "text/xml"]`.
-- **An empty `content_types` / `response_content_types` list is refused.** It
-  used to mean "every valid media type". Omit the field for the defaults, or
-  list the media types to validate.
-- **`protobuf_method_messages` entries are direction-authoritative.** An entry
-  that sets only `response` (or only `request`) no longer validates the other
-  direction against `protobuf_request_type` / `protobuf_response_type`. To keep
-  the old behavior, name the type for both directions in that entry.
-- **Protobuf validation is broader and bounded.** It now also covers gRPC-Web
-  (binary and text) in both directions, so translated gRPC-Web responses are
-  validated. Per-method request rules now apply on HTTP/3 and generic
-  dispatch. Unenrolled gRPC methods now keep streaming. A message over 50000
-  nested messages, 1048576 field values, or 32 levels is refused for every
-  descriptor pool. A proto2 closed-enum number outside the declared set no
-  longer satisfies `required`. When the aggregate decode budget is exhausted,
-  the plugin answers `503` / `RESOURCE_EXHAUSTED`.
-- **New options.** `enforcement_mode: log_only` lets you roll out a schema
-  without rejecting traffic. `reject_unsupported_media_types: true` refuses
-  ungoverned request bodies with `415`. Violations are recorded as
-  `body_validator.{request,response}_{outcome,status,detail}` metadata, and
-  these keys are on the built-in log allowlist.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
@@ -195,6 +173,36 @@ A Kubernetes RequestAuthentication whose `jwtRules[]` entry has neither
 answer inbound HTTP with `503` (see the fail-closed note under Security in the
 CHANGELOG). Previously such a resource vetoed every mesh reload. Add a key
 source to each rule before upgrading.
+
+### `ai_semantic_cache` keys bind response policy and honor retention directives (#6822)
+
+No configuration change is required, but cached content behaves differently
+after the upgrade:
+
+- Exact keys and semantic scopes move to a new key domain (v4) and bind the
+  request's response-side policy provenance (RTDS response gate content plus
+  the static response-presentation digest). Every entry retained by an earlier
+  version, locally or in Redis, is unreachable, so expect a cold cache after
+  the rollout. Changing a `response_transformer` (or other enrolled
+  presentation) rule now also starts a fresh cache instead of replaying old
+  bodies. Old Redis keys expire by their TTL; rotate `redis_key_prefix` if you
+  want them gone sooner.
+- A proxy whose response-presentation policy cannot be established (for
+  example one carrying `mcp_gateway`, whose rewrite is `Dynamic`) now gets
+  `X-Ai-Cache-Status: BYPASS` on every request. Custom code or tests that drive
+  the plugin with a bare `RequestContext` must set the digest the protocol
+  entry paths copy from the plugin-cache view
+  (`_test_support::set_response_presentation_policy_digest_for_test`).
+- Responses carrying `Cache-Control: no-store` or `private`, or `Set-Cookie`,
+  are no longer stored. Requests with `Cache-Control: no-store` / `no-cache`,
+  Cohere v1 `conversation_id`, or duplicate JSON members bypass the cache.
+- Semantic scopes bind instruction text byte-exactly, so prompts whose
+  system/developer instructions differ only in case or whitespace no longer
+  share semantic hits.
+- A `priority_override` that places `ai_semantic_cache` at or before a
+  final-request-body policy plugin (`waf`, `body_validator`,
+  `openapi_validator`, `ai_prompt_compressor`, …) is now refused at admission;
+  restore the default ordering.
 
 ### Backend idle connections: higher default ceiling (#6793)
 

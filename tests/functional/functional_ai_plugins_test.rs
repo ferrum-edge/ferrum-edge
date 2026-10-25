@@ -431,11 +431,19 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
         ("content-length".to_string(), REQUEST.len().to_string()),
     ]);
     let new_ctx = || {
-        RequestContext::new(
+        let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             "POST".to_string(),
             "/v1/chat/completions".to_string(),
-        )
+        );
+        // Stand in for the protocol entry path, which copies the static
+        // response-presentation digest from the plugin-cache view; without
+        // one the cache treats the response policy as unprovable and bypasses.
+        ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test(
+            &mut ctx,
+            Some([0x5c; 32]),
+        );
+        ctx
     };
     let mut ctx = new_ctx();
     assert!(matches!(
@@ -539,6 +547,11 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
                 "127.0.0.1".to_string(),
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
+            );
+            // Stand in for the protocol entry path's plugin-cache-view digest.
+            ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test(
+                &mut ctx,
+                Some([0x5c; 32]),
             );
             reader
                 .on_final_request_body_with_context(&mut ctx, &request_headers, REQUEST)
@@ -948,6 +961,11 @@ async fn functional_ai_semantic_cache_redis_quarantine_compare_delete_is_race_sa
                 "127.0.0.1".to_string(),
                 "POST".to_string(),
                 "/v1/chat/completions".to_string(),
+            );
+            // Stand in for the protocol entry path's plugin-cache-view digest.
+            ferrum_edge::_test_support::set_response_presentation_policy_digest_for_test(
+                &mut ctx,
+                Some([0x5c; 32]),
             );
             reader
                 .on_final_request_body_with_context(&mut ctx, &request_headers, REQUEST)
