@@ -102,6 +102,23 @@ impl Runtime {
             .expect("epoch republishes");
         self.config = next;
     }
+
+    /// Apply `next` as a FULL rebuild — every plugin instance reconstructed,
+    /// as file-mode `SIGHUP`, a DP full snapshot, or a DB-mode full reload
+    /// does — and publish it in a new epoch.
+    fn full_rebuild(&mut self, next: GatewayConfig) {
+        let rebuilt = PluginCache::new(&next).expect("full rebuild builds");
+        self.store
+            .republish_from_runtime_parts_for_test(
+                next.clone(),
+                &rebuilt,
+                &self.consumer_index,
+                &self.load_balancer,
+            )
+            .expect("epoch republishes");
+        self.plugin_cache = rebuilt;
+        self.config = next;
+    }
 }
 
 #[test]
@@ -196,4 +213,65 @@ fn unrelated_reload_keeps_the_established_session() {
         "a reload that leaves this proxy's datagram hooks untouched must not end its sessions"
     );
     assert!(fence.is_current(), "the re-verified generation is cached");
+}
+
+/// Fix round 2 (PR6868-MUSE-3): the fence compares the datagram-hook POLICY,
+/// not plugin instance identity, so a full rebuild that reconstructs
+/// identical instances keeps established sessions.
+#[test]
+fn identical_full_rebuild_keeps_the_established_session() {
+    let mut runtime = Runtime::new(gateway_config(
+        vec![udp_proxy("udp-a", 19_506, vec!["udp-rl"])],
+        vec![limiter(100)],
+    ));
+    let fence = udp_datagram_policy_fence_for_test(&runtime.store, &default_namespace(), "udp-a");
+    let before = runtime.store.load().config_generation();
+
+    let same = runtime.config.clone();
+    runtime.full_rebuild(same);
+
+    assert!(
+        runtime.store.load().config_generation() > before,
+        "the rebuild must publish a new generation for this check to mean anything"
+    );
+    assert!(
+        fence.is_current(),
+        "reconstructed but identical datagram-hook plugins must not end sessions"
+    );
+}
+
+#[test]
+fn full_rebuild_with_a_changed_limit_ends_the_established_session() {
+    let mut runtime = Runtime::new(gateway_config(
+        vec![udp_proxy("udp-a", 19_507, vec!["udp-rl"])],
+        vec![limiter(100)],
+    ));
+    let fence = udp_datagram_policy_fence_for_test(&runtime.store, &default_namespace(), "udp-a");
+
+    let mut tightened = runtime.config.clone();
+    tightened.plugin_configs[0].config = json!({"datagrams_per_second": 10});
+    runtime.full_rebuild(tightened);
+
+    assert!(
+        !fence.is_current(),
+        "a full rebuild that changes the limit must end the established session"
+    );
+}
+
+#[test]
+fn full_rebuild_with_a_new_priority_or_trigger_ends_the_established_session() {
+    let mut runtime = Runtime::new(gateway_config(
+        vec![udp_proxy("udp-a", 19_508, vec!["udp-rl"])],
+        vec![limiter(100)],
+    ));
+    let fence = udp_datagram_policy_fence_for_test(&runtime.store, &default_namespace(), "udp-a");
+
+    let mut reprioritized = runtime.config.clone();
+    reprioritized.plugin_configs[0].priority_override = Some(2_916);
+    runtime.full_rebuild(reprioritized);
+
+    assert!(
+        !fence.is_current(),
+        "a datagram-hook priority change is a policy change"
+    );
 }

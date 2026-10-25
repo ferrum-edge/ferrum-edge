@@ -593,20 +593,29 @@ impl NodeWaypointUdpSessionSource {
 /// keeps sending, because every admitted datagram refreshes its idle timer.
 ///
 /// The fence compares the published configuration generation with the last
-/// one it verified: one atomic load while nothing changed, so the per-datagram
-/// path stays allocation-, lock-, and hash-free. When the generation moves it
-/// looks up the proxy's CURRENT UDP plugin list through an `ArcSwap` guard and
-/// compares its datagram-hook instances with the admitted ones by identity.
-/// Delta reloads preserve an unchanged proxy's instances, so an unrelated
-/// change re-verifies and the session continues; a changed hook set ends the
-/// session so the client's next datagram is admitted — stream-connect chain,
-/// trigger decisions, and hook list — under the current generation.
+/// one it verified: two atomic loads (the session's verified generation and the
+/// store's published mirror) while nothing changed, so the
+/// per-datagram path stays allocation-, lock-, and hash-free. When the
+/// generation moves it reads, through an `ArcSwap` guard, the proxy's CURRENT
+/// datagram-hook policy digest — precomputed when the plugin cache built the
+/// entry from the plugin configs' ids, triggers, priorities, and config
+/// documents (`plugin_cache::udp_datagram_policy_digest`) — and compares it
+/// with the admission digest. A reload that leaves the proxy's datagram-hook
+/// configs unchanged (an unrelated delta, or a full rebuild that reconstructs
+/// identical instances) re-verifies and the session continues; a real policy
+/// change ends the session so the client's next datagram is admitted —
+/// stream-connect chain, trigger decisions, and hook list — under the current
+/// generation.
 pub(crate) struct UdpDatagramPolicyFence {
     store: Arc<RequestEpochStore>,
     namespace: String,
     proxy_id: String,
-    /// The proxy's complete UDP plugin list from the admission generation.
-    admitted_plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    /// Digest of the proxy's datagram-hook policy in the admission generation.
+    admitted_digest: crate::plugin_cache::UdpDatagramPolicyDigest,
+    /// Pins the admission generation's instances: an instance that contributes
+    /// `Arc` identity (not built through the cache funnel) to the digest must
+    /// not be freed and its address reused while the session compares against it.
+    _admitted_plugins: Arc<Vec<Arc<dyn Plugin>>>,
     verified_generation: AtomicU64,
 }
 
@@ -622,7 +631,10 @@ impl UdpDatagramPolicyFence {
             store,
             namespace: namespace.to_owned(),
             proxy_id: proxy_id.to_owned(),
-            admitted_plugins,
+            admitted_digest: admission_epoch
+                .plugin_cache
+                .udp_datagram_policy_digest(namespace, proxy_id),
+            _admitted_plugins: admitted_plugins,
             verified_generation: AtomicU64::new(admission_epoch.config_generation()),
         }
     }
@@ -645,40 +657,16 @@ impl UdpDatagramPolicyFence {
             if generation == verified {
                 return true;
             }
-            let current = epoch.plugin_cache.plugins_for_protocol(
-                &self.namespace,
-                &self.proxy_id,
-                ProxyProtocol::Udp,
-            );
-            if !datagram_hook_plugins_match(&self.admitted_plugins, &current) {
+            let current = epoch
+                .plugin_cache
+                .udp_datagram_policy_digest(&self.namespace, &self.proxy_id);
+            if current != self.admitted_digest {
                 return false;
             }
             self.verified_generation
                 .fetch_max(generation, Ordering::AcqRel);
             true
         })
-    }
-}
-
-/// Whether two UDP plugin lists carry the same datagram-hook instances, in the
-/// same order, by `Arc` identity. Non-datagram plugins are ignored: they ran
-/// once at admission and are not re-run for an established session.
-pub(crate) fn datagram_hook_plugins_match(
-    admitted: &[Arc<dyn Plugin>],
-    current: &[Arc<dyn Plugin>],
-) -> bool {
-    let mut admitted = admitted
-        .iter()
-        .filter(|plugin| plugin.requires_udp_datagram_hooks());
-    let mut current = current
-        .iter()
-        .filter(|plugin| plugin.requires_udp_datagram_hooks());
-    loop {
-        match (admitted.next(), current.next()) {
-            (None, None) => return true,
-            (Some(admitted), Some(current)) if Arc::ptr_eq(admitted, current) => {}
-            _ => return false,
-        }
     }
 }
 
@@ -8098,6 +8086,11 @@ async fn handle_dtls_client_inner(
                     refusal.as_str()
                 ));
             }
+            // A reload may have changed the datagram-hook policy while a hook
+            // awaited: do not forward under the admission generation's verdict.
+            if !policy_fence_fwd.is_current() {
+                return Err(udp_datagram_policy_changed_error());
+            }
 
             // Publish before sending so a fast backend reply cannot observe a
             // zero or stale amplification budget.
@@ -8294,6 +8287,9 @@ async fn handle_dtls_client_inner(
                      ({})",
                     refusal.as_str()
                 ));
+            }
+            if !policy_fence_rev.is_current() {
+                return Err(udp_datagram_policy_changed_error());
             }
 
             let sent = within_dtls_trust_fence(

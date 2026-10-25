@@ -11476,6 +11476,48 @@ fn test_udp_rate_limiting_rejects_tcp_and_http_attachments() {
         .expect("a global UDP limiter keeps per-protocol filtering in a mixed deployment");
 }
 
+/// Fix round 2 (PR6868-MUSE-5): a global `udp_rate_limiting` keeps
+/// per-protocol filtering, but one with no UDP/DTLS proxy at all is inert and
+/// says so.
+#[test]
+fn test_global_udp_rate_limiting_without_udp_proxy_warns() {
+    const WARNING: &str = "has no UDP/DTLS proxy to protect";
+    let global = || {
+        make_plugin_config(
+            "udp-rl",
+            "udp_rate_limiting",
+            PluginScope::Global,
+            None,
+            true,
+        )
+    };
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    PluginCache::new(&make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![global()],
+    ))
+    .expect("an inert global UDP limiter still loads");
+    drop(guard);
+    assert!(logs.contents().contains(WARNING), "{}", logs.contents());
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    PluginCache::new(&make_config(
+        vec![
+            make_proxy("p1", "/api", vec![]),
+            make_udp_proxy("p2", vec![], BackendScheme::Udp),
+        ],
+        vec![global()],
+    ))
+    .expect("a mixed deployment loads");
+    drop(guard);
+    assert!(
+        !logs.contents().contains(WARNING),
+        "a global limiter that covers a UDP proxy is not inert: {}",
+        logs.contents()
+    );
+}
+
 #[test]
 fn test_tcp_connection_throttle_accepts_tcp_and_tcp_tls_attachments() {
     for scheme in [BackendScheme::Tcp, BackendScheme::Tcps] {
