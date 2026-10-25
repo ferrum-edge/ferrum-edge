@@ -3046,6 +3046,20 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_mesh_ext_authz_check_duration_seconds",
+    "type": "histogram",
+    "help": "Time from dispatching a CUSTOM external authorization check to the provider's response headers (or the failure that ended it), per admitted extension provider.",
+    "labels": [
+      "provider",
+      "le",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_mesh_ext_authz_check_failures_total",
     "type": "counter",
     "help": "Failed CUSTOM external authorization checks by how the failure was resolved.",
@@ -3063,6 +3077,20 @@
     "type": "counter",
     "help": "Istio AuthorizationPolicy CUSTOM external authorization check outcomes.",
     "labels": [
+      "outcome",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_ext_authz_provider_checks_total",
+    "type": "counter",
+    "help": "CUSTOM external authorization check outcomes per admitted extension provider.",
+    "labels": [
+      "provider",
       "outcome",
       "gateway_namespace"
     ],
@@ -4585,6 +4613,19 @@
     "emission": "always"
   },
   {
+    "name": "ferrum_request_body_bytes_total",
+    "type": "counter",
+    "help": "HTTP-family request body bytes relayed from clients to backends.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
     "name": "ferrum_request_duration_ms",
     "type": "histogram",
     "help": "Request duration in milliseconds.",
@@ -4734,6 +4775,19 @@
     "export_surface": "/metrics",
     "bundled": "alert_and_dashboard",
     "emission": "always"
+  },
+  {
+    "name": "ferrum_response_body_bytes_total",
+    "type": "counter",
+    "help": "HTTP-family response body bytes relayed from backends to clients.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_service_discovery_body_budget_rejected_total",
@@ -5323,6 +5377,20 @@
     "export_surface": "/metrics",
     "bundled": "documented_only",
     "emission": "always"
+  },
+  {
+    "name": "ferrum_unmatched_requests_total",
+    "type": "counter",
+    "help": "Requests refused before routing because no proxy matched or the mesh REGISTRY_ONLY policy refused an outbound route miss, by closed reason and response status.",
+    "labels": [
+      "reason",
+      "status_code",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
   },
   {
     "name": "ferrum_upstream_targets",

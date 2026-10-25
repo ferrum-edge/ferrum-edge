@@ -1456,6 +1456,44 @@ fn vs_malformed_header_transform_fails_closed() {
     }
 }
 
+/// PR #6858: request-side writes into the gateway-owned `x-path-param-*` and
+/// `x-consumer-*` namespaces are refused on the VirtualService at translation,
+/// rather than emitting a `mesh_route_dispatch` config that fails at plugin
+/// construction. `remove` stays admitted.
+#[test]
+fn vs_request_header_writes_into_gateway_owned_namespaces_fail_closed() {
+    let vs = |headers: serde_json::Value| {
+        virtual_service(json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "match": [{"uri": {"prefix": "/api"}}],
+                "headers": headers,
+                "route": [{"destination": {
+                    "host": "echo.default.svc.cluster.local",
+                    "port": {"number": 8080}
+                }}]
+            }]
+        }))
+    };
+    for headers in [
+        json!({"request": {"set": {"x-path-param-account": "other"}}}),
+        json!({"request": {"add": {"X_Path_Param_Id": "7"}}}),
+        json!({"request": {"set": {"x-consumer-role": "admin"}}}),
+    ] {
+        let error = translate_k8s_objects(&[vs(headers.clone())], options())
+            .expect_err("a gateway-owned request header write must fail closed");
+        assert!(
+            error.to_string().contains("gateway-owned request header"),
+            "{headers}: {error}"
+        );
+    }
+    translate_k8s_objects(
+        &[vs(json!({"request": {"remove": ["x-path-param-account"]}}))],
+        options(),
+    )
+    .expect("removing a path-capture header stays admitted");
+}
+
 #[test]
 fn vs_request_host_set_projects_to_typed_authority_rewrite() {
     for request_headers in [

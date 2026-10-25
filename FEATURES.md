@@ -114,7 +114,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ### Authorization & Security Plugins
 
 - **Access Control** — consumer-based and group-based allow/deny lists (consumers declare `acl_groups` membership; plugins match via `allowed_groups` / `disallowed_groups`)
-- **OPA** — Open Policy Agent authorization via the OPA Data API with fail-closed defaults, configurable decision pointers, and request-header redaction
+- **OPA** — Open Policy Agent authorization via the OPA Data API with fail-closed defaults, configurable decision pointers, request-header and credential redaction, verified external-identity realms, query and repeated-header ambiguity screening, opt-in decision obligations (upstream headers on allow, policy-shaped denials), a per-instance decision bulkhead, and `opa.decision` / `opa.reason` log metadata
 - **Mesh Outbound Registry** — HTTP-family Host allowlist used by mesh `REGISTRY_ONLY` outbound policy. It is normally auto-injected from mesh slices but can also be configured directly on non-mesh gateways as a generic Host allowlist.
 - **IP Restriction** — standalone IP/CIDR filtering
 - **Geo Restriction** — GeoIP-based country allow/deny lists using MaxMind .mmdb database files
@@ -130,7 +130,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Body Validator** — JSON Schema, XML, and gRPC protobuf validation
 - **OpenAPI Validator** — request/response JSON contract enforcement generated from attached OpenAPI/Swagger specs via `x-ferrum-validate`, with block/log-only/disabled modes and emergency bypasses
 - **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends
-- **Fault Injection** — probabilistic HTTP/gRPC aborts and latency injection, TCP stream-connect rejection/delay, and UDP/DTLS session-admission abort plus per-datagram abort/delay (isolated session workers; no shared-recv HOL) for chaos testing, with per-instance counters so proxy/group scopes stay independent
+- **Fault Injection** — probabilistic HTTP/gRPC aborts and latency injection, TCP stream-connect rejection/delay, and UDP/DTLS session-admission abort plus per-datagram abort/delay (isolated session workers; no shared-recv HOL) for chaos testing, with per-instance counters so proxy/group scopes stay independent, one decision per fault side per packet, optional `match.headers` targeting, and an optional `expires_at` experiment end
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
 - **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding of `grpc-status`, binary `*-bin` metadata, and valid ASCII custom trailing metadata (hop-by-hop / forbidden / invalid fields excluded); response media type is negotiated from `Accept` (with q-values/wildcards, message-format suffix preservation, and fail-closed refusal when Accept is malformed or fully unacceptable)
 - **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment

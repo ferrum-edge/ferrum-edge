@@ -265,7 +265,8 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
     `run_final_request_body_hooks_with_provenance` immediately before step 6 on
     every dispatch ladder (`GHSA-3973-47g5-4mcx`). A plugin claims a request with
     `enforces_final_request_body_policy` (`waf`, `body_validator`, `graphql`,
-    and deny-policy `a2a_gateway` configurations)
+    deny-policy `a2a_gateway` configurations, and `preserve_tag`-configured
+    `ai_prompt_compressor` instances on candidate JSON `POST`s)
     only when its configured policy would BOTH inspect this representation and
     be able to REFUSE it — a `monitor`-mode WAF, a body rule set that only logs,
     and an `on_body_too_large: skip` body outside the scan window all lose an
@@ -324,7 +325,9 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
      the governed body direction carries an enforcing body policy
      (`request_body_policy_enforces` / `response_body_policy_enforces`, which
      also count `on_body_too_large: block` while globally enforcing); `allow` is
-     the silent variant of the default; `block` rejects unconditionally and is
+     the silent variant of the default; `block` rejects unconditionally (except
+     a `global_exemptions.header_present`-exempt request, for which every rule
+     and refusing disposition is suppressed) and is
      the only setting that also covers the cheap metadata/header scans. Do not
      make a fail-closed timeout the default: it rejects traffic the WAF scanned
      and cleared.

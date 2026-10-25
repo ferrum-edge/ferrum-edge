@@ -1212,6 +1212,7 @@ fn spawn_session_hook_ingress_worker(
                 session.datagram_payload_kind,
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&session.metadata)),
+                false,
                 ) => allowed,
                 _ = session.hook_ingress_stop_notify.notified() => break,
             };
@@ -2178,6 +2179,7 @@ async fn udp_datagram_allowed(
     payload_kind: StreamBytesKind,
     direction: UdpDatagramDirection,
     metadata_sink: Option<UdpMetadataSink<'_>>,
+    admission_datagram: bool,
 ) -> bool {
     if datagram_plugins.is_empty() {
         return true;
@@ -2193,6 +2195,7 @@ async fn udp_datagram_allowed(
         payload,
         payload_kind,
         metadata_sink,
+        admission_datagram,
     };
     for plugin in datagram_plugins {
         if matches!(plugin.on_udp_datagram(&ctx).await, UdpDatagramVerdict::Drop) {
@@ -2561,6 +2564,72 @@ pub(crate) struct UdpSetupFailureContext<'a> {
     pub(crate) connected_wall_at: chrono::DateTime<chrono::Utc>,
     pub(crate) duration_ms: f64,
     pub(crate) error: &'a anyhow::Error,
+}
+
+/// Snapshot the attribution of a frontend-DTLS connection the
+/// `on_stream_connect` chain rejected, taken at the chain's exit exactly like
+/// plain UDP's `UdpSetupProgress::record_stream_admission`.
+///
+/// Synchronous on purpose: the context is borrowed only here, never across an
+/// await.
+pub(crate) fn dtls_plugin_rejection_progress(
+    plugins: Arc<Vec<Arc<dyn Plugin>>>,
+    proxy_name: Option<&str>,
+    backend_scheme: BackendScheme,
+    configured_backend_target: String,
+    stream_ctx: &StreamConnectionContext,
+) -> UdpSetupProgress {
+    let mut progress = UdpSetupProgress::default();
+    progress.record_stream_admission(
+        plugins,
+        proxy_name,
+        backend_scheme,
+        configured_backend_target,
+        stream_ctx,
+    );
+    progress
+}
+
+/// Terminal facts of a plugin-rejected frontend-DTLS connection.
+pub(crate) struct DtlsPluginRejection<'a> {
+    pub(crate) namespace: &'a str,
+    pub(crate) proxy_id: &'a str,
+    pub(crate) client_ip: &'a str,
+    pub(crate) listen_port: u16,
+    pub(crate) connected_wall_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) duration_ms: f64,
+}
+
+/// Emit the one terminal summary for a plugin-rejected frontend-DTLS
+/// connection through the same setup-failure path a plain-UDP plugin reject
+/// uses.
+///
+/// The summary is zero-byte, classified as a client-side
+/// `StreamSetupKind::RejectedByPlugin`, attributed to the admitting plugin
+/// slice, generation, and trigger decisions recorded in `progress`, and
+/// carries the metadata the chain wrote (for example `ip_restriction.reason`).
+/// The admitting slice's `on_stream_disconnect` observers receive it. Returns
+/// whether a summary was emitted.
+pub(crate) async fn emit_dtls_plugin_rejection_summary(
+    progress: UdpSetupProgress,
+    rejection: DtlsPluginRejection<'_>,
+) -> bool {
+    let error: anyhow::Error = StreamSetupError::new(
+        StreamSetupKind::RejectedByPlugin,
+        DTLS_SESSION_SETUP_CONTEXT,
+    )
+    .into();
+    progress
+        .emit_setup_failure_if_owner(UdpSetupFailureContext {
+            namespace: rejection.namespace,
+            proxy_id: rejection.proxy_id,
+            client_ip: rejection.client_ip,
+            listen_port: rejection.listen_port,
+            connected_wall_at: rejection.connected_wall_at,
+            duration_ms: rejection.duration_ms,
+            error: &error,
+        })
+        .await
 }
 
 struct DtlsDisconnectContext<'a> {
@@ -5040,6 +5109,9 @@ async fn process_new_session_datagram(
                 },
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&first_datagram_metadata)),
+                // This packet opened the session; the `on_stream_connect`
+                // admission chain above already evaluated it.
+                true,
             )
         },
     )
@@ -5228,6 +5300,7 @@ async fn process_new_session_datagram(
                 session.datagram_payload_kind,
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&session.metadata)),
+                false,
             )
             .await
             {
@@ -6061,6 +6134,32 @@ async fn start_dtls_frontend_listener(
                                 "DTLS connection rejected by plugin"
                             );
                             client_conn.close().await;
+                            // Same terminal contract as a plain-UDP plugin
+                            // reject: one zero-byte, client-side summary
+                            // carrying the chain's metadata (for example
+                            // `ip_restriction.reason`). The session never
+                            // reached accepted-session accounting, so
+                            // `total_sessions` stays untouched.
+                            let progress = dtls_plugin_rejection_progress(
+                                Arc::clone(&plugins),
+                                proxy_name.as_deref(),
+                                backend_scheme,
+                                format!("{}:{}", proxy.backend_host, proxy.backend_port),
+                                &stream_ctx,
+                            );
+                            emit_dtls_plugin_rejection_summary(
+                                progress,
+                                DtlsPluginRejection {
+                                    namespace: &proxy_namespace,
+                                    proxy_id: &resolved_proxy_id,
+                                    client_ip: client_ip.as_ref(),
+                                    listen_port: port,
+                                    connected_wall_at: connected_at,
+                                    duration_ms: connected_mono.elapsed().as_secs_f64()
+                                        * 1000.0,
+                                },
+                            )
+                            .await;
                             return;
                         }
                         DtlsStreamConnectOutcome::TrustWithdrawn => {
@@ -6072,8 +6171,9 @@ async fn start_dtls_frontend_listener(
                             // transport and the reserved session slot. The
                             // session never reached the accepted-session
                             // accounting below, so `total_sessions` is not
-                            // incremented and no disconnect summary is built —
-                            // identical to a plugin refusal at the same point.
+                            // incremented and no disconnect summary is built
+                            // (a plugin refusal at the same point emits one
+                            // zero-byte setup-failure summary instead).
                             warn!(
                                 proxy_id = %handler_proxy_id,
                                 client = %udp_client_log_addr(client_addr),
@@ -7838,6 +7938,11 @@ async fn handle_dtls_client_inner(
     let c2b_trust = client_trust.clone();
     let b2c_trust = client_trust.clone();
     let client_to_backend = tokio::spawn(async move {
+        // The accept-time `on_stream_connect` chain already admitted this
+        // session; its first application datagram is the event that chain's
+        // per-session decisions (for example a fault-injection abort roll)
+        // stand for, so datagram hooks must not decide them a second time.
+        let mut first_application_datagram = true;
         'c2b: loop {
             let data = match dtls_c2b_under_bounds(
                 c2b_auth_plan,
@@ -7868,6 +7973,8 @@ async fn handle_dtls_client_inner(
                 ));
             }
             let len = data.len();
+            let admission_datagram = first_application_datagram;
+            first_application_datagram = false;
 
             metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_fwd
@@ -7889,6 +7996,7 @@ async fn handle_dtls_client_inner(
                     payload: &data,
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_fwd.as_ref())),
+                    admission_datagram,
                 };
                 let mut dropped = false;
                 for plugin in dgram_plugins.iter() {
@@ -8087,6 +8195,7 @@ async fn handle_dtls_client_inner(
                     payload: &data,
                     payload_kind: StreamBytesKind::DecryptedApp,
                     metadata_sink: Some(UdpMetadataSink::new(dgram_metadata_rev.as_ref())),
+                    admission_datagram: false,
                 };
                 match dtls_reply_commit_after_backend_hooks(
                     dgram_plugins_rev.as_ref(),
@@ -9138,6 +9247,7 @@ async fn create_session(
                     payload: send_data,
                     payload_kind: reply_session.datagram_payload_kind,
                     metadata_sink: Some(UdpMetadataSink::new(&reply_session.metadata)),
+                    admission_datagram: false,
                 };
                 match udp_reply_commit_after_backend_hooks(
                     reply_datagram_plugins.as_ref(),
@@ -9392,6 +9502,7 @@ async fn create_session(
                                     metadata_sink: Some(UdpMetadataSink::new(
                                         &reply_session.metadata,
                                     )),
+                                    admission_datagram: false,
                                 };
                                 match udp_reply_commit_after_backend_hooks(
                                     reply_datagram_plugins.as_ref(),

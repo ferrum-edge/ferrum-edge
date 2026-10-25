@@ -255,6 +255,23 @@ fn waf_header_present_secret_values_are_projected() {
 }
 
 #[test]
+fn fault_injection_match_header_values_are_projected() {
+    let projected = project(
+        "fault_injection",
+        json!({
+            "abort": { "status_code": 503, "percentage": 100.0 },
+            "match": { "headers": { "x-chaos-test": "fault-target-secret-canary" } },
+            "expires_at": "2026-11-01T12:30:00Z"
+        }),
+    );
+    assert_eq!(projected["match"]["headers"]["x-chaos-test"], REDACTED);
+    // Header names, fault shape, and the experiment bound stay visible.
+    assert_eq!(projected["abort"]["status_code"], 503);
+    assert_eq!(projected["expires_at"], "2026-11-01T12:30:00Z");
+    assert_no_canaries(&projected, &["fault-target-secret-canary"]);
+}
+
+#[test]
 fn otel_header_values_are_secret_by_default_regardless_of_name() {
     let projected = project(
         "otel_tracing",

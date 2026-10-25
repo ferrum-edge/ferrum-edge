@@ -5,10 +5,13 @@
 //! Supports JSON, XML, and plain text response bodies with configurable
 //! content type and HTTP status code.
 //!
-//! The response body and `content-type` value are computed **once** at
-//! construction time so the request hot path only does string clones —
-//! no per-request `format!()`, no `String::replace()` chains, no JSON/XML
-//! parse or escape work.
+//! The response body, `content-type`, and every configured response header are
+//! computed **once** at construction time. The body is held as shared
+//! [`Bytes`], so a matching request costs a reference-count bump for the body
+//! plus the clone of the precomputed header map that the owned
+//! [`PluginResult`] contract requires — no per-request body copy (HEAD
+//! included), `format!()`, `String::replace()` chain, or JSON/XML parse or
+//! escape work.
 //!
 //! When `content_type` classifies as JSON and `message` is a complete,
 //! unambiguous JSON value, that value is the response body (not string-escaped
@@ -21,9 +24,17 @@
 //! final (200–599); informational statuses including `101` are rejected.
 //! Statuses `204`/`205`/`304` force an empty body. Header triggers evaluate
 //! raw multi-value field lines (including non-UTF-8 presence) rather than the
-//! lossy materialized map.
+//! lossy materialized map, comparing the RFC 9110 field value (surrounding
+//! SP/HTAB stripped) so the same logical header matches identically on
+//! HTTP/1.1, HTTP/2, and HTTP/3.
+//!
+//! The plugin runs in `on_request_received` at priority 125, before IP
+//! restriction, authentication, authorization, rate limiting, and the WAF. A
+//! termination is therefore served to unauthenticated callers; post-auth
+//! mocking belongs to `response_mock` (`before_proxy`).
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -32,11 +43,52 @@ use super::{Plugin, PluginResult, RequestContext};
 use crate::config::types::{HttpFlavor, HttpWireTransport};
 
 /// Every accepted top-level configuration property.
-pub const REQUEST_TERMINATION_CONFIG_KEYS: &[&str] =
-    &["status_code", "content_type", "body", "message", "trigger"];
+pub const REQUEST_TERMINATION_CONFIG_KEYS: &[&str] = &[
+    "status_code",
+    "content_type",
+    "body",
+    "message",
+    "headers",
+    "trigger",
+];
 
 /// Every accepted key inside `trigger`.
 pub const REQUEST_TERMINATION_TRIGGER_KEYS: &[&str] = &["path_prefix", "header", "header_value"];
+
+/// Most response headers one instance may configure under `headers`.
+pub const REQUEST_TERMINATION_MAX_HEADERS: usize = 32;
+
+/// Longest configured response header value, in bytes. Values are visible
+/// ASCII, so this is also the character count the published schema bounds.
+pub const REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES: usize = 4096;
+
+/// Response header names that carry credentials or an authentication
+/// challenge. A canned response must never mint a session cookie or stand in
+/// for the gateway's own `WWW-Authenticate` challenge.
+const CREDENTIAL_RESPONSE_HEADER_NAMES: &[&str] = &[
+    "authentication-info",
+    "authorization",
+    "proxy-authentication-info",
+    "proxy-authorization",
+    "set-cookie",
+    "set-cookie2",
+    "www-authenticate",
+];
+
+/// Exact gateway-owned response header names (gateway error contract).
+const GATEWAY_OWNED_RESPONSE_HEADER_NAMES: &[&str] =
+    &["x-gateway-error", "x-gateway-upstream-status"];
+
+/// Gateway-owned response header families: `x-ferrum-*` carries diagnostics
+/// and internal gRPC-Web bridge markers, and `grpc-*` is gRPC status metadata
+/// that the reject normalizer reads (a configured `grpc-status: 0` would turn
+/// the termination into a successful RPC).
+const GATEWAY_OWNED_RESPONSE_HEADER_PREFIXES: &[&str] = &["x-ferrum-", "grpc-"];
+
+/// Fail-closed body for a 2xx termination of a CONNECT / Extended CONNECT
+/// request.
+const CONNECT_REFUSAL_BODY: &[u8] =
+    b"{\"message\":\"CONNECT termination requires a non-success status\",\"status_code\":403}";
 
 #[derive(Debug, Clone)]
 enum Trigger {
@@ -47,12 +99,16 @@ enum Trigger {
 
 pub struct RequestTermination {
     status_code: u16,
-    /// Pre-computed `content-type` header value.
-    content_type: String,
     /// Pre-rendered response body. Built once from `body`, `message`,
-    /// `content_type`, and `status_code` at construction time so the hot path
-    /// never re-renders it. Empty for 204/205/304.
-    body: String,
+    /// `content_type`, and `status_code` at construction time and shared by
+    /// reference count, so the hot path never re-renders or copies it. Empty
+    /// for 204/205/304.
+    body: Bytes,
+    /// Pre-computed response headers: `content-type` plus every validated
+    /// `headers` entry, keyed by lowercase name.
+    headers: HashMap<String, String>,
+    /// Pre-computed headers for the fail-closed CONNECT refusal.
+    connect_refusal_headers: HashMap<String, String>,
     trigger: Trigger,
 }
 
@@ -101,12 +157,21 @@ impl RequestTermination {
             render_default_body(&content_type, status_code, rendered_message)
         };
 
+        let configured_headers = parse_response_headers(config)?;
         let trigger = parse_trigger(config)?;
+
+        let mut headers = HashMap::with_capacity(1 + configured_headers.len());
+        headers.insert("content-type".to_string(), content_type);
+        headers.extend(configured_headers);
+
+        let mut connect_refusal_headers = HashMap::with_capacity(1);
+        connect_refusal_headers.insert("content-type".to_string(), "application/json".to_string());
 
         Ok(Self {
             status_code,
-            content_type,
-            body,
+            body: Bytes::from(body),
+            headers,
+            connect_refusal_headers,
             trigger,
         })
     }
@@ -161,16 +226,22 @@ fn parse_content_type(config: &Map<String, Value>) -> Result<String, String> {
     match config.get("content_type") {
         None => Ok("application/json".to_string()),
         Some(Value::String(value)) => {
-            let trimmed = value.trim();
+            // Visible ASCII plus SP/HTAB only — the published schema's
+            // alphabet. `HeaderValue` alone would also admit obs-text bytes,
+            // which the admin schema refuses.
+            if !value.bytes().all(is_visible_ascii_or_ows) {
+                return Err(
+                    "request_termination: `content_type` must contain only visible ASCII \
+                     characters, spaces, and horizontal tabs"
+                        .to_string(),
+                );
+            }
+            let trimmed = trim_ows_str(value);
             if trimmed.is_empty() {
                 return Err(
                     "request_termination: `content_type` must be a non-empty string".to_string(),
                 );
             }
-            HeaderValue::from_str(trimmed).map_err(|_| {
-                "request_termination: `content_type` contains characters not permitted in HTTP header values"
-                    .to_string()
-            })?;
             Ok(trimmed.to_string())
         }
         Some(other) => Err(format!(
@@ -299,7 +370,7 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
             .to_string();
         let value = match trigger.get("header_value") {
             None => String::new(),
-            Some(Value::String(value)) => value.clone(),
+            Some(Value::String(value)) => parse_header_trigger_value(value)?,
             Some(other) => {
                 return Err(format!(
                     "request_termination: `trigger.header_value` must be a string, got: {other:?}",
@@ -311,6 +382,156 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
     }
 
     Err("request_termination: `trigger` must set `path_prefix` or `header`".to_string())
+}
+
+/// Validate `trigger.header_value` and return its RFC 9110 field value.
+///
+/// The value must be a legal field value (no control character other than
+/// HTAB), or the trigger could never fire on any transport. Surrounding
+/// SP/HTAB is stripped, matching how the match side compares wire values. A
+/// non-empty value that is only whitespace is refused instead of silently
+/// becoming a presence match.
+fn parse_header_trigger_value(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Ok(String::new());
+    }
+    HeaderValue::from_str(value).map_err(|_| {
+        "request_termination: `trigger.header_value` contains characters not permitted in an \
+         HTTP field value (control characters other than horizontal tab); the trigger could \
+         never match"
+            .to_string()
+    })?;
+    let trimmed = trim_ows_str(value);
+    if trimmed.is_empty() {
+        return Err(
+            "request_termination: `trigger.header_value` must not be only whitespace; omit it \
+             (or set it to an empty string) to match header presence"
+                .to_string(),
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Parse the optional `headers` object into validated, lowercase-named
+/// response headers. Construction-time only.
+fn parse_response_headers(config: &Map<String, Value>) -> Result<Vec<(String, String)>, String> {
+    let Some(value) = config.get("headers") else {
+        return Ok(Vec::new());
+    };
+    let Value::Object(map) = value else {
+        return Err(
+            "request_termination: `headers` must be an object mapping header names \
+             to string values"
+                .to_string(),
+        );
+    };
+    if map.len() > REQUEST_TERMINATION_MAX_HEADERS {
+        return Err(format!(
+            "request_termination: `headers` accepts at most \
+             {REQUEST_TERMINATION_MAX_HEADERS} entries"
+        ));
+    }
+    let mut parsed: Vec<(String, String)> = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        let header = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            format!("request_termination: `headers` key {name:?} is not a valid HTTP field name")
+        })?;
+        // `HeaderName` normalizes to lowercase.
+        let lower = header.as_str();
+        if let Some(reason) = reserved_response_header_reason(lower) {
+            return Err(format!(
+                "request_termination: `headers` key {name:?} {reason}"
+            ));
+        }
+        if parsed.iter().any(|(existing, _)| existing == lower) {
+            return Err(format!(
+                "request_termination: `headers` key {name:?} is configured more than once \
+                 (header names are case-insensitive)"
+            ));
+        }
+        let Value::String(value) = value else {
+            return Err(format!(
+                "request_termination: `headers` value for {name:?} must be a string"
+            ));
+        };
+        if let Some(reason) = response_header_value_problem(value) {
+            return Err(format!(
+                "request_termination: `headers` value for {name:?} {reason}"
+            ));
+        }
+        parsed.push((lower.to_string(), value.clone()));
+    }
+    Ok(parsed)
+}
+
+/// Why a lowercase response header name may not be configured, or `None`.
+fn reserved_response_header_reason(lower: &str) -> Option<&'static str> {
+    if crate::proxy::headers::is_protocol_managed_plugin_response_destination(lower) {
+        return Some(
+            "is protocol-managed (hop-by-hop or framing) and cannot be configured; the gateway \
+             derives framing from the canned body, status, and method",
+        );
+    }
+    if lower == "content-type" {
+        return Some("is set by `content_type`; configure the media type there");
+    }
+    if CREDENTIAL_RESPONSE_HEADER_NAMES.contains(&lower) {
+        return Some(
+            "carries credentials or an authentication challenge and cannot be set on a canned \
+             response",
+        );
+    }
+    if GATEWAY_OWNED_RESPONSE_HEADER_NAMES.contains(&lower)
+        || GATEWAY_OWNED_RESPONSE_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+    {
+        return Some(
+            "is gateway-owned (gateway error, diagnostic, or gRPC status metadata) and cannot \
+             be configured",
+        );
+    }
+    None
+}
+
+/// Why a configured response header value is invalid, or `None`.
+fn response_header_value_problem(value: &str) -> Option<&'static str> {
+    if value.len() > REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES {
+        return Some("exceeds the 4096-byte limit");
+    }
+    if !value.bytes().all(is_visible_ascii_or_ows) {
+        return Some("must contain only visible ASCII characters, spaces, and horizontal tabs");
+    }
+    let bytes = value.as_bytes();
+    if matches!(bytes.first(), Some(b' ' | b'\t')) || matches!(bytes.last(), Some(b' ' | b'\t')) {
+        return Some("must not have leading or trailing whitespace");
+    }
+    None
+}
+
+/// HTAB, SP, or a visible ASCII character (`0x21..=0x7E`).
+#[inline]
+fn is_visible_ascii_or_ows(byte: u8) -> bool {
+    byte == b'\t' || (0x20..=0x7E).contains(&byte)
+}
+
+/// Strip RFC 9110 optional whitespace (SP / HTAB) from both ends.
+#[inline]
+fn trim_ows_str(value: &str) -> &str {
+    value.trim_matches(|c: char| c == ' ' || c == '\t')
+}
+
+/// Strip RFC 9110 optional whitespace (SP / HTAB) from both ends of a raw
+/// field line. Allocation-free.
+#[inline]
+fn trim_ows_bytes(mut bytes: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = bytes {
+        bytes = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = bytes {
+        bytes = rest;
+    }
+    bytes
 }
 
 fn json_u64(value: &Value) -> Option<u64> {
@@ -346,6 +567,16 @@ fn unreachable_parsed_path_prefix_reason(path: &str) -> Option<&'static str> {
         return Some(
             "must not contain a fragment delimiter (`#`); request paths are the parsed URI path, \
              so a prefix with a fragment can never match",
+        );
+    }
+    // `http::uri::PathAndQuery` refuses these three bytes literally, and the
+    // canonicalizer refuses their percent escapes (`%3C`, `%3E`, `%60`), so
+    // no admitted request path can contain one. Literal `"`, `{`, `}`, `[`,
+    // `]`, `^`, `|`, and UTF-8 are admitted by the parser and stay valid.
+    if path.bytes().any(|byte| matches!(byte, b'<' | b'>' | b'`')) {
+        return Some(
+            "must not contain `<`, `>`, or a backtick; request-target parsing refuses them \
+             literally and canonicalization refuses their escapes, so the prefix can never match",
         );
     }
     None
@@ -471,8 +702,11 @@ fn xml_escape(s: &str) -> String {
 ///
 /// * Presence (`header_value` empty): any field line — including non-UTF-8 —
 ///   counts as present.
-/// * Exact value: any individual field line whose bytes equal the configured
-///   value matches. Never compares against a comma-folded serialization.
+/// * Exact value: any individual field line whose RFC 9110 field value (bytes
+///   with surrounding SP/HTAB stripped) equals the configured value matches.
+///   HTTP/1.1 parsing already strips that whitespace while HPACK/QPACK deliver
+///   it verbatim, so trimming here keeps the match transport-independent.
+///   Never compares against a comma-folded serialization.
 ///
 /// When raw headers are unavailable (unit-test harnesses that only populate
 /// `ctx.headers`), falls back to the materialized map.
@@ -483,7 +717,7 @@ fn header_trigger_matches(ctx: &RequestContext, header: &str, expected: &str) ->
                 // Presence-only: any field line, including non-UTF-8, matches.
                 return true;
             }
-            if value == expected.as_bytes() {
+            if trim_ows_bytes(value) == expected.as_bytes() {
                 // Exact match against an individual field line — never against
                 // a comma-folded serialization of repeated lines.
                 return true;
@@ -494,7 +728,7 @@ fn header_trigger_matches(ctx: &RequestContext, header: &str, expected: &str) ->
 
     ctx.headers
         .get(header)
-        .is_some_and(|v| expected.is_empty() || v == expected)
+        .is_some_and(|v| expected.is_empty() || trim_ows_str(v) == expected)
 }
 
 #[async_trait]
@@ -534,30 +768,21 @@ impl Plugin for RequestTermination {
                     Some(HttpWireTransport::Http2 | HttpWireTransport::Http3)
                 );
         let is_tunnel = ctx.method.eq_ignore_ascii_case("CONNECT") || is_extended_connect_websocket;
-        let (status_code, body, content_type) = if is_tunnel
-            && (200..300).contains(&self.status_code)
-        {
-            (
-                403u16,
-                "{\"message\":\"CONNECT termination requires a non-success status\",\"status_code\":403}"
-                    .to_string(),
-                "application/json".to_string(),
-            )
-        } else {
-            (
-                self.status_code,
-                self.body.clone(),
-                self.content_type.clone(),
-            )
-        };
+        if is_tunnel && (200..300).contains(&self.status_code) {
+            return PluginResult::RejectBinary {
+                status_code: 403,
+                body: Bytes::from_static(CONNECT_REFUSAL_BODY),
+                headers: self.connect_refusal_headers.clone(),
+            };
+        }
 
-        let mut headers = HashMap::with_capacity(1);
-        headers.insert("content-type".to_string(), content_type);
-
-        PluginResult::Reject {
-            status_code,
-            body,
-            headers,
+        // `Bytes::clone` shares the pre-rendered allocation (HEAD included:
+        // the shared finalizer omits DATA but still needs the representation
+        // length). The header map is cloned because `PluginResult` owns it.
+        PluginResult::RejectBinary {
+            status_code: self.status_code,
+            body: self.body.clone(),
+            headers: self.headers.clone(),
         }
     }
 }

@@ -537,8 +537,58 @@ extensionProviders:
 }
 
 #[test]
-fn upstream_and_allow_response_mutation_are_refused_at_admission() {
-    for field in ["headersToUpstreamOnAllow", "headersToDownstreamOnAllow"] {
+fn allowed_request_mutation_lists_are_admitted() {
+    // The oauth2-proxy / token-exchange shape: provider identity and an
+    // exchanged token go upstream, a refreshed session cookie goes back to the
+    // browser. Both lists used to be refused outright.
+    let mesh = translate_provider_only(
+        r#"
+extensionProviders:
+- name: p
+  envoyExtAuthzHttp:
+    service: 127.0.0.1
+    port: 8000
+    headersToUpstreamOnAllow:
+    - x-auth-request-user
+    - Authorization
+    headersToDownstreamOnAllow:
+    - set-cookie
+"#,
+    )
+    .expect("allowed-request header lists are a supported contract");
+    let provider = &mesh.ext_authz_providers[0];
+    assert_eq!(
+        provider.headers_to_upstream_on_allow,
+        vec![
+            "x-auth-request-user".to_string(),
+            "authorization".to_string()
+        ],
+        "names are normalized to lowercase at translation"
+    );
+    assert_eq!(
+        provider.headers_to_downstream_on_allow,
+        vec!["set-cookie".to_string()]
+    );
+}
+
+#[test]
+fn allowed_request_mutation_refuses_gateway_framing_and_representation_headers() {
+    for (field, header) in [
+        // The gateway's own authentication assertions: a provider must not
+        // impersonate them to the backend.
+        ("headersToUpstreamOnAllow", "x-consumer-id"),
+        ("headersToUpstreamOnAllow", "x_consumer_username"),
+        ("headersToUpstreamOnAllow", "x-path-param-user"),
+        // Body representation / response-only fields.
+        ("headersToUpstreamOnAllow", "content-type"),
+        ("headersToUpstreamOnAllow", "set-cookie"),
+        // Routing / framing / gateway-reserved, refused for every direction.
+        ("headersToUpstreamOnAllow", "host"),
+        ("headersToUpstreamOnAllow", "x-ferrum-hops"),
+        ("headersToUpstreamOnAllow", "x-forwarded-for"),
+        ("headersToDownstreamOnAllow", "content-encoding"),
+        ("headersToDownstreamOnAllow", "transfer-encoding"),
+    ] {
         let error = translate_provider_only(&format!(
             r#"
 extensionProviders:
@@ -547,15 +597,39 @@ extensionProviders:
     service: 127.0.0.1
     port: 8000
     {field}:
-    - x-authz-decision
+    - {header}
 "#
         ))
-        .unwrap_err();
+        .expect_err("a reserved allow-mutation header must be refused");
         assert!(
-            error.contains("not supported"),
-            "{field} must be refused rather than silently dropped, got: {error}"
+            error.contains(field),
+            "{field} {header} must be refused with a field-shaped diagnostic, got: {error}"
         );
     }
+}
+
+#[test]
+fn native_provider_validation_applies_the_same_allow_mutation_rules() {
+    let mut accepted = provider("p");
+    accepted.headers_to_upstream_on_allow = vec!["x-auth-request-user".to_string()];
+    accepted.headers_to_downstream_on_allow = vec!["set-cookie".to_string()];
+    accepted
+        .validate()
+        .expect("a native/xDS provider with allow-mutation lists is admitted");
+
+    let mut refused = provider("p");
+    refused.headers_to_upstream_on_allow = vec!["x-consumer-custom-id".to_string()];
+    let error = refused
+        .validate()
+        .expect_err("a gateway assertion name must be refused at the native boundary too");
+    assert!(error.contains("headersToUpstreamOnAllow"), "got: {error}");
+
+    let mut uppercase = provider("p");
+    uppercase.headers_to_downstream_on_allow = vec!["Set-Cookie".to_string()];
+    assert!(
+        uppercase.validate().is_err(),
+        "the native boundary requires the normalized lowercase spelling"
+    );
 }
 
 #[test]

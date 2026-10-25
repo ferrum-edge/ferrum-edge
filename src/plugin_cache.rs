@@ -566,6 +566,65 @@ fn is_builtin_named(plugin: &Arc<dyn Plugin>, name: &str) -> bool {
     plugin.name() == name && crate::plugins::is_builtin_plugin(plugin.as_ref())
 }
 
+/// The built-in `opa` instance behind `plugin`, looking through cache wrappers.
+/// Keyed on the concrete type, never the reported name.
+fn builtin_opa<'a>(plugin: &'a (dyn Plugin + 'static)) -> Option<&'a crate::plugins::opa::Opa> {
+    let any: &dyn std::any::Any = plugin;
+    if let Some(opa) = any.downcast_ref::<crate::plugins::opa::Opa>() {
+        return Some(opa);
+    }
+    match cache_owned_plugin(any) {
+        Some(CacheOwnedPlugin::Wraps(inner)) => builtin_opa(inner),
+        _ => None,
+    }
+}
+
+/// An `opa` allow obligation (`decision_request_headers`) must never author a
+/// header an authentication plugin on the same effective chain owns as a
+/// credential location: the policy would replace the client's credential on
+/// the upstream request, or the owner's `hide_credentials` strip would silently
+/// drop the obligation after OPA recorded an allow. Names are compared as
+/// backends read them (ASCII case, `_` and `-` equivalent). Credential names a
+/// non-authentication plugin publishes are refused per request by OPA itself.
+fn validate_opa_obligations_against_credential_owners(
+    plugins: &[Arc<dyn Plugin>],
+) -> Result<(), String> {
+    for plugin in plugins {
+        let Some(opa) = builtin_opa(plugin.as_ref()) else {
+            continue;
+        };
+        let destinations = opa.decision_request_header_destinations();
+        if destinations.is_empty() {
+            continue;
+        }
+        for owner in plugins.iter().filter(|owner| {
+            owner.is_auth_plugin()
+                && owner
+                    .supported_protocols()
+                    .iter()
+                    .any(|protocol| plugin.supported_protocols().contains(protocol))
+        }) {
+            if let Some(credential) = owner.request_headers_to_redact().iter().find(|credential| {
+                destinations.iter().any(|destination| {
+                    crate::proxy::headers::field_names_equivalent_for_backends(
+                        destination,
+                        credential,
+                    )
+                })
+            }) {
+                return Err(format!(
+                    "opa `decision_request_headers` cannot name {credential:?}, which \
+                     authentication plugin {:?} on the same effective plugin chain owns as a \
+                     credential location; a policy decision must never author or replace a \
+                     credential",
+                    owner.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject security-sensitive plugin compositions whose ordering or body view
 /// cannot preserve the configured enforcement contract.
 pub(crate) fn validate_plugin_security_composition(
@@ -590,6 +649,8 @@ pub(crate) fn validate_plugin_security_composition(
             plugin.name()
         ));
     }
+
+    validate_opa_obligations_against_credential_owners(plugins)?;
 
     for protocol in ALL_PROXY_PROTOCOLS {
         let identity_soap_count = plugins
@@ -2273,11 +2334,24 @@ impl Plugin for PluginInstanceWrapper {
             .on_ws_reassembly_frames(proxy_id, connection_id, direction, fragment_frames)
             .await
     }
+    fn on_ws_policy_close(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        close: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) {
+        self.inner
+            .on_ws_policy_close(proxy_id, connection_id, direction, close);
+    }
     fn prepare_ws_frame_delivery(
         &self,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
         message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<crate::plugins::WsFrameDeliveryObservation> {
-        self.inner.prepare_ws_frame_delivery(message)
+        self.inner
+            .prepare_ws_frame_delivery(connection_id, direction, message)
     }
     fn emit_ws_frame_delivery(
         &self,
@@ -2470,7 +2544,9 @@ pub(crate) fn validate_tcp_connection_throttle_attachments(
 /// Whether an effective plugin config can require the parsed WebSocket relay.
 ///
 /// Built-ins answer from the config-independent
-/// [`crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS`] declaration. An
+/// [`crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS`] declaration, except
+/// `api_chargeback`, which needs the parsed relay only when it prices
+/// bandwidth and answers from its parsed pricing without being constructed. An
 /// out-of-tree plugin is constructed and asked through
 /// [`Plugin::requires_websocket_framing`]; a plugin that cannot be constructed
 /// is reported as an error so the caller fails closed.
@@ -2481,6 +2557,13 @@ fn plugin_config_may_require_websocket_framing(
     let name = pc.plugin_name.as_str();
     if crate::plugins::BUILTIN_WEBSOCKET_FRAMING_PLUGINS.contains(&name) {
         return Ok(true);
+    }
+    // The one built-in whose framing need depends on its config: a
+    // bandwidth-priced `api_chargeback` bills WebSocket sessions from the
+    // parsed relay's payload counters, which a compressed passthrough session
+    // relayed as raw bytes would not provide.
+    if name == "api_chargeback" {
+        return crate::plugins::api_chargeback::config_requires_websocket_framing(&pc.config);
     }
     if crate::plugins::builtin_plugin_parity_meta(name).is_some() {
         return Ok(false);
@@ -4545,12 +4628,22 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "grpc_web",
     "hmac_auth",
     "jwks_auth",
+    // `jwt_auth` publishes its configured token header as a credential
+    // location, which the `opa` obligation-destination refusal reads; the
+    // candidate view must see it exactly as runtime construction does.
+    // Construction is pure config parsing.
+    "jwt_auth",
     "key_auth",
     "load_testing",
     "mcp_gateway",
     "mesh_route_dispatch",
     "oauth2_introspection",
     "oidc_relying_party",
+    // `opa` with `decision_request_headers` reports request-header mutation
+    // from `authorize`, so the `response_caching` / `request_deduplication`
+    // ordering gates must see the constructed instance in candidate admission
+    // too, not a capability-less shape. Construction is pure config parsing.
+    "opa",
     "otel_tracing",
     "rate_limiting",
     "request_deduplication",
@@ -6996,6 +7089,7 @@ impl PluginCache {
         previous_lifecycle_generation_high_water: u64,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
+        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -7444,6 +7538,7 @@ impl PluginCache {
         country_mmdb_load_mode: CountryMmdbLoadMode,
     ) -> Result<Arc<PluginCacheInner>, String> {
         validate_gateway_plugin_composition(config)?;
+        crate::plugins::api_chargeback::validate_live_overflow_reservation(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);

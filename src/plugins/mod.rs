@@ -1379,6 +1379,16 @@ pub struct UdpDatagramContext<'a> {
     /// that `build_udp_stream_summary` / `build_dtls_stream_summary` read at
     /// disconnect. `None` when there is no session map to attach to (or in tests).
     pub metadata_sink: Option<UdpMetadataSink<'a>>,
+    /// `true` only for the first client→backend datagram of a session whose
+    /// `on_stream_connect` admission chain already ran for it: the packet that
+    /// opened a plain-UDP session (the proxy runs this hook on it during
+    /// session setup, after admission evaluated the same packet), and the first
+    /// decrypted application datagram of a terminating-DTLS session (admitted
+    /// at handshake accept). A plugin that makes one first-contact decision in
+    /// both hooks (for example a fault-injection abort roll) must not decide it
+    /// a second time here. `false` for every later datagram and for every
+    /// backend→client datagram.
+    pub admission_datagram: bool,
 }
 
 /// Sink for recording session-scoped metadata from the per-datagram UDP/DTLS
@@ -2231,6 +2241,16 @@ pub(crate) struct A2aGatewayClaim {
     /// mutable header map. The ordinary transform path needs no such flag: the
     /// core already runs the shared invalidation for it.
     pub(crate) card_body_replaced: bool,
+    /// The exact JSON-RPC request bytes the arrival-time classification above
+    /// was decided over, when the context held them as [`bytes::Bytes`].
+    ///
+    /// A refcounted handle, not a copy. The final backend-visible request-body
+    /// hook compares the finalized body against it: byte-identical bytes are
+    /// provably classified exactly as they were at arrival, so the hook skips
+    /// re-parsing them, while any difference re-runs the full classification
+    /// and refuses a change of response-shaping operation class the response
+    /// phase above was not set up for.
+    pub(crate) classified_request_body: Option<bytes::Bytes>,
 }
 
 /// Lifecycle of an Agent Card rewrite `a2a_gateway` claimed on the response path
@@ -2574,6 +2594,14 @@ pub struct RequestContext {
     /// Keep this source fact separate from the effective budget so an earlier
     /// default policy cannot satisfy a later `reject_no_deadline` policy.
     pub(crate) grpc_deadline_had_valid_client_timeout: bool,
+    /// Set by every enabled `request_transformer` with body rules that ran
+    /// `before_proxy` for this request. Proxy core then inspects the FINAL
+    /// outbound headers for content-integrity fields (`Content-Digest`,
+    /// `Repr-Digest`, `Digest`, `Content-MD5`) and retires them when the body
+    /// rules may rewrite the request
+    /// (`crate::proxy::retire_stale_request_integrity_headers`). A plain bool
+    /// so the enrollment itself never allocates.
+    pub(crate) request_body_integrity_retirement: bool,
     /// Monotonic receipt instant captured with the request context. Effective
     /// budgets are added to this exact anchor, independent of wall-clock jumps.
     pub(crate) grpc_deadline_received_at: tokio::time::Instant,
@@ -2822,6 +2850,13 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
+    /// Set by the process-global `prometheus_metrics` request hook when it
+    /// observed this transaction. Gates the gRPC message scanners (see
+    /// [`crate::plugins::mesh::prometheus_helpers::request_observes_grpc_messages`]).
+    ///
+    /// A typed bit rather than a `metadata` marker so the per-request hook
+    /// allocates nothing; it never reaches transaction logs.
+    prometheus_metrics_observed: bool,
     /// Per-request memo of duplicate-object-member screens over governed JSON
     /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
     /// `body_validator`, and `ai_tool_governor` can all inspect the same
@@ -3291,6 +3326,23 @@ pub struct RequestContext {
     /// H3 request handlers; a default-constructed context leaves it `0`, which
     /// falls back to the gate's own hard ceiling.
     pub max_response_body_size_bytes: usize,
+    /// Transport evidence about whether request DATA may follow the head,
+    /// recorded once by the frontend that built this context.
+    ///
+    /// * `Some(false)` — the transport PROVED the request ends with its head:
+    ///   an HTTP/1.1 request with no body framing (or `Content-Length: 0`), or
+    ///   an HTTP/2 HEADERS frame carrying END_STREAM.
+    /// * `Some(true)` — a body may follow: declared HTTP/1.1 framing, an
+    ///   HTTP/2 stream left open after HEADERS, and every HTTP/3 request (the
+    ///   `h3` request stream exposes no end-of-stream signal before the first
+    ///   read).
+    /// * `None` — no transport evidence (synthetic and test contexts); body
+    ///   governance falls back to the declared `Content-Length` /
+    ///   `Transfer-Encoding` framing.
+    ///
+    /// Read by request-body policies that must not let an omitted
+    /// `Content-Length` / `Content-Type` stand in for proof of an empty body.
+    pub(crate) inbound_request_body_may_follow: Option<bool>,
     /// Strictest active *route-scoped* request-body ceiling enforced by this
     /// request's matched plugin set (`Plugin::enforced_request_body_limit`),
     /// or `None` when no matched plugin enforces one.
@@ -3718,6 +3770,23 @@ pub(crate) struct PluginRequestState {
     /// `metadata` so authorization-phase rejection logging can never serialize
     /// raw claim values.
     pub(crate) pending_claim_headers: HashMap<String, String>,
+    /// `mesh_authz` CUSTOM `headersToUpstreamOnAllow` results, staged on an
+    /// allowed check and consumed by the SAME instance's `before_proxy`.
+    /// Keyed by the staging instance's process-unique id, so two effective
+    /// `mesh_authz` instances on one request (an operator global beside the
+    /// force-injected `__mesh_authz`, say) can never overwrite or consume each
+    /// other's provider-owned names. Each entry is one pair per provider-owned
+    /// name: `Some(value)` installs the provider's value, `None` only strips
+    /// the client's copy. Kept out of `metadata` so a provider-minted token can
+    /// never be serialized into a transaction log.
+    pub(crate) mesh_ext_authz_upstream_headers:
+        HashMap<u64, crate::plugins::mesh::ext_authz::StagedUpstreamHeaders>,
+    /// `mesh_authz` CUSTOM `headersToDownstreamOnAllow` results, keyed the same
+    /// way, applied to the client-visible response by the staging instance's
+    /// own `after_proxy` / WebSocket handshake hook. Same out-of-`metadata`
+    /// reasoning (it routinely carries `Set-Cookie`).
+    pub(crate) mesh_ext_authz_downstream_headers:
+        HashMap<u64, crate::plugins::mesh::ext_authz::StagedDownstreamHeaders>,
     /// Lowercase `claim_headers` destinations already sanitized for this
     /// request. Gateway-owned destinations are stripped exactly once, by the
     /// first plugin instance that owns them, so a later instance sharing a
@@ -4453,6 +4522,7 @@ impl RequestContext {
             timestamp_received: Utc::now(),
             grpc_deadline_initialized: false,
             grpc_deadline_had_valid_client_timeout: false,
+            request_body_integrity_retirement: false,
             grpc_deadline_received_at: tokio::time::Instant::now(),
             grpc_deadline_preflight_complete: false,
             grpc_deadline_budget_ms: None,
@@ -4495,6 +4565,7 @@ impl RequestContext {
             h3_response_upstream_is_fallback: false,
             original_accept_encoding: None,
             websocket_response_boundary: false,
+            prometheus_metrics_observed: false,
             json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             governed_request_body_plaintext: None,
             finalized_response_replay: false,
@@ -4554,6 +4625,7 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: 0,
+            inbound_request_body_may_follow: None,
             route_request_body_limit_bytes: None,
             route_response_body_limit_bytes: None,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5993,6 +6065,7 @@ impl RequestContext {
             timestamp_received: self.timestamp_received,
             grpc_deadline_initialized: self.grpc_deadline_initialized,
             grpc_deadline_had_valid_client_timeout: self.grpc_deadline_had_valid_client_timeout,
+            request_body_integrity_retirement: self.request_body_integrity_retirement,
             grpc_deadline_received_at: self.grpc_deadline_received_at,
             grpc_deadline_preflight_complete: self.grpc_deadline_preflight_complete,
             grpc_deadline_budget_ms: self.grpc_deadline_budget_ms,
@@ -6073,6 +6146,11 @@ impl RequestContext {
                 // compatibility clone would extend their lifetime unnecessarily.
                 hook_state.pending_claim_headers = HashMap::new();
                 hook_state.sanitized_claim_header_destinations = HashSet::new();
+                // Same for the `mesh_authz` ext-authz allow-header staging: it
+                // is consumed only by `before_proxy` / `after_proxy` on the
+                // live context, and may carry a provider-minted credential.
+                hook_state.mesh_ext_authz_upstream_headers = HashMap::new();
+                hook_state.mesh_ext_authz_downstream_headers = HashMap::new();
                 // Response caching has no final request-body hook. Its private
                 // backend-header delta remains on the live donor context for the
                 // eventual response store rather than extending raw values into
@@ -6086,6 +6164,7 @@ impl RequestContext {
             h3_response_upstream_is_fallback: self.h3_response_upstream_is_fallback,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
+            prometheus_metrics_observed: self.prometheus_metrics_observed,
             json_scan_memo: self.json_scan_memo.clone(),
             // Deliberately NOT carried: the shared request representation gate
             // stages this view from the exact `(headers, body)` pair the final
@@ -6192,6 +6271,7 @@ impl RequestContext {
             request_body_sha256: None,
             request_body_sha512: None,
             max_response_body_size_bytes: self.max_response_body_size_bytes,
+            inbound_request_body_may_follow: self.inbound_request_body_may_follow,
             // Route ceilings are request-scoped policy, not per-phase state:
             // the final-body hooks must hold the same bound the streaming and
             // buffering paths were admitted under, so a post-transform check
@@ -6481,6 +6561,17 @@ impl RequestContext {
 
     pub(crate) fn has_websocket_response_boundary(&self) -> bool {
         self.websocket_response_boundary
+    }
+
+    /// Record that the `prometheus_metrics` request hook observed this
+    /// transaction. Idempotent and allocation-free.
+    pub fn mark_prometheus_metrics_observed(&mut self) {
+        self.prometheus_metrics_observed = true;
+    }
+
+    /// Whether the `prometheus_metrics` request hook observed this transaction.
+    pub fn prometheus_metrics_observed(&self) -> bool {
+        self.prometheus_metrics_observed
     }
 
     pub(crate) fn request_header_requires_redaction(&self, header_name: &str) -> bool {
@@ -6943,6 +7034,15 @@ impl RequestContext {
     #[inline]
     pub fn has_raw_headers(&self) -> bool {
         self.raw_headers.is_some()
+    }
+
+    /// Whether [`Self::materialize_headers`] has populated `headers` from the
+    /// raw map. Once it has, `headers` is the AUTHORITATIVE request view: a
+    /// name absent from it was removed (or never sent), and policy readers
+    /// must not resurrect it from the retained raw block.
+    #[inline]
+    pub fn headers_are_materialized(&self) -> bool {
+        self.headers_materialized
     }
 
     /// Share the pristine request header block with a retry planner without
@@ -13115,16 +13215,48 @@ pub trait Plugin: Any + Send + Sync {
     /// Returns `true` when this plugin only observes WebSocket frame decisions
     /// and never mutates or rejects them.
     ///
-    /// After an earlier admission/mutating `on_ws_frame` hook returns a
-    /// terminal `Message::Close`, the shared H1/H2/H3 relay keeps invoking
-    /// observational hooks with that already-final Close so they can record
-    /// the decision, while skipping later mutating plugins so they neither
-    /// charge budget nor replace the Close code/reason.
-    /// The relay ignores the return value from an observational hook for every
-    /// frame, enforcing the observe-only contract even if an implementation
-    /// accidentally returns a replacement.
+    /// Observational plugins still receive [`Plugin::on_ws_frame`] for each
+    /// message at their configured priority position, but the relay ignores
+    /// their return value (enforcing the observe-only contract even if an
+    /// implementation accidentally returns a replacement) and skips them in
+    /// [`Plugin::on_ws_reassembly_frames`]. Once any admission/mutating hook
+    /// returns a terminal `Message::Close`, the rest of the chain — observers
+    /// included — is skipped for that message, so later mutating plugins
+    /// neither charge budget nor replace the Close code/reason.
+    ///
+    /// The final decision is instead delivered exactly once, independent of
+    /// priority order, through [`Plugin::on_ws_policy_close`].
     fn observes_ws_frame_decisions(&self) -> bool {
         false
+    }
+
+    /// Observe one gateway-published WebSocket policy Close.
+    ///
+    /// Called only on plugins whose [`Plugin::observes_ws_frame_decisions`]
+    /// returns `true`, exactly once per relay-half policy decision and AFTER
+    /// the full decision is known, so the record does not depend on where the
+    /// observer sits in priority order. Sources: a terminal Close returned by
+    /// the `on_ws_frame` chain (after the control-frame guard), a fragment
+    /// budget Close from [`Plugin::on_ws_reassembly_frames`], and the relay's
+    /// parser rejections of an inbound message (plugin or global
+    /// frame/message size ceilings, incomplete-message bounds, and terminated
+    /// `permessage-deflate` faults). `direction` is the direction of the
+    /// rejected input. Session-level stops (idle timeout, drain, maximum
+    /// lifetime, credential expiry, trust withdrawal) and relay transport
+    /// faults are not policy Closes; they surface on `on_ws_disconnect` through
+    /// the bounded `websocket.termination_reason` metadata and the failure
+    /// attribution fields.
+    ///
+    /// This is a decision record, not a delivery record: it fires before the
+    /// bounded Close write and regardless of whether that write succeeds.
+    /// Must not block or mutate protocol state.
+    fn on_ws_policy_close(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _close: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) {
     }
 
     /// Optional parser-level WebSocket size policy.
@@ -13222,9 +13354,10 @@ pub trait Plugin: Any + Send + Sync {
     /// Returning `Some(Message::Close(...))` will close the WebSocket in both directions.
     ///
     /// The first terminal Close from a priority-ordered admission/mutating hook
-    /// is preserved for the rest of the chain: later mutating plugins are not
-    /// invoked for that frame, and observational hooks
-    /// ([`Plugin::observes_ws_frame_decisions`]) may still see the final Close.
+    /// is preserved for the rest of the chain: no later plugin is invoked for
+    /// that frame, and observational hooks
+    /// ([`Plugin::observes_ws_frame_decisions`]) receive the final Close once
+    /// through [`Plugin::on_ws_policy_close`] instead.
     ///
     /// Delivery-accurate frame logging must use
     /// [`Plugin::prepare_ws_frame_delivery`] /
@@ -13283,9 +13416,14 @@ pub trait Plugin: Any + Send + Sync {
     /// Return `Some` only when this plugin will emit after a successful sink
     /// accept. The relay discards prepared observations on cancel/write failure
     /// so frame logs share the success-only boundary with `frames_*` /
-    /// `bytes_*` counters. Default: no observation.
+    /// `bytes_*` counters. `connection_id` and `direction` are the same values
+    /// the matching [`Plugin::emit_ws_frame_delivery`] call receives, so a
+    /// plugin can apply per-session or per-direction selection before doing
+    /// any per-message work. Default: no observation.
     fn prepare_ws_frame_delivery(
         &self,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<WsFrameDeliveryObservation> {
         None
@@ -13621,9 +13759,12 @@ pub fn create_plugin_with_http_client_and_config_id(
         "jwt_auth" => Ok(Some(Arc::new(jwt_auth::JwtAuth::new(config)?))),
         "key_auth" => Ok(Some(Arc::new(key_auth::KeyAuth::new(config)?))),
         "basic_auth" => Ok(Some(Arc::new(basic_auth::BasicAuth::new(config)?))),
-        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new(
+        // The stable plugin-config id owns the rejected-credential cache and the
+        // per-username failure backoff, so a compatible reload inherits them.
+        "ldap_auth" => Ok(Some(Arc::new(ldap_auth::LdapAuth::new_with_config_id(
             config,
             http_client,
+            plugin_config_id,
         )?))),
         // Same reasoning as `jwks_auth`: the stable plugin-config id is the
         // `ferrum-hmac-v2` nonce protection domain.
@@ -13880,9 +14021,12 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ws_message_size_limiting" => Ok(Some(Arc::new(
             ws_message_size_limiting::WsMessageSizeLimiting::new(config)?,
         ))),
-        "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
-            config,
-        )?))),
+        // The stable plugin-config id is stamped on every record as
+        // `plugin_id`, so two effective instances on one proxy stay
+        // distinguishable in `ws_frame_log` output.
+        "ws_frame_logging" => Ok(Some(Arc::new(
+            ws_frame_logging::WsFrameLogging::new_with_config_id(config, plugin_config_id)?,
+        ))),
         "ws_rate_limiting" => {
             let plugin = ws_rate_limiting::WsRateLimiting::new_with_config_id(
                 config,
@@ -14206,7 +14350,8 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 }
             }
         }
-        // ldap_url is a single ldap:// / ldaps:// URL.
+        // ldap_url is a single ldap:// / ldaps:// URL; failover_ldap_urls
+        // lists further endpoints dialed the same way.
         "ldap_auth" => {
             if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())
                 && let Ok(parsed) = url::Url::parse(url.trim())
@@ -14217,6 +14362,20 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 return Err(format!(
                     "ldap_url IP {ip} denied by backend egress policy: {reason}"
                 ));
+            }
+            if let Some(urls) = config.get("failover_ldap_urls").and_then(Value::as_array) {
+                for (index, url) in urls.iter().enumerate() {
+                    if let Some(url) = url.as_str()
+                        && let Ok(parsed) = url::Url::parse(url.trim())
+                        && let Some(host) = parsed.host_str()
+                        && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                    {
+                        return Err(format!(
+                            "failover_ldap_urls[{index}] IP {ip} denied by backend egress policy: {reason}"
+                        ));
+                    }
+                }
             }
         }
         // broker_list is parsed with the pinned librdkafka grammar

@@ -232,7 +232,13 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ),
     ("jwt_auth", NONE),
     ("key_auth", NONE),
-    ("ldap_auth", &[endpoint_url(&["ldap_url"])]),
+    (
+        "ldap_auth",
+        &[
+            endpoint_url(&["ldap_url"]),
+            endpoint_url(&["failover_ldap_urls"]),
+        ],
+    ),
     ("basic_auth", NONE),
     ("hmac_auth", NONE),
     ("soap_ws_security", NONE),
@@ -279,7 +285,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         // `header_present` values are shared secrets that suppress every rule.
         &[secret(&["global_exemptions", "header_present", "*"])],
     ),
-    ("fault_injection", NONE),
+    (
+        "fault_injection",
+        // `match.headers` values opt a request into faults; operators may
+        // target with a shared secret or a credential-bearing header.
+        &[secret(&["match", "headers", "*"])],
+    ),
     ("body_validator", NONE),
     ("openapi_validator", NONE),
     (

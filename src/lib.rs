@@ -114,6 +114,16 @@ pub mod _test_support {
         ctx.authorization_connection_closer = Some(closer);
     }
 
+    /// Install a route's credential-header redaction set on a request
+    /// context, as the H1/H2/H3 handlers do from the plugin cache view
+    /// (`opa` obligation-destination conflict tests).
+    pub fn set_request_headers_to_redact_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_headers_to_redact(std::sync::Arc::new(headers));
+    }
+
     /// The gateway's `499` client-closed-request logging status (issue #6768
     /// client-abort scope tests).
     pub const CLIENT_CLOSED_REQUEST_STATUS: u16 =
@@ -186,6 +196,21 @@ pub mod _test_support {
     ) -> Result<(), anyhow::Error> {
         crate::modes::file::await_fallible_listener_handles(handles, move || shutdown.shutdown())
             .await
+    }
+
+    /// Bytes of backend-provided semantic text (task id, context id, task
+    /// state) an `a2a_gateway` SSE inspector retains after ingesting `chunks`,
+    /// before the stream ends.
+    pub fn a2a_sse_retained_semantic_bytes_for_test(
+        binding: &'static str,
+        metadata_limit: usize,
+        chunks: &[&[u8]],
+    ) -> usize {
+        crate::plugins::a2a_gateway::sse_inspector_retained_semantic_bytes(
+            binding,
+            metadata_limit,
+            chunks,
+        )
     }
 
     /// `body_validator`'s omitted-field gRPC decompression default resolved
@@ -2548,6 +2573,22 @@ pub mod _test_support {
     pub fn admin_builder_failure_response_for_test()
     -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
         crate::admin::admin_builder_failure_response()
+    }
+
+    /// Collect an admin response through the connection body wrapper exactly
+    /// as the admin listener does (`/charges` delivery acknowledgement tests).
+    pub async fn collect_guarded_admin_response_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) -> bytes::Bytes {
+        crate::admin::collect_guarded_admin_response_for_test(response).await
+    }
+
+    /// Wrap an admin response as the admin listener does, then drop it
+    /// without writing its body (`/charges` delivery acknowledgement tests).
+    pub fn drop_guarded_admin_response_unpolled_for_test(
+        response: hyper::Response<http_body_util::Full<bytes::Bytes>>,
+    ) {
+        crate::admin::drop_guarded_admin_response_unpolled_for_test(response)
     }
 
     pub fn x_gateway_error_for_backend_failure_for_test(
@@ -5070,6 +5111,38 @@ pub mod _test_support {
         }
     }
 
+    /// Drive the production frontend-DTLS plugin-rejection summary path: the
+    /// same attribution snapshot and emission the DTLS accept handler runs
+    /// when its `on_stream_connect` chain rejects. Returns whether a summary
+    /// was emitted.
+    pub async fn emit_dtls_plugin_rejection_summary_for_test(
+        plugins: Vec<Arc<dyn Plugin>>,
+        proxy: &crate::config::types::Proxy,
+        ctx: &crate::plugins::StreamConnectionContext,
+        client_ip: &str,
+        listen_port: u16,
+    ) -> bool {
+        let progress = crate::proxy::udp_proxy::dtls_plugin_rejection_progress(
+            Arc::new(plugins),
+            proxy.name.as_deref(),
+            proxy.effective_scheme(),
+            format!("{}:{}", proxy.backend_host, proxy.backend_port),
+            ctx,
+        );
+        crate::proxy::udp_proxy::emit_dtls_plugin_rejection_summary(
+            progress,
+            crate::proxy::udp_proxy::DtlsPluginRejection {
+                namespace: &proxy.namespace,
+                proxy_id: &proxy.id,
+                client_ip,
+                listen_port,
+                connected_wall_at: chrono::Utc::now(),
+                duration_ms: 0.0,
+            },
+        )
+        .await
+    }
+
     /// The production wrapper that decides whether a stream-setup DNS resolve
     /// failure becomes a typed `StreamSetupKind::DnsLookup` or stays an
     /// untyped gateway-side egress-policy denial.
@@ -5628,9 +5701,12 @@ pub mod _test_support {
     /// Prepare deferred delivery observations for the final post-plugin message.
     pub fn prepare_ws_frame_deliveries_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
         message: &Message,
     ) -> Vec<(usize, crate::plugins::WsFrameDeliveryObservation)> {
-        match crate::proxy::prepare_ws_frame_deliveries(plugins, message) {
+        match crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, message)
+        {
             crate::proxy::WsFrameDeliveryBatch::None => Vec::new(),
             crate::proxy::WsFrameDeliveryBatch::One(index, observation) => {
                 vec![(index, observation)]
@@ -5691,12 +5767,14 @@ pub mod _test_support {
             crate::proxy::apply_ws_frame_plugins(plugins, proxy_id, connection_id, direction, raw)
                 .await;
         if matches!(&outgoing, Message::Close(_)) {
-            // Policy Close is already recorded by observational `on_ws_frame`
-            // hooks inside the applicator; the production relay does not also
-            // emit a delivered observation for that rejection path.
+            // Policy Close is already reported to decision observers
+            // (`on_ws_policy_close`) by the applicator after the full pass; the
+            // production relay does not also emit a delivered observation for
+            // that rejection path.
             return outgoing;
         }
-        let prepared = crate::proxy::prepare_ws_frame_deliveries(plugins, &outgoing);
+        let prepared =
+            crate::proxy::prepare_ws_frame_deliveries(plugins, connection_id, direction, &outgoing);
         crate::proxy::emit_ws_frame_deliveries(
             plugins,
             proxy_id,
@@ -5705,6 +5783,89 @@ pub mod _test_support {
             prepared,
         );
         outgoing
+    }
+
+    /// Report one gateway policy Close to the decision observers in `plugins`
+    /// exactly as both relay halves do (`on_ws_policy_close`).
+    pub fn observe_ws_policy_close_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        close: Option<&CloseFrame>,
+    ) {
+        crate::proxy::observe_ws_policy_close(plugins, proxy_id, connection_id, direction, close)
+    }
+
+    /// Drive the production framed WebSocket relay (`run_websocket_session`,
+    /// shared by H1 Upgrade and H2/H3 Extended CONNECT) end to end over
+    /// caller-owned transports.
+    ///
+    /// `client_io` is the gateway's client-side byte transport (the relay runs
+    /// a server-role framer over it, so client frames must be masked);
+    /// `backend_ws_stream` is the gateway's client-role framer toward the
+    /// backend. `plugins` goes through the production per-session collection
+    /// (execution-trigger admission and `bind_ws_session` substitution) to
+    /// build the parser-policy, frame-hook, and disconnect lists. Tunnel mode,
+    /// the idle timeout, the session deadline, drain, client trust, and
+    /// `permessage-deflate` are all off, so the session ends only through peer
+    /// Close, transport EOF/error, or a policy Close. `client_transport_settle`
+    /// is the H3 bridge verdict seam ([`crate::proxy::WsClientTransportSettle`]).
+    pub async fn run_framed_websocket_relay_for_test<C, B>(
+        client_io: C,
+        backend_ws_stream: tokio_tungstenite::WebSocketStream<B>,
+        proxy_id: &str,
+        connection_id: u64,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        session_meta: crate::proxy::WsSessionMeta,
+        client_transport_settle: Option<crate::proxy::WsClientTransportSettle<'_>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let env_config = crate::config::EnvConfig::default();
+        let mut upgrade_ctx = crate::plugins::RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/ws".to_string(),
+        );
+        let (ws_framing_plugins, ws_frame_plugins) =
+            crate::proxy::collect_websocket_relay_plugins(plugins, true, &mut upgrade_ctx);
+        let ws_disconnect_plugins =
+            crate::proxy::collect_websocket_disconnect_plugins(plugins, &mut upgrade_ctx);
+        let adaptive_buffer = crate::adaptive_buffer::AdaptiveBufferTracker::new(
+            false, false, 300, 8_192, 65_536, 65_536, 64,
+        );
+        let session_deadline = crate::proxy::WsSessionDeadline {
+            at: tokio::time::Instant::now() + Duration::from_secs(3_600),
+            reason: crate::proxy::WsTerminationReason::MaxLifetime,
+        };
+        crate::proxy::run_websocket_session(
+            client_io,
+            backend_ws_stream,
+            proxy_id,
+            connection_id,
+            ws_framing_plugins,
+            ws_frame_plugins,
+            ws_disconnect_plugins,
+            session_meta,
+            None,
+            env_config.max_websocket_frame_size_bytes,
+            env_config.websocket_write_buffer_size,
+            false,
+            Duration::from_secs(30),
+            None,
+            session_deadline,
+            None,
+            Arc::new(crate::overload::OverloadState::new()),
+            crate::proxy::WsFragmentPolicy::from_env(&env_config),
+            &adaptive_buffer,
+            None,
+            None,
+            client_transport_settle,
+        )
+        .await
     }
 
     /// Run the production per-session plugin-collection step, including
@@ -6728,6 +6889,39 @@ pub mod _test_support {
         plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
     ) {
         plugin.reset_rate_limit_rejection_warn_for_test();
+    }
+
+    // ── plugins/mesh/outbound_registry ───────────────────────────────────────
+    /// Reset the process-wide HTTP REGISTRY_ONLY denial-log limiter so a
+    /// capture test can observe the next denial line.
+    pub fn mesh_outbound_registry_reset_http_deny_warn_for_test() {
+        crate::plugins::mesh::outbound_registry::reset_http_deny_warn_for_test();
+    }
+
+    /// Emit the HTTP REGISTRY_ONLY denial warning against a caller-owned
+    /// limiter and clock (deterministic log-capture coverage).
+    pub fn mesh_outbound_registry_warn_http_deny_with_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+        host: Option<&str>,
+        port: Option<u16>,
+        listen_port: Option<u16>,
+        client_ip: &str,
+    ) {
+        crate::plugins::mesh::outbound_registry::warn_http_registry_deny_with(
+            limiter,
+            now_ms,
+            host,
+            port,
+            listen_port,
+            client_ip,
+            crate::plugins::mesh::outbound_registry::DENY_SOURCE_PLUGIN,
+        );
+    }
+
+    /// Request-authority split used by `mesh_outbound_registry`.
+    pub fn mesh_outbound_registry_split_host_header_for_test(value: &str) -> (&str, Option<u16>) {
+        crate::plugins::mesh::outbound_registry::split_host_header(value)
     }
 
     // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
@@ -9971,6 +10165,15 @@ pub mod _test_support {
         crate::proxy::request_may_have_body(method, headers)
     }
 
+    /// Proxy core's stale request-digest retirement over the final outbound
+    /// headers (clone-on-write into `owned_proxy_headers`).
+    pub fn retire_stale_request_integrity_headers(
+        ctx: &crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<HashMap<String, String>>,
+    ) {
+        crate::proxy::retire_stale_request_integrity_headers(ctx, owned_proxy_headers)
+    }
+
     pub async fn apply_request_body_plugins(
         plugins: &[Arc<dyn Plugin>],
         headers: &HashMap<String, String>,
@@ -10437,6 +10640,17 @@ pub mod _test_support {
         flavor: crate::config::types::HttpFlavor,
     ) {
         ctx.set_request_http_flavor(flavor);
+    }
+
+    /// Record the transport's request end-of-stream evidence exactly as the
+    /// H1/H2 (`!Incoming::is_end_stream()`) and H3 (always `Some(true)`)
+    /// frontends do, so body-governance decisions can be exercised for a head
+    /// that omits `Content-Length` / `Content-Type`.
+    pub fn set_inbound_request_body_may_follow_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        may_follow: Option<bool>,
+    ) {
+        ctx.inbound_request_body_may_follow = may_follow;
     }
 
     /// Stamp the authoritative client-visible wire transport a frontend would
@@ -11796,6 +12010,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::DecryptedApp,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::dtls_reply_commit_after_backend_hooks(
             plugins, &ctx, plan, &trust.0,
@@ -12066,6 +12281,7 @@ pub mod _test_support {
             payload,
             payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
             metadata_sink: None,
+            admission_datagram: false,
         };
         match crate::proxy::udp_proxy::udp_reply_commit_after_backend_hooks(plugins, &ctx, plan)
             .await
@@ -12147,8 +12363,31 @@ pub mod _test_support {
         protected_status: u16,
         protected_body: &[u8],
     ) -> PrecommitAuthorizationGateForTest {
+        precommit_authorization_gate_with_policy_for_test(
+            ctx,
+            max_lifetime_seconds,
+            request_uses_grpc_content_type,
+            protected_status,
+            HashMap::new(),
+            protected_body,
+            &[],
+        )
+    }
+
+    /// The same production gate, starting from an already-decorated protected
+    /// response and given the route's precomputed initial-response header
+    /// policy slice, as the H1/H2 funnel passes it.
+    pub fn precommit_authorization_gate_with_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        max_lifetime_seconds: u64,
+        request_uses_grpc_content_type: bool,
+        protected_status: u16,
+        protected_headers: HashMap<String, String>,
+        protected_body: &[u8],
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> PrecommitAuthorizationGateForTest {
         let mut status = protected_status;
-        let mut headers = HashMap::new();
+        let mut headers = protected_headers;
         let mut body = crate::retry::ResponseBody::buffered(protected_body.to_vec());
         let termination = crate::proxy::apply_precommit_authorization_terminal(
             ctx,
@@ -12157,6 +12396,7 @@ pub mod _test_support {
             &mut status,
             &mut headers,
             &mut body,
+            initial_response_header_policy_plugins,
         );
         let body = match body {
             crate::retry::ResponseBody::Buffered(bytes) => bytes.to_vec(),
@@ -12169,6 +12409,29 @@ pub mod _test_support {
             body,
             log_metadata: crate::proxy::clone_log_metadata(ctx),
         }
+    }
+
+    /// The buffered-response authorization terminal builder on a plain HTTP
+    /// request (no gRPC-Web content type), given an already-decorated
+    /// protected header map and the route's initial-response header policy.
+    /// Returns `(status, headers, body_bytes)`.
+    pub fn buffered_authorization_terminal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        termination: crate::proxy::auth_lifetime::StreamAuthTermination,
+        protected_headers: HashMap<String, String>,
+        initial_response_header_policy_plugins: &[std::sync::Arc<dyn crate::plugins::Plugin>],
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        let mut headers = protected_headers;
+        let mut body = bytes::Bytes::from_static(b"protected");
+        let status = crate::proxy::replace_buffered_response_with_authorization_terminal(
+            ctx,
+            termination,
+            None,
+            &mut headers,
+            &mut body,
+            initial_response_header_policy_plugins,
+        );
+        (status, headers, body.to_vec())
     }
 
     /// The authorization-lifetime plan and bounded protocol family every H1/H2
