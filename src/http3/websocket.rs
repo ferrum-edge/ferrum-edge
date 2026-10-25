@@ -175,12 +175,12 @@ const H3_WS_DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
 const H3_WS_SEND_PUMP_READ_BUFFER_BYTES: usize = 16 * 1024;
 const H3_WS_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
-struct AbortOnDropJoinHandle {
-    handle: Option<tokio::task::JoinHandle<()>>,
+struct AbortOnDropJoinHandle<T = ()> {
+    handle: Option<tokio::task::JoinHandle<T>>,
 }
 
-impl AbortOnDropJoinHandle {
-    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
         Self {
             handle: Some(handle),
         }
@@ -200,9 +200,75 @@ impl AbortOnDropJoinHandle {
     }
 }
 
-async fn wait_for_h3_ws_send_pump(
+/// Client-side transport verdict of the H3 WebSocket send pump: `None` when
+/// every byte the framer produced was handed to QUIC and the stream finished,
+/// otherwise the class of the first failed DATA write or FIN.
+type H3WsSendPumpOutcome = Option<retry::ErrorClass>;
+
+/// Classify a failed send-pump write (DATA or FIN) toward the client with the
+/// same evidence rules the request-read path uses: a peer reset /
+/// `STOP_SENDING` or a client-closed connection is the client going away, an
+/// H3 framing violation is a protocol error, and anything gateway-side or
+/// unobservable is a closed connection.
+fn classify_h3_ws_send_error(error: &h3::error::StreamError) -> retry::ErrorClass {
+    use crate::http3::stream_util::{H3RequestReadFailure, classify_h3_request_read_error};
+    match classify_h3_request_read_error(error) {
+        H3RequestReadFailure::ClientAbort => retry::ErrorClass::ClientDisconnect,
+        H3RequestReadFailure::Malformed => retry::ErrorClass::ProtocolError,
+        H3RequestReadFailure::GatewayTerminated => retry::ErrorClass::ConnectionClosed,
+    }
+}
+
+/// Settle the send pump for the shared relay's disconnect record.
+///
+/// Awaited by the framed relay after it dropped the client duplex (the pump's
+/// end-of-stream signal) and before `on_ws_disconnect`, so a QUIC write/FIN
+/// failure after the framer accepted the final Close is attributed to the
+/// session instead of being lost behind a clean terminal record. Bounded by
+/// `drain_grace`: a pump still blocked (for example in client flow control)
+/// when the grace expires is aborted and recorded as a write timeout, which
+/// keeps it distinguishable from a transport error. Every attribution is
+/// `BackendToClient` + `Write`: the pump only carries gateway→client bytes.
+/// Takes the handle out of `send_pump` once it resolves, so the caller's
+/// later [`wait_for_h3_ws_send_pump`] is a no-op instead of a second grace.
+async fn settle_h3_ws_send_pump(
     proxy_id: &str,
-    mut send_pump: AbortOnDropJoinHandle,
+    send_pump: &mut AbortOnDropJoinHandle<H3WsSendPumpOutcome>,
+    drain_grace: Duration,
+) -> Option<crate::proxy::WsRelayFailure> {
+    let waited = match send_pump.handle.as_mut() {
+        Some(handle) => tokio::time::timeout(drain_grace, handle).await,
+        None => return None,
+    };
+    let class = match waited {
+        // A cancelled/panicked pump task carries no transport evidence.
+        Ok(joined) => {
+            send_pump.handle = None;
+            joined.ok().flatten()
+        }
+        Err(_) => {
+            warn!(
+                proxy_id = %proxy_id,
+                drain_grace_seconds = drain_grace.as_secs(),
+                "H3 WS send pump drain grace expired; aborting pump"
+            );
+            if let Some(handle) = send_pump.handle.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+            Some(retry::ErrorClass::ReadWriteTimeout)
+        }
+    }?;
+    Some((
+        crate::plugins::Direction::BackendToClient,
+        class,
+        Some(crate::proxy::tcp_proxy::StreamIoSide::Write),
+    ))
+}
+
+async fn wait_for_h3_ws_send_pump<T>(
+    proxy_id: &str,
+    mut send_pump: AbortOnDropJoinHandle<T>,
     drain_grace: Duration,
 ) {
     let Some(mut handle) = send_pump.handle.take() else {
@@ -222,7 +288,7 @@ async fn wait_for_h3_ws_send_pump(
     }
 }
 
-impl Drop for AbortOnDropJoinHandle {
+impl<T> Drop for AbortOnDropJoinHandle<T> {
     fn drop(&mut self) {
         if let Some(handle) = &self.handle {
             handle.abort();
@@ -1743,9 +1809,12 @@ pub(crate) async fn handle_h3_websocket(
 
     let proxy_id_for_send_pump = proxy.id.clone();
 
-    // pump_read → h3_send : WS framer's encoded bytes flow back over QUIC
-    let send_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+    // pump_read → h3_send : WS framer's encoded bytes flow back over QUIC.
+    // Resolves to the first DATA/FIN failure (see `H3WsSendPumpOutcome`) so the
+    // shared relay can attribute it on the disconnect record.
+    let mut send_pump = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         let mut buf = vec![0u8; H3_WS_SEND_PUMP_READ_BUFFER_BYTES];
+        let mut failure: H3WsSendPumpOutcome = None;
         loop {
             // Every server-bound close — including the 1002 a client protocol
             // violation earns — is encoded by the shared relay's framer and
@@ -1770,6 +1839,7 @@ pub(crate) async fn handle_h3_websocket(
                     "H3 WS send pump: h3 send_data error: {}",
                     e
                 );
+                failure = Some(classify_h3_ws_send_error(&e));
                 break;
             }
         }
@@ -1779,7 +1849,13 @@ pub(crate) async fn handle_h3_websocket(
                 "H3 WS send pump: h3 finish error: {}",
                 e
             );
+            // Keep the first failure: a FIN error after a failed DATA write is
+            // a consequence of it.
+            if failure.is_none() {
+                failure = Some(classify_h3_ws_send_error(&e));
+            }
         }
+        failure
     }));
 
     // ── Collect parsed-relay and disconnect plugin lists ────────────
@@ -1835,6 +1911,9 @@ pub(crate) async fn handle_h3_websocket(
     let relay_result = match backend_handshake {
         crate::proxy::WsBackendHandshake::Direct(handshake) => {
             let handshake = *handshake;
+            let pump_settle: crate::proxy::WsClientTransportSettle<'_> = Box::pin(
+                settle_h3_ws_send_pump(&proxy.id, &mut send_pump, H3_WS_PUMP_DRAIN_GRACE),
+            );
             crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
@@ -1857,11 +1936,15 @@ pub(crate) async fn handle_h3_websocket(
                 &adaptive_buf,
                 ws_client_trust_session,
                 ws_deflate_session,
+                Some(pump_settle),
             )
             .await
         }
         crate::proxy::WsBackendHandshake::Mesh(handshake) => {
             let handshake = *handshake;
+            let pump_settle: crate::proxy::WsClientTransportSettle<'_> = Box::pin(
+                settle_h3_ws_send_pump(&proxy.id, &mut send_pump, H3_WS_PUMP_DRAIN_GRACE),
+            );
             crate::proxy::run_websocket_session(
                 client_io,
                 handshake.stream,
@@ -1884,6 +1967,7 @@ pub(crate) async fn handle_h3_websocket(
                 &adaptive_buf,
                 ws_client_trust_session,
                 ws_deflate_session,
+                Some(pump_settle),
             )
             .await
         }
@@ -1913,11 +1997,13 @@ pub(crate) async fn handle_h3_websocket(
     // ── Tear down pump tasks ─────────────────────────────────────────
     //
     // The send pump exits naturally when its duplex half (`pump_read`)
-    // sees EOF — which happens as soon as `run_websocket_proxy`
-    // returns and drops `client_io` (the other end of the duplex
-    // pair). Awaiting it ensures the H3 send side calls `finish()` so
-    // the peer sees a clean FIN rather than a force-drop / protocol
-    // abort.
+    // sees EOF — which happens as soon as the relay drops `client_io`
+    // (the other end of the duplex pair). Awaiting it ensures the H3
+    // send side calls `finish()` so the peer sees a clean FIN rather
+    // than a force-drop / protocol abort. On the framed relay path the
+    // shared relay already settled the pump before `on_ws_disconnect`
+    // (`settle_h3_ws_send_pump`), so this wait returns immediately; it
+    // still bounds the raw tunnel path and any early relay exit.
     //
     // The recv pump, however, is blocked in
     // `h3_recv.recv_data().await`. For a cooperative client this

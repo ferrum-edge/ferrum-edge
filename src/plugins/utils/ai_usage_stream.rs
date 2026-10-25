@@ -312,21 +312,26 @@ impl UsageAccumulator {
     pub fn apply_event_json(&mut self, json: &Value, configured: Option<AiProvider>) {
         self.capture_model(json);
         // OpenAI Responses streaming (`response.*` events). The authoritative
-        // counters ride the TERMINAL `response.completed` event and live under
-        // `response.usage`, not root `usage`, so without this arm a completed
-        // Responses stream reported no usage at all and the budget kept the
-        // pre-request estimate (`GHSA-pqjf-4jcj-34rp`). Every other
-        // `response.*` event — `response.created`, `response.in_progress`,
-        // `response.incomplete`, `response.failed`, the per-item deltas — is a
-        // progress snapshot, never a usage authority, so the whole family
-        // returns here rather than falling through to the generic arms below.
+        // counters ride the TERMINAL event and live under `response.usage`, not
+        // root `usage`, so without this arm a completed Responses stream
+        // reported no usage at all and the budget kept the pre-request estimate
+        // (`GHSA-pqjf-4jcj-34rp`). Two events are terminal and usage-bearing:
+        // `response.completed` and `response.incomplete` — the latter is a
+        // finished response that stopped early (for example at
+        // `max_output_tokens`) and still bills the tokens it reports
+        // (`ai_rate_limiter-SOL-4`). Every other `response.*` event —
+        // `response.created`, `response.in_progress`, `response.failed`, the
+        // per-item deltas — is a progress snapshot, never a usage authority, so
+        // the whole family returns here rather than falling through to the
+        // generic arms below. A terminal whose usage is absent or malformed
+        // records nothing usable and stays resolved by the unmetered policy.
         // Mirrors the sibling `ai_token_metrics` terminal-event handling, and
         // matches no supported provider's own event names (Anthropic uses
         // `message_*`/`content_block_*`, Cohere v2 `message-*`).
         if let Some(kind) = json.get("type").and_then(Value::as_str)
             && kind.starts_with("response.")
         {
-            if kind == "response.completed"
+            if matches!(kind, "response.completed" | "response.incomplete")
                 && let Some(response) = json.get("response")
             {
                 let provider = detect_sse_provider(response)

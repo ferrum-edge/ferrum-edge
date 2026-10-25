@@ -31,6 +31,7 @@ fn make_ctx(client_ip: &str, datagram_size: usize) -> UdpDatagramContext<'static
         payload: &[],
         payload_kind: StreamBytesKind::PlaintextWire,
         metadata_sink: None,
+        admission_datagram: false,
     }
 }
 

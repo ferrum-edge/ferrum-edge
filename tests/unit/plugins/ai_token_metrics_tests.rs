@@ -1484,7 +1484,7 @@ async fn openai_responses_buffered_and_completed_sse_are_supported() {
 }
 
 #[tokio::test]
-async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
+async fn non_terminal_or_malformed_openai_responses_do_not_invent_usage() {
     let plugin = AiTokenMetrics::new(&json!({
         "provider": "openai",
         "buffer_streaming_responses": true,
@@ -1493,7 +1493,7 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
     .unwrap();
     let mut headers =
         HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
-    for event_type in ["response.incomplete", "response.failed"] {
+    for event_type in ["response.failed", "response.in_progress"] {
         let mut ctx = create_test_context();
         let event = format!(
             "data: {}\n\n",
@@ -1505,6 +1505,37 @@ async fn incomplete_or_malformed_openai_responses_do_not_invent_usage() {
         assert!(!ctx.metadata.contains_key("ai_provider"));
         assert!(!ctx.metadata.contains_key("ai_estimated_cost"));
     }
+
+    // `response.incomplete` is TERMINAL: a finished response that stopped early
+    // (for example at `max_output_tokens`) and bills the usage it reports
+    // (ai_rate_limiter-SOL-4). It is read exactly like `response.completed`.
+    let mut ctx = create_test_context();
+    let incomplete = format!(
+        "data: {}\n\n",
+        json!({
+            "type": "response.incomplete",
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 20, "output_tokens": 64, "total_tokens": 84}
+            }
+        })
+    );
+    plugin
+        .on_response_body(&mut ctx, 200, &mut headers, incomplete.as_bytes())
+        .await;
+    assert_eq!(
+        ctx.metadata.get("ai_prompt_tokens").map(String::as_str),
+        Some("20")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_completion_tokens").map(String::as_str),
+        Some("64")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_total_tokens").map(String::as_str),
+        Some("84")
+    );
 
     let mut ctx = create_test_context();
     let malformed = serde_json::to_vec(&json!({

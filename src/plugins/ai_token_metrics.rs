@@ -309,9 +309,14 @@ impl AiTokenMetrics {
             };
 
             let event_type = json.get("type").and_then(Value::as_str);
-            // Failed/incomplete Responses events are deliberately not usage
-            // authorities. Only response.completed unwraps its Response object.
-            let payload = if event_type == Some("response.completed") {
+            // Failed and in-progress Responses events are deliberately not usage
+            // authorities. The two terminal events — `response.completed` and
+            // `response.incomplete` (a finished response that stopped early and
+            // still bills what it reports) — unwrap their Response object.
+            let payload = if matches!(
+                event_type,
+                Some("response.completed" | "response.incomplete")
+            ) {
                 let Some(response) = json.get("response") else {
                     continue;
                 };
