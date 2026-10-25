@@ -9902,8 +9902,10 @@ fn test_priority_override_preserves_ws_parser_policy_and_framing() {
     let limits = limiter
         .websocket_size_limits()
         .expect("priority wrapper delegates parser policy");
-    assert_eq!(limits.max_frame_bytes, 65_536);
-    assert_eq!(limits.max_message_bytes, 262_144);
+    for direction in [&limits.client_to_backend, &limits.backend_to_client] {
+        assert_eq!(direction.max_frame_bytes, 65_536);
+        assert_eq!(direction.max_message_bytes, 262_144);
+    }
 }
 
 #[test]

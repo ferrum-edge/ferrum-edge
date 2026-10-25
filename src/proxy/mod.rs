@@ -242,7 +242,7 @@ use crate::plugins::utils::openai_error::{
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RELEASE_INFLIGHT_ON_COMMIT_METADATA_KEY, RequestContext, TransactionSummary,
-    WebSocketFrameDirection, WebSocketSizeLimits, is_builtin_plugin,
+    WebSocketDirectionSizeLimits, WebSocketFrameDirection, is_builtin_plugin,
     mesh_route_dispatch::MeshRouteDispatchConfig,
 };
 use crate::proxy::headers as headers_mod;
@@ -16397,10 +16397,13 @@ async fn handle_websocket_request_authenticated(
     // constrains neither the client-side nor the backend-side framer (issue
     // #3734). The decision is memoized on the upgrade context, so the later
     // frame/disconnect collection reuses it rather than re-evaluating.
+    // The backend framer reads backend frames, so it takes the
+    // backend->client direction's ceilings.
     let ws_size_limit_plugins = collect_websocket_size_limit_plugins(&plugins, &mut ctx);
     let ws_size_limits = EffectiveWsSizeLimits::from_plugins(
         state.max_websocket_frame_size_bytes,
         &ws_size_limit_plugins,
+        WebSocketFrameDirection::BackendToClient,
     );
     // The client-sent Host: the mesh egress Extended CONNECT `:authority` is
     // derived from it (the egress route is `preserve_host_header`) so the peer's
@@ -20454,18 +20457,29 @@ pub(crate) fn collect_websocket_disconnect_plugins(
 }
 
 impl EffectiveWsSizeLimits {
-    pub(crate) fn from_plugins(global_frame_bytes: usize, plugins: &[Arc<dyn Plugin>]) -> Self {
+    /// Combine the applicable instances' limits for the framer that reads
+    /// frames travelling in `direction`. Called once per session and
+    /// direction, never per frame: the client-side framer takes
+    /// `ClientToBackend`, every backend-side framer `BackendToClient`.
+    pub(crate) fn from_plugins(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn Plugin>],
+        direction: WebSocketFrameDirection,
+    ) -> Self {
         let mut plugin_frame: Option<WsSizeLimitRule> = None;
         let mut plugin_message: Option<WsSizeLimitRule> = None;
 
         for plugin in plugins {
-            let Some(WebSocketSizeLimits {
+            let Some(limits) = plugin.websocket_size_limits() else {
+                continue;
+            };
+            let WebSocketDirectionSizeLimits {
                 max_frame_bytes,
                 max_message_bytes,
                 close_reason,
-            }) = plugin.websocket_size_limits()
-            else {
-                continue;
+            } = match direction {
+                WebSocketFrameDirection::ClientToBackend => limits.client_to_backend,
+                WebSocketFrameDirection::BackendToClient => limits.backend_to_client,
             };
 
             if plugin_frame
@@ -20508,7 +20522,7 @@ impl EffectiveWsSizeLimits {
         }
     }
 
-    fn plugin_close_for_error(
+    pub(crate) fn plugin_close_for_error(
         &self,
         error: &tokio_tungstenite::tungstenite::Error,
     ) -> Option<(CloseFrame, &'static str, usize, usize)> {
@@ -20539,6 +20553,47 @@ impl EffectiveWsSizeLimits {
             size,
             max_size,
         ))
+    }
+
+    /// The Close for a terminated `permessage-deflate` read fault on this
+    /// direction, and whether a size-policy plugin supplied the violated
+    /// ceiling.
+    ///
+    /// The inflate adapter beneath the framer enforces the same frame and
+    /// message ceilings as the parser, so a size fault whose limit is exactly
+    /// the binding plugin rule keeps that plugin's configured reason, as the
+    /// equivalent uncompressed violation would. An independent ceiling (the
+    /// global frame limit or a stricter
+    /// `FERRUM_WEBSOCKET_PERMESSAGE_DEFLATE_MAX_MESSAGE_BYTES`) and corrupt
+    /// compressed data keep the adapter's fixed, non-secret reason.
+    pub(crate) fn permessage_deflate_fault_close(
+        &self,
+        fault: ws_permessage_deflate::PermessageDeflateFault,
+    ) -> (CloseFrame, bool) {
+        use ws_permessage_deflate::PermessageDeflateFault;
+
+        let rule = match fault {
+            PermessageDeflateFault::CompressedFrameTooLarge { max, .. }
+            | PermessageDeflateFault::DecompressedFrameTooLarge { max } => self
+                .plugin_frame
+                .as_ref()
+                .filter(|rule| self.max_frame_bytes == max && rule.max_bytes == max),
+            PermessageDeflateFault::DecompressedMessageTooLarge { max } => self
+                .plugin_message
+                .as_ref()
+                .filter(|rule| self.max_message_bytes == max && rule.max_bytes == max),
+            PermessageDeflateFault::InvalidCompressedData => None,
+        };
+        match rule {
+            Some(rule) => (
+                CloseFrame {
+                    code: CloseCode::Size,
+                    reason: rule.close_reason.as_ref().to_owned().into(),
+                },
+                true,
+            ),
+            None => (fault.close_frame(), false),
+        }
     }
 
     /// Global frame/message capacity overflow Close when no plugin rule supplied
@@ -21246,6 +21301,7 @@ where
         let client_limits = EffectiveWsSizeLimits::from_plugins(
             max_websocket_frame_size_bytes,
             &ws_framing_plugins,
+            WebSocketFrameDirection::ClientToBackend,
         );
         let streams = permessage_deflate
             .wrap(
@@ -21574,13 +21630,23 @@ where
         return Ok(());
     }
 
-    let effective_size_limits = Arc::new(EffectiveWsSizeLimits::from_plugins(
+    // Each direction is combined independently, once per session. The client
+    // framer below reads client frames (client->backend ceilings); the backend
+    // framer was born at connect time with the backend->client ceilings, which
+    // `size_limits_btc` reproduces for Close-reason attribution.
+    let size_limits_ctb = EffectiveWsSizeLimits::from_plugins(
         max_websocket_frame_size_bytes,
         &ws_framing_plugins,
-    ));
+        WebSocketFrameDirection::ClientToBackend,
+    );
+    let size_limits_btc = EffectiveWsSizeLimits::from_plugins(
+        max_websocket_frame_size_bytes,
+        &ws_framing_plugins,
+        WebSocketFrameDirection::BackendToClient,
+    );
     let mut ws_config = WebSocketConfig::default();
-    ws_config.max_frame_size = Some(effective_size_limits.max_frame_bytes);
-    ws_config.max_message_size = Some(effective_size_limits.max_message_bytes);
+    ws_config.max_frame_size = Some(size_limits_ctb.max_frame_bytes);
+    ws_config.max_message_size = Some(size_limits_ctb.max_message_bytes);
     ws_config.write_buffer_size = websocket_write_buffer_size;
     // RFC 6455 §5.1: a server MUST close the connection on an unmasked
     // client frame. RFC 8441 / RFC 9220 Extended CONNECT bootstrap the
@@ -21672,8 +21738,6 @@ where
     // framers, so mid-message read progress also refreshes the watermark.
     let ws_idle_tracker_ctb = ws_idle_tracker.clone();
     let ws_idle_tracker_btc = ws_idle_tracker;
-    let size_limits_ctb = Arc::clone(&effective_size_limits);
-    let size_limits_btc = effective_size_limits;
     let overload_ctb = Arc::clone(&overload);
     let overload_btc = Arc::clone(&overload);
     let shutdown_rx_ctb = shutdown_rx.clone();
@@ -21984,6 +22048,10 @@ where
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
                                 );
+                                crate::plugins::prometheus_metrics::global_registry()
+                                    .record_ws_message_size_limit_rejection(
+                                        WebSocketFrameDirection::ClientToBackend,
+                                    );
                                 // Cancellation precedes the bounded polite write so policy
                                 // teardown cannot be held by a non-reading destination.
                                 observe_ws_policy_close(
@@ -22061,7 +22129,18 @@ where
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );
-                                let close = fault.close_frame();
+                                // A size fault at the binding plugin ceiling keeps
+                                // the plugin's configured reason and counts as a
+                                // size-policy rejection, exactly like the
+                                // uncompressed parser violation.
+                                let (close, plugin_bound) =
+                                    size_limits_ctb.permessage_deflate_fault_close(fault);
+                                if plugin_bound {
+                                    crate::plugins::prometheus_metrics::global_registry()
+                                        .record_ws_message_size_limit_rejection(
+                                            WebSocketFrameDirection::ClientToBackend,
+                                        );
+                                }
                                 observe_ws_policy_close(
                                     &ctb_plugins,
                                     &proxy_id_ctb,
@@ -22377,6 +22456,10 @@ where
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
                                 );
+                                crate::plugins::prometheus_metrics::global_registry()
+                                    .record_ws_message_size_limit_rejection(
+                                        WebSocketFrameDirection::BackendToClient,
+                                    );
                                 observe_ws_policy_close(
                                     &btc_plugins,
                                     &proxy_id_btc,
@@ -22452,7 +22535,18 @@ where
                                     limit_kind,
                                     "WebSocket permessage-deflate input rejected before forwarding"
                                 );
-                                let close = fault.close_frame();
+                                // A size fault at the binding plugin ceiling keeps
+                                // the plugin's configured reason and counts as a
+                                // size-policy rejection, exactly like the
+                                // uncompressed parser violation.
+                                let (close, plugin_bound) =
+                                    size_limits_btc.permessage_deflate_fault_close(fault);
+                                if plugin_bound {
+                                    crate::plugins::prometheus_metrics::global_registry()
+                                        .record_ws_message_size_limit_rejection(
+                                            WebSocketFrameDirection::BackendToClient,
+                                        );
+                                }
                                 observe_ws_policy_close(
                                     &btc_plugins,
                                     &proxy_id_btc,

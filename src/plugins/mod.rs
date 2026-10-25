@@ -281,19 +281,44 @@ pub const REQUEST_ID_METADATA_KEY: &str = "request_id";
 /// (health-neutral).
 pub const ROUTE_REQUEST_TIMEOUT_METADATA_KEY: &str = "route_request_timeout";
 
-/// Parser-level limits contributed by a WebSocket size-policy plugin.
-///
-/// The relay combines every applicable instance before either peer is read,
-/// so the strictest frame and reassembled-message ceilings are enforced by
-/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+/// Parser-level limits for one WebSocket relay direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WebSocketSizeLimits {
+pub struct WebSocketDirectionSizeLimits {
     /// Maximum payload bytes accepted in any one wire frame.
     pub max_frame_bytes: usize,
     /// Maximum payload bytes accepted after continuation reassembly.
     pub max_message_bytes: usize,
     /// RFC 6455 Close reason paired with code 1009 on either violation.
     pub close_reason: Arc<str>,
+}
+
+/// Parser-level limits contributed by a WebSocket size-policy plugin.
+///
+/// The relay combines every applicable instance before either peer is read,
+/// so the strictest frame and reassembled-message ceilings are enforced by
+/// tungstenite itself rather than by a post-reassembly `on_ws_frame` hook.
+/// Each direction is combined independently: `client_to_backend` bounds the
+/// client-side framer (frames the client sends), `backend_to_client` bounds
+/// the backend-side framer (frames the backend sends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketSizeLimits {
+    /// Limits applied to frames read from the client.
+    pub client_to_backend: WebSocketDirectionSizeLimits,
+    /// Limits applied to frames read from the backend.
+    pub backend_to_client: WebSocketDirectionSizeLimits,
+}
+
+impl WebSocketSizeLimits {
+    /// The limits that bound frames travelling in `direction`.
+    pub fn for_direction(
+        &self,
+        direction: WebSocketFrameDirection,
+    ) -> &WebSocketDirectionSizeLimits {
+        match direction {
+            WebSocketFrameDirection::ClientToBackend => &self.client_to_backend,
+            WebSocketFrameDirection::BackendToClient => &self.backend_to_client,
+        }
+    }
 }
 
 /// gRPC-only (single protocol).

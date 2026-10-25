@@ -909,9 +909,11 @@ pub(crate) async fn handle_h3_websocket(
     // constrain either framer (issue #3734). Memoized on the upgrade context.
     let ws_size_limit_plugins =
         crate::proxy::collect_websocket_size_limit_plugins(&plugins, &mut ctx);
+    // The backend framer reads backend frames: backend->client ceilings.
     let ws_size_limits = crate::proxy::EffectiveWsSizeLimits::from_plugins(
         state.max_websocket_frame_size_bytes,
         &ws_size_limit_plugins,
+        crate::plugins::WebSocketFrameDirection::BackendToClient,
     );
     // Mesh WS client Host: same source as H1/H2 — the materialized
     // `ctx.headers` map, which already back-fills a missing Host from the H3

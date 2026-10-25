@@ -1031,6 +1031,8 @@ continuations are reassembled before this ordinary hook. Parser-level size
 policy is the exception: `ws_message_size_limiting` installs the strictest
 configured actual-frame and reassembled-message ceilings before either parser
 reads, so continuation payloads are checked individually before allocation.
+Each direction is combined separately (`client_to_backend` for the client-side
+parser, `backend_to_client` for the backend-side parser), once per session.
 
 Physical fragments that produce no message — the initial non-final Text/Binary
 frame and every intermediate continuation, including zero-length ones — are
