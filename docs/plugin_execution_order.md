@@ -1059,10 +1059,12 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 Delivery-accurate observers prepare metadata before `send()` (so large payloads
 are not cloned solely for logging) and emit only after the sink accepts the
 write — the same success boundary as `frames_*` / `bytes_*`. Cancelled or failed
-writes discard the prepared observation. `ws_frame_logging` uses this path for
-ordinary frames and peer Close (`outcome=delivered`) and records plugin
-rejection Closes separately (`outcome=policy_close`) when it observes the final
-decision in the mutating chain.
+writes discard the prepared observation. `prepare_ws_frame_delivery` receives
+the session `connection_id` and direction so an observer can apply per-session
+or per-direction selection (for example `ws_frame_logging`'s `sample_rate` /
+`direction`) before any per-message work. `ws_frame_logging` uses this path for
+ordinary frames and peer Close (`outcome=delivered`) and records policy Closes
+separately (`outcome=policy_close`) through `on_ws_policy_close`.
 
 ### Connection Tracking
 
@@ -1077,14 +1079,24 @@ directions. The first terminal Close from a priority-ordered admission/mutating
 `on_ws_frame` hook is preserved for the rest of the chain: later mutating
 plugins (including additional `ws_rate_limiting` instances) are not invoked for
 that frame, so they neither charge local/Redis budget nor replace the Close
-code/reason. Observational hooks that opt in via
-`observes_ws_frame_decisions()` (today: `ws_frame_logging`) still receive the
-already-final Close so they can record the decision. The relay then records the
-first detailed policy Close, signals shared cancellation before any potentially
-backpressured write, then attempts the same protocol-valid Close to both peers
-under a short bound. Parser-level size rejections
+code/reason. Observational plugins after the rejecting plugin are skipped too
+for that message. Instead, every plugin that opts in via
+`observes_ws_frame_decisions()` (today: `ws_frame_logging`) receives the final
+decision exactly once through `on_ws_policy_close`, after the full pass, so the
+observation does not depend on priority order (an observer moved ahead of the
+rejecting plugin by `priority_override` still records it). The relay then
+records the first detailed policy Close, signals shared cancellation before any
+potentially backpressured write, then attempts the same protocol-valid Close to
+both peers under a short bound. Parser-level size rejections
 (`ws_message_size_limiting` via `websocket_size_limits`) never enter the
 post-reassembly hook chain and use the same dual-peer Close path with code 1009.
+The same `on_ws_policy_close` notification fires for those parser rejections
+(plugin or global size ceilings, incomplete-message bounds, terminated
+`permessage-deflate` faults) and for fragment-budget Closes from
+`on_ws_reassembly_frames`, with the direction of the rejected input. Session
+stops (idle timeout, drain, maximum lifetime, credential expiry, trust
+withdrawal) and transport faults are not policy Closes; `on_ws_disconnect`
+reports them through `websocket.termination_reason` and the failure fields.
 
 ### Session-Bound Message Policy (`bind_ws_session`)
 
@@ -1720,7 +1732,7 @@ Given all built-in plugins enabled, the execution order is:
 | 64 | `ai_token_metrics` | 4100 | on_response_body |
 | 65 | `ai_rate_limiter` | 4200 | before_proxy, on_final_request_body_with_context, after_proxy, on_response_body, response_stream_inspector, on_response_stream_terminated |
 | 66 | `stdout_logging` | 9000 | log, on_stream_disconnect, on_ws_disconnect |
-| 67 | `ws_frame_logging` | 9050 | on_ws_frame, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect |
+| 67 | `ws_frame_logging` | 9050 | on_ws_policy_close, prepare_ws_frame_delivery, emit_ws_frame_delivery, on_ws_disconnect |
 | 68 | `statsd_logging` | 9075 | log, on_stream_disconnect, on_ws_disconnect |
 | 69 | `http_logging` | 9100 | log, on_stream_disconnect |
 | 70 | `tcp_logging` | 9125 | log, on_stream_disconnect |
@@ -2193,7 +2205,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
 | `ai_rate_limiter` | ✓ | | | | | HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
-| `ws_frame_logging` | | | ✓ | | | `on_ws_frame` records policy decisions such as Close; delivery observations are emitted after successful destination sends |
+| `ws_frame_logging` | | | ✓ | | | `on_ws_policy_close` records final policy Close decisions; delivery observations are emitted after successful destination sends |
 | `statsd_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `tcp_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |

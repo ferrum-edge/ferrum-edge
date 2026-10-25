@@ -259,6 +259,7 @@ mod websocket_connection_limit_tests;
 mod websocket_drain_accounting_tests;
 mod websocket_fragment_metering_tests;
 mod websocket_frame_delivery_tests;
+mod websocket_frame_logging_relay_tests;
 mod websocket_frame_plugin_composition_tests;
 mod websocket_permessage_deflate_terminate_tests;
 mod websocket_permessage_deflate_tests;

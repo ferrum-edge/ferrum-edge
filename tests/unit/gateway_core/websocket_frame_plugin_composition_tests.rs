@@ -62,6 +62,7 @@ impl Plugin for SizeRejectPlugin {
 struct CountingObserver {
     seen_close: AtomicU64,
     replacements: AtomicU64,
+    policy_closes: std::sync::Mutex<Vec<(WebSocketFrameDirection, Option<u16>)>>,
 }
 
 #[async_trait]
@@ -103,6 +104,19 @@ impl Plugin for CountingObserver {
             code: CloseCode::Policy,
             reason: "observer overwrite".into(),
         })))
+    }
+
+    fn on_ws_policy_close(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        direction: WebSocketFrameDirection,
+        close: Option<&CloseFrame>,
+    ) {
+        self.policy_closes
+            .lock()
+            .unwrap()
+            .push((direction, close.map(|cf| u16::from(cf.code))));
     }
 }
 
@@ -179,6 +193,7 @@ async fn earlier_size_close_is_preserved_over_rate_limiter_both_directions() {
         let observer = Arc::new(CountingObserver {
             seen_close: AtomicU64::new(0),
             replacements: AtomicU64::new(0),
+            policy_closes: std::sync::Mutex::new(Vec::new()),
         });
         let logger = Arc::new(WsFrameLogging::new(&json!({})).unwrap());
         let plugins: Vec<Arc<dyn Plugin>> =
@@ -213,10 +228,17 @@ async fn earlier_size_close_is_preserved_over_rate_limiter_both_directions() {
             keys_before_reject,
             "rate limiter must not charge after an earlier terminal Close ({direction:?})"
         );
-        assert_eq!(observer.seen_close.load(Ordering::SeqCst), 1);
-        // Observer attempted replacements for both the admitted frame and the
-        // final Close, but the applicator must ignore both.
-        assert_eq!(observer.replacements.load(Ordering::SeqCst), 2);
+        // The terminal Close ends the chain for every later plugin, observers
+        // included; the decision reaches observers once, after the pass,
+        // through `on_ws_policy_close`.
+        assert_eq!(observer.seen_close.load(Ordering::SeqCst), 0);
+        // The observer's replacement attempt on the admitted frame is ignored.
+        assert_eq!(observer.replacements.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *observer.policy_closes.lock().unwrap(),
+            vec![(direction, Some(1009))],
+            "exactly one final-decision observation ({direction:?})"
+        );
     }
 }
 

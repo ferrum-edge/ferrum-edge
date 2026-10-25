@@ -2237,11 +2237,24 @@ impl Plugin for PluginInstanceWrapper {
             .on_ws_reassembly_frames(proxy_id, connection_id, direction, fragment_frames)
             .await
     }
+    fn on_ws_policy_close(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        close: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) {
+        self.inner
+            .on_ws_policy_close(proxy_id, connection_id, direction, close);
+    }
     fn prepare_ws_frame_delivery(
         &self,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
         message: &tokio_tungstenite::tungstenite::Message,
     ) -> Option<crate::plugins::WsFrameDeliveryObservation> {
-        self.inner.prepare_ws_frame_delivery(message)
+        self.inner
+            .prepare_ws_frame_delivery(connection_id, direction, message)
     }
     fn emit_ws_frame_delivery(
         &self,
