@@ -13666,7 +13666,7 @@ pub fn create_plugin_with_http_client(
 /// status/metrics under that stable identity, `proxy_alerts` scopes its
 /// `${incident_key}` receiver correlation key to it, while `request_mirror`
 /// records attribute each shadow destination, and `request_size_limiting` names
-/// the rejecting instance in its rejection metadata. Pass `None` for config-validation and
+/// the rejecting instance in its rejection metadata (a blank id is refused). Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
 /// (uses the plugin's standalone default id). Blank ids fail closed when
 /// supplied.

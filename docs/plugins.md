@@ -6590,9 +6590,16 @@ identify the refusal without echoing any body bytes:
 | `request_size_limiting.limit_bytes` | The instance's `max_bytes` |
 | `request_size_limiting.observed_bytes` | The declared `Content-Length`, or the buffered/final body length; absent for an ambiguous `Content-Length` |
 
-The final-body check records these fields whenever the final request-body stage
-runs with a request context. The plugin does not request that context itself, so
-it adds no per-request context clone. A streaming overrun refused by the proxy
+The `Content-Length` and buffered-body refusals always record these fields. The
+final-body refusal (`final_body_over_limit`) records them only when its hook is
+handed a request context: always on native HTTP/3, but on HTTP/1.1 and HTTP/2
+only when another plugin on the same route requests the final-body context
+(`needs_final_request_body_context`, for example a context-aware body transform
+or AI policy plugin). `request_size_limiting` does not request it, so that it
+never adds a per-request context clone. On an H1/H2 route without such a plugin,
+a post-transform overrun is still refused with the same `413` and is visible in
+the transaction log as status `413` with `rejection_phase` `on_final_request_body`,
+but it carries no `request_size_limiting.*` metadata. A streaming overrun refused by the proxy
 core is not a plugin decision and records no plugin metadata; it is identified by
 its `413` status and `request_body_too_large` error class. There is no
 monitor/dry-run mode.

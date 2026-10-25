@@ -23,7 +23,14 @@
 //! a streaming upload overruns this ceiling, so the client contract does not
 //! depend on which enforcement point fired. The limit, the observed size, and
 //! the rejecting instance go to request metadata (and from there to the
-//! transaction log) instead of the response body.
+//! transaction log) instead of the response body. That metadata is always
+//! recorded by the `Content-Length` and buffered-body refusals. The final-body
+//! refusal records it only when its hook is handed a request context: always on
+//! native HTTP/3, but on H1/H2 only when another plugin on the route asks for
+//! the final-body context (`needs_final_request_body_context`). This plugin
+//! does not ask, so it never adds a per-request context clone; without that
+//! context the H1/H2 final-body `413` carries no `request_size_limiting.*`
+//! metadata.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -96,8 +103,8 @@ impl RequestSizeLimiting {
     }
 
     /// Build an instance that reports `config_id` (the plugin-config resource
-    /// id) as its identity in rejection metadata. `None` (or a blank id)
-    /// reports `standalone`.
+    /// id) as its identity in rejection metadata. `None` reports `standalone`;
+    /// a blank id is refused.
     pub fn new_with_config_id(config: &Value, config_id: Option<&str>) -> Result<Self, String> {
         let Some(config_obj) = config.as_object() else {
             return Err("request_size_limiting: config must be an object".to_string());
@@ -111,14 +118,16 @@ impl RequestSizeLimiting {
 
         let max_bytes = required_positive_u64(config, "max_bytes", "request_size_limiting")?;
 
-        // Observability identity only: it never selects state or policy, so a
-        // missing or blank id reports `standalone` instead of refusing the
-        // instance (resource ids are already validated at config admission).
-        let instance_id: Arc<str> = Arc::from(
-            config_id
-                .filter(|id| !id.is_empty())
-                .unwrap_or(STANDALONE_INSTANCE_ID),
-        );
+        // The factory contract: a supplied id must be usable, so a blank one
+        // fails closed (as `request_mirror` does) rather than masquerading as
+        // an unnamed instance. Only an absent id reports `standalone`.
+        let instance_id: Arc<str> = match config_id {
+            Some(id) if id.trim().is_empty() => {
+                return Err("request_size_limiting: plugin_config_id must not be blank".to_string());
+            }
+            Some(id) => Arc::from(id.trim()),
+            None => Arc::from(STANDALONE_INSTANCE_ID),
+        };
 
         Ok(Self {
             max_bytes,

@@ -721,3 +721,71 @@ async fn factory_reports_the_plugin_config_id_as_the_rejecting_instance() {
         Some("tenant-upload-limit")
     );
 }
+
+/// The factory contract: a supplied plugin-config id must be usable. A blank id
+/// fails closed (as `request_mirror` does) instead of reporting `standalone`.
+#[test]
+fn blank_plugin_config_id_fails_closed() {
+    let config = json!({"max_bytes": 1024});
+    for blank in ["", "   "] {
+        let error = match RequestSizeLimiting::new_with_config_id(&config, Some(blank)) {
+            Ok(_) => panic!("blank id {blank:?} must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("plugin_config_id must not be blank"),
+            "{error}"
+        );
+        let factory_error = match ferrum_edge::plugins::create_plugin_with_http_client_and_config_id(
+            "request_size_limiting",
+            &config,
+            ferrum_edge::plugins::PluginHttpClient::default(),
+            Some(blank),
+        ) {
+            Ok(_) => panic!("factory must refuse blank id {blank:?}"),
+            Err(error) => error,
+        };
+        assert!(
+            factory_error.contains("plugin_config_id must not be blank"),
+            "{factory_error}"
+        );
+    }
+    // An absent id is the standalone default, not an error.
+    assert!(RequestSizeLimiting::new_with_config_id(&config, None).is_ok());
+}
+
+/// The header-phase refusals record their metadata on the real request context
+/// on every protocol; only the final-body refusal depends on a context being
+/// handed to its hook. Pin both header-phase refusals through the production
+/// factory, which is how the proxy builds the instance.
+#[tokio::test]
+async fn header_phase_rejections_record_metadata_through_the_factory() {
+    let plugin = ferrum_edge::plugins::create_plugin_with_http_client_and_config_id(
+        "request_size_limiting",
+        &json!({"max_bytes": 16}),
+        ferrum_edge::plugins::PluginHttpClient::default(),
+        Some("edge-limit"),
+    )
+    .unwrap()
+    .unwrap();
+
+    for (content_length, status, reason, observed) in [
+        ("17", 413, "content_length_over_limit", Some("17")),
+        ("16, 17", 400, "content_length_ambiguous", None),
+    ] {
+        let mut ctx = make_ctx("POST", "/api");
+        ctx.headers
+            .insert("content-length".to_string(), content_length.to_string());
+        match plugin.on_request_received(&mut ctx).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, status),
+            other => panic!("{content_length}: expected Reject, got {other:?}"),
+        }
+        assert_eq!(metadata(&ctx, REJECTION_REASON_METADATA_KEY), Some(reason));
+        assert_eq!(
+            metadata(&ctx, REJECTION_INSTANCE_METADATA_KEY),
+            Some("edge-limit")
+        );
+        assert_eq!(metadata(&ctx, REJECTION_LIMIT_METADATA_KEY), Some("16"));
+        assert_eq!(metadata(&ctx, REJECTION_OBSERVED_METADATA_KEY), observed);
+    }
+}
