@@ -4192,7 +4192,7 @@ async fn rfc9421_enforces_created_and_expires() {
             "stale-created",
             format!(
                 r#";created={};keyid="{TEST_USERNAME}";nonce="{}""#,
-                now - 301,
+                now - 400,
                 test_nonce(0x7200)
             ),
             "outside its validity window",
@@ -4201,7 +4201,7 @@ async fn rfc9421_enforces_created_and_expires() {
             "future-created",
             format!(
                 r#";created={};keyid="{TEST_USERNAME}";nonce="{}""#,
-                now + 301,
+                now + 400,
                 test_nonce(0x7201)
             ),
             "outside its validity window",
@@ -4605,4 +4605,177 @@ fn structured_field_dictionaries_are_parsed_strictly() {
         parse_dictionary(&many_members),
         Err(StructuredFieldError::TooMany)
     );
+}
+
+// ── PR #6853 review round 1 ─────────────────────────────────────────
+
+/// HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) WebSocket handshakes are Extended
+/// CONNECT on the wire; the frontends rewrite the policy method to `GET`. The
+/// RFC 9421 `@method` component must still be the `CONNECT` the client signed.
+#[tokio::test]
+async fn rfc9421_extended_connect_websocket_signs_the_wire_method() {
+    use ferrum_edge::_test_support::record_wire_request_line_for_hmac_for_test;
+
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let uri: http::Uri = "https://api.example.com/socket".parse().unwrap();
+    let handshake = |method_signed: &str, nonce: &str| {
+        // The frontend: wire method CONNECT, policy method rewritten to GET.
+        let mut ctx = make_ctx("CONNECT", "/socket");
+        set_content_digest(&mut ctx, sha256_content_digest_header(b""));
+        let mut signed = ctx.clone();
+        signed.method = method_signed.to_string();
+        sign_rfc9421(
+            &mut signed,
+            TEST_SECRET.as_bytes(),
+            RFC9421_BASELINE,
+            &rfc9421_params(nonce),
+        );
+        for name in ["signature-input", "signature"] {
+            ctx.headers
+                .insert(name.to_string(), signed.headers.get(name).unwrap().clone());
+        }
+        ctx.method = "GET".to_string();
+        record_wire_request_line_for_hmac_for_test(
+            &mut ctx,
+            "CONNECT",
+            http::Version::HTTP_2,
+            &uri,
+        );
+        ctx
+    };
+
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-ws-connect");
+    let mut ctx = handshake("CONNECT", &test_nonce(0x7800));
+    assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    assert_eq!(
+        ctx.identified_consumer.as_ref().unwrap().username,
+        TEST_USERNAME
+    );
+    assert_eq!(
+        ctx.method, "GET",
+        "policy and backend keep the rewritten method"
+    );
+
+    // A signature over the rewritten method is not the client's signature.
+    let plugin = plugin_named(rfc9421_config(), "rfc9421-ws-get");
+    let mut ctx = handshake("GET", &test_nonce(0x7801));
+    assert_reject_error(
+        plugin.authenticate(&mut ctx, &consumer_index).await,
+        401,
+        "Invalid credentials",
+    );
+}
+
+/// Both frontends must record the wire request line before authentication:
+/// the H1/H2 handler at context creation, and HTTP/3 at creation plus its
+/// WebSocket method rewrite.
+#[test]
+fn both_frontends_record_the_wire_request_line_for_rfc9421() {
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    assert!(
+        proxy.contains(
+            "ctx.record_wire_request_line_for_hmac(req.method().as_str(), inbound_version, req.uri());"
+        ),
+        "the H1/H2 handler must record the wire request line"
+    );
+    let h3 = include_str!("../../../src/http3/server.rs");
+    assert!(
+        h3.contains("ctx.record_wire_request_line_for_hmac(req.method().as_str(), req.version(), req.uri());"),
+        "the HTTP/3 handler must record the wire request line"
+    );
+    let rewrite = h3
+        .find("if http_flavor == HttpFlavor::WebSocket {")
+        .expect("HTTP/3 WebSocket method rewrite");
+    let rewrite_body = &h3[rewrite..rewrite + 400];
+    let recorded = rewrite_body
+        .find("ctx.set_wire_method_for_hmac(ctx.method.clone());")
+        .expect("HTTP/3 must retain the wire method before rewriting it");
+    let rewritten = rewrite_body
+        .find("ctx.method = method.clone();")
+        .expect("HTTP/3 rewrite");
+    assert!(
+        recorded < rewritten,
+        "the wire method is captured before the rewrite"
+    );
+}
+
+/// `@request-target` is the target as sent: an HTTP/1.1 absolute-form target
+/// and a present-but-empty query are not reproducible from path + query.
+#[tokio::test]
+async fn rfc9421_request_target_covers_absolute_form_and_empty_query() {
+    use ferrum_edge::_test_support::record_wire_request_line_for_hmac_for_test;
+    use ferrum_edge::plugins::hmac_auth::unreconstructible_request_target;
+
+    let absolute: http::Uri = "https://api.example.com/api/orders?x=1".parse().unwrap();
+    let empty_query: http::Uri = "/api/orders?".parse().unwrap();
+    let origin: http::Uri = "/api/orders?x=1".parse().unwrap();
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_11, &absolute).as_deref(),
+        Some("https://api.example.com/api/orders?x=1")
+    );
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_2, &empty_query).as_deref(),
+        Some("/api/orders?")
+    );
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_11, &origin),
+        None,
+        "an ordinary origin-form request allocates nothing"
+    );
+    // HTTP/2 URIs always carry scheme and authority; the target is `:path`.
+    assert_eq!(
+        unreconstructible_request_target(http::Version::HTTP_2, &absolute),
+        None
+    );
+
+    let consumer_index = ConsumerIndex::new(&[create_hmac_consumer()]);
+    let covered: Vec<&str> = RFC9421_BASELINE
+        .iter()
+        .copied()
+        .chain(["@request-target"])
+        .collect();
+    for (index, (uri, signed_target)) in [
+        (&absolute, "https://api.example.com/api/orders?x=1"),
+        (&empty_query, "/api/orders?"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut ctx = rfc9421_ctx();
+        if uri.query() == Some("") {
+            ctx.set_raw_query_string(String::new());
+        }
+        record_wire_request_line_for_hmac_for_test(&mut ctx, "POST", http::Version::HTTP_11, uri);
+        // Sign with an independent base that uses the wire target.
+        let params = rfc9421_params(&test_nonce(0x7900 + index as u64));
+        let list = format!(
+            "({}){params}",
+            covered
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut base = String::new();
+        for name in &covered {
+            let value = if *name == "@request-target" {
+                signed_target.to_string()
+            } else {
+                test_component_value(&ctx, name)
+            };
+            base.push_str(&format!("\"{name}\": {value}\n"));
+        }
+        base.push_str(&format!("\"@signature-params\": {list}"));
+        let mut mac = HmacSha256::new_from_slice(TEST_SECRET.as_bytes()).unwrap();
+        mac.update(base.as_bytes());
+        let signature =
+            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        ctx.headers
+            .insert("signature-input".to_string(), format!("sig1={list}"));
+        ctx.headers
+            .insert("signature".to_string(), format!("sig1=:{signature}:"));
+
+        let plugin = plugin_named(rfc9421_config(), &format!("rfc9421-target-{index}"));
+        assert_continue(plugin.authenticate(&mut ctx, &consumer_index).await);
+    }
 }

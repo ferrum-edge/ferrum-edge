@@ -876,6 +876,137 @@ fn staggered_expiry_reclamation_examines_due_markers_not_the_whole_lane() {
     );
 }
 
+/// Clustered expirations (PR #6853 review): a whole lane admitted inside one
+/// second expires inside one second too. Reclamation must still visit only
+/// the markers that are actually due — popping them from the ordered expiry
+/// index — rather than rescanning the live remainder of that second on every
+/// pass.
+#[test]
+fn clustered_expiry_reclamation_never_rescans_live_markers() {
+    const CAP: usize = 4_000;
+    const STEPS: u64 = 400;
+    let sub = "clustered-expiry-index";
+    let authority = process_authority(sub, CAP);
+    let lane = process_lane(&authority).expect("process lane");
+    let retention_ms = u64::try_from(RETENTION.as_millis()).expect("retention fits u64");
+
+    // Four markers per millisecond: the whole lane inside one second.
+    for idx in 0..CAP as u64 {
+        let marker = lane_marker(sub, &format!("fill-{idx}"));
+        assert_eq!(
+            admit_process_at(&authority, &marker, idx / 4),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    let scans_before = lane.prune_scans();
+    let examined_before = lane.prune_entries_examined_for_tests();
+
+    for step in 0..STEPS {
+        let now = retention_ms + step + 1;
+        let marker = lane_marker(sub, &format!("new-{step}"));
+        assert_eq!(
+            admit_process_at(&authority, &marker, now),
+            Some(ReplayAdmission::Admitted),
+            "an expired slot must be reclaimed at step {step}"
+        );
+    }
+
+    let scans = lane.prune_scans() - scans_before;
+    let examined = lane.prune_entries_examined_for_tests() - examined_before;
+    // Each pass reclaims everything due so far, so passes are few but every
+    // one lands inside the clustered second.
+    assert!(scans >= 3, "the scenario must drive reclamation ({scans})");
+    // Every examined marker was due: at most four fill markers expire per
+    // millisecond, over `STEPS + 1` milliseconds.
+    assert!(
+        examined <= 4 * (STEPS + 2),
+        "{scans} passes examined {examined} markers; only due markers may be visited"
+    );
+    assert_eq!(
+        lane.indexed_markers_for_tests(),
+        lane.retained_entries(),
+        "every retained marker is indexed exactly once"
+    );
+    let still_live = lane_marker(sub, &format!("fill-{}", CAP as u64 - 1));
+    assert_eq!(
+        admit_process_at(&authority, &still_live, retention_ms + STEPS),
+        Some(ReplayAdmission::Replay)
+    );
+}
+
+/// Refreshing an expired marker in place (same principal, at its share) moves
+/// its index entry instead of searching for it, and leaves exactly one index
+/// entry per retained marker, so later reclamation finds every refreshed
+/// marker at its new expiry.
+#[test]
+fn refreshed_markers_move_in_the_expiry_index_and_are_reclaimed_later() {
+    const SHARE: usize = 256;
+    let sub = "refresh-reindex";
+    let authority = process_authority(sub, SHARE * 4);
+    let lane = process_lane(&authority).expect("process lane");
+    let retention_ms = u64::try_from(RETENTION.as_millis()).expect("retention fits u64");
+    let replay_domain = domain(sub);
+    let markers: Vec<_> = (0..SHARE)
+        .map(|idx| replay_domain.marker(&[b"principal-a", format!("nonce-{idx}").as_bytes()]))
+        .collect();
+
+    for marker in &markers {
+        assert_eq!(
+            admit_process_at(&authority, marker, 0),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    // Every marker expired and is re-presented by the same principal, which
+    // is exactly at its share: each is refreshed in place.
+    let refresh_at = retention_ms + 1;
+    for marker in &markers {
+        assert_eq!(
+            admit_process_at(&authority, marker, refresh_at),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    assert_eq!(lane.retained_entries(), SHARE);
+    assert_eq!(
+        lane.indexed_markers_for_tests(),
+        SHARE,
+        "a refresh moves the index entry; it never leaves a stale one behind"
+    );
+    for marker in &markers {
+        assert_eq!(
+            admit_process_at(&authority, marker, refresh_at + 1),
+            Some(ReplayAdmission::Replay),
+            "a refreshed marker is live again"
+        );
+    }
+
+    // Fill the rest of the lane with other principals, then let the
+    // refreshed markers expire: reclamation must find them at their new
+    // expiry and visit nothing else.
+    for idx in 0..(SHARE * 3) {
+        let marker = lane_marker(sub, &format!("other-{idx}"));
+        assert_eq!(
+            admit_process_at(&authority, &marker, refresh_at + 10),
+            Some(ReplayAdmission::Admitted)
+        );
+    }
+    let examined_before = lane.prune_entries_examined_for_tests();
+    let after_refreshed_expire = refresh_at + retention_ms + 1;
+    assert_eq!(
+        admit_process_at(
+            &authority,
+            &lane_marker(sub, "after-refresh"),
+            after_refreshed_expire
+        ),
+        Some(ReplayAdmission::Admitted)
+    );
+    assert_eq!(
+        lane.prune_entries_examined_for_tests() - examined_before,
+        SHARE as u64,
+        "exactly the expired refreshed markers are examined"
+    );
+    assert_eq!(lane.indexed_markers_for_tests(), lane.retained_entries());
+}
+
 /// Concurrent insertion while a due prune recomputes the earliest bound must
 /// not drop a still-live marker or treat it as expired.
 #[test]

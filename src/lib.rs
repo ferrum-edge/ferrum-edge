@@ -425,6 +425,17 @@ pub mod _test_support {
         crate::proxy::publish_websocket_handshake_body_digests(plugins, ctx);
     }
 
+    /// Record the frontend request line exactly as the H1/H2 handler does at
+    /// context creation (RFC 9421 `@method` / `@request-target` provenance).
+    pub fn record_wire_request_line_for_hmac_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        wire_method: &str,
+        version: http::Version,
+        uri: &http::Uri,
+    ) {
+        ctx.record_wire_request_line_for_hmac(wire_method, version, uri);
+    }
+
     /// Record buffered-body metadata exactly as the H1/H2/H3 body ladders do,
     /// so tests can pin which body digest snapshots are computed.
     pub fn store_request_body_metadata_for_test(

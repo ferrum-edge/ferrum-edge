@@ -35,8 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ferrum-hmac-v1`** (issue #6853). Values above 10,000,000 and any
   `replay_max_entries` on a `ferrum-hmac-v1` policy (which has no replay
   state) now fail admission instead of being accepted. Process replay-lane
-  reclamation (shared with `jwks_auth` DPoP) now visits only markers whose
-  expiry bucket is due rather than scanning the whole lane, and HMAC body
+  reclamation (shared with `jwks_auth` DPoP) now pops only expired markers
+  from an ordered expiry index rather than scanning the whole lane, and HMAC body
   hashing computes only the digest algorithms the client presented.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so

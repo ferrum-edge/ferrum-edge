@@ -34142,6 +34142,11 @@ async fn handle_proxy_request_inner(
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
+    // RFC 9421 `hmac_auth` signs the client's request line: retain the wire
+    // method an Extended CONNECT WebSocket rewrite replaced, and any
+    // request-target the path and query cannot reproduce. Allocation-free for
+    // an ordinary request.
+    ctx.record_wire_request_line_for_hmac(req.method().as_str(), inbound_version, req.uri());
     let mut request_scheme = if is_tls { "https" } else { "http" };
     ctx.request_is_secure = is_tls;
     ctx.metadata.insert(

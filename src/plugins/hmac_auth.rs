@@ -679,7 +679,13 @@ fn rfc9421_component_is_supported(name: &str) -> bool {
 /// RFC 9421 §2 component value for `name`, derived from the request.
 fn rfc9421_component_value(ctx: &RequestContext, name: &str) -> Result<String, &'static str> {
     match name {
-        "@method" => Ok(ctx.method.clone()),
+        // §2.2.1: the method of the signed request message. A frontend that
+        // rewrote the policy method (WebSocket Extended CONNECT → GET)
+        // retained the wire method for exactly this derivation.
+        "@method" => Ok(ctx
+            .hmac_wire_method
+            .clone()
+            .unwrap_or_else(|| ctx.method.clone())),
         "@authority" => ctx
             .request_authority
             .clone()
@@ -693,6 +699,13 @@ fn rfc9421_component_value(ctx: &RequestContext, name: &str) -> Result<String, &
             value.push_str(query);
             Ok(value)
         }
+        // §2.2.5: the request-target as sent. The frontend retains it when the
+        // path and query cannot reproduce it (absolute-form, empty query).
+        "@request-target" if ctx.hmac_wire_request_target.is_some() => Ok(ctx
+            .hmac_wire_request_target
+            .as_ref()
+            .map(|target| target.as_str().to_string())
+            .unwrap_or_default()),
         "@request-target" => {
             let path = rfc9421_path(ctx);
             let query = ctx.raw_query_string();
@@ -708,6 +721,28 @@ fn rfc9421_component_value(ctx: &RequestContext, name: &str) -> Result<String, &
         _ if name.starts_with('@') => Err(UNSUPPORTED_SIGNATURE_COMPONENT_BODY),
         header => canonical_field_value(ctx, header)?.ok_or(MISSING_COVERED_COMPONENT_BODY),
     }
+}
+
+/// The request-target a frontend must retain for RFC 9421 `@request-target`
+/// because the path and query alone cannot reproduce it: an HTTP/1.x
+/// absolute-form target (`GET https://host/p?q HTTP/1.1`), or a
+/// present-but-empty query (`/p?`), which the query accessor collapses to
+/// absence. `None` for every ordinary origin-form request, so the common path
+/// allocates nothing. HTTP/2 and HTTP/3 always carry origin-form `:path`.
+pub fn unreconstructible_request_target(version: http::Version, uri: &http::Uri) -> Option<String> {
+    let http1 = matches!(
+        version,
+        http::Version::HTTP_09 | http::Version::HTTP_10 | http::Version::HTTP_11
+    );
+    if http1 && uri.scheme().is_some() {
+        return Some(uri.to_string());
+    }
+    if uri.query() == Some("") {
+        return uri
+            .path_and_query()
+            .map(|target| target.as_str().to_string());
+    }
+    None
 }
 
 /// §2.2.6: the absolute path as sent, `/` when empty.

@@ -25089,8 +25089,10 @@ components:
             within clock_skew_seconds, and the nonce is claimed single-use like
             v2 (in its own replay domain). Unknown algorithms, components,
             component parameters, and signature parameters are refused.
-            Supported derived components are @method, @authority, @path,
-            @query, and @request-target. 'ferrum-hmac-v1' is
+            Supported derived components are @method (the wire method:
+            CONNECT for an HTTP/2 or HTTP/3 WebSocket Extended CONNECT),
+            @authority, @path, @query, and @request-target (the target as
+            sent, including HTTP/1.1 absolute form and an empty query). 'ferrum-hmac-v1' is
             freshness-only — a captured valid request can be replayed verbatim
             for the whole clock_skew_seconds window — and additionally requires
             allow_unsafe_replayable_v1 true. v1 rejects a nonce parameter
@@ -25130,8 +25132,8 @@ components:
             At capacity only expired markers are reclaimed; if none can be, the
             request is refused (503) rather than a live marker evicted.
             Repeated full-live refusals are O(1) until an expiry is actually
-            due, and a due reclamation visits only markers whose expiry bucket
-            has started, never the whole lane. An equivalent reload applies the
+            due, and a due reclamation pops only markers whose expiry has
+            passed from an ordered expiry index, never rescanning live markers. An equivalent reload applies the
             new cap without forgetting live markers. Ignored for 'shared';
             rejected with ferrum-hmac-v1, which has no replay state.
         signed_headers:

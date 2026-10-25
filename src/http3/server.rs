@@ -3496,6 +3496,9 @@ async fn handle_h3_request(
 
     // Build request context (client_ip resolved below after headers are parsed)
     let mut ctx = RequestContext::new(socket_ip.to_owned(), method.clone(), path.clone());
+    // RFC 9421 `hmac_auth` signs the client's request-target; retain it when
+    // the path and query cannot reproduce it. Allocation-free otherwise.
+    ctx.record_wire_request_line_for_hmac(req.method().as_str(), req.version(), req.uri());
     // Carry the operator's response-body ceiling so the buffered representation
     // gate bounds its decompression by the same limit the wire path enforces.
     ctx.max_response_body_size_bytes = state.max_response_body_size_bytes;
@@ -3857,6 +3860,8 @@ async fn handle_h3_request(
     // CONNECT path. Plain CONNECT and CONNECT-UDP keep CONNECT; the 0-RTT
     // allowlist above still gates the wire method.
     if http_flavor == HttpFlavor::WebSocket {
+        // RFC 9421 `@method` covers the method the client signed.
+        ctx.set_wire_method_for_hmac(ctx.method.clone());
         method = "GET".to_string();
         ctx.method = method.clone();
     }
