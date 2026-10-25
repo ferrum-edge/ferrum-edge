@@ -11518,6 +11518,98 @@ async fn oversized_namespace_markup_is_refused_before_parsing() {
     }
 }
 
+/// Per-item ceilings do not bound the parser on their own: declarations are
+/// paid for once on an ancestor and inherited by every descendant. Children
+/// that each carry an at-ceiling set of prefixed attributes over near-equal
+/// at-ceiling URIs repeat the parser's pairwise duplicate check per element,
+/// and a deep chain of declaring elements grows the inherited scope every level
+/// re-tests. Both are refused before parsing by the document-wide aggregates.
+#[tokio::test]
+async fn aggregate_namespace_parse_work_is_refused_before_parsing() {
+    // (a) One ancestor declaring 63 near-equal 2048-byte URIs, and ten
+    // children that each carry 63 attributes, one per inherited prefix.
+    let shared = "A".repeat(2_041);
+    let ancestor_declarations: String = (0..63)
+        .map(|index| format!(r#" xmlns:p{index:02}="urn:{shared}{index:03}""#))
+        .collect();
+    let child_attributes: String = (0..63)
+        .map(|index| format!(r#" p{index:02}:a="""#))
+        .collect();
+    let children = format!("<c{child_attributes}/>").repeat(10);
+    let inherited_square = format!("<Item{ancestor_declarations}>{children}</Item>");
+
+    // (b) A chain of nested elements that each declare eight new prefixes:
+    // 20 levels × 8 = 160 declarations, past the document-wide ceiling.
+    let mut chain_open = String::new();
+    let mut chain_close = String::new();
+    for level in 0..20 {
+        chain_open.push_str(&format!("<n{level}"));
+        for index in 0..8 {
+            chain_open.push_str(&format!(
+                r#" xmlns:l{level}x{index}="urn:l{level}x{index}""#
+            ));
+        }
+        chain_open.push('>');
+        chain_close.insert_str(0, &format!("</n{level}>"));
+    }
+    let declaring_chain = format!("<Item>{chain_open}{chain_close}</Item>");
+
+    // (c) PR6820-SOL-7: declarations spread across ancestors (each within the
+    // per-tag ceilings, with long near-equal prefixes), then many descendants
+    // that each redeclare one namespace. A redeclaration defeats the parser's
+    // "no new declarations" shortcut, so every such descendant re-merges the
+    // whole inherited scope; each one is also a declaration, so the
+    // document-wide ceiling refuses the shape long before it can repeat.
+    let long_prefix_declarations = |ancestor: usize| -> String {
+        (0..60)
+            .map(|index| format!(r#" xmlns:p{}{ancestor}{index:02}="urn:p""#, "a".repeat(57)))
+            .collect()
+    };
+    let redeclaring_leaves = r#"<x xmlns:z="urn:z"/>"#.repeat(200);
+    let redeclaring_descendants = format!(
+        "<Item><o0{}><o1{}>{redeclaring_leaves}</o1></o0></Item>",
+        long_prefix_declarations(0),
+        long_prefix_declarations(1)
+    );
+
+    for (label, item) in [
+        ("inherited at-ceiling attribute squares", inherited_square),
+        ("deep declaring chain", declaring_chain),
+        (
+            "ancestor scope re-merged by redeclaring descendants",
+            redeclaring_descendants,
+        ),
+    ] {
+        let result = timestamp_only_outcome_with_item(&item).await;
+        assert_eq!(reject_status(&result), 400, "{label}");
+        assert!(
+            reject_body(&result).contains("namespace and attribute bounds"),
+            "{label}: got {}",
+            reject_body(&result)
+        );
+    }
+}
+
+/// Ordinary namespace inheritance — a few declarations on ancestors and a
+/// handful of descendants that redeclare a binding — stays well inside the
+/// aggregate ceilings.
+#[tokio::test]
+async fn ordinary_namespace_inheritance_is_accepted() {
+    let ancestor = |name: &str| -> String {
+        (0..10)
+            .map(|index| format!(r#" xmlns:{name}{index}="urn:example:{name}{index}""#))
+            .collect()
+    };
+    let leaves = r#"<x xmlns:z="urn:z" z:a=""/>"#.repeat(20);
+    let item = format!(
+        "<Item><o0{}><o1{}>{leaves}</o1></o0></Item>",
+        ancestor("a"),
+        ancestor("b")
+    );
+    let result = timestamp_only_outcome_with_item(&item).await;
+    assert!(matches!(result, PluginResult::Continue), "{result:?}");
+}
+
 /// A start tag that never terminates is not "within bounds" just because the
 /// screen cannot frame it: the parser tokenizes (and duplicate-checks) every
 /// declaration of such a tag before it discovers the missing `>` at end of
@@ -11564,14 +11656,28 @@ async fn unterminated_markup_is_refused_before_parsing() {
     }
 }
 
-/// The ceilings sit far above real messages: a URI of exactly 2048 bytes and
-/// an element with exactly 256 attributes are still accepted, as is markup
-/// that merely looks oversized inside a comment or CDATA section.
+/// The ceilings sit far above real messages: a URI of exactly 2048 bytes, an
+/// element with exactly 64 attributes, and an envelope with exactly 128
+/// namespace declarations are still accepted, as is markup that merely looks
+/// oversized inside a comment or CDATA section.
 #[tokio::test]
 async fn namespace_markup_at_the_ceilings_is_accepted() {
     let max_uri = format!("urn:{}", "A".repeat(2_044));
     assert_eq!(max_uri.len(), 2_048);
-    let max_attributes: String = (0..256).map(|index| format!(" a{index}=\"\"")).collect();
+    let max_attributes: String = (0..64).map(|index| format!(" a{index}=\"\"")).collect();
+    // `wrap_soap` already declares four namespaces (soap, wsse, wsu, and the
+    // GetPrice default), so 124 more reach exactly 128, split across two
+    // elements to stay within the per-tag attribute ceiling.
+    let declarations = |prefix: &str| -> String {
+        (0..62)
+            .map(|index| format!(" xmlns:{prefix}{index}=\"urn:{prefix}{index}\""))
+            .collect()
+    };
+    let at_declaration_ceiling = format!(
+        "<Item{}><x{}/>Widget</Item>",
+        declarations("p"),
+        declarations("q")
+    );
     let long_uri = format!("urn:{}", "A".repeat(3_000));
     for (label, item) in [
         (
@@ -11579,9 +11685,10 @@ async fn namespace_markup_at_the_ceilings_is_accepted() {
             format!(r#"<Item xmlns:p="{max_uri}">Widget</Item>"#),
         ),
         (
-            "256 attributes",
+            "64 attributes",
             format!("<Item{max_attributes}>Widget</Item>"),
         ),
+        ("128 namespace declarations", at_declaration_ceiling),
         (
             "oversized text in a comment",
             format!(r#"<Item><!-- <x xmlns:p="{long_uri}"/> -->Widget</Item>"#),
@@ -11600,7 +11707,8 @@ async fn namespace_markup_at_the_ceilings_is_accepted() {
 }
 
 /// Canonical attribute order compares namespace URIs. Two near-equal URIs
-/// (inside the length ceiling) shared by many attributes on nested elements
+/// (inside the length ceiling) shared by at-ceiling attribute sets on nested
+/// elements
 /// fit the byte budget, but the bytes the sort examines are charged to the
 /// namespace-resolution allowance and refused; ordinary URIs are unaffected.
 #[test]
@@ -11608,17 +11716,22 @@ fn canonical_attribute_ordering_work_is_charged() {
     fn nested_attribute_fixture(uri_p: &str, uri_q: &str) -> String {
         let mut open = String::new();
         let mut close = String::new();
-        for element in 0..10 {
+        for element in 0..80 {
             open.push_str(&format!("<e{element}"));
-            for index in 0..250 {
+            for index in 0..64 {
                 let prefix = if index % 2 == 0 { "p" } else { "q" };
                 open.push_str(&format!(" {prefix}:a{index:03}=\"\""));
             }
             open.push('>');
             close.insert_str(0, &format!("</e{element}>"));
         }
+        // Filler outside `SignedInfo` raises the byte budget (2 × envelope)
+        // without lifting the namespace allowance off its floor, so the fixture
+        // fits the byte budget by a wide margin and only the sort charge can
+        // refuse it.
+        let filler = "x".repeat(40_000);
         format!(
-            "<root xmlns:p=\"{uri_p}\" xmlns:q=\"{uri_q}\"><SignedInfo>{open}{close}</SignedInfo></root>"
+            "<root xmlns:p=\"{uri_p}\" xmlns:q=\"{uri_q}\"><!--{filler}--><SignedInfo>{open}{close}</SignedInfo></root>"
         )
     }
 
@@ -11638,7 +11751,7 @@ fn canonical_attribute_ordering_work_is_charged() {
     let first_q = canonical.find(" q:a001").expect("q attribute rendered");
     let last_p = canonical
         .find("<e1")
-        .and_then(|end| canonical[..end].rfind(" p:a248"))
+        .and_then(|end| canonical[..end].rfind(" p:a062"))
         .expect("p attribute rendered");
     assert!(last_p < first_q, "{canonical}");
 }

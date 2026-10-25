@@ -449,24 +449,62 @@ const NAMESPACE_SCAN_BUDGET_MULTIPLIER: usize = 32;
 /// room.
 const MIN_NAMESPACE_SCAN_BUDGET: usize = 4_194_304;
 
-/// Hard ceilings on governed-envelope markup that namespace processing scales
-/// with, enforced over the raw envelope before it is parsed (see
+/// Ceilings on governed-envelope markup that namespace processing scales with,
+/// enforced over the raw envelope before it is parsed (see
 /// [`screen_raw_namespace_markup`]).
 ///
-/// Every namespace prefix, namespace URI, and attribute name is
-/// caller-chosen, and the parser's own duplicate-attribute check and every
-/// later canonicalization step (prefix resolution, rendered-binding equality,
-/// canonical attribute ordering) compare them. Per-step accounting bounds what
-/// canonicalization does; these ceilings bound the input itself, so no single
-/// comparison is long and no single element carries enough attributes to
-/// square. Real WS-Security / SOAP / SAML namespace URIs are well under 200
-/// bytes and elements carry a handful of attributes.
+/// Every namespace prefix, namespace URI, and attribute name is caller-chosen,
+/// and both the parser and canonicalization compare them. Canonicalization is
+/// charged step by step (`WorkBudget`); the parser is not, so its work is
+/// bounded here, over the raw bytes, by per-item ceilings AND document-wide
+/// aggregates. Per-item ceilings alone are not enough: a declaration is paid
+/// for once on an ancestor and inherited by every descendant, so per-element
+/// parser work can grow with (attributes × URI length) while that element's
+/// own input stays a few bytes per attribute.
+///
+/// roxmltree 0.21.2 does three kinds of comparison work per start tag, and the
+/// screen bounds each:
+///
+/// - **Duplicate-attribute check** — every attribute is compared with every
+///   earlier attribute of the same tag by expanded name, namespace URI first:
+///   at most `n²` comparisons of local names, of which only prefixed pairs read
+///   a URI (`p²` comparisons of up to the longest URI declared so far). The
+///   tag's own namespace declarations are likewise checked pairwise by prefix
+///   (`d²` comparisons). The screen charges
+///   `n² × longest name + p² × longest URI + d² × longest prefix` per tag.
+/// - **Prefix resolution** — each prefixed attribute and a prefixed element
+///   name scans the in-scope declarations (at most every declaration seen so
+///   far) comparing prefixes: charged `declarations so far × prefix length`.
+/// - Both charges accumulate into one allowance of
+///   [`RAW_MARKUP_WORK_MULTIPLIER`] × envelope length (floor
+///   [`MIN_RAW_MARKUP_WORK`]): at the default 10 MiB body ceiling that is at
+///   most ~3.4 × 10⁸ compared bytes, the same order as one pass of the
+///   canonicalization budgets.
+/// - **Inherited-scope resolution** — an element that declares namespaces
+///   re-tests each inherited binding against the bindings collected so far,
+///   ≤ D² prefix comparisons for D = [`MAX_DOCUMENT_NAMESPACE_DECLARATIONS`],
+///   and at most D elements declare anything. That is ≤ D³ ≈ 2.1 × 10⁶
+///   comparisons of ≤ [`MAX_NAMESPACE_PREFIX_DECLARATION_BYTES`]-byte names,
+///   ≈ 1.5 × 10⁸ bytes worst case for the whole document, independent of its
+///   size, so it needs no running charge.
+///
+/// Real WS-Security / SOAP / SAML envelopes declare well under 50 namespaces,
+/// with URIs under 200 bytes, prefixes under 20 bytes, and a handful of
+/// attributes per element, so ordinary messages use a small fraction of each.
 const MAX_NAMESPACE_URI_BYTES: usize = 2_048;
-/// Ceiling on any attribute name, which includes every `xmlns:prefix`
-/// declaration and therefore every namespace prefix in use.
-const MAX_ATTRIBUTE_NAME_BYTES: usize = 256;
+/// Ceiling on any attribute name.
+const MAX_ATTRIBUTE_NAME_BYTES: usize = 128;
+/// Ceiling on a namespace declaration's attribute name (`xmlns:` plus the
+/// prefix), and so on every prefix in use.
+const MAX_NAMESPACE_PREFIX_DECLARATION_BYTES: usize = 70;
 /// Ceiling on attributes (namespace declarations included) per start tag.
-const MAX_ATTRIBUTES_PER_ELEMENT: usize = 256;
+const MAX_ATTRIBUTES_PER_ELEMENT: usize = 64;
+/// Ceiling on namespace declarations across the whole envelope.
+const MAX_DOCUMENT_NAMESPACE_DECLARATIONS: usize = 128;
+/// Raw-markup comparison allowance multiplier, applied to the envelope length.
+const RAW_MARKUP_WORK_MULTIPLIER: usize = 32;
+/// Floor for the raw-markup comparison allowance.
+const MIN_RAW_MARKUP_WORK: usize = 1_048_576;
 
 /// Bounds for MTOM/XOP (`multipart/related`) unpacking. The gateway only ever
 /// walks part *headers* looking for the SOAP root part; attachment payloads are
@@ -7448,26 +7486,34 @@ enum RawMarkupScreen {
     Unframed,
 }
 
-/// Screen every start tag in the raw envelope against
-/// [`MAX_ATTRIBUTES_PER_ELEMENT`] attributes, [`MAX_ATTRIBUTE_NAME_BYTES`] per
-/// attribute name, and — for an `xmlns` / `xmlns:prefix` declaration —
-/// [`MAX_NAMESPACE_URI_BYTES`] of declared URI.
+/// Screen every start tag in the raw envelope against the per-item ceilings
+/// and the document-wide aggregates documented on
+/// [`MAX_NAMESPACE_URI_BYTES`]: attributes per tag, attribute-name, prefix, and
+/// URI length, total namespace declarations, and the accumulated parser
+/// comparison work.
 ///
 /// One linear pass that recognizes start tags exactly as the id scan does
 /// (comments, CDATA, processing instructions, and declarations are skipped as
 /// non-element spans; attribute values are quote-aware). Lengths are raw
 /// bytes, which can only over-state a value that uses character references, so
-/// the ceiling is conservative.
+/// every ceiling is conservative. The longest URI is a running maximum over
+/// every declaration seen so far, which over-states any one tag's in-scope set.
 ///
 /// A construct the scan cannot frame is [`RawMarkupScreen::Unframed`], never
 /// "within bounds". The bytes are not well-formed XML, but the parser only
 /// discovers that at end of input — after it has tokenized, and checked for
 /// duplicates, every attribute and namespace declaration of an unterminated
-/// tag. Letting such a tag through would hand the parser exactly the
-/// unbounded tag the ceilings exist to refuse. Well-formed XML always frames:
-/// `<` cannot appear unescaped in character data or attribute values, so every
-/// `<` this scan meets opens markup the parser would also see.
+/// tag. Well-formed XML always frames: `<` cannot appear unescaped in character
+/// data or attribute values, so every `<` this scan meets opens markup the
+/// parser would also see.
 fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
+    let allowance = xml
+        .len()
+        .saturating_mul(RAW_MARKUP_WORK_MULTIPLIER)
+        .max(MIN_RAW_MARKUP_WORK);
+    let mut work = 0usize;
+    let mut declarations = 0usize;
+    let mut longest_uri = 0usize;
     let mut search_from = 0usize;
     while let Some(rel) = xml.get(search_from..).and_then(|rest| rest.find('<')) {
         let tag_start = search_from + rel;
@@ -7499,15 +7545,67 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
         let Some(tag) = xml.get(tag_start + 1..tag_start + tag_end_rel) else {
             return RawMarkupScreen::Unframed;
         };
+
         let mut attributes = 0usize;
+        let mut prefixed = 0usize;
+        let mut declared = 0usize;
+        let mut longest_name = 0usize;
+        let mut longest_prefix = 0usize;
+        let mut resolution_work = 0usize;
         let exceeded = scan_tag_attributes(tag, |name, value| {
             attributes += 1;
-            let declares_namespace = name == "xmlns" || name.starts_with("xmlns:");
-            attributes > MAX_ATTRIBUTES_PER_ELEMENT
-                || name.len() > MAX_ATTRIBUTE_NAME_BYTES
-                || (declares_namespace && value.len() > MAX_NAMESPACE_URI_BYTES)
+            if attributes > MAX_ATTRIBUTES_PER_ELEMENT || name.len() > MAX_ATTRIBUTE_NAME_BYTES {
+                return true;
+            }
+            if name == "xmlns" || name.starts_with("xmlns:") {
+                declared += 1;
+                declarations += 1;
+                if declarations > MAX_DOCUMENT_NAMESPACE_DECLARATIONS
+                    || name.len() > MAX_NAMESPACE_PREFIX_DECLARATION_BYTES
+                    || value.len() > MAX_NAMESPACE_URI_BYTES
+                {
+                    return true;
+                }
+                longest_uri = longest_uri.max(value.len());
+                longest_prefix = longest_prefix.max(name.len());
+                return false;
+            }
+            longest_name = longest_name.max(name.len());
+            if let Some((prefix, _)) = name.split_once(':') {
+                prefixed += 1;
+                resolution_work = resolution_work
+                    .saturating_add(declarations.max(1).saturating_mul(prefix.len().max(1)));
+            }
+            false
         });
         if exceeded {
+            return RawMarkupScreen::Exceeded;
+        }
+
+        // A prefixed element name is resolved against the same in-scope set.
+        if let Some((prefix, _)) =
+            extract_full_tag_name_from_tag(tag).and_then(|qname| qname.split_once(':'))
+        {
+            resolution_work = resolution_work
+                .saturating_add(declarations.max(1).saturating_mul(prefix.len().max(1)));
+        }
+        let regular = attributes.saturating_sub(declared);
+        let tag_work = regular
+            .saturating_mul(regular)
+            .saturating_mul(longest_name.max(1))
+            .saturating_add(
+                prefixed
+                    .saturating_mul(prefixed)
+                    .saturating_mul(longest_uri.max(1)),
+            )
+            .saturating_add(
+                declared
+                    .saturating_mul(declared)
+                    .saturating_mul(longest_prefix.max(1)),
+            )
+            .saturating_add(resolution_work);
+        work = work.saturating_add(tag_work);
+        if work > allowance {
             return RawMarkupScreen::Exceeded;
         }
         search_from = tag_start + tag_end_rel + 1;

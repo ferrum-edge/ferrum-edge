@@ -422,9 +422,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ordering (the sort's examined bytes are charged) cannot multiply
     canonicalization CPU on `SignedInfo` before the signature is checked.
   - **Fixed raw markup ceilings on governed envelopes**, enforced before the
-    XML parser runs: at most 256 attributes per start tag (namespace
-    declarations included), 256-byte attribute names / namespace prefixes,
-    and 2048-byte namespace URIs. Larger markup is refused with `400`
+    XML parser runs: at most 64 attributes per start tag (namespace
+    declarations included), 128-byte attribute names, 70-byte namespace
+    declaration names, 2048-byte namespace URIs, and 128 namespace
+    declarations per envelope, plus a document-wide allowance on the parser's
+    duplicate-attribute and prefix-resolution comparison work (32 × envelope
+    length, floor 1 048 576). Larger markup is refused with `400`
     (`xml_namespace_bounds`), and a start tag, comment, CDATA section,
     processing instruction, or quote that never terminates is refused as
     malformed by the same pre-parse scan.
