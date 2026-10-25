@@ -1712,7 +1712,7 @@ Given all built-in plugins enabled, the execution order is:
 | 10 | `sse` | 250 | on_request_received, before_proxy, after_proxy, transform_response_body, response_stream_inspector |
 | 11 | `grpc_web` | 260 | on_request_received, before_proxy, transform_request_body, on_final_request_body, after_proxy, transform_response_body |
 | 12 | `grpc_method_router` | 275 | on_request_received, on_backend_path_resolved |
-| 13 | `spiffe_identity` | 940 | on_request_received, on_stream_connect |
+| 13 | `spiffe_identity` | 940 | on_request_received, before_proxy, on_stream_connect |
 | 14 | `mtls_auth` | 950 | authenticate, on_stream_connect |
 | 15 | `jwks_auth` | 1000 | authenticate, before_proxy |
 | 16 | `oauth2_introspection` | 1050 | authenticate, before_proxy |

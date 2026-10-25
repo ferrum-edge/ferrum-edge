@@ -231,6 +231,23 @@ fn http_only_graphs_skip_post_write_policy_admission() {
         admission_lease: None,
     };
     assert!(associated_graph.requires_post_write_policy_admission());
+
+    // A `spiffe_identity` row can attach to a persisted non-terminating stream
+    // proxy, so its stream TLS-termination compatibility must be re-read after
+    // the write (spiffe_identity-MUSE-2).
+    let mut spiffe = plugin_config("ferrum", "pc-spiffe");
+    spiffe.plugin_name = "spiffe_identity".to_string();
+    spiffe.config = json!({});
+    let spiffe_plugins = vec![spiffe];
+    let spiffe_graph = AtomicBatchGraph {
+        namespace: "ferrum",
+        consumers: &[],
+        upstreams: &[],
+        proxies: &[],
+        plugin_configs: &spiffe_plugins,
+        admission_lease: None,
+    };
+    assert!(spiffe_graph.requires_post_write_policy_admission());
 }
 
 #[test]

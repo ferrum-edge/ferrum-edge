@@ -26204,7 +26204,7 @@ components:
     # are also accepted as operator-managed `plugin_configs` rows on non-mesh
     # gateways for standalone deployments, with the schema below.
     SpiffeIdentityConfig:
-      type: object
+      type: [object, "null"]
       description: |
         Plugin: spiffe_identity — Extracts the SPIFFE ID from the peer
         certificate's URI SAN and populates `ctx.peer_spiffe_id` /
@@ -26233,8 +26233,63 @@ components:
         `{"error":"invalid SPIFFE identity certificate"}` body as a malformed
         one. A pre-stamped kernel-attested or HBONE-asserted `peer_spiffe_id`
         carries no validity window and is not treated as certificate-bounded.
+
+        `null` and `{}` select the default extraction-only behavior: no
+        identity is required, every trust domain the listener's verifier
+        accepted is admitted, and nothing is forwarded to the backend. Every
+        field below is an opt-in tightening of that default.
+
+        Rejections never echo the peer certificate: a malformed SPIFFE URI SAN
+        is the fixed `403` `{"error":"invalid SPIFFE identity certificate"}`,
+        and its debug diagnostic names only a fixed reason, never the URI or
+        any credential its userinfo or query carried.
+
+        A proxy- or proxy-group-scoped instance on a stream proxy is refused at
+        admission unless that proxy sets `frontend_tls: true` and
+        `passthrough: false`, exactly as for `mtls_auth`. Global instances are
+        exempt and remain no-ops on plaintext listeners.
       additionalProperties: false
-      properties: {}
+      properties:
+        require_identity:
+          type: boolean
+          default: false
+          description: |
+            When true, a request or stream that reaches this plugin without a
+            usable SPIFFE identity (no client certificate, a certificate with
+            no SPIFFE URI SAN, or certificate DER that does not parse) is
+            refused with a fixed `403` `{"error":"SPIFFE identity required"}`.
+            A pre-stamped kernel-attested or HBONE-asserted identity counts as
+            present.
+        allowed_trust_domains:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          description: |
+            When set, only identities whose trust domain is listed are
+            admitted; any other identity — certificate-derived or pre-stamped —
+            is refused with a fixed `403`
+            `{"error":"SPIFFE trust domain not allowed"}`. Entries are bare
+            SPIFFE trust domains (SPIFFE-ID section 2.1 grammar, no
+            `spiffe://` scheme), matched exactly. Omit the field to admit every
+            trust domain; an explicit empty list is rejected.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 255
+            pattern: "^[a-z0-9._-]+$"
+        forward_identity:
+          type: boolean
+          default: false
+          description: |
+            When true, the admitted SPIFFE ID is forwarded to the backend in
+            the fixed gateway-owned request header `x-ferrum-peer-spiffe-id`
+            (HTTP family only). Every client-supplied copy — compared ASCII
+            case-insensitively with `_` read as `-` — is removed from the
+            initial header block before the gateway's value is set, including
+            on requests that carry no identity; client request-trailer copies
+            are dropped by the gateway's request-trailer boundary, which owns
+            the whole `x-ferrum-*` namespace.
 
     MeshAuthzPolicy:
       type: object

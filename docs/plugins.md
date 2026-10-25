@@ -2766,28 +2766,32 @@ Replay-authority Redis clients additionally prove the server will not evict a st
 
 ### `spiffe_identity`
 
-Extracts the SPIFFE ID from a trusted peer certificate's URI SAN and publishes it for downstream plugins. This is extraction-only: it is not an authentication plugin, does not map a Consumer, and does not reject a missing identity.
+Extracts the SPIFFE ID from a trusted peer certificate's URI SAN and publishes it for downstream plugins. By default it is extraction-only: it is not an authentication plugin, does not map a Consumer, and does not reject a missing identity. Three opt-in fields tighten that default for standalone gateways that terminate SPIFFE mTLS themselves.
 
 **Priority:** 940
-**Hooks:** `on_request_received`, `on_stream_connect`
+**Hooks:** `on_request_received`, `before_proxy` (only when `forward_identity` is set), `on_stream_connect`
 **Protocols:** HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, terminated TCP+TLS, and UDP+DTLS
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| *(none)* | — | `{}` | No configuration keys are admitted. `{}` and `null` are the only valid configs. |
+| `require_identity` | Boolean | `false` | Refuse a request or stream that reaches the plugin without a usable SPIFFE identity — no client certificate, a certificate with no SPIFFE URI SAN, or certificate DER that does not parse — with a fixed `403` `{"error":"SPIFFE identity required"}`. A pre-stamped kernel-attested or HBONE-asserted identity counts as present. |
+| `allowed_trust_domains` | String[] | *(any)* | Admit only identities whose trust domain is listed (exact match, bare trust domain without `spiffe://`, 1–64 unique entries). Any other identity, certificate-derived or pre-stamped, is refused with a fixed `403` `{"error":"SPIFFE trust domain not allowed"}`. Omit the field to admit every trust domain the listener's verifier accepts; an explicit empty list is rejected. |
+| `forward_identity` | Boolean | `false` | HTTP family only: forward the admitted SPIFFE ID to the backend in the fixed gateway-owned request header `x-ferrum-peer-spiffe-id`. Every client-supplied copy (ASCII case-insensitive, `_` read as `-`) is removed from the initial header block first, including on requests that carry no identity, so the backend never sees a client-chosen value. Client request-trailer copies are dropped by the gateway's request-trailer boundary, which owns the whole `x-ferrum-*` namespace on every H1/H2/H3 forwarding path. The name is fixed (as Envoy's `x-forwarded-client-cert` is) precisely so that late boundary can own it. |
 
-**Admission:** Config must be a JSON object with no properties, or `null`. Any property is rejected (`spiffe_identity: no configuration fields are supported`). Arrays, strings, numbers, and booleans are rejected (`spiffe_identity: config must be an object`).
+`{}` and `null` select the default: nothing is required, every trust domain is admitted, and nothing is forwarded.
 
-**Prerequisite:** A frontend-terminated, trusted peer certificate (`tls_client_cert_der`). Plaintext connections and certificates that carry no SPIFFE URI SAN are no-ops. Stream proxies need TLS/DTLS termination the same way [`mtls_auth`](#mtls_auth) does.
+**Admission:** Config must be a JSON object or `null`. An unknown property is rejected (`spiffe_identity: unsupported configuration field; …`) without echoing the key; arrays, strings, numbers, and booleans are rejected (`spiffe_identity: config must be an object`). Field errors name only the field (and the list index), never the rejected value. A proxy- or proxy-group-scoped instance attached to a stream proxy is refused unless that proxy sets `frontend_tls: true` and `passthrough: false` — the same rule as [`mtls_auth`](#mtls_auth) — because such a listener can never see a peer certificate and the plugin would otherwise silently publish no principal. Global instances (including the mesh-injected `__mesh_spiffe_identity`) are exempt and stay no-ops on plaintext listeners. The refusal runs on every admission and load path: Admin API resource writes, API-spec create/replace (`x-ferrum-plugins`), `POST /batch`, restore, file/database/CP loads, and data-plane snapshots.
+
+**Prerequisite:** A frontend-terminated, trusted peer certificate (`tls_client_cert_der`). Plaintext connections and certificates that carry no SPIFFE URI SAN are no-ops unless `require_identity` is set. Stream proxies need TLS/DTLS termination the same way [`mtls_auth`](#mtls_auth) does.
 
 **Outputs:**
 - HTTP family: `ctx.peer_spiffe_id`
 - Stream (TCP/UDP/DTLS): `peer_spiffe_id` metadata on `StreamConnectionContext`
 
 **Behavior:**
-- Pre-stamped identity wins. If `ctx.peer_spiffe_id` is already set (HTTP family) or stream metadata already contains `peer_spiffe_id` (for example a node-waypoint eBPF-attested pod identity), the plugin does not re-derive from the peer certificate.
-- Missing certificate, no SPIFFE URI SAN, or unparseable DER: continue without identity.
-- Multiple URI SANs, a malformed `spiffe://` URI, or a validity interval that cannot be represented as a coherent window: reject HTTP 403 with `{"error":"invalid SPIFFE identity certificate"}`.
+- Pre-stamped identity wins. If `ctx.peer_spiffe_id` is already set (HTTP family) or stream metadata already contains `peer_spiffe_id` (for example a node-waypoint eBPF-attested pod identity), the plugin does not re-derive from the peer certificate. Only `allowed_trust_domains` still applies to it.
+- Missing certificate, no SPIFFE URI SAN, or unparseable DER: continue without identity (or the fixed `403` under `require_identity`).
+- Multiple URI SANs, a malformed `spiffe://` URI, or a validity interval that cannot be represented as a coherent window: reject HTTP 403 with `{"error":"invalid SPIFFE identity certificate"}`. The debug diagnostic carries only a fixed reason (for example "SPIFFE URI SAN carries a query component"); it never includes the rejected URI, so a CA-signed certificate whose URI SAN embeds a credential in its userinfo or query cannot leak it into logs.
 - HTTP-family extraction is cached per mTLS connection so multiplexed requests parse the peer certificate at most once.
 
 **Trust-domain grammar.** The trust domain is admitted exactly as [SPIFFE-ID §2.1](https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md#21-trust-domain) defines it: non-empty, at most 255 bytes, lowercase, and composed only of `[a-z0-9.-_]`. That character set is the whole grammar, so a leading or trailing `.`, `-`, or `_` is legal and accepted. Everything the character set excludes — userinfo (`@`), a port (`:`), percent-encoding (`%`), IPv6 literals — is still rejected, as is anything above the SPIFFE ID's own 2048-byte total bound, a non-`spiffe` scheme, a query or fragment, a trailing slash, and empty or dot-only path segments.
@@ -2801,11 +2805,27 @@ Extracts the SPIFFE ID from a trusted peer certificate's URI SAN and publishes i
 - Only a **certificate-derived** identity carries this provenance. A pre-stamped kernel-attested (node-waypoint eBPF) or HBONE-asserted `peer_spiffe_id` has no leaf validity window and is deliberately not treated as certificate-bounded.
 - Because a TLS-terminating TCP listener carrying this plugin can admit such a principal, it stays on the buffered userspace path rather than the kernel-TLS `splice(2)` fast path, exactly as [`mtls_auth`](#mtls_auth) does. See [frontend_tls.md — Kernel TLS and the stream authorization deadline](frontend_tls.md#kernel-tls-and-the-stream-authorization-deadline).
 
+**Trust withdrawal on established mesh-inbound connections.** The per-request re-check above is temporal only. On a mesh inbound listener (Sidecar `:15006`, waypoint HTTP), withdrawing the peer's trust domain from the inbound SPIFFE bundle or publishing a CRL that revokes its leaf takes effect on every **new** handshake and, through the [HBONE Admission Fence](mesh.md#hbone-admission-fence), on every HBONE CONNECT and live tunnel — but an already-established ordinary inbound HTTP/1.1 keep-alive, HTTP/2, or HTTP/3 connection keeps admitting its cached principal until the leaf's `notAfter` or until the connection closes. Mesh inbound listeners are deliberately outside the generic frontend [client-trust retirement](frontend_tls.md#client-trust-generations-and-established-transport-retirement) domain. The exposure is bounded by the SVID lifetime, so keep issued SVID TTLs short (SPIRE's default is about one hour) when trust withdrawal must cut existing connections promptly.
+
+**HBONE inner reuse.** An instance with `require_identity` or `allowed_trust_domains` set does not advertise [HBONE inner application connection reuse](mesh.md#hbone-inner-application-connection-reuse): its admission verdict is a per-CONNECT decision no fence sweep re-issues, so a reload that tightens it withdraws reuse and forces a fresh CONNECT. The default configuration and `forward_identity` keep reuse.
+
 **Mesh injection:** Mesh mode auto-injects a global instance with reserved id `__mesh_spiffe_identity` and empty config `{}`. An operator-managed global `spiffe_identity` is an explicit override and suppresses that reserved instance, including under transparent inbound capture: capture force-injects only the reserved `__mesh_authz` instance beside an operator `mesh_authz` global, never `__mesh_spiffe_identity`. Standalone (non-mesh) gateways may attach the plugin like any other public plugin when they terminate mTLS/DTLS and want SPIFFE identity for [mesh authorization](mesh.md#authorization) or [`rate_limiting`](#rate_limiting) `limit_by: spiffe_identity`. See [mesh.md — SPIFFE Identity](mesh.md#spiffe-identity).
 
 ```yaml
 plugin_name: spiffe_identity
 config: {}
+```
+
+Standalone gateway that requires a peer SVID from one trust domain and forwards it to the backend:
+
+```yaml
+plugin_name: spiffe_identity
+scope: proxy
+proxy_id: payments-api
+config:
+  require_identity: true
+  allowed_trust_domains: ["prod.example.com"]
+  forward_identity: true
 ```
 
 ### `mtls_auth`

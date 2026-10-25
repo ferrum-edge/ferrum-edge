@@ -8218,6 +8218,71 @@ fn assert_component_validity(
     );
 }
 
+/// `SpiffeIdentityConfig` admits exactly what `SpiffeIdentity::new` admits for
+/// every shape the schema can express — including the documented `null`
+/// config (spiffe_identity-SOL-2).
+#[test]
+fn spiffe_identity_schema_matches_constructor_admission() {
+    use ferrum_edge::plugins::mesh::spiffe_identity::SpiffeIdentity;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let cases = [
+        (serde_json::Value::Null, true),
+        (json!({}), true),
+        (json!({"require_identity": true}), true),
+        (json!({"allowed_trust_domains": ["prod.example.com"]}), true),
+        (json!({"forward_identity": true}), true),
+        (
+            json!({
+                "require_identity": true,
+                "allowed_trust_domains": ["prod.example.com", "staging.example.com"],
+                "forward_identity": true
+            }),
+            true,
+        ),
+        (json!([]), false),
+        (json!("spiffe"), false),
+        (json!(1), false),
+        (json!(true), false),
+        (json!({"unexpected": true}), false),
+        (json!({"require_identity": "yes"}), false),
+        (json!({"allowed_trust_domains": []}), false),
+        (json!({"allowed_trust_domains": [1]}), false),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com", "prod.example.com"]}),
+            false,
+        ),
+        // Lexical trust-domain grammar the constructor enforces
+        // (PR #6871 review SOL-4).
+        (json!({"allowed_trust_domains": ["PROD.example"]}), false),
+        (
+            json!({"allowed_trust_domains": ["spiffe://prod.example.com"]}),
+            false,
+        ),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com:8443"]}),
+            false,
+        ),
+        (json!({"allowed_trust_domains": [""]}), false),
+        (json!({"allowed_trust_domains": ["a".repeat(256)]}), false),
+        (json!({"allowed_trust_domains": ["a".repeat(255)]}), true),
+        (json!({"allowed_trust_domains": ["_audit.example-1"]}), true),
+        (json!({"forward_identity": "x-spiffe-id"}), false),
+        (json!({"forward_identity": 7}), false),
+        (json!({"forward_header": "x-spiffe-id"}), false),
+    ];
+    for (instance, expected_valid) in cases {
+        assert_component_validity(&spec, "SpiffeIdentityConfig", &instance, expected_valid);
+        assert_eq!(
+            SpiffeIdentity::new(&instance).is_ok(),
+            expected_valid,
+            "constructor/schema admission mismatch for {instance}"
+        );
+    }
+}
+
 #[test]
 fn stdout_logging_schema_rejects_unknown_outer_and_filter_keys() {
     let spec: serde_json::Value =

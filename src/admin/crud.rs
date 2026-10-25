@@ -555,6 +555,12 @@ fn validate_candidate_plugin_graph(
     crate::plugin_cache::validate_plugin_composition_candidate(candidate, http_client)
         .map_err(|error| AfterValidateError::BadRequest(vec![error]))?;
     crate::plugin_cache::validate_tcp_connection_throttle_attachments(candidate)
+        .map_err(AfterValidateError::BadRequest)?;
+    // Shared by direct plugin/proxy writes, API-spec create/replace, proxy
+    // deletes, and restore, so an API-spec bundle cannot attach a scoped
+    // `spiffe_identity` to a non-terminating stream listener either.
+    candidate
+        .validate_scoped_spiffe_identity_stream_compatibility()
         .map_err(AfterValidateError::BadRequest)
 }
 
@@ -1835,6 +1841,44 @@ pub(crate) async fn current_transaction_log_schema_graph_is_valid(
     }
 }
 
+/// Refuse a `spiffe_identity` write that would leave a proxy/proxy-group-scoped
+/// instance on a stream proxy terminating no TLS/DTLS, where it could never
+/// see a peer certificate.
+async fn validate_spiffe_identity_candidate(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    plugin: &PluginConfig,
+) -> Result<(), AfterValidateError> {
+    let mut config = db
+        .load_namespace_snapshot(namespace)
+        .await
+        .map_err(AfterValidateError::Db)?;
+    if let Some(existing) = config
+        .plugin_configs
+        .iter_mut()
+        .find(|item| item.id == plugin.id)
+    {
+        *existing = plugin.clone();
+    } else {
+        config.plugin_configs.push(plugin.clone());
+    }
+    // The Admin API appends a proxy-scoped write's association in the same
+    // transaction (issue #4611), so judge the graph that write produces.
+    for proxy in plugin_attach_proxy_candidates(db, namespace, plugin)
+        .await
+        .map_err(AfterValidateError::Db)?
+    {
+        if let Some(existing) = config.proxies.iter_mut().find(|item| item.id == proxy.id) {
+            *existing = proxy;
+        } else {
+            config.proxies.push(proxy);
+        }
+    }
+    config
+        .validate_mtls_auth_compatibility()
+        .map_err(AfterValidateError::BadRequest)
+}
+
 async fn validate_mtls_auth_candidate(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -1869,9 +1913,14 @@ async fn validate_mtls_auth_candidate(
             .plugin_configs
             .retain(|plugin| plugin.id != removed_plugin_id);
     }
-    if proxy
-        .is_some_and(|candidate| !config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()))
-    {
+    let checks_mtls_auth = proxy
+        .is_none_or(|candidate| config.has_effective_mtls_auth_for_proxy(candidate.id.as_str()));
+    // A scoped `spiffe_identity` shares the stream TLS-termination requirement
+    // (but not the credential-uniqueness one) with `mtls_auth`.
+    let checks_spiffe_identity = proxy.is_some_and(|candidate| {
+        config.has_scoped_spiffe_identity_for_proxy(candidate.id.as_str())
+    });
+    if !checks_mtls_auth && !checks_spiffe_identity {
         return Ok(());
     }
     let compatibility_errors = config
@@ -1880,6 +1929,9 @@ async fn validate_mtls_auth_candidate(
         .unwrap_or_default();
     if !compatibility_errors.is_empty() {
         return Err(AfterValidateError::BadRequest(compatibility_errors));
+    }
+    if !checks_mtls_auth {
+        return Ok(());
     }
     config
         .validate_unique_mtls_credentials()
@@ -4971,6 +5023,12 @@ impl AdminResource for PluginConfig {
             || existing.is_some_and(|plugin| plugin.plugin_name == "mtls_auth")
         {
             validate_mtls_auth_candidate(db, namespace, None, Some(resource), None).await?;
+        } else if resource.plugin_name == "spiffe_identity" && resource.scope != PluginScope::Global
+        {
+            // Stream TLS-termination compatibility only; a `spiffe_identity`
+            // write never changes mTLS credential uniqueness, and a global
+            // instance is exempt (it no-ops on plaintext listeners).
+            validate_spiffe_identity_candidate(db, namespace, resource).await?;
         }
         // Validate the graph the write will produce, including the proxy
         // association it attaches (issue #4611).

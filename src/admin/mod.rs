@@ -9171,10 +9171,17 @@ fn batch_needs_consumer_snapshot(batch: &RestorePayload) -> bool {
 }
 
 fn batch_needs_mtls_plugin_compat(batch: &RestorePayload) -> bool {
+    // A scoped `spiffe_identity` row shares `mtls_auth`'s stream
+    // TLS-termination requirement, so it is screened against the persisted
+    // stream proxies it can attach to even when the batch carries none.
     batch
         .proxies
         .iter()
         .any(|proxy| proxy.dispatch_kind.is_stream())
+        || batch
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.plugin_name == "spiffe_identity")
 }
 
 fn batch_submits_plugin_graph(batch: &RestorePayload) -> bool {

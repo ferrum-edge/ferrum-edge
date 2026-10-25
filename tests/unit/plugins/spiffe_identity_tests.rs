@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
-    request_credential_deadline_at, request_credential_deadline_remaining,
+    has_verified_peer_spiffe_identity_for_test, request_credential_deadline_at,
+    request_credential_deadline_remaining,
 };
 use ferrum_edge::config::types::{BackendScheme, Consumer};
 use ferrum_edge::consumer_index::ConsumerIndex;
@@ -15,7 +16,9 @@ use ferrum_edge::proxy::auth_lifetime::{
 use rcgen::string::Ia5String;
 use rcgen::{CertificateParams, KeyPair, SanType};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn build_cert(spiffe_uri: Option<&str>, dns: Option<&str>) -> Vec<u8> {
     let mut params = CertificateParams::default();
@@ -79,10 +82,13 @@ fn test_spiffe_identity_trait_contract() {
 
 #[test]
 fn test_spiffe_identity_rejects_config_fields() {
-    let err = SpiffeIdentity::new(&json!({"unexpected": true}))
-        .err()
-        .expect("unknown config must be rejected");
-    assert!(err.contains("no configuration fields are supported"));
+    let err = SpiffeIdentity::new(&json!({"unexpected_canary_key": true}))
+        .expect_err("unknown config must be rejected");
+    assert!(err.contains("unsupported configuration field"), "{err}");
+    assert!(
+        !err.contains("unexpected_canary_key"),
+        "the rejected key must not be echoed: {err}"
+    );
 }
 
 #[tokio::test]
@@ -690,4 +696,478 @@ fn test_spiffe_identity_keeps_a_tcp_tls_listener_off_the_ktls_handoff() {
         false,
         &[plugin]
     ));
+}
+
+// ── Material-free invalid-SVID diagnostics (spiffe_identity-SOL-1) ─────────
+
+const QUERY_CANARY: &str = "REVIEW_CANARY_SECRET_9f3c";
+const USERINFO_CANARY: &str = "CANARY_PASSWORD_77";
+
+/// URI SANs that are CA-signable X.509 URIs but invalid SPIFFE IDs, each
+/// carrying a credential the diagnostic must never repeat.
+fn credential_bearing_uri_sans() -> [String; 3] {
+    [
+        format!("spiffe://corp.example/ns/payments/sa/client?token={QUERY_CANARY}"),
+        format!("spiffe://alice:{USERINFO_CANARY}@corp.example/ns/payments/sa/client"),
+        format!("spiffe://corp.example/ns/payments/sa/client#{QUERY_CANARY}"),
+    ]
+}
+
+fn assert_diagnostics_are_material_free(logs: &str, uri: &str) {
+    assert!(
+        logs.contains("rejecting peer cert with invalid SPIFFE URI SAN"),
+        "the rejection must still be diagnosed at debug: {logs:?}"
+    );
+    super::plugin_utils::assert_no_secrets(
+        logs,
+        "invalid SPIFFE URI SAN rejection",
+        &[QUERY_CANARY, USERINFO_CANARY, uri, "corp.example"],
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_http_invalid_spiffe_uri_san_diagnostic_never_echoes_the_uri() {
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    for uri in credential_bearing_uri_sans() {
+        let cert_der = Arc::new(build_cert_with_uri_sans(&[uri.as_str()]));
+        let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+
+        let (logs, guard) = super::plugin_utils::capture_debug_logs();
+        // Repeated requests share the connection cache: the cached outcome
+        // must be as material-free as the first derivation.
+        for _ in 0..2 {
+            let mut ctx = ctx_on_connection(&cert_der, &cache);
+            assert_invalid_svid_reject(plugin.on_request_received(&mut ctx).await);
+            assert!(ctx.peer_spiffe_id.is_none());
+        }
+        let mut uncached =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        uncached.tls_client_cert_der = Some(Arc::clone(&cert_der));
+        assert_invalid_svid_reject(plugin.on_request_received(&mut uncached).await);
+        drop(guard);
+
+        assert_diagnostics_are_material_free(&logs.contents(), &uri);
+        let cached = format!("{cache:?}");
+        assert!(
+            !cached.contains(QUERY_CANARY) && !cached.contains(USERINFO_CANARY),
+            "the connection cache must not retain the rejected URI: {cached}"
+        );
+        assert_eq!(cache.extraction_count(), 1);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_invalid_spiffe_uri_san_diagnostic_never_echoes_the_uri() {
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    for uri in credential_bearing_uri_sans() {
+        let mut ctx = empty_stream_ctx(Some(build_cert_with_uri_sans(&[uri.as_str()])));
+
+        let (logs, guard) = super::plugin_utils::capture_debug_logs();
+        assert_invalid_svid_reject(plugin.on_stream_connect(&mut ctx).await);
+        drop(guard);
+
+        assert!(ctx.metadata.is_none());
+        assert_diagnostics_are_material_free(&logs.contents(), &uri);
+    }
+}
+
+// ── Peerless classifier agrees with admission (spiffe_identity-MUSE-3) ─────
+
+#[tokio::test(start_paused = true)]
+async fn test_verified_peer_helper_refuses_once_the_captured_deadline_elapses() {
+    let cert_der = Arc::new(svid_with_validity(LIFETIME_SVID, -60, 300));
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+
+    let mut first = ctx_on_connection(&cert_der, &cache);
+    assert!(matches!(
+        plugin.on_request_received(&mut first).await,
+        PluginResult::Continue
+    ));
+    assert!(has_verified_peer_spiffe_identity_for_test(
+        &ctx_on_connection(&cert_der, &cache)
+    ));
+
+    // The paused tokio clock moves the monotonic deadline captured at first
+    // admission into the past while the wall clock still reads inside the
+    // leaf's window — exactly a wall-clock rollback.
+    tokio::time::advance(Duration::from_secs(600)).await;
+
+    let mut second = ctx_on_connection(&cert_der, &cache);
+    assert_invalid_svid_reject(plugin.on_request_received(&mut second).await);
+    assert!(
+        !has_verified_peer_spiffe_identity_for_test(&ctx_on_connection(&cert_der, &cache)),
+        "the peerless classifier must refuse exactly what admission refuses"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_verified_peer_helper_admits_before_any_deadline_is_captured() {
+    // No admission yet on this connection: the slot is empty, so only the
+    // wall-clock window decides — the two functions agree trivially.
+    let cert_der = Arc::new(svid_with_validity(LIFETIME_SVID, -60, 300));
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    tokio::time::advance(Duration::from_secs(600)).await;
+    assert!(has_verified_peer_spiffe_identity_for_test(
+        &ctx_on_connection(&cert_der, &cache)
+    ));
+}
+
+// ── Opt-in admission policy (spiffe_identity-MUSE-4) ───────────────────────
+
+fn assert_fixed_reject(result: PluginResult, expected_error: &str) {
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+                json!({ "error": expected_error })
+            );
+            assert!(!body.contains("spiffe://"), "no identity is echoed: {body}");
+        }
+        other => panic!("expected a fixed 403 {expected_error:?}, got {other:?}"),
+    }
+}
+
+const IDENTITY_REQUIRED: &str = "SPIFFE identity required";
+const TRUST_DOMAIN_NOT_ALLOWED: &str = "SPIFFE trust domain not allowed";
+
+#[test]
+fn test_admission_policy_config_is_validated_without_echoing_values() {
+    let too_many: Vec<String> = (0..65).map(|i| format!("td{i}.example")).collect();
+    for (config, needle) in [
+        (
+            json!({"require_identity": "yes"}),
+            "`require_identity` must be a boolean",
+        ),
+        (
+            json!({"allowed_trust_domains": "prod.example.com"}),
+            "must be an array",
+        ),
+        (
+            json!({"allowed_trust_domains": []}),
+            "at least one trust domain",
+        ),
+        (
+            json!({"allowed_trust_domains": [7]}),
+            "`allowed_trust_domains[0]` must be a string",
+        ),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com", "prod.example.com"]}),
+            "`allowed_trust_domains[1]` duplicates",
+        ),
+        (
+            json!({"allowed_trust_domains": ["spiffe://CANARY.example"]}),
+            "`allowed_trust_domains[0]` is not a valid SPIFFE trust domain",
+        ),
+        (
+            json!({ "allowed_trust_domains": too_many }),
+            "at most 64 entries",
+        ),
+    ] {
+        let err = SpiffeIdentity::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("{config} must be rejected"));
+        assert!(err.contains(needle), "{config}: {err}");
+        assert!(
+            !err.contains("CANARY"),
+            "the rejected value must not be echoed: {err}"
+        );
+    }
+
+    for valid in [
+        json!(null),
+        json!({}),
+        json!({"require_identity": false}),
+        json!({"require_identity": true}),
+        json!({"allowed_trust_domains": ["prod.example.com", "_audit.example"]}),
+        json!({"forward_identity": true}),
+    ] {
+        assert!(
+            SpiffeIdentity::new(&valid).is_ok(),
+            "{valid} must be accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_require_identity_refuses_every_identity_absence_on_http() {
+    let plugin = SpiffeIdentity::new(&json!({"require_identity": true})).unwrap();
+    for cert in [
+        None,
+        Some(build_cert(None, Some("client.example.com"))),
+        Some(vec![0u8, 1, 2, 3]),
+    ] {
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.tls_client_cert_der = cert.map(Arc::new);
+        assert_fixed_reject(
+            plugin.on_request_received(&mut ctx).await,
+            IDENTITY_REQUIRED,
+        );
+        assert!(ctx.peer_spiffe_id.is_none());
+    }
+
+    let mut admitted =
+        RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    admitted.tls_client_cert_der = Some(Arc::new(build_cert(Some(LIFETIME_SVID), None)));
+    assert!(matches!(
+        plugin.on_request_received(&mut admitted).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        admitted.peer_spiffe_id.as_ref().map(SpiffeId::as_str),
+        Some(LIFETIME_SVID)
+    );
+
+    // A pre-stamped identity counts as present.
+    let mut pre_stamped =
+        RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    pre_stamped.peer_spiffe_id = Some(SpiffeId::new(LIFETIME_SVID).unwrap());
+    assert!(matches!(
+        plugin.on_request_received(&mut pre_stamped).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_require_identity_refuses_every_identity_absence_on_streams() {
+    let plugin = SpiffeIdentity::new(&json!({"require_identity": true})).unwrap();
+    for cert in [
+        None,
+        Some(build_cert(None, Some("client.example.com"))),
+        Some(vec![0u8, 1, 2, 3]),
+    ] {
+        let mut ctx = empty_stream_ctx(cert);
+        assert_fixed_reject(plugin.on_stream_connect(&mut ctx).await, IDENTITY_REQUIRED);
+        assert!(!ctx.is_authenticated());
+    }
+
+    let mut admitted = empty_stream_ctx(Some(build_cert(Some(LIFETIME_SVID), None)));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut admitted).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_default_config_still_admits_identity_absence() {
+    // Defaults are byte-identical to the extraction-only behavior.
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut stream = empty_stream_ctx(None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut stream).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_allowed_trust_domains_gate_certificate_identities_on_http() {
+    let plugin =
+        SpiffeIdentity::new(&json!({"allowed_trust_domains": ["prod.example.com"]})).unwrap();
+
+    let mut listed =
+        RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    listed.tls_client_cert_der = Some(Arc::new(build_cert(Some(LIFETIME_SVID), None)));
+    assert!(matches!(
+        plugin.on_request_received(&mut listed).await,
+        PluginResult::Continue
+    ));
+    assert!(listed.has_certificate_spiffe_principal());
+
+    let cert_der = Arc::new(build_cert(
+        Some("spiffe://other.example.com/ns/api/sa/default"),
+        None,
+    ));
+    let cache = Arc::new(SpiffeIdentityConnectionCache::new());
+    for _ in 0..2 {
+        let mut unlisted = ctx_on_connection(&cert_der, &cache);
+        assert_fixed_reject(
+            plugin.on_request_received(&mut unlisted).await,
+            TRUST_DOMAIN_NOT_ALLOWED,
+        );
+        assert!(unlisted.peer_spiffe_id.is_none());
+        assert!(!request_is_authenticated(&unlisted));
+    }
+
+    // The policy applies to a pre-stamped identity too.
+    let mut pre_stamped =
+        RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    pre_stamped.peer_spiffe_id =
+        Some(SpiffeId::new("spiffe://other.example.com/ns/api/sa/default").unwrap());
+    assert_fixed_reject(
+        plugin.on_request_received(&mut pre_stamped).await,
+        TRUST_DOMAIN_NOT_ALLOWED,
+    );
+
+    // No identity at all is not a trust-domain question: it passes unless
+    // `require_identity` is also set.
+    let mut anonymous =
+        RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    assert!(matches!(
+        plugin.on_request_received(&mut anonymous).await,
+        PluginResult::Continue
+    ));
+}
+
+#[tokio::test]
+async fn test_allowed_trust_domains_gate_stream_identities() {
+    let plugin =
+        SpiffeIdentity::new(&json!({"allowed_trust_domains": ["prod.example.com"]})).unwrap();
+
+    let mut listed = empty_stream_ctx(Some(build_cert(Some(LIFETIME_SVID), None)));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut listed).await,
+        PluginResult::Continue
+    ));
+    assert!(listed.has_certificate_spiffe_principal());
+
+    let mut unlisted = empty_stream_ctx(Some(build_cert(
+        Some("spiffe://other.example.com/ns/tcp/sa/default"),
+        None,
+    )));
+    assert_fixed_reject(
+        plugin.on_stream_connect(&mut unlisted).await,
+        TRUST_DOMAIN_NOT_ALLOWED,
+    );
+    assert!(unlisted.metadata.is_none());
+    assert!(!unlisted.is_authenticated());
+
+    for (pre_stamped, admitted) in [
+        ("spiffe://prod.example.com/ns/attested/sa/default", true),
+        ("spiffe://other.example.com/ns/attested/sa/default", false),
+        ("not a spiffe id", false),
+    ] {
+        let mut ctx = empty_stream_ctx(None);
+        ctx.insert_metadata("peer_spiffe_id".to_string(), pre_stamped.to_string());
+        let result = plugin.on_stream_connect(&mut ctx).await;
+        if admitted {
+            assert!(matches!(result, PluginResult::Continue), "{pre_stamped}");
+        } else {
+            assert_fixed_reject(result, TRUST_DOMAIN_NOT_ALLOWED);
+        }
+    }
+}
+
+#[test]
+fn test_admission_policy_withdraws_hbone_inner_reuse() {
+    for (config, reusable) in [
+        (json!({}), true),
+        (json!({"forward_identity": true}), true),
+        (json!({"require_identity": false}), true),
+        (json!({"require_identity": true}), false),
+        (
+            json!({"allowed_trust_domains": ["prod.example.com"]}),
+            false,
+        ),
+    ] {
+        let plugin = SpiffeIdentity::new(&config).unwrap();
+        assert_eq!(plugin.allows_hbone_inner_reuse(), reusable, "{config}");
+    }
+}
+
+// ── Backend identity propagation (spiffe_identity-MUSE-5) ──────────────────
+
+const FORWARDED: &str = ferrum_edge::plugins::mesh::spiffe_identity::FORWARDED_IDENTITY_HEADER;
+
+#[test]
+fn test_forwarded_identity_header_is_gateway_owned_at_the_trailer_boundary() {
+    // PR #6871 review SOL-3: the fixed name sits in the `x-ferrum-*` namespace
+    // the shared request-trailer boundary owns.
+    assert_eq!(FORWARDED, "x-ferrum-peer-spiffe-id");
+}
+
+#[tokio::test]
+async fn test_forward_identity_replaces_every_client_copy_with_the_admitted_identity() {
+    let plugin = SpiffeIdentity::new(&json!({"forward_identity": true})).unwrap();
+    assert!(plugin.modifies_request_headers());
+
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.tls_client_cert_der = Some(Arc::new(build_cert(Some(LIFETIME_SVID), None)));
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert(
+        FORWARDED.to_string(),
+        "spiffe://attacker.example/ns/forged/sa/x".to_string(),
+    );
+    headers.insert("X_Ferrum_Peer_Spiffe_Id".to_string(), "forged".to_string());
+    headers.insert("accept".to_string(), "*/*".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    assert_eq!(
+        headers.get(FORWARDED).map(String::as_str),
+        Some(LIFETIME_SVID)
+    );
+    assert!(!headers.contains_key("X_Ferrum_Peer_Spiffe_Id"));
+    assert_eq!(headers.get("accept").map(String::as_str), Some("*/*"));
+    assert_eq!(headers.len(), 2);
+}
+
+#[tokio::test]
+async fn test_forward_identity_strips_client_copies_without_an_identity() {
+    let plugin = SpiffeIdentity::new(&json!({"forward_identity": true})).unwrap();
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert(
+        "X-FERRUM-PEER-SPIFFE-ID".to_string(),
+        "spiffe://attacker.example/ns/forged/sa/x".to_string(),
+    );
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        headers.is_empty(),
+        "a client-chosen identity must never reach the backend: {headers:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_default_config_forwards_nothing() {
+    let plugin = SpiffeIdentity::new(&json!({})).unwrap();
+    assert!(!plugin.modifies_request_headers());
+    let mut ctx = RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+    ctx.tls_client_cert_der = Some(Arc::new(build_cert(Some(LIFETIME_SVID), None)));
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("x-spiffe-id".to_string(), "client-value".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        headers.get("x-spiffe-id").map(String::as_str),
+        Some("client-value"),
+        "without forward_identity the plugin must not touch backend headers"
+    );
+    assert!(!headers.contains_key(FORWARDED));
+}
+
+#[test]
+fn test_forward_identity_must_be_a_boolean() {
+    for invalid in [json!("x-spiffe-id"), json!(1), json!(null), json!([])] {
+        let err = SpiffeIdentity::new(&json!({ "forward_identity": invalid }))
+            .err()
+            .unwrap_or_else(|| panic!("{invalid} must be refused"));
+        assert!(
+            err.contains("`forward_identity` must be a boolean"),
+            "{err}"
+        );
+    }
+    // The configurable header name of the first revision is gone.
+    assert!(SpiffeIdentity::new(&json!({"forward_header": "x-spiffe-id"})).is_err());
 }
