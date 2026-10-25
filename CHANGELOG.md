@@ -157,28 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **A `mesh_route_dispatch` rule without an authority rewrite no longer undoes
-  another plugin's `Host`.** Every matching non-authority rule restored the
-  client's original `Host`, discarding a `Host` an earlier plugin had set.
-  It now undoes only a rewrite an earlier dispatch instance made, restoring the
-  value that was live just before it.
-- **`mesh_route_dispatch` publishes route-local TLS and retry policy without a
-  per-request deep clone.** Per-rule `backend_tls` / `retry` are compiled into
-  shared `Arc`s at load; `RequestContext::route_override_resolved_tls` is now
-  `Option<Arc<BackendTlsConfig>>` and `route_override_retry` is
-  `Option<Option<Arc<RetryConfig>>>` (custom plugins that set them wrap the
-  value in `Arc::new`).
-- **`mesh_route_dispatch` match observability and Istio match parity.** A rule
-  may carry an optional `name`; every match publishes
-  `mesh_route_dispatch.rule_index` and (when named)
-  `mesh_route_dispatch.rule_name` transaction-log metadata, withdrawn on a
-  NodeWaypoint authorization veto. `match.without_headers` (Istio
-  `withoutHeaders`), `StringMatch` `prefix` / `regex` values in
-  `match.query_params`, and `match.port` (Istio `port`, from the original
-  destination or frontend listener port only) are new predicates, and the
-  VirtualService translator now maps them instead of terminating those routes
-  with `request_termination`. Istio `sourceLabels` / `gateways` / `scheme`
-  HTTP predicates remain unsupported.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
@@ -449,35 +427,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`mesh_route_dispatch` route request-header policy can no longer be
-  skipped by chain order.** Proxy core applied a matched rule's
-  `request_transform` only after the last eligible `request_transformer`; a
-  `priority_override` placing that consumer before the dispatcher (priority
-  2995) finalized an empty slot, and the list the dispatcher published
-  afterwards was silently dropped, so a route rule stripping
-  `X-Internal-Role` forwarded the client's value. The list is now applied
-  after the later of the last eligible consumer and the end of the whole
-  dispatch block (so a superseded rule's credential is never applied to the
-  winning backend), on HTTP/1.1, HTTP/2, and HTTP/3 alike. WebSocket
-  handshakes, whose chain never runs the HTTP/gRPC-only transformers, now get
-  the matched rule's request and response route lists through a cache-owned
-  consumer stand-in instead of silently forwarding a stripped header. A chain whose dispatch
-  rules carry `request_transform` / `response_transform` with no configured
-  `request_transformer` / `response_transformer` is now refused at
-  plugin-cache construction and admin admission instead of silently dropping
-  the lists (an RTDS-disabled transformer still counts as configured).
-- **`mesh_route_dispatch` operands are admitted only in URL grammar.**
-  `redirect.uri` must be an absolute path with a canonical path component and
-  no fragment (a relative `uri: new` used to redirect `app.example.com` to the
-  different host `app.example.comnew`), and may carry its own query only
-  without `match_prefix`; every byte, query included, must be printable ASCII
-  (a raw NUL/DEL/control byte used to drop `Location` from the 3xx).
-  `rewrite.authority` and `redirect.authority` must be
-  exactly `host` or `host:port` (a DNS name or IPv4 literal, or a bracketed
-  IPv6 literal); a path, query, fragment, or userinfo is rejected at load. The
-  Istio VirtualService translator applies the same checks and fails the
-  resource closed (`FerrumAccepted=False`) rather than emitting a plugin that
-  fails construction.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
