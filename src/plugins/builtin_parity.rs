@@ -588,7 +588,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ai_semantic_cache",
         classification: BuiltinPluginClassification::Public,
         priority: 4057,
-        active_phases: "on_final_request_body_with_context, after_proxy, on_final_response_body",
+        active_phases: "on_final_request_body_with_context, after_proxy, on_final_response_body, on_response_committed",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only exact/semantic cache for LLM JSON request and response bodies",
     },
