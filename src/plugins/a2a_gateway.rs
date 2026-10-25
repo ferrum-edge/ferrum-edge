@@ -1501,18 +1501,20 @@ impl A2aGateway {
     /// proven to keep the admitted class (a valid but oversized
     /// `agent/getCard` envelope would otherwise be dispatched under non-card
     /// response handling), so it is refused at the detection ceiling rather
-    /// than parsed without bound. A parseable body this classifier simply does
-    /// not recognize (for example an unknown method) is not covered: that is
-    /// not an Agent Card or streaming operation the response phase acts on.
-    ///
-    /// Returns `Some(true)` for an oversized body, `Some(false)` for one that is
-    /// no longer a JSON document, and `None` when nothing needs refusing.
+    /// than parsed without bound. A JSON-RPC BATCH the classifier could not
+    /// classify is refused too: one unrecognized member makes the whole batch
+    /// unclassified, which would otherwise hide a recognized Agent Card or
+    /// streaming member beside it (PR6841-SOL-4). An admitted batch was fully
+    /// classified at arrival, so only a changed batch reaches this. A
+    /// parseable singleton this classifier simply does not recognize (for
+    /// example an unknown method) is not covered: it carries no Agent Card or
+    /// streaming operation the response phase acts on.
     fn final_jsonrpc_class_unprovable(
         &self,
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
-    ) -> Option<bool> {
+    ) -> Option<FinalClassUnprovable> {
         if !(self.discovery.rewrite_agent_card_urls || self.observability.emit_metadata) {
             return None;
         }
@@ -1531,13 +1533,32 @@ impl A2aGateway {
         if self.detection.max_request_body_size > 0
             && body.len() as u64 > self.detection.max_request_body_size
         {
-            return Some(true);
+            return Some(FinalClassUnprovable::Oversized);
         }
         // Bounded by the detection ceiling just checked; parses without
         // building a tree.
-        serde_json::from_slice::<serde::de::IgnoredAny>(body)
-            .is_err()
-            .then_some(false)
+        if serde_json::from_slice::<serde::de::IgnoredAny>(body).is_err() {
+            return Some(FinalClassUnprovable::Unreadable);
+        }
+        let is_array = body
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| *byte == b'[');
+        if !is_array {
+            return None;
+        }
+        // Only reached for a changed, unclassifiable batch; the tree is bounded
+        // by the same ceiling and is needed to answer every request member.
+        let ids = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .map(collect_batch_response_ids)
+            })
+            .unwrap_or(BatchResponseIds::NoneAnswerable);
+        Some(FinalClassUnprovable::UnclassifiedBatch(ids))
     }
 }
 
@@ -2136,7 +2157,7 @@ impl Plugin for A2aGateway {
             return PluginResult::Continue;
         }
         let Some(detection) = self.detect_jsonrpc_body(ctx, headers, body) else {
-            if let Some(oversized) = self.final_jsonrpc_class_unprovable(ctx, headers, body) {
+            if let Some(unprovable) = self.final_jsonrpc_class_unprovable(ctx, headers, body) {
                 if self.observability.emit_metadata {
                     ctx.metadata
                         .insert("a2a.policy_decision".to_string(), "deny".to_string());
@@ -2149,11 +2170,19 @@ impl Plugin for A2aGateway {
                     body_size = body.len(),
                     "Refusing admitted A2A request whose final body can no longer be classified"
                 );
-                let detection = unclassified_jsonrpc_detection(oversized);
-                return if oversized {
-                    oversized_jsonrpc_response(&detection)
-                } else {
-                    reclassified_jsonrpc_response(&detection)
+                return match unprovable {
+                    FinalClassUnprovable::Oversized => {
+                        oversized_jsonrpc_response(&unclassified_jsonrpc_detection(true))
+                    }
+                    FinalClassUnprovable::Unreadable => {
+                        reclassified_jsonrpc_response(&unclassified_jsonrpc_detection(false))
+                    }
+                    FinalClassUnprovable::UnclassifiedBatch(ids) => {
+                        let mut detection = unclassified_jsonrpc_detection(false);
+                        detection.jsonrpc_batch_response = true;
+                        detection.jsonrpc_batch_ids = Some(ids);
+                        reclassified_jsonrpc_response(&detection)
+                    }
                 };
             }
             return PluginResult::Continue;
@@ -2995,6 +3024,18 @@ fn reclassified_jsonrpc_response(detection: &A2aDetection) -> PluginResult {
         .to_string(),
         headers: HashMap::from([("content-type".to_string(), "application/json".to_string())]),
     }
+}
+
+/// Why an admitted JSON-RPC request's finalized body cannot be classified.
+/// See `A2aGateway::final_jsonrpc_class_unprovable`.
+enum FinalClassUnprovable {
+    /// Over `detection.max_request_body_size`; never parsed.
+    Oversized,
+    /// No longer a JSON document.
+    Unreadable,
+    /// A batch with at least one member the classifier does not recognize,
+    /// carrying the member ids the refusal must answer.
+    UnclassifiedBatch(BatchResponseIds),
 }
 
 /// The detection a JSON-RPC body over `detection.max_request_body_size`

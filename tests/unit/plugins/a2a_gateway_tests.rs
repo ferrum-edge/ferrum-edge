@@ -7150,3 +7150,44 @@ fn a2a_presentation_digest_moved_past_the_v1_domain() {
         "replays stored under the pre-fix card semantics must be refused"
     );
 }
+
+// ── PR #6841 fix round 2 ──────────────────────────────────────────────────
+
+/// PR6841-SOL-4: one unrecognized member leaves a whole final batch
+/// unclassified, which must not hide a card member introduced beside it.
+#[tokio::test]
+async fn changed_final_batch_hiding_a_card_behind_an_unknown_member_is_refused() {
+    let gateway = plugin(json!({"observability": {"emit_metadata": false}}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "t1"}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tasks/get", "params": {"id": "t2"}}
+    ]));
+    assert!(matches!(
+        gateway.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let dispatched = json!([
+        {"jsonrpc": "2.0", "id": 1, "method": "agent/getCard"},
+        {"jsonrpc": "2.0", "id": 2, "method": "vendor/ping"}
+    ])
+    .to_string();
+    let PluginResult::Reject {
+        status_code, body, ..
+    } = gateway
+        .on_final_request_body_with_context(&mut ctx, &headers, dispatched.as_bytes())
+        .await
+    else {
+        panic!("an unclassifiable changed batch must be refused before dispatch");
+    };
+    assert_eq!(status_code, 200);
+    let body: Value = serde_json::from_str(&body).expect("refusal is JSON");
+    let responses = body
+        .as_array()
+        .expect("a batch refusal answers with an array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 2);
+    for response in responses {
+        assert_eq!(response["error"]["code"], -32001);
+    }
+}

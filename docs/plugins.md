@@ -9021,7 +9021,9 @@ admitted and refreshes `a2a.method` (and `a2a.task_id`, which is removed when
 the new envelope carries no task hint). A finalized body of an admitted
 JSON-RPC request that can no longer be classified at all — grown past
 `detection.max_request_body_size` (HTTP `413`, JSON-RPC `-32013`) or no longer a
-JSON document (`-32001`, `a2a.error: operation_class_unprovable`) — is refused
+JSON document (`-32001`, `a2a.error: operation_class_unprovable`), or a batch
+with a member the classifier does not recognize (every request member answered
+`-32001`) — is refused
 the same way while card rewriting or metadata is enabled; raise
 `detection.max_request_body_size` (or set it to `0`) if transforms legitimately
 grow bodies past it. A finalized body byte-identical to the one
