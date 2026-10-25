@@ -176,6 +176,7 @@ mod node_waypoint_udp_identity_tests;
 mod node_waypoint_udp_reply_source_tests;
 mod node_waypoint_udp_steering_tests;
 mod observability_delivery_tests;
+mod otel_tracing_propagation_allocation_tests;
 mod overload_tests;
 mod owned_shell_tests;
 mod per_port_load_balancer_tests;

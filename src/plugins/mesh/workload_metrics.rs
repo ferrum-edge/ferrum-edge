@@ -692,11 +692,20 @@ impl WorkloadMetrics {
         self.insert_common_metadata(&mut ctx.metadata);
         self.apply_telemetry_metadata_with_probe(&mut ctx.metadata, headers, probe);
         let cel_stamp_needs = effective_metric_tag_cel_stamp_needs(&ctx.metadata);
-        if self.should_ensure_http_trace_context(&ctx.metadata, probe) {
+        // When `otel_tracing` established the gateway SERVER span it owns the
+        // request's trace identity and its trust decision: re-deriving here
+        // would re-parent that span, and importing the wire `tracestate`
+        // would resurrect state `otel_tracing` dropped as untrusted.
+        if self.should_ensure_http_trace_context(&ctx.metadata, probe)
+            && !trace_owned_by_otel_tracing(ctx)
+        {
             if !probe.has_valid_traceparent() {
                 import_b3_trace_metadata(&mut ctx.metadata, probe);
             }
             ensure_trace_metadata(&mut ctx.metadata, headers);
+            ctx.claim_gateway_trace_owner(
+                crate::plugins::otel_tracing::GatewayTraceOwner::WorkloadMetrics,
+            );
             if let Some(tracestate) = probe.tracestate {
                 ctx.metadata
                     .insert(TRACESTATE_HEADER.to_string(), tracestate.to_string());
@@ -881,6 +890,15 @@ impl WorkloadMetrics {
         if !self.trace_context_enabled() {
             return false;
         }
+        // `otel_tracing` owns this request's SERVER span: the backend map's
+        // `traceparent` is that span, not a replacement parent, and no early
+        // provenance markers were recorded for it.
+        if trace_owned_by_otel_tracing(ctx) {
+            ctx.metadata.remove(CAPTURED_TRACEPARENT_METADATA);
+            ctx.metadata.remove(CAPTURED_B3_METADATA);
+            ctx.metadata.remove(CAPTURED_TRACESTATE_METADATA);
+            return false;
+        }
         // `on_request_received` imports inbound context early so authorization
         // rejects remain observable. For accepted requests, request_transformer
         // runs before this hook and its final header policy is authoritative.
@@ -896,8 +914,19 @@ impl WorkloadMetrics {
         let final_b3_context = !final_traceparent && has_b3_trace_context(headers);
         let final_b3_sampling = !final_traceparent && b3_sampling_decision(headers).is_some();
         let final_trace_signal = final_traceparent || final_b3_context || final_b3_sampling;
+        // A final `traceparent` that is exactly the gateway SERVER span this
+        // request already established (a sibling tracing plugin, or an earlier
+        // instance, injected it) is this gateway's own context, not a new
+        // parent. Re-deriving from it would mint a second SERVER span
+        // parented under the first, which no exporter reports.
+        let final_is_gateway_context = final_traceparent
+            && header_value(headers, TRACEPARENT_HEADER).is_some_and(|value| {
+                ctx.metadata
+                    .get(TRACEPARENT_HEADER)
+                    .is_some_and(|own| own == value)
+            });
 
-        if final_trace_signal {
+        if final_trace_signal && !final_is_gateway_context {
             clear_http_trace_metadata(&mut ctx.metadata);
         }
 
@@ -2754,6 +2783,12 @@ fn existing_sampling_decision<MS: std::hash::BuildHasher>(
         .and_then(|value| traceparent_sampling_decision(value))
         .or_else(|| probe.traceparent.and_then(traceparent_sampling_decision))
         .or_else(|| probe.b3_sampling_decision())
+}
+
+/// Whether the standalone `otel_tracing` plugin established this request's
+/// gateway SERVER span (see [`crate::plugins::otel_tracing::GatewayTraceOwner`]).
+fn trace_owned_by_otel_tracing(ctx: &RequestContext) -> bool {
+    ctx.gateway_trace_owner() == Some(crate::plugins::otel_tracing::GatewayTraceOwner::OtelTracing)
 }
 
 fn clear_http_trace_metadata<MS: std::hash::BuildHasher>(

@@ -23326,7 +23326,11 @@ components:
           description: >-
             Custom HTTP headers sent with OTLP exports (values treated as secrets).
             Field names must be HTTP tokens and values must be legal HTTP header
-            values; both are rejected at construction otherwise.
+            values; both are rejected at construction otherwise. Names are
+            case-insensitive: two keys differing only in case are rejected, as are
+            the exporter-managed Content-Type, Content-Length, Content-Encoding,
+            Transfer-Encoding, and Host, and Authorization when `authorization` is
+            set.
         authorization:
           type: string
           minLength: 1
@@ -23423,6 +23427,16 @@ components:
           type: boolean
           default: true
           description: Include bounded url.path attribute (never used as span name)
+        compression:
+          type: string
+          pattern: '^\s*([Nn][Oo][Nn][Ee]|[Gg][Zz][Ii][Pp])\s*$'
+          default: none
+          description: >-
+            Export body compression. Canonical values are none and gzip; the value
+            is trimmed and matched case-insensitively. gzip sends each OTLP/HTTP
+            JSON batch with Content-Encoding gzip; when the compressed copy cannot
+            be reserved under the process observability byte ceiling the batch is
+            sent uncompressed.
 
     MtlsAuthConfig:
       type: [object, "null"]

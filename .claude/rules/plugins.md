@@ -120,8 +120,14 @@ paths:
   rows. Its Prometheus counters and top-level status totals are process-lifetime;
   instance diagnostics are generation-local. Pending per-event ownership spans
   retired workers, but a process crash cannot flush or account for lost memory.
+- Exception: `otel_tracing` admits at most one effective instance per proxy
+  after merge: the gateway SERVER span identity, sampling decision, and
+  attempt recorder are single request slots. When it and a trace-enabled
+  `workload_metrics` share a request, the first to establish the SERVER span
+  owns it (`RequestContext::gateway_trace_owner`, typed, never metadata) and
+  the other reuses it rather than re-deriving or importing wire `tracestate`.
 - Exception: `load_testing` admits at most one effective instance per proxy
-  after merge. It and both chargeback plugins are enforced by
+  after merge. It, `otel_tracing`, and both chargeback plugins are enforced by
   `exclusive_effective_instance_errors` in `src/plugin_cache.rs`, applied to the
   merged per-proxy chain in both the full-build and incremental-rebuild paths.
 - Stateful protections are owned by a **stable policy identity**

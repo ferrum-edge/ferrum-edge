@@ -115,7 +115,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "otel_tracing",
         classification: BuiltinPluginClassification::Public,
         priority: 25,
-        active_phases: "on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect",
+        active_phases: "on_request_received, on_stream_connect, before_proxy, after_proxy, apply_websocket_handshake_response_headers, log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Tracing for all protocols",
     },

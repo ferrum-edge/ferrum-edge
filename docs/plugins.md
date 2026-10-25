@@ -29,7 +29,7 @@ For execution order, protocol support matrix, and design rationale, see [plugin_
 Admin writes and file/database/control-plane admission validate the same effective
 plugin chains as full cache construction and incremental reloads. Scope merging,
 global shadowing and priority ordering happen before checking CORS/mesh-dispatch
-contiguity, exclusive `load_testing`/`api_chargeback` instances, the aggregate
+contiguity, exclusive `load_testing`/`api_chargeback`/`otel_tracing` instances, the aggregate
 `workload_metrics` tag-plan budget, and global Prometheus/BPF registry ownership.
 A violating admin candidate returns `400` before either its plugin row or proxy
 association is persisted. Valid multi-instance configurations remain supported.
@@ -2460,6 +2460,8 @@ in per-event or snapshot export.
 
 W3C Trace Context propagation and OTLP/HTTP JSON span export. Runs at priority 25 (earliest plugin) to capture accurate request timing.
 
+At most one `otel_tracing` instance may be effective on a proxy after global/proxy/proxy_group merge: the gateway `SERVER` span identity, its sampling decision, and the per-attempt `CLIENT` span recorder are single per-request slots, so a second instance would overwrite the first's decisions and orphan its spans. Two proxy-scoped (or two global) instances on one proxy are rejected at admission; a proxy-scoped instance still replaces a global one. To send spans to two collectors, export once and fan out from an OpenTelemetry Collector.
+
 This plugin has no exporter selector: it always exports OTLP. Zipkin, Datadog, and Lightstep span export is configured through mesh Telemetry providers on [`workload_metrics`](#workload_metrics) — see [Mesh Observability](mesh.md#observability).
 
 **Priority:** 25
@@ -2472,7 +2474,9 @@ Supports two modes:
 
 `trace_context_trust` defaults to `untrusted` (fail-closed). Untrusted ingress never adopts or exports caller-chosen trace identity; Ferrum creates a fresh root and discards the inbound IDs and companion state. Set `trusted` only for internal/mesh listeners that should parent under a valid W3C `traceparent`.
 
-Wire parsing follows W3C Trace Context: lowercase hex only, version-`00` exact field count, forward-compatible higher versions, outgoing version always `00`, and `tracestate` is dropped whenever the parent is invalid or untrusted. Before backend dispatch, every case-insensitive caller-supplied `traceparent`/`tracestate` field is removed and only the trusted or newly generated canonical context is inserted. When generation is disabled, rejected caller context is stripped rather than passed through unchanged.
+Wire parsing follows W3C Trace Context: lowercase hex only, version-`00` exact field count, forward-compatible higher versions, outgoing version always `00`, and `tracestate` is dropped whenever the parent is invalid or untrusted. A trusted parent's `tracestate` is forwarded only when it is a valid W3C list — at most 32 `key=value` members under the W3C key/value grammar, no duplicate keys, and at most 8 KiB; an invalid `tracestate` is dropped while its `traceparent` is still honored. Before backend dispatch, every case-insensitive caller-supplied `traceparent`/`tracestate` field is removed and only the trusted or newly generated canonical context is inserted. When generation is disabled, rejected caller context is stripped rather than passed through unchanged.
+
+When `otel_tracing` and a trace-enabled [`workload_metrics`](#workload_metrics) instance run on the same request, whichever establishes the gateway `SERVER` span first owns it (at default priorities, `otel_tracing`). The other plugin reuses that span's trace ID, span ID, and `traceparent` rather than deriving a new span from it, and `workload_metrics` does not import the wire `tracestate` into a span `otel_tracing` owns. The exported `SERVER` span, every attempt `CLIENT` span, the backend's `traceparent`, and the client echo therefore name the same span.
 
 Sampling is parent-based for trusted parents (`sampled=0` suppresses export while still propagating flags). Root traces use `root_sampling` (`always_on` by default, or `always_off` / `ratio` with `root_sampling_ratio`). `root_sampling_ratio` is accepted only when `root_sampling=ratio`; setting it with any other mode is rejected.
 
@@ -2486,7 +2490,7 @@ Terminal outcomes set OTLP `ERROR` for HTTP ≥500, nonzero gRPC status, body/st
 
 With an `endpoint` configured, every sampled request also exports one `CLIENT` span per backend attempt, retries included, as a child of the gateway `SERVER` span. A request that needed three attempts therefore exports four spans; size `buffer_capacity` / `buffer_max_bytes` for that. Attempt spans share the plugin's export queue, its byte budget, and `max_attribute_bytes`.
 
-Each attempt dispatches its own `traceparent`, naming the attempt's span with the request's trace ID and sampled flag, so the backend's `SERVER` span nests under the attempt that reached it. `tracestate` is forwarded unchanged. The `traceparent` echoed to the client still names the gateway `SERVER` span. Unsampled requests, propagation-only mode, and requests without `otel_tracing` dispatch exactly as before: the backend receives the gateway span's context and nothing extra is recorded.
+Each attempt dispatches its own `traceparent`, naming the attempt's span with the request's trace ID and sampled flag, so the backend's `SERVER` span nests under the attempt that reached it. `tracestate` is forwarded unchanged. The `traceparent` echoed to the client still names the gateway `SERVER` span, on ordinary responses and on successful WebSocket handshakes (H1 `101`, H2/H3 extended CONNECT `200`), where it replaces any backend-supplied copy. Unsampled requests, propagation-only mode, and requests without `otel_tracing` dispatch exactly as before: the backend receives the gateway span's context and nothing extra is recorded.
 
 Attempts are instrumented where the gateway records a per-attempt outcome:
 
@@ -2531,7 +2535,7 @@ With tracing absent, the request unsampled, or propagation-only mode, every atte
 | `root_sampling` | String | `always_on` | `always_on`, `always_off`, or `ratio` for locally created roots |
 | `root_sampling_ratio` | Number | _(required for ratio)_ | Fraction in `[0.0, 1.0]` when `root_sampling=ratio`; rejected if set with any other `root_sampling` mode |
 | `include_url_path` | Boolean | `true` | Include bounded `url.path` attribute |
-| `headers` | Object | `{}` | Custom HTTP headers sent with exports (values treated as secrets). Field names must be HTTP tokens and values must be legal HTTP header values |
+| `headers` | Object | `{}` | Custom HTTP headers sent with exports (values treated as secrets). Field names must be HTTP tokens and values must be legal HTTP header values. Names are case-insensitive, so two keys differing only in case are rejected; exporter-managed names (`Content-Type`, `Content-Length`, `Content-Encoding`, `Transfer-Encoding`, `Host`) are rejected, as is `Authorization` when `authorization` is set |
 | `authorization` | String | _(none)_ | `Authorization` header value for OTLP exports (secret). Rejected at construction — including in propagation-only mode — when it is not a legal HTTP header value |
 | `batch_size` | Integer | `50` | Spans per export batch (`1`–`10000`) |
 | `flush_interval_ms` | Integer | `5000` | Max delay before flushing a partial batch (`100`–`600000`) |
@@ -2540,10 +2544,11 @@ With tracing absent, the request unsampled, or propagation-only mode, every atte
 | `max_attribute_bytes` | Integer | `2048` | Max retained bytes (`64`–`16384`) per **request-derived** string attribute (consumer, user agent, route, namespace, addresses, `url.path`, mesh attributes). Configured `service_name` / `deployment_environment` are not bounded by it |
 | `max_retries` | Integer | `2` | Retry attempts on export failure (`0`–`10`) |
 | `retry_delay_ms` | Integer | `1000` | Base delay before the first retry (`0`–`60000`); later retries double it with ±25% jitter, capped at 60000 ms. A collector `Retry-After` overrides it for that attempt |
+| `compression` | String | `none` | `none` or `gzip`. With `gzip`, each OTLP/HTTP JSON batch is sent gzip-compressed with `Content-Encoding: gzip`. The compressed copy is charged to the process observability byte ceiling; if it cannot be reserved the batch is sent uncompressed and counted on `ferrum_observability_batch_materialization_fallbacks_total` |
 
 Unknown configuration keys, explicit `null` properties, empty configured strings, invalid types, and out-of-range numeric values are rejected, including exporter controls supplied while propagation-only mode is active. Configured strings are trimmed before use, so a whitespace-only value is rejected; `trace_context_trust` and `root_sampling` are accepted case-insensitively with surrounding whitespace trimmed. A rejected value's own content never reaches a diagnostic: configuration errors name the field and the expected JSON type, so a mis-templated credential cannot be echoed into validation or plugin-cache warnings.
 
-Export failures follow the OTLP/HTTP contract: only `429`, `502`, `503`, and `504` are retried, and every other non-success status discards the batch immediately instead of consuming the retry budget. A `Retry-After` header on a retryable response is honored in both its `delay-seconds` and HTTP-date forms; without one, the configured `retry_delay_ms` doubles per attempt with ±25% jitter. Every retry wait is capped at 60000 ms so one throttled batch cannot hold the shutdown drain open. OTLP partial-success responses are recognized (not retried); success bodies are read with a 64 KiB ceiling and collector messages are control-sanitized and capped at 512 bytes. Count/byte queue admission is atomic under concurrency, and overflow diagnostics are rate-limited with suppressed-event summaries. Exported spans include `ferrum.namespace`, gateway latency and terminal-outcome attributes, and role-correct address mapping; the Zipkin and Datadog payload builders behind those attributes are reached only through `workload_metrics` mesh Telemetry providers.
+Export failures follow the OTLP/HTTP contract: only `429`, `502`, `503`, and `504` are retried, and every other non-success status discards the batch immediately instead of consuming the retry budget. A `Retry-After` header on a retryable response is honored in both its `delay-seconds` and HTTP-date forms; without one, the configured `retry_delay_ms` doubles per attempt with ±25% jitter. Every retry wait is capped at 60000 ms so one throttled batch cannot hold the shutdown drain open. OTLP partial-success responses are recognized (not retried); success bodies are read with a 64 KiB ceiling and collector messages are control-sanitized and capped at 512 bytes. Count/byte queue admission is atomic under concurrency, and overflow diagnostics are rate-limited with suppressed-event summaries. Span accounting is published on `/metrics` under the fixed label `plugin="otel_tracing"`: `ferrum_plugin_log_sink_records_accepted_total` counts SERVER and attempt spans admitted to the export queue, and `ferrum_plugin_log_sink_records_dropped_total` counts spans lost with `reason` `queue_full`, `byte_budget`, `shutdown` (refused at admission), `batch_discard` (a non-retryable status, exhausted retries, or no HTTP client), or `sink_error` (spans an OTLP partial success rejected). Spans lost because a batch representation could not be materialized are counted on `ferrum_observability_batch_materialization_*`. Propagation-only mode exports nothing and builds no span. Exported spans include `ferrum.namespace`, gateway latency and terminal-outcome attributes, and role-correct address mapping; the Zipkin and Datadog payload builders behind those attributes are reached only through `workload_metrics` mesh Telemetry providers.
 
 ---
 

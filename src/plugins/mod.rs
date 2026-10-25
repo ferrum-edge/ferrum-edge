@@ -2646,6 +2646,12 @@ pub struct RequestContext {
     /// unless an exporting `otel_tracing` instance sampled this request. Not
     /// visible to plugins and not serialized.
     backend_attempt_trace: Option<Arc<crate::plugins::otel_tracing::BackendAttemptTrace>>,
+    /// The tracing plugin that established this request's gateway `SERVER`
+    /// span (`trace_id` / `span_id` / `traceparent` in `metadata`). First
+    /// claim wins; a sibling tracing plugin then reuses that identity instead
+    /// of re-deriving it. Typed so a plugin-written metadata value can neither
+    /// claim nor release it. Not serialized.
+    gateway_trace_owner: Option<crate::plugins::otel_tracing::GatewayTraceOwner>,
     /// Whether the gateway selected the health-neutral retained-response
     /// capacity terminal (`503` / gRPC `RESOURCE_EXHAUSTED`) or its deterministic
     /// JSON output-policy counterpart (`502`) for this request.
@@ -4048,6 +4054,28 @@ impl RequestContext {
         self.diagnostic_slot.is_some() || self.backend_attempt_trace.is_some()
     }
 
+    /// The tracing plugin that established this request's gateway `SERVER`
+    /// span, if one has.
+    pub fn gateway_trace_owner(&self) -> Option<crate::plugins::otel_tracing::GatewayTraceOwner> {
+        self.gateway_trace_owner
+    }
+
+    /// Record `owner` as the plugin that established this request's gateway
+    /// `SERVER` span unless another plugin already did. Returns whether
+    /// `owner` owns it after the call.
+    pub(crate) fn claim_gateway_trace_owner(
+        &mut self,
+        owner: crate::plugins::otel_tracing::GatewayTraceOwner,
+    ) -> bool {
+        match self.gateway_trace_owner {
+            Some(existing) => existing == owner,
+            None => {
+                self.gateway_trace_owner = Some(owner);
+                true
+            }
+        }
+    }
+
     /// Install (or clear) the `otel_tracing` per-attempt span recorder.
     pub(crate) fn set_backend_attempt_trace(
         &mut self,
@@ -4371,6 +4399,7 @@ impl RequestContext {
             backend_dispatch_state: BackendDispatchState::NotDispatched,
             diagnostic_slot: None,
             backend_attempt_trace: None,
+            gateway_trace_owner: None,
             gateway_capacity_response_selected: false,
             gateway_representation_response_selected: false,
             final_body_policy_terminal_replacement: false,
@@ -5900,6 +5929,7 @@ impl RequestContext {
             backend_dispatch_state: self.backend_dispatch_state,
             diagnostic_slot: self.diagnostic_slot.clone(),
             backend_attempt_trace: self.backend_attempt_trace.clone(),
+            gateway_trace_owner: self.gateway_trace_owner,
             gateway_capacity_response_selected: self.gateway_capacity_response_selected,
             gateway_representation_response_selected: self.gateway_representation_response_selected,
             final_body_policy_terminal_replacement: self.final_body_policy_terminal_replacement,

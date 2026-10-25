@@ -990,7 +990,9 @@ reject or perform I/O after the backend has accepted the session. Ferrum then
 strips connection/framing/WebSocket transport fields, adds the authoritative
 H1 Upgrade fields or Extended CONNECT response, preserves the verified backend
 subprotocol, and appends any gateway-owned sticky cookie. `correlation_id`
-uses this boundary to echo generated and preserved IDs consistently.
+uses this boundary to echo generated and preserved IDs consistently, and
+`otel_tracing` uses it to echo the gateway `SERVER` span's `traceparent`
+(replacing any backend-supplied copy).
 
 Plugins that opt into `on_ws_disconnect` receive exactly one terminal callback
 after both relay directions finish, including clean closes, typed errors, drain
@@ -1654,7 +1656,7 @@ Given all built-in plugins enabled, the execution order is:
 
 | # | Plugin | Priority | Active Phases |
 |---|--------|----------|---------------|
-| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
+| 1 | `otel_tracing` | 25 | on_request_received, on_stream_connect, before_proxy, after_proxy, apply_websocket_handshake_response_headers, log, on_stream_disconnect, on_ws_disconnect |
 | 2 | `correlation_id` | 50 | on_request_received, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect |
 | 3 | `cors` | 100 | on_request_received, after_proxy |
 | 4 | `request_termination` | 125 | on_request_received |
