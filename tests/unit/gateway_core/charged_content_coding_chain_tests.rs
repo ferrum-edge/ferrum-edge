@@ -13,6 +13,7 @@
 use std::io::Write;
 
 use ferrum_edge::_test_support::{
+    CHARGED_DECODE_ZSTD_SCRATCH_BYTES, CHARGED_DECODE_ZSTD_WINDOW_LOG_MAX,
     ChargedCodingChainOutcome, RESPONSE_BUFFER_RESERVATION_UNIT_BYTES as UNIT,
     RESPONSE_DECODE_BROTLI_SCRATCH_BYTES, RESPONSE_DECODE_GZIP_SCRATCH_BYTES,
     ResponseBufferBudgetProbe, decode_charged_coding_chain_in,
@@ -279,4 +280,132 @@ fn the_cumulative_ceiling_still_binds() {
 
     assert_eq!(outcome, ChargedCodingChainOutcome::TooLarge);
     assert_eq!(budget.available_bytes(), total);
+}
+
+fn zstd(data: &[u8]) -> Vec<u8> {
+    zstd::stream::encode_all(data, 3).expect("zstd encode")
+}
+
+/// A hand-built single-block zstd frame (RFC 8878 §3.1.1) carrying `b"a"` as a
+/// raw block, whose header declares a window of `1 << window_log` bytes with no
+/// content size. Building it by hand pins exactly which window the frame asks
+/// for, independent of libzstd's encoder parameter choices.
+fn zstd_frame_with_window_log(window_log: u32) -> Vec<u8> {
+    assert!((10..=41).contains(&window_log));
+    let exponent = u8::try_from(window_log - 10).expect("exponent fits a byte");
+    vec![
+        0x28,
+        0xb5,
+        0x2f,
+        0xfd,          // magic number
+        0x00,          // descriptor: no content size, not single-segment, no checksum
+        exponent << 3, // window descriptor: exponent, mantissa 0
+        0x09,
+        0x00,
+        0x00, // last block, raw, size 1
+        b'a',
+    ]
+}
+
+#[test]
+fn an_ordinary_zstd_upload_round_trips_and_releases_its_charge() {
+    let plaintext = document();
+    let budget = generous_budget();
+    let total = budget.available_bytes();
+
+    let outcome = decode(&budget, &["zstd"], &zstd(&plaintext));
+
+    assert_eq!(outcome, ChargedCodingChainOutcome::Decoded(plaintext));
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[test]
+fn zstd_stacks_with_the_other_codings_in_reverse_application_order() {
+    let plaintext = document();
+    let budget = generous_budget();
+    let encoded = gzip(&zstd(&plaintext));
+
+    let outcome = decode(&budget, &["zstd", "gzip"], &encoded);
+
+    assert_eq!(outcome, ChargedCodingChainOutcome::Decoded(plaintext));
+}
+
+#[test]
+fn zstd_trailing_bytes_and_second_frames_are_refused() {
+    let budget = generous_budget();
+    let total = budget.available_bytes();
+    for suffix in [vec![0], b"trailing bytes".to_vec(), zstd(b"second frame")] {
+        let mut encoded = zstd(&document());
+        encoded.extend_from_slice(&suffix);
+        assert_eq!(
+            decode(&budget, &["zstd"], &encoded),
+            ChargedCodingChainOutcome::Malformed
+        );
+        assert_eq!(budget.available_bytes(), total);
+    }
+}
+
+#[test]
+fn a_truncated_or_garbage_zstd_stream_is_malformed() {
+    let budget = generous_budget();
+    let encoded = zstd(&document());
+    for body in [
+        &encoded[..encoded.len() - 2],
+        b"\x28\xb5\x2f\xfdnot a frame".as_slice(),
+        b"not zstd at all".as_slice(),
+    ] {
+        assert_eq!(
+            decode(&budget, &["zstd"], body),
+            ChargedCodingChainOutcome::Malformed
+        );
+    }
+}
+
+#[test]
+fn a_zstd_window_above_the_rfc_9659_cap_is_refused_before_allocation() {
+    let budget = generous_budget();
+    let total = budget.available_bytes();
+
+    // Exactly at the 8 MB cap: decodes.
+    assert_eq!(
+        decode(
+            &budget,
+            &["zstd"],
+            &zstd_frame_with_window_log(CHARGED_DECODE_ZSTD_WINDOW_LOG_MAX)
+        ),
+        ChargedCodingChainOutcome::Decoded(b"a".to_vec())
+    );
+    // One step above it: a format error, not a 16 MiB allocation.
+    assert_eq!(
+        decode(
+            &budget,
+            &["zstd"],
+            &zstd_frame_with_window_log(CHARGED_DECODE_ZSTD_WINDOW_LOG_MAX + 1)
+        ),
+        ChargedCodingChainOutcome::Malformed
+    );
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[test]
+fn a_budget_that_cannot_cover_the_zstd_scratch_refuses_before_construction() {
+    let encoded = zstd(&document());
+    let budget = probe(blocks(CHARGED_DECODE_ZSTD_SCRATCH_BYTES) - 1);
+    let total = budget.available_bytes();
+
+    assert_eq!(
+        decode(&budget, &["zstd"], &encoded),
+        ChargedCodingChainOutcome::CapacityRefused
+    );
+    assert_eq!(budget.available_bytes(), total);
+}
+
+#[test]
+fn the_zstd_per_layer_ceiling_still_binds() {
+    let plaintext = vec![b'z'; 64 * 1024];
+    let budget = generous_budget();
+    assert_eq!(
+        decode_with(&budget, &["zstd"], &zstd(&plaintext), 1024, LIMIT, 0),
+        ChargedCodingChainOutcome::TooLarge
+    );
 }

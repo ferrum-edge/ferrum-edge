@@ -318,7 +318,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "mesh_authz",
         classification: BuiltinPluginClassification::Public,
         priority: 2075,
-        active_phases: "authorize, on_stream_connect",
+        active_phases: "authorize, before_proxy, after_proxy, apply_websocket_handshake_response_headers, on_stream_connect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Applies Layer 2 mesh policy using SPIFFE or HBONE identities",
     },

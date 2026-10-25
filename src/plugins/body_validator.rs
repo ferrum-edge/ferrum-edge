@@ -53,17 +53,20 @@
 //! disclosure.
 
 use async_trait::async_trait;
-use flate2::bufread::GzDecoder;
 use prost_reflect::{
-    Cardinality, DescriptorPool, DynamicMessage, MessageDescriptor, ReflectMessage, Syntax,
-    Value as ProtobufValue,
+    Cardinality, DescriptorPool, DynamicMessage, EnumDescriptor, Kind, MessageDescriptor,
+    ReflectMessage, Syntax, Value as ProtobufValue,
 };
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
+use crate::plugins::utils::log_sampling::warn_sampled;
+use crate::proxy::response_buffer_budget::{
+    self as response_budget, BudgetRef, ResponseBufferReservation,
+};
 use crate::util::json_dup_keys::{self, JsonScanMemo};
 
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
@@ -87,6 +90,11 @@ struct ProtobufMethodEntry {
 struct ProtobufTargets {
     default_request: bool,
     default_response: bool,
+    /// Every method path that has a `protobuf_method_messages` entry. An entry
+    /// is direction-authoritative: a direction it omits is NOT validated
+    /// against the default type, because a single-direction entry is how an
+    /// operator says "do not validate this method's other direction".
+    method_entries: HashSet<String>,
     method_requests: HashSet<String>,
     method_responses: HashSet<String>,
 }
@@ -101,12 +109,91 @@ impl ProtobufTargets {
     }
 
     fn request_applies(&self, grpc_path: &str) -> bool {
-        self.default_request || self.method_requests.contains(grpc_path)
+        if self.method_entries.contains(grpc_path) {
+            self.method_requests.contains(grpc_path)
+        } else {
+            self.default_request
+        }
     }
 
     fn response_applies(&self, grpc_path: &str) -> bool {
-        self.default_response || self.method_responses.contains(grpc_path)
+        if self.method_entries.contains(grpc_path) {
+            self.method_responses.contains(grpc_path)
+        } else {
+            self.default_response
+        }
     }
+}
+
+/// What a configured violation does to the exchange.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnforcementMode {
+    /// Reject the request (`400` / `415`) or the response (`502`).
+    Block,
+    /// Evaluate, record the would-be outcome in metadata, and always continue.
+    LogOnly,
+}
+
+/// Which upstream response statuses response validation applies to.
+///
+/// A response schema describes the operation's SUCCESS document. Judging a
+/// backend `404` / `422` / `500` error document against it used to replace the
+/// real status and error body with a gateway `502`, so the default scope is
+/// `2XX` only and operators opt other statuses in explicitly.
+#[derive(Clone)]
+struct ResponseStatusScope {
+    /// `classes[n]` selects every `nXX` status, `n` in `1..=5`.
+    classes: [bool; 6],
+    codes: Vec<u16>,
+}
+
+impl ResponseStatusScope {
+    fn success_only() -> Self {
+        let mut classes = [false; 6];
+        classes[2] = true;
+        Self {
+            classes,
+            codes: Vec::new(),
+        }
+    }
+
+    fn contains(&self, status: u16) -> bool {
+        let class = usize::from(status / 100);
+        self.classes.get(class).copied().unwrap_or(false) || self.codes.contains(&status)
+    }
+}
+
+/// Source of [`BodyValidator::instance_id`]. Process-unique and never
+/// persisted; it scopes this instance's private per-request state.
+static NEXT_BODY_VALIDATOR_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Why a protobuf representation did not validate.
+enum ProtobufFailure {
+    /// The bytes violate the descriptor, the framing, or an inspection bound.
+    Invalid(String),
+    /// The aggregate decode budget could not admit the working set. Nothing is
+    /// wrong with the bytes; the gateway is out of inspection capacity.
+    Capacity,
+}
+
+impl From<String> for ProtobufFailure {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+/// The outcome of one request-side evaluation, before the enforcement mode
+/// decides what it does to the exchange.
+enum RequestVerdict {
+    Pass,
+    Violation {
+        status: u16,
+        detail: String,
+    },
+    Capacity,
+    /// Log-only mode only: the representation carried a content coding no
+    /// gate decoded for this instance, so it could not be observed.
+    Uninspected,
 }
 
 #[derive(Default)]
@@ -172,7 +259,35 @@ pub const BODY_VALIDATOR_CONFIG_KEYS: &[&str] = &[
     "protobuf_method_messages",
     "protobuf_reject_unknown_fields",
     "grpc_max_decompressed_size_bytes",
+    "enforcement_mode",
+    "reject_unsupported_media_types",
+    "response_status_codes",
 ];
+
+/// Request/response metadata keys this plugin publishes when a configured rule
+/// finds a violation (or, in `log_only` mode, would have rejected). Values are
+/// fixed categories, a status code, and the same payload-free bounded
+/// diagnostic the client-visible `details` field carries.
+pub const BODY_VALIDATOR_REQUEST_OUTCOME_KEY: &str = "body_validator.request_outcome";
+pub const BODY_VALIDATOR_REQUEST_STATUS_KEY: &str = "body_validator.request_status";
+pub const BODY_VALIDATOR_REQUEST_DETAIL_KEY: &str = "body_validator.request_detail";
+pub const BODY_VALIDATOR_RESPONSE_OUTCOME_KEY: &str = "body_validator.response_outcome";
+pub const BODY_VALIDATOR_RESPONSE_STATUS_KEY: &str = "body_validator.response_status";
+pub const BODY_VALIDATOR_RESPONSE_DETAIL_KEY: &str = "body_validator.response_detail";
+
+/// Outcome value for a violation that rejected the exchange.
+const OUTCOME_REJECTED: &str = "rejected";
+/// Outcome value for a `log_only` violation that was allowed through.
+const OUTCOME_WOULD_REJECT: &str = "would_reject";
+/// Outcome value for a representation `log_only` mode could not observe (an
+/// undecoded content coding, or no inspection capacity).
+const OUTCOME_UNINSPECTED: &str = "uninspected";
+/// Outcome value for an inspection-capacity refusal in `block` mode.
+const OUTCOME_CAPACITY_REFUSED: &str = "capacity_refused";
+
+/// Fixed diagnostic for `reject_unsupported_media_types`.
+const UNSUPPORTED_MEDIA_TYPE_DETAIL: &str =
+    "Request media type is not one this validator is configured to inspect";
 
 /// Every key a single `protobuf_method_messages` entry accepts.
 pub const BODY_VALIDATOR_PROTOBUF_METHOD_KEYS: &[&str] = &["request", "response"];
@@ -210,8 +325,12 @@ pub struct BodyValidator {
     /// Reject XML whose entity definitions reference other general entities —
     /// the billion-laughs expansion signature.
     xml_reject_nested_entities: bool,
-    /// Content types to validate for requests (empty = validate all).
+    /// Content types to validate for requests. Never empty: an explicit empty
+    /// list is rejected at construction. Entries are exact essences or
+    /// `type/*+suffix` structured-suffix patterns.
     content_types: Vec<String>,
+    /// Refuse (`415`) a request body this instance has no configured rule for.
+    reject_unsupported_media_types: bool,
 
     // ── Response validation config ──
     /// Compiled JSON Schema for response body validation (if configured).
@@ -222,6 +341,8 @@ pub struct BodyValidator {
     response_required_xml_elements: Vec<RequiredXmlElement>,
     /// Content types to validate for responses.
     response_content_types: Vec<String>,
+    /// Upstream statuses response validation applies to (default `2XX`).
+    response_status_scope: ResponseStatusScope,
 
     // ── Protobuf validation config ──
     /// Descriptor pool loaded from the compiled `FileDescriptorSet` binary.
@@ -264,6 +385,12 @@ pub struct BodyValidator {
     has_xml_request_validation: bool,
     /// Whether XML response validation is active (response_validate_xml OR response_required_xml_elements non-empty).
     has_xml_response_validation: bool,
+
+    // ── Enforcement ──
+    /// `block` (default) or `log_only`.
+    enforcement_mode: EnforcementMode,
+    /// Process-unique id scoping this instance's private per-request state.
+    instance_id: u64,
 }
 
 impl BodyValidator {
@@ -336,6 +463,19 @@ impl BodyValidator {
         )?;
         let response_content_types = optional_content_types(config, "response_content_types")?
             .unwrap_or_else(default_content_types);
+        let response_status_scope = optional_response_status_scope(config)?
+            .unwrap_or_else(ResponseStatusScope::success_only);
+        let enforcement_mode = match optional_string(config, "enforcement_mode")? {
+            None | Some("block") => EnforcementMode::Block,
+            Some("log_only") => EnforcementMode::LogOnly,
+            Some(_) => {
+                return Err(
+                    "body_validator: `enforcement_mode` must be `block` or `log_only`".to_string(),
+                );
+            }
+        };
+        let reject_unsupported_media_types =
+            optional_bool(config, "reject_unsupported_media_types")?.unwrap_or(false);
 
         // ── Protobuf validation config ──
         let protobuf_config = load_protobuf_config(config, descriptor_mode)?;
@@ -391,6 +531,15 @@ impl BodyValidator {
                     .to_string(),
             );
         }
+        if reject_unsupported_media_types && !has_request_validation {
+            // Strict media-type admission refuses every body no request rule
+            // inspects; without any request rule it would refuse every body.
+            return Err(
+                "body_validator: `reject_unsupported_media_types` requires at least one request \
+                 validation rule"
+                    .to_string(),
+            );
+        }
 
         Ok(Self {
             json_validator,
@@ -399,10 +548,12 @@ impl BodyValidator {
             xml_max_entities,
             xml_reject_nested_entities,
             content_types,
+            reject_unsupported_media_types,
             response_json_validator,
             response_required_fields,
             response_required_xml_elements,
             response_content_types,
+            response_status_scope,
             _protobuf_pool: protobuf_pool,
             protobuf_request_descriptor,
             protobuf_response_descriptor,
@@ -419,23 +570,39 @@ impl BodyValidator {
             has_pre_proxy_request_validation: has_json_xml_request,
             has_xml_request_validation,
             has_xml_response_validation,
+            enforcement_mode,
+            instance_id: NEXT_BODY_VALIDATOR_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         })
     }
 
-    /// Shared implementation of the final backend-visible request-body hooks.
+    /// Evaluate the final backend-visible request body against the configured
+    /// rules. Shared by both final request-body hooks.
+    ///
+    /// `ctx` is `Some` on the context-aware hook. It supplies the gRPC method
+    /// path when the hook headers carry no `:path` — only the native H1/H2 gRPC
+    /// ladder injects one; HTTP/3, the H3 bridge, and generic dispatch do not,
+    /// and a per-method rule must not silently stop applying there.
     ///
     /// `json_scan_memo` is `Some` on the context-aware hook so the duplicate
     /// object-member screen of this exact body is shared with the other
     /// governed plugins running in the same stage, and `None` on the
     /// context-free hook, where the screen runs standalone.
-    async fn validate_final_request_body(
+    ///
+    /// `undecoded_coding` is set only in `log_only` mode, which never claims the
+    /// representation gate: a content-coded JSON/XML body then reaches this
+    /// hook still encoded, and is recorded as uninspected rather than as a
+    /// spurious UTF-8 violation.
+    fn evaluate_final_request_body(
         &self,
+        ctx: Option<&RequestContext>,
         headers: &HashMap<String, String>,
         body: &[u8],
         json_scan_memo: Option<&mut JsonScanMemo>,
-    ) -> PluginResult {
+        undecoded_coding: bool,
+        budget: BudgetRef<'_>,
+    ) -> RequestVerdict {
         if !self.has_request_validation {
-            return PluginResult::Continue;
+            return RequestVerdict::Pass;
         }
 
         let content_type = headers
@@ -447,109 +614,306 @@ impl BodyValidator {
         // satisfies the configured representation is a question only that
         // representation can answer: an empty JSON/XML document is invalid, and
         // a zero-length gRPC transport body is not a frame
-        // (`GHSA-2vmr-ww8r-mww3`). The applicability checks below still return
-        // `Continue` for representations this instance does not govern.
-        if !is_grpc_content_type(content_type) {
-            // Only run the JSON/XML branch when JSON or XML validation is
-            // actually configured. A protobuf-only plugin must Continue on
-            // non-grpc content types (the gRPC branch below is the one that
-            // applies to it). `has_request_validation` alone isn't enough —
-            // it's also true for protobuf-only configs, which would otherwise
-            // mis-treat a non-gRPC payload as malformed JSON.
-            let has_json_validation =
-                self.json_validator.is_some() || !self.required_fields.is_empty();
-            if !has_json_validation && !self.has_xml_request_validation {
-                return PluginResult::Continue;
+        // (`GHSA-2vmr-ww8r-mww3`). The applicability checks below still pass
+        // representations this instance does not govern (unless strict media
+        // type admission refuses them).
+        if let Some(representation) = grpc_representation(content_type) {
+            if !self.has_protobuf_request_validation {
+                return self.unsupported_request_body_verdict(body);
             }
-
-            if !content_type_matches(&self.content_types, content_type) {
-                return PluginResult::Continue;
+            let grpc_path = request_grpc_method_path(headers, ctx);
+            if self.protobuf_dependency_unavailable
+                && self.protobuf_targets.request_applies(&grpc_path)
+            {
+                return RequestVerdict::Violation {
+                    status: 400,
+                    detail: "configured protobuf descriptor dependency is unavailable".to_string(),
+                };
             }
-
-            // JSON branch matches `before_proxy`: any matching JSON-like body is
-            // screened once request validation is active for this content type,
-            // even when only XML rules (plus `content_types: ["application/json"]`)
-            // activated the plugin — otherwise a request-body transform can
-            // reintroduce duplicate members after the first screen and the final
-            // backend-visible bytes are never checked. `has_json_validation` is
-            // consulted only by the early Continue above so protobuf-only configs
-            // still never treat arbitrary non-gRPC payloads as JSON.
-            let validate_as_json = is_json_like_content_type(content_type);
-            let validate_as_xml = !validate_as_json
-                && is_xml_like_content_type(content_type)
-                && self.has_xml_request_validation;
-            if !validate_as_json && !validate_as_xml {
-                // Allowlisted media type that no configured rule can inspect.
-                return PluginResult::Continue;
-            }
-
-            // A body the configured JSON/XML rules cannot even decode is not
-            // evidence that the policy passed. Reject with a fixed diagnostic
-            // that never reproduces any of the offending bytes.
-            let body_str = match std::str::from_utf8(body) {
-                Ok(value) => value,
-                Err(_) => return request_reject(NON_UTF8_REQUEST_BODY),
-            };
-
-            let result = if validate_as_json {
-                Self::validate_json_body(
-                    body_str,
-                    &self.required_fields,
-                    self.json_validator.as_ref(),
-                    Direction::Request,
-                    json_scan_memo,
-                )
-            } else {
-                Self::validate_xml_body(
-                    body_str,
-                    &self.required_xml_elements,
-                    self.xml_max_entities,
-                    self.xml_reject_nested_entities,
-                )
-            };
-
-            return match result {
-                Ok(()) => PluginResult::Continue,
-                Err(msg) => request_reject(&msg),
-            };
-        }
-
-        if !self.has_protobuf_request_validation {
-            return PluginResult::Continue;
-        }
-
-        // Resolve gRPC method path from headers (injected by the proxy handler)
-        let grpc_path = headers.get(":path").map(|s| s.as_str()).unwrap_or("");
-        if self.protobuf_dependency_unavailable && self.protobuf_targets.request_applies(grpc_path)
-        {
-            return protobuf_reject(
-                400,
-                "request",
-                "configured protobuf descriptor dependency is unavailable",
-            );
-        }
-        let descriptor = match self.get_request_descriptor(grpc_path) {
-            Some(d) => d,
-            None => {
-                // No descriptor for this method — skip validation
+            let Some(descriptor) = self.get_request_descriptor(&grpc_path) else {
+                // No descriptor for this method — nothing configured to check.
                 debug!(
                     "body_validator: no protobuf request descriptor for method '{}'",
                     grpc_path
                 );
-                return PluginResult::Continue;
+                return RequestVerdict::Pass;
+            };
+            return match self.validate_grpc_representation(
+                body,
+                representation,
+                descriptor,
+                Direction::Request,
+                None,
+                budget,
+            ) {
+                Ok(()) => RequestVerdict::Pass,
+                Err(ProtobufFailure::Invalid(detail)) => RequestVerdict::Violation {
+                    status: 400,
+                    detail,
+                },
+                Err(ProtobufFailure::Capacity) => RequestVerdict::Capacity,
+            };
+        }
+
+        // Only run the JSON/XML branch when JSON or XML validation is actually
+        // configured. A protobuf-only plugin must not treat a non-gRPC payload
+        // as malformed JSON. `has_request_validation` alone isn't enough — it's
+        // also true for protobuf-only configs.
+        let has_json_validation = self.json_validator.is_some() || !self.required_fields.is_empty();
+        if !has_json_validation && !self.has_xml_request_validation {
+            return self.unsupported_request_body_verdict(body);
+        }
+
+        if !content_type_matches(&self.content_types, content_type) {
+            return self.unsupported_request_body_verdict(body);
+        }
+
+        // JSON branch matches `before_proxy`: any matching JSON-like body is
+        // screened once request validation is active for this content type,
+        // even when only XML rules (plus `content_types: ["application/json"]`)
+        // activated the plugin — otherwise a request-body transform can
+        // reintroduce duplicate members after the first screen and the final
+        // backend-visible bytes are never checked. `has_json_validation` is
+        // consulted only by the early return above so protobuf-only configs
+        // still never treat arbitrary non-gRPC payloads as JSON.
+        let validate_as_json = is_json_like_content_type(content_type);
+        let validate_as_xml = !validate_as_json
+            && is_xml_like_content_type(content_type)
+            && self.has_xml_request_validation;
+        if !validate_as_json && !validate_as_xml {
+            // Allowlisted media type that no configured rule can inspect.
+            return self.unsupported_request_body_verdict(body);
+        }
+
+        if undecoded_coding {
+            return RequestVerdict::Uninspected;
+        }
+
+        // A body the configured JSON/XML rules cannot even decode is not
+        // evidence that the policy passed. Reject with a fixed diagnostic
+        // that never reproduces any of the offending bytes.
+        let body_str = match std::str::from_utf8(body) {
+            Ok(value) => value,
+            Err(_) => {
+                return RequestVerdict::Violation {
+                    status: 400,
+                    detail: NON_UTF8_REQUEST_BODY.to_string(),
+                };
             }
         };
 
-        match self.validate_protobuf_body(body, descriptor) {
-            Ok(()) => PluginResult::Continue,
-            Err(msg) => protobuf_reject(400, "request", &msg),
+        let result = if validate_as_json {
+            Self::validate_json_body(
+                body_str,
+                &self.required_fields,
+                self.json_validator.as_ref(),
+                Direction::Request,
+                json_scan_memo,
+            )
+        } else {
+            Self::validate_xml_body(
+                body_str,
+                &self.required_xml_elements,
+                self.xml_max_entities,
+                self.xml_reject_nested_entities,
+            )
+        };
+
+        match result {
+            Ok(()) => RequestVerdict::Pass,
+            Err(detail) => RequestVerdict::Violation {
+                status: 400,
+                detail,
+            },
         }
+    }
+
+    /// The verdict for a request body no configured rule inspects: a pass,
+    /// unless `reject_unsupported_media_types` refuses a non-empty one.
+    fn unsupported_request_body_verdict(&self, body: &[u8]) -> RequestVerdict {
+        if self.reject_unsupported_media_types && !body.is_empty() {
+            RequestVerdict::Violation {
+                status: 415,
+                detail: UNSUPPORTED_MEDIA_TYPE_DETAIL.to_string(),
+            }
+        } else {
+            RequestVerdict::Pass
+        }
+    }
+
+    /// Whether the configured JSON/XML request rules would inspect a body of
+    /// this media type (the `before_proxy` / final-hook applicability ladder).
+    fn json_xml_request_rule_inspects(&self, content_type: &str) -> bool {
+        if !self.has_pre_proxy_request_validation
+            || !content_type_matches(&self.content_types, content_type)
+        {
+            return false;
+        }
+        is_json_like_content_type(content_type)
+            || (is_xml_like_content_type(content_type) && self.has_xml_request_validation)
+    }
+
+    /// Map a request-side verdict onto the exchange under the configured
+    /// enforcement mode.
+    fn finish_request_verdict(
+        &self,
+        ctx: Option<&mut RequestContext>,
+        verdict: RequestVerdict,
+    ) -> PluginResult {
+        match verdict {
+            RequestVerdict::Pass => PluginResult::Continue,
+            RequestVerdict::Violation { status, detail } => {
+                self.violation(ctx, Direction::Request, status, &detail)
+            }
+            RequestVerdict::Capacity => self.capacity_refusal(ctx, Direction::Request),
+            RequestVerdict::Uninspected => {
+                if let Some(ctx) = ctx {
+                    record_outcome(ctx, Direction::Request, OUTCOME_UNINSPECTED, None, None);
+                }
+                PluginResult::Continue
+            }
+        }
+    }
+
+    /// Decide one configured violation: reject it in `block` mode, or record it
+    /// and continue in `log_only` mode. Either way, when a request context is
+    /// available the outcome is published under the fixed
+    /// `body_validator.{request,response}_*` metadata keys.
+    fn violation(
+        &self,
+        ctx: Option<&mut RequestContext>,
+        direction: Direction,
+        status_code: u16,
+        msg: &str,
+    ) -> PluginResult {
+        // Every producer builds a payload-free diagnostic. `bound_detail` is
+        // the compiled-in size ceiling on top of that, never the
+        // confidentiality mechanism (`GHSA-5p2h-fq6q-gwh9`).
+        let detail = bound_detail(msg);
+        let enforced = self.enforcement_mode == EnforcementMode::Block;
+        if let Some(ctx) = ctx {
+            let outcome = if enforced {
+                OUTCOME_REJECTED
+            } else {
+                OUTCOME_WOULD_REJECT
+            };
+            record_outcome(ctx, direction, outcome, Some(status_code), Some(&detail));
+        }
+        let side = match direction {
+            Direction::Request => "request",
+            Direction::Response => "response",
+        };
+        if !enforced {
+            debug!(
+                "body_validator: log_only {} validation would reject ({}): {}",
+                side, status_code, detail
+            );
+            return PluginResult::Continue;
+        }
+        debug!("body_validator: {} validation failed: {}", side, detail);
+        let error = match (status_code, direction) {
+            (415, _) => "Unsupported request media type",
+            (_, Direction::Request) => "Request body validation failed",
+            (_, Direction::Response) => "Response body validation failed",
+        };
+        PluginResult::Reject {
+            status_code,
+            body: serde_json::json!({
+                "error": error,
+                "details": detail
+            })
+            .to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
+    /// The gateway-local inspection-capacity terminal for a protobuf decode the
+    /// aggregate budget could not admit: `503` / `RESOURCE_EXHAUSTED`, never a
+    /// validation `400`/`502` (nothing is wrong with the bytes) and never a
+    /// pass-through of uninspected bytes. `log_only` mode, which never refuses
+    /// traffic, records the representation as uninspected instead.
+    fn capacity_refusal(
+        &self,
+        ctx: Option<&mut RequestContext>,
+        direction: Direction,
+    ) -> PluginResult {
+        if self.enforcement_mode == EnforcementMode::LogOnly {
+            if let Some(ctx) = ctx {
+                record_outcome(ctx, direction, OUTCOME_UNINSPECTED, None, None);
+            }
+            return PluginResult::Continue;
+        }
+        let (status_code, body, grpc_status, grpc_message) = match direction {
+            Direction::Request => (
+                response_budget::REQUEST_DECODE_OVERLOAD_STATUS,
+                response_budget::REQUEST_DECODE_OVERLOAD_BODY,
+                response_budget::REQUEST_DECODE_OVERLOAD_GRPC_STATUS,
+                response_budget::REQUEST_DECODE_OVERLOAD_GRPC_MESSAGE,
+            ),
+            Direction::Response => (
+                response_budget::RESPONSE_BUFFER_OVERLOAD_STATUS,
+                response_budget::RESPONSE_BUFFER_OVERLOAD_BODY,
+                response_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_STATUS,
+                response_budget::RESPONSE_BUFFER_OVERLOAD_GRPC_MESSAGE,
+            ),
+        };
+        warn_sampled!("body_validator: protobuf inspection refused: decode budget exhausted");
+        if let Some(ctx) = ctx {
+            record_outcome(
+                ctx,
+                direction,
+                OUTCOME_CAPACITY_REFUSED,
+                Some(status_code),
+                None,
+            );
+            // Typed provenance so the response finalizer publishes this fixed
+            // gateway terminal as written instead of re-deciding it.
+            ctx.mark_gateway_capacity_response_selected();
+        }
+        let mut headers = HashMap::new();
+        headers.insert("grpc-status".to_string(), grpc_status.to_string());
+        headers.insert("grpc-message".to_string(), grpc_message.to_string());
+        PluginResult::Reject {
+            status_code,
+            body: body.to_string(),
+            headers,
+        }
+    }
+
+    /// Whether the final request body is byte-identical (with the same
+    /// `Content-Type`) to the representation this instance already validated
+    /// and passed in `before_proxy`. Validation is a pure function of those two
+    /// inputs, so re-running the parse and schema evaluation could only repeat
+    /// the same answer. Any transform, relabel, or decode misses and is
+    /// re-validated.
+    fn final_request_body_matches_early_pass(
+        &self,
+        ctx: &RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> bool {
+        let Some(previous) = ctx
+            .plugin_state()
+            .and_then(|state| {
+                state
+                    .body_validator_early_request_digests
+                    .get(&self.instance_id)
+            })
+            .copied()
+        else {
+            return false;
+        };
+        let content_type = headers
+            .get("content-type")
+            .map(String::as_str)
+            .unwrap_or("");
+        early_request_digest(content_type, body) == previous
     }
 
     /// Whether the configured final request-body rules would actually inspect
     /// this finalized representation.
     ///
-    /// Mirrors the applicability ladder inside [`Self::validate_final_request_body`]
+    /// Mirrors the applicability ladder inside [`Self::evaluate_final_request_body`]
     /// exactly, so the shared request representation gate claims precisely the
     /// requests this plugin enforces on (`GHSA-3973-47g5-4mcx`).
     fn final_request_body_policy_applies(&self, headers: &HashMap<String, String>) -> bool {
@@ -560,9 +924,9 @@ impl BodyValidator {
             .get("content-type")
             .map(String::as_str)
             .unwrap_or("");
-        if is_grpc_content_type(content_type) {
-            // Native gRPC carries its per-message compression in `grpc-encoding`,
-            // not `Content-Encoding`, so this branch is never the one the gate
+        if grpc_representation(content_type).is_some() {
+            // gRPC carries its per-message compression in `grpc-encoding`, not
+            // `Content-Encoding`, so this branch is never the one the gate
             // decodes for. Declining keeps framed bodies out of the gate.
             return false;
         }
@@ -588,7 +952,7 @@ impl BodyValidator {
             return false;
         }
         let content_type = content_type.unwrap_or("");
-        if is_grpc_content_type(content_type) {
+        if grpc_representation(content_type).is_some() {
             return false;
         }
         if !self.has_json_response_validation() && !self.has_xml_response_validation {
@@ -759,59 +1123,282 @@ impl BodyValidator {
         Ok(())
     }
 
-    /// Validate a gRPC protobuf body (request or response) against a message descriptor.
+    /// Validate a gRPC body in any supported framing against a message
+    /// descriptor.
     ///
-    /// The body uses gRPC length-prefixed framing: 1 byte compressed flag + 4 bytes
-    /// big-endian u32 message length + protobuf payload bytes.
-    fn validate_protobuf_body(
+    /// Native gRPC is one length-prefixed frame. gRPC-Web (binary, or text-mode
+    /// base64) is the same message frame optionally followed by one terminal
+    /// trailer frame; a translated gRPC-Web response reaches the final
+    /// client-visible phase in that representation, after `grpc_web` re-framed
+    /// it, so it is validated here rather than being skipped as "not gRPC".
+    ///
+    /// Every byte of working set this decode allocates — the base64 output, the
+    /// decompressed payload, the decoder's own heap, and the reflected message
+    /// graph — is charged to `budget` before it is allocated and released when
+    /// this returns (`plugins::charged_decode`).
+    fn validate_grpc_representation(
         &self,
         body: &[u8],
+        representation: GrpcRepresentation,
         descriptor: &MessageDescriptor,
-    ) -> Result<(), String> {
-        let payload = parse_grpc_frame(body, self.grpc_max_decompressed_size_bytes)?;
+        direction: Direction,
+        response_headers: Option<&HashMap<String, String>>,
+        budget: BudgetRef<'_>,
+    ) -> Result<(), ProtobufFailure> {
+        let mut reservation = ResponseBufferReservation::new();
+        match representation {
+            GrpcRepresentation::Native => {
+                self.validate_protobuf_frame(body, descriptor, 0, &mut reservation, budget)
+            }
+            GrpcRepresentation::WebBinary => self.validate_grpc_web_frames(
+                body,
+                descriptor,
+                direction,
+                response_headers,
+                0,
+                &mut reservation,
+                budget,
+            ),
+            GrpcRepresentation::WebText => {
+                if body.is_empty() {
+                    return self.validate_grpc_web_frames(
+                        body,
+                        descriptor,
+                        direction,
+                        response_headers,
+                        0,
+                        &mut reservation,
+                        budget,
+                    );
+                }
+                // Base64 output is at most three quarters of the input; charge it
+                // before the decoder allocates it.
+                let decoded_capacity = body.len() / 4 * 3;
+                if !reservation.reserve_in(budget, decoded_capacity) {
+                    return Err(ProtobufFailure::Capacity);
+                }
+                let decoded = super::grpc_web::decode_grpc_web_text_body(body)
+                    .ok_or_else(|| "gRPC-Web text body is not valid base64".to_string())?;
+                let resident = decoded.capacity();
+                self.validate_grpc_web_frames(
+                    &decoded,
+                    descriptor,
+                    direction,
+                    response_headers,
+                    resident,
+                    &mut reservation,
+                    budget,
+                )
+            }
+        }
+    }
+
+    /// Validate a binary gRPC-Web frame sequence: at most one message frame
+    /// (unary scope, as on native gRPC) followed by at most one terminal
+    /// trailer frame.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_grpc_web_frames(
+        &self,
+        data: &[u8],
+        descriptor: &MessageDescriptor,
+        direction: Direction,
+        response_headers: Option<&HashMap<String, String>>,
+        concurrent_bytes: usize,
+        reservation: &mut ResponseBufferReservation,
+        budget: BudgetRef<'_>,
+    ) -> Result<(), ProtobufFailure> {
+        let (message, trailer) = split_grpc_web_frames(data)?;
+        match message {
+            Some(frame) => self.validate_protobuf_frame(
+                frame,
+                descriptor,
+                concurrent_bytes,
+                reservation,
+                budget,
+            ),
+            None => {
+                // A gRPC-Web terminal ERROR legitimately carries only the
+                // trailer frame (or, with no body at all, the merged header
+                // view). Status OK, a missing status, and ambiguous statuses
+                // still require a message frame — exactly the native rule.
+                let terminal_error = match trailer {
+                    Some(block) => grpc_web_trailer_is_terminal_error(block),
+                    None => response_headers.is_some_and(grpc_empty_response_is_terminal_error),
+                };
+                if direction == Direction::Response && terminal_error {
+                    Ok(())
+                } else {
+                    Err("gRPC-Web body carries no message frame".to_string().into())
+                }
+            }
+        }
+    }
+
+    /// Validate one native gRPC length-prefixed frame against a message
+    /// descriptor.
+    ///
+    /// The body uses gRPC length-prefixed framing: 1 byte compressed flag + 4
+    /// bytes big-endian u32 message length + protobuf payload bytes.
+    ///
+    /// The decode is bounded BEFORE reflection: a descriptor-aware wire
+    /// preflight charges every message and field value against the fixed
+    /// inspection budgets and the 32-level depth bound, for every pool and
+    /// policy, so a small (possibly compressed) frame cannot materialize an
+    /// unbounded reflected graph before any limit is consulted. The reflected
+    /// working set the preflight measured is then reserved against the
+    /// aggregate decode budget, alongside the decompressed payload, before
+    /// `DynamicMessage::decode` allocates it.
+    fn validate_protobuf_frame(
+        &self,
+        frame: &[u8],
+        descriptor: &MessageDescriptor,
+        concurrent_bytes: usize,
+        reservation: &mut ResponseBufferReservation,
+        budget: BudgetRef<'_>,
+    ) -> Result<(), ProtobufFailure> {
+        let payload = parse_grpc_frame_charged(
+            frame,
+            self.grpc_max_decompressed_size_bytes,
+            concurrent_bytes,
+            reservation,
+            budget,
+        )?;
+
+        let policy = ProtobufMessagePolicy {
+            check_required: self.protobuf_pool_has_proto2,
+            reject_unknown: self.protobuf_reject_unknown_fields,
+        };
+        let mut preflight = ProtobufDecodePreflight::default();
+        if let Err(error) = preflight.charge_message() {
+            return Err(error.into_failure());
+        }
+        if let Err(error) =
+            preflight_protobuf_fields(&payload, Some(descriptor), None, 0, &mut preflight, policy)
+        {
+            return Err(error.into_failure());
+        }
+
+        let decompressed_resident = match &payload {
+            Cow::Owned(buffer) => buffer.capacity(),
+            Cow::Borrowed(_) => 0,
+        };
+        // An undeclared closed-enum occurrence (permitted: strict mode already
+        // refused it above) is stripped from a separate inspection copy so the
+        // decoded tree has conforming proto2 merge/oneof/initialization
+        // semantics. The rewrite is in place in ONE payload-sized buffer, which
+        // is therefore the copy's entire allocation, charged here before it
+        // exists.
+        let strip_closed_enums = preflight.undeclared_closed_enum;
+        let inspection_copy_bound = if strip_closed_enums { payload.len() } else { 0 };
+        // String and bytes values are copied out of the payload, so the
+        // payload length bounds them; messages and values are charged at a
+        // conservative per-node cost.
+        let working_set = concurrent_bytes
+            .saturating_add(decompressed_resident)
+            .saturating_add(payload.len())
+            .saturating_add(inspection_copy_bound)
+            .saturating_add(preflight.reflected_bytes());
+        if !reservation.reserve_in(budget, working_set) {
+            return Err(ProtobufFailure::Capacity);
+        }
+        let inspection_copy = if strip_closed_enums {
+            let mut stripped = vec![0u8; payload.len()];
+            let mut writer = WireWriter {
+                out: stripped.as_mut_slice(),
+                len: 0,
+            };
+            if let Err(error) =
+                strip_undeclared_closed_enums(&payload, Some(descriptor), None, &mut writer)
+            {
+                return Err(error.into_failure());
+            }
+            let written = writer.len;
+            stripped.truncate(written);
+            Some(stripped)
+        } else {
+            None
+        };
+        let decode_input: &[u8] = inspection_copy.as_deref().unwrap_or(payload.as_ref());
+
         // The `prost` decode error is not reproduced: its rendering is not part
         // of a stability contract Ferrum controls, so it is not a surface this
         // gateway can promise stays free of payload bytes
         // (`GHSA-5p2h-fq6q-gwh9`). The failure class alone is what a caller or
         // operator can act on.
-        let msg = DynamicMessage::decode(descriptor.clone(), payload.as_ref())
-            .map_err(|_| "Protobuf decode failed".to_string())?;
+        let msg = DynamicMessage::decode(descriptor.clone(), decode_input)
+            .map_err(|_| PROTOBUF_DECODE_FAILED_DETAIL.to_string())?;
         // Two independent message policies share one bounded descriptor walk.
         //
         // Wire decoding does not enforce proto2 initialization, so a correctly
         // framed message that omits a `required` field decodes cleanly
-        // (GHSA-qvrp-m3v9-345m).
+        // (GHSA-qvrp-m3v9-345m). A closed (proto2) enum field carrying an
+        // undeclared number is, to a conforming reader, an UNKNOWN field: the
+        // preflight refuses it in strict mode, and the inspection copy decoded
+        // above leaves it out, so it can neither satisfy `required` nor
+        // overwrite a declared value or a oneof selection.
         //
         // `DynamicMessage::unknown_fields()` is message-LOCAL, so checking only
         // the decoded outer message left unknown fields inside nested,
         // repeated, map-value, oneof, and extension messages unexamined even
         // though `protobuf_reject_unknown_fields` is documented as a strict
         // schema policy (`GHSA-cqmm-vj3c-g8w8`).
-        let policy = ProtobufMessagePolicy {
-            check_required: self.protobuf_pool_has_proto2,
-            reject_unknown: self.protobuf_reject_unknown_fields,
-        };
         if policy.is_active() {
-            let mut budget = ProtobufWalkBudget::default();
-            check_protobuf_message(&msg, policy, &mut budget)?;
+            let mut walk_budget = ProtobufWalkBudget::default();
+            check_protobuf_message(&msg, policy, &mut walk_budget)?;
         }
         Ok(())
     }
 
-    /// Look up the request message descriptor for a given gRPC path.
-    fn get_request_descriptor(&self, grpc_path: &str) -> Option<&MessageDescriptor> {
-        self.protobuf_method_messages
-            .get(grpc_path)
-            .and_then(|e| e.request.as_ref())
-            .or(self.protobuf_request_descriptor.as_ref())
+    /// Request-side gRPC protobuf validation of `body` in the framing named by
+    /// `content_type`, against an explicitly bound aggregate budget, reduced to
+    /// a fixed outcome label.
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
+    pub(crate) fn protobuf_request_outcome_in(
+        &self,
+        grpc_path: &str,
+        content_type: &str,
+        body: &[u8],
+        budget: BudgetRef<'_>,
+    ) -> &'static str {
+        let Some(representation) = grpc_representation(content_type) else {
+            return "unconfigured";
+        };
+        let Some(descriptor) = self.get_request_descriptor(canonical_grpc_method(grpc_path)) else {
+            return "unconfigured";
+        };
+        match self.validate_grpc_representation(
+            body,
+            representation,
+            descriptor,
+            Direction::Request,
+            None,
+            budget,
+        ) {
+            Ok(()) => "pass",
+            Err(ProtobufFailure::Invalid(_)) => "invalid",
+            Err(ProtobufFailure::Capacity) => "capacity",
+        }
     }
 
-    /// Look up the response message descriptor for a given gRPC path.
+    /// Look up the request message descriptor for a given gRPC path.
+    ///
+    /// A `protobuf_method_messages` entry is direction-authoritative: when the
+    /// method has an entry, a direction the entry omits is not validated,
+    /// rather than falling back to the default type.
+    fn get_request_descriptor(&self, grpc_path: &str) -> Option<&MessageDescriptor> {
+        match self.protobuf_method_messages.get(grpc_path) {
+            Some(entry) => entry.request.as_ref(),
+            None => self.protobuf_request_descriptor.as_ref(),
+        }
+    }
+
+    /// Look up the response message descriptor for a given gRPC path, with the
+    /// same direction-authoritative entry rule as the request side.
     fn get_response_descriptor(&self, grpc_path: &str) -> Option<&MessageDescriptor> {
-        self.protobuf_method_messages
-            .get(grpc_path)
-            .and_then(|e| e.response.as_ref())
-            .or(self.protobuf_response_descriptor.as_ref())
+        match self.protobuf_method_messages.get(grpc_path) {
+            Some(entry) => entry.response.as_ref(),
+            None => self.protobuf_response_descriptor.as_ref(),
+        }
     }
 
     /// Whether JSON response validation rules are configured.
@@ -819,24 +1406,39 @@ impl BodyValidator {
         self.response_json_validator.is_some() || !self.response_required_fields.is_empty()
     }
 
-    /// Resolve the gRPC method path used for response descriptor lookup.
+    /// Resolve the gRPC method a request/response belongs to from the request
+    /// context, as the canonical `/Service/Method` key.
     ///
-    /// Prefer `grpc_full_method` set by `grpc_method_router` when available;
-    /// otherwise fall back to `ctx.path`.
-    fn grpc_method_path_for_response(ctx: &RequestContext) -> String {
-        ctx.metadata
-            .get("grpc_full_method")
-            .map(|method| {
-                if method.starts_with('/') {
-                    method.clone()
+    /// The backend-effective path the gateway bound after route policy
+    /// (`authorized_backend_path`, private and not plugin-writable) wins when
+    /// present; then `grpc_full_method` set by `grpc_method_router`; then
+    /// `ctx.path`, onto which a route-override rewrite is mirrored. Whatever the
+    /// source, only the trailing `/Service/Method` is the method key, so a
+    /// prefix that does not touch the service segment cannot change the entry.
+    /// A prefix REPLACEMENT can (`/v1.Greeter` stripped, `/v2.Greeter`
+    /// prepended), which is why method-scoped configurations opt into
+    /// backend-path resolution and the bound path wins. Backends never echo
+    /// `:path` in responses.
+    fn grpc_method_path(ctx: &RequestContext) -> Cow<'_, str> {
+        if let Some(path) = ctx.authorized_backend_path() {
+            return Cow::Borrowed(canonical_grpc_method(path));
+        }
+        match ctx.metadata.get("grpc_full_method") {
+            Some(method) if method.starts_with('/') => {
+                Cow::Borrowed(canonical_grpc_method(method.as_str()))
+            }
+            Some(method) => {
+                let mut path = String::with_capacity(method.len() + 1);
+                path.push('/');
+                path.push_str(method);
+                if canonical_grpc_method(&path).len() == path.len() {
+                    Cow::Owned(path)
                 } else {
-                    let mut path = String::with_capacity(method.len() + 1);
-                    path.push('/');
-                    path.push_str(method);
-                    path
+                    Cow::Owned(canonical_grpc_method(&path).to_string())
                 }
-            })
-            .unwrap_or_else(|| ctx.path.clone())
+            }
+            None => Cow::Borrowed(canonical_grpc_method(ctx.path.as_str())),
+        }
     }
 
     /// Whether protobuf response validation applies to this request/response.
@@ -844,7 +1446,30 @@ impl BodyValidator {
         self.has_protobuf_response_validation
             && self
                 .protobuf_targets
-                .response_applies(&Self::grpc_method_path_for_response(ctx))
+                .response_applies(&Self::grpc_method_path(ctx))
+    }
+
+    /// Whether protobuf request validation may apply to this request.
+    ///
+    /// Used by the buffering vote, which runs before the route-override path
+    /// rewrite is mirrored onto `ctx.path`, so the pending rewrite is
+    /// considered too: the vote must never be narrower than the method the
+    /// final hook will select, or an enrolled method would stream past it.
+    fn protobuf_request_may_apply(&self, ctx: &RequestContext) -> bool {
+        self.protobuf_targets
+            .request_applies(&Self::grpc_method_path(ctx))
+            || ctx.route_override_path.as_deref().is_some_and(|path| {
+                self.protobuf_targets
+                    .request_applies(canonical_grpc_method(path))
+            })
+    }
+
+    /// Whether this exchange's upstream status selects response validation:
+    /// inside `response_status_codes`, and not a partial (`206`) or delta
+    /// (`226`) fragment, which is not a complete document a schema can judge.
+    fn response_status_validated(&self, ctx: &RequestContext, response_status: u16) -> bool {
+        self.response_status_scope.contains(response_status)
+            && !response_is_fragment(ctx, response_status)
     }
 
     /// Whether the final response-body hook would inspect this media type.
@@ -869,7 +1494,7 @@ impl BodyValidator {
         if is_text_event_stream_media_type(content_type) {
             return false;
         }
-        if is_grpc_content_type(content_type) {
+        if grpc_representation(content_type).is_some() {
             return self.applicable_protobuf_response_validation(ctx);
         }
         if !content_type_matches(&self.response_content_types, content_type) {
@@ -886,17 +1511,6 @@ impl BodyValidator {
     }
 }
 
-/// Parse the first gRPC length-prefixed frame and return the protobuf payload bytes.
-///
-/// Frame format: [1 byte compressed flag] [4 bytes big-endian u32 length] [payload]
-///
-/// Supports unary RPCs only (single frame per message). For streaming RPCs the body
-/// may contain multiple concatenated frames — this function validates only the first
-/// frame and rejects trailing data via the length mismatch check.
-///
-/// When the compressed flag is set (byte 0 == 1), the payload is decompressed using
-/// gzip (deflate), which is the standard gRPC compression algorithm. Other compression
-/// algorithms (e.g., zstd, snappy) are not supported and will return an error.
 /// Default maximum decompressed size for a gRPC frame (10 MB). Prevents compression-bomb
 /// DoS — without a cap, a tiny compressed payload can inflate into gigabytes and OOM
 /// the process.
@@ -909,18 +1523,37 @@ const DEFAULT_MAX_GRPC_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 /// leave a small compressed frame effectively unbounded.
 const MAX_GRPC_DECOMPRESSED_SIZE_CEILING: usize = 64 * 1024 * 1024;
 
-fn parse_grpc_frame(
-    body: &[u8],
+/// Parse one gRPC length-prefixed frame and return the protobuf payload bytes.
+///
+/// Frame format: [1 byte compressed flag] [4 bytes big-endian u32 length] [payload]
+///
+/// Supports unary RPCs only (single frame per message). For streaming RPCs the
+/// body may contain multiple concatenated frames — the exact-length check
+/// rejects the trailing data.
+///
+/// When the compressed flag is set (byte 0 == 1), the payload is decompressed
+/// as gzip, the standard gRPC compression algorithm, through the shared strict,
+/// budget-charged decoder ([`super::charged_decode::decode_one_coding`]): the
+/// decoder's heap and every growth of the output are reserved against `budget`
+/// BEFORE they are allocated, the output is capped at
+/// `max_decompressed_size_bytes`, and the payload must be exactly one fully
+/// consumed gzip member (a multistream peer would also decode a concatenated
+/// member this validator never inspected, while the original frame is
+/// forwarded unchanged). Other compression algorithms are not supported.
+fn parse_grpc_frame_charged<'a>(
+    body: &'a [u8],
     max_decompressed_size_bytes: usize,
-) -> Result<Cow<'_, [u8]>, String> {
+    concurrent_bytes: usize,
+    reservation: &mut ResponseBufferReservation,
+    budget: BudgetRef<'_>,
+) -> Result<Cow<'a, [u8]>, ProtobufFailure> {
     if max_decompressed_size_bytes == 0 {
-        return Err("gRPC decompressed size limit must be greater than zero".to_string());
+        return Err("gRPC decompressed size limit must be greater than zero"
+            .to_string()
+            .into());
     }
     if body.len() < 5 {
-        return Err(format!(
-            "gRPC frame too short: {} bytes (minimum 5)",
-            body.len()
-        ));
+        return Err(format!("gRPC frame too short: {} bytes (minimum 5)", body.len()).into());
     }
     let compressed = body[0];
     let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
@@ -930,51 +1563,812 @@ fn parse_grpc_frame(
             "gRPC frame length mismatch: header says {} bytes but payload is {} bytes",
             msg_len,
             payload.len()
-        ));
+        )
+        .into());
     }
     if compressed > 1 {
         // The gRPC wire format defines only 0 (identity) and 1 (compressed
         // with the `grpc-encoding` codec); any other flag is malformed.
-        return Err(format!(
-            "gRPC frame has invalid compressed flag {compressed}"
-        ));
+        return Err(format!("gRPC frame has invalid compressed flag {compressed}").into());
     }
-    if compressed != 0 {
-        // gRPC compression uses gzip (deflate) by default per the gRPC spec.
-        // Bounded read to prevent compression-bomb DoS. `bufread::GzDecoder`
-        // (not `read::GzDecoder`, whose internal `BufReader` may pull past the
-        // first member) leaves the exact unconsumed input for the check below.
-        let mut decoder = GzDecoder::new(payload);
-        let initial_capacity = payload.len().min(max_decompressed_size_bytes);
-        let mut decompressed = Vec::with_capacity(initial_capacity);
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = decoder
-                .read(&mut buf)
-                .map_err(|e| format!("Failed to decompress gRPC frame (gzip): {e}"))?;
-            if n == 0 {
-                break;
-            }
-            if decompressed.len().saturating_add(n) > max_decompressed_size_bytes {
-                return Err(format!(
-                    "gRPC decompressed body exceeds max size of {max_decompressed_size_bytes} bytes"
-                ));
-            }
-            decompressed.extend_from_slice(&buf[..n]);
-        }
-        // The payload must be exactly one fully consumed gzip member. A
-        // multistream peer would also decode a concatenated member (or treat
-        // trailing bytes its own way) that this validator never inspected,
-        // while the original frame is forwarded unchanged.
-        if !decoder.into_inner().is_empty() {
-            return Err(
-                "gRPC compressed payload contains trailing or concatenated gzip data".to_string(),
-            );
-        }
-        Ok(Cow::Owned(decompressed))
+    if compressed == 0 {
+        return Ok(Cow::Borrowed(payload));
+    }
+    use super::charged_decode::{ChargedDecodeError, decode_one_coding};
+    match decode_one_coding(
+        "gzip",
+        payload,
+        max_decompressed_size_bytes,
+        concurrent_bytes,
+        reservation,
+        budget,
+    ) {
+        Ok(decompressed) => Ok(Cow::Owned(decompressed)),
+        Err(ChargedDecodeError::TooLarge) => Err(format!(
+            "gRPC decompressed body exceeds max size of {max_decompressed_size_bytes} bytes"
+        )
+        .into()),
+        Err(ChargedDecodeError::CapacityRefused) => Err(ProtobufFailure::Capacity),
+        Err(ChargedDecodeError::Unsupported | ChargedDecodeError::Malformed) => Err(
+            "Failed to decompress gRPC frame (gzip): malformed, truncated, trailing, or \
+             concatenated gzip data"
+                .to_string()
+                .into(),
+        ),
+    }
+}
+
+/// gRPC framing of a body, decided by its media-type essence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrpcRepresentation {
+    /// `application/grpc[+fmt]`: one length-prefixed message frame.
+    Native,
+    /// `application/grpc-web[+fmt]`: message frame, optional trailer frame.
+    WebBinary,
+    /// `application/grpc-web-text[+fmt]`: base64 of the binary framing.
+    WebText,
+}
+
+fn grpc_representation(content_type: &str) -> Option<GrpcRepresentation> {
+    let media_type = media_type_essence(content_type)?;
+    let matches_family = |base: &str| {
+        media_type.eq_ignore_ascii_case(base)
+            || (media_type.len() > base.len() + 1
+                && ascii_starts_with_ignore_case(media_type, base)
+                && media_type.as_bytes()[base.len()] == b'+')
+    };
+    if matches_family("application/grpc") {
+        Some(GrpcRepresentation::Native)
+    } else if matches_family("application/grpc-web-text") {
+        Some(GrpcRepresentation::WebText)
+    } else if matches_family("application/grpc-web") {
+        Some(GrpcRepresentation::WebBinary)
     } else {
-        Ok(Cow::Borrowed(payload))
+        None
     }
+}
+
+/// The gRPC method path a final request body belongs to.
+///
+/// The native H1/H2 gRPC ladder injects a synthetic `:path` into the hook
+/// headers; when it is absent (HTTP/3, the H3 bridge, generic dispatch) the
+/// request context names the method instead, so a per-method rule cannot
+/// silently stop applying on those dispatchers. Only the context-free
+/// compatibility hook has neither, and it then matches only a default type.
+fn request_grpc_method_path<'a>(
+    headers: &'a HashMap<String, String>,
+    ctx: Option<&'a RequestContext>,
+) -> Cow<'a, str> {
+    // The bound backend-effective path is authoritative; a synthetic `:path`
+    // (the local, possibly unstripped request path) never outranks it.
+    if let Some(path) = ctx.and_then(RequestContext::authorized_backend_path) {
+        return Cow::Borrowed(canonical_grpc_method(path));
+    }
+    if let Some(path) = headers.get(":path") {
+        return Cow::Borrowed(canonical_grpc_method(path.as_str()));
+    }
+    match ctx {
+        Some(ctx) => BodyValidator::grpc_method_path(ctx),
+        None => Cow::Borrowed(""),
+    }
+}
+
+/// The canonical gRPC method key of a request path: its trailing
+/// `/Service/Method` (query and fragment excluded). A gRPC method is always the
+/// last two path segments, so a listen-path prefix, a stripped prefix, or a
+/// backend base path cannot make the same method select a different
+/// `protobuf_method_messages` entry.
+fn canonical_grpc_method(path: &str) -> &str {
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    let path = &path[..end];
+    let Some(last) = path.rfind('/') else {
+        return path;
+    };
+    match path[..last].rfind('/') {
+        Some(start) => &path[start..],
+        None => path,
+    }
+}
+
+/// Whether a response is a range slice (`206`) or a delta (`226`) of the
+/// selected representation rather than a complete document. The pristine
+/// fragment stamp recorded before `after_proxy` covers a status or
+/// `Content-Range` an earlier hook rewrote.
+fn response_is_fragment(ctx: &RequestContext, response_status: u16) -> bool {
+    response_status == 206
+        || response_status == 226
+        || ctx
+            .metadata
+            .contains_key(crate::proxy::ORIGIN_FRAGMENT_RESPONSE_METADATA_KEY)
+}
+
+/// Publish one validation outcome under the fixed per-direction metadata keys.
+fn record_outcome(
+    ctx: &mut RequestContext,
+    direction: Direction,
+    outcome: &'static str,
+    status: Option<u16>,
+    detail: Option<&str>,
+) {
+    let (outcome_key, status_key, detail_key) = match direction {
+        Direction::Request => (
+            BODY_VALIDATOR_REQUEST_OUTCOME_KEY,
+            BODY_VALIDATOR_REQUEST_STATUS_KEY,
+            BODY_VALIDATOR_REQUEST_DETAIL_KEY,
+        ),
+        Direction::Response => (
+            BODY_VALIDATOR_RESPONSE_OUTCOME_KEY,
+            BODY_VALIDATOR_RESPONSE_STATUS_KEY,
+            BODY_VALIDATOR_RESPONSE_DETAIL_KEY,
+        ),
+    };
+    ctx.metadata
+        .insert(outcome_key.to_string(), outcome.to_string());
+    match status {
+        Some(status) => {
+            ctx.metadata
+                .insert(status_key.to_string(), status.to_string());
+        }
+        None => {
+            ctx.metadata.remove(status_key);
+        }
+    }
+    match detail {
+        Some(detail) => {
+            ctx.metadata
+                .insert(detail_key.to_string(), detail.to_string());
+        }
+        None => {
+            ctx.metadata.remove(detail_key);
+        }
+    }
+}
+
+/// SHA-256 over the `Content-Type` and body a request-side verdict was reached
+/// for. Used only to recognize the byte-identical representation again in the
+/// final hook; never logged, exported, or compared against peer input. SHA-256
+/// rather than a fast hash because a collision would let a transformed body
+/// reuse the earlier pass.
+fn early_request_digest(content_type: &str, body: &[u8]) -> [u8; 32] {
+    let mut hasher = crate::fips::approved::Sha256::new();
+    hasher.update(content_type.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(body);
+    hasher.finalize()
+}
+
+/// Whether the request headers alone already answer "is there a body?".
+fn request_headers_declare_body_framing(headers: &HashMap<String, String>) -> bool {
+    headers.contains_key("content-length") || headers.contains_key("transfer-encoding")
+}
+
+/// A `CONNECT` request (including HTTP/2 extended CONNECT and mesh HBONE) or a
+/// transport-classified WebSocket handshake opens a tunnel; what follows is not
+/// a request body this plugin governs, so strict media-type admission does not
+/// apply to it. Decided from trusted request state (the request line and the
+/// frontend's own flavor classification), never from a client-supplied
+/// `Upgrade` header, which an ordinary upload can carry.
+fn request_opens_tunnel(ctx: &RequestContext) -> bool {
+    ctx.method.eq_ignore_ascii_case("CONNECT")
+        || ctx.is_hbone_connect_relay()
+        || matches!(
+            ctx.request_http_flavor(),
+            crate::config::types::HttpFlavor::WebSocket
+        )
+}
+
+/// Whether a request ungoverned by any configured rule carries a body, for
+/// `reject_unsupported_media_types`. Headers decide when they can
+/// (`Content-Length`, `Transfer-Encoding`); otherwise the buffered
+/// representation the strict vote requested, or the transport's empty proof,
+/// does. A representation that cannot be shown empty counts as a body.
+fn ungoverned_request_carries_body(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> bool {
+    if request_opens_tunnel(ctx) {
+        return false;
+    }
+    if let Some(length) = headers.get("content-length") {
+        // Only a well-formed zero proves there is none; anything else,
+        // including a malformed or comma-joined value, counts as a body.
+        return !matches!(length.trim().parse::<u64>(), Ok(0));
+    }
+    if headers.contains_key("transfer-encoding") {
+        return true;
+    }
+    if let Some(text) = ctx.metadata.get("request_body") {
+        return !text.is_empty();
+    }
+    if let Some(bytes) = ctx.request_body_bytes.as_deref() {
+        return !bytes.is_empty();
+    }
+    !ctx.replay_request_body_empty_proven()
+}
+
+/// The single message frame (header included) and the trailer-frame payload of
+/// a binary gRPC-Web body.
+type GrpcWebFrames<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// Split a binary gRPC-Web frame sequence into its single message frame
+/// (header included) and its terminal trailer-frame payload.
+///
+/// More than one message frame is the unary-scope rejection native gRPC
+/// already applies; a trailer frame that is not last, a compressed trailer
+/// frame, an unknown flag, and truncated framing are malformed.
+fn split_grpc_web_frames(data: &[u8]) -> Result<GrpcWebFrames<'_>, String> {
+    let mut message: Option<&[u8]> = None;
+    let mut trailer: Option<&[u8]> = None;
+    let mut pos = 0usize;
+    while pos < data.len() {
+        if trailer.is_some() {
+            return Err("gRPC-Web frame follows the trailer frame".to_string());
+        }
+        if data.len() - pos < 5 {
+            return Err(format!(
+                "gRPC frame too short: {} bytes (minimum 5)",
+                data.len() - pos
+            ));
+        }
+        let flag = data[pos];
+        let declared =
+            u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+        let end = usize::try_from(declared)
+            .ok()
+            .and_then(|length| (pos + 5).checked_add(length))
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| "gRPC-Web frame length exceeds the body".to_string())?;
+        match flag {
+            0x00 | 0x01 => {
+                if message.is_some() {
+                    return Err(
+                        "gRPC body carries more than one message frame (unary only)".to_string()
+                    );
+                }
+                message = Some(&data[pos..end]);
+            }
+            0x80 => trailer = Some(&data[pos + 5..end]),
+            _ => return Err("gRPC-Web frame has an invalid flag".to_string()),
+        }
+        pos = end;
+    }
+    Ok((message, trailer))
+}
+
+/// `true` when a gRPC-Web trailer block carries one unambiguous non-zero
+/// terminal `grpc-status` (the same rule as
+/// [`grpc_empty_response_is_terminal_error`]).
+fn grpc_web_trailer_is_terminal_error(block: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return false;
+    };
+    let mut status: Option<&str> = None;
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.trim().eq_ignore_ascii_case("grpc-status") {
+            if status.is_some() {
+                return false;
+            }
+            status = Some(value.trim());
+        }
+    }
+    status
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|code| (1..=16).contains(&code))
+}
+
+/// Fixed diagnostic for a protobuf payload the wire preflight or the reflection
+/// decoder rejected.
+const PROTOBUF_DECODE_FAILED_DETAIL: &str = "Protobuf decode failed";
+
+/// Maximum number of field values (scalar elements included) one decoded
+/// message tree may carry. Every value becomes a reflected node, so this bounds
+/// the graph `DynamicMessage::decode` materializes independently of the byte
+/// size of the payload that encodes it.
+const MAX_PROTOBUF_VALUES: usize = 1 << 20;
+
+/// Conservative reflected-graph cost of one decoded message (descriptor handle
+/// plus its field map), charged to the aggregate decode budget.
+const PROTOBUF_REFLECTED_MESSAGE_BYTES: usize = 256;
+
+/// Conservative reflected-graph cost of one decoded field value.
+const PROTOBUF_REFLECTED_VALUE_BYTES: usize = 64;
+
+/// Counts the descriptor-aware wire preflight charges before reflection.
+#[derive(Default)]
+struct ProtobufDecodePreflight {
+    messages: usize,
+    values: usize,
+    /// Whether any closed (proto2) enum occurrence carried an undeclared
+    /// number. The decoder would install it as an ordinary value; a conforming
+    /// reader moves it to the unknown-field set instead.
+    undeclared_closed_enum: bool,
+}
+
+/// Why the wire preflight refused a payload.
+enum PreflightError {
+    Malformed,
+    Budget,
+    Depth,
+    /// A closed-enum occurrence outside the declared set under
+    /// `protobuf_reject_unknown_fields`: an unknown field to a conforming
+    /// proto2 reader.
+    UnknownClosedEnum,
+}
+
+impl PreflightError {
+    fn into_failure(self) -> ProtobufFailure {
+        let detail = match self {
+            Self::Malformed => PROTOBUF_DECODE_FAILED_DETAIL,
+            Self::Budget => PROTOBUF_BUDGET_DETAIL,
+            Self::Depth => PROTOBUF_DEPTH_DETAIL,
+            Self::UnknownClosedEnum => "Message contains 1 unknown field(s)",
+        };
+        ProtobufFailure::Invalid(detail.to_string())
+    }
+}
+
+impl ProtobufDecodePreflight {
+    fn charge_message(&mut self) -> Result<(), PreflightError> {
+        self.messages += 1;
+        if self.messages > MAX_PROTOBUF_MESSAGES {
+            return Err(PreflightError::Budget);
+        }
+        Ok(())
+    }
+
+    fn charge_values(&mut self, count: usize) -> Result<(), PreflightError> {
+        self.values = self.values.saturating_add(count);
+        if self.values > MAX_PROTOBUF_VALUES {
+            return Err(PreflightError::Budget);
+        }
+        Ok(())
+    }
+
+    fn reflected_bytes(&self) -> usize {
+        self.messages
+            .saturating_mul(PROTOBUF_REFLECTED_MESSAGE_BYTES)
+            .saturating_add(self.values.saturating_mul(PROTOBUF_REFLECTED_VALUE_BYTES))
+    }
+}
+
+/// How a field number is shaped on the wire, from the descriptor.
+enum WireFieldShape {
+    /// A message (or group, or map entry) value: its payload is a nested
+    /// message the decoder reflects.
+    Message(MessageDescriptor),
+    /// A repeated numeric field whose length-delimited form is packed.
+    Packed(PackedWidth),
+    /// A CLOSED (proto2) enum field. Each wire occurrence is judged on its own:
+    /// a conforming reader puts an undeclared number in the unknown-field set
+    /// and keeps any earlier declared value, while the reflection decoder simply
+    /// overwrites the field with the last number it read.
+    ClosedEnum {
+        enum_type: EnumDescriptor,
+        repeated: bool,
+    },
+    /// Anything else: one value per occurrence.
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum PackedWidth {
+    Varint,
+    Fixed32,
+    Fixed64,
+}
+
+fn wire_field_shape(descriptor: &MessageDescriptor, number: u32) -> WireFieldShape {
+    let (kind, is_list) = if let Some(field) = descriptor.get_field(number) {
+        (field.kind(), field.is_list())
+    } else if let Some(extension) = descriptor.get_extension(number) {
+        (extension.kind(), extension.is_list())
+    } else {
+        return WireFieldShape::Other;
+    };
+    match kind {
+        Kind::Message(message) => WireFieldShape::Message(message),
+        Kind::Enum(enum_type) if enum_is_closed(&enum_type) => WireFieldShape::ClosedEnum {
+            enum_type,
+            repeated: is_list,
+        },
+        _ if !is_list => WireFieldShape::Other,
+        Kind::Double | Kind::Fixed64 | Kind::Sfixed64 => {
+            WireFieldShape::Packed(PackedWidth::Fixed64)
+        }
+        Kind::Float | Kind::Fixed32 | Kind::Sfixed32 => {
+            WireFieldShape::Packed(PackedWidth::Fixed32)
+        }
+        Kind::Int32
+        | Kind::Int64
+        | Kind::Uint32
+        | Kind::Uint64
+        | Kind::Sint32
+        | Kind::Sint64
+        | Kind::Bool
+        | Kind::Enum(_) => WireFieldShape::Packed(PackedWidth::Varint),
+        Kind::String | Kind::Bytes => WireFieldShape::Other,
+    }
+}
+
+fn read_wire_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for index in 0..10u32 {
+        let byte = *buf.get(*pos)?;
+        *pos += 1;
+        // The tenth byte may contribute only the 64th bit.
+        if index == 9 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn take_wire_bytes<'a>(buf: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = pos.checked_add(len)?;
+    let bytes = buf.get(*pos..end)?;
+    *pos = end;
+    Some(bytes)
+}
+
+/// Descriptor-aware wire preflight: walk the encoded message without
+/// allocating, charging every message and every field value (each packed
+/// element included) against the inspection budgets and the nesting depth.
+///
+/// It runs for every pool and policy before `DynamicMessage::decode`, so the
+/// reflected graph is bounded before it exists — a post-decode walk can only
+/// observe allocations that already happened, and used to be skipped entirely
+/// for a proto3-only pool with default unknown-field handling. It is never
+/// stricter than the decoder about well-formed input: anything it calls
+/// malformed the decoder rejects too.
+///
+/// `end_group` is `Some(field)` while scanning a group's contents. Returns the
+/// number of bytes consumed (the whole buffer for a message body; through the
+/// matching end-group tag for a group).
+fn preflight_protobuf_fields(
+    buf: &[u8],
+    descriptor: Option<&MessageDescriptor>,
+    end_group: Option<u32>,
+    depth: usize,
+    budget: &mut ProtobufDecodePreflight,
+    policy: ProtobufMessagePolicy,
+) -> Result<usize, PreflightError> {
+    if depth > MAX_PROTOBUF_MESSAGE_DEPTH {
+        return Err(PreflightError::Depth);
+    }
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let key = read_wire_varint(buf, &mut pos).ok_or(PreflightError::Malformed)?;
+        let wire_type = key & 0x7;
+        let number = u32::try_from(key >> 3).map_err(|_| PreflightError::Malformed)?;
+        if number == 0 {
+            return Err(PreflightError::Malformed);
+        }
+        if wire_type == 4 {
+            return if end_group == Some(number) {
+                Ok(pos)
+            } else {
+                Err(PreflightError::Malformed)
+            };
+        }
+        budget.charge_values(1)?;
+        let shape = match descriptor {
+            Some(descriptor) => wire_field_shape(descriptor, number),
+            None => WireFieldShape::Other,
+        };
+        match wire_type {
+            0 => {
+                let value = read_wire_varint(buf, &mut pos).ok_or(PreflightError::Malformed)?;
+                if let WireFieldShape::ClosedEnum { enum_type, .. } = &shape
+                    && !closed_enum_value_is_declared(enum_type, value)
+                {
+                    if policy.reject_unknown {
+                        return Err(PreflightError::UnknownClosedEnum);
+                    }
+                    budget.undeclared_closed_enum = true;
+                }
+            }
+            1 => {
+                take_wire_bytes(buf, &mut pos, 8).ok_or(PreflightError::Malformed)?;
+            }
+            5 => {
+                take_wire_bytes(buf, &mut pos, 4).ok_or(PreflightError::Malformed)?;
+            }
+            2 => {
+                let len = read_wire_varint(buf, &mut pos)
+                    .and_then(|len| usize::try_from(len).ok())
+                    .ok_or(PreflightError::Malformed)?;
+                let payload =
+                    take_wire_bytes(buf, &mut pos, len).ok_or(PreflightError::Malformed)?;
+                match shape {
+                    WireFieldShape::Message(nested) if nested.is_map_entry() => {
+                        // A map entry is not a reflected message of its own
+                        // (its key and value land in the parent's map), so it
+                        // adds no nesting level; its value message does. The
+                        // decoder materializes a DEFAULT value message for every
+                        // entry even when the value field is omitted on the
+                        // wire, so that message is charged here, once per
+                        // entry, and not again for an explicit value.
+                        if matches!(nested.map_entry_value_field().kind(), Kind::Message(_)) {
+                            budget.charge_message()?;
+                        }
+                        preflight_protobuf_fields(
+                            payload,
+                            Some(&nested),
+                            None,
+                            depth,
+                            budget,
+                            policy,
+                        )?;
+                    }
+                    WireFieldShape::Message(nested) => {
+                        let charged_by_map_entry = number == MAP_ENTRY_VALUE_FIELD
+                            && descriptor.is_some_and(MessageDescriptor::is_map_entry);
+                        if !charged_by_map_entry {
+                            budget.charge_message()?;
+                        }
+                        preflight_protobuf_fields(
+                            payload,
+                            Some(&nested),
+                            None,
+                            depth + 1,
+                            budget,
+                            policy,
+                        )?;
+                    }
+                    WireFieldShape::ClosedEnum {
+                        enum_type,
+                        repeated: true,
+                        ..
+                    } => {
+                        // Packed closed-enum list: every element is its own
+                        // occurrence.
+                        let mut element = 0usize;
+                        let mut elements = 0usize;
+                        while element < payload.len() {
+                            let value = read_wire_varint(payload, &mut element)
+                                .ok_or(PreflightError::Malformed)?;
+                            elements += 1;
+                            if !closed_enum_value_is_declared(&enum_type, value) {
+                                if policy.reject_unknown {
+                                    return Err(PreflightError::UnknownClosedEnum);
+                                }
+                                budget.undeclared_closed_enum = true;
+                            }
+                        }
+                        budget.charge_values(elements)?;
+                    }
+                    WireFieldShape::Packed(width) => {
+                        let elements = match width {
+                            PackedWidth::Varint => {
+                                payload.iter().filter(|byte| **byte & 0x80 == 0).count()
+                            }
+                            PackedWidth::Fixed32 => payload.len() / 4,
+                            PackedWidth::Fixed64 => payload.len() / 8,
+                        };
+                        budget.charge_values(elements)?;
+                    }
+                    WireFieldShape::ClosedEnum { .. } | WireFieldShape::Other => {}
+                }
+            }
+            3 => {
+                // A group: a declared group field's message, or an unknown
+                // group whose nested fields the decoder retains as unknown
+                // field sets. Both are charged as one nesting level.
+                budget.charge_message()?;
+                let nested = match shape {
+                    WireFieldShape::Message(nested) => Some(nested),
+                    _ => None,
+                };
+                let consumed = preflight_protobuf_fields(
+                    &buf[pos..],
+                    nested.as_ref(),
+                    Some(number),
+                    depth + 1,
+                    budget,
+                    policy,
+                )?;
+                pos += consumed;
+            }
+            _ => return Err(PreflightError::Malformed),
+        }
+    }
+    if end_group.is_some() {
+        // A group opened in this buffer never closed.
+        return Err(PreflightError::Malformed);
+    }
+    Ok(pos)
+}
+
+/// A map entry's value field number (`MapEntry.value = 2`).
+const MAP_ENTRY_VALUE_FIELD: u32 = 2;
+
+/// Whether a wire varint is a declared number of a closed enum. Enum numbers
+/// are `int32` on the wire (negative numbers are sign-extended to ten bytes),
+/// so the truncation matches the decoder's own `int32` read.
+fn closed_enum_value_is_declared(enum_type: &EnumDescriptor, value: u64) -> bool {
+    enum_type.get_value(value as i32).is_some()
+}
+
+/// Fixed-capacity output for [`strip_undeclared_closed_enums`].
+///
+/// The sanitizer writes into ONE caller-allocated slice of exactly the
+/// payload's length and never allocates: a nested message or packed list keeps
+/// its original length-prefix width, and the slot is back-filled once the
+/// rewritten content's length is known. Bytes are only ever removed, so the
+/// output can never outgrow the input, and an attempt to would be refused as
+/// malformed rather than reallocating outside the charged working set.
+struct WireWriter<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl WireWriter<'_> {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), PreflightError> {
+        let end = self
+            .len
+            .checked_add(bytes.len())
+            .filter(|end| *end <= self.out.len())
+            .ok_or(PreflightError::Malformed)?;
+        self.out[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+
+    /// Reserve `width` bytes for a length prefix, returning its offset.
+    fn reserve_slot(&mut self, width: usize) -> Result<usize, PreflightError> {
+        let start = self.len;
+        let end = start
+            .checked_add(width)
+            .filter(|end| *end <= self.out.len())
+            .ok_or(PreflightError::Malformed)?;
+        self.len = end;
+        Ok(start)
+    }
+
+    /// Back-fill a reserved slot with the length of everything written after
+    /// it, as a varint padded to the slot's original width (continuation bits
+    /// on every byte but the last). Protobuf readers accept a non-minimal
+    /// varint, and the rewritten length never exceeds the original one, so it
+    /// always fits.
+    fn fill_length_slot(&mut self, start: usize, width: usize) -> Result<(), PreflightError> {
+        let content_start = start + width;
+        let mut value = (self.len - content_start) as u64;
+        if width < 10 && value >> (7 * width) != 0 {
+            return Err(PreflightError::Malformed);
+        }
+        for index in 0..width {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if index + 1 < width {
+                byte |= 0x80;
+            }
+            self.out[start + index] = byte;
+        }
+        Ok(())
+    }
+}
+
+/// Re-encode an already preflighted message with every undeclared closed-enum
+/// occurrence removed: the inspection representation a conforming proto2
+/// reader would build, where such a number goes to the unknown-field set and
+/// never becomes (or overwrites, or selects in a oneof) the field's value.
+///
+/// Decoding THAT with the reflection decoder makes ordinary merge, last-wins,
+/// and oneof semantics — and therefore the post-decode `required` walk —
+/// conform, including across merged submessage occurrences. Only the
+/// inspection copy is rewritten; the backend still receives the original
+/// bytes. The rewrite is in place in one fixed output (see [`WireWriter`]),
+/// so its whole allocation is the single payload-sized buffer the caller
+/// charged before allocating it — no per-nesting-level buffer exists. The
+/// preflight already validated the framing and bounded the depth, so the same
+/// grammar errors are reported as malformed here.
+fn strip_undeclared_closed_enums(
+    buf: &[u8],
+    descriptor: Option<&MessageDescriptor>,
+    end_group: Option<u32>,
+    out: &mut WireWriter<'_>,
+) -> Result<usize, PreflightError> {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let field_start = pos;
+        let key = read_wire_varint(buf, &mut pos).ok_or(PreflightError::Malformed)?;
+        let wire_type = key & 0x7;
+        let number = u32::try_from(key >> 3).map_err(|_| PreflightError::Malformed)?;
+        if wire_type == 4 {
+            return if end_group == Some(number) {
+                out.push(&buf[field_start..pos])?;
+                Ok(pos)
+            } else {
+                Err(PreflightError::Malformed)
+            };
+        }
+        let shape = match descriptor {
+            Some(descriptor) => wire_field_shape(descriptor, number),
+            None => WireFieldShape::Other,
+        };
+        match wire_type {
+            0 => {
+                let value = read_wire_varint(buf, &mut pos).ok_or(PreflightError::Malformed)?;
+                let undeclared = matches!(
+                    &shape,
+                    WireFieldShape::ClosedEnum { enum_type, .. }
+                        if !closed_enum_value_is_declared(enum_type, value)
+                );
+                if !undeclared {
+                    out.push(&buf[field_start..pos])?;
+                }
+            }
+            1 => {
+                take_wire_bytes(buf, &mut pos, 8).ok_or(PreflightError::Malformed)?;
+                out.push(&buf[field_start..pos])?;
+            }
+            5 => {
+                take_wire_bytes(buf, &mut pos, 4).ok_or(PreflightError::Malformed)?;
+                out.push(&buf[field_start..pos])?;
+            }
+            2 => {
+                let tag_end = pos;
+                let len = read_wire_varint(buf, &mut pos)
+                    .and_then(|len| usize::try_from(len).ok())
+                    .ok_or(PreflightError::Malformed)?;
+                let width = pos - tag_end;
+                let payload =
+                    take_wire_bytes(buf, &mut pos, len).ok_or(PreflightError::Malformed)?;
+                match shape {
+                    WireFieldShape::Message(nested) => {
+                        out.push(&buf[field_start..tag_end])?;
+                        let slot = out.reserve_slot(width)?;
+                        strip_undeclared_closed_enums(payload, Some(&nested), None, out)?;
+                        out.fill_length_slot(slot, width)?;
+                    }
+                    WireFieldShape::ClosedEnum {
+                        enum_type,
+                        repeated: true,
+                    } => {
+                        out.push(&buf[field_start..tag_end])?;
+                        let slot = out.reserve_slot(width)?;
+                        let mut element = 0usize;
+                        while element < payload.len() {
+                            let start = element;
+                            let value = read_wire_varint(payload, &mut element)
+                                .ok_or(PreflightError::Malformed)?;
+                            if closed_enum_value_is_declared(&enum_type, value) {
+                                out.push(&payload[start..element])?;
+                            }
+                        }
+                        out.fill_length_slot(slot, width)?;
+                    }
+                    _ => out.push(&buf[field_start..pos])?,
+                }
+            }
+            3 => {
+                out.push(&buf[field_start..pos])?;
+                let nested = match shape {
+                    WireFieldShape::Message(nested) => Some(nested),
+                    _ => None,
+                };
+                let consumed =
+                    strip_undeclared_closed_enums(&buf[pos..], nested.as_ref(), Some(number), out)?;
+                pos += consumed;
+            }
+            _ => return Err(PreflightError::Malformed),
+        }
+    }
+    if end_group.is_some() {
+        return Err(PreflightError::Malformed);
+    }
+    Ok(pos)
 }
 
 fn default_grpc_max_decompressed_size_bytes() -> Result<usize, String> {
@@ -1735,6 +3129,12 @@ fn check_protobuf_message_at(
     Ok(())
 }
 
+/// Whether an enum type is CLOSED: declared in a proto2 file. A closed enum
+/// admits only its declared numbers; a proto3 (open) enum keeps any number.
+fn enum_is_closed(enum_type: &EnumDescriptor) -> bool {
+    enum_type.parent_file().syntax() == Syntax::Proto2
+}
+
 fn check_protobuf_message_in_value(
     value: &ProtobufValue,
     policy: ProtobufMessagePolicy,
@@ -1844,6 +3244,13 @@ fn optional_content_types(
     let Some(values) = optional_string_vec(config, field)? else {
         return Ok(None);
     };
+    if values.is_empty() {
+        // An empty list used to mean "every valid media type" — the opposite
+        // of what it reads as. Omit the field for the defaults instead.
+        return Err(format!(
+            "body_validator: `{field}` must not be empty; omit it to use the defaults"
+        ));
+    }
     let mut parsed = Vec::with_capacity(values.len());
     for (index, value) in values.into_iter().enumerate() {
         // Normalize configured media types the same way actual headers are
@@ -1862,12 +3269,71 @@ fn optional_content_types(
     Ok(Some(parsed))
 }
 
+/// Default request/response media types: JSON and XML, including their RFC
+/// 6838 structured-suffix types (`application/problem+json`,
+/// `application/vnd.acme.v2+json`, `application/atom+xml`, ...), which the
+/// JSON/XML dispatch already understands. gRPC-family types never match a
+/// pattern entry.
 fn default_content_types() -> Vec<String> {
     vec![
         "application/json".to_string(),
+        "application/*+json".to_string(),
         "application/xml".to_string(),
+        "application/*+xml".to_string(),
         "text/xml".to_string(),
     ]
+}
+
+/// Parse `response_status_codes`: a non-empty array of integer statuses
+/// (`100..=599`) and/or status classes `"1XX"`..`"5XX"`.
+fn optional_response_status_scope(config: &Value) -> Result<Option<ResponseStatusScope>, String> {
+    const FIELD: &str = "response_status_codes";
+    let Some(value) = config.get(FIELD) else {
+        return Ok(None);
+    };
+    let Some(entries) = value.as_array() else {
+        return Err(format!("body_validator: `{FIELD}` must be an array"));
+    };
+    if entries.is_empty() {
+        return Err(format!(
+            "body_validator: `{FIELD}` must not be empty; omit it to validate 2XX responses"
+        ));
+    }
+    let mut scope = ResponseStatusScope {
+        classes: [false; 6],
+        codes: Vec::new(),
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(code) = entry.as_u64() {
+            let Some(code) = u16::try_from(code)
+                .ok()
+                .filter(|code| (100..=599).contains(code))
+            else {
+                return Err(format!(
+                    "body_validator: `{FIELD}` integer entries must be HTTP statuses 100-599 \
+                     (invalid entry at index {index})"
+                ));
+            };
+            scope.codes.push(code);
+            continue;
+        }
+        let class = entry.as_str().and_then(|text| match text.as_bytes() {
+            [digit @ b'1'..=b'5', first, second]
+                if first.eq_ignore_ascii_case(&b'x') && second.eq_ignore_ascii_case(&b'x') =>
+            {
+                Some(usize::from(*digit - b'0'))
+            }
+            _ => None,
+        });
+        let Some(class) = class else {
+            return Err(format!(
+                "body_validator: `{FIELD}` entries must be integer statuses or classes `1XX`-`5XX` \
+                 (invalid entry at index {index})"
+            ));
+        };
+        scope.classes[class] = true;
+    }
+    Ok(Some(scope))
 }
 
 /// Media-type essence (`type`/`subtype`) from a `Content-Type` value: the token
@@ -1915,24 +3381,39 @@ fn is_media_type_token_byte(byte: u8) -> bool {
     )
 }
 
-/// Exact type/subtype match against configured media types.
+/// Type/subtype match against configured media types.
 ///
 /// Compares the normalized essence of `content_type` (parameters stripped,
 /// OWS trimmed, ASCII case-insensitive) to each configured entry. Distinct
 /// neighbors such as `application/json-seq` and parameter values that merely
-/// contain a configured string do not match. An empty configured list means
-/// "match all valid media types" (legacy). A malformed actual value never
-/// matches, including when the configured list is empty.
+/// contain a configured string do not match. A malformed actual value never
+/// matches. The configured list is never empty (construction rejects it).
+///
+/// An entry of the form `type/*+suffix` is a structured-suffix pattern: it
+/// matches any `type/<name>+suffix` with a non-empty `<name>`, except the
+/// gRPC-family types (`application/grpc+json`, `application/grpc-web+json`),
+/// whose bodies are length-prefixed frames rather than a document.
 fn content_type_matches(configured: &[String], content_type: &str) -> bool {
     let Some(actual) = media_type_essence(content_type) else {
         return false;
     };
-    if configured.is_empty() {
-        return true;
-    }
-    configured
-        .iter()
-        .any(|expected| actual.eq_ignore_ascii_case(expected))
+    configured.iter().any(|expected| {
+        if let Some((type_name, suffix)) = expected
+            .split_once("/*+")
+            .filter(|(_, suffix)| !suffix.is_empty())
+        {
+            let Some((actual_type, actual_subtype)) = actual.split_once('/') else {
+                return false;
+            };
+            actual_type.eq_ignore_ascii_case(type_name)
+                && actual_subtype.len() > suffix.len() + 1
+                && ascii_ends_with_ignore_case(actual_subtype, suffix)
+                && actual_subtype.as_bytes()[actual_subtype.len() - suffix.len() - 1] == b'+'
+                && grpc_representation(actual).is_none()
+        } else {
+            actual.eq_ignore_ascii_case(expected)
+        }
+    })
 }
 
 /// Whether the request declares a `Content-Encoding` the shared representation
@@ -1947,16 +3428,6 @@ fn request_declares_content_coding(headers: &HashMap<String, String>) -> bool {
     headers
         .get("content-encoding")
         .is_some_and(|value| super::request_representation::requires_decode_judgment(value))
-}
-
-fn is_grpc_content_type(content_type: &str) -> bool {
-    // gRPC media types use application/grpc or a registered representation
-    // suffix such as application/grpc+proto. Parameters never participate.
-    let Some(media_type) = media_type_essence(content_type) else {
-        return false;
-    };
-    media_type.eq_ignore_ascii_case("application/grpc")
-        || ascii_starts_with_ignore_case(media_type, "application/grpc+")
 }
 
 /// Enforce bounded internal-entity policy and reject every external identifier.
@@ -2678,6 +4149,7 @@ fn parse_protobuf_shape(config: &Value) -> Result<ProtobufShape, String> {
                         .to_string(),
                 );
             }
+            targets.method_entries.insert(method_path.clone());
             if request.is_some() {
                 targets.method_requests.insert(method_path.clone());
             }
@@ -2881,40 +4353,6 @@ const NON_UTF8_RESPONSE_BODY: &str = "Response body is not valid UTF-8";
 const REQUEST_BODY_REPRESENTATION_UNAVAILABLE: &str =
     "Request body representation was unavailable for validation";
 
-/// Build the client-facing 400 for a request-body validation failure.
-fn request_reject(msg: &str) -> PluginResult {
-    // Every producer builds a payload-free diagnostic. `bound_detail` is the
-    // compiled-in size ceiling on top of that, never the confidentiality
-    // mechanism (`GHSA-5p2h-fq6q-gwh9`).
-    let detail = bound_detail(msg);
-    PluginResult::Reject {
-        status_code: 400,
-        body: serde_json::json!({
-            "error": "Request body validation failed",
-            "details": detail
-        })
-        .to_string(),
-        headers: HashMap::new(),
-    }
-}
-
-/// Build the client-facing 502 for a response-body validation failure.
-fn response_reject(msg: &str) -> PluginResult {
-    // Response diagnostics are payload-free and deliberately coarser than
-    // request diagnostics; retain the same compiled-in ceiling before they
-    // reach either the client or tracing (`GHSA-5p2h-fq6q-gwh9`).
-    let detail = bound_detail(msg);
-    PluginResult::Reject {
-        status_code: 502,
-        body: serde_json::json!({
-            "error": "Response body validation failed",
-            "details": detail
-        })
-        .to_string(),
-        headers: HashMap::new(),
-    }
-}
-
 /// `true` when an empty gRPC reply is a legitimate terminal error response:
 /// the hook-visible header map carries one unambiguous non-zero terminal status
 /// and no message frame is sent.
@@ -2940,28 +4378,6 @@ fn grpc_empty_response_is_terminal_error(response_headers: &HashMap<String, Stri
     (1..=16).contains(&code)
 }
 
-/// Helper to build a rejection `PluginResult` for protobuf validation failures.
-fn protobuf_reject(status_code: u16, direction: &str, msg: &str) -> PluginResult {
-    let msg = bound_detail(msg);
-    debug!(
-        "body_validator: {} protobuf validation failed: {}",
-        direction, msg
-    );
-    PluginResult::Reject {
-        status_code,
-        body: serde_json::json!({
-            "error": if status_code == 400 {
-                "Request body validation failed"
-            } else {
-                "Response body validation failed"
-            },
-            "details": msg
-        })
-        .to_string(),
-        headers: HashMap::new(),
-    }
-}
-
 #[async_trait]
 impl Plugin for BodyValidator {
     fn name(&self) -> &str {
@@ -2985,9 +4401,11 @@ impl Plugin for BodyValidator {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        // JSON/XML validation reads request_body from metadata in before_proxy.
-        // Protobuf validation runs in on_final_request_body and should not force pre-before_proxy buffering.
-        self.has_pre_proxy_request_validation
+        // JSON/XML validation reads request_body from metadata in before_proxy,
+        // and strict media-type admission needs to know whether an ungoverned
+        // request carries a body. Protobuf validation runs in
+        // on_final_request_body and should not force pre-before_proxy buffering.
+        self.has_pre_proxy_request_validation || self.reject_unsupported_media_types
     }
 
     fn requires_request_body_buffering(&self) -> bool {
@@ -3000,7 +4418,7 @@ impl Plugin for BodyValidator {
     /// metadata text view when one exists (composition with `ai_prompt_shield`)
     /// and falls back to these bytes only when that text view is absent.
     fn needs_request_body_bytes(&self) -> bool {
-        self.has_pre_proxy_request_validation
+        self.has_pre_proxy_request_validation || self.reject_unsupported_media_types
     }
 
     fn needs_request_body_text(&self) -> bool {
@@ -3027,16 +4445,28 @@ impl Plugin for BodyValidator {
             .map(String::as_str)
             .unwrap_or("");
 
-        // Native gRPC is governed only by configured protobuf descriptors.
-        if is_grpc_content_type(content_type) {
-            return self.has_protobuf_request_validation;
+        // gRPC is governed only by configured protobuf descriptors, and only
+        // for the methods they enroll: buffering an unenrolled method would take
+        // it off the streaming path (deadlocking bidi RPCs and collecting
+        // unbounded server streams) only for the hooks to skip it.
+        if grpc_representation(content_type).is_some() {
+            return self.has_protobuf_request_validation && self.protobuf_request_may_apply(ctx);
         }
 
         // Everything else is governed only by the configured JSON/XML rules. A
         // protobuf-only instance must not pull unrelated media types onto the
         // buffered path: its final hook would no-op on them anyway.
-        self.has_pre_proxy_request_validation
+        if self.has_pre_proxy_request_validation
             && content_type_matches(&self.content_types, content_type)
+        {
+            return true;
+        }
+
+        // Strict media-type admission must learn whether an ungoverned request
+        // carries a body when its headers do not already say.
+        self.reject_unsupported_media_types
+            && !request_headers_declare_body_framing(&ctx.headers)
+            && !request_opens_tunnel(ctx)
     }
 
     async fn before_proxy(
@@ -3044,10 +4474,10 @@ impl Plugin for BodyValidator {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only the configured JSON/XML rules decide here; protobuf validation
-        // runs in `on_final_request_body`. The request method is deliberately
-        // not consulted (`GHSA-2vmr-ww8r-mww3`).
-        if !self.has_pre_proxy_request_validation {
+        // Only the configured JSON/XML rules (and strict media-type admission)
+        // decide here; protobuf validation runs in `on_final_request_body`. The
+        // request method is deliberately not consulted (`GHSA-2vmr-ww8r-mww3`).
+        if !self.has_pre_proxy_request_validation && !self.reject_unsupported_media_types {
             return PluginResult::Continue;
         }
 
@@ -3057,24 +4487,36 @@ impl Plugin for BodyValidator {
             .map(String::as_str)
             .unwrap_or("");
 
-        // gRPC protobuf validation is handled in on_final_request_body, not here
-        if is_grpc_content_type(content_type) {
+        // gRPC protobuf validation is handled in on_final_request_body, not here.
+        if grpc_representation(content_type).is_some() {
+            if self.reject_unsupported_media_types && !self.has_protobuf_request_validation {
+                // gRPC is a body-bearing protocol this instance has no rule for.
+                return self.violation(
+                    Some(ctx),
+                    Direction::Request,
+                    415,
+                    UNSUPPORTED_MEDIA_TYPE_DETAIL,
+                );
+            }
             return PluginResult::Continue;
         }
 
-        if !content_type_matches(&self.content_types, content_type) {
+        if !self.json_xml_request_rule_inspects(content_type) {
+            // The media type is outside the configured allowlist, or inside it
+            // but no configured rule can inspect it. Nothing to decide — unless
+            // strict media-type admission refuses a body nothing inspects.
+            if self.reject_unsupported_media_types && ungoverned_request_carries_body(ctx, headers)
+            {
+                return self.violation(
+                    Some(ctx),
+                    Direction::Request,
+                    415,
+                    UNSUPPORTED_MEDIA_TYPE_DETAIL,
+                );
+            }
             return PluginResult::Continue;
         }
-
         let validate_as_json = is_json_like_content_type(content_type);
-        let validate_as_xml = !validate_as_json
-            && is_xml_like_content_type(content_type)
-            && self.has_xml_request_validation;
-        if !validate_as_json && !validate_as_xml {
-            // The media type is inside the configured allowlist but no
-            // configured rule can inspect it. Nothing to decide.
-            return PluginResult::Continue;
-        }
 
         // A declared, non-identity `Content-Encoding` means the representation
         // this early hook can see is a COMPRESSED encoding of the document the
@@ -3091,7 +4533,8 @@ impl Plugin for BodyValidator {
         // gate decodes it or fails it closed — and only for a representation
         // that actually reached this hook. A missing representation still fails
         // closed below, and an undecodable coding is still a rejection before
-        // backend egress.
+        // backend egress. (In `log_only` mode, which never claims, the final
+        // hook records the encoded representation as uninspected.)
         let defer_encoded_representation = request_declares_content_coding(headers)
             && self.final_request_body_policy_applies(headers);
 
@@ -3124,33 +4567,47 @@ impl Plugin for BodyValidator {
             None
         };
 
-        let result = match resolved {
+        // `Ok(Some(digest))`: the body was validated and passed; the digest lets
+        // the final hook recognize the byte-identical representation.
+        let result: Result<Option<[u8; 32]>, String> = match resolved {
             None => Err(REQUEST_BODY_REPRESENTATION_UNAVAILABLE.to_string()),
             // Present but encoded: the governed decode and the authoritative
             // verdict both belong to the final hook.
-            Some(_) if defer_encoded_representation => Ok(()),
+            Some(_) if defer_encoded_representation => Ok(None),
             Some(body) => match std::str::from_utf8(body) {
                 Err(_) => Err(NON_UTF8_REQUEST_BODY.to_string()),
-                Ok(body_str) if validate_as_json => Self::validate_json_body(
-                    body_str,
-                    &self.required_fields,
-                    self.json_validator.as_ref(),
-                    Direction::Request,
-                    Some(&mut json_scan_memo),
-                ),
-                Ok(body_str) => Self::validate_xml_body(
-                    body_str,
-                    &self.required_xml_elements,
-                    self.xml_max_entities,
-                    self.xml_reject_nested_entities,
-                ),
+                Ok(body_str) => {
+                    let verdict = if validate_as_json {
+                        Self::validate_json_body(
+                            body_str,
+                            &self.required_fields,
+                            self.json_validator.as_ref(),
+                            Direction::Request,
+                            Some(&mut json_scan_memo),
+                        )
+                    } else {
+                        Self::validate_xml_body(
+                            body_str,
+                            &self.required_xml_elements,
+                            self.xml_max_entities,
+                            self.xml_reject_nested_entities,
+                        )
+                    };
+                    verdict.map(|()| Some(early_request_digest(content_type, body)))
+                }
             },
         };
 
         ctx.json_scan_memo = json_scan_memo;
 
         match result {
-            Ok(()) => PluginResult::Continue,
+            Ok(Some(digest)) => {
+                ctx.plugin_state_mut()
+                    .body_validator_early_request_digests
+                    .insert(self.instance_id, digest);
+                PluginResult::Continue
+            }
+            Ok(None) => PluginResult::Continue,
             Err(msg) => {
                 if msg == REQUEST_BODY_REPRESENTATION_UNAVAILABLE {
                     // Fixed-cardinality operator signal: no request value, no
@@ -3159,11 +4616,8 @@ impl Plugin for BodyValidator {
                         plugin = "body_validator",
                         "Request body representation unavailable; failing closed"
                     );
-                } else {
-                    let detail = bound_detail(&msg);
-                    debug!("body_validator: request validation failed: {}", detail);
                 }
-                request_reject(&msg)
+                self.violation(Some(ctx), Direction::Request, 400, &msg)
             }
         }
     }
@@ -3173,7 +4627,17 @@ impl Plugin for BodyValidator {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        self.validate_final_request_body(headers, body, None).await
+        let undecoded_coding = self.enforcement_mode == EnforcementMode::LogOnly
+            && request_declares_content_coding(headers);
+        let verdict = self.evaluate_final_request_body(
+            None,
+            headers,
+            body,
+            None,
+            undecoded_coding,
+            BudgetRef::request_decode(),
+        );
+        self.finish_request_verdict(None, verdict)
     }
 
     /// Claim the finalized request representation whenever the configured
@@ -3185,14 +4649,16 @@ impl Plugin for BodyValidator {
     /// conversion below as compressed octets, failed it, and — before
     /// `GHSA-2vmr-ww8r-mww3` tightened it — was skipped; even after that fix it
     /// produced a confusing non-UTF-8 rejection rather than validating the
-    /// document the backend actually parses.
+    /// document the backend actually parses. `log_only` mode cannot refuse, so
+    /// it never claims (an undecodable coding must not become a `400` there).
     fn enforces_final_request_body_policy(
         &self,
         _ctx: &RequestContext,
         headers: &HashMap<String, String>,
         _body: &[u8],
     ) -> bool {
-        self.final_request_body_policy_applies(headers)
+        self.enforcement_mode == EnforcementMode::Block
+            && self.final_request_body_policy_applies(headers)
     }
 
     /// The shared backend-visible representation gate stages decoded plaintext
@@ -3200,14 +4666,29 @@ impl Plugin for BodyValidator {
     /// when `body_validator` is the only contextual plugin in the chain; without
     /// this capability the proxy takes the compatibility hook path with no
     /// context, so a body-validator-only configuration can never reach either
-    /// the charged decoder or the duplicate-key memo below.
+    /// the charged decoder, the duplicate-key memo, or the context-derived gRPC
+    /// method path below.
     fn needs_final_request_body_context(&self) -> bool {
         self.has_request_validation
     }
 
-    /// Context-aware variant so the duplicate-key screen of the final
+    /// A per-method protobuf rule is keyed on the BACKEND-effective method.
+    /// Listen-path stripping plus a proxy or target base path can replace the
+    /// service segment the client sent (`/v1.Greeter/Call` served as
+    /// `/v2.Greeter/Call`), so opt into backend-path resolution: the gateway
+    /// then binds the assembled path on every ladder before dispatch
+    /// (`authorized_backend_path`), the per-method selectors read it, and the
+    /// dispatchers re-ask the body-buffering votes against it. A default-type
+    /// configuration applies to every method and needs no resolution.
+    fn requires_backend_path_resolution(&self) -> bool {
+        !self.protobuf_targets.method_entries.is_empty()
+    }
+
+    /// Context-aware variant: the duplicate-key screen of the final
     /// backend-visible body is shared with every other governed plugin in this
-    /// hook stage (they all receive the same context object).
+    /// hook stage (they all receive the same context object), the gRPC method
+    /// path is recovered from the context when the dispatcher injected no
+    /// `:path`, and the outcome is published to metadata.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -3222,13 +4703,25 @@ impl Plugin for BodyValidator {
         // handle exists only to escape the borrow of `ctx` that the memo take
         // below needs.
         let decoded_view = ctx.inspectable_final_request_body_owned();
+        let decoded = decoded_view.is_some();
         let body: &[u8] = decoded_view.as_deref().unwrap_or(body);
+        if self.final_request_body_matches_early_pass(ctx, headers, body) {
+            return PluginResult::Continue;
+        }
+        let undecoded_coding = self.enforcement_mode == EnforcementMode::LogOnly
+            && !decoded
+            && request_declares_content_coding(headers);
         let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
-        let result = self
-            .validate_final_request_body(headers, body, Some(&mut json_scan_memo))
-            .await;
+        let verdict = self.evaluate_final_request_body(
+            Some(&*ctx),
+            headers,
+            body,
+            Some(&mut json_scan_memo),
+            undecoded_coding,
+            BudgetRef::request_decode(),
+        );
         ctx.json_scan_memo = json_scan_memo;
-        result
+        self.finish_request_verdict(Some(ctx), verdict)
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -3239,7 +4732,34 @@ impl Plugin for BodyValidator {
         // Request Accept is only client intent. Keep ordinary backend JSON/XML
         // and protobuf responses on the validator path until response headers
         // prove that the backend selected an event stream.
-        self.has_response_validation && !request_method_omits_response_body(&ctx.method)
+        if !self.has_response_validation || request_method_omits_response_body(&ctx.method) {
+            return false;
+        }
+        // A gRPC request (native, translated gRPC-Web, or pass-through
+        // gRPC-Web) answers in gRPC framing, which only an applicable protobuf
+        // descriptor inspects. Buffering an unenrolled method would take it off
+        // the streaming path for nothing.
+        if super::grpc_web::client_grpc_framing_representation(ctx).is_some() {
+            return self.applicable_protobuf_response_validation(ctx);
+        }
+        self.has_json_response_validation()
+            || self.has_xml_response_validation
+            || self.applicable_protobuf_response_validation(ctx)
+    }
+
+    /// A zero-byte synthetic success (for example a `response_mock` rule with
+    /// an empty body) is a representation the configured rules must judge — an
+    /// empty JSON/XML document is invalid — so opt into the synthetic body
+    /// pipeline for it. Protocol-defined no-body responses, out-of-scope
+    /// statuses, and fragments stay exempt exactly as on the backend path.
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+    ) -> bool {
+        self.has_response_validation
+            && self.response_status_validated(ctx, response_status)
+            && !synthetic_response_omits_body(&ctx.method, response_status)
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
@@ -3253,10 +4773,12 @@ impl Plugin for BodyValidator {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         // Once headers prove the representation is outside JSON/XML/gRPC
-        // validation scope (or is an unbounded event stream), retries must not
-        // keep pinning it on the buffered path. Matching types stay buffered.
+        // validation scope (or is an unbounded event stream, an out-of-scope
+        // status, or a fragment), retries must not keep pinning it on the
+        // buffered path. Matching types stay buffered.
         self.should_buffer_response_body(ctx)
             && (synthetic_response_omits_body(&ctx.method, response_status)
+                || !self.response_status_validated(ctx, response_status)
                 || !self.response_body_requires_buffering_for_media_type(
                     ctx,
                     response_headers.get("content-type").map(String::as_str),
@@ -3286,11 +4808,13 @@ impl Plugin for BodyValidator {
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         // Narrow the pre-flight vote after backend headers arrive: release
-        // media types the final hook would skip (binary downloads, etc.) while
-        // keeping matching JSON/XML and applicable gRPC protobuf responses
-        // buffered for validation.
+        // media types the final hook would skip (binary downloads, etc.),
+        // statuses outside `response_status_codes`, and range/delta fragments,
+        // while keeping matching JSON/XML and applicable gRPC protobuf
+        // responses buffered for validation.
         self.should_buffer_response_body(ctx)
             && !synthetic_response_omits_body(&ctx.method, response_status)
+            && self.response_status_validated(ctx, response_status)
             && self.response_body_requires_buffering_for_media_type(ctx, content_type)
     }
 
@@ -3302,17 +4826,15 @@ impl Plugin for BodyValidator {
     ) -> PluginResult {
         if self.should_buffer_response_body(ctx)
             && !synthetic_response_omits_body(&ctx.method, response_status)
+            && self.response_status_validated(ctx, response_status)
             && original_response_is_event_stream(ctx, response_headers)
         {
-            return PluginResult::Reject {
-                status_code: 502,
-                body: serde_json::json!({
-                    "error": "Response body validation failed",
-                    "details": "event-stream responses require a bounded streaming validator"
-                })
-                .to_string(),
-                headers: HashMap::new(),
-            };
+            return self.violation(
+                Some(ctx),
+                Direction::Response,
+                502,
+                "event-stream responses require a bounded streaming validator",
+            );
         }
         PluginResult::Continue
     }
@@ -3321,19 +4843,31 @@ impl Plugin for BodyValidator {
     /// gate decodes it to plaintext — or fails it closed — before validation
     /// (`GHSA-4vqr-427g-5cg7`).
     ///
-    /// Narrow on purpose: only when the configured JSON/XML rules would inspect
-    /// this media type AND the pristine pre-`after_proxy` stamp says the origin
-    /// declared a content coding. An identity-coded response is already the
-    /// representation this plugin validates, so nothing changes for it. Gateway
-    /// compression is not a reason to claim: it now runs in the deferred
-    /// transport-encoding stage, after this plugin has decided.
+    /// Narrow on purpose: only in `block` mode, only when the configured
+    /// JSON/XML rules would inspect this media type, only for a complete
+    /// (non-fragment) representation, AND only when the pristine
+    /// pre-`after_proxy` stamp says the origin declared a content coding. An
+    /// identity-coded response is already the representation this plugin
+    /// validates, so nothing changes for it. Gateway compression is not a
+    /// reason to claim: it now runs in the deferred transport-encoding stage,
+    /// after this plugin has decided.
     fn enforces_response_body_policy(
         &self,
         ctx: &RequestContext,
         response_content_type: Option<&str>,
         _response_body: &[u8],
     ) -> bool {
-        self.final_response_body_policy_applies(response_content_type)
+        self.enforcement_mode == EnforcementMode::Block
+            && self.final_response_body_policy_applies(response_content_type)
+            // A status outside `response_status_codes` is never validated, so
+            // its encoded body must not be claimed (decoded, or refused for an
+            // unsupported coding / exhausted budget) on this plugin's behalf.
+            && ctx
+                .origin_http_response_status()
+                .is_none_or(|status| self.response_status_validated(ctx, status))
+            && !ctx
+                .metadata
+                .contains_key(crate::proxy::ORIGIN_FRAGMENT_RESPONSE_METADATA_KEY)
             && ctx
                 .metadata
                 .contains_key(crate::proxy::ORIGIN_ENCODED_RESPONSE_METADATA_KEY)
@@ -3369,6 +4903,13 @@ impl Plugin for BodyValidator {
             return PluginResult::Continue;
         }
 
+        // A response schema describes a complete success document. Statuses
+        // outside `response_status_codes` (default `2XX`) keep the backend's
+        // own status and body, and a `206`/`226` fragment is not a document.
+        if !self.response_status_validated(ctx, response_status) {
+            return PluginResult::Continue;
+        }
+
         // The ONLY no-body exemptions are the ones HTTP itself defines. An
         // ordinary body-bearing success (200, 201, …) that arrives empty is a
         // validation failure, not an exemption (`GHSA-2vmr-ww8r-mww3`), and the
@@ -3384,8 +4925,8 @@ impl Plugin for BodyValidator {
             .map(String::as_str)
             .unwrap_or("");
 
-        // gRPC protobuf response validation
-        if is_grpc_content_type(content_type) {
+        // gRPC protobuf response validation, in native or gRPC-Web framing.
+        if let Some(representation) = grpc_representation(content_type) {
             if !self.has_protobuf_response_validation {
                 return PluginResult::Continue;
             }
@@ -3400,26 +4941,38 @@ impl Plugin for BodyValidator {
             // Resolve the gRPC method path from the request, NOT response headers.
             // Backends never echo `:path` in responses, so reading response_headers
             // would always miss per-method `protobuf_method_messages` overrides.
-            let grpc_path = Self::grpc_method_path_for_response(ctx);
+            let grpc_path = Self::grpc_method_path(ctx).into_owned();
             if self.protobuf_dependency_unavailable
                 && self.protobuf_targets.response_applies(&grpc_path)
             {
-                return protobuf_reject(
+                return self.violation(
+                    Some(ctx),
+                    Direction::Response,
                     502,
-                    "response",
                     "configured protobuf descriptor dependency is unavailable",
                 );
             }
-            let descriptor = match self.get_response_descriptor(&grpc_path) {
-                Some(d) => d,
-                None => return PluginResult::Continue,
+            let Some(descriptor) = self.get_response_descriptor(&grpc_path) else {
+                return PluginResult::Continue;
             };
             // 502 Bad Gateway: the backend returned a response whose protobuf
             // payload does not match the expected schema — i.e., the upstream
             // produced an invalid response, which is the definition of 502.
-            return match self.validate_protobuf_body(body, descriptor) {
+            return match self.validate_grpc_representation(
+                body,
+                representation,
+                descriptor,
+                Direction::Response,
+                Some(response_headers),
+                BudgetRef::global(),
+            ) {
                 Ok(()) => PluginResult::Continue,
-                Err(msg) => protobuf_reject(502, "response", &msg),
+                Err(ProtobufFailure::Invalid(msg)) => {
+                    self.violation(Some(ctx), Direction::Response, 502, &msg)
+                }
+                Err(ProtobufFailure::Capacity) => {
+                    self.capacity_refusal(Some(ctx), Direction::Response)
+                }
             };
         }
 
@@ -3442,11 +4995,24 @@ impl Plugin for BodyValidator {
             return PluginResult::Continue;
         }
 
+        // `log_only` mode never claims the representation gate, so an
+        // origin-encoded body it did not get decoded is not observable here.
+        if self.enforcement_mode == EnforcementMode::LogOnly
+            && response_headers
+                .get("content-encoding")
+                .is_some_and(|value| super::request_representation::requires_decode_judgment(value))
+        {
+            record_outcome(ctx, Direction::Response, OUTCOME_UNINSPECTED, None, None);
+            return PluginResult::Continue;
+        }
+
         // Convert body bytes to string for validation. A body the configured
         // rules cannot decode is not a passing response.
         let body_str = match std::str::from_utf8(body) {
             Ok(s) => s,
-            Err(_) => return response_reject(NON_UTF8_RESPONSE_BODY),
+            Err(_) => {
+                return self.violation(Some(ctx), Direction::Response, 502, NON_UTF8_RESPONSE_BODY);
+            }
         };
 
         // Determine validation type
@@ -3469,15 +5035,11 @@ impl Plugin for BodyValidator {
 
         match result {
             Ok(()) => PluginResult::Continue,
-            Err(msg) => {
-                // `msg` is already payload-free by construction, so the same
-                // string is safe for the client body and for internal tracing;
-                // there is no raw-detail development channel to fall back to
-                // (`GHSA-5p2h-fq6q-gwh9`).
-                let detail = bound_detail(&msg);
-                debug!("body_validator: response validation failed: {}", detail);
-                response_reject(&detail)
-            }
+            // `msg` is already payload-free by construction, so the same string
+            // is safe for the client body, for metadata, and for internal
+            // tracing; there is no raw-detail development channel to fall back
+            // to (`GHSA-5p2h-fq6q-gwh9`).
+            Err(msg) => self.violation(Some(ctx), Direction::Response, 502, &msg),
         }
     }
 
