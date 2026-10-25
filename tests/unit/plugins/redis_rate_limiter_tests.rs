@@ -9750,3 +9750,109 @@ async fn ownership_writes_require_exact_ok_watch_and_multi_acknowledgements() {
         let _ = server.shutdown.send(());
     }
 }
+
+// ── ws_rate_limiting aggregate budgets on a shared Redis key (PR #6867) ───
+
+/// Wait for detached hand-backs to land on the fake keyspace.
+async fn wait_for_charged_total(server: &KeyspaceServer, expected: i64) -> i64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let total = server.charged_total();
+        if total == expected || tokio::time::Instant::now() >= deadline {
+            return total;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// PR6867-SOL-1: an aggregate `limit_by` key is shared by every session, every
+/// reconnect, and every replica of one policy, so a refused frame must leave
+/// no lasting charge on it. Before the hand-back, each refused retry stayed on
+/// the counter and supplied the previous-window usage that refused the next
+/// one, starving the budget for everyone sharing the key indefinitely.
+#[tokio::test]
+async fn ws_aggregate_redis_refusals_leave_no_lasting_charge() {
+    use ferrum_edge::plugins::ws_rate_limiting::WsRateLimiting;
+    use ferrum_edge::plugins::{Plugin, PluginHttpClient, RequestContext, WebSocketFrameDirection};
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    let server = spawn_keyspace_redis_server(KeyspaceServerOptions::default()).await;
+    let config = json!({
+        "frames_per_second": 1,
+        "burst_size": 1,
+        "limit_by": "consumer",
+        "sync_mode": "redis",
+        "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+        "redis_health_check_interval_seconds": 3600,
+    });
+    // Two instances stand in for two gateway replicas of one policy: each has
+    // its own instance UUID, and aggregate keys must not carry it.
+    let replica_a =
+        Arc::new(WsRateLimiting::new(&config, PluginHttpClient::default()).expect("replica a"));
+    let replica_b =
+        Arc::new(WsRateLimiting::new(&config, PluginHttpClient::default()).expect("replica b"));
+    let mut ctx = RequestContext::new("10.0.0.1".to_string(), "GET".to_string(), "/ws".into());
+    let mut consumer = super::plugin_utils::create_test_consumer();
+    consumer.username = "alice".to_string();
+    ctx.identified_consumer = Some(Arc::new(consumer));
+    let session_a = Arc::clone(&replica_a)
+        .bind_ws_session(&ctx)
+        .expect("aggregate session on replica a");
+    let session_b = Arc::clone(&replica_b)
+        .bind_ws_session(&ctx)
+        .expect("aggregate session on replica b");
+    let direction = WebSocketFrameDirection::ClientToBackend;
+    let message = Message::Text("hello".into());
+
+    assert!(
+        session_a
+            .on_ws_frame("proxy", 1, direction, &message)
+            .await
+            .is_none(),
+        "the first frame fits the shared one-frame budget"
+    );
+    assert_eq!(server.charged_total(), 1);
+
+    // The other replica shares the budget, so its frame is refused...
+    let refused = session_b.on_ws_frame("proxy", 2, direction, &message).await;
+    assert!(
+        matches!(refused, Some(Message::Close(_))),
+        "a replica of the same policy must draw on the shared aggregate budget"
+    );
+    // ...and the refusal hands back exactly what it charged.
+    assert_eq!(
+        wait_for_charged_total(&server, 1).await,
+        1,
+        "a refused frame must not stay charged on the shared aggregate key"
+    );
+
+    // A batch larger than the whole budget is refused without touching Redis.
+    let mutations_before = server.incrs();
+    let oversized = session_b
+        .on_ws_reassembly_frames("proxy", 2, direction, 5)
+        .await;
+    assert!(matches!(oversized, Some(Message::Close(_))));
+    assert_eq!(
+        server.incrs(),
+        mutations_before,
+        "a batch that can never fit must not charge the shared counter"
+    );
+    assert_eq!(server.charged_total(), 1);
+
+    // The shared budget stays usable: once the one-frame window refills, a
+    // fresh session on either replica is admitted instead of inheriting the
+    // refused attempts' charges.
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    let session_c = Arc::clone(&replica_b)
+        .bind_ws_session(&ctx)
+        .expect("aggregate session after the window refills");
+    assert!(
+        session_c
+            .on_ws_frame("proxy", 3, direction, &message)
+            .await
+            .is_none(),
+        "refused attempts must not keep the shared budget exhausted"
+    );
+
+    let _ = server.shutdown.send(());
+}
