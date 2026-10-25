@@ -1172,7 +1172,7 @@ Plugins execute in priority order (lower number runs first):
 | # | Plugin | Priority | Behavior |
 |---|--------|----------|----------|
 | 1 | `ws_message_size_limiting` | 2810 | Pre-read actual-frame and bounded-reassembly policy; closes both peers with 1009 |
-| 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket rate limiting, charged per physical frame (fragments batched via `on_ws_reassembly_frames`) |
+| 2 | `ws_rate_limiting` | 2910 | Per-connection (or `limit_by` consumer/IP/service aggregate) token-bucket rate limiting, charged per physical frame (fragments batched via `on_ws_reassembly_frames`); aggregate identity bound once via `bind_ws_session`, connection state released on `on_ws_disconnect` |
 | 3 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
 
 ### Zero-Overhead Opt-In
@@ -1687,7 +1687,7 @@ Given all built-in plugins enabled, the execution order is:
 | 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
 | 32 | `graphql` | 2850 | before_proxy, on_final_request_body |
 | 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
-| 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames |
+| 34 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames, on_ws_disconnect |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, finalize_client_visible_response_body, finalize_client_visible_response_headers, on_ws_frame, on_stream_connect, on_udp_datagram |

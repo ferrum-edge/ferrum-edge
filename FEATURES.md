@@ -156,7 +156,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 ### WebSocket Plugins
 
 - **WebSocket Message Size Limiting** — enforces maximum frame sizes on WebSocket connections, closing with code 1009 (Message Too Big) on violation
-- **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess; supports Redis-backed mode that externalizes per-connection counters with per-plugin/gateway-instance key namespacing (budgets are not portable across reconnects or rebuilds). Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
+- **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, or an aggregate budget shared by every session of one consumer, client IP, or proxy (`limit_by`), closing with code 1008 (Policy Violation) on excess; supports Redis-backed mode that externalizes per-connection counters with per-plugin/gateway-instance key namespacing (per-connection budgets are not portable across reconnects or rebuilds; aggregate budgets are keyed by their identity and shared by every replica of the policy). Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **WebSocket Frame Logging** — logs frame metadata (direction, type, size, connection ID) without transforming frames
 
 ### UDP Plugins

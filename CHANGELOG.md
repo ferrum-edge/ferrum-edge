@@ -139,6 +139,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
+- **`ws_rate_limiting` review hardening.**
+  - Idle state no longer locks out new sessions at the 50,000-key cap. Atomic
+    admission never lets the map grow past the cap, so the capacity sweep's
+    strict "over the cap" trigger could never fire and a map full of idle
+    entries refused every new session until a traffic-count-sampled sweep ran.
+    Capacity pressure now starts at the cap; the sweep stays cooldown-gated and
+    stale-only, so active budgets are never evicted.
+  - A finished session's per-connection budget is released when the session
+    ends (`on_ws_disconnect`). Connection ids are process-unique and never
+    charged again, so connection churn under a long refill window can no
+    longer fill the map with dead sessions' buckets.
+  - A fail-closed close while centralized enforcement is unavailable
+    (`redis_failure_policy: fail_closed`) now counts in
+    `ferrum_rate_limit_enforcement_unavailable_total`; previously a Redis
+    outage closed sessions without moving any metric.
+  - New optional `limit_by` (`connection` default, `consumer`, `ip`,
+    `service`) adds an aggregate frame budget shared by every session of one
+    authenticated identity (anonymous sessions use their client IP), client IP,
+    or proxy. The identity is bound once at upgrade admission, so per-frame
+    admission stays allocation-free. With `sync_mode: redis` aggregate keys
+    carry no per-instance UUID, so replicas of one policy share the budget.
+    Existing configs keep per-connection budgets.
+  - `sync_mode: local` policies accept any `frames_per_second` / `burst_size`
+    pair within 1–1000000 (for example a burst below the sustained rate, or a
+    non-integral ratio). The integer-multiple, `burst >= rate`, and 3600-second
+    refill-window constraints exist only for the Redis two-window
+    approximation and now apply only with `sync_mode: redis`.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's

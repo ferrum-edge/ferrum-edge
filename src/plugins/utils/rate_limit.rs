@@ -570,6 +570,17 @@ where
         self.state.contains_key(key)
     }
 
+    /// Drop one key's state and release its reserved capacity slot.
+    ///
+    /// Only for a key no live caller can charge again (a finished WebSocket
+    /// session's process-unique connection id). Removing a key a live caller
+    /// still charges would hand it a fresh budget.
+    pub fn remove_key(&self, key: &K) {
+        if self.state.remove(key).is_some() {
+            self.release_entry_slot();
+        }
+    }
+
     fn release_entry_slot(&self) {
         let _ = self
             .entry_count
@@ -928,6 +939,11 @@ where
 
     pub fn contains_local_key(&self, key: &K) -> bool {
         self.fallback.contains_key(key)
+    }
+
+    /// See [`LocalLimiter::remove_key`].
+    pub fn remove_local_key(&self, key: &K) {
+        self.fallback.remove_key(key);
     }
 
     #[allow(dead_code)] // used only by external tests; dead in binary test target
@@ -1375,10 +1391,10 @@ impl SharedLocalLimiterState for AiTokenRateAlgorithm {
 }
 
 impl SharedLocalLimiterState for WsFrameRateAlgorithm {
-    type Key = u64;
+    type Key = WsRateLimitKey;
 
-    fn registry() -> &'static LocalLimiterRegistry<u64, Self> {
-        static REGISTRY: LocalLimiterRegistry<u64, WsFrameRateAlgorithm> =
+    fn registry() -> &'static LocalLimiterRegistry<WsRateLimitKey, Self> {
+        static REGISTRY: LocalLimiterRegistry<WsRateLimitKey, WsFrameRateAlgorithm> =
             LocalLimiterRegistry::new();
         &REGISTRY
     }
@@ -1729,6 +1745,16 @@ where
         match self {
             Self::Local(local) => local.contains_key(key),
             Self::Failover(failover) => failover.contains_local_key(key),
+        }
+    }
+
+    /// Release one local/fallback key that can never be charged again. See
+    /// [`LocalLimiter::remove_key`]; centralized Redis counters are left to
+    /// their own TTL.
+    pub fn remove_local_key(&self, key: &K) {
+        match self {
+            Self::Local(local) => local.remove_key(key),
+            Self::Failover(failover) => failover.remove_local_key(key),
         }
     }
 
@@ -3460,6 +3486,20 @@ impl WsRateLimitOp {
     }
 }
 
+/// Local/fallback state key for `ws_rate_limiting`.
+///
+/// `Connection` is the default per-session budget, keyed by the process-local
+/// monotonic WebSocket connection id (never reused within a process).
+/// `Aggregate` is a budget shared by every session bound to one
+/// `limit_by` identity (`consumer:…`, `ip:…`, `service:…`), captured once at
+/// upgrade admission; cloning it per frame is a reference-count bump, never an
+/// allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum WsRateLimitKey {
+    Connection(u64),
+    Aggregate(Arc<str>),
+}
+
 #[derive(Debug, Clone)]
 pub struct WsFrameRateAlgorithm {
     frames_per_second: f64,
@@ -3492,7 +3532,43 @@ pub const WS_FRAME_REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
 /// Rejecting unrepresentable configs is fail-closed: Redis never silently
 /// raises the configured frame rate, and Redis failure/recovery cannot change
 /// the effective sustained-rate policy for an accepted config.
+///
+/// The burst/refill relations exist only for the Redis two-window
+/// approximation. A `sync_mode: local` policy runs the token bucket alone and
+/// validates with [`validate_ws_frame_rate_bounds`] instead.
 pub fn validate_ws_frame_rate_params(
+    frames_per_second: u64,
+    burst_size: u64,
+) -> Result<(), String> {
+    validate_ws_frame_rate_bounds(frames_per_second, burst_size)?;
+    if burst_size < frames_per_second {
+        return Err("ws_rate_limiting: `burst_size` must be >= `frames_per_second`".to_string());
+    }
+    if !burst_size.is_multiple_of(frames_per_second) {
+        return Err(
+            "ws_rate_limiting: `burst_size` must be an integer multiple of \
+             `frames_per_second` so Redis and local sustained rates match"
+                .to_string(),
+        );
+    }
+    let window_seconds = burst_size / frames_per_second;
+    if window_seconds > WS_FRAME_REDIS_MAX_WINDOW_SECONDS {
+        return Err(format!(
+            "ws_rate_limiting: `burst_size` / `frames_per_second` refill window \
+             exceeds the Redis-representable maximum of \
+             {WS_FRAME_REDIS_MAX_WINDOW_SECONDS} seconds"
+        ));
+    }
+    Ok(())
+}
+
+/// Operational bounds every `ws_rate_limiting` policy must satisfy, whatever
+/// its `sync_mode`: both values in `1..=MAX_RATE_LIMIT_MAX_REQUESTS`.
+///
+/// A local token bucket represents any capacity/refill pair, so a
+/// `sync_mode: local` policy needs nothing more; the Redis-only relations live
+/// in [`validate_ws_frame_rate_params`].
+pub fn validate_ws_frame_rate_bounds(
     frames_per_second: u64,
     burst_size: u64,
 ) -> Result<(), String> {
@@ -3510,24 +3586,6 @@ pub fn validate_ws_frame_rate_params(
     if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
         return Err(format!(
             "ws_rate_limiting: `burst_size` must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: \"{burst_size}\""
-        ));
-    }
-    if burst_size < frames_per_second {
-        return Err("ws_rate_limiting: `burst_size` must be >= `frames_per_second`".to_string());
-    }
-    if !burst_size.is_multiple_of(frames_per_second) {
-        return Err(
-            "ws_rate_limiting: `burst_size` must be an integer multiple of \
-             `frames_per_second` so Redis and local sustained rates match"
-                .to_string(),
-        );
-    }
-    let window_seconds = burst_size / frames_per_second;
-    if window_seconds > WS_FRAME_REDIS_MAX_WINDOW_SECONDS {
-        return Err(format!(
-            "ws_rate_limiting: `burst_size` / `frames_per_second` refill window \
-             exceeds the Redis-representable maximum of \
-             {WS_FRAME_REDIS_MAX_WINDOW_SECONDS} seconds"
         ));
     }
     Ok(())

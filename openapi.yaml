@@ -13967,25 +13967,31 @@ components:
     WsRateLimitingConfig:
       type: object
       description: |
-        Configuration for the `ws_rate_limiting` plugin. Enforces per-connection
-        frame rate limiting using a token-bucket algorithm. When the bucket is
+        Configuration for the `ws_rate_limiting` plugin. Enforces WebSocket
+        frame rate limiting using a token-bucket algorithm, per connection by
+        default or as an aggregate budget shared by every session of one
+        consumer, client IP, or proxy (`limit_by`). When the bucket is
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
-        (client→backend and backend→client) consume from the same per-connection
-        bucket. `frames_per_second` and `burst_size` must form an integer-multiple
-        refill window of at most 3600 seconds (and stay within 1–1000000) so Redis
-        two-window enforcement cannot over-admit or under-admit relative to the
-        local token bucket, including across Redis failure/recovery. Redis mode
-        (`sync_mode: "redis"`) externalizes those per-connection counters under a
-        per-plugin/gateway-instance key namespace; it does not coordinate a portable
-        frame budget across gateway instances, reconnects, or plugin rebuilds.
-        `sync_mode` is parsed case-insensitively (`LOCAL`, `Redis`); `redis`
-        requires `redis_url`. Unknown top-level keys are rejected by the runtime
-        and by this schema. Counter storage supports only local memory and Redis;
-        database-backed counters are intentionally unsupported. Residual admission
-        rules this schema cannot express, enforced by the constructor alone:
-        `burst_size` must be >= `frames_per_second`, an integer multiple of it,
-        and `burst_size / frames_per_second` must be at most 3600 seconds.
+        (client→backend and backend→client) consume from the same bucket. Both
+        values stay within 1–1000000. With `sync_mode: "redis"`,
+        `frames_per_second` and `burst_size` must also form an integer-multiple
+        refill window of at most 3600 seconds so Redis two-window enforcement
+        cannot over-admit or under-admit relative to the local token bucket,
+        including across Redis failure/recovery; a local-only policy accepts any
+        capacity/refill pair. Redis mode externalizes those per-connection
+        counters under a per-plugin/gateway-instance key namespace; it does not
+        coordinate a portable per-connection frame budget across gateway
+        instances, reconnects, or plugin rebuilds. Aggregate `limit_by` budgets
+        are keyed by their portable identity instead, so replicas of one policy
+        share them. `sync_mode` is parsed case-insensitively (`LOCAL`, `Redis`);
+        `redis` requires `redis_url`. Unknown top-level keys are rejected by the
+        runtime and by this schema. Counter storage supports only local memory
+        and Redis; database-backed counters are intentionally unsupported.
+        Residual admission rules this schema cannot express, enforced by the
+        constructor alone: with `sync_mode: "redis"`, `burst_size` must be >=
+        `frames_per_second`, an integer multiple of it, and
+        `burst_size / frames_per_second` must be at most 3600 seconds.
       additionalProperties: false
       allOf:
         - if:
@@ -14005,9 +14011,9 @@ components:
           description: >-
             Token refill rate per second. Range 1–1000000. Must be greater than
             zero — configs with `frames_per_second: 0` are rejected at config
-            load time. Together with `burst_size`, must yield an integer-multiple
-            refill window of at most 3600 seconds so Redis and local sustained
-            rates match.
+            load time. With `sync_mode: redis`, together with `burst_size`, must
+            yield an integer-multiple refill window of at most 3600 seconds so
+            Redis and local sustained rates match.
         burst_size:
           type: integer
           format: uint64
@@ -14016,11 +14022,14 @@ components:
           description: >-
             Maximum burst capacity (tokens). Range 1–1000000. Defaults to the
             value of `frames_per_second` when not explicitly set. Must be greater
-            than zero, greater than or equal to `frames_per_second`, an integer
-            multiple of `frames_per_second`, and yield a refill window
-            (`burst_size / frames_per_second`) of at most 3600 seconds. Configs
-            that Redis cannot represent without over-admitting or under-admitting
-            relative to the local token bucket are rejected at config load time.
+            than zero. With `sync_mode: redis` it must also be greater than or
+            equal to `frames_per_second`, an integer multiple of
+            `frames_per_second`, and yield a refill window
+            (`burst_size / frames_per_second`) of at most 3600 seconds: configs
+            that Redis cannot represent without over-admitting or
+            under-admitting relative to the local token bucket are rejected at
+            config load time. A local-only policy accepts any pair, including a
+            burst smaller than the sustained rate.
         close_reason:
           type: string
           default: "Frame rate exceeded"
@@ -14028,6 +14037,20 @@ components:
             Close-frame reason text sent when the frame rate is exceeded.
             Truncated on a UTF-8 char boundary to 123 bytes (the RFC 6455 §5.5
             control-frame payload limit) so the frame stays well-formed.
+        limit_by:
+          type: string
+          enum: [connection, consumer, ip, service]
+          default: connection
+          description: >-
+            Budget dimension. `connection` (default) gives every WebSocket
+            session its own bucket. `consumer` shares one bucket across every
+            session of the authenticated identity (mapped Consumer username,
+            else the external authenticated identity); anonymous sessions share
+            their client IP's bucket. `ip` shares one bucket per resolved client
+            IP. `service` shares one bucket per proxy. The identity is resolved
+            once at upgrade admission. Aggregate budgets use the same 50,000-key
+            local cap; with `sync_mode: redis` they are keyed by that identity
+            (no per-instance UUID), so replicas of one policy share them.
         sync_mode:
           type: string
           pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
@@ -14064,10 +14087,11 @@ components:
             `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` so two
             independent policies of this plugin type in one namespace do not
             share the surrounding key namespace. Must be non-empty when set.
-            This plugin still prepends a per-instance UUID to every logical
-            connection key, so an explicit shared prefix does not opt two
-            plugin or gateway instances into a shared per-connection frame
-            budget.
+            In the default `limit_by: connection` mode this plugin still
+            prepends a per-instance UUID to every logical connection key, so an
+            explicit shared prefix does not opt two plugin or gateway instances
+            into a shared per-connection frame budget. Aggregate `limit_by`
+            keys carry no instance UUID.
         redis_pool_size:
           type: integer
           minimum: 1
