@@ -321,6 +321,7 @@ at construction without disclosing credentials.
 | `response_caching` | `max_total_size_bytes` | `104857600` | Maximum accounted approximate retained response-entry footprint |
 | `ai_semantic_cache` | `max_entries` | `10000` | Maximum cached LLM responses |
 | `request_deduplication` | `max_entries` | `10000` | Maximum tracked idempotency keys |
+| `request_deduplication` | `max_inflight_entries` | `max_entries` | Hard ceiling on live in-flight markers (executing plus interrupted requests retained until `inflight_ttl_seconds`); a new key past it gets `503` |
 | `request_deduplication` | `max_entry_size_bytes` | `1048576` | Maximum retained completed response entry |
 | `request_deduplication` | `max_total_size_bytes` | `104857600` | Exact maximum retained local completed response-entry bytes |
 | `soap_ws_security` | `nonce.max_cache_size` | `100000` | Maximum tracked nonces |
