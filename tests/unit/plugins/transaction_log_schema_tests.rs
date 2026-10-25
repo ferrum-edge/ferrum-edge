@@ -895,7 +895,7 @@ fn test_flatten_overwrite_honors_the_prefix() {
     let summary = TransactionSummary {
         metadata: ferrum_edge::plugins::MetadataMap::from_iter([
             ("trace_id".to_string(), "abc-123".to_string()),
-            ("_dedup_key".to_string(), "internal".to_string()),
+            ("_dedup_key".to_string(), "dedup-sentinel-7f3a".to_string()),
         ]),
         ..grpc_summary()
     };
@@ -915,7 +915,9 @@ fn test_flatten_overwrite_honors_the_prefix() {
     // The unprefixed static key is not the promoted key, so it is untouched.
     assert_eq!(text_at(&parsed, "trace_id"), Some("unprefixed"));
     // Internal-only lifecycle metadata is never emitted.
-    assert!(!rendered.contains("internal"), "{rendered}");
+    assert!(!rendered.contains("dedup-sentinel-7f3a"), "{rendered}");
+    assert!(parsed.get("meta__dedup_key").is_none(), "{rendered}");
+    assert!(parsed.get("_dedup_key").is_none(), "{rendered}");
 }
 
 // ── Compiler bounds ─────────────────────────────────────────────────
