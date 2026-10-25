@@ -2758,6 +2758,16 @@ fn access_control_schema_matches_runtime_validation() {
             "disallowed_consumers": ["é".repeat(4096)],
             "allow_authenticated_identity": true
         }),
+        json!({"allowed_external_identities": [{"identity": "alice"}]}),
+        json!({
+            "allowed_external_identities": [{"identity": "alice", "mechanism": "jwks_auth"}],
+            "allowed_groups": ["engineering"]
+        }),
+        json!({
+            "disallowed_external_identities": [{"identity": "é".repeat(4096), "mechanism": "ldap_auth"}],
+            "allow_authenticated_identity": true
+        }),
+        json!({"disallowed_external_identities": [{"identity": "\u{feff}"}]}),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -2798,6 +2808,20 @@ fn access_control_schema_matches_runtime_validation() {
             "disallowed_consumers": ["a".repeat(4097)],
             "allow_authenticated_identity": true
         }),
+        json!({"allowed_external_identities": []}),
+        json!({"allowed_external_identities": [], "allow_authenticated_identity": true}),
+        json!({
+            "allowed_external_identities": [{"identity": "alice"}],
+            "allow_authenticated_identity": true
+        }),
+        json!({"allowed_external_identities": ["alice"]}),
+        json!({"allowed_external_identities": [{"mechanism": "jwks_auth"}]}),
+        json!({"allowed_external_identities": [{"identity": "   "}]}),
+        json!({"allowed_external_identities": [{"identity": "\u{0085}"}]}),
+        json!({"allowed_external_identities": [{"identity": "a".repeat(4097)}]}),
+        json!({"disallowed_external_identities": [{"identity": "alice", "mechanism": "jwks"}]}),
+        json!({"disallowed_external_identities": [{"identity": "alice", "realm": "x"}]}),
+        json!({"disallowed_external_identities": []}),
     ] {
         assert!(
             validator.validate(&config).is_err(),
@@ -14209,6 +14233,20 @@ fn admin_referential_delete_conflicts_have_openapi_parity() {
             "Consumer is referenced by one or more access_control plugin_configs and cannot be deleted"
         ),
         "DELETE /consumers/{{id}} 409 must name the access_control error string: {consumer_desc}"
+    );
+
+    let consumer_rename_409 = spec
+        .pointer("/paths/~1consumers~1{id}/put/responses/409")
+        .expect("PUT /consumers/{id} must document 409");
+    let consumer_rename_desc = consumer_rename_409["description"]
+        .as_str()
+        .expect("PUT /consumers/{id} 409 description");
+    assert!(
+        consumer_rename_desc.contains(
+            "Consumer is referenced by one or more access_control plugin_configs and cannot be renamed"
+        ),
+        "PUT /consumers/{{id}} 409 must name the access_control rename error string: \
+         {consumer_rename_desc}"
     );
 
     let upstream_409 = spec

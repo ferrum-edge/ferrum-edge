@@ -3598,6 +3598,22 @@ pub(crate) fn consumer_audit_body(consumer: &Consumer) -> Value {
     json!(super::redact_consumer_credentials_for_audit(consumer))
 }
 
+/// `409` body for a Consumer rename the store refused because an
+/// `access_control` plugin config still names the previous username in
+/// `allowed_consumers` or `disallowed_consumers`.
+const CONSUMER_RENAME_REFERENCED_BY_ACCESS_CONTROL: &str =
+    "Consumer is referenced by one or more access_control plugin_configs and cannot be renamed";
+
+/// The SQL and MongoDB stores refuse a username change while an
+/// `access_control` entry names the old username; their error text carries
+/// this marker (driver context may wrap it, so the whole chain is searched).
+fn is_access_control_rename_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("referenced by access_control") && message.contains("cannot be renamed")
+    })
+}
+
 pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response<Full<Bytes>> {
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
@@ -3605,8 +3621,9 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if is_mtls_dns_admission_unavailable(error) {
         return super::mtls_dns_admission_unavailable_response();
     }
-    let unique_conflict =
-        is_mtls_dns_identity_conflict(error) || super::chain_has_unique_constraint_violation(error);
+    let unique_conflict = is_access_control_rename_conflict(error)
+        || is_mtls_dns_identity_conflict(error)
+        || super::chain_has_unique_constraint_violation(error);
     let message = consumer_persist_error_message(error);
     let status = if unique_conflict {
         StatusCode::CONFLICT
@@ -3625,6 +3642,8 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
     if is_mtls_dns_admission_unavailable(error) {
         MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+    } else if is_access_control_rename_conflict(error) {
+        CONSUMER_RENAME_REFERENCED_BY_ACCESS_CONTROL.to_string()
     } else if let Some(conflict) = mtls_dns_identity_conflict(error) {
         // Render the typed conflict, not the chain's outermost message: the
         // identities it names are internally constructed and not secrets, but
