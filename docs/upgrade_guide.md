@@ -28,6 +28,29 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `ai_token_metrics`: priority 4070 and default streaming metering (#6857)
+
+`ai_token_metrics` now runs at priority 4070 instead of 4100: after
+`ai_federation` (4060) and before `ai_response_guard` (4075) and
+`security_headers` (4080). Custom plugins or `priority_override` values that
+relied on running before token metrics in the 4070–4099 range, for example to
+rewrite a response body it reads, must move below 4070. A guard rejection of a
+2xx generation now keeps that generation's `ai_*` token metadata, estimated
+cost, and Prometheus counters, where previously the request recorded nothing.
+
+Streamed `text/event-stream` and AWS `application/vnd.amazon.eventstream`
+responses are now metered by default without buffering, and a collected SSE
+body is metered whether or not `buffer_streaming_responses` is set. Under an
+unchanged configuration, `ferrum_ai_*_tokens_total` and
+`ferrum_ai_estimated_cost_currency_units_total` therefore rise to include
+streamed traffic that previously contributed nothing, and those transactions
+gain `ai_*` metadata and `ai_streaming: "true"`. Rebaseline cost dashboards and
+alert thresholds. `buffer_streaming_responses: true` is only needed to meter
+content-coded (`gzip`/`br`) SSE origins, which the incremental observer cannot
+read. A 2xx JSON or streamed response that yields no usage now carries
+`{prefix}_unmetered_reason`, and a backend model longer than 256 bytes or
+containing control characters is no longer copied into `{prefix}_model`.
+
 ### HTTP transaction logs: `response_delivery` and pre-response `499` / `400` / `444` records (#6768, #6769)
 
 Every HTTP-family transaction record now includes `response_delivery`

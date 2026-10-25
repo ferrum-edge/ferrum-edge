@@ -8,8 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **`ai_token_metrics` meters streamed responses without buffering and runs
-  before `ai_response_guard`.** A streamed 2xx `text/event-stream` or AWS
+- **BREAKING — `ai_token_metrics` meters streamed responses without buffering
+  and runs before `ai_response_guard`** (issue/PR #6857). A streamed 2xx `text/event-stream` or AWS
   `application/vnd.amazon.eventstream` response is now metered by default
   through a pass-through stream inspector built on the shared bounded usage
   extractor: chunks are forwarded unchanged and immediately, and the observed
