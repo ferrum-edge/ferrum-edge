@@ -8,22 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **BREAKING — `a2a_gateway` rewrites GRPC and HTTP+JSON Agent Card interfaces
-  to the gateway** (issue/PR #6841). With `discovery.rewrite_agent_card_urls`
-  on, every advertised interface on a transport the gateway fronts now points
-  at the gateway: `JSONRPC` (or no transport) and `HTTP+JSON` / `REST` URLs
-  become the public base plus `endpoint.path`, `GRPC` URLs become the public
-  base, and the top-level `url` follows `preferredTransport` the same way, on
-  both the HTTP JSON and unary gRPC card paths. GRPC and HTTP+JSON URLs were
-  previously preserved, publishing the agent's direct addresses. Interfaces on
-  any other transport keep the backend URL; signatures are dropped on mutation
-  as before.
-- **`a2a_gateway` per-consumer method grants** (PR #6841).
-  `policy.methods.<name>` `allow` entries accept `allowed_groups` /
-  `denied_groups`, matched against the gateway-mapped Consumer's `acl_groups`
-  (no Consumer is never granted), decided in `before_proxy` on every binding
-  and re-decided on the final JSON-RPC body. An ungranted method is refused
-  like a `deny` rule.
+- **BREAKING — `cors` method/header lists are bounded** (issue/PR #6844).
+  `allowed_methods`, `allowed_headers`, and `exposed_headers` now accept at
+  most 128 entries of at most 256 bytes each, in `CorsPlugin` construction,
+  `openapi.yaml`, the Istio `corsPolicy` translator, and mesh validation.
+  Previously only the 1 MiB plugin-config cap applied, so an oversized list
+  was scanned on every cross-origin request and serialized into every
+  response. A config over either bound is now rejected at load/reload (Istio
+  policies are deferred), so split or trim such lists before upgrading.
+- **`cors` can answer Private Network Access preflights.** New
+  `allow_private_network` (default `false`): a preflight from an allowed origin
+  that carries `Access-Control-Request-Private-Network: true` is answered with
+  `Access-Control-Allow-Private-Network: true`, locally or on a
+  `preflight_continue` forwarded response. Previously a client that enforces
+  PNA preflights could not reach a private address through a CORS-managed
+  route, because the plugin strips the backend's own `Access-Control-*`
+  fields. With several CORS policies, every matching policy must opt in. The
+  field is never sent on actual responses. It does not grant Chrome 142+
+  Local Network Access, which is a separate browser permission.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
   element content iteratively instead of recursing once per nesting level, so
   the parser no longer spends stack per level (0.21.1 overflowed a 2 MiB
@@ -155,29 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`a2a_gateway` refuses a final request body that changes operation class**
-  (PR #6841). A later body transform that turned an admitted JSON-RPC request
-  into an Agent Card (or changed its streaming class) was dispatched under the
-  arrival-time response handling, so a card could be served with the backend's
-  internal URLs. Such a body is now refused with JSON-RPC `-32001` and
-  `a2a.error: operation_class_changed`, and an admitted request whose final
-  body outgrows `detection.max_request_body_size` (`413`) or is no longer a
-  JSON document (`-32001`, `operation_class_unprovable`) is refused too; a
-  same-class change refreshes `a2a.method` and `a2a.task_id`. The final-body hook no longer runs where it cannot change an
-  outcome and skips re-parsing a body byte-identical to the one classified at
-  arrival.
-- **`a2a_gateway` bounds SSE semantic metadata when it is retained** (PR
-  #6841). Task ids, context ids, and task states observed on a long-lived SSE
-  stream are reduced to `observability.max_payload_size` (and the normalized
-  state) as each event completes, instead of being held at full event size
-  until the stream ends. Published values are unchanged.
-- **`a2a_gateway` derives the forwarded-origin scheme from the connection's
-  security** (PR #6841). With no `X-Forwarded-Proto`, the scheme is `https`
-  exactly when the client connection is TLS (or HTTP/3), not when the client
-  sent SNI, so SNI-less HTTPS clients are no longer handed (or refused) an
-  `http://` origin.
-- **`A2aGatewayConfig` OpenAPI rejects `discovery.public_base_url: null` as a
-  public-origin choice** (PR #6841), matching the constructor.
+- **Composed `cors` policies keep wildcard response-header exposure.** An
+  uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
+  (for example `["Content-Disposition"]`) produced an empty
+  `Access-Control-Expose-Headers`, so browser JavaScript could read neither
+  header although each policy alone allowed it. Exposure now intersects with
+  the same wildcard rules as allowed methods and headers: the explicit list
+  survives, two uncredentialed wildcards expose `*`, and a credentialed
+  policy's literal `*` is omitted rather than widened when the aggregate drops
+  credentials.
+- **`cors` documentation matches the native preflight header behavior.** A
+  single policy (or identical composed policies) does not refuse a requested
+  header that no policy lists; it returns `204` with the configured
+  `Access-Control-Allow-Headers` and the browser enforces it. `403 CORS header
+  not allowed` is returned only when composed policies disagree. The
+  troubleshooting guide no longer claims every origin matcher is
+  case-insensitive (object `exact`/`prefix` and `regex` are case-sensitive). A
+  unit test now fails when `Cargo.lock` resolves a `psl` version other than the
+  one the generated CORS Public Suffix List ancestor index was built from.
 - **`workload_metrics` (mesh telemetry) review hardening.**
   - Workload RED metrics (`ferrum_mesh_requests_total`, request duration,
     request/response size, gRPC message families) gain Istio's
@@ -430,13 +427,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`a2a_gateway` no longer forwards encoded or partial HTTP Agent Cards
-  un-rewritten** (PR #6841). A `gzip`/`br` card (which a backend may send
-  whatever `detection.strip_accept_encoding` negotiated) or a `206`/`226` card
-  slice failed to parse and passed through with the backend's internal URLs.
-  Such responses are now claimed by the shared buffered-response
-  representation gate: a supported coding is decoded and the card rewritten,
-  and anything uninspectable fails closed with `502`.
+- **BREAKING — `ai_semantic_cache` hardening from the production-launch
+  review** (issue #6822). Exact keys and semantic scopes now bind the request's complete
+  response-side policy provenance (RTDS gate content plus the static
+  response-presentation digest), so an entry retained under an earlier
+  `response_transformer` rule — locally or by another replica in Redis — can no
+  longer replay past a new field-removal rule; a request whose presentation
+  policy is unprovable bypasses. Instruction state (`system`/`developer`
+  messages, Anthropic `system`, Responses `instructions` and
+  `system`/`developer` `input` items, Gemini `systemInstruction`, Cohere
+  `preamble`) is bound byte-exactly in semantic scopes and Responses
+  instruction items leave the embedding input. Cohere v1 `conversation_id`
+  requests, request bodies with duplicate JSON members, and requests carrying
+  `Cache-Control: no-store`/`no-cache` bypass lookup and storage; responses
+  with `Cache-Control: no-store`/`private` or `Set-Cookie` are never stored.
+  Composition admission refuses any final-request-body policy plugin ordered at
+  or after an `ai_semantic_cache` instance by `priority_override`. Key domains
+  move to v4, so previously retained entries are unreachable.
+- **`ai_semantic_cache` populates from `ai_federation` and tolerates replica
+  clock skew.** A provider-backed `ai_federation` 2xx answer (proven by
+  federation's internal external-operation provenance) is now stored, so the
+  documented cache-before-federation chain hits on repeats, but only when
+  federation recorded that the provider's original headers carried no
+  `Cache-Control: no-store`/`private` or `Set-Cookie`, and only from the
+  committed-response hook once the final synthetic headers (late
+  `after_proxy` header rules, rotated cookies) also allow it; fabricated
+  synthetic bodies remain ineligible. An authenticated Redis envelope sealed up
+  to 60 seconds in the reader's future is admitted, and an authentic envelope
+  that is expired or further in the future is a plain miss instead of being
+  quarantined and deleted. Canonical `"stream": true` requests skip the
+  embedding call.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with
