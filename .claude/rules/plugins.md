@@ -1002,7 +1002,7 @@ on a native-gRPC request.
 - Add unit tests for valid and invalid configs in `tests/unit/plugins/` and register the module.
 - Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
-- Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`stdout_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
+- Plugin `config` objects are closed. Use `crate::util::unknown_keys::reject_unknown_keys` against a `*_CONFIG_KEYS` allowlist. FailClosed and KeepLastKnownGood constructors return `Err`. OptionalFailOpen constructors also return `Err` so the validation pipeline / plugin cache can warn and omit the instance (`http_logging`); do not swallow typos. `mcp_gateway` `command`/`args`/`stdio` must fail with an HTTP-only message, not a generic unknown-key error.
 - Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup.
 - A plugin config field that names a process environment variable (credential
   or URL) resolves it ONLY through `plugins::utils::plugin_secret_env`
