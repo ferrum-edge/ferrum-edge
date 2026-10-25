@@ -30,17 +30,18 @@
 //!   unknown variable or an unterminated `$(` is rejected; `$$(` is a literal
 //!   `$(`). A rule whose variable is unavailable for a request, or whose
 //!   resolved header value is not a valid `HeaderValue`, is skipped for that
-//!   request rather than authoring a partial value. Credential-bearing
-//!   headers and authentication-owned query credentials are never template
-//!   sources.
+//!   request rather than authoring a partial value. Sources resolve from the
+//!   ORIGINAL client headers and query, so a rename cannot relabel a
+//!   credential into an innocuous source name; credential-class names (any
+//!   spelling), chain credential locations, and authentication-owned query
+//!   credentials are never template sources.
 //! - Query `value` / `new_key` / `key` strings must not contain CR or LF
 //!   (injection into the request-target). Names and values are otherwise
 //!   percent-encoded when authored onto the outbound query.
 //! - Rules are split into `header_rules` and `query_rules` so the hot path
 //!   does not dispatch on target strings per request, and so
 //!   [`modifies_request_headers`] returns an accurate answer (which lets the
-//!   handler skip cloning `ctx.headers` for query-only configs; body rules
-//!   need the copy to remove stale integrity fields, see below).
+//!   handler skip cloning `ctx.headers` for query-only and body-only configs).
 //!
 //! ## Query mutation contract
 //!
@@ -76,12 +77,15 @@
 //! Body rules can replace the request bytes after the backend header map has
 //! already been fixed on some dispatch ladders, so a client
 //! `Content-Digest` / `Repr-Digest` / `Digest` / `Content-MD5` computed over
-//! the original bytes cannot be repaired afterwards. Whenever this instance's
-//! body rules may rewrite the request (a body may be present and its
-//! effective `Content-Type` is absent or JSON), `before_proxy` removes those
-//! fields from the outbound map rather than forwarding a digest that would
-//! describe different bytes. Client JSON number lexemes are preserved exactly
-//! across a rewrite (see `body_transform::apply_request_body_rules`).
+//! the original bytes cannot be repaired afterwards. When a request carries
+//! such a field, `before_proxy` asks proxy core to retire it; core decides
+//! over the FINAL outbound headers (after every `before_proxy` hook and the
+//! route-header finalizer) whether the body rules may rewrite the request (a
+//! body may be present and the effective `Content-Type` is absent or JSON),
+//! and removes the fields clone-on-write (`proxy::
+//! retire_stale_request_integrity_headers`). Client JSON number lexemes are
+//! preserved exactly across a rewrite (see
+//! `body_transform::apply_request_body_rules`).
 //!
 //! ## Non-application signal
 //!
@@ -198,9 +202,12 @@ enum TemplateVariable {
     ClientIp,
     /// `$(request_id)`: the canonical request ID (`correlation_id`).
     RequestId,
-    /// `$(header.<name>)`: a pre-lowercased outbound request header.
+    /// `$(header.<name>)`: a pre-lowercased header of the ORIGINAL client
+    /// request (`ctx.headers`), never the outbound map, so an earlier rename
+    /// cannot launder a credential into an innocuous source name.
     Header(String),
-    /// `$(query.<name>)`: a percent-decoded query parameter.
+    /// `$(query.<name>)`: a percent-decoded parameter of the ORIGINAL client
+    /// query (the retained raw wire query), for the same reason.
     Query(String),
 }
 
@@ -227,7 +234,7 @@ impl TemplateVariable {
     fn resolve<'a>(
         &self,
         ctx: &'a RequestContext,
-        headers: &'a HashMap<String, String>,
+        original_query: &'a HashMap<String, String>,
     ) -> Option<&'a str> {
         match self {
             Self::ConsumerUsername => ctx.backend_consumer_username(),
@@ -238,17 +245,18 @@ impl TemplateVariable {
                 .map(String::as_str),
             Self::Header(name) => {
                 // A custom credential location (for example a `key_auth`
-                // header) is only known per chain; never copy it elsewhere.
-                if super::utils::replay_partition::is_request_credential_context_header(ctx, name) {
+                // header) is only known per chain; never copy it elsewhere,
+                // in any `_` / `-` spelling.
+                if header_source_is_chain_credential(ctx, name) {
                     return None;
                 }
-                headers.get(name.as_str()).map(String::as_str)
+                ctx.headers.get(name.as_str()).map(String::as_str)
             }
             Self::Query(name) => {
                 if query_name_is_auth_credential(ctx, name) {
                     return None;
                 }
-                ctx.query_params.get(name.as_str()).map(String::as_str)
+                original_query.get(name.as_str()).map(String::as_str)
             }
         }
     }
@@ -256,13 +264,17 @@ impl TemplateVariable {
 
 impl ValueTemplate {
     /// Resolve every part, or `None` when any variable is unavailable.
-    fn resolve(&self, ctx: &RequestContext, headers: &HashMap<String, String>) -> Option<String> {
+    fn resolve(
+        &self,
+        ctx: &RequestContext,
+        original_query: &HashMap<String, String>,
+    ) -> Option<String> {
         let mut resolved = String::new();
         for part in &self.parts {
             match part {
                 TemplatePart::Literal(text) => resolved.push_str(text),
                 TemplatePart::Variable(variable) => {
-                    resolved.push_str(variable.resolve(ctx, headers)?);
+                    resolved.push_str(variable.resolve(ctx, original_query)?);
                 }
             }
         }
@@ -274,6 +286,55 @@ impl ValueTemplate {
             .iter()
             .any(|part| matches!(part, TemplatePart::Variable(TemplateVariable::Query(_))))
     }
+
+    fn reads_headers(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|part| matches!(part, TemplatePart::Variable(TemplateVariable::Header(_))))
+    }
+}
+
+/// Whether a header or query NAME can never be a template source: the
+/// built-in credential header inventory (`_` / `-` folded) or any name the
+/// shared sensitive-name classifier flags (`authorization`, `*_token`,
+/// `api_key`, `session`, `password`, …, in any delimiter spelling).
+fn template_source_name_is_sensitive(name: &str) -> bool {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+    super::utils::replay_partition::CREDENTIAL_CONTEXT_HEADERS
+        .iter()
+        .any(|credential| field_names_equivalent_for_backends(name, credential))
+        || super::utils::metadata_redaction::is_sensitive_header_name(name)
+}
+
+/// Whether this request's chain declared `name` (folded) a credential header
+/// location, beyond the built-in inventory checked at construction.
+fn header_source_is_chain_credential(ctx: &RequestContext, name: &str) -> bool {
+    use crate::proxy::headers::field_names_equivalent_for_backends;
+    ctx.request_headers_requiring_redaction()
+        .iter()
+        .any(|credential| field_names_equivalent_for_backends(name, credential))
+}
+
+/// The percent-decoded ORIGINAL client query (last occurrence wins), decoded
+/// exactly as `RequestContext::materialize_query_params` does. Built once per
+/// request, only when a template reads `$(query.<name>)`.
+fn original_query_params(ctx: &RequestContext) -> HashMap<String, String> {
+    use percent_encoding::percent_decode_str;
+    let mut params = HashMap::new();
+    let Some(raw) = ctx.raw_query_string() else {
+        return params;
+    };
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.insert(
+            percent_decode_str(name).decode_utf8_lossy().into_owned(),
+            percent_decode_str(value).decode_utf8_lossy().into_owned(),
+        );
+    }
+    params
 }
 
 /// Whether an authentication plugin marked `name` as a query credential
@@ -307,7 +368,7 @@ fn parse_template_variable(name: &str, idx: usize) -> Result<TemplateVariable, S
                 )
             })?
             .to_string();
-        if super::utils::replay_partition::is_credential_context_header(&header) {
+        if template_source_name_is_sensitive(&header) {
             return Err(format!(
                 "request_transformer: `rule[{idx}]`: template variable `$(header.<name>)` names a credential-bearing header; credentials cannot be copied into another request field"
             ));
@@ -318,6 +379,11 @@ fn parse_template_variable(name: &str, idx: usize) -> Result<TemplateVariable, S
         if query.is_empty() {
             return Err(format!(
                 "request_transformer: `rule[{idx}]`: template variable `$(query.<name>)` must name a query parameter"
+            ));
+        }
+        if template_source_name_is_sensitive(query) {
+            return Err(format!(
+                "request_transformer: `rule[{idx}]`: template variable `$(query.<name>)` names a credential-bearing query parameter; credentials cannot be copied into another request field"
             ));
         }
         return Ok(TemplateVariable::Query(query.to_string()));
@@ -433,7 +499,7 @@ impl HeaderRule {
     fn authored_value<'r>(
         &'r self,
         ctx: &RequestContext,
-        headers: &HashMap<String, String>,
+        original_query: &HashMap<String, String>,
     ) -> Result<Cow<'r, str>, &'static str> {
         let Some(template) = &self.value_template else {
             return self
@@ -443,7 +509,7 @@ impl HeaderRule {
                 .ok_or(RULE_SKIPPED_TEMPLATE_UNRESOLVED);
         };
         let resolved = template
-            .resolve(ctx, headers)
+            .resolve(ctx, original_query)
             .ok_or(RULE_SKIPPED_TEMPLATE_UNRESOLVED)?;
         // A resolved request value (a decoded query parameter, a consumer
         // name) can carry CR/LF or other bytes no protocol may emit.
@@ -482,11 +548,11 @@ impl QueryRule {
     fn authored_value<'r>(
         &'r self,
         ctx: &RequestContext,
-        headers: &HashMap<String, String>,
+        original_query: &HashMap<String, String>,
     ) -> Result<Cow<'r, str>, &'static str> {
         match &self.value_template {
             Some(template) => template
-                .resolve(ctx, headers)
+                .resolve(ctx, original_query)
                 .map(Cow::Owned)
                 .ok_or(RULE_SKIPPED_TEMPLATE_UNRESOLVED),
             None => self
@@ -521,8 +587,12 @@ pub struct RequestTransformer {
     /// requests keep the generation they pinned.
     rules_enabled: bool,
     /// Whether any header/query template reads `$(query.<name>)`, so
-    /// `before_proxy` materializes the decoded query map once up front.
+    /// `before_proxy` decodes the original client query once up front.
     templates_read_query: bool,
+    /// Whether any template reads `$(header.<name>)` from the original client
+    /// headers, which the dispatcher keeps intact only while it hands this
+    /// instance a separate outbound copy.
+    templates_read_headers: bool,
 }
 
 fn parse_op(op: &str) -> Option<(HeaderOp, QueryOp)> {
@@ -932,6 +1002,15 @@ impl RequestTransformer {
                     .filter_map(|rule| rule.value_template.as_ref()),
             )
             .any(ValueTemplate::reads_query);
+        let templates_read_headers = header_rules
+            .iter()
+            .filter_map(|rule| rule.value_template.as_ref())
+            .chain(
+                query_rules
+                    .iter()
+                    .filter_map(|rule| rule.value_template.as_ref()),
+            )
+            .any(ValueTemplate::reads_headers);
 
         Ok(Self {
             header_rules,
@@ -940,30 +1019,22 @@ impl RequestTransformer {
             apply_route_overrides,
             rules_enabled,
             templates_read_query,
+            templates_read_headers,
         })
     }
 
-    /// Classify this request for the body rules after the header phase: may
-    /// they rewrite it, or are they declined for a declared non-JSON type?
-    fn body_rule_disposition(
+    /// Whether this instance's body rules decline this request outright for
+    /// a declared non-JSON `Content-Type` that may carry a body.
+    fn body_rules_decline_declared_non_json(
         &self,
         ctx: &RequestContext,
         headers: &HashMap<String, String>,
-    ) -> BodyRuleDisposition {
-        if self.body_rules.is_empty() || !crate::proxy::request_may_have_body(&ctx.method, headers)
-        {
-            return BodyRuleDisposition::NotApplicable;
-        }
-        match headers.get("content-type").map(String::as_str) {
-            Some(content_type) if !body_transform::is_json_content_type(content_type) => {
-                BodyRuleDisposition::DeclaredNonJson
-            }
-            // Framed gRPC `+json` can never parse as one document.
-            Some(content_type) if body_transform::is_framed_grpc_content_type(content_type) => {
-                BodyRuleDisposition::NotApplicable
-            }
-            _ => BodyRuleDisposition::MayRewrite,
-        }
+    ) -> bool {
+        !self.body_rules.is_empty()
+            && crate::proxy::request_may_have_body(&ctx.method, headers)
+            && headers
+                .get("content-type")
+                .is_some_and(|content_type| !body_transform::is_json_content_type(content_type))
     }
 
     /// Shared body pass for the context-free and context-aware hooks.
@@ -989,28 +1060,40 @@ impl RequestTransformer {
     }
 }
 
-enum BodyRuleDisposition {
-    /// No body rules, or no body this instance could rewrite.
-    NotApplicable,
-    /// A declared non-JSON `Content-Type`: the body rules decline it.
-    DeclaredNonJson,
-    /// The body rules may replace the request bytes.
-    MayRewrite,
-}
-
 enum BodyPass {
     Replaced(Vec<u8>),
     Skipped(&'static str),
     Unchanged,
 }
 
+/// Whether `name` is a request field computed over the request content.
+pub(crate) fn is_body_bound_request_integrity_header(name: &str) -> bool {
+    BODY_BOUND_REQUEST_INTEGRITY_HEADERS
+        .iter()
+        .any(|bound| name.eq_ignore_ascii_case(bound))
+}
+
+/// Whether request-transformer body rules may replace the bytes of a request
+/// with these FINAL outbound headers: a body may be present and the effective
+/// `Content-Type` is absent or a JSON document type (framed gRPC `+json` can
+/// never parse as one document).
+pub(crate) fn request_body_rules_may_rewrite(
+    method: &str,
+    headers: &HashMap<String, String>,
+) -> bool {
+    crate::proxy::request_may_have_body(method, headers)
+        && headers
+            .get("content-type")
+            .map(String::as_str)
+            .is_none_or(|content_type| {
+                body_transform::is_json_content_type(content_type)
+                    && !body_transform::is_framed_grpc_content_type(content_type)
+            })
+}
+
 /// Remove request integrity fields computed over the client's bytes.
-fn strip_body_bound_integrity_headers(headers: &mut HashMap<String, String>) {
-    headers.retain(|name, _| {
-        !BODY_BOUND_REQUEST_INTEGRITY_HEADERS
-            .iter()
-            .any(|bound| name.eq_ignore_ascii_case(bound))
-    });
+pub(crate) fn strip_body_bound_integrity_headers(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !is_body_bound_request_integrity_header(name));
 }
 
 #[async_trait]
@@ -1039,13 +1122,23 @@ impl Plugin for RequestTransformer {
         // "ctx.headers is the original inbound headers" invariant and (on
         // some paths) silently drops route-level header writes.
         //
-        // Body rules mutate headers too: `before_proxy` removes request
-        // integrity fields (`Content-Digest`, …) that a rewrite would leave
-        // describing different bytes.
+        // A `$(header.<name>)` template reads the ORIGINAL client headers in
+        // `ctx.headers`, which stay intact during `before_proxy` only when the
+        // dispatcher hands plugins a separate outbound copy. Body rules do NOT
+        // force the copy: stale integrity fields are retired by proxy core
+        // over the final outbound headers, copying only when a request
+        // actually carries one (`retire_stale_request_integrity_headers`).
         self.rules_enabled
             && (!self.header_rules.is_empty()
                 || self.apply_route_overrides
-                || !self.body_rules.is_empty())
+                || self.templates_read_headers)
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        // The context-aware body hook publishes the value-free skip reason;
+        // without this the ordinary H1/H2 dispatcher would select the
+        // context-free hook and drop it.
+        self.rules_enabled && !self.body_rules.is_empty()
     }
 
     fn modifies_request_query(&self) -> bool {
@@ -1102,9 +1195,11 @@ impl Plugin for RequestTransformer {
         if !self.rules_enabled {
             return PluginResult::Continue;
         }
-        if self.templates_read_query {
-            ctx.materialize_query_params();
-        }
+        let original_query = if self.templates_read_query {
+            original_query_params(ctx)
+        } else {
+            HashMap::new()
+        };
         let mut rule_skipped: Option<&'static str> = None;
         for rule in &self.header_rules {
             match rule.operation {
@@ -1114,7 +1209,7 @@ impl Plugin for RequestTransformer {
                     if headers.contains_key(&rule.key) {
                         continue;
                     }
-                    match rule.authored_value(ctx, headers) {
+                    match rule.authored_value(ctx, &original_query) {
                         Ok(val) => {
                             let val = val.into_owned();
                             headers.insert(rule.key.clone(), val);
@@ -1123,7 +1218,7 @@ impl Plugin for RequestTransformer {
                         Err(reason) => rule_skipped = Some(reason),
                     }
                 }
-                HeaderOp::Update => match rule.authored_value(ctx, headers) {
+                HeaderOp::Update => match rule.authored_value(ctx, &original_query) {
                     Ok(val) => {
                         let val = val.into_owned();
                         headers.insert(rule.key.clone(), val);
@@ -1155,17 +1250,26 @@ impl Plugin for RequestTransformer {
             }
         }
         if !self.query_rules.is_empty() {
-            apply_query_rules(self, ctx, headers, &mut rule_skipped);
+            apply_query_rules(self, ctx, &original_query, &mut rule_skipped);
         }
-        match self.body_rule_disposition(ctx, headers) {
-            BodyRuleDisposition::NotApplicable => {}
-            BodyRuleDisposition::DeclaredNonJson => {
-                ctx.metadata.insert(
-                    BODY_SKIPPED_METADATA_KEY.to_string(),
-                    BODY_SKIPPED_NON_JSON_CONTENT_TYPE.to_string(),
-                );
-            }
-            BodyRuleDisposition::MayRewrite => strip_body_bound_integrity_headers(headers),
+        if self.body_rules_decline_declared_non_json(ctx, headers) {
+            ctx.metadata.insert(
+                BODY_SKIPPED_METADATA_KEY.to_string(),
+                BODY_SKIPPED_NON_JSON_CONTENT_TYPE.to_string(),
+            );
+        }
+        // Body rules may rewrite the bytes a client digest describes. Whether
+        // they can is decided by proxy core over the FINAL outbound headers
+        // (a later header rule or the route-header finalizer may still change
+        // `Content-Type`), so only request the retirement here — and only when
+        // the request carries such a field, keeping the ordinary path free of
+        // any header copy or per-request state.
+        if !self.body_rules.is_empty()
+            && headers
+                .keys()
+                .any(|name| is_body_bound_request_integrity_header(name))
+        {
+            ctx.plugin_state_mut().request_body_integrity_retirement = true;
         }
         if let Some(reason) = rule_skipped {
             ctx.metadata
@@ -1199,7 +1303,12 @@ impl Plugin for RequestTransformer {
         _request_headers: &std::collections::HashMap<String, String>,
     ) -> Option<Vec<u8>> {
         match self.transform_body(body, content_type) {
-            BodyPass::Replaced(bytes) => Some(bytes),
+            BodyPass::Replaced(bytes) => {
+                // A `before_proxy` non-JSON verdict is superseded when a later
+                // header change made the body rewritable after all.
+                ctx.metadata.remove(BODY_SKIPPED_METADATA_KEY);
+                Some(bytes)
+            }
             BodyPass::Skipped(reason) => {
                 ctx.metadata
                     .insert(BODY_SKIPPED_METADATA_KEY.to_string(), reason.to_string());
@@ -1213,7 +1322,7 @@ impl Plugin for RequestTransformer {
 fn apply_query_rules(
     plugin: &RequestTransformer,
     ctx: &mut RequestContext,
-    headers: &HashMap<String, String>,
+    original_query: &HashMap<String, String>,
     rule_skipped: &mut Option<&'static str>,
 ) {
     // Prefer an earlier transformer's published outbound query, then the
@@ -1254,7 +1363,7 @@ fn apply_query_rules(
                 if rule.value_template.is_some() && ordered.contains_decoded_name(&rule.key) {
                     continue;
                 }
-                match rule.authored_value(ctx, headers) {
+                match rule.authored_value(ctx, original_query) {
                     Ok(val) => {
                         let changed = ordered.add(&rule.key, &val);
                         if changed {
@@ -1266,7 +1375,7 @@ fn apply_query_rules(
                     Err(reason) => *rule_skipped = Some(reason),
                 }
             }
-            QueryOp::Update => match rule.authored_value(ctx, headers) {
+            QueryOp::Update => match rule.authored_value(ctx, original_query) {
                 Ok(val) => {
                     query_mutated |= ordered.update(&rule.key, &val);
                     debug!("request_transformer: updated query param {}", rule.key);

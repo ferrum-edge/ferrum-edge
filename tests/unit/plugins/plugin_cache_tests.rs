@@ -12475,6 +12475,31 @@ fn test_waf_sets_needs_final_request_body_context_capability() {
 }
 
 #[test]
+fn request_transformer_body_rules_select_the_context_aware_body_hook() {
+    // PR #6858 review SOL-2: a chain whose only body plugin is a
+    // request_transformer must still route H1/H2 through the context-aware
+    // transform so `request_transformer.body_skipped` is published.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "request_transformer",
+            json!({"rules": [{"operation": "remove", "target": "body", "key": "internal.secret"}]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    assert!(caps.has(PluginCapabilities::NEEDS_FINAL_REQUEST_BODY_CONTEXT));
+    assert!(caps.has(PluginCapabilities::MODIFIES_REQUEST_BODY));
+    assert!(
+        !caps.has(PluginCapabilities::MODIFIES_REQUEST_HEADERS),
+        "body rules alone must not force the per-request header-map copy"
+    );
+}
+
+#[test]
 fn test_priority_override_preserves_finalized_request_policy_capability() {
     let mut waf = make_plugin_config_with_json(
         "ps1",

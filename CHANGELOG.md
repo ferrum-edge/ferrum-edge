@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`$(consumer.username)`, `$(client_ip)`, `$(request_id)`,
   `$(header.<name>)`, `$(query.<name>)`), so an unknown variable fails to load
   — write `$$(` for a literal `$(`. Behaviour changes too: header/query rules
-  and route-header finalization now also run on WebSocket handshakes, and an
-  instance whose body rules may rewrite a JSON request removes the client's
-  `Content-Digest`, `Repr-Digest`, `Digest`, and `Content-MD5` before dispatch.
+  and route-header finalization now also run on WebSocket handshakes, and when
+  an instance's body rules may rewrite a JSON request (judged over the final
+  outbound headers) proxy core removes the client's `Content-Digest`,
+  `Repr-Digest`, `Digest`, and `Content-MD5` before dispatch. Template
+  sources read the original client request and refuse credential-class names.
+  `mesh_route_dispatch` `request_transform` add/update destinations under
+  `x-path-param-*` are refused too.
   Unapplied rules and body passes record `request_transformer.rule_skipped` /
   `request_transformer.body_skipped` metadata.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses

@@ -797,14 +797,16 @@ fn run_body_rules(
         scan_document_numbers(&json, &mut scan);
         // Only a document that still holds an `f64` can have lost a lexeme:
         // every integer serde_json kept as `u64` / `i64` re-serializes exactly.
-        // A string already shaped like the private stand-in disables the
-        // substitution (it could not be told apart from one), leaving the
-        // ordinary serialization below.
-        if scan.has_float && !scan.has_number_stand_in {
+        // The stand-in generation is one no string in the document already
+        // uses, so a client string can never be mistaken for a stand-in and a
+        // stand-in-shaped client string never disables the preservation.
+        if scan.has_float {
             let spans = lossy_number_spans(body);
             if !spans.is_empty()
+                && let Some(generation) =
+                    (0u64..).find(|candidate| !scan.used_stand_in_generations.contains(candidate))
                 && let Some(construction) =
-                    rewrite_preserving_number_lexemes(body, &spans, rules, ceiling)
+                    rewrite_preserving_number_lexemes(body, &spans, rules, ceiling, generation)
             {
                 return BodyRulesPass::Construction(construction);
             }
@@ -892,26 +894,39 @@ fn serialize_document_bounded<T: Serialize + ?Sized>(
 
 // ── Number-lexeme preservation ────────────────────────────────────────────
 
-/// Prefix of the private JSON string that stands in for a preserved number
-/// lexeme while rules run. It starts with NUL, which a client can only send as
-/// an explicit `\u0000` escape; a document whose strings already carry the
-/// prefix is never substituted (see [`run_body_rules`]).
-const NUMBER_STAND_IN_PREFIX: &str = "\u{0}ferrum-number:";
-
-/// JSON-text spelling of [`NUMBER_STAND_IN_PREFIX`] (opening quote included).
-const NUMBER_STAND_IN_JSON_PREFIX: &[u8] = b"\"\\u0000ferrum-number:";
+/// Family prefix of the private JSON strings that stand in for preserved
+/// number lexemes while rules run. A stand-in is
+/// `"\u{0}ferrum-number-<generation>:<index>"`, where `<generation>` is chosen
+/// so that no string already in the document (client content or a rule value)
+/// starts with `"\u{0}ferrum-number-<generation>:"`. Every stand-in in the
+/// rewritten document is therefore one this module created.
+const NUMBER_STAND_IN_FAMILY: &str = "\u{0}ferrum-number-";
 
 #[derive(Default)]
 struct DocumentNumberScan {
     has_float: bool,
-    has_number_stand_in: bool,
+    /// Stand-in generations some string in the document already spells.
+    used_stand_in_generations: std::collections::HashSet<u64>,
+}
+
+/// The stand-in generation a string spells, if it starts with
+/// `NUMBER_STAND_IN_FAMILY` followed by decimal digits and `:`.
+fn stand_in_generation(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix(NUMBER_STAND_IN_FAMILY)?;
+    let (digits, _) = rest.split_once(':')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
 }
 
 fn scan_document_numbers(value: &Value, scan: &mut DocumentNumberScan) {
     match value {
         Value::Number(number) => scan.has_float |= number.is_f64(),
         Value::String(text) => {
-            scan.has_number_stand_in |= text.starts_with(NUMBER_STAND_IN_PREFIX);
+            if let Some(generation) = stand_in_generation(text) {
+                scan.used_stand_in_generations.insert(generation);
+            }
         }
         Value::Array(items) => {
             for item in items {
@@ -989,17 +1004,22 @@ fn lossy_number_spans(body: &[u8]) -> Vec<(usize, usize)> {
 /// value — so they behave identically on the stand-in document: a number a
 /// rule removed or overwrote is gone, one a rename moved keeps its exact
 /// spelling at the destination, and one no rule touched is unchanged. The
-/// caller guarantees no client string already carried the stand-in prefix, so
-/// every stand-in in the result is one this function created. Returns `None`
-/// (the caller then serializes the ordinary document) if any step fails.
+/// caller picked a `generation` no existing string spells, so every stand-in
+/// in the result is one this function created. Returns `None` only on an
+/// internal failure (a span that is not a valid JSON number, or a stand-in
+/// document that does not re-parse), which the caller cannot reach for a body
+/// that already parsed.
 fn rewrite_preserving_number_lexemes(
     body: &[u8],
     spans: &[(usize, usize)],
     rules: &[BodyRule],
     ceiling: usize,
+    generation: u64,
 ) -> Option<crate::plugins::BoundedResponseBodyConstruction> {
     use std::io::Write as _;
 
+    let prefix = format!("{NUMBER_STAND_IN_FAMILY}{generation}:");
+    let json_prefix = format!("\"\\u0000ferrum-number-{generation}:");
     let mut lexemes: Vec<Box<RawValue>> = Vec::with_capacity(spans.len());
     let mut substituted: Vec<u8> =
         Vec::with_capacity(body.len().saturating_add(spans.len().saturating_mul(32)));
@@ -1008,7 +1028,7 @@ fn rewrite_preserving_number_lexemes(
         let lexeme = std::str::from_utf8(body.get(start..end)?).ok()?;
         lexemes.push(RawValue::from_string(lexeme.to_owned()).ok()?);
         substituted.extend_from_slice(body.get(cursor..start)?);
-        substituted.extend_from_slice(NUMBER_STAND_IN_JSON_PREFIX);
+        substituted.extend_from_slice(json_prefix.as_bytes());
         write!(substituted, "{index}\"").ok()?;
         cursor = end;
     }
@@ -1022,6 +1042,7 @@ fn rewrite_preserving_number_lexemes(
     Some(serialize_document_bounded(
         &LexemePreservingDocument {
             value: &document,
+            prefix: &prefix,
             lexemes: &lexemes,
         },
         ceiling,
@@ -1029,8 +1050,12 @@ fn rewrite_preserving_number_lexemes(
 }
 
 /// The preserved lexeme a stand-in string names, if `text` is one.
-fn preserved_lexeme<'a>(text: &str, lexemes: &'a [Box<RawValue>]) -> Option<&'a RawValue> {
-    let digits = text.strip_prefix(NUMBER_STAND_IN_PREFIX)?;
+fn preserved_lexeme<'a>(
+    text: &str,
+    prefix: &str,
+    lexemes: &'a [Box<RawValue>],
+) -> Option<&'a RawValue> {
+    let digits = text.strip_prefix(prefix)?;
     if digits.is_empty()
         || !digits.bytes().all(|byte| byte.is_ascii_digit())
         || (digits.len() > 1 && digits.starts_with('0'))
@@ -1045,6 +1070,8 @@ fn preserved_lexeme<'a>(text: &str, lexemes: &'a [Box<RawValue>]) -> Option<&'a 
 /// `serde_json::Value` would.
 struct LexemePreservingDocument<'a> {
     value: &'a Value,
+    /// This rewrite's stand-in prefix (`NUMBER_STAND_IN_FAMILY` + generation).
+    prefix: &'a str,
     lexemes: &'a [Box<RawValue>],
 }
 
@@ -1054,7 +1081,7 @@ impl Serialize for LexemePreservingDocument<'_> {
         S: Serializer,
     {
         match self.value {
-            Value::String(text) => match preserved_lexeme(text, self.lexemes) {
+            Value::String(text) => match preserved_lexeme(text, self.prefix, self.lexemes) {
                 Some(raw) => raw.serialize(serializer),
                 None => serializer.serialize_str(text),
             },
@@ -1063,6 +1090,7 @@ impl Serialize for LexemePreservingDocument<'_> {
                 for item in items {
                     seq.serialize_element(&LexemePreservingDocument {
                         value: item,
+                        prefix: self.prefix,
                         lexemes: self.lexemes,
                     })?;
                 }
@@ -1075,6 +1103,7 @@ impl Serialize for LexemePreservingDocument<'_> {
                         key,
                         &LexemePreservingDocument {
                             value: item,
+                            prefix: self.prefix,
                             lexemes: self.lexemes,
                         },
                     )?;

@@ -930,19 +930,28 @@ async fn test_request_transformer_modifies_request_headers_false_for_query_only(
 }
 
 #[tokio::test]
-async fn test_request_transformer_modifies_request_headers_true_for_body_only() {
-    // Body rules remove stale content-integrity fields (`Content-Digest`, …)
-    // from the outbound map in `before_proxy`, so they need the cloned header
-    // map (request_transformer-SOL-2).
+async fn test_request_transformer_modifies_request_headers_false_for_body_only() {
+    // Stale integrity fields are retired by proxy core over the final
+    // outbound headers, clone-on-write, so body rules no longer force a
+    // per-request header-map copy (PR #6858 review SOL-6).
     let plugin = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "add", "target": "body", "key": "v", "value": "1"}
         ]
     }))
     .unwrap();
-    assert!(plugin.modifies_request_headers());
+    assert!(!plugin.modifies_request_headers());
     assert!(plugin.modifies_request_body());
     assert!(!plugin.modifies_request_query());
+    // The context-aware body hook publishes the skip reason, so the H1/H2
+    // dispatcher must select it (PR #6858 review SOL-2).
+    assert!(plugin.needs_final_request_body_context());
+
+    let header_only = RequestTransformer::new(&json!({
+        "rules": [{"operation": "add", "target": "header", "key": "x-a", "value": "1"}]
+    }))
+    .unwrap();
+    assert!(!header_only.needs_final_request_body_context());
 }
 
 #[tokio::test]
@@ -2766,26 +2775,61 @@ async fn body_rename_and_update_keep_number_lexemes_where_they_land() {
 }
 
 #[tokio::test]
-async fn body_number_preservation_never_turns_a_client_string_into_a_number() {
-    // A client string shaped like the private stand-in disables substitution;
-    // the string must survive as a string.
+async fn body_number_preservation_survives_stand_in_shaped_client_strings() {
+    // A client string shaped like a private stand-in stays a string AND no
+    // longer disables preservation of unrelated lossy numbers (PR #6858
+    // review SOL-4): the stand-in generation is chosen to be unused.
     let plugin = RequestTransformer::new(&json!({
         "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
     }))
     .unwrap();
-    let body = br#"{"s":"\u0000ferrum-number:0","n":1.5,"debug":true}"#;
+    let body = br#"{"s":"\u0000ferrum-number-0:0","t":"\u0000ferrum-number-1:0","u":"\u0000ferrum-number:0","id":18446744073709551617,"pi":3.14159265358979323846264338327950288,"debug":true}"#;
     let out = plugin
         .transform_request_body(body, Some("application/json"), &HashMap::new())
         .await
         .expect("the remove rule rewrites the body");
-    let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(value["s"], json!("\u{0}ferrum-number:0"));
-    assert_eq!(value["n"], json!(1.5));
-    assert!(value.get("debug").is_none());
+    let members = raw_members(&out);
+    assert!(!members.contains_key("debug"));
+    assert_eq!(members["s"], r#""\u0000ferrum-number-0:0""#);
+    assert_eq!(members["t"], r#""\u0000ferrum-number-1:0""#);
+    assert_eq!(members["u"], r#""\u0000ferrum-number:0""#);
+    assert_eq!(members["id"], "18446744073709551617");
+    assert_eq!(members["pi"], "3.14159265358979323846264338327950288");
+}
+
+fn integrity_headers(content_type: Option<&str>) -> HashMap<String, String> {
+    let mut headers: HashMap<String, String> = HashMap::new();
+    if let Some(content_type) = content_type {
+        headers.insert("content-type".to_string(), content_type.to_string());
+    }
+    headers.insert("content-digest".to_string(), "sha-256=:stale:".to_string());
+    headers.insert("Repr-Digest".to_string(), "sha-256=:stale:".to_string());
+    headers.insert("digest".to_string(), "SHA-256=stale".to_string());
+    headers.insert("content-md5".to_string(), "stale".to_string());
+    headers.insert("x-keep".to_string(), "1".to_string());
+    headers
+}
+
+/// Run `plugins` through `before_proxy` the way the dispatcher does when no
+/// instance advertises a header mutation (the outbound map IS the taken
+/// `ctx.headers`), then proxy core's final-header digest retirement.
+async fn run_chain_then_retire(
+    plugins: &[&RequestTransformer],
+    ctx: &mut RequestContext,
+    inbound: HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    let mut outbound = inbound.clone();
+    for plugin in plugins {
+        plugin.before_proxy(ctx, &mut outbound).await;
+    }
+    ctx.headers = inbound;
+    let mut owned = (outbound != ctx.headers).then_some(outbound);
+    ferrum_edge::_test_support::retire_stale_request_integrity_headers(ctx, &mut owned);
+    owned
 }
 
 #[tokio::test]
-async fn body_rules_strip_stale_request_integrity_headers() {
+async fn body_rules_retire_stale_request_integrity_headers_over_final_headers() {
     // request_transformer-SOL-2: a digest computed over the client's bytes
     // must not reach the backend beside a body the rules may rewrite.
     let plugin = RequestTransformer::new(&json!({
@@ -2798,24 +2842,54 @@ async fn body_rules_strip_stale_request_integrity_headers() {
         None,
     ] {
         let mut ctx = post_ctx();
-        let mut headers: HashMap<String, String> = HashMap::new();
-        if let Some(content_type) = content_type {
-            headers.insert("content-type".to_string(), content_type.to_string());
-        }
-        headers.insert("content-digest".to_string(), "sha-256=:stale:".to_string());
-        headers.insert("Repr-Digest".to_string(), "sha-256=:stale:".to_string());
-        headers.insert("digest".to_string(), "SHA-256=stale".to_string());
-        headers.insert("content-md5".to_string(), "stale".to_string());
-        headers.insert("x-keep".to_string(), "1".to_string());
-        plugin.before_proxy(&mut ctx, &mut headers).await;
+        let outbound = run_chain_then_retire(&[&plugin], &mut ctx, integrity_headers(content_type))
+            .await
+            .expect("the retirement materializes an outbound copy");
         for stale in ["content-digest", "Repr-Digest", "digest", "content-md5"] {
             assert!(
-                !headers.contains_key(stale),
+                !outbound.contains_key(stale),
                 "{stale} must be removed for {content_type:?}"
             );
+            // The original inbound view is never mutated.
+            assert!(ctx.headers.contains_key(stale));
         }
-        assert_eq!(headers.get("x-keep").map(String::as_str), Some("1"));
+        assert_eq!(outbound.get("x-keep").map(String::as_str), Some("1"));
     }
+}
+
+#[tokio::test]
+async fn digest_retirement_follows_a_later_content_type_rewrite() {
+    // PR #6858 review SOL-1: a later header-only instance turns a declared
+    // `text/plain` upload into JSON the body rules then rewrite. The decision
+    // is taken over the FINAL headers, so the digest is still retired.
+    let body = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let relabel = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "content-type", "value": "application/json"}]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&body, &relabel],
+        &mut ctx,
+        integrity_headers(Some("text/plain")),
+    )
+    .await
+    .expect("the relabel produced an outbound copy");
+    assert_eq!(
+        outbound.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert!(!outbound.contains_key("content-digest"));
+    assert!(!outbound.contains_key("content-md5"));
+
+    // Without the relabel the declared non-JSON upload keeps its digest.
+    let mut ctx = post_ctx();
+    let outbound =
+        run_chain_then_retire(&[&body], &mut ctx, integrity_headers(Some("text/plain"))).await;
+    assert!(outbound.is_none(), "nothing to retire, nothing copied");
 }
 
 #[tokio::test]
@@ -2825,26 +2899,20 @@ async fn integrity_headers_survive_when_body_rules_cannot_rewrite() {
     }))
     .unwrap();
 
-    // A declared non-JSON upload is never rewritten.
-    let mut ctx = post_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("content-type".to_string(), "text/plain".to_string());
-    headers.insert(
-        "content-digest".to_string(),
-        "sha-256=:original:".to_string(),
-    );
-    body_plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(headers.contains_key("content-digest"));
-
     // A bodiless GET is never rewritten.
     let mut ctx = make_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert(
-        "content-digest".to_string(),
-        "sha-256=:original:".to_string(),
-    );
-    body_plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(headers.contains_key("content-digest"));
+    let outbound = run_chain_then_retire(&[&body_plugin], &mut ctx, integrity_headers(None)).await;
+    assert!(outbound.is_none());
+
+    // Framed gRPC JSON can never parse as one document.
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(
+        &[&body_plugin],
+        &mut ctx,
+        integrity_headers(Some("application/grpc+json")),
+    )
+    .await;
+    assert!(outbound.is_none());
 
     // Header-only rules never touch the body.
     let header_plugin = RequestTransformer::new(&json!({
@@ -2852,14 +2920,29 @@ async fn integrity_headers_survive_when_body_rules_cannot_rewrite() {
     }))
     .unwrap();
     let mut ctx = post_ctx();
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("content-type".to_string(), "application/json".to_string());
-    headers.insert(
-        "content-digest".to_string(),
-        "sha-256=:original:".to_string(),
-    );
-    header_plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(headers.contains_key("content-digest"));
+    let outbound = run_chain_then_retire(
+        &[&header_plugin],
+        &mut ctx,
+        integrity_headers(Some("application/json")),
+    )
+    .await
+    .expect("the header rule produced an outbound copy");
+    assert!(outbound.contains_key("content-digest"));
+}
+
+#[tokio::test]
+async fn requests_without_integrity_fields_take_the_no_copy_path() {
+    // PR #6858 review SOL-6: a JSON request with no digest allocates no
+    // outbound copy and no per-request plugin state for the retirement.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [{"operation": "remove", "target": "body", "key": "debug"}]
+    }))
+    .unwrap();
+    let mut inbound: HashMap<String, String> = HashMap::new();
+    inbound.insert("content-type".to_string(), "application/json".to_string());
+    let mut ctx = post_ctx();
+    let outbound = run_chain_then_retire(&[&plugin], &mut ctx, inbound).await;
+    assert!(outbound.is_none());
 }
 
 #[test]
@@ -3007,8 +3090,10 @@ async fn header_and_query_values_resolve_bounded_template_variables() {
     ctx.metadata
         .insert("request_id".to_string(), "req-123".to_string());
     ctx.set_raw_query_string("region=eu%2Dwest".to_string());
-    let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("x-tenant".to_string(), "acme".to_string());
+    // Header sources resolve from the ORIGINAL client headers.
+    ctx.headers
+        .insert("x-tenant".to_string(), "acme".to_string());
+    let mut headers = ctx.headers.clone();
 
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
@@ -3075,15 +3160,16 @@ async fn unresolvable_or_unsafe_templates_skip_the_rule_and_say_why() {
         Some("template_invalid_header_value")
     );
 
-    // An authentication-owned query credential is never a template source.
+    // An authentication-owned query credential is never a template source,
+    // even under an innocuous name the classifier would not flag.
     let plugin = RequestTransformer::new(&json!({
-        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.api_key)"}]
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "$(query.locale)"}]
     }))
     .unwrap();
     let mut ctx = make_ctx();
-    ctx.set_raw_query_string("api_key=s3cr3t".to_string());
+    ctx.set_raw_query_string("locale=s3cr3t".to_string());
     ctx.metadata.insert(
-        "auth.strip_query_param.api_key".to_string(),
+        "auth.strip_query_param.locale".to_string(),
         "true".to_string(),
     );
     let mut headers: HashMap<String, String> = HashMap::new();
@@ -3104,6 +3190,17 @@ fn malformed_or_credential_templates_fail_admission() {
         ("$(consumer.username", "unterminated"),
         ("$(header.authorization)", "credential-bearing header"),
         ("$(header.Cookie)", "credential-bearing header"),
+        // Any delimiter spelling of a credential header, and any name the
+        // shared sensitive-name classifier flags (PR #6858 review SOL-3).
+        ("$(header.x_api_key)", "credential-bearing header"),
+        ("$(header.X_Auth_Token)", "credential-bearing header"),
+        ("$(header.x-session-secret)", "credential-bearing header"),
+        ("$(query.api_key)", "credential-bearing query parameter"),
+        (
+            "$(query.access_token)",
+            "credential-bearing query parameter",
+        ),
+        ("$(query.password)", "credential-bearing query parameter"),
         ("$(header.bad name)", "valid HTTP header"),
         ("$(query.)", "must name a query parameter"),
         (
@@ -3194,4 +3291,59 @@ async fn body_non_application_publishes_a_value_free_reason() {
     for value in ctx.metadata.values() {
         assert!(!value.contains("SENSITIVE"));
     }
+}
+
+#[tokio::test]
+async fn templates_cannot_copy_a_credential_an_earlier_rename_relabelled() {
+    // PR #6858 review SOL-3: `rename authorization -> x-context` followed by
+    // a template over `x-context` must not publish the credential under an
+    // innocuous query name (secondary egress would not recognise it). Header
+    // sources resolve from the ORIGINAL client headers, so the renamed name
+    // carries nothing.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-context"},
+            {"operation": "add", "target": "query", "key": "trace", "value": "ref=$(header.x-context)"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.insert(
+        "authorization".to_string(),
+        "Bearer SECRET-TOKEN".to_string(),
+    );
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        headers.get("x-context").map(String::as_str),
+        Some("Bearer SECRET-TOKEN"),
+        "the rename itself still applies"
+    );
+    assert!(
+        ctx.outbound_query_string()
+            .is_none_or(|query| !query.contains("SECRET")),
+        "{:?}",
+        ctx.outbound_query_string()
+    );
+
+    // The same holds across instances for query renames: the second
+    // instance reads the original client query, where `k` never existed.
+    let rename = RequestTransformer::new(&json!({
+        "rules": [{"operation": "rename", "target": "query", "key": "sig", "new_key": "k"}]
+    }))
+    .unwrap();
+    let copy = RequestTransformer::new(&json!({
+        "rules": [{"operation": "update", "target": "header", "key": "x-copied", "value": "v=$(query.k)"}]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("sig=SECRET-SIG".to_string());
+    let mut headers = ctx.headers.clone();
+    rename.before_proxy(&mut ctx, &mut headers).await;
+    copy.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        ctx.outbound_query_string()
+            .is_some_and(|query| query.contains("k="))
+    );
+    assert!(!headers.contains_key("x-copied"));
 }

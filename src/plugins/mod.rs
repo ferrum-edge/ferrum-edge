@@ -3717,6 +3717,12 @@ pub(crate) struct PluginRequestState {
     /// instances) cannot launder a credential name. Empty unless a rename ran.
     pub(crate) request_header_rename_lineage: Vec<(String, String)>,
     pub(crate) request_query_rename_lineage: Vec<(String, String)>,
+    /// Set by an enabled `request_transformer` with body rules when this
+    /// request carries a content-integrity field (`Content-Digest`,
+    /// `Repr-Digest`, `Digest`, `Content-MD5`). Proxy core then retires those
+    /// fields over the FINAL outbound headers when the body rules may rewrite
+    /// the request (`crate::proxy::retire_stale_request_integrity_headers`).
+    pub(crate) request_body_integrity_retirement: bool,
     /// Deltas from the original request-header view to the complete
     /// backend-visible view, staged by `response_caching` instances during
     /// lookup and consumed when the origin supplies its final `Vary`

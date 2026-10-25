@@ -29539,11 +29539,13 @@ components:
             rejected).
             May reference up to 8 request variables, compiled at load time:
             `$(consumer.username)`, `$(client_ip)`, `$(request_id)`,
-            `$(header.<name>)` (the outbound header map at the time the rule
-            runs), and `$(query.<name>)` (the percent-decoded query this
-            instance received). `$$(` writes a literal `$(`; an unknown
-            variable, an unterminated `$(`, or a credential-bearing header
-            source (authorization, cookie, x-api-key, …) is rejected. When a
+            `$(header.<name>)` and `$(query.<name>)` (both read from the
+            ORIGINAL client request, so a rename cannot relabel a
+            credential). `$$(` writes a literal `$(`; an unknown variable, an
+            unterminated `$(`, or a credential-bearing source name (the
+            built-in credential headers in any `_` / `-` spelling, or any
+            name the shared sensitive-name classifier flags: `*token*`,
+            `*secret*`, `password`, `api_key`, …) is rejected. When a
             variable is unavailable for a request — or names a credential
             location an auth plugin marked — or the resolved text is not a
             valid HeaderValue, the rule is skipped for that request and

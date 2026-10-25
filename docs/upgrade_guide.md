@@ -42,7 +42,12 @@ upgrading:
   `.user`, `a..b`) are refused in `request_transformer` and
   `response_transformer`. Fix the typo, or escape a literal dot as `\.`.
 - A header or query `value` containing `$(` is now a template. Replace a
-  literal `$(` with `$$(`; an unknown variable is refused at load.
+  literal `$(` with `$$(`; an unknown variable, or a credential-class source
+  name (`$(header.authorization)`, `$(query.access_token)`, …), is refused at
+  load.
+- `mesh_route_dispatch` `request_transform` (VirtualService
+  `headers.request.set/add`) add/update destinations under `x-path-param-*`
+  are refused, so a VirtualService that sets one fails translation.
 
 Behaviour changes that need no config edit but may matter downstream:
 
@@ -50,10 +55,10 @@ Behaviour changes that need no config edit but may matter downstream:
   now apply to WebSocket upgrade handshakes on the same route. A transformer
   meant only for plain HTTP requests needs a route that does not serve
   WebSocket.
-- An instance with body rules removes `Content-Digest`, `Repr-Digest`,
-  `Digest`, and `Content-MD5` from any request with a JSON (or absent)
-  `Content-Type` that may carry a body — even when the rules end up not
-  changing it. A backend that requires request digests cannot sit behind body
+- When an instance has body rules, `Content-Digest`, `Repr-Digest`,
+  `Digest`, and `Content-MD5` are removed from any request whose FINAL
+  outbound `Content-Type` is JSON (or absent) and that may carry a body —
+  even when the rules end up not changing it. A backend that requires request digests cannot sit behind body
   rules.
 - Transaction logs gain `request_transformer.rule_skipped` and
   `request_transformer.body_skipped` metadata when a rule or body pass did not

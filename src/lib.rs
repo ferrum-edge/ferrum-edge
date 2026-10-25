@@ -9870,6 +9870,15 @@ pub mod _test_support {
         crate::proxy::request_may_have_body(method, headers)
     }
 
+    /// Proxy core's stale request-digest retirement over the final outbound
+    /// headers (clone-on-write into `owned_proxy_headers`).
+    pub fn retire_stale_request_integrity_headers(
+        ctx: &crate::plugins::RequestContext,
+        owned_proxy_headers: &mut Option<HashMap<String, String>>,
+    ) {
+        crate::proxy::retire_stale_request_integrity_headers(ctx, owned_proxy_headers)
+    }
+
     pub async fn apply_request_body_plugins(
         plugins: &[Arc<dyn Plugin>],
         headers: &HashMap<String, String>,

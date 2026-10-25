@@ -18101,10 +18101,70 @@ pub fn refresh_backend_gateway_assertion_headers(
     }
 }
 
+/// Retire request content-integrity fields (`Content-Digest`, `Repr-Digest`,
+/// `Digest`, `Content-MD5`) that `request_transformer` body rules may
+/// invalidate, judged over the FINAL outbound headers — after every
+/// `before_proxy` hook and the route-header finalizer, before any backend
+/// header builder consumes the map. Several dispatch ladders install headers
+/// before the body transform runs, so a digest cannot be recomputed for the
+/// rewritten bytes.
+///
+/// Free on the ordinary path: the request transformer only requests this when
+/// the request actually carried such a field, and the outbound map is copied
+/// (clone-on-write) only when one must be removed. `ctx.headers` keeps the
+/// original inbound view.
+pub(crate) fn retire_stale_request_integrity_headers(
+    ctx: &RequestContext,
+    owned_proxy_headers: &mut Option<HashMap<String, String>>,
+) {
+    if !ctx
+        .plugin_state()
+        .is_some_and(|state| state.request_body_integrity_retirement)
+    {
+        return;
+    }
+    let effective = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers);
+    if !request_integrity_retirement_applies(ctx, effective) {
+        return;
+    }
+    let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+    crate::plugins::request_transformer::strip_body_bound_integrity_headers(headers);
+}
+
+/// Owned-map variant of [`retire_stale_request_integrity_headers`] for the
+/// native HTTP/3 deferred passes, whose outbound map is already a copy.
+pub(crate) fn retire_stale_request_integrity_headers_in_map(
+    ctx: &RequestContext,
+    headers: &mut HashMap<String, String>,
+) {
+    if ctx
+        .plugin_state()
+        .is_some_and(|state| state.request_body_integrity_retirement)
+        && request_integrity_retirement_applies(ctx, headers)
+    {
+        crate::plugins::request_transformer::strip_body_bound_integrity_headers(headers);
+    }
+}
+
+fn request_integrity_retirement_applies(
+    ctx: &RequestContext,
+    headers: &HashMap<String, String>,
+) -> bool {
+    use crate::plugins::request_transformer::{
+        is_body_bound_request_integrity_header, request_body_rules_may_rewrite,
+    };
+    headers
+        .keys()
+        .any(|name| is_body_bound_request_integrity_header(name))
+        && request_body_rules_may_rewrite(&ctx.method, headers)
+}
+
 fn refresh_effective_backend_gateway_assertion_headers(
     ctx: &mut RequestContext,
     owned_proxy_headers: &mut Option<HashMap<String, String>>,
 ) {
+    // A deferred pass or egress overlay can change `Content-Type` again.
+    retire_stale_request_integrity_headers(ctx, owned_proxy_headers);
     if let Some(headers) = owned_proxy_headers.as_mut() {
         refresh_backend_gateway_assertion_headers(ctx, headers);
     } else {
@@ -36841,6 +36901,10 @@ async fn handle_proxy_request_inner(
         let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
         refresh_backend_gateway_assertion_headers(&ctx, headers);
     }
+    // Stale request digests: decided over the final outbound headers, after
+    // every `before_proxy` hook and the route-header finalizer. The native
+    // HTTP/3 frontend does the same at the same point — keep both in sync.
+    retire_stale_request_integrity_headers(&ctx, &mut owned_proxy_headers);
     // Proxy hop limit (issue #6109): re-assert the forwarded `X-Ferrum-Hops`
     // count on the authoritative outbound map now that every request-phase
     // plugin has run, so no plugin can reset the count the next gateway hop
