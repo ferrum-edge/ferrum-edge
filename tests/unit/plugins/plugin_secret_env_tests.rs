@@ -171,6 +171,17 @@ fn ai_stream_router_api_key_reference(name: &str) -> Value {
     })
 }
 
+fn soap_ws_security_password_reference(name: &str) -> Value {
+    json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": format!("${{{name}}}")}]
+        }
+    })
+}
+
 fn mcp_gateway_server_header_reference(name: &str) -> Value {
     json!({
         "mode": "aggregate_router",
@@ -270,10 +281,11 @@ fn ai_tool_governor_approval_header_reference(name: &str) -> Value {
 /// `(plugin, config builder)`. A new env-reference field belongs here.
 type ConfigBuilder = fn(&str) -> Value;
 
-const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 9] = [
+const ENV_REFERENCE_FIELDS: [(&str, ConfigBuilder); 10] = [
     ("api_chargeback_sink", api_chargeback_sink_password_ref),
     ("ai_semantic_firewall", ai_semantic_firewall_api_key_env),
     ("ai_stream_router", ai_stream_router_api_key_reference),
+    ("soap_ws_security", soap_ws_security_password_reference),
     (
         "ai_tool_governor",
         ai_tool_governor_approval_header_reference,

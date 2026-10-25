@@ -2,11 +2,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
     finalize_plugin_rejection_for_test, finalize_plugin_rejection_without_committed_hooks_for_test,
-    finalized_response_replay_for_test, request_deduplication_completed_size_snapshot_for_test,
+    finalized_response_replay_for_test, mark_query_credential_for_test,
+    request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_execution_barriers_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_inflight_count_snapshot_for_test,
+    request_deduplication_live_inflight_count_snapshot_for_test,
     request_deduplication_logical_keys_from_context_for_test,
     request_deduplication_redis_cached_response_payload_is_valid,
     request_deduplication_redis_payload_for_test,
@@ -26,9 +28,13 @@ use ferrum_edge::plugins::request_deduplication::{
     CONDITIONALLY_DYNAMIC_RESPONSE_PRESENTATION_PLUGINS, DYNAMIC_RESPONSE_PRESENTATION_PLUGINS,
     RequestDeduplication,
 };
+use ferrum_edge::plugins::request_transformer::RequestTransformer;
 use ferrum_edge::plugins::response_transformer::ResponseTransformer;
 use ferrum_edge::plugins::serverless_function::ServerlessFunction;
 use ferrum_edge::plugins::utils::policy_digest::presentation_policy_digest;
+use ferrum_edge::plugins::utils::route_header_transform::{
+    RouteHeaderTransformOp, RouteHeaderTransformRule,
+};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
     ResponsePresentationPolicy, create_plugin_with_http_client,
@@ -891,6 +897,7 @@ fn config_admission_normalization_is_the_published_contract() {
         "ttl_seconds",
         "inflight_ttl_seconds",
         "max_entries",
+        "max_inflight_entries",
         "max_entry_size_bytes",
         "max_total_size_bytes",
     ] {
@@ -1005,10 +1012,13 @@ fn every_documented_config_key_is_accepted() {
         "ttl_seconds": 120,
         "inflight_ttl_seconds": 30,
         "max_entries": 100,
+        "max_inflight_entries": 50,
         "max_entry_size_bytes": 4096,
         "max_total_size_bytes": 65536,
         "applicable_methods": ["POST", "PUT"],
         "scope_by_consumer": false,
+        "anonymous_caller_scope": "caller_address",
+        "caller_partition": "authenticated_identity",
         "enforce_required": true,
         "sync_mode": "redis",
         "redis_url": "redis://dedup-redis.internal:6379/0",
@@ -3887,6 +3897,10 @@ async fn terminal_replay_survives_active_capacity_then_becomes_tombstone() {
         .await;
     let dedup = make_plugin(json!({
         "max_entries": 1,
+        // Two concurrent operations must both be admitted while the completed
+        // entry target stays at one; `max_inflight_entries` defaults to
+        // `max_entries` and is the hard live-marker ceiling.
+        "max_inflight_entries": 2,
         "ttl_seconds": 300,
         "inflight_ttl_seconds": 300
     }));
@@ -5302,9 +5316,12 @@ async fn test_expired_completed_entries_release_retained_bytes() {
 
 #[tokio::test]
 async fn test_active_inflight_entries_survive_capacity_pressure() {
+    // Live markers may exceed the completed-entry target (`max_entries`) up to
+    // the separate hard `max_inflight_entries` ceiling.
     let config = json!({
         "ttl_seconds": 300,
-        "max_entries": 2
+        "max_entries": 2,
+        "max_inflight_entries": 3
     });
     let plugin = make_plugin(config);
 
@@ -5329,6 +5346,280 @@ async fn test_active_inflight_entries_survive_capacity_pressure() {
         PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 409),
         other => panic!("Expected duplicate in-flight request to be rejected, got {other:?}"),
     }
+}
+
+/// request_deduplication-SOL-2: an interrupted streamed response keeps its
+/// in-flight marker until `inflight_ttl_seconds`, so a client that resets
+/// fresh-key requests could otherwise grow retained markers without bound.
+/// Admission reserves a live slot before inserting; at the ceiling a NEW key is
+/// refused with 503 while already-tracked keys still conflict, and expiry
+/// reclaims the slots.
+#[tokio::test]
+async fn new_keys_are_refused_once_live_inflight_capacity_is_saturated() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "inflight_ttl_seconds": 300,
+        "max_entries": 2
+    }));
+
+    for key in ["interrupted-a", "interrupted-b"] {
+        let mut ctx = new_ctx("POST", "/stream");
+        let mut headers = HashMap::from([("idempotency-key".to_string(), key.to_string())]);
+        assert!(matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        // The client reset the SSE response after its first bytes.
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(16))
+            .await;
+    }
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        2
+    );
+    assert_eq!(plugin.tracked_keys_count(), Some(2));
+
+    for attempt in 0..4 {
+        let mut ctx = new_ctx("POST", "/stream");
+        let mut headers = HashMap::from([(
+            "idempotency-key".to_string(),
+            format!("fresh-over-capacity-{attempt}"),
+        )]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 503, "{body}");
+                assert!(body.contains("in-flight capacity"), "{body}");
+            }
+            other => panic!("a new key past the live in-flight ceiling must be refused: {other:?}"),
+        }
+        assert!(
+            request_identity(&plugin, &ctx).is_none(),
+            "a refused request must not own any completion state"
+        );
+    }
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(2),
+        "refused keys must not allocate retained state"
+    );
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        2
+    );
+
+    // Existing keys keep their protection: the interrupted operation is still
+    // refused rather than evicted to admit new work.
+    let mut duplicate_ctx = new_ctx("POST", "/stream");
+    let mut duplicate_headers =
+        HashMap::from([("idempotency-key".to_string(), "interrupted-a".to_string())]);
+    match plugin
+        .before_proxy(&mut duplicate_ctx, &mut duplicate_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409, "{body}");
+            assert!(body.contains("already in progress"), "{body}");
+        }
+        other => panic!("an existing key must still conflict at capacity: {other:?}"),
+    }
+
+    // Lease expiry reclaims the slots through the ordinary cleanup scan.
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+    let mut reclaimed_ctx = new_ctx("POST", "/stream");
+    let mut reclaimed_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "fresh-after-expiry".to_string(),
+    )]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut reclaimed_ctx, &mut reclaimed_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        1
+    );
+}
+
+/// PR6818-SOL-1: the live ceiling is enforced by one CAS on one exact counter,
+/// so many distinct new keys racing on separate workers admit exactly the
+/// ceiling, refuse the rest, and return the counter to zero once released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_new_keys_admit_exactly_the_live_inflight_ceiling() {
+    const CEILING: usize = 4;
+    const CONTENDERS: usize = 32;
+    let plugin = Arc::new(make_plugin(json!({ "max_inflight_entries": CEILING })));
+    let start = Arc::new(Barrier::new(CONTENDERS));
+    let mut tasks = Vec::with_capacity(CONTENDERS);
+    for index in 0..CONTENDERS {
+        let plugin = Arc::clone(&plugin);
+        let start = Arc::clone(&start);
+        tasks.push(tokio::spawn(async move {
+            let mut ctx = new_ctx("POST", "/concurrent");
+            let mut headers =
+                HashMap::from([("idempotency-key".to_string(), format!("concurrent-{index}"))]);
+            start.wait().await;
+            let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+            let admitted = match result {
+                PluginResult::Continue => true,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ref body,
+                    ..
+                } if body.contains("in-flight capacity") => false,
+                other => panic!("unexpected admission result: {other:?}"),
+            };
+            (admitted, ctx)
+        }));
+    }
+
+    let mut admitted = Vec::new();
+    let mut refused = 0usize;
+    for task in tasks {
+        let (was_admitted, ctx) = task.await.expect("admission task");
+        if was_admitted {
+            admitted.push(ctx);
+        } else {
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        admitted.len(),
+        CEILING,
+        "exactly the ceiling must be admitted"
+    );
+    assert_eq!(refused, CONTENDERS - CEILING);
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        CEILING
+    );
+
+    for mut ctx in admitted {
+        plugin
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(1))
+            .await;
+    }
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        0,
+        "every release must return its slot exactly"
+    );
+}
+
+/// Execution barriers have their own `max_entries` budget: converting an
+/// owner's marker into a barrier frees its live slot for new work.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn execution_barriers_do_not_consume_live_inflight_slots() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 60,
+        "max_inflight_entries": 1,
+        "max_entry_size_bytes": 1
+    }));
+
+    let mut owner = new_ctx("POST", "/api");
+    let mut owner_headers =
+        HashMap::from([("idempotency-key".to_string(), "barrier-owner".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+    owner.metadata.insert(
+        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    plugin
+        .on_response_committed(&mut owner, 200, &HashMap::new(), b"done")
+        .await;
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        0,
+        "the barrier must not hold a live slot"
+    );
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        1
+    );
+
+    let mut fresh = new_ctx("POST", "/api");
+    let mut fresh_headers =
+        HashMap::from([("idempotency-key".to_string(), "after-barrier".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut fresh, &mut fresh_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        request_deduplication_live_inflight_count_snapshot_for_test(&plugin),
+        1
+    );
+
+    let mut duplicate = new_ctx("POST", "/api");
+    let mut duplicate_headers =
+        HashMap::from([("idempotency-key".to_string(), "barrier-owner".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut duplicate, &mut duplicate_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 409,
+            ..
+        }
+    ));
+}
+
+/// A clean completion frees its live slot immediately, so the ceiling bounds
+/// concurrent and retained markers rather than throughput.
+#[tokio::test]
+async fn released_inflight_slots_admit_new_keys() {
+    let plugin = make_plugin(json!({ "max_inflight_entries": 1 }));
+
+    let mut first_ctx = new_ctx("POST", "/stream");
+    let mut first_headers =
+        HashMap::from([("idempotency-key".to_string(), "slot-first".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut first_ctx, &mut first_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut blocked_ctx = new_ctx("POST", "/stream");
+    let mut blocked_headers =
+        HashMap::from([("idempotency-key".to_string(), "slot-second".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut blocked_ctx, &mut blocked_headers)
+            .await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+
+    plugin
+        .on_response_stream_terminated(&mut first_ctx, 200, &BodyOutcome::success(64))
+        .await;
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        0
+    );
+
+    let mut admitted_ctx = new_ctx("POST", "/stream");
+    let mut admitted_headers =
+        HashMap::from([("idempotency-key".to_string(), "slot-second".to_string())]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut admitted_ctx, &mut admitted_headers)
+            .await,
+        PluginResult::Continue
+    ));
 }
 
 /// A cached response with `Set-Cookie: session=A` from the first client must
@@ -6574,7 +6865,7 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     assert!(matches!(result, PluginResult::Continue));
 
     let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
-    assert!(logical_key.starts_with("v6:"));
+    assert!(logical_key.starts_with("v7:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
         "super-secret-body",
@@ -6853,6 +7144,715 @@ async fn dedup_isolates_effective_route_destination() {
         ),
         "a different effective destination must not replay"
     );
+}
+
+/// Route response-header policy as `mesh_route_dispatch` publishes it for the
+/// matched rule: one `add x-policy: <value>` rule.
+fn route_response_policy(value: &str) -> Option<Arc<Vec<RouteHeaderTransformRule>>> {
+    Some(Arc::new(vec![RouteHeaderTransformRule {
+        operation: RouteHeaderTransformOp::Add,
+        key: "x-policy".to_string(),
+        value: Some(value.to_string()),
+    }]))
+}
+
+/// request_deduplication-SOL-1: a route's response-header policy changes how
+/// a result is presented, not which operation the backend executes. Reloading
+/// only that policy must not address a fresh logical key — that would execute
+/// a completed non-idempotent operation a second time. An unchanged policy
+/// still replays; a changed one is refused with 409 by the fingerprint.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn route_response_header_only_reload_conflicts_instead_of_reexecuting() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({ "ttl_seconds": 300 }));
+
+    let mut original = dedup_ctx("127.0.0.1", "payment-route-policy");
+    original.route_override_upstream_id = Some("payments".to_string());
+    original.route_override_response_transform = route_response_policy("v1");
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"{\"charged\":100}").await,
+        PluginResult::Continue
+    ));
+
+    let mut unchanged = dedup_ctx("127.0.0.1", "payment-route-policy");
+    unchanged.route_override_upstream_id = Some("payments".to_string());
+    unchanged.route_override_response_transform = route_response_policy("v1");
+    let mut unchanged_headers = unchanged.headers.clone();
+    match plugin
+        .before_proxy(&mut unchanged, &mut unchanged_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"{\"charged\":100}"),
+        other => panic!("an unchanged route response policy must replay: {other:?}"),
+    }
+
+    let mut reloaded = dedup_ctx("127.0.0.1", "payment-route-policy");
+    reloaded.route_override_upstream_id = Some("payments".to_string());
+    reloaded.route_override_response_transform = route_response_policy("v2");
+    let mut reloaded_headers = reloaded.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut reloaded, &mut reloaded_headers)
+            .await,
+    );
+    assert!(
+        request_identity(&plugin, &reloaded).is_none(),
+        "a response-policy-only reload must never acquire fresh ownership"
+    );
+
+    // Dropping the route response policy entirely is the same presentation-only
+    // change and must not execute the operation again either.
+    let mut removed = dedup_ctx("127.0.0.1", "payment-route-policy");
+    removed.route_override_upstream_id = Some("payments".to_string());
+    let mut removed_headers = removed.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut removed, &mut removed_headers)
+            .await,
+    );
+}
+
+/// The execution destination is still bound: the same response policy in
+/// front of a different upstream is a different operation.
+#[tokio::test]
+async fn route_response_policy_does_not_merge_distinct_execution_destinations() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300 }));
+
+    let mut first = dedup_ctx("127.0.0.1", "payment-destination");
+    first.route_override_upstream_id = Some("payments-a".to_string());
+    first.route_override_response_transform = route_response_policy("v1");
+    let mut first_headers = first.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut second = dedup_ctx("127.0.0.1", "payment-destination");
+    second.route_override_upstream_id = Some("payments-b".to_string());
+    second.route_override_response_transform = route_response_policy("v1");
+    let mut second_headers = second.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut second, &mut second_headers).await,
+        PluginResult::Continue
+    ));
+    let (first_key, _) = request_identity(&plugin, &first).expect("first ownership");
+    let (second_key, _) = request_identity(&plugin, &second).expect("second ownership");
+    assert_ne!(first_key, second_key);
+}
+
+fn consumer_principal(id: &str, username: &str) -> Arc<ferrum_edge::config::types::Consumer> {
+    let mut consumer = super::plugin_utils::create_test_consumer();
+    consumer.id = id.to_string();
+    consumer.username = username.to_string();
+    Arc::new(consumer)
+}
+
+fn principal_ctx(
+    client_ip: &str,
+    key: &str,
+    consumer: Option<&Arc<ferrum_edge::config::types::Consumer>>,
+    token: &str,
+) -> RequestContext {
+    let mut ctx = dedup_ctx(client_ip, key);
+    ctx.identified_consumer = consumer.cloned();
+    if consumer.is_some() {
+        ctx.auth_method = Some("jwt_auth");
+    }
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    ctx
+}
+
+/// request_deduplication-CLAUDE-1 (M1): with the opt-in
+/// `caller_partition: authenticated_identity`, a retry by the same verified
+/// principal survives a token refresh and an address change, which the
+/// default credential partition treats as a different caller.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_replays_across_credential_rotation() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let mut original = principal_ctx("203.0.113.7", "rotation-order", Some(&alice), "old-token");
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"{\"order\":\"created\"}").await,
+        PluginResult::Continue
+    ));
+
+    let mut rotated = principal_ctx("198.51.100.9", "rotation-order", Some(&alice), "new-token");
+    let mut rotated_headers = rotated.headers.clone();
+    match plugin
+        .before_proxy(&mut rotated, &mut rotated_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, headers, .. } => {
+            assert_eq!(&body[..], b"{\"order\":\"created\"}");
+            assert_eq!(
+                headers.get("x-idempotent-replayed").map(String::as_str),
+                Some("true")
+            );
+        }
+        other => panic!("the same verified principal must replay after rotation: {other:?}"),
+    }
+
+    // A different verified principal never shares the operation.
+    let bob = consumer_principal("consumer-bob", "bob");
+    let mut other = principal_ctx("203.0.113.7", "rotation-order", Some(&bob), "old-token");
+    let mut other_headers = other.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut other, &mut other_headers).await,
+            PluginResult::Continue
+        ),
+        "a different principal must not replay another principal's operation"
+    );
+}
+
+/// The default stays credential-scoped, and the opt-in falls back to it for a
+/// request without a gateway-verified principal (a bare identity string that
+/// no authentication boundary committed is not one).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn credential_partition_remains_default_and_fallback() {
+    let _policy = pinned_policy_guard();
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let default_plugin = make_plugin(json!({ "ttl_seconds": 300 }));
+    let mut original = principal_ctx("203.0.113.7", "default-order", Some(&alice), "old-token");
+    assert!(matches!(
+        dedup_cycle(&default_plugin, &mut original, b"created").await,
+        PluginResult::Continue
+    ));
+    let mut rotated = principal_ctx("203.0.113.7", "default-order", Some(&alice), "new-token");
+    let mut rotated_headers = rotated.headers.clone();
+    assert!(
+        matches!(
+            default_plugin
+                .before_proxy(&mut rotated, &mut rotated_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "the default credential partition must keep a rotated token isolated"
+    );
+
+    let opt_in = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let mut unverified = principal_ctx("203.0.113.7", "fallback-order", None, "old-token");
+    unverified.authenticated_identity = Some("alice".to_string());
+    assert!(matches!(
+        dedup_cycle(&opt_in, &mut unverified, b"created").await,
+        PluginResult::Continue
+    ));
+    let mut unverified_rotated = principal_ctx("203.0.113.7", "fallback-order", None, "new-token");
+    unverified_rotated.authenticated_identity = Some("alice".to_string());
+    let mut unverified_headers = unverified_rotated.headers.clone();
+    assert!(
+        matches!(
+            opt_in
+                .before_proxy(&mut unverified_rotated, &mut unverified_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "without a verified principal the opt-in must fall back to the credential partition"
+    );
+}
+
+/// A verified-principal request whose credential is carried in a configured
+/// query location, as `jwt_auth` `token_lookup: query:access_token` marks it.
+fn query_principal_ctx(
+    key: &str,
+    consumer: &Arc<ferrum_edge::config::types::Consumer>,
+    token: &str,
+    amount: u32,
+) -> RequestContext {
+    query_principal_ctx_named(key, consumer, "access_token", token, amount)
+}
+
+/// [`query_principal_ctx`] with an explicit credential parameter name. The
+/// name is used verbatim on the wire and in `query_params`, which is how the
+/// gateway materializes a name without percent escapes (a literal `+` stays a
+/// `+`).
+fn query_principal_ctx_named(
+    key: &str,
+    consumer: &Arc<ferrum_edge::config::types::Consumer>,
+    param: &str,
+    token: &str,
+    amount: u32,
+) -> RequestContext {
+    let mut ctx = dedup_ctx("127.0.0.1", key);
+    ctx.identified_consumer = Some(Arc::clone(consumer));
+    ctx.auth_method = Some("jwt_auth");
+    ctx.set_raw_query_string(format!("{param}={token}&amount={amount}"));
+    ctx.query_params
+        .insert(param.to_string(), token.to_string());
+    ctx.query_params
+        .insert("amount".to_string(), amount.to_string());
+    mark_query_credential_for_test(&mut ctx, param);
+    ctx
+}
+
+/// PR6818-SOL-2: a refreshed query-parameter credential of the same verified
+/// principal replays under `caller_partition: authenticated_identity`, while a
+/// changed non-credential query pair still conflicts and another principal
+/// stays isolated.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_presence_binds_query_credentials() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let mut original = query_principal_ctx("query-rotation", &alice, "jwt-a", 100);
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"query-created").await,
+        PluginResult::Continue
+    ));
+
+    let mut refreshed = query_principal_ctx("query-rotation", &alice, "jwt-b", 100);
+    let mut refreshed_headers = refreshed.headers.clone();
+    match plugin
+        .before_proxy(&mut refreshed, &mut refreshed_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"query-created"),
+        other => panic!("a refreshed query credential must replay: {other:?}"),
+    }
+
+    let mut changed = query_principal_ctx("query-rotation", &alice, "jwt-b", 200);
+    let mut changed_headers = changed.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut changed, &mut changed_headers)
+            .await,
+    );
+
+    let bob = consumer_principal("consumer-bob", "bob");
+    let mut other = query_principal_ctx("query-rotation", &bob, "jwt-a", 100);
+    let mut other_headers = other.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut other, &mut other_headers).await,
+        PluginResult::Continue
+    ));
+}
+
+/// PR6818-SOL-3: credential query names are matched with the gateway's own
+/// percent-decoding, which keeps a literal `+`, so a `token_lookup:
+/// query:access+token` credential is presence-bound too.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_matches_literal_plus_query_credential_names() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let mut original =
+        query_principal_ctx_named("plus-rotation", &alice, "access+token", "jwt-a", 100);
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"plus-created").await,
+        PluginResult::Continue
+    ));
+
+    let mut refreshed =
+        query_principal_ctx_named("plus-rotation", &alice, "access+token", "jwt-b", 100);
+    let mut refreshed_headers = refreshed.headers.clone();
+    match plugin
+        .before_proxy(&mut refreshed, &mut refreshed_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"plus-created"),
+        other => panic!("a refreshed `access+token` credential must replay: {other:?}"),
+    }
+
+    let mut changed =
+        query_principal_ctx_named("plus-rotation", &alice, "access+token", "jwt-b", 200);
+    let mut changed_headers = changed.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut changed, &mut changed_headers)
+            .await,
+    );
+}
+
+/// Renames a query credential and a credential header to ordinary names, as
+/// an admitted `request_transformer` at priority 3000 may before deduplication.
+fn credential_renaming_transformer() -> RequestTransformer {
+    RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "access_token", "new_key": "backend_token"},
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-backend-token"}
+        ]
+    }))
+    .expect("credential-renaming request_transformer config")
+}
+
+/// Run the real transformer, then deduplication, over one verified-principal
+/// request whose credential travels in both the query and `Authorization`.
+async fn renamed_principal_request(
+    dedup: &RequestDeduplication,
+    transformer: &RequestTransformer,
+    consumer: &Arc<ferrum_edge::config::types::Consumer>,
+    token: &str,
+    amount: u32,
+) -> (PluginResult, RequestContext) {
+    let mut ctx = query_principal_ctx("renamed-rotation", consumer, token, amount);
+    ctx.headers
+        .insert("authorization".to_string(), format!("Bearer {token}"));
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        transformer.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        headers.contains_key("x-backend-token") && !headers.contains_key("authorization"),
+        "the transformer must have renamed the credential header"
+    );
+    assert!(
+        ctx.outbound_query_string().is_some_and(
+            |query| query.contains("backend_token=") && !query.contains("access_token=")
+        ),
+        "the transformer must have renamed the credential query parameter"
+    );
+    let result = dedup.before_proxy(&mut ctx, &mut headers).await;
+    (result, ctx)
+}
+
+/// PR6818-SOL-2 (round 2): a credential that an earlier `request_transformer`
+/// renamed to an ordinary header or query name keeps its presence-only
+/// classification, so a refreshed credential of the same principal still
+/// replays; a changed business parameter conflicts and another principal stays
+/// isolated.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_follows_credential_renames() {
+    let _policy = pinned_policy_guard();
+    let dedup = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let transformer = credential_renaming_transformer();
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let (first, mut first_ctx) =
+        renamed_principal_request(&dedup, &transformer, &alice, "jwt-a", 100).await;
+    assert!(matches!(first, PluginResult::Continue));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), b"renamed-created")
+            .await,
+        PluginResult::Continue
+    ));
+
+    match renamed_principal_request(&dedup, &transformer, &alice, "jwt-b", 100)
+        .await
+        .0
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"renamed-created"),
+        other => panic!("a refreshed renamed credential must replay: {other:?}"),
+    }
+
+    assert_fingerprint_conflict(
+        renamed_principal_request(&dedup, &transformer, &alice, "jwt-b", 200)
+            .await
+            .0,
+    );
+
+    let bob = consumer_principal("consumer-bob", "bob");
+    assert!(matches!(
+        renamed_principal_request(&dedup, &transformer, &bob, "jwt-a", 100)
+            .await
+            .0,
+        PluginResult::Continue
+    ));
+}
+
+/// PR6818-SOL-4: the credential classification follows the CURRENT holder.
+/// A chain that parks the credential on an intermediate name, moves it on, and
+/// then renames business data onto that intermediate name must leave the
+/// business value bound: changing it conflicts, while a refreshed credential of
+/// the same principal still replays.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_rebinds_names_reused_after_a_credential_rename() {
+    let _policy = pinned_policy_guard();
+    let dedup = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let transformer = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "header", "key": "authorization", "new_key": "x-stage"},
+            {"operation": "rename", "target": "header", "key": "x-stage", "new_key": "x-backend-token"},
+            {"operation": "rename", "target": "header", "key": "x-business", "new_key": "x-stage"}
+        ]
+    }))
+    .expect("chained rename request_transformer config");
+    let alice = consumer_principal("consumer-alice", "alice");
+
+    let dedup_ref = &dedup;
+    let transformer_ref = &transformer;
+    let alice_ref = &alice;
+    let run = move |token: &'static str, business: &'static str| async move {
+        let mut ctx = principal_ctx("127.0.0.1", "chained-rename-order", Some(alice_ref), token);
+        ctx.headers
+            .insert("x-business".to_string(), business.to_string());
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            transformer_ref.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(headers.get("x-stage").map(String::as_str), Some(business));
+        assert!(headers.contains_key("x-backend-token"));
+        let result = dedup_ref.before_proxy(&mut ctx, &mut headers).await;
+        (result, ctx)
+    };
+
+    let (first, mut first_ctx) = run("token-a", "selector-a").await;
+    assert!(matches!(first, PluginResult::Continue));
+    assert!(matches!(
+        dedup
+            .on_final_response_body(&mut first_ctx, 200, &HashMap::new(), b"chained-created")
+            .await,
+        PluginResult::Continue
+    ));
+
+    match run("token-b", "selector-a").await.0 {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"chained-created"),
+        other => panic!("a refreshed credential on its final name must replay: {other:?}"),
+    }
+
+    assert_fingerprint_conflict(run("token-b", "selector-b").await.0);
+}
+
+/// PR6818-MUSE-2: a re-signed retry (fresh `Authorization` signature, `Date`,
+/// `x-amz-date`, and `x-amz-content-sha256`) of the same verified principal
+/// replays under the opt-in, while any other changed header still conflicts.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn authenticated_identity_partition_presence_binds_signature_context_headers() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "caller_partition": "authenticated_identity"
+    }));
+    let alice = consumer_principal("consumer-alice", "alice");
+    let signed = |signature: &str, date: &str, tenant: &str| {
+        let mut ctx = principal_ctx("127.0.0.1", "signed-order", Some(&alice), signature);
+        for (name, value) in [
+            ("date", date),
+            ("x-amz-date", date),
+            ("x-amz-content-sha256", signature),
+            ("amz-sdk-invocation-id", signature),
+            ("amz-sdk-request", date),
+            ("x-tenant", tenant),
+        ] {
+            ctx.headers.insert(name.to_string(), value.to_string());
+        }
+        ctx
+    };
+
+    let mut original = signed("sig-1", "Mon, 05 Oct 2026 10:00:00 GMT", "acme");
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut original, b"signed-created").await,
+        PluginResult::Continue
+    ));
+
+    let mut resigned = signed("sig-2", "Mon, 05 Oct 2026 10:00:07 GMT", "acme");
+    let mut resigned_headers = resigned.headers.clone();
+    match plugin
+        .before_proxy(&mut resigned, &mut resigned_headers)
+        .await
+    {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"signed-created"),
+        other => panic!("a re-signed retry of the same principal must replay: {other:?}"),
+    }
+
+    let mut other_tenant = signed("sig-3", "Mon, 05 Oct 2026 10:00:09 GMT", "globex");
+    let mut other_tenant_headers = other_tenant.headers.clone();
+    assert_fingerprint_conflict(
+        plugin
+            .before_proxy(&mut other_tenant, &mut other_tenant_headers)
+            .await,
+    );
+}
+
+#[test]
+fn caller_partition_accepts_only_the_documented_values() {
+    for value in ["credential", "authenticated_identity"] {
+        RequestDeduplication::new(
+            &json!({ "caller_partition": value }),
+            PluginHttpClient::default(),
+        )
+        .unwrap_or_else(|e| panic!("caller_partition {value:?} must be accepted: {e}"));
+    }
+    const SENTINEL: &str = "sentinel-caller-partition-7c1e";
+    for config in [
+        json!({ "caller_partition": SENTINEL }),
+        json!({ "caller_partition": "AUTHENTICATED_IDENTITY" }),
+        json!({ "caller_partition": null }),
+        json!({ "caller_partition": true }),
+    ] {
+        let Err(error) = RequestDeduplication::new(&config, PluginHttpClient::default()) else {
+            panic!("caller_partition {config} must be rejected");
+        };
+        assert!(error.contains("`caller_partition`"), "{error}");
+        assert!(
+            !error.contains(SENTINEL),
+            "diagnostic must be value-redacted: {error}"
+        );
+    }
+}
+
+/// request_deduplication-CLAUDE-4 (M4): an earlier plugin can leave two
+/// case-variant spellings of the idempotency header. Selecting either one by
+/// map iteration order would let a retry key on the other value; the request
+/// is refused deterministically instead.
+#[tokio::test]
+async fn conflicting_case_variant_idempotency_headers_are_refused() {
+    let plugin = make_plugin(json!({}));
+    for attempt in 0..16 {
+        let mut ctx = new_ctx("POST", "/orders");
+        let mut headers = HashMap::from([
+            ("idempotency-key".to_string(), "value-a".to_string()),
+            ("Idempotency-Key".to_string(), "value-b".to_string()),
+        ]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "attempt {attempt}: {body}");
+                assert!(body.contains("Conflicting values"), "{body}");
+                assert!(!body.contains("value-a") && !body.contains("value-b"));
+            }
+            other => panic!("attempt {attempt}: ambiguous key must be refused: {other:?}"),
+        }
+        assert!(request_identity(&plugin, &ctx).is_none());
+    }
+
+    // Duplicate spellings that agree are one distinct value, not ambiguity.
+    let mut agreeing_ctx = new_ctx("POST", "/orders");
+    let mut agreeing_headers = HashMap::from([
+        ("idempotency-key".to_string(), "same-value".to_string()),
+        ("Idempotency-Key".to_string(), "same-value".to_string()),
+    ]);
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut agreeing_ctx, &mut agreeing_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&plugin, &agreeing_ctx).is_some());
+}
+
+/// The authority and framing headers the fingerprint reads by name get the
+/// same deterministic refusal.
+#[tokio::test]
+async fn conflicting_case_variant_fingerprint_headers_are_refused() {
+    let plugin = make_plugin(json!({}));
+    for (name, upper, first, second) in [
+        ("host", "Host", "a.example", "b.example"),
+        ("content-encoding", "Content-Encoding", "gzip", "identity"),
+    ] {
+        let mut ctx = new_ctx("POST", "/orders");
+        let mut headers = HashMap::from([
+            ("idempotency-key".to_string(), format!("framing-{name}")),
+            (name.to_string(), first.to_string()),
+            (upper.to_string(), second.to_string()),
+        ]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 400, "{name}: {body}");
+                assert!(body.contains("case-variant"), "{name}: {body}");
+            }
+            other => panic!("{name}: ambiguous fingerprint header must be refused: {other:?}"),
+        }
+        assert!(request_identity(&plugin, &ctx).is_none());
+    }
+}
+
+/// request_deduplication-CLAUDE-3 (M3): the retained body is now materialized
+/// before the accounting lock is taken. Ownership is still re-validated under
+/// the lock, so an owner whose lease was taken over in between publishes
+/// nothing and leaves the successor untouched.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // the policy guard must span plugin awaits to serialize overlay state
+async fn completion_materialized_outside_the_lock_still_refuses_a_stale_owner() {
+    let _policy = pinned_policy_guard();
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "inflight_ttl_seconds": 300 }));
+
+    let mut owner = dedup_ctx("127.0.0.1", "materialized-stale-owner");
+    let mut owner_headers = owner.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut owner, &mut owner_headers).await,
+        PluginResult::Continue
+    ));
+
+    request_deduplication_expire_inflight_entries_for_test(&plugin);
+    let mut successor = dedup_ctx("127.0.0.1", "materialized-stale-owner");
+    let mut successor_headers = successor.headers.clone();
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut successor, &mut successor_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // The stale owner finishes with a large body after losing ownership.
+    let stale_body = vec![b's'; 64 * 1024];
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut owner, 200, &HashMap::new(), &stale_body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        assert_completed_size_exact(&plugin),
+        0,
+        "a stale owner must not publish its pre-materialized body"
+    );
+
+    let mut duplicate = dedup_ctx("127.0.0.1", "materialized-stale-owner");
+    let mut duplicate_headers = duplicate.headers.clone();
+    match plugin
+        .before_proxy(&mut duplicate, &mut duplicate_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 409, "{body}");
+            assert!(body.contains("already in progress"), "{body}");
+        }
+        other => panic!("the successor's in-flight ownership must survive: {other:?}"),
+    }
+
+    // The successor's own completion is retained and replays its bytes.
+    assert!(matches!(
+        plugin
+            .on_final_response_body(&mut successor, 200, &HashMap::new(), b"successor")
+            .await,
+        PluginResult::Continue
+    ));
+    let mut replay = dedup_ctx("127.0.0.1", "materialized-stale-owner");
+    let mut replay_headers = replay.headers.clone();
+    match plugin.before_proxy(&mut replay, &mut replay_headers).await {
+        PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], b"successor"),
+        other => panic!("the successor completion must replay: {other:?}"),
+    }
 }
 
 /// The origin receives Ferrum's regenerated forwarding identity for an
@@ -7691,4 +8691,57 @@ async fn unfinished_work_without_a_completion_expires_with_the_inflight_lease() 
     );
     assert!(request_identity(&plugin, &retry).is_some());
     drop(owner);
+}
+
+/// request_deduplication-SOL-2, Redis mode: a new key acquires the distributed
+/// record before the local live-slot reservation. When that reservation fails,
+/// the acquired ownership is released so peers are not blocked by an
+/// operation that never ran, and the refusal is a deterministic 503.
+#[tokio::test]
+async fn redis_capacity_refusal_releases_the_acquired_distributed_ownership() {
+    let (server, _exec_arrivals) = spawn_scripted_dedup_redis(0).await;
+    let plugin = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+        "redis_connect_timeout_seconds": 5,
+        "redis_pool_size": 1,
+        "redis_health_check_interval_seconds": 3600,
+        "max_inflight_entries": 1
+    }));
+
+    let mut holder = new_ctx("POST", "/api");
+    let mut holder_headers =
+        HashMap::from([("idempotency-key".to_string(), "capacity-holder".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut holder, &mut holder_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(server.single_record()["state"], "inflight");
+
+    let mut refused = new_ctx("POST", "/api");
+    let mut refused_headers = HashMap::from([(
+        "idempotency-key".to_string(),
+        "capacity-refused".to_string(),
+    )]);
+    match plugin
+        .before_proxy(&mut refused, &mut refused_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503, "{body}");
+            assert!(body.contains("in-flight capacity"), "{body}");
+        }
+        other => panic!("a new key past the live ceiling must be refused: {other:?}"),
+    }
+    assert!(request_identity(&plugin, &refused).is_none());
+
+    // Only the holder's record remains: the refused key's SET NX was released.
+    let record = server.single_record();
+    assert_eq!(record["state"], "inflight");
+    assert_eq!(
+        request_deduplication_inflight_count_snapshot_for_test(&plugin),
+        1
+    );
 }

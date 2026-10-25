@@ -8,7 +8,8 @@ use ferrum_edge::plugins::utils::claim_resolver::{
 use ferrum_edge::plugins::utils::json_escape::escape_json_string;
 use ferrum_edge::plugins::utils::jwks_store::JwksKeyStore;
 use ferrum_edge::plugins::utils::jwt_verifier::{
-    JwtVerifyParams, peek_unverified_issuer, verify_jwt_with_jwks,
+    CompiledJwtValidation, JwtVerifyParams, peek_unverified_issuer,
+    verify_jwt_with_compiled_validation, verify_jwt_with_jwks,
 };
 use ferrum_edge::plugins::utils::query::{
     CanonicalQuery, OrderedQuery, QueryAmbiguity, canonical_query_for_policy,
@@ -944,6 +945,115 @@ async fn jwt_verifier_accepts_matching_kid_and_key() {
         .await
         .expect("matching kid must verify");
     assert_eq!(claims["sub"], "user");
+}
+
+/// `CompiledJwtValidation` is the per-provider precompiled form of the policy
+/// `verify_jwt_with_jwks` rebuilds on every call (jwks_auth-SOL-3). Both paths
+/// must reach the identical verdict and claims for every issuer, audience,
+/// shape, and `kid` case.
+#[tokio::test]
+async fn compiled_validation_matches_per_call_validation() {
+    let audiences = vec!["api".to_string(), "other-api".to_string()];
+    let params = JwtVerifyParams {
+        issuer: Some("https://issuer"),
+        audiences: &audiences,
+        require_exp: true,
+        leeway_secs: 0,
+        validate_nbf: true,
+    };
+    let compiled = CompiledJwtValidation::new(&params);
+    let store = two_key_store();
+    let now = chrono::Utc::now().timestamp();
+
+    let cases = [
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+            "key-1",
+            true,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": ["x", "other-api"]}),
+            "key-1",
+            true,
+        ),
+        (json!({"sub": "u", "iss": "https://issuer"}), "key-1", false),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "nope"}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": 42}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://other", "aud": "api"}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": ["https://issuer"], "aud": "api"}),
+            "key-1",
+            false,
+        ),
+        (json!({"sub": "u", "aud": "api"}), "key-1", false),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api", "nbf": now + 600}),
+            "key-1",
+            false,
+        ),
+        (
+            json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+            "no-such-kid",
+            false,
+        ),
+    ];
+    for (claims, kid, accepted) in cases {
+        let token = super::jwks_auth_support::create_rs256_token_with_kid(
+            &claims,
+            include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+            kid,
+        );
+        let per_call = verify_jwt_with_jwks(&token, &store, &params).await;
+        let precompiled = verify_jwt_with_compiled_validation(&token, &store, &compiled);
+        assert_eq!(
+            per_call.is_some(),
+            accepted,
+            "per-call verdict for {claims}"
+        );
+        assert_eq!(
+            per_call, precompiled,
+            "compiled verdict must match for {claims}"
+        );
+    }
+
+    // A token signed by the other published key under `key-1` stays rejected.
+    let wrong_key = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "u", "iss": "https://issuer", "aud": "api"}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private_other.pem"),
+        "key-1",
+    );
+    assert!(verify_jwt_with_compiled_validation(&wrong_key, &store, &compiled).is_none());
+}
+
+/// The compiled policy carries the configured `exp`/`nbf` leeway.
+#[test]
+fn compiled_validation_applies_configured_leeway() {
+    let now = chrono::Utc::now().timestamp();
+    let store = two_key_store();
+    let recently_expired = super::jwks_auth_support::create_rs256_token_with_kid(
+        &json!({"sub": "u", "exp": now - 20}),
+        include_bytes!("../../../tests/fixtures/test_rsa_private.pem"),
+        "key-1",
+    );
+    let strict = CompiledJwtValidation::new(&jwt_verify_params());
+    let lenient = CompiledJwtValidation::new(&JwtVerifyParams {
+        leeway_secs: 60,
+        ..jwt_verify_params()
+    });
+    assert!(verify_jwt_with_compiled_validation(&recently_expired, &store, &strict).is_none());
+    assert!(verify_jwt_with_compiled_validation(&recently_expired, &store, &lenient).is_some());
 }
 
 fn ctx_with_header(name: &str, value: &str) -> RequestContext {

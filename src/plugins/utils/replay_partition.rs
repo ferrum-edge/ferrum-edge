@@ -29,7 +29,9 @@
 //!   scheme / authority and rewritten path, not the originally matched proxy,
 //!   plus the matched route's response-header policy, which a finalized replay
 //!   does not re-apply, and the route-override backend TLS identity and DNS
-//!   policy.
+//!   policy. `request_deduplication`'s logical key names an *execution* and
+//!   uses [`append_execution_destination_partition`], which omits the
+//!   response-header policy; its fingerprint binds the full destination.
 //! * **Request target** — the original client authority, `Host`, method, path,
 //!   and effective outbound query
 //!   ([`append_request_target_partition`]).
@@ -64,6 +66,7 @@ use std::net::IpAddr;
 use crate::config::types::BackendTlsConfig;
 use crate::plugins::RequestContext;
 use crate::plugins::RouteOverrideDnsPolicy;
+use crate::plugins::utils::auth_flow::ExternalIdentityRealm;
 use crate::plugins::utils::route_header_transform::RouteHeaderTransformOp;
 use crate::util::body_limit::{ContentLength, parse_content_length};
 
@@ -564,6 +567,85 @@ pub fn append_caller_partition(
     }
 }
 
+/// Whether this request carries a principal the gateway itself verified: a
+/// configured `Consumer` resolved by an authentication plugin, a peer SPIFFE
+/// identity proven by the transport, or an external identity committed through
+/// the authentication boundary together with its verified realm.
+///
+/// A bare `authenticated_identity` string without a committed realm does not
+/// qualify: any plugin can write that public field, but only
+/// [`crate::plugins::utils::auth_flow::commit_authentication_attempt`] can
+/// attach the realm that says which authority vouched for it.
+pub fn has_verified_principal(ctx: &RequestContext) -> bool {
+    ctx.identified_consumer.is_some()
+        || ctx.peer_spiffe_id.is_some()
+        || verified_external_identity(ctx).is_some()
+}
+
+/// The external identity and its verifying realm, when no `Consumer` was
+/// resolved and the identity was committed through the authentication
+/// boundary.
+fn verified_external_identity(ctx: &RequestContext) -> Option<(&str, ExternalIdentityRealm)> {
+    if ctx.identified_consumer.is_some() {
+        return None;
+    }
+    let realm = ctx.authenticated_identity_realm()?;
+    let identity = ctx.effective_identity()?;
+    Some((identity, realm))
+}
+
+/// Append a caller partition bound to the gateway-verified principal only,
+/// for a plugin instance whose operator opted into principal-scoped replay
+/// (`request_deduplication`'s `caller_partition: authenticated_identity`).
+///
+/// Unlike [`append_caller_partition`], this binds neither the digests of the
+/// presented credential bytes nor the canonical peer address. A client that
+/// refreshes a short-lived token, signs every request (HMAC, SigV4), or retries
+/// from a new address after NAT rebinding stays in one partition as long as
+/// the gateway resolves the same principal. That relaxation is the operator's
+/// attestation: two credentials of one principal with different scopes share
+/// the partition, so scope-level distinction then rests on the authorization
+/// plugins that already ran before the replay lookup.
+///
+/// Returns `false` without writing anything when the request carries no
+/// verified principal (see [`has_verified_principal`]); the caller must then
+/// fall back to [`append_caller_partition`]. The mode is framed first, so a
+/// principal-scoped partition can never collide with a credential-scoped one.
+pub fn append_verified_principal_partition(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+) -> bool {
+    if !has_verified_principal(ctx) {
+        return false;
+    }
+    hasher.text("caller.partition_mode", "verified_principal");
+    hasher.optional_text("caller.auth_method", ctx.auth_method);
+    hasher.optional_text(
+        "caller.verified_consumer_id",
+        ctx.identified_consumer.as_ref().map(|c| c.id.as_str()),
+    );
+    match verified_external_identity(ctx) {
+        Some((identity, realm)) => {
+            hasher.bool_value("caller.verified_external_identity_present", true);
+            hasher.text("caller.verified_external_identity", identity);
+            hasher.text("caller.verified_realm_mechanism", realm.mechanism());
+            match realm.authority() {
+                Some(authority) => {
+                    hasher.bool_value("caller.verified_realm_authority_present", true);
+                    hasher.nested("caller.verified_realm_authority", authority);
+                }
+                None => hasher.bool_value("caller.verified_realm_authority_present", false),
+            }
+        }
+        None => hasher.bool_value("caller.verified_external_identity_present", false),
+    }
+    hasher.optional_text(
+        "caller.peer_spiffe_id",
+        ctx.peer_spiffe_id.as_ref().map(|id| id.as_str()),
+    );
+    true
+}
+
 /// Append the effective destination dimension: the route/provider the *current*
 /// request would reach, after every route-dispatch plugin has run.
 ///
@@ -571,7 +653,35 @@ pub fn append_caller_partition(
 /// (or once they have refused composition with anything that could still change
 /// it). Proxy *absence* is framed explicitly rather than defaulted to a sentinel,
 /// so an unmatched request can never share a partition with a matched one.
+///
+/// This binds the matched route's response-header policy too, because a
+/// finalized replay does not re-apply it. A plugin whose key names an
+/// *execution* rather than a retained representation uses
+/// [`append_execution_destination_partition`] instead.
 pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestContext) {
+    append_destination_partition_with(hasher, ctx, true);
+}
+
+/// [`append_destination_partition`] without the matched route's
+/// response-header policy.
+///
+/// For `request_deduplication`'s logical key: that key names the operation the
+/// backend executed, and a response-header-only route reload does not change
+/// which operation an identical retry would execute. Binding the response
+/// policy there would address a fresh key after such a reload and let the
+/// retry execute the non-idempotent operation a second time. The caller must
+/// still bind the response policy somewhere that conflicts instead of
+/// replaying (deduplication binds the full [`append_destination_partition`]
+/// into its request fingerprint, so a changed policy is a 409).
+pub fn append_execution_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestContext) {
+    append_destination_partition_with(hasher, ctx, false);
+}
+
+fn append_destination_partition_with(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    bind_response_transform: bool,
+) {
     let Some(proxy) = ctx.matched_proxy.as_ref() else {
         hasher.bool_value("dst.matched_proxy", false);
         // A route-dispatch override is the only destination signal an unmatched
@@ -579,7 +689,7 @@ pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestC
         // header/host selectors those plugins read. Binding it here too keeps
         // the "different destination, different partition" rule from silently
         // degrading to "no partition at all" whenever proxy matching is absent.
-        append_route_override_partition(hasher, ctx);
+        append_route_override_partition(hasher, ctx, bind_response_transform);
         return;
     };
     hasher.bool_value("dst.matched_proxy", true);
@@ -608,7 +718,7 @@ pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestC
         }
     }
 
-    append_route_override_partition(hasher, ctx);
+    append_route_override_partition(hasher, ctx, bind_response_transform);
 }
 
 /// Append the route-dispatch override dimension.
@@ -618,7 +728,11 @@ pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestC
 /// scheme/upstream overrides are framed here as well as through
 /// `effective_*`, because the matched-proxy arm resolves them against the proxy
 /// while the unmatched arm has nothing to resolve against.
-fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestContext) {
+fn append_route_override_partition(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    bind_response_transform: bool,
+) {
     hasher.optional_text("dst.authority", ctx.route_override_authority.as_deref());
     hasher.optional_text("dst.rewrite_path", ctx.route_override_path.as_deref());
     hasher.bool_value(
@@ -651,23 +765,29 @@ fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestCo
     // current matched rule's complete, ordered transform here so a route-only
     // reload cannot address an entry finalized under an older rule. This
     // shared destination partition protects response caching, request
-    // deduplication, and semantic-cache replays alike.
-    match ctx.route_override_response_transform.as_deref() {
-        Some(rules) => {
-            hasher.bool_value("dst.response_transform_present", true);
-            hasher.count("dst.response_transform_rules", rules.len());
-            for rule in rules {
-                let operation = match rule.operation {
-                    RouteHeaderTransformOp::Add => "add",
-                    RouteHeaderTransformOp::Update => "update",
-                    RouteHeaderTransformOp::Remove => "remove",
-                };
-                hasher.text("dst.response_transform_operation", operation);
-                hasher.text("dst.response_transform_key", &rule.key);
-                hasher.optional_text("dst.response_transform_value", rule.value.as_deref());
+    // deduplication's fingerprint, and semantic-cache replays alike. The
+    // execution-identity variant omits it (see
+    // `append_execution_destination_partition`) and frames that omission.
+    if bind_response_transform {
+        match ctx.route_override_response_transform.as_deref() {
+            Some(rules) => {
+                hasher.bool_value("dst.response_transform_present", true);
+                hasher.count("dst.response_transform_rules", rules.len());
+                for rule in rules {
+                    let operation = match rule.operation {
+                        RouteHeaderTransformOp::Add => "add",
+                        RouteHeaderTransformOp::Update => "update",
+                        RouteHeaderTransformOp::Remove => "remove",
+                    };
+                    hasher.text("dst.response_transform_operation", operation);
+                    hasher.text("dst.response_transform_key", &rule.key);
+                    hasher.optional_text("dst.response_transform_value", rule.value.as_deref());
+                }
             }
+            None => hasher.bool_value("dst.response_transform_present", false),
         }
-        None => hasher.bool_value("dst.response_transform_present", false),
+    } else {
+        hasher.text("dst.response_transform_scope", "execution_identity");
     }
 
     append_route_override_backend_tls_partition(hasher, ctx.route_override_resolved_tls.as_ref());
@@ -703,6 +823,9 @@ fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestCo
 ///   order (a reordered list only costs a miss). The derived
 ///   `san_allow_list_key_digest` is skipped: it is recomputed from this list
 ///   and serde does not carry it, so it adds nothing and could be stale.
+/// * `suppress_global_client_identity` — whether the gateway-global client
+///   pair may be presented when the per-route pair is unset (bound only when
+///   set).
 ///
 /// There is no min-version or ALPN field on `BackendTlsConfig`; those follow
 /// the gateway-global TLS policy, which is identical for every rule.
@@ -735,6 +858,14 @@ fn append_route_override_backend_tls_partition(
     hasher.count("dst.override_tls_san_allow_list", tls.san_allow_list.len());
     for san in &tls.san_allow_list {
         hasher.text("dst.override_tls_san", san);
+    }
+    // Whether the gateway-global backend client identity may stand in for an
+    // unset per-route pair. An isolated provider destination presents no
+    // client certificate where an otherwise identical one presents the
+    // gateway's, so the two are different callers to the origin. Bound only
+    // when set, so every existing partition digest is unchanged.
+    if tls.suppress_global_client_identity {
+        hasher.bool_value("dst.override_tls_suppress_global_client_identity", true);
     }
 }
 

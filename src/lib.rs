@@ -220,6 +220,40 @@ pub mod _test_support {
         crate::plugins::body_validator::inherited_grpc_max_decompressed_size_bytes(raw)
     }
 
+    /// `body_validator`'s request-side gRPC protobuf validation of `body` for
+    /// `grpc_path`, in the framing `content_type` names (native gRPC or
+    /// gRPC-Web binary/text), with the aggregate decode budget bound to an
+    /// ISOLATED semaphore so a test can observe admission, refusal, and
+    /// release deterministically. Answers `"pass"`, `"invalid"`,
+    /// `"capacity"`, or `"unconfigured"` (no descriptor for the method, or not
+    /// a gRPC media type).
+    pub fn body_validator_protobuf_request_outcome_in_budget_for_test(
+        plugin: &crate::plugins::body_validator::BodyValidator,
+        probe: &ResponseBufferBudgetProbe,
+        grpc_path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> &'static str {
+        plugin.protobuf_request_outcome_in(grpc_path, content_type, body, probe.0.handle())
+    }
+
+    /// Record the genuine origin/backend HTTP status exactly as
+    /// `run_after_proxy_hooks` does before any response hook runs.
+    pub fn record_origin_http_response_status_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: u16,
+    ) {
+        ctx.record_origin_http_response_status(status);
+    }
+
+    /// How many `body_validator` instances recorded an early `before_proxy`
+    /// pass on this request (the typed digest the final hook compares against
+    /// to skip re-validating byte-identical bytes).
+    pub fn body_validator_early_pass_count_for_test(ctx: &crate::plugins::RequestContext) -> usize {
+        ctx.plugin_state()
+            .map_or(0, |state| state.body_validator_early_request_digests.len())
+    }
+
     /// The plugin material registry as `(plugin, field path, class)`, where
     /// class is `tls`, `gateway_only` or `open_map`.
     pub fn scoped_plugin_registry_for_test() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -4148,6 +4182,22 @@ pub mod _test_support {
         plugin.inflight_count_snapshot_for_tests()
     }
 
+    /// Record a present credential query parameter exactly as an
+    /// authentication plugin's `mark_query_credentials_for_redaction` hook does
+    /// (`jwt_auth` `token_lookup: query:<name>`, `key_auth` query keys). The
+    /// value is read from `ctx.query_params`.
+    pub fn mark_query_credential_for_test(ctx: &mut crate::plugins::RequestContext, name: &str) {
+        crate::plugins::utils::token_extract::mark_query_credential_metadata(ctx, name);
+    }
+
+    /// Exact live in-flight marker count (execution barriers excluded): the
+    /// `max_inflight_entries` admission counter.
+    pub fn request_deduplication_live_inflight_count_snapshot_for_test(
+        plugin: &crate::plugins::request_deduplication::RequestDeduplication,
+    ) -> usize {
+        plugin.live_inflight_count_snapshot_for_tests()
+    }
+
     /// Whether a constructed `request_deduplication` instance's Redis client
     /// requires the no-eviction retention screen (`None` in local mode).
     pub fn request_deduplication_redis_requires_no_eviction_for_test(
@@ -4702,6 +4752,29 @@ pub mod _test_support {
     ) -> Result<u64, String> {
         crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?
             .shared_claim_retention_seconds_for_tests()
+    }
+
+    /// Whether a constructed `soap_ws_security` instance's shared replay client
+    /// demands the no-eviction retention screen (`None` in process scope).
+    pub fn soap_shared_replay_requires_no_eviction_for_test(
+        config: &serde_json::Value,
+    ) -> Result<Option<bool>, String> {
+        Ok(
+            crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?
+                .shared_replay_requires_no_eviction_for_tests(),
+        )
+    }
+
+    /// One SAML assertion single-use claim against `plugin`'s configured replay
+    /// backend (process or shared), without minting a signed assertion.
+    pub async fn soap_claim_saml_assertion_for_test(
+        plugin: &crate::plugins::soap_ws_security::SoapWsSecurity,
+        issuer: &str,
+        assertion_id: &str,
+    ) -> Result<(), String> {
+        plugin
+            .claim_saml_assertion_for_tests(issuer, assertion_id)
+            .await
     }
 
     /// One-shot proof that map/index drift cannot be recovered as a fresh
@@ -11199,6 +11272,36 @@ pub mod _test_support {
         )
     }
 
+    /// The client RPC deadline's pump guard, held by the client-facing body
+    /// in production. Opaque: a test only keeps it alive or drops it.
+    pub struct RpcDeadlinePumpGuardForTest(
+        #[allow(dead_code)] crate::proxy::response_watchdog::ResponsePumpGuard,
+    );
+
+    /// Move one body into the client RPC deadline's response pump, as
+    /// `ProxyBody::with_client_grpc_deadline` does on an H1/H2 frontend, and
+    /// return the pump's intermediate reader separately from its guard, so a
+    /// test can drive that reader's own expiry acknowledgement while the
+    /// client-facing guard stays alive.
+    pub fn rpc_deadline_cancellable_body_for_test(
+        inner: crate::proxy::ProxyBody,
+        deadline_at: tokio::time::Instant,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> (
+        crate::proxy::response_watchdog::AuthorizationCancellableBody,
+        RpcDeadlinePumpGuardForTest,
+    ) {
+        let (body, guard) =
+            crate::proxy::response_watchdog::AuthorizationCancellableBody::for_client_rpc_deadline(
+                inner,
+                deadline_at,
+                fired,
+                Some(closer),
+            );
+        (body, RpcDeadlinePumpGuardForTest(guard))
+    }
+
     /// Which owner settled one authenticated streaming response (issue #3815).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum AuthorizationTerminalOwnershipForTest {
@@ -14483,7 +14586,51 @@ pub mod _test_support {
         deadline: tokio::time::Instant,
         grpc_web_response_content_type: Option<&str>,
     ) -> crate::proxy::ProxyBody {
-        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, None)
+    }
+
+    /// [`proxy_body_with_client_grpc_deadline_for_test`] on a hyper-driven
+    /// HTTP/1.1 / HTTP/2 frontend connection: the upstream moves into the
+    /// gateway-owned response pump, so the client RPC deadline releases the
+    /// backend and, after the bounded grace, requests `closer` even while
+    /// nothing polls the client-visible body.
+    pub fn proxy_body_with_client_grpc_deadline_and_closer_for_test(
+        body: crate::proxy::ProxyBody,
+        deadline: tokio::time::Instant,
+        grpc_web_response_content_type: Option<&str>,
+        closer: crate::proxy::auth_lifetime::AuthorizationConnectionCloser,
+    ) -> crate::proxy::ProxyBody {
+        body.with_client_grpc_deadline(deadline, grpc_web_response_content_type, Some(closer))
+    }
+
+    /// Poll a native-gRPC streaming upload (`GrpcBody::Streaming`, the body
+    /// hyper's HTTP/2 request pipe reads) whose client never ends the upload,
+    /// under an optional client RPC deadline, and report its first item.
+    /// `Some(Err(message))` means the deadline ended the upload in an error,
+    /// which hyper turns into RST_STREAM on the backend stream.
+    pub async fn grpc_streaming_upload_first_item_under_rpc_deadline_for_test(
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<Result<(), String>> {
+        let client = http_body_util::StreamBody::new(futures_util::stream::pending::<
+            Result<http_body::Frame<bytes::Bytes>, std::io::Error>,
+        >());
+        let (source, join) = crate::proxy::upload_pump::spawn_upload_pump(client, None, 0, false);
+        let mut body = Box::pin(crate::proxy::grpc_proxy::GrpcBody::Streaming {
+            require_end_stream: false,
+            incoming: crate::proxy::body::UploadSource::Pumped(source),
+            auth_deadline: None,
+            rpc_deadline: crate::proxy::grpc_proxy::streaming_upload_rpc_deadline(deadline),
+            bytes_seen: 0,
+            max_bytes: 0,
+            exceeded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_bytes: None,
+            upload_observer: None,
+            grpc_messages: None,
+            grpc_scanner: None,
+        });
+        let first = std::future::poll_fn(|cx| http_body::Body::poll_frame(body.as_mut(), cx)).await;
+        drop(join);
+        first.map(|item| item.map(|_| ()).map_err(|error| error.to_string()))
     }
 
     /// Parse a Gateway API Duration (GEP-2257) exactly as the HTTPRoute
@@ -16042,6 +16189,15 @@ pub mod _test_support {
     /// decode pass before it constructs the decoder.
     pub const RESPONSE_DECODE_BROTLI_SCRATCH_BYTES: usize =
         crate::plugins::charged_decode::BROTLI_DECODER_SCRATCH_BYTES;
+
+    /// Conservative heap ceiling the charged content-coding chain reserves for
+    /// one `zstd` decode pass before it constructs the decoder.
+    pub const CHARGED_DECODE_ZSTD_SCRATCH_BYTES: usize =
+        crate::plugins::charged_decode::ZSTD_DECODER_SCRATCH_BYTES;
+
+    /// The `zstd` window cap (as a base-2 log) the charged chain enforces.
+    pub const CHARGED_DECODE_ZSTD_WINDOW_LOG_MAX: u32 =
+        crate::plugins::charged_decode::ZSTD_WINDOW_LOG_MAX;
 
     /// The output-buffer capacity the production decode ends up holding for a
     /// decoded body of `decoded_len` bytes under `limit`, computed with the
@@ -18644,7 +18800,10 @@ pub mod _test_support {
                 http_body_util::StreamBody::new(backend),
                 None,
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h2_coalescing" => coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -18660,7 +18819,10 @@ pub mod _test_support {
                 None,
                 default_coalesce_target_bytes(),
                 0,
-                Some(deadline()),
+                Some(crate::proxy::body::ClientGrpcResponseDeadline::new(
+                    deadline(),
+                    None,
+                )),
                 None,
             ),
             "h3_direct" => direct_streaming_h3_body(

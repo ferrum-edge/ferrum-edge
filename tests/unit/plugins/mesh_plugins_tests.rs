@@ -11398,3 +11398,323 @@ async fn mesh_authz_connect_relay_keeps_transport_rules() {
         "L7 DENY for another source",
     );
 }
+
+// ── Standalone `mesh_policies` matcher admission (parity with MeshConfig::validate)
+
+fn mesh_authz_construction_error(config: &serde_json::Value) -> String {
+    // Match rather than `expect_err`: MeshAuthz intentionally omits Debug.
+    match MeshAuthz::new(config) {
+        Ok(_) => panic!("mesh_authz must refuse {config}"),
+        Err(error) => error,
+    }
+}
+
+fn single_rule_policies(rule: serde_json::Value) -> serde_json::Value {
+    json!([{
+        "name": "guard",
+        "namespace": "default",
+        "scope": { "kind": "mesh_wide" },
+        "rules": [rule],
+    }])
+}
+
+#[test]
+fn mesh_authz_refuses_a_pseudo_header_to_headers_deny_in_direct_policies() {
+    // A request's `:path` lives in `ctx.path`, never in the ordinary header
+    // map, so this DENY could never match and `GET /admin` would be allowed.
+    let policies = single_rule_policies(json!({
+        "action": "deny",
+        "to": [{ "headers": { ":path": "/admin*" } }],
+    }));
+    let config = json!({ "mesh_policies": policies });
+    let error = mesh_authz_construction_error(&config);
+    assert!(error.contains("pseudo-header"), "got: {error}");
+
+    // The admin/file admission path runs the same constructor.
+    let admin = ferrum_edge::plugins::validate_plugin_config("mesh_authz", &config)
+        .expect_err("admin admission must refuse an inert DENY");
+    assert!(admin.contains("pseudo-header"), "got: {admin}");
+
+    // An embedded slice that did not come through `MeshConfig::validate` is
+    // held to the same contract.
+    let slice = json!({
+        "mesh_slice": {
+            "node_id": "node-a",
+            "namespace": "default",
+            "version": "test",
+            "mesh_policies": policies,
+        }
+    });
+    let error = mesh_authz_construction_error(&slice);
+    assert!(error.contains("pseudo-header"), "got: {error}");
+}
+
+#[test]
+fn mesh_authz_refuses_never_matching_request_matchers_in_direct_policies() {
+    for (label, rule, needle) in [
+        (
+            "impossible port prefix",
+            json!({ "action": "deny", "to": [{ "port_patterns": ["70000*"] }] }),
+            "port_patterns[0]",
+        ),
+        (
+            "mid-string port wildcard",
+            json!({ "action": "deny", "to": [{ "port_patterns": ["8*0"] }] }),
+            "port_patterns[0]",
+        ),
+        (
+            "impossible negated port",
+            json!({ "action": "allow", "to": [{ "not_port_patterns": ["0*"] }] }),
+            "not_port_patterns[0]",
+        ),
+        (
+            "out-of-range host port",
+            json!({ "action": "deny", "to": [{ "hosts": ["api:99999"] }] }),
+            "hosts[0]",
+        ),
+        (
+            "ambiguous negated host",
+            json!({ "action": "deny", "to": [{ "not_hosts": ["a:b:c"] }] }),
+            "not_hosts[0]",
+        ),
+        (
+            "empty to entry",
+            json!({ "action": "deny", "to": [{}] }),
+            "to[0]: at least one",
+        ),
+        (
+            "empty from entry",
+            json!({ "action": "deny", "from": [{}] }),
+            "from[0]: at least one",
+        ),
+    ] {
+        let config = json!({ "mesh_policies": single_rule_policies(rule) });
+        let error = mesh_authz_construction_error(&config);
+        assert!(
+            error.contains(needle),
+            "{label}: refusal must name the field ({needle}), got: {error}"
+        );
+    }
+}
+
+#[test]
+fn mesh_authz_refuses_an_unnamed_direct_policy() {
+    let config = json!({
+        "mesh_policies": [{
+            "name": "",
+            "namespace": "default",
+            "scope": { "kind": "mesh_wide" },
+            "rules": [{ "action": "deny", "to": [{ "paths": ["/admin/*"] }] }],
+        }]
+    });
+    let error = mesh_authz_construction_error(&config);
+    assert!(error.contains("MeshPolicy.name"), "got: {error}");
+}
+
+#[test]
+fn mesh_authz_still_admits_a_pseudo_header_when_condition() {
+    // `when: request.headers[:path]` is sourced from the typed request facts
+    // and remains supported; only the `to.headers` spelling is refused.
+    let config = json!({
+        "mesh_policies": single_rule_policies(json!({
+            "action": "deny",
+            "when": [{ "key": "request.headers[:path]", "values": ["/admin*"] }],
+        }))
+    });
+    assert!(MeshAuthz::new(&config).is_ok());
+}
+
+// ── One resolution for a repeated request header ─────────────────────────
+
+fn repeated_tenant_context(values: &[&str], materialize: bool) -> RequestContext {
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    let mut headers = http::HeaderMap::new();
+    for value in values {
+        headers.append("x-tenant", value.parse().expect("header value"));
+    }
+    ctx.set_raw_headers(headers);
+    if materialize {
+        ctx.materialize_headers();
+    }
+    ctx
+}
+
+#[tokio::test]
+async fn mesh_authz_when_header_condition_sees_every_repeated_field_line() {
+    // DENY when `x-tenant` ends in `banned`. The client hides the banned value
+    // behind an earlier field line; a first-value reading saw only `ok`.
+    let mut deny = allow_client_policy(PolicyAction::Deny);
+    deny.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-tenant]".to_string(),
+        values: vec!["*banned".to_string()],
+        not_values: Vec::new(),
+    }];
+    let plugin = MeshAuthz::new(&json!({ "mesh_policies": [deny] })).expect("plugin config");
+
+    for materialize in [false, true] {
+        let mut ctx = repeated_tenant_context(&["ok", "banned"], materialize);
+        assert!(
+            matches!(
+                plugin.authorize(&mut ctx).await,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "the DENY must see the second field line (materialized: {materialize})"
+        );
+        let mut clean = repeated_tenant_context(&["ok", "fine"], materialize);
+        assert!(matches!(
+            plugin.authorize(&mut clean).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_to_headers_and_when_judge_the_same_repeated_header_value() {
+    // The `to.headers` predicate and the `when:` condition read the SAME
+    // joined value, whether or not anything materialized the headers first.
+    let mut header_deny = allow_client_policy(PolicyAction::Deny);
+    header_deny.name = "header-deny".to_string();
+    header_deny.rules[0].to = vec![RequestMatch {
+        headers: HashMap::from([("x-tenant".to_string(), "ok, banned".to_string())]),
+        ..RequestMatch::default()
+    }];
+    let mut condition_deny = allow_client_policy(PolicyAction::Deny);
+    condition_deny.name = "condition-deny".to_string();
+    condition_deny.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-tenant]".to_string(),
+        values: vec!["ok, banned".to_string()],
+        not_values: Vec::new(),
+    }];
+    for (policy, expected_rule) in [
+        (header_deny, "header-deny"),
+        (condition_deny, "condition-deny"),
+    ] {
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+        for materialize in [false, true] {
+            let mut ctx = repeated_tenant_context(&["ok", "banned"], materialize);
+            let result = plugin.authorize(&mut ctx).await;
+            assert!(
+                matches!(result, PluginResult::Reject { .. }),
+                "{expected_rule} must match the joined value (materialized: {materialize}), got {result:?}"
+            );
+            assert!(
+                ctx.metadata
+                    .get("mesh_authz.deny_policy")
+                    .is_some_and(|rule| rule.contains(expected_rule)),
+                "unexpected deny attribution: {:?}",
+                ctx.metadata.get("mesh_authz.deny_policy")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_header_rule_resolves_its_header_among_many_unrelated_ones() {
+    // Behaviour pin for the selective header lookup: the predicate reads only
+    // `x-tenant`, however many unrelated headers the client sends.
+    let mut policy = allow_client_policy(PolicyAction::Allow);
+    policy.rules[0].to = vec![RequestMatch {
+        headers: HashMap::from([("x-tenant".to_string(), "prod".to_string())]),
+        ..RequestMatch::default()
+    }];
+    let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+
+    for (tenant, allowed) in [("prod", true), ("dev", false)] {
+        let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+        let mut headers = http::HeaderMap::new();
+        for index in 0..64 {
+            headers.insert(
+                http::HeaderName::from_bytes(format!("x-unrelated-{index}").as_bytes())
+                    .expect("header name"),
+                "irrelevant-value".parse().expect("header value"),
+            );
+        }
+        headers.insert("x-tenant", tenant.parse().expect("header value"));
+        ctx.set_raw_headers(headers);
+        let result = plugin.authorize(&mut ctx).await;
+        assert_eq!(
+            matches!(result, PluginResult::Continue),
+            allowed,
+            "x-tenant={tenant}: unexpected verdict {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_does_not_resurrect_a_header_removed_after_materialization() {
+    // An earlier plugin materialized the request, removed the untrusted client
+    // `x-role`, and published no vetted replacement. Once headers are
+    // materialized the map is authoritative: neither `to.headers` nor a `when:`
+    // condition may read the removed value back from the raw block.
+    let mut header_allow = allow_client_policy(PolicyAction::Allow);
+    header_allow.rules[0].to = vec![RequestMatch {
+        headers: HashMap::from([("x-role".to_string(), "admin".to_string())]),
+        ..RequestMatch::default()
+    }];
+    let mut condition_allow = allow_client_policy(PolicyAction::Allow);
+    condition_allow.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-role]".to_string(),
+        values: vec!["admin".to_string()],
+        not_values: Vec::new(),
+    }];
+    for (label, policy) in [("to.headers", header_allow), ("when", condition_allow)] {
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+        for (removed, expect_allowed) in [(true, false), (false, true)] {
+            let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-role", "admin".parse().expect("header value"));
+            ctx.set_raw_headers(headers);
+            ctx.materialize_headers();
+            if removed {
+                ctx.headers.remove("x-role");
+            }
+            let result = plugin.authorize(&mut ctx).await;
+            assert_eq!(
+                matches!(result, PluginResult::Continue),
+                expect_allowed,
+                "{label}, removed={removed}: unexpected verdict {result:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_matches_a_plugin_inserted_mixed_case_header_on_every_surface() {
+    // An earlier plugin materializes the request, removes the untrusted client
+    // `x-tenant`, and publishes a vetted value under an operator-cased key. The
+    // egress builders forward it as the ordinary `x-tenant` field, so both a
+    // `to.headers` DENY and a `when:` DENY must see it.
+    let mut header_deny = allow_client_policy(PolicyAction::Deny);
+    header_deny.rules[0].to = vec![RequestMatch {
+        headers: HashMap::from([("x-tenant".to_string(), "blocked".to_string())]),
+        ..RequestMatch::default()
+    }];
+    let mut condition_deny = allow_client_policy(PolicyAction::Deny);
+    condition_deny.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-tenant]".to_string(),
+        values: vec!["blocked".to_string()],
+        not_values: Vec::new(),
+    }];
+    for (label, policy) in [("to.headers", header_deny), ("when", condition_deny)] {
+        let plugin = MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config");
+        for (published, expect_denied) in [("blocked", true), ("allowed", false)] {
+            let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-tenant", "client-forged".parse().expect("header value"));
+            ctx.set_raw_headers(headers);
+            ctx.materialize_headers();
+            ctx.headers.remove("x-tenant");
+            ctx.headers
+                .insert("X-Tenant".to_string(), published.to_string());
+            let result = plugin.authorize(&mut ctx).await;
+            assert_eq!(
+                matches!(result, PluginResult::Reject { .. }),
+                expect_denied,
+                "{label}, published={published}: unexpected verdict {result:?}"
+            );
+        }
+    }
+}
