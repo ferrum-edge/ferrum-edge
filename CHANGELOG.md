@@ -82,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. New `Plugin::observes_mesh_label_metadata()` (default `true`)
   declares whether a plugin can see the labels; custom plugins need no change.
 - **BREAKING — `ai_request_guard` evaluates more of what the backend reads**
-  (PR #6849). Bodies with duplicate object members (including escaped spellings)
+  (issue/PR #6849). Bodies with duplicate object members (including escaped spellings)
   are rejected as uninspectable (`ambiguous_json`). `POST` bodies whose
   `Content-Type` is missing, non-JSON, or joined are now buffered, and those that
   open a JSON object are evaluated. Output caps written as integral floats,
