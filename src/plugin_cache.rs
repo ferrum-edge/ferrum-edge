@@ -819,6 +819,42 @@ pub(crate) fn validate_plugin_security_composition(
             // capability.
         }
 
+        // `ai_semantic_cache` answers a HIT from its final-request-body hook,
+        // and the final-body chain stops at the first `RejectBinary`, so every
+        // fail-closed final-request-body policy on the route must run BEFORE
+        // the cache — otherwise a `priority_override` on either side lets a
+        // hit answer a request that policy would refuse. Equal priority is
+        // refused too: the name tie-break would put `ai_semantic_cache` ahead
+        // of e.g. `waf`. `ai_federation` is the documented downstream
+        // dispatcher: its final-body checks govern only the provider request
+        // it would send, which a hit never sends. Candidate admission needs no
+        // full construction here: the cache's `CompositionShapePlugin`
+        // stand-in carries its name and effective priority, and the cheap
+        // finalized-policy views carry the enforcers'.
+        for semantic_cache in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && is_builtin_named(plugin, "ai_semantic_cache")
+        }) {
+            if let Some(enforcer) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && !Arc::ptr_eq(plugin, semantic_cache)
+                    && !is_builtin_named(plugin, "ai_federation")
+                    && plugin.enforces_finalized_request_policy()
+                    && plugin.priority() >= semantic_cache.priority()
+            }) {
+                return Err(format!(
+                    "final request-body policy plugin {:?} at effective priority \"{}\" must \
+                     run before every ai_semantic_cache instance for protocol {:?}; \
+                     ai_semantic_cache priority \"{}\" would answer a cache hit before that \
+                     policy decides the finalized request",
+                    enforcer.name(),
+                    enforcer.priority(),
+                    protocol,
+                    semantic_cache.priority()
+                ));
+            }
+        }
+
         for side_effecting_plugin in plugins.iter().filter(|plugin| {
             plugin.supported_protocols().contains(&protocol)
                 && plugin.requires_prior_request_deduplication()
