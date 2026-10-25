@@ -11579,12 +11579,27 @@ async fn aggregate_namespace_parse_work_is_refused_before_parsing() {
         long_prefix_declarations(1)
     );
 
+    // (d) PR6820-MUSE-3: the parser reads `z:xmlns="..."` (any prefix, local
+    // name `xmlns`) as a default-namespace declaration, so it triggers the same
+    // inherited-scope merge as a real redeclaration. The ancestor alone fits the
+    // allowance; only charging every pseudo-declaring leaf's merge refuses it.
+    let ancestor_declarations: String = (0..60)
+        .map(|index| format!(r#" xmlns:prefix{index:03}abcdefghijk="urn:p""#))
+        .collect();
+    let pseudo_declaring_leaves = r#"<x z:xmlns="urn:z"/>"#.repeat(200);
+    let pseudo_redeclaring_descendants =
+        format!("<Item><o0{ancestor_declarations}>{pseudo_declaring_leaves}</o0></Item>");
+
     for (label, item) in [
         ("inherited at-ceiling attribute squares", inherited_square),
         ("deep declaring chain", declaring_chain),
         (
             "ancestor scope re-merged by redeclaring descendants",
             redeclaring_descendants,
+        ),
+        (
+            "ancestor scope re-merged by `*:xmlns` pseudo-declarations",
+            pseudo_redeclaring_descendants,
         ),
     ] {
         let result = timestamp_only_outcome_with_item(&item).await;

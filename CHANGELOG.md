@@ -429,7 +429,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the parser's duplicate-attribute, prefix-resolution, and inherited-scope
     merge comparison work (32 × envelope length, floor 1 048 576). Scope is
     tracked with element nesting, so wide sibling collections that each
-    redeclare a namespace are unaffected. Larger markup is refused with `400`
+    redeclare a namespace are unaffected; declarations are classified exactly
+    as the parser does, including `prefix:xmlns` pseudo-declarations. Larger markup is refused with `400`
     (`xml_namespace_bounds`), and a start tag, comment, CDATA section,
     processing instruction, or quote that never terminates is refused as
     malformed by the same pre-parse scan.

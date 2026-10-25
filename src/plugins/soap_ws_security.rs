@@ -7582,7 +7582,7 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
             if attributes > MAX_ATTRIBUTES_PER_ELEMENT || name.len() > MAX_ATTRIBUTE_NAME_BYTES {
                 return true;
             }
-            if name == "xmlns" || name.starts_with("xmlns:") {
+            if raw_attribute_declares_namespace(name) {
                 declared += 1;
                 if name.len() > MAX_NAMESPACE_PREFIX_DECLARATION_BYTES
                     || value.len() > MAX_NAMESPACE_URI_BYTES
@@ -7656,6 +7656,23 @@ fn screen_raw_namespace_markup(xml: &str) -> RawMarkupScreen {
         search_from = tag_start + tag_end_rel + 1;
     }
     RawMarkupScreen::Within
+}
+
+/// Whether the parser treats an attribute named `name` as a namespace
+/// declaration, mirroring roxmltree 0.21.2 `process_attribute` exactly.
+///
+/// The qname splits at its single `:` (a second `:` is a parse error). The
+/// parser binds a namespace when the prefix is `xmlns` (`xmlns:p="..."`) **or**
+/// when the local name is `xmlns` under ANY prefix (`xmlns="..."`, and also
+/// `z:xmlns="..."`, which it reads as a default-namespace declaration without
+/// resolving `z`). Either form appends to the element's namespace range and so
+/// triggers the inherited-scope merge, so the screen must count both, or a
+/// pseudo-declaration spelling would re-merge a large scope uncharged.
+fn raw_attribute_declares_namespace(name: &str) -> bool {
+    match name.split_once(':') {
+        Some((prefix, local)) => prefix == "xmlns" || local == "xmlns",
+        None => name == "xmlns",
+    }
 }
 
 fn skip_markup_declaration(xml: &str, tag_start: usize) -> Result<usize, String> {
