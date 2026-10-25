@@ -675,6 +675,9 @@ pub(crate) fn route_authority_operand_error(authority: &str) -> Option<&'static 
 /// per-request canonicalization would refuse with `400` fails validation
 /// instead. A prefix-rebasing redirect (`match_prefix` set) appends the
 /// unmatched request suffix after `uri`, so it may not carry its own query.
+/// Only printable ASCII is admitted anywhere in the operand, query included
+/// (raw control bytes and unencoded non-ASCII are refused); percent-encoded
+/// query text is kept verbatim and is never decoded here.
 pub(crate) fn redirect_uri_operand_error(uri: &str, rebases_prefix: bool) -> Option<String> {
     if !uri.starts_with('/') {
         return Some("must be an absolute path starting with `/`".to_string());
@@ -684,6 +687,17 @@ pub(crate) fn redirect_uri_operand_error(uri: &str, rebases_prefix: bool) -> Opt
     }
     if uri.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Some("must not contain whitespace".to_string());
+    }
+    // The whole operand — query included — becomes the `Location` header
+    // value, which carries visible ASCII only. A raw control byte (NUL, BEL,
+    // DEL, …) or an unencoded non-ASCII character would make the response
+    // silently drop `Location` and answer an empty 3xx.
+    if !uri.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Some(
+            "must contain only printable ASCII; raw control bytes are refused and other \
+             characters must be percent-encoded"
+                .to_string(),
+        );
     }
     let (path, has_query) = match uri.split_once('?') {
         Some((path, _)) => (path, true),
@@ -2487,6 +2501,12 @@ impl Plugin for MeshRouteDispatch {
 
     fn publishes_route_request_header_transforms(&self) -> bool {
         self.publishes_request_transforms
+    }
+
+    /// Every instance: a matching rule replaces the staged request list,
+    /// clearing it when the rule declares none.
+    fn replaces_route_request_header_transforms(&self) -> bool {
+        true
     }
 
     fn publishes_route_response_header_transforms(&self) -> bool {

@@ -3200,6 +3200,13 @@ fn mesh_l7_routing_istio_malformed_redirect_and_rewrite_operands_are_refused() {
         (
             serde_json::json!({
                 "match": [{"uri": {"prefix": "/old"}}],
+                "redirect": {"uri": "/new?x=\u{0}"}
+            }),
+            "redirect.uri must contain only printable ASCII",
+        ),
+        (
+            serde_json::json!({
+                "match": [{"uri": {"prefix": "/old"}}],
                 "redirect": {"uri": "/new", "authority": "evil.example/x"}
             }),
             "redirect.authority must be `host` or `host:port`",

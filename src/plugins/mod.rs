@@ -11777,13 +11777,26 @@ pub trait Plugin: Any + Send + Sync {
     /// `before_proxy` (a `mesh_route_dispatch` instance whose rules carry
     /// `request_transform`).
     ///
-    /// Proxy core applies the published list after the LATER of the last
-    /// eligible consumer and the last producer, so a consumer that a priority
-    /// override placed before the producer cannot finalize an empty slot and
-    /// silently drop route policy the producer publishes afterwards. Plugin
-    /// cache composition also refuses a producer with no configured
-    /// `request_transformer` on the same effective chain.
+    /// Plugin cache composition refuses such a producer with no configured
+    /// `request_transformer` on the same effective chain. Where the list is
+    /// applied is decided by [`Self::replaces_route_request_header_transforms`].
     fn publishes_route_request_header_transforms(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this instance's `before_proxy` may replace (publish
+    /// OR clear) [`RequestContext::route_override_request_transform`] — every
+    /// `mesh_route_dispatch` instance, because a matching rule replaces the
+    /// whole route decision, including the staged request header list, even
+    /// when its own rules carry no `request_transform`.
+    ///
+    /// Proxy core applies the staged list after the LATER of the last
+    /// eligible consumer and the last such instance. A consumer that a
+    /// priority override placed before the dispatch block therefore neither
+    /// finalizes an empty slot (dropping a list published afterwards) nor
+    /// applies a list a later dispatch instance would have superseded — and
+    /// no later dispatch predicate observes route headers early.
+    fn replaces_route_request_header_transforms(&self) -> bool {
         false
     }
 

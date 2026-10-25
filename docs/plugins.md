@@ -9453,7 +9453,7 @@ type column says so. Unknown keys are rejected at every level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. Must be an absolute path (leading `/`) whose path component is already canonical (no dot segments, backslashes, or escapes that decode differently), without a fragment or whitespace; it may carry its own `?query` unless `match_prefix` is set, because the unmatched suffix is appended after `uri`. A relative value is rejected at load because it would be concatenated onto the authority (`uri: new` would have redirected `app.example.com` to the different host `app.example.comnew`). A Gateway API `ReplacePrefixMatch` with an empty `replacePrefixMatch` (strip the matched prefix) is translated to `uri: /`, which composes `/old` → `/`, `/old/` → `/`, and `/old/child` → `/child` under `match_prefix: /old`. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
+| `uri` | String \| null | omitted | Replacement `Location` path; the request path is preserved when unset. Must be an absolute path (leading `/`) whose path component is already canonical (no dot segments, backslashes, or escapes that decode differently), without a fragment, and printable ASCII only — query included, so a raw control byte or unencoded non-ASCII character is refused (percent-encode it); it may carry its own `?query` unless `match_prefix` is set, because the unmatched suffix is appended after `uri`. A relative value is rejected at load because it would be concatenated onto the authority (`uri: new` would have redirected `app.example.com` to the different host `app.example.comnew`). A Gateway API `ReplacePrefixMatch` with an empty `replacePrefixMatch` (strip the matched prefix) is translated to `uri: /`, which composes `/old` → `/`, `/old/` → `/`, and `/old/child` → `/child` under `match_prefix: /old`. The composed path is canonicalized, and a `.` or `..` segment is refused with `400` |
 | `match_prefix` | String \| null | omitted | Prefix replaced by `uri`, with the same literal-substitution contract as `rewrite.match_prefix` |
 | `authority` | String \| null | omitted | Replacement `Location` authority; the request authority is preserved when unset. Same `host` / `host:port` grammar as `rewrite.authority` |
 | `port` | 1–65535 \| null | omitted | Replacement authority port. Mutually exclusive with `derive_port` |
@@ -9717,10 +9717,19 @@ and nothing is allocated for it.
 Route header transforms are published onto the request context and applied by
 proxy core after the last **eligible** (enabled) `request_transformer` /
 `response_transformer` in the chain. The request list is applied after the
-LATER of that consumer and the last `mesh_route_dispatch` instance, so a
-consumer that a `priority_override` moves ahead of the dispatcher still has the
-matched rule's list applied once the dispatcher has published it — route policy
-is never silently dropped because of chain order.
+LATER of that consumer and the last `mesh_route_dispatch` instance — every
+instance, including one whose rules carry no `request_transform`, because a
+matching rule replaces the whole route decision. A consumer that a
+`priority_override` moves ahead of the dispatch block therefore still has the
+winning rule's list applied once the block has decided, a superseded rule's
+list is never applied, and no later dispatch predicate sees route headers early.
+
+The transformers themselves run on HTTP and gRPC only. A WebSocket handshake
+still gets the matched rule's route lists: the WebSocket chain carries a
+cache-owned stand-in for each eligible consumer (route-header finalization
+only — never the transformer's static header, query, or body rules), so the
+request list reaches the backend handshake and the response list decorates the
+successful upgrade response as well as a redirect / fault / rejection answer.
 
 A chain whose rules carry `request_transform` / `response_transform` but that has
 no configured `request_transformer` / `response_transformer` respectively is

@@ -3907,3 +3907,24 @@ async fn port_predicate_reads_only_trusted_port_provenance() {
     .expect_err("port 0 can never be addressed");
     assert!(err.contains("match.port"), "got {err}");
 }
+
+#[test]
+fn redirect_uri_query_admits_only_printable_ascii() {
+    // PR6821-SOL-3: a raw control byte in the redirect's own query passed
+    // admission and made the response silently drop `Location`.
+    for uri in [
+        "/new?x=\u{0}",
+        "/new?x=\u{7}",
+        "/new?x=\u{7f}",
+        "/new?x=caf\u{e9}",
+    ] {
+        let err = MeshRouteDispatch::new(&redirect_rule(json!({"uri": uri})))
+            .expect_err(&format!("{uri:?} must be refused"));
+        assert!(
+            err.contains("redirect.uri` must contain only printable ASCII"),
+            "{uri:?}: {err}"
+        );
+    }
+    MeshRouteDispatch::new(&redirect_rule(json!({"uri": "/new?x=%00&name=caf%C3%A9"})))
+        .expect("percent-encoded query text is kept verbatim");
+}

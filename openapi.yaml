@@ -26898,11 +26898,13 @@ components:
                   uri:
                     type: [string, "null"]
                     minLength: 1
-                    pattern: '^/[^#\s]*$'
+                    pattern: '^/[!"$-~]*$'
                     description: |
                       Replacement path for the Location header; request path
                       preserved when unset. Must be an absolute path (leading
-                      `/`) without a fragment or whitespace whose path
+                      `/`) of printable ASCII only — no fragment, whitespace,
+                      raw control byte, or unencoded non-ASCII, query included
+                      — whose path
                       component is already canonical (dot segments,
                       backslashes, and escapes that decode differently are
                       rejected at load — a runtime check the pattern does not

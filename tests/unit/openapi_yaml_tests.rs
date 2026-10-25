@@ -13257,6 +13257,21 @@ fn mesh_route_dispatch_runtime_and_openapi_contracts_match() {
             true,
         ),
         (
+            "redirect_uri_query_nul",
+            parity_rule(json!({"redirect": {"uri": "/new?x=\u{0}"}})),
+            false,
+        ),
+        (
+            "redirect_uri_query_del",
+            parity_rule(json!({"redirect": {"uri": "/new?x=\u{7f}"}})),
+            false,
+        ),
+        (
+            "redirect_uri_encoded_query",
+            parity_rule(json!({"redirect": {"uri": "/new?x=%00"}})),
+            true,
+        ),
+        (
             "redirect_authority_with_path",
             parity_rule(json!({"redirect": {"authority": "a/b"}})),
             false,

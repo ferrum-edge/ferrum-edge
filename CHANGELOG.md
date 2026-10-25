@@ -390,8 +390,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2995) finalized an empty slot, and the list the dispatcher published
   afterwards was silently dropped, so a route rule stripping
   `X-Internal-Role` forwarded the client's value. The list is now applied
-  after the later of the last eligible consumer and the last dispatch
-  instance, on HTTP/1.1, HTTP/2, and HTTP/3 alike. A chain whose dispatch
+  after the later of the last eligible consumer and the end of the whole
+  dispatch block (so a superseded rule's credential is never applied to the
+  winning backend), on HTTP/1.1, HTTP/2, and HTTP/3 alike. WebSocket
+  handshakes, whose chain never runs the HTTP/gRPC-only transformers, now get
+  the matched rule's request and response route lists through a cache-owned
+  consumer stand-in instead of silently forwarding a stripped header. A chain whose dispatch
   rules carry `request_transform` / `response_transform` with no configured
   `request_transformer` / `response_transformer` is now refused at
   plugin-cache construction and admin admission instead of silently dropping
@@ -400,7 +404,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `redirect.uri` must be an absolute path with a canonical path component and
   no fragment (a relative `uri: new` used to redirect `app.example.com` to the
   different host `app.example.comnew`), and may carry its own query only
-  without `match_prefix`. `rewrite.authority` and `redirect.authority` must be
+  without `match_prefix`; every byte, query included, must be printable ASCII
+  (a raw NUL/DEL/control byte used to drop `Location` from the 3xx).
+  `rewrite.authority` and `redirect.authority` must be
   exactly `host` or `host:port` (a DNS name or IPv4 literal, or a bracketed
   IPv6 literal); a path, query, fragment, or userinfo is rejected at load. The
   Istio VirtualService translator applies the same checks and fails the

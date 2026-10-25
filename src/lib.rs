@@ -9233,6 +9233,22 @@ pub mod _test_support {
         .await
     }
 
+    /// The production successful-WebSocket-handshake response header pass,
+    /// including the matched route response-header list.
+    pub fn finalize_successful_websocket_response_headers_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &crate::plugins::RequestContext,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        crate::proxy::finalize_successful_websocket_response_headers(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+        );
+    }
+
     /// Like [`run_after_proxy_hooks_for_test`] but surfaces the terminal
     /// rejection parts (status, body, headers) when an `after_proxy` hook
     /// rejects or exhausts the RPC deadline, so tests can assert which gateway

@@ -854,3 +854,198 @@ fn cache_refuses_route_transforms_without_a_configured_consumer() {
     ]);
     assert!(PluginCache::new(&rtds_disabled).is_ok());
 }
+
+#[tokio::test]
+async fn cache_backed_route_request_policy_waits_for_the_whole_dispatch_block() {
+    // PR6821-SOL-1: dispatcher B publishes no request transforms but still
+    // replaces the route decision. Finalizing right after dispatcher A applied
+    // A's credential before B won, and let B's predicates see it.
+    let config = make_config(vec![
+        plugin_config(
+            "rt-early",
+            "request_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            Some(2990),
+            None,
+        ),
+        plugin_config(
+            "mrd-a",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "backend-a.internal", "backend_port": 8080},
+                "request_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Backend-Key", "value": "backend-a-only"}
+                ]
+            }]}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd-b",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {
+                    "headers": {"x-route": "b"},
+                    "without_headers": {"x-backend-key": {"regex": ".*"}}
+                },
+                "destination": {"backend_host": "backend-b.internal", "backend_port": 8080}
+            }]}),
+            Some(2996),
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::Http);
+    let consumer = plugins
+        .iter()
+        .position(|p| p.name() == "request_transformer")
+        .expect("consumer in chain");
+    let dispatchers: Vec<usize> = plugins
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.name() == "mesh_route_dispatch")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(dispatchers.len(), 2);
+    assert!(consumer < dispatchers[0] && dispatchers[0] < dispatchers[1]);
+    assert!(!plugins[dispatchers[1]].publishes_route_request_header_transforms());
+    assert!(plugins[dispatchers[1]].replaces_route_request_header_transforms());
+
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::from([("x-route".to_string(), "b".to_string())]);
+    run_request_chain(&plugins, &mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("backend-b.internal"),
+        "dispatcher B must not observe A's route header before the block ends"
+    );
+    assert!(
+        !headers.contains_key("x-backend-key"),
+        "the superseded rule's credential must never reach backend B; got {:?}",
+        headers.get("x-backend-key")
+    );
+    assert!(ctx.route_override_request_transform.is_none());
+}
+
+fn websocket_route_transform_config() -> GatewayConfig {
+    make_config(vec![
+        plugin_config(
+            "rt",
+            "request_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "resp",
+            "response_transformer",
+            json!({"rules": [], "apply_route_overrides": true}),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            json!({"rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"backend_host": "ws.internal", "backend_port": 8080},
+                "request_transform": [
+                    {"operation": "remove", "target": "header", "key": "X-Internal-Role"}
+                ],
+                "response_transform": [
+                    {"operation": "update", "target": "header", "key": "X-Route", "value": "ws"}
+                ]
+            }]}),
+            None,
+            None,
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn websocket_view_applies_route_request_policy_to_the_handshake() {
+    // PR6821-SOL-2: the transformers run on HTTP/gRPC only, so the WebSocket
+    // view used to lose the consumer and forward the stripped header.
+    let cache = PluginCache::new(&websocket_route_transform_config()).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::WebSocket);
+    assert!(
+        plugins
+            .iter()
+            .all(|p| p.name() != "request_transformer" && p.name() != "response_transformer"),
+        "the transformers themselves never run on WebSocket"
+    );
+    assert!(
+        plugins
+            .iter()
+            .any(|p| p.participates_in_route_request_header_finalization()),
+        "the WebSocket view keeps an eligible route request consumer"
+    );
+
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::from([("x-internal-role".to_string(), "admin".to_string())]);
+    run_request_chain(&plugins, &mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("ws.internal")
+    );
+    assert!(
+        !headers.contains_key("x-internal-role"),
+        "route remove must apply to the WebSocket handshake"
+    );
+
+    let mut response_headers = HashMap::new();
+    ferrum_edge::_test_support::finalize_successful_websocket_response_headers_for_test(
+        &plugins,
+        &ctx,
+        101,
+        &mut response_headers,
+    );
+    assert_eq!(
+        response_headers.get("x-route").map(String::as_str),
+        Some("ws"),
+        "route response policy must decorate the successful upgrade"
+    );
+}
+
+#[tokio::test]
+async fn websocket_view_keeps_rtds_disabled_consumers_ineligible() {
+    // A disabled RTDS transformer is not eligible on HTTP, so its WebSocket
+    // stand-in must not exist either: the route list stays unused.
+    let config = make_config(vec![
+        plugin_config(
+            "rt-disabled",
+            "request_transformer",
+            json!({
+                "rules": [{
+                    "operation": "add",
+                    "target": "header",
+                    "key": "X-Disabled",
+                    "value": "no"
+                }],
+                "runtime_overlay_scope": "gate",
+                "runtime_overlay_resolved_enabled": false
+            }),
+            None,
+            None,
+        ),
+        plugin_config(
+            "mrd",
+            "mesh_route_dispatch",
+            route_dispatch_config("request_transform"),
+            None,
+            None,
+        ),
+    ]);
+    let cache = PluginCache::new(&config).expect("cache");
+    let plugins =
+        plugins_for_protocol_for_test(&cache, DEFAULT_NAMESPACE, "p1", ProxyProtocol::WebSocket);
+    assert!(
+        !plugins
+            .iter()
+            .any(|p| p.participates_in_route_request_header_finalization())
+    );
+}
