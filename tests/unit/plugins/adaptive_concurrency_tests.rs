@@ -11,8 +11,8 @@ use ferrum_edge::_test_support::{
 };
 use ferrum_edge::PluginCache;
 use ferrum_edge::adaptive_concurrency::{
-    AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy, AdaptiveConcurrencyLimiter,
-    AdaptiveConcurrencySnapshot,
+    AdaptiveConcurrencyAdmissionKind, AdaptiveConcurrencyConfig, AdaptiveConcurrencyKeyBy,
+    AdaptiveConcurrencyLimiter, AdaptiveConcurrencySnapshot, AdaptiveConcurrencyTotals,
 };
 use ferrum_edge::config::db_backend::NamespacedResourceId;
 use ferrum_edge::config::types::{GatewayConfig, Proxy, UpstreamTarget};
@@ -3259,4 +3259,382 @@ fn h3_grpc_streaming_bridge_settles_admission_with_captured_response_timing() {
             .contains("let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64()"),
         "the logged TTFB and the latency sample must share one capture"
     );
+}
+
+fn keyed_config(
+    key_by: AdaptiveConcurrencyKeyBy,
+    max_tracked_keys: usize,
+    initial_limit: u64,
+    shadow_mode: bool,
+) -> Arc<AdaptiveConcurrencyConfig> {
+    Arc::new(AdaptiveConcurrencyConfig {
+        key_by,
+        max_tracked_keys,
+        min_limit: 1,
+        initial_limit,
+        max_limit: initial_limit,
+        min_samples: 1,
+        baseline_window_samples: 1000,
+        target_latency_multiplier: 1.5,
+        decrease_ratio: 0.5,
+        increase_step: 1,
+        shadow_mode,
+        expose_headers: false,
+    })
+}
+
+fn upstream_proxy(id: &str) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "namespace": "default",
+        "upstream_id": "up-1",
+        "backend_host": "backend.local",
+        "backend_port": 8080
+    }))
+    .expect("upstream proxy should deserialize")
+}
+
+/// Admission to an already-tracked target must only need a shared READ of its
+/// DashMap shard. The old path took the shard's exclusive `entry` lock on every
+/// admission, so concurrent requests for one popular target serialized on it;
+/// with another reader holding the shard, that admission blocked until the
+/// reader let go. Covered for every scope, including the per-call
+/// `upstream_target` scope.
+#[test]
+fn adaptive_concurrency_existing_target_admits_while_its_shard_is_read_held() {
+    let backend_target = target("10.0.0.5", 9000);
+    for (key_by, proxy, upstream_target) in [
+        (AdaptiveConcurrencyKeyBy::Proxy, proxy(), None),
+        (
+            AdaptiveConcurrencyKeyBy::Upstream,
+            upstream_proxy("proxy-up"),
+            Some(backend_target.clone()),
+        ),
+        (
+            AdaptiveConcurrencyKeyBy::Backend,
+            proxy(),
+            Some(backend_target.clone()),
+        ),
+    ] {
+        let limiter = Arc::new(AdaptiveConcurrencyLimiter::new(4));
+        let config = keyed_config(key_by, 10_000, 8, false);
+        drop(
+            limiter
+                .try_acquire(&proxy, upstream_target.as_ref(), Arc::clone(&config))
+                .expect("warm the target"),
+        );
+
+        let (admitted, worker) = limiter
+            .hold_target_read_guard_for_test(&proxy, upstream_target.as_ref(), key_by, || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let worker = {
+                    let limiter = Arc::clone(&limiter);
+                    let proxy = proxy.clone();
+                    let upstream_target = upstream_target.clone();
+                    let config = Arc::clone(&config);
+                    thread::spawn(move || {
+                        let admitted = limiter
+                            .try_acquire(&proxy, upstream_target.as_ref(), config)
+                            .is_ok();
+                        let _ = tx.send(admitted);
+                    })
+                };
+                (rx.recv_timeout(Duration::from_secs(5)), worker)
+            })
+            .expect("the warmed target is tracked");
+        worker.join().expect("admission worker should not panic");
+        assert!(
+            matches!(admitted, Ok(true)),
+            "{key_by:?}: an existing target must admit while another reader holds its shard: {admitted:?}"
+        );
+        assert_eq!(limiter.tracked_keys_count(), 1, "{key_by:?}");
+    }
+}
+
+/// The read-guard fast path must not weaken first-insert accounting: racing
+/// first admissions for one new target at a one-key cap all land on the single
+/// tracked state (none falls back to an untracked bypass state).
+#[test]
+fn adaptive_concurrency_racing_first_admissions_insert_one_tracked_target() {
+    const RACERS: usize = 8;
+    let proxy = proxy();
+    let limiter = Arc::new(AdaptiveConcurrencyLimiter::new(4));
+    let config = keyed_config(AdaptiveConcurrencyKeyBy::Proxy, 1, 64, false);
+    let barrier = Arc::new(Barrier::new(RACERS));
+    let workers = (0..RACERS)
+        .map(|_| {
+            let limiter = Arc::clone(&limiter);
+            let proxy = proxy.clone();
+            let config = Arc::clone(&config);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                limiter
+                    .try_acquire(&proxy, None, config)
+                    .expect("a racing first admission is under the limit")
+            })
+        })
+        .collect::<Vec<_>>();
+    let permits = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("racer should not panic"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(limiter.tracked_keys_count(), 1);
+    assert!(
+        permits
+            .iter()
+            .all(|permit| permit.admission_kind() == AdaptiveConcurrencyAdmissionKind::WithinLimit),
+        "every racer must be admitted on the one tracked state"
+    );
+    let snapshot = limiter
+        .snapshot(&proxy, None, AdaptiveConcurrencyKeyBy::Proxy)
+        .expect("the racing target is tracked");
+    assert_eq!(snapshot.in_flight, RACERS as u64);
+    drop(permits);
+}
+
+/// DEEPSEEK-FLASH-2: an existing target is looked up through the borrowed key
+/// view under a shard read guard; the owned key (`host.to_owned()` plus an
+/// `Arc<str>` scope) is built only after that lookup misses, and admission never
+/// formats a per-call `upstream_target` scope into a fresh `String`.
+#[test]
+fn adaptive_concurrency_admission_builds_no_owned_key_for_existing_targets() {
+    let source = include_str!("../../../src/adaptive_concurrency.rs");
+    let target_state = source
+        .split("    fn target_state(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    fn ").next())
+        .expect("target_state lookup");
+    let read_lookup = target_state
+        .find(".get(&lookup as &dyn AdaptiveConcurrencyKeyView)")
+        .expect("existing targets must be found through the borrowed key view");
+    let owned_key = target_state
+        .find("host: host.to_owned()")
+        .expect("the owned key is built for first insert");
+    let entry = target_state
+        .find(".inner.entry(key)")
+        .expect("first insert uses the entry API");
+    assert!(
+        read_lookup < owned_key && owned_key < entry,
+        "the read-guard lookup must precede owned-key construction and the entry lock"
+    );
+
+    let with_scope = source
+        .split("    fn with_scope<R>(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    fn ").next())
+        .expect("with_scope");
+    assert!(
+        with_scope.contains("UPSTREAM_SCOPE_SCRATCH.with("),
+        "upstream_target scope must be formatted into the thread-local scratch"
+    );
+    assert!(
+        !with_scope.contains("Arc::from(") && !with_scope.contains("String::"),
+        "admission must not allocate the upstream_target scope per call"
+    );
+}
+
+fn decision_total(
+    proxy_id: &str,
+    decision: ferrum_edge::plugins::prometheus_metrics::AdaptiveConcurrencyDecision,
+) -> u64 {
+    ferrum_edge::plugins::prometheus_metrics::global_registry()
+        .adaptive_concurrency_decision_total(proxy_id, decision)
+}
+
+fn proxy_with_id(id: &str) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "namespace": "default",
+        "backend_host": "backend.local",
+        "backend_port": 8080
+    }))
+    .expect("proxy should deserialize")
+}
+
+/// SOL-3 / DEEPSEEK-FLASH-1: shed, shadow would-reject, and key-cap bypass
+/// decisions are exported per proxy on the fixed-label
+/// `ferrum_adaptive_concurrency_decisions_total` family. Ordinary admissions
+/// record nothing. Each scenario uses its own proxy id because the registry is
+/// process-global.
+#[test]
+fn adaptive_concurrency_exports_shed_shadow_and_bypass_decisions() {
+    use ferrum_edge::plugins::prometheus_metrics::AdaptiveConcurrencyDecision::{
+        Rejected, UntrackedBypass, WouldReject,
+    };
+
+    // Enforcing: the second concurrent request is shed.
+    let enforcing: Arc<dyn Plugin> = Arc::new(
+        AdaptiveConcurrency::new(
+            &json!({"min_limit": 1, "initial_limit": 1, "max_limit": 1}),
+            PluginHttpClient::default(),
+        )
+        .expect("enforcing config"),
+    );
+    let shed_proxy = proxy_with_id("adaptive-metrics-shed");
+    let held = expect_admitted(acquire_from_plugin(&enforcing, &shed_proxy, None));
+    assert_eq!(decision_total(&shed_proxy.id, Rejected), 0);
+    assert_rejected(acquire_from_plugin(&enforcing, &shed_proxy, None));
+    assert_eq!(decision_total(&shed_proxy.id, Rejected), 1);
+    assert_eq!(decision_total(&shed_proxy.id, WouldReject), 0);
+    drop(held);
+
+    // Shadow: the same over-limit request is admitted and counted as would-reject.
+    let shadow: Arc<dyn Plugin> = Arc::new(
+        AdaptiveConcurrency::new(
+            &json!({"min_limit": 1, "initial_limit": 1, "max_limit": 1, "shadow_mode": true}),
+            PluginHttpClient::default(),
+        )
+        .expect("shadow config"),
+    );
+    let shadow_proxy = proxy_with_id("adaptive-metrics-shadow");
+    let first = expect_admitted(acquire_from_plugin(&shadow, &shadow_proxy, None));
+    assert_eq!(decision_total(&shadow_proxy.id, WouldReject), 0);
+    let second = expect_admitted(acquire_from_plugin(&shadow, &shadow_proxy, None));
+    assert_eq!(decision_total(&shadow_proxy.id, WouldReject), 1);
+    assert_eq!(decision_total(&shadow_proxy.id, Rejected), 0);
+    drop((first, second));
+
+    // Key cap: a second target beyond `max_tracked_keys` bypasses limiting.
+    let capped: Arc<dyn Plugin> = Arc::new(
+        AdaptiveConcurrency::new(
+            &json!({"key_by": "backend_target", "max_tracked_keys": 1}),
+            PluginHttpClient::default(),
+        )
+        .expect("key-cap config"),
+    );
+    let cap_proxy = proxy_with_id("adaptive-metrics-cap");
+    let tracked_target = target("tracked.example.com", 8080);
+    let overflow_target = target("overflow.example.com", 8080);
+    let tracked = expect_admitted(acquire_from_plugin(
+        &capped,
+        &cap_proxy,
+        Some(&tracked_target),
+    ));
+    assert_eq!(decision_total(&cap_proxy.id, UntrackedBypass), 0);
+    let overflow = expect_admitted(acquire_from_plugin(
+        &capped,
+        &cap_proxy,
+        Some(&overflow_target),
+    ));
+    assert_eq!(decision_total(&cap_proxy.id, UntrackedBypass), 1);
+    drop((tracked, overflow));
+
+    let exposition = ferrum_edge::plugins::prometheus_metrics::global_registry().render_uncached();
+    for (proxy_id, decision) in [
+        ("adaptive-metrics-shed", "rejected"),
+        ("adaptive-metrics-shadow", "would_reject"),
+        ("adaptive-metrics-cap", "untracked_bypass"),
+    ] {
+        let series = format!(
+            "ferrum_adaptive_concurrency_decisions_total{{proxy_id=\"{proxy_id}\",decision=\"{decision}\""
+        );
+        assert!(
+            exposition.contains(&series),
+            "missing {series} in /metrics exposition"
+        );
+    }
+}
+
+/// The limiter reports why it admitted each permit, so the plugin can count
+/// shadow would-rejects and key-cap bypasses without a second lookup.
+#[test]
+fn adaptive_concurrency_permit_reports_admission_kind() {
+    let proxy = proxy();
+    let limiter = AdaptiveConcurrencyLimiter::new(4);
+    let shadow = keyed_config(AdaptiveConcurrencyKeyBy::Backend, 1, 1, true);
+    let tracked_target = target("tracked.example.com", 8080);
+    let overflow_target = target("overflow.example.com", 8080);
+
+    let within = limiter
+        .try_acquire(&proxy, Some(&tracked_target), Arc::clone(&shadow))
+        .expect("first admission");
+    assert_eq!(
+        within.admission_kind(),
+        AdaptiveConcurrencyAdmissionKind::WithinLimit
+    );
+    let over = limiter
+        .try_acquire(&proxy, Some(&tracked_target), Arc::clone(&shadow))
+        .expect("shadow admits past the limit");
+    assert_eq!(
+        over.admission_kind(),
+        AdaptiveConcurrencyAdmissionKind::ShadowWouldReject
+    );
+    let bypass = limiter
+        .try_acquire(&proxy, Some(&overflow_target), Arc::clone(&shadow))
+        .expect("over-cap target fails open");
+    assert_eq!(
+        bypass.admission_kind(),
+        AdaptiveConcurrencyAdmissionKind::UntrackedBypass
+    );
+}
+
+/// SOL-3 / DEEPSEEK-FLASH-1: `/admin/metrics` reads live limiter state summed
+/// across every policy at read time.
+#[test]
+fn adaptive_concurrency_totals_sum_tracked_limits_and_in_flight() {
+    let config = cache_config(
+        "proxy",
+        json!({"min_limit": 1, "initial_limit": 4, "max_limit": 8}),
+    );
+    let cache = PluginCache::new(&config).expect("cache should build");
+    let (policies, idle) = cache.adaptive_concurrency_totals();
+    assert_eq!(policies, 1);
+    assert_eq!(idle, AdaptiveConcurrencyTotals::default());
+
+    let first = expect_admitted(acquire_from_cache(&cache, &config));
+    let second = expect_admitted(acquire_from_cache(&cache, &config));
+    let (policies, busy) = cache.adaptive_concurrency_totals();
+    assert_eq!(policies, 1);
+    assert_eq!(
+        busy,
+        AdaptiveConcurrencyTotals {
+            tracked_targets: 1,
+            limit: 4,
+            in_flight: 2,
+        }
+    );
+    drop((first, second));
+    let (_, released) = cache.adaptive_concurrency_totals();
+    assert_eq!(released.in_flight, 0);
+    assert_eq!(released.tracked_targets, 1);
+}
+
+/// DEEPSEEK-FLASH-3: a backend that answers a terminated permessage-deflate
+/// upgrade with an extension response the gateway cannot honor gets a 502. Both
+/// the H1/H2 and the H3 WebSocket paths must settle the admission permit as a
+/// backend failure before returning, instead of dropping it unsampled while a
+/// broken backend keeps its limit.
+#[test]
+fn websocket_deflate_negotiation_failure_settles_admission_as_backend_failure() {
+    for (path, source, error_body) in [
+        (
+            "src/proxy/mod.rs",
+            include_str!("../../../src/proxy/mod.rs"),
+            "Backend WebSocket extension negotiation failed",
+        ),
+        (
+            "src/http3/websocket.rs",
+            include_str!("../../../src/http3/websocket.rs"),
+            "Backend WebSocket extension negotiation failed",
+        ),
+    ] {
+        let (before_body, _) = source
+            .split_once(error_body)
+            .unwrap_or_else(|| panic!("{path}: deflate negotiation failure response"));
+        let failure_arm = before_body
+            .rsplit_once("Err(reason) => {")
+            .map(|(_, arm)| arm)
+            .unwrap_or_else(|| panic!("{path}: deflate negotiation failure arm"));
+        let record = failure_arm
+            .find("permits.record_backend_outcome(BackendAdmissionOutcome {")
+            .unwrap_or_else(|| panic!("{path}: the failure arm must settle the admission permit"));
+        let settled = &failure_arm[record..];
+        assert!(
+            settled.contains("response_status: 502")
+                && settled.contains("error_class: Some(retry::ErrorClass::ProtocolError)"),
+            "{path}: the permit must record the 502 protocol failure: {settled}"
+        );
+    }
 }

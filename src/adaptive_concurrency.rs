@@ -5,6 +5,7 @@
 //! request? Proxy, proxy-group, and global plugin scopes control how state is
 //! shared, and compatible cache generations reuse that state across reloads.
 
+use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,14 @@ thread_local! {
     /// afterwards, so a re-entrant call simply starts from an empty buffer
     /// instead of panicking on a nested borrow (mirrors `adaptive_buffer`).
     static SCOPE_KEY_SCRATCH: std::cell::Cell<String> =
+        const { std::cell::Cell::new(String::new()) };
+
+    /// Reusable scratch buffer for the per-request `upstream_target` scope.
+    ///
+    /// That scope is not cached (see `with_scope`), so it is formatted into
+    /// this buffer instead of a fresh `String`/`Arc<str>` on every admission.
+    /// Same take/put-back discipline as `SCOPE_KEY_SCRATCH`.
+    static UPSTREAM_SCOPE_SCRATCH: std::cell::Cell<String> =
         const { std::cell::Cell::new(String::new()) };
 }
 
@@ -210,11 +219,11 @@ pub struct AdaptiveConcurrencyConfig {
 
 #[derive(Clone, Debug, Eq)]
 pub struct AdaptiveConcurrencyKey {
-    // `Arc<str>` (not `String`): the scope is request-independent and resolved
-    // through a per-proxy cache, so building a key on the hot path is a refcount
-    // bump rather than a fresh allocation. `Hash`/`PartialEq` below stay
-    // content-based (`Arc<str>` hashes/compares the `str`), so distinct `Arc`
-    // instances carrying the same scope still collide/compare equal.
+    // Owned keys are built only when a target is first inserted; the admission
+    // hot path looks existing targets up through the borrowed
+    // `AdaptiveConcurrencyKeyView`. `Hash`/`PartialEq` below stay content-based
+    // (`Arc<str>` hashes/compares the `str`), so distinct `Arc` instances
+    // carrying the same scope still collide/compare equal.
     scope: Arc<str>,
     host: String,
     port: u16,
@@ -227,10 +236,81 @@ impl PartialEq for AdaptiveConcurrencyKey {
 }
 
 impl Hash for AdaptiveConcurrencyKey {
+    // Must hash exactly like `dyn AdaptiveConcurrencyKeyView` below (scope,
+    // host, port as `str`/`str`/`u16`), because the admission path looks
+    // existing targets up through that borrowed view.
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.scope.hash(state);
         self.host.hash(state);
         self.port.hash(state);
+    }
+}
+
+/// Borrowed view of a target key.
+///
+/// The admission hot path finds an existing target from the request's borrowed
+/// scope and host through this view, so a warm target never builds an owned
+/// [`AdaptiveConcurrencyKey`]; the owned key is allocated only on first insert.
+pub trait AdaptiveConcurrencyKeyView {
+    fn scope(&self) -> &str;
+    fn host(&self) -> &str;
+    fn port(&self) -> u16;
+}
+
+impl AdaptiveConcurrencyKeyView for AdaptiveConcurrencyKey {
+    fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    fn host(&self) -> &str {
+        &self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl<'a> Borrow<dyn AdaptiveConcurrencyKeyView + 'a> for AdaptiveConcurrencyKey {
+    fn borrow(&self) -> &(dyn AdaptiveConcurrencyKeyView + 'a) {
+        self
+    }
+}
+
+impl Hash for dyn AdaptiveConcurrencyKeyView + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.scope().hash(state);
+        self.host().hash(state);
+        self.port().hash(state);
+    }
+}
+
+impl PartialEq for dyn AdaptiveConcurrencyKeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope() == other.scope() && self.host() == other.host() && self.port() == other.port()
+    }
+}
+
+impl Eq for dyn AdaptiveConcurrencyKeyView + '_ {}
+
+/// Allocation-free lookup key built from borrowed request data.
+struct BorrowedAdaptiveConcurrencyKey<'a> {
+    scope: &'a str,
+    host: &'a str,
+    port: u16,
+}
+
+impl AdaptiveConcurrencyKeyView for BorrowedAdaptiveConcurrencyKey<'_> {
+    fn scope(&self) -> &str {
+        self.scope
+    }
+
+    fn host(&self) -> &str {
+        self.host
+    }
+
+    fn port(&self) -> u16 {
+        self.port
     }
 }
 
@@ -422,36 +502,7 @@ impl AdaptiveConcurrencyLimiter {
             let (config, config_generation) =
                 self.admission_config(generation, Arc::clone(&request_config));
             self.ensure_policy_generation_admitted(generation, lb_generation)?;
-            let key = build_key(
-                self.resolve_scope(&tracking_space, proxy, config.key_by),
-                proxy,
-                target,
-            );
-            let state = match tracking_space.inner.entry(key) {
-                Entry::Occupied(entry) => Arc::clone(entry.get()),
-                Entry::Vacant(entry) => {
-                    if self.reserve_key_slot(&tracking_space, config.max_tracked_keys) {
-                        let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
-                        entry.insert(Arc::clone(&state));
-                        state
-                    } else {
-                        // Key-cardinality cap reached. Fail OPEN with a per-request,
-                        // untracked state rather than rejecting: `max_tracked_keys`
-                        // only bounds the limiter's own memory, so a target beyond
-                        // the cap must still be admitted (never black-holed by a
-                        // blanket 503). `shadow_mode` likewise stays fail-open for
-                        // current-generation capacity decisions; the separate
-                        // generation-ownership checks still fail closed.
-                        // This state is NOT inserted into the map (memory stays
-                        // bounded) and dies with the permit, so overflow targets run
-                        // without adaptive limiting until the policy is removed and
-                        // recreated (or a structural key-space change resets it).
-                        // Starting at `in_flight = 0` it always admits below.
-                        drop(entry);
-                        Arc::new(AdaptiveConcurrencyState::new(config.initial_limit))
-                    }
-                }
-            };
+            let (state, tracked) = self.target_state(&tracking_space, proxy, target, &config);
 
             loop {
                 let current = state.in_flight.load(Ordering::Relaxed);
@@ -463,7 +514,8 @@ impl AdaptiveConcurrencyLimiter {
                     .load(Ordering::Acquire)
                     .max(config.min_limit)
                     .min(config.max_limit);
-                if current >= limit && !config.shadow_mode {
+                let over_limit = current >= limit;
+                if over_limit && !config.shadow_mode {
                     let generation_admitted =
                         self.policy_generation_admitted(generation, lb_generation);
                     let tracking_space_current = self.tracking_space_is_current(&tracking_space);
@@ -508,6 +560,16 @@ impl AdaptiveConcurrencyLimiter {
                             return Err(self.generation_handoff_rejection());
                         }
                         let feedback_epoch = state.feedback_epoch.load(Ordering::Acquire);
+                        // An untracked state starts at `in_flight = 0`, so it
+                        // is never over its limit; a tracked over-limit
+                        // admission can only be a shadow-mode admission.
+                        let admission_kind = if !tracked {
+                            AdaptiveConcurrencyAdmissionKind::UntrackedBypass
+                        } else if over_limit {
+                            AdaptiveConcurrencyAdmissionKind::ShadowWouldReject
+                        } else {
+                            AdaptiveConcurrencyAdmissionKind::WithinLimit
+                        };
                         return Ok(Arc::new(AdaptiveConcurrencyPermit {
                             state,
                             config,
@@ -515,6 +577,7 @@ impl AdaptiveConcurrencyLimiter {
                             policy_generation: generation,
                             lb_generation,
                             feedback_epoch,
+                            admission_kind,
                             recorded: AtomicBool::new(false),
                         }));
                     }
@@ -522,6 +585,66 @@ impl AdaptiveConcurrencyLimiter {
                 }
             }
         }
+    }
+
+    /// Resolve the target's shared state, plus whether it is tracked.
+    ///
+    /// Hot path: an existing target is found through a shard READ guard and a
+    /// borrowed key view, so concurrent admissions for one popular target do
+    /// not serialize on the shard's write lock and build no owned key. Only a
+    /// miss allocates the owned key and takes the `entry` write lock, which
+    /// rechecks for a racing insert before reserving a key slot, so a target
+    /// is inserted and counted against `max_tracked_keys` exactly once.
+    fn target_state(
+        &self,
+        tracking_space: &AdaptiveConcurrencyTrackingSpace,
+        proxy: &Proxy,
+        target: Option<&UpstreamTarget>,
+        config: &AdaptiveConcurrencyConfig,
+    ) -> (Arc<AdaptiveConcurrencyState>, bool) {
+        let (host, port) = target_host_port(proxy, target);
+        self.with_scope(tracking_space, proxy, config.key_by, |scope| {
+            let lookup = BorrowedAdaptiveConcurrencyKey { scope, host, port };
+            if let Some(existing) = tracking_space
+                .inner
+                .get(&lookup as &dyn AdaptiveConcurrencyKeyView)
+            {
+                return (Arc::clone(existing.value()), true);
+            }
+            let key = AdaptiveConcurrencyKey {
+                scope: Arc::from(scope),
+                host: host.to_owned(),
+                port,
+            };
+            match tracking_space.inner.entry(key) {
+                Entry::Occupied(entry) => (Arc::clone(entry.get()), true),
+                Entry::Vacant(entry) => {
+                    if self.reserve_key_slot(tracking_space, config.max_tracked_keys) {
+                        let state = Arc::new(AdaptiveConcurrencyState::new(config.initial_limit));
+                        entry.insert(Arc::clone(&state));
+                        (state, true)
+                    } else {
+                        // Key-cardinality cap reached. Fail OPEN with a per-request,
+                        // untracked state rather than rejecting: `max_tracked_keys`
+                        // only bounds the limiter's own memory, so a target beyond
+                        // the cap must still be admitted (never black-holed by a
+                        // blanket 503). `shadow_mode` likewise stays fail-open for
+                        // current-generation capacity decisions; the separate
+                        // generation-ownership checks still fail closed.
+                        // This state is NOT inserted into the map (memory stays
+                        // bounded) and dies with the permit, so overflow targets run
+                        // without adaptive limiting until the policy is removed and
+                        // recreated (or a structural key-space change resets it).
+                        // Starting at `in_flight = 0` it always admits below.
+                        drop(entry);
+                        (
+                            Arc::new(AdaptiveConcurrencyState::new(config.initial_limit)),
+                            false,
+                        )
+                    }
+                }
+            }
+        })
     }
 
     fn admission_config(
@@ -871,15 +994,64 @@ impl AdaptiveConcurrencyLimiter {
         key_by: AdaptiveConcurrencyKeyBy,
     ) -> Option<AdaptiveConcurrencySnapshot> {
         let tracking_space = self.tracking_space.load();
-        let key = build_key(
-            self.resolve_scope(&tracking_space, proxy, key_by),
-            proxy,
-            target,
-        );
-        tracking_space
-            .inner
-            .get(&key)
-            .map(|entry| AdaptiveConcurrencySnapshot::from_state(key, entry.value()))
+        let (host, port) = target_host_port(proxy, target);
+        self.with_scope(&tracking_space, proxy, key_by, |scope| {
+            let lookup = BorrowedAdaptiveConcurrencyKey { scope, host, port };
+            tracking_space
+                .inner
+                .get(&lookup as &dyn AdaptiveConcurrencyKeyView)
+                .map(|entry| {
+                    AdaptiveConcurrencySnapshot::from_state(entry.key().clone(), entry.value())
+                })
+        })
+    }
+
+    /// Hold a shard read guard on one tracked target while `f` runs.
+    ///
+    /// Test seam: lets an in-process test prove that admission to an existing
+    /// target only needs a shared read of its shard. `None` when the target is
+    /// not tracked in the active space.
+    #[doc(hidden)]
+    #[allow(dead_code)] // External unit tests call this through the library target.
+    pub fn hold_target_read_guard_for_test<R>(
+        &self,
+        proxy: &Proxy,
+        target: Option<&UpstreamTarget>,
+        key_by: AdaptiveConcurrencyKeyBy,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let tracking_space = self.tracking_space.load();
+        let (host, port) = target_host_port(proxy, target);
+        self.with_scope(&tracking_space, proxy, key_by, |scope| {
+            let lookup = BorrowedAdaptiveConcurrencyKey { scope, host, port };
+            let guard = tracking_space
+                .inner
+                .get(&lookup as &dyn AdaptiveConcurrencyKeyView)?;
+            let result = f();
+            drop(guard);
+            Some(result)
+        })
+    }
+
+    /// Aggregate state of the active tracking space, summed at read time.
+    ///
+    /// Covers tracked targets only: untracked over-cap admissions and permits
+    /// still finishing against a detached (structurally retired) space are not
+    /// part of the active space. Admin-path only; never called per request.
+    pub fn totals(&self) -> AdaptiveConcurrencyTotals {
+        let tracking_space = self.tracking_space.load();
+        let mut totals = AdaptiveConcurrencyTotals::default();
+        for entry in tracking_space.inner.iter() {
+            let state = entry.value();
+            totals.tracked_targets = totals.tracked_targets.saturating_add(1);
+            totals.limit = totals
+                .limit
+                .saturating_add(state.limit.load(Ordering::Acquire));
+            totals.in_flight = totals
+                .in_flight
+                .saturating_add(state.in_flight.load(Ordering::Relaxed));
+        }
+        totals
     }
 
     /// Every target tracked in the active tracking space. Inspection only, for
@@ -897,48 +1069,91 @@ impl AdaptiveConcurrencyLimiter {
             .collect()
     }
 
-    /// Resolve the scope component of the key for `proxy` under `key_by`.
-    /// `backend` scoping returns one shared constant. `proxy` scoping caches a
-    /// reused `Arc<str>` per namespace-qualified `namespace|id` runtime key —
-    /// which uniquely and stably identifies the proxy, so the cached
+    /// Run `f` with the scope component of the key for `proxy` under `key_by`,
+    /// without allocating once the calling thread is warm.
+    ///
+    /// `backend` scoping passes one shared constant. `proxy` scoping passes a
+    /// reused `Arc<str>` cached per namespace-qualified `namespace|id` runtime
+    /// key — which uniquely and stably identifies the proxy, so the cached
     /// `proxy:{ns}:{id}` scope never goes stale and never crosses tenants.
-    /// `upstream` scoping is computed per call: its `upstream:{ns}:{upstream_id}`
-    /// depends on the proxy's upstream, which can change across a reload while a
-    /// shared (global/proxy_group) limiter instance — and this cache — is
+    /// `upstream` scoping is formatted per call into a thread-local scratch
+    /// buffer: its `upstream:{ns}:{upstream_id}` depends on the proxy's
+    /// upstream, which can change across a reload while a shared
+    /// (global/proxy_group) limiter instance — and the scope cache — is
     /// preserved, so caching it by proxy identity would serve a stale upstream
-    /// scope. The string is short, and the admission path already allocates the
-    /// full key in `build_key`.
-    fn resolve_scope(
+    /// scope. `f` must not call back into `with_scope`; a re-entrant call is
+    /// still correct, it just allocates a fresh buffer.
+    fn with_scope<R>(
         &self,
         tracking_space: &AdaptiveConcurrencyTrackingSpace,
         proxy: &Proxy,
         key_by: AdaptiveConcurrencyKeyBy,
-    ) -> Arc<str> {
+        f: impl FnOnce(&str) -> R,
+    ) -> R {
         match key_by {
-            AdaptiveConcurrencyKeyBy::Backend => Arc::clone(&self.backend_scope),
-            AdaptiveConcurrencyKeyBy::Upstream => Arc::from(adaptive_concurrency_scope(
-                key_by,
-                proxy,
-                proxy.upstream_id.as_deref(),
-            )),
+            AdaptiveConcurrencyKeyBy::Backend => f(&*self.backend_scope),
+            AdaptiveConcurrencyKeyBy::Upstream => UPSTREAM_SCOPE_SCRATCH.with(|slot| {
+                let mut scope = slot.take();
+                write_adaptive_concurrency_scope(
+                    &mut scope,
+                    key_by,
+                    proxy,
+                    proxy.upstream_id.as_deref(),
+                );
+                let result = f(&scope);
+                slot.set(scope);
+                result
+            }),
             AdaptiveConcurrencyKeyBy::Proxy => {
-                with_namespaced_key(&proxy.namespace, &proxy.id, |cache_key| {
-                    if let Some(cached) = tracking_space.scope_cache.get(cache_key) {
-                        return Arc::clone(cached.value());
-                    }
-                    let scope: Arc<str> = Arc::from(adaptive_concurrency_scope(
-                        key_by,
-                        proxy,
-                        proxy.upstream_id.as_deref(),
-                    ));
-                    tracking_space
-                        .scope_cache
-                        .insert(cache_key.into(), Arc::clone(&scope));
-                    scope
-                })
+                let scope = self.cached_proxy_scope(tracking_space, proxy);
+                f(&scope)
             }
         }
     }
+
+    fn cached_proxy_scope(
+        &self,
+        tracking_space: &AdaptiveConcurrencyTrackingSpace,
+        proxy: &Proxy,
+    ) -> Arc<str> {
+        with_namespaced_key(&proxy.namespace, &proxy.id, |cache_key| {
+            if let Some(cached) = tracking_space.scope_cache.get(cache_key) {
+                return Arc::clone(cached.value());
+            }
+            let scope: Arc<str> = Arc::from(adaptive_concurrency_scope(
+                AdaptiveConcurrencyKeyBy::Proxy,
+                proxy,
+                proxy.upstream_id.as_deref(),
+            ));
+            tracking_space
+                .scope_cache
+                .insert(cache_key.into(), Arc::clone(&scope));
+            scope
+        })
+    }
+}
+
+/// Aggregate learned state of one limiter's active tracking space.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdaptiveConcurrencyTotals {
+    /// Distinct target keys tracked.
+    pub tracked_targets: u64,
+    /// Sum of the tracked targets' current adaptive limits.
+    pub limit: u64,
+    /// Sum of the tracked targets' current in-flight admissions.
+    pub in_flight: u64,
+}
+
+/// How the limiter admitted one permit, for operator decision metrics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveConcurrencyAdmissionKind {
+    /// Admitted below the target's adaptive limit.
+    WithinLimit,
+    /// `shadow_mode` admitted a request the adaptive limit would have rejected.
+    ShadowWouldReject,
+    /// The target is beyond `max_tracked_keys`, so it was admitted without
+    /// adaptive limiting (the documented fail-open key cap).
+    UntrackedBypass,
 }
 
 #[allow(dead_code)]
@@ -987,10 +1202,16 @@ pub struct AdaptiveConcurrencyPermit {
     policy_generation: u64,
     lb_generation: u64,
     feedback_epoch: u64,
+    admission_kind: AdaptiveConcurrencyAdmissionKind,
     recorded: AtomicBool,
 }
 
 impl AdaptiveConcurrencyPermit {
+    /// How this permit was admitted.
+    pub fn admission_kind(&self) -> AdaptiveConcurrencyAdmissionKind {
+        self.admission_kind
+    }
+
     fn begin_feedback(&self) -> Option<AdaptiveConcurrencyFeedbackGuard<'_>> {
         if self.policy.feedback_blocked.load(Ordering::Acquire)
             || !self.feedback_generation_current()
@@ -1144,22 +1365,12 @@ impl Drop for AdaptiveConcurrencyPermit {
     }
 }
 
-fn build_key(
-    scope: Arc<str>,
-    proxy: &Proxy,
-    target: Option<&UpstreamTarget>,
-) -> AdaptiveConcurrencyKey {
-    // Only host/port vary per request; `scope` is resolved (and cached) by the
-    // caller via `resolve_scope`.
-    let (host, port) = target
+/// The selected backend endpoint: the load-balanced target, or the proxy's
+/// direct backend. Only this and the scope vary per request.
+fn target_host_port<'a>(proxy: &'a Proxy, target: Option<&'a UpstreamTarget>) -> (&'a str, u16) {
+    target
         .map(|target| (target.host.as_str(), target.port))
-        .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port));
-
-    AdaptiveConcurrencyKey {
-        scope,
-        host: host.to_string(),
-        port,
-    }
+        .unwrap_or((proxy.backend_host.as_str(), proxy.backend_port))
 }
 
 /// Canonical scope formatter shared by request admission and cold route-key
@@ -1170,33 +1381,38 @@ pub(crate) fn adaptive_concurrency_scope(
     proxy: &Proxy,
     upstream_id: Option<&str>,
 ) -> String {
-    match key_by {
-        AdaptiveConcurrencyKeyBy::Proxy => scoped_proxy(proxy),
-        AdaptiveConcurrencyKeyBy::Upstream => upstream_id
-            .map(|upstream_id| {
-                let mut scope = String::with_capacity(
-                    "upstream::".len() + proxy.namespace.len() + upstream_id.len(),
-                );
-                scope.push_str("upstream:");
-                scope.push_str(&proxy.namespace);
-                scope.push(':');
-                scope.push_str(upstream_id);
-                scope
-            })
-            .unwrap_or_else(|| scoped_proxy(proxy)),
-        // `backend` scope is served as a shared constant by `resolve_scope` and
-        // never reaches this function in practice.
-        AdaptiveConcurrencyKeyBy::Backend => "backend".to_string(),
-    }
+    let mut scope = String::new();
+    write_adaptive_concurrency_scope(&mut scope, key_by, proxy, upstream_id);
+    scope
 }
 
-fn scoped_proxy(proxy: &Proxy) -> String {
-    let mut scope = String::with_capacity("proxy::".len() + proxy.namespace.len() + proxy.id.len());
-    scope.push_str("proxy:");
-    scope.push_str(&proxy.namespace);
-    scope.push(':');
-    scope.push_str(&proxy.id);
-    scope
+/// Write the canonical scope into `scope`, replacing its contents. The single
+/// formatter behind [`adaptive_concurrency_scope`] and the allocation-free
+/// per-request `upstream_target` scope, so the two cannot drift.
+fn write_adaptive_concurrency_scope(
+    scope: &mut String,
+    key_by: AdaptiveConcurrencyKeyBy,
+    proxy: &Proxy,
+    upstream_id: Option<&str>,
+) {
+    scope.clear();
+    match (key_by, upstream_id) {
+        (AdaptiveConcurrencyKeyBy::Upstream, Some(upstream_id)) => {
+            scope.push_str("upstream:");
+            scope.push_str(&proxy.namespace);
+            scope.push(':');
+            scope.push_str(upstream_id);
+        }
+        (AdaptiveConcurrencyKeyBy::Proxy, _) | (AdaptiveConcurrencyKeyBy::Upstream, None) => {
+            scope.push_str("proxy:");
+            scope.push_str(&proxy.namespace);
+            scope.push(':');
+            scope.push_str(&proxy.id);
+        }
+        // `backend` scope is served as a shared constant by `with_scope` and
+        // never reaches this function in practice.
+        (AdaptiveConcurrencyKeyBy::Backend, _) => scope.push_str("backend"),
+    }
 }
 
 /// Windowed-minimum latency baseline (issue #5737).

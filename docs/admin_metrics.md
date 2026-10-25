@@ -279,6 +279,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   "rate_limiting": {
     "tracked_key_count": 4217
   },
+  "adaptive_concurrency": {
+    "policy_count": 2,
+    "tracked_target_count": 3,
+    "limit_total": 96,
+    "in_flight_total": 7
+  },
   "tcp_connection_throttle": {
     "enforcement_scope": "process_local",
     "replica_limit_behavior": "configured_limit_per_replica"
@@ -430,6 +436,24 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 
 - A `tracked_key_count` approaching 100K may indicate a DDoS or scanner generating many unique source IPs
 - Under normal traffic, this count should correlate with the number of unique clients in your active window duration
+
+### `adaptive_concurrency`
+
+Live state of every `adaptive_concurrency` policy, summed when the snapshot is built. Per-target values are not listed, so the response size does not grow with `max_tracked_keys`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `policy_count` | integer | Live `adaptive_concurrency` policies (one per namespace + plugin-config id) |
+| `tracked_target_count` | integer | Backend target keys tracked across those policies |
+| `limit_total` | integer | Sum of the tracked targets' current adaptive limits |
+| `in_flight_total` | integer | Sum of the tracked targets' current in-flight admissions |
+
+Untracked admissions beyond `max_tracked_keys` and permits still finishing against a structurally retired tracking space are not included. Shed, shadow-mode would-reject, and key-cap bypass decisions are counted per proxy by the `ferrum_adaptive_concurrency_decisions_total` Prometheus counter (see [`prometheus_metrics.md`](prometheus_metrics.md)).
+
+**What to look for:**
+
+- `in_flight_total` close to `limit_total` means the tracked targets are running at their learned limits and new requests are likely being shed
+- A falling `limit_total` with a steady `tracked_target_count` means backends are reporting higher latency or failures
 
 ### `tcp_connection_throttle`
 

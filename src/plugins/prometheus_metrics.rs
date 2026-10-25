@@ -896,6 +896,45 @@ const RESPONSE_CACHE_LOOKUP_STATUSES: [(&str, &str); 5] = [
     ("PREDICTED-BYPASS", "predicted_bypass"),
 ];
 
+/// `adaptive_concurrency` admission decisions exported as
+/// `ferrum_adaptive_concurrency_decisions_total{proxy_id, decision}`.
+///
+/// A fixed, compiled-in label set. Ordinary within-limit admissions are not
+/// counted, so the request path records nothing unless a request is shed,
+/// would have been shed in `shadow_mode`, or bypassed adaptive limiting at the
+/// `max_tracked_keys` cap. The backend target is never a label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdaptiveConcurrencyDecision {
+    /// Admission refused with a 503: the target was at its adaptive limit, or
+    /// the request crossed a policy/load-balancer generation handoff.
+    Rejected,
+    /// `shadow_mode` admitted a request the adaptive limit would have refused.
+    WouldReject,
+    /// The target is beyond `max_tracked_keys` and was admitted without
+    /// adaptive limiting.
+    UntrackedBypass,
+}
+
+impl AdaptiveConcurrencyDecision {
+    pub const ALL: [Self; 3] = [Self::Rejected, Self::WouldReject, Self::UntrackedBypass];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::WouldReject => "would_reject",
+            Self::UntrackedBypass => "untracked_bypass",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Rejected => 0,
+            Self::WouldReject => 1,
+            Self::UntrackedBypass => 2,
+        }
+    }
+}
+
 fn response_cache_lookup_status_index(status: &str) -> Option<usize> {
     RESPONSE_CACHE_LOOKUP_STATUSES
         .iter()
@@ -1044,6 +1083,11 @@ pub struct MetricsRegistry {
     /// [`RESPONSE_CACHE_LOOKUP_STATUSES`] classes. Each slot is padded onto its
     /// own cache line because every cache-eligible request increments one.
     response_cache_lookups: [CachePadded<AtomicU64>; 5],
+    /// `adaptive_concurrency` decisions by proxy_id, one map per
+    /// [`AdaptiveConcurrencyDecision`] (indexed by `AdaptiveConcurrencyDecision::index`).
+    /// Keyed by the configured proxy id only, so cardinality is bounded by the
+    /// proxy inventory; stale series age out with the other per-proxy counters.
+    adaptive_concurrency_decisions: [DashMap<Arc<str>, TimestampedCounter>; 3],
     /// Admin configuration mutations refused because the Admin API is in
     /// read-only mode. Counted only on real admission attempts, not on
     /// observe-only health probes.
@@ -1329,6 +1373,9 @@ impl MetricsRegistry {
             }),
             oauth2_introspection_cache_cleanup_work: AtomicU64::new(0),
             response_cache_lookups: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
+            adaptive_concurrency_decisions: std::array::from_fn(|_| {
+                DashMap::with_shard_amount(shards)
+            }),
             admin_read_only_rejected_mutations: AtomicU64::new(0),
             request_mirror_dispatched: AtomicU64::new(0),
             request_mirror_completed: AtomicU64::new(0),
@@ -2012,6 +2059,38 @@ impl MetricsRegistry {
         };
         self.response_cache_lookups[index].fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
+    }
+
+    /// Record one `adaptive_concurrency` decision for `proxy_id`. Allocates the
+    /// series key only the first time a proxy reports that decision.
+    pub fn record_adaptive_concurrency_decision(
+        &self,
+        proxy_id: &str,
+        decision: AdaptiveConcurrencyDecision,
+    ) {
+        let counters = &self.adaptive_concurrency_decisions[decision.index()];
+        if let Some(existing) = counters.get(proxy_id) {
+            existing.increment(self.epoch);
+        } else {
+            counters
+                .entry(Arc::from(proxy_id))
+                .or_insert_with(|| TimestampedCounter::new(self.epoch))
+                .increment(self.epoch);
+        }
+        self.maybe_invalidate_cache();
+    }
+
+    // Test-crate-only; dead code in the BIN target.
+    /// Current `adaptive_concurrency` decision count for one proxy.
+    #[allow(dead_code)]
+    pub fn adaptive_concurrency_decision_total(
+        &self,
+        proxy_id: &str,
+        decision: AdaptiveConcurrencyDecision,
+    ) -> u64 {
+        self.adaptive_concurrency_decisions[decision.index()]
+            .get(proxy_id)
+            .map_or(0, |counter| counter.value.load(Ordering::Relaxed))
     }
 
     /// Record one admin configuration mutation refused by read-only mode.
@@ -3473,7 +3552,10 @@ impl MetricsRegistry {
         for counters in [
             &self.request_body_bytes_counter,
             &self.response_body_bytes_counter,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.adaptive_concurrency_decisions.iter())
+        {
             counters.retain(|_, value| {
                 let keep = value.nanos_since_update(self.epoch) < ttl_nanos;
                 if !keep {
@@ -5451,6 +5533,29 @@ impl MetricsRegistry {
                     "{name}{{proxy_id=\"{}\"{}}} {}\n",
                     proxy_id, ns_label, count
                 ));
+            }
+        }
+
+        // adaptive_concurrency shed / shadow would-reject / key-cap bypass
+        // decisions. Emitted only once a decision has occurred.
+        if self
+            .adaptive_concurrency_decisions
+            .iter()
+            .any(|counters| !counters.is_empty())
+        {
+            output.push_str(
+                "# HELP ferrum_adaptive_concurrency_decisions_total adaptive_concurrency admission decisions other than an ordinary within-limit admit, by proxy and decision.\n",
+            );
+            output.push_str("# TYPE ferrum_adaptive_concurrency_decisions_total counter\n");
+            for decision in AdaptiveConcurrencyDecision::ALL {
+                let label = decision.label();
+                for entry in self.adaptive_concurrency_decisions[decision.index()].iter() {
+                    let count = entry.value().value.load(Ordering::Relaxed);
+                    let proxy_id = escape_label_value(entry.key());
+                    output.push_str(&format!(
+                        "ferrum_adaptive_concurrency_decisions_total{{proxy_id=\"{proxy_id}\",decision=\"{label}\"{ns_label}}} {count}\n"
+                    ));
+                }
             }
         }
 
