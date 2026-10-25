@@ -35914,7 +35914,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate is a conservative chars/4 heuristic, not provider tokenizer parity. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. When Redis is unavailable at terminal reconciliation, actual usage is charged locally within the existing identity cap and the reservation lifecycle is finalized, including zero-token reservations and committed streams. Successful fallback sets instance-scoped ai_ratelimit_locally_accounted=true. Local usage is not replayed to Redis. Process counters ferrum_ai_rate_limit_local_accounting_tokens_total and ferrum_ai_rate_limit_unaccounted_tokens_total expose fallback charges and capacity-limited accounting gaps. Admission remains fail closed; buffered/federated successful responses still receive 503 and committed streams retain their response."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Pre-dispatch prompt estimates walk the request JSON once, counting billable string values, visited object member names (including tool/function schema property names), and JSON scalar literals at serialized width so a present recognized field cannot suppress unknown billed text; exclusions are path/context aware (unsigned numeric output caps only at the exact paths also read for completion-budget reservation — negative/fractional values count fail-closed; multimodal URL/base64/file leaves only inside matching provider content-part family and part type — member names and unrelated textual siblings still count; wrong-family/malformed parts and ordinary strings including data: URLs in instructions/schemas always count). The estimate weights each character by its UTF-8 width (ASCII at chars/4 as before; two-byte scalars such as Cyrillic or Greek at two per token; CJK, kana, Hangul, Indic, and emoji at one token each) and adds media_token_estimate per recognized image/audio/file part; it is a reservation heuristic, not provider tokenizer parity. Only identified AI calls (or POST bodies it cannot inspect) consult the budget: GETs, framed gRPC-Web, and parsed non-LLM JSON are never refused or counted. Every uncompressed POST is classified from its bytes whatever its Content-Type label, and a body a request transform turns into an AI call is re-classified and admitted at the final request-body stage. Budget refusals (429) carry Retry-After. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported. When Redis is unavailable at terminal reconciliation, actual usage is charged locally within the existing identity cap and the reservation lifecycle is finalized, including zero-token reservations and committed streams. Successful fallback sets instance-scoped ai_ratelimit_locally_accounted=true. Local usage is not replayed to Redis. Process counters ferrum_ai_rate_limit_local_accounting_tokens_total and ferrum_ai_rate_limit_unaccounted_tokens_total expose fallback charges and capacity-limited accounting gaps. Admission remains fail closed; buffered/federated successful responses still receive 503 and committed streams retain their response."
       required: [token_limit]
       allOf:
         - if:
@@ -35924,6 +35924,15 @@ components:
                 pattern: "^[rR][eE][dD][iI][sS]$"
           then:
             required: [redis_url]
+        - if:
+            required: [consumer_limits]
+            properties:
+              consumer_limits:
+                minProperties: 1
+          then:
+            properties:
+              limit_by:
+                enum: [consumer]
       properties:
         token_limit:
           type: integer
@@ -35994,6 +36003,50 @@ components:
             committed, so reject cannot substitute a 502; it degrades to its
             fail-closed accounting half (the reservation stays charged) and logs
             the violation.
+        consumer_limits:
+          type: object
+          maxProperties: 1024
+          propertyNames:
+            minLength: 1
+            maxLength: 512
+          additionalProperties:
+            type: integer
+            format: uint64
+            minimum: 1
+            maximum: 18446744073709551615
+          description: >-
+            Per-consumer token ceilings, keyed by the exact authenticated
+            identity that limit_by=consumer keys on (requires limit_by
+            consumer). A listed consumer keeps its own window; only the ceiling
+            differs. Unlisted consumers and IP-keyed fallbacks use token_limit.
+        model_limits:
+          type: object
+          maxProperties: 1024
+          propertyNames:
+            minLength: 1
+            maxLength: 512
+          additionalProperties:
+            type: integer
+            format: uint64
+            minimum: 1
+            maximum: 18446744073709551615
+          description: >-
+            Per-model token budgets, keyed by the request body's exact top-level
+            `model`. A request for a listed model is charged against that
+            model's own window per identity, with this ceiling, and never
+            against the default window; a model budget takes precedence over
+            consumer_limits. Unlisted models use the default budget.
+        media_token_estimate:
+          type: integer
+          format: uint64
+          minimum: 0
+          maximum: 1000000
+          default: 0
+          description: >-
+            Tokens pre-reserved for each recognized image, audio, or file
+            content part (the parts whose binary payload the prompt estimate
+            excludes). 0 reserves nothing for media; reconciliation still
+            charges the provider-reported usage.
         sync_mode:
           type: string
           pattern: "^([lL][oO][cC][aA][lL]|[rR][eE][dD][iI][sS])$"
