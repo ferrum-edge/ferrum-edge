@@ -427,40 +427,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **`ai_prompt_shield` no longer forwards prompts it could not inspect, and
-  reads tool-call arguments.** In `content` / `all` mode:
-  - A JSON-labelled `POST` whose body is not UTF-8 (UTF-16 / UTF-32 with or
-    without a BOM), that the strict parser refuses (`NaN`, comments, trailing
-    commas), or whose `Content-Type` declares a non-UTF-8 `charset` is now
-    refused with `400` by `reject` / `redact` and recorded by `warn`
-    (reasons `non_utf8_body`, `malformed_json`, `unsupported_charset`). Before, it was forwarded uninspected to an upstream whose decoder
-    may read it. An `all`-mode `redact` instance no longer forwards a malformed
-    body unchanged.
-  - Every `POST`, `PUT`, and `PATCH` that is not framed gRPC is buffered
-    (`mcp_arguments` stays `POST`-only). A body with no or a non-JSON
-    `Content-Type` that may be a JSON document (strict JSON, a BOM, UTF-16 /
-    UTF-32, a JSON root scalar) is held to exactly the declared-JSON rules,
-    including the charset, size-ceiling, and unparseable-body refusals, and
-    an encoded one is decoded by the representation gate for enforcing
-    actions, so relabelling the header no longer skips the shield. Text and
-    binary uploads are left alone, but they are now buffered and held to the
-    global request-body limit.
-  - gRPC-Web framing is recognized by the proxy's own classifier rather than
-    an `application/grpc-web` prefix, so `application/grpc-webhook+json` is
-    inspected.
-  - `on_final_request_body` decides scope from the final headers, so a later
-    header rewrite (`text/plain` relabelled to `application/json`) can no
-    longer carry a request past it.
-  - Content mode scans and redacts tool-call arguments replayed in the
-    history: OpenAI `tool_calls[].function.arguments` and
-    `function_call.arguments`, Responses `function_call` items, Anthropic `tool_use` /
-    `server_tool_use` / `mcp_tool_use` `input`, and Gemini `functionCall.args`.
-  - Walking the matches of a custom pattern is work-bounded. An open-ended
-    pattern such as `.*[^A-Z]|[A-Z]` can no longer cost quadratic time in one
-    synchronous rewrite: an exhausted walk refuses redaction with `413`
-    (`redaction_budget_exceeded`) and counts as a match in detection.
-  - `before_proxy` redaction reuses the document it already parsed instead of
-    parsing the body again.
 - **BREAKING — `ai_semantic_cache` hardening from the production-launch
   review** (issue #6822). Exact keys and semantic scopes now bind the request's complete
   response-side policy provenance (RTDS gate content plus the static
