@@ -15031,7 +15031,8 @@ fn fault_injection_schema_matches_runtime_contract() {
 #[test]
 fn request_termination_schema_matches_strict_runtime_contract() {
     use ferrum_edge::plugins::request_termination::{
-        REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
+        REQUEST_TERMINATION_CONFIG_KEYS, REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES,
+        REQUEST_TERMINATION_MAX_HEADERS, REQUEST_TERMINATION_TRIGGER_KEYS, RequestTermination,
     };
 
     let spec: serde_json::Value =
@@ -15053,6 +15054,14 @@ fn request_termination_schema_matches_strict_runtime_contract() {
 
     assert_eq!(schema["properties"]["status_code"]["minimum"], 200);
     assert_eq!(schema["properties"]["status_code"]["maximum"], 599);
+    assert_eq!(
+        schema["properties"]["headers"]["maxProperties"],
+        json!(REQUEST_TERMINATION_MAX_HEADERS)
+    );
+    assert_eq!(
+        schema["properties"]["headers"]["additionalProperties"]["maxLength"],
+        json!(REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES)
+    );
     assert!(
         schema["properties"]["body"].get("default").is_none(),
         "body must not default to empty string — omission and \"\" differ at runtime"
@@ -15152,6 +15161,21 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         }),
         json!({"trigger": {"path_prefix": "*"}}),
         json!({"trigger": {"path_prefix": "/"}}),
+        // Literal `{`, `}`, and UTF-8 are admitted by the request-target parser.
+        json!({"trigger": {"path_prefix": "/users/{id}"}}),
+        json!({"trigger": {"path_prefix": "/caf\u{e9}"}}),
+        json!({"trigger": {"header": "x-maintenance", "header_value": " padded "}}),
+        json!({"trigger": {"header": "x-maintenance", "header_value": "caf\u{e9}"}}),
+        json!({"content_type": " text/plain\t"}),
+        json!({
+            "status_code": 503,
+            "headers": {
+                "Retry-After": "120",
+                "cache-control": "no-store",
+                "x-maintenance-window": "02:00-03:00 UTC",
+                "x-empty": ""
+            }
+        }),
         json!({
             "content_type": "application/xml",
             "body": "<ok/>",
@@ -15197,11 +15221,64 @@ fn request_termination_schema_matches_strict_runtime_contract() {
         json!({"unknown": true}),
         json!({"status_code": 204, "body": "x"}),
         json!({"content_type": "application/xml", "message": "\u{0001}"}),
+        // Runtime and schema share one alphabet (request_termination-CLAUDE-3).
+        json!({"content_type": "text/pl\u{e4}in"}),
+        json!({"content_type": "\ntext/plain"}),
+        json!({"trigger": {"path_prefix": "/a\u{0085}b"}}),
+        // Bytes the request-target parser refuses (request_termination-CLAUDE-2).
+        json!({"trigger": {"path_prefix": "/a<b"}}),
+        json!({"trigger": {"path_prefix": "/a>b"}}),
+        json!({"trigger": {"path_prefix": "/a`b"}}),
+        // Unreachable or whitespace-only header values (request_termination-CLAUDE-1).
+        json!({"trigger": {"header": "x-policy", "header_value": "true\n"}}),
+        json!({"trigger": {"header": "x-policy", "header_value": "x\u{0001}"}}),
+        json!({"trigger": {"header": "x-policy", "header_value": "  "}}),
+        // Configured response headers (request_termination-CLAUDE-5).
+        json!({"headers": null}),
+        json!({"headers": []}),
+        json!({"headers": {"bad name": "1"}}),
+        json!({"headers": {"Content-Length": "1"}}),
+        json!({"headers": {"transfer-encoding": "chunked"}}),
+        json!({"headers": {"content-type": "text/plain"}}),
+        json!({"headers": {"Set-Cookie": "a=b"}}),
+        json!({"headers": {"www-authenticate": "Bearer"}}),
+        json!({"headers": {"grpc-status": "0"}}),
+        json!({"headers": {"X-Ferrum-Diagnostic-Ref": "x"}}),
+        json!({"headers": {"x-gateway-error": "x"}}),
+        json!({"headers": {"retry-after": 120}}),
+        json!({"headers": {"x-a": " 1"}}),
+        json!({"headers": {"x-a": "1\t"}}),
+        json!({"headers": {"x-a": "caf\u{e9}"}}),
+        json!({"headers": {"x-a": "a\r\nx-b: b"}}),
     ] {
         assert_component_validity(&spec, "RequestTerminationConfig", &invalid, false);
         assert!(
             RequestTermination::new(&invalid).is_err(),
             "schema-invalid config unexpectedly passed runtime: {invalid}"
+        );
+    }
+
+    let header_bounds = |count: usize, value_len: usize| {
+        let map: serde_json::Map<String, serde_json::Value> = (0..count)
+            .map(|i| (format!("x-h{i}"), json!("v".repeat(value_len))))
+            .collect();
+        json!({ "headers": map })
+    };
+    let at_limit = header_bounds(
+        REQUEST_TERMINATION_MAX_HEADERS,
+        REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES,
+    );
+    assert_component_validity(&spec, "RequestTerminationConfig", &at_limit, true);
+    RequestTermination::new(&at_limit)
+        .unwrap_or_else(|error| panic!("headers at both limits failed runtime: {error}"));
+    for over_limit in [
+        header_bounds(REQUEST_TERMINATION_MAX_HEADERS + 1, 1),
+        header_bounds(1, REQUEST_TERMINATION_MAX_HEADER_VALUE_BYTES + 1),
+    ] {
+        assert_component_validity(&spec, "RequestTerminationConfig", &over_limit, false);
+        assert!(
+            RequestTermination::new(&over_limit).is_err(),
+            "over-limit headers unexpectedly passed runtime"
         );
     }
 
@@ -15219,6 +15296,18 @@ fn request_termination_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("trailers-only"));
     assert!(guide.contains("INTERNAL"));
     assert!(guide.contains("query delimiter"));
+    // request_termination-CLAUDE-4: the pre-authentication phase is documented
+    // with the post-auth alternative on both surfaces.
+    assert!(guide.contains("before authentication"));
+    assert!(guide.contains("use `response_mock`"));
+    let schema_desc = schema["description"].as_str().unwrap_or_default();
+    assert!(
+        schema_desc.contains("before authentication"),
+        "{schema_desc}"
+    );
+    assert!(schema_desc.contains("`response_mock`"), "{schema_desc}");
+    assert!(guide.contains("RFC 9110 field value"));
+    assert!(guide.contains("`Retry-After`"));
 }
 
 #[test]
