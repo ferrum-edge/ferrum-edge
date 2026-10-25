@@ -1031,6 +1031,23 @@ fn consumer_credential_surface_schemas_match_runtime_redaction() {
             false,
         );
     }
+    // Like HMAC secrets, a Consumer JWT secret needs 32 non-whitespace
+    // characters; padding does not count (jwt_auth-CLAUDE-2).
+    for padded in [
+        " ".repeat(32),
+        format!("a{}", " ".repeat(31)),
+        format!("{}{}", "j".repeat(31), " ".repeat(64)),
+    ] {
+        let padded_runtime_jwt: Consumer = serde_json::from_value(json!({
+            "username": "alice",
+            "credentials": {"jwt": [{"secret": padded}]}
+        }))
+        .expect("padded JWT Consumer deserializes");
+        assert!(padded_runtime_jwt.validate_fields().is_err());
+        for component in ["JwtCredential", "JwtCredentialBackup"] {
+            assert_component_validity(&spec, component, &json!({"secret": padded}), false);
+        }
+    }
     for component in ["HmacAuthCredential", "HmacAuthCredentialBackup"] {
         assert_component_validity(
             &spec,
@@ -17288,6 +17305,10 @@ fn jwt_auth_schema_matches_runtime_admission() {
         json!({"audiences": ["payments-api"]}),
         json!({"leeway_secs": 300}),
         json!({"require_exp": false, "require_nbf": true}),
+        json!({"algorithm": "HS256"}),
+        json!({"algorithm": "HS384"}),
+        json!({"algorithm": "HS512", "hide_credentials": true}),
+        json!({"token_lookup": "query:token", "hide_credentials": false}),
     ];
     for config in &accepted {
         assert_component_validity(&spec, "JwtAuthConfig", config, true);
@@ -17312,6 +17333,11 @@ fn jwt_auth_schema_matches_runtime_admission() {
         json!({"leeway_secs": -1}),
         json!({"leeway_secs": 301}),
         json!({"audience": ["payments-api"]}),
+        json!({"algorithm": "RS256"}),
+        json!({"algorithm": "hs256"}),
+        json!({"algorithm": "none"}),
+        json!({"algorithm": ["HS256"]}),
+        json!({"hide_credentials": "yes"}),
     ];
     for config in &rejected {
         assert_component_validity(&spec, "JwtAuthConfig", config, false);

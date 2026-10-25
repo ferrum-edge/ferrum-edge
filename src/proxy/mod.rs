@@ -14027,6 +14027,11 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Config reload: {}", message);
         }
+        // Same boundary for Consumer `jwt` secrets: weak, malformed, or
+        // cross-Consumer shared JWT secrets never reach the ConsumerIndex.
+        for message in new_config.quarantine_invalid_jwt_credentials() {
+            error!("Config reload: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -14869,6 +14874,12 @@ impl ProxyState {
         for message in new_config.quarantine_invalid_hmac_credentials() {
             error!("Incremental config: {}", message);
         }
+        // Consumer `jwt` secrets get the same fail-closed treatment on the
+        // patched snapshot, so a delta that introduces a shared secret strips
+        // it from every Consumer holding it, not only the delta's rows.
+        for message in new_config.quarantine_invalid_jwt_credentials() {
+            error!("Incremental config: {}", message);
+        }
         inject_gateway_workload_metrics_if_svid(
             &mut new_config,
             &self.gateway_svid_bundle,
@@ -15243,7 +15254,7 @@ impl ProxyState {
     /// [`Self::current_config`].
     ///
     /// `update_config` normalizes fields, resolves upstream TLS, quarantines
-    /// invalid HMAC credentials, and injects gateway workload-metrics identity
+    /// invalid HMAC and JWT credentials, and injects gateway workload-metrics identity
     /// **before** storing the snapshot. A raw CP-delivered candidate has not
     /// been through those node-local steps, so comparing it directly against
     /// the applied config reports a spurious mismatch on any node whose
@@ -15265,6 +15276,7 @@ impl ProxyState {
         candidate.normalize_fields();
         candidate.resolve_upstream_tls();
         let _ = candidate.quarantine_invalid_hmac_credentials();
+        let _ = candidate.quarantine_invalid_jwt_credentials();
         inject_gateway_workload_metrics_if_svid(
             &mut candidate,
             &self.gateway_svid_bundle,

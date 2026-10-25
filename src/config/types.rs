@@ -311,11 +311,20 @@ pub(crate) const SUPPORTED_GEO_COUNTRY_CODES: &[u8] = concat!(
 )
 .as_bytes();
 
-/// Effective strength of an hmac_auth secret: whitespace does not count
-/// toward [`MIN_HMAC_SECRET_LENGTH`]. Shared by admission-time field
-/// validation and the full-load quarantine so the two policies cannot drift.
+/// Effective strength of an hmac_auth secret, a Consumer `jwt` secret, or a
+/// keyauth key: whitespace does not count toward the type's minimum. Shared
+/// by admission-time field validation, the full-load quarantines, and the
+/// `jwt_auth` verifier so the policies cannot drift.
 pub(crate) fn hmac_secret_strength(secret: &str) -> usize {
     secret.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+
+/// Whether a Consumer `jwt` secret carries at least [`MIN_JWT_SECRET_LENGTH`]
+/// non-whitespace characters. The single predicate behind JWT credential
+/// admission, the full-load/swap quarantine, and the `jwt_auth` verifier's
+/// refusal to sign-check against a weaker stored key.
+pub(crate) fn jwt_secret_meets_minimum_strength(secret: &str) -> bool {
+    hmac_secret_strength(secret) >= MIN_JWT_SECRET_LENGTH
 }
 /// Minimum byte length for the server-side Basic-auth HMAC secret.
 pub const MIN_BASIC_AUTH_HMAC_SECRET_LENGTH: usize = 32;
@@ -5024,6 +5033,178 @@ impl GatewayConfig {
         messages
     }
 
+    /// Cross-Consumer `jwt` secret collisions within each namespace, as
+    /// `(consumer id, conflicting consumer id, namespace)` triples, each pair
+    /// reported once.
+    ///
+    /// `jwt_auth` selects the verifying Consumer from the token's unverified,
+    /// signer-chosen identity claim, so anyone who can sign with a secret two
+    /// Consumers share can sign as either of them. Reuse across namespaces and
+    /// within one Consumer (rotation entries sharing a secret) is allowed.
+    fn jwt_credential_collisions(&self) -> Vec<(&str, &str, &str)> {
+        let mut owners: HashMap<(&str, &str), &str> = HashMap::new();
+        let mut collisions: Vec<(&str, &str, &str)> = Vec::new();
+
+        for consumer in &self.consumers {
+            let namespace = consumer.namespace.as_str();
+            let id = consumer.id.as_str();
+            for entry in consumer.credential_entries("jwt") {
+                let Some(secret) = entry.get("secret").and_then(|s| s.as_str()) else {
+                    continue;
+                };
+                match owners.entry((namespace, secret)) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(id);
+                    }
+                    std::collections::hash_map::Entry::Occupied(slot) => {
+                        let owner = *slot.get();
+                        let collision = (id, owner, namespace);
+                        if owner != id && !collisions.contains(&collision) {
+                            collisions.push(collision);
+                        }
+                    }
+                }
+            }
+        }
+
+        collisions
+    }
+
+    /// Error text for one cross-Consumer JWT secret collision. Names only
+    /// consumer ids and the namespace, never the secret.
+    fn jwt_collision_message(consumer_id: &str, other_id: &str, namespace: &str) -> String {
+        format!(
+            "Duplicate jwt secret in consumer {:?} (conflicts with consumer {:?} in namespace {:?}); \
+             each Consumer needs its own JWT signing secret",
+            consumer_id, other_id, namespace
+        )
+    }
+
+    fn jwt_credential_uniqueness_errors(&self) -> Vec<String> {
+        self.jwt_credential_collisions()
+            .into_iter()
+            .map(|(id, other, namespace)| Self::jwt_collision_message(id, other, namespace))
+            .collect()
+    }
+
+    /// Validate only the cross-Consumer `jwt` secret constraint.
+    pub fn validate_unique_jwt_credentials(&self) -> Result<(), Vec<String>> {
+        let duplicates = self.jwt_credential_uniqueness_errors();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Validate the cross-Consumer `jwt` secret constraint for collisions that
+    /// involve one of `consumer_ids`. Admin candidate checks use this narrower
+    /// surface so a pre-existing duplicate between two other Consumers (which
+    /// the full-load quarantine already strips) does not block an unrelated
+    /// write or the repair of one side.
+    pub fn validate_unique_jwt_credentials_for_consumers(
+        &self,
+        consumer_ids: &[&str],
+    ) -> Result<(), Vec<String>> {
+        let duplicates: Vec<String> = self
+            .jwt_credential_collisions()
+            .into_iter()
+            .filter(|collision| {
+                consumer_ids.contains(&collision.0) || consumer_ids.contains(&collision.1)
+            })
+            .map(|(id, other, namespace)| Self::jwt_collision_message(id, other, namespace))
+            .collect();
+
+        if duplicates.is_empty() {
+            Ok(())
+        } else {
+            Err(duplicates)
+        }
+    }
+
+    /// Fail-closed handling of Consumer `jwt` credential policy at full-load
+    /// and runtime-swap time.
+    ///
+    /// Strips the `jwt` credential from every consumer whose stored value is
+    /// not a non-empty array of objects each carrying a string `secret` with
+    /// at least [`MIN_JWT_SECRET_LENGTH`] non-whitespace characters, and then
+    /// from EVERY consumer whose secret is shared with another consumer in the
+    /// same namespace. Unlike [`Self::quarantine_invalid_hmac_credentials`]
+    /// there is no first-loaded winner: whoever holds a shared JWT secret can
+    /// sign a token naming any Consumer that accepts it, so no holder of the
+    /// shared value is a trustworthy owner. The same secret may be reused in a
+    /// different namespace. Extra legacy fields beside `secret` (for example
+    /// a historical `algorithm: HS256` selector) are left to admission-time
+    /// validation; the verifier only ever reads `secret`.
+    ///
+    /// Admin write-time validation rejects NEW violations; this guard covers
+    /// pre-existing and out-of-band rows and snapshots from sources that
+    /// bypass the SQL/Mongo loaders. A stripped credential fails closed: the
+    /// `jwt_auth` plugin returns 401 for a consumer with no `jwt` entries.
+    /// Returns one human-readable message per quarantined credential (never
+    /// containing the secret); callers log these at `error!` severity.
+    pub fn quarantine_invalid_jwt_credentials(&mut self) -> Vec<String> {
+        let mut messages = Vec::new();
+
+        for consumer in &mut self.consumers {
+            let Some(value) = consumer.credentials.get("jwt") else {
+                continue;
+            };
+            let admissible = match value.as_array() {
+                Some(entries) if !entries.is_empty() => entries.iter().all(|entry| {
+                    entry
+                        .as_object()
+                        .and_then(|obj| obj.get("secret"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(jwt_secret_meets_minimum_strength)
+                }),
+                _ => false,
+            };
+            if !admissible {
+                consumer.credentials.remove("jwt");
+                messages.push(format!(
+                    "Quarantined jwt credential of consumer {:?}: a stored entry is \
+                     malformed or its secret has fewer than {} non-whitespace characters \
+                     — the credential is excluded from this config load so the weak \
+                     secret cannot authenticate. Repair the stored credential to restore it.",
+                    consumer.id, MIN_JWT_SECRET_LENGTH
+                ));
+            }
+        }
+
+        let mut affected: HashMap<(String, String), String> = HashMap::new();
+        for (id, other, namespace) in self.jwt_credential_collisions() {
+            affected
+                .entry((namespace.to_string(), id.to_string()))
+                .or_insert_with(|| other.to_string());
+            affected
+                .entry((namespace.to_string(), other.to_string()))
+                .or_insert_with(|| id.to_string());
+        }
+        if affected.is_empty() {
+            return messages;
+        }
+
+        for consumer in &mut self.consumers {
+            let key = (consumer.namespace.clone(), consumer.id.clone());
+            if let Some(other_id) = affected.get(&key)
+                && consumer.credentials.remove("jwt").is_some()
+            {
+                messages.push(format!(
+                    "Quarantined jwt credential of consumer {:?}: one of its secrets is also \
+                     configured on consumer {:?} in namespace {:?} — whoever holds a shared \
+                     secret can sign tokens as either Consumer, so the credential is excluded \
+                     from this config load on every Consumer that shares it. Rotate the shared \
+                     secret to restore it.",
+                    consumer.id, other_id, consumer.namespace
+                ));
+            }
+        }
+
+        messages
+    }
+
     /// Reject a runtime snapshot in which one keyauth key, basicauth username,
     /// or exact mTLS identity belongs to two Consumers of the same namespace
     /// (issue #6572).
@@ -5108,8 +5289,8 @@ impl GatewayConfig {
 
     /// Validate that consumer credentials are unique across all consumers.
     ///
-    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets, and
-    /// mTLS identities.
+    /// Checks keyauth API keys, basicauth usernames, HMAC shared secrets,
+    /// Consumer JWT secrets (per namespace), and mTLS identities.
     /// mTLS identities are exact by default and additionally ASCII-case-folded
     /// when an effective `san_dns` mTLS policy can consume the DNS lookup index.
     /// If two consumers share the same credential, the ConsumerIndex silently
@@ -5145,6 +5326,7 @@ impl GatewayConfig {
         }
 
         duplicates.extend(self.hmac_credential_uniqueness_errors());
+        duplicates.extend(self.jwt_credential_uniqueness_errors());
         duplicates.extend(self.mtls_credential_uniqueness_errors());
 
         if duplicates.is_empty() {
@@ -9212,15 +9394,17 @@ impl Consumer {
                         ));
                     }
                     match obj.get("secret") {
-                        Some(serde_json::Value::String(secret))
-                            if secret.chars().count() >= MIN_JWT_SECRET_LENGTH => {}
                         Some(serde_json::Value::String(secret)) => {
-                            errors.push(format!(
-                                "{}.secret must be at least {} characters (got {})",
-                                prefix,
-                                MIN_JWT_SECRET_LENGTH,
-                                secret.chars().count()
-                            ));
+                            // Whitespace does not count toward the floor, the
+                            // same rule as hmac_auth secrets: an HS256 key is
+                            // brute-forceable offline from one captured token.
+                            let strength = hmac_secret_strength(secret);
+                            if strength < MIN_JWT_SECRET_LENGTH {
+                                errors.push(format!(
+                                    "{}.secret must be at least {} non-whitespace characters (got {})",
+                                    prefix, MIN_JWT_SECRET_LENGTH, strength
+                                ));
+                            }
                         }
                         Some(_) => errors.push(format!("{}.secret must be a string", prefix)),
                         None => {}

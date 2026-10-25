@@ -10089,8 +10089,20 @@ mod inner {
                     crate::startup::sanitize_startup_cause(message, &[])
                 );
             }
-            let consumer_quarantine_active =
-                !identity_quarantined.is_empty() || !hmac_quarantined.is_empty();
+            // Fail-closed Consumer `jwt` secret policy, parity with the SQL
+            // loader: strip weak, malformed, or cross-Consumer shared JWT
+            // secrets (on every Consumer sharing one) before this snapshot
+            // can publish or broadcast.
+            let jwt_quarantined = config.quarantine_invalid_jwt_credentials();
+            for message in &jwt_quarantined {
+                error!(
+                    "MongoDB config: {}",
+                    crate::startup::sanitize_startup_cause(message, &[])
+                );
+            }
+            let consumer_quarantine_active = !identity_quarantined.is_empty()
+                || !hmac_quarantined.is_empty()
+                || !jwt_quarantined.is_empty();
 
             // Serving-mode repairability (issue #4526), parity with the SQL
             // loader: quarantine stored plugin rows the shared construction

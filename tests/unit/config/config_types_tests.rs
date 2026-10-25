@@ -1863,6 +1863,226 @@ fn test_quarantine_hmac_duplicate_secret_first_loaded_consumer_wins() {
     assert!(!config.consumers[1].has_credential("hmac_auth"));
 }
 
+// ---- Consumer JWT secret policy (jwt_auth-SOL-1 / SOL-2 / CLAUDE-2) ----
+
+fn jwt_consumer(id: &str, username: &str, secrets: &[&str]) -> Consumer {
+    let mut consumer = make_consumer(id, username);
+    let entries: Vec<serde_json::Value> = secrets
+        .iter()
+        .map(|secret| serde_json::json!({"secret": secret}))
+        .collect();
+    consumer
+        .credentials
+        .insert("jwt".into(), serde_json::Value::Array(entries));
+    consumer
+}
+
+#[test]
+fn test_unique_consumer_credentials_rejects_jwt_secret_shared_across_consumers() {
+    let secret = "shared-jwt-secret-at-least-32-characters";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[secret]),
+        jwt_consumer("eve", "eve", &[secret]),
+    ];
+
+    let errors = config.validate_unique_consumer_credentials().unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("Duplicate jwt secret"));
+    assert!(errors[0].contains("\"eve\"") && errors[0].contains("\"alice\""));
+    assert!(
+        !errors[0].contains(secret),
+        "the secret must never be echoed"
+    );
+    assert!(config.validate_unique_jwt_credentials().is_err());
+}
+
+#[test]
+fn test_unique_jwt_credentials_rejects_collision_introduced_by_a_rotation_entry() {
+    let alice_secret = "alice-jwt-secret-at-least-32-characters";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[alice_secret]),
+        jwt_consumer(
+            "eve",
+            "eve",
+            &["eve-own-jwt-secret-at-least-32-characters", alice_secret],
+        ),
+    ];
+
+    assert!(config.validate_unique_jwt_credentials().is_err());
+    assert!(config.validate_unique_consumer_credentials().is_err());
+}
+
+#[test]
+fn test_unique_jwt_credentials_allow_same_consumer_rotation_and_other_namespaces() {
+    let secret = "reusable-jwt-secret-at-least-32-characters";
+    let mut tenant_a = jwt_consumer("alice", "alice", &[secret, secret]);
+    tenant_a.namespace = "tenant-a".to_string();
+    let mut tenant_b = jwt_consumer("bob", "bob", &[secret]);
+    tenant_b.namespace = "tenant-b".to_string();
+    let mut config = empty_config();
+    config.consumers = vec![tenant_a, tenant_b];
+
+    assert!(config.validate_unique_jwt_credentials().is_ok());
+    assert!(config.validate_unique_consumer_credentials().is_ok());
+    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("jwt"))
+    );
+}
+
+#[test]
+fn test_unique_jwt_credentials_for_consumers_reports_only_involved_collisions() {
+    let legacy = "legacy-shared-jwt-secret-at-least-32-chars";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[legacy]),
+        jwt_consumer("eve", "eve", &[legacy]),
+        jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+    ];
+
+    // A pre-existing duplicate between two other Consumers does not block a
+    // write to an unrelated Consumer...
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["bob"])
+            .is_ok()
+    );
+    // ...but a write to either side of the duplicate is refused.
+    let errors = config
+        .validate_unique_jwt_credentials_for_consumers(&["eve"])
+        .unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert!(!errors[0].contains(legacy));
+    assert!(
+        config
+            .validate_unique_jwt_credentials_for_consumers(&["alice"])
+            .is_err()
+    );
+}
+
+#[test]
+fn test_quarantine_jwt_strips_shared_secret_from_every_holder() {
+    let secret = "shared-jwt-secret-at-least-32-characters";
+    let mut config = empty_config();
+    config.consumers = vec![
+        jwt_consumer("alice", "alice", &[secret]),
+        jwt_consumer("bob", "bob", &["bob-own-jwt-secret-at-least-32-characters"]),
+        jwt_consumer(
+            "eve",
+            "eve",
+            &["eve-own-jwt-secret-at-least-32-characters", secret],
+        ),
+        jwt_consumer("mallory", "mallory", &[secret]),
+    ];
+
+    let messages = config.quarantine_invalid_jwt_credentials();
+    assert_eq!(messages.len(), 3, "{messages:?}");
+    assert!(messages.iter().all(|message| !message.contains(secret)));
+    let holders: Vec<(&str, bool)> = config
+        .consumers
+        .iter()
+        .map(|consumer| (consumer.id.as_str(), consumer.has_credential("jwt")))
+        .collect();
+    // No first-loaded winner: every holder of the shared secret loses it,
+    // and the Consumer with its own secret is untouched.
+    assert_eq!(
+        holders,
+        vec![
+            ("alice", false),
+            ("bob", true),
+            ("eve", false),
+            ("mallory", false)
+        ]
+    );
+    assert!(config.validate_unique_jwt_credentials().is_ok());
+}
+
+#[test]
+fn test_quarantine_jwt_strips_weak_or_malformed_credentials() {
+    let shapes = [
+        serde_json::json!([{"secret": "test-jwt-secret"}]),
+        serde_json::json!([{"secret": " ".repeat(32)}]),
+        serde_json::json!([{"secret": format!("a{}", " ".repeat(31))}]),
+        serde_json::json!([{"secret": format!("{}x", "\t".repeat(31))}]),
+        serde_json::json!([
+            {"secret": "strong-jwt-secret-at-least-32-characters"},
+            {"secret": "weak"}
+        ]),
+        serde_json::json!([{"secret": 12345}]),
+        serde_json::json!([{"no_secret": true}]),
+        serde_json::json!(["not-an-object"]),
+        serde_json::json!([]),
+        serde_json::json!({"secret": "not-an-array-secret-at-least-32-chars!"}),
+    ];
+    for shape in shapes {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer.credentials.insert("jwt".into(), shape.clone());
+        let mut config = empty_config();
+        config.consumers = vec![consumer];
+
+        let messages = config.quarantine_invalid_jwt_credentials();
+        assert_eq!(messages.len(), 1, "shape not quarantined: {shape}");
+        assert!(!messages[0].contains("test-jwt-secret"));
+        assert!(!config.consumers[0].credentials.contains_key("jwt"));
+    }
+}
+
+#[test]
+fn test_quarantine_jwt_keeps_strong_secrets_and_legacy_selector_fields() {
+    // The verifier only reads `secret`, so a historical `algorithm: HS256`
+    // selector on an otherwise strong stored entry is left to admission
+    // validation rather than stripped at load.
+    let mut legacy = make_consumer("legacy", "legacy");
+    legacy.credentials.insert(
+        "jwt".into(),
+        serde_json::json!([{
+            "secret": "legacy-jwt-secret-at-least-32-characters",
+            "algorithm": "HS256"
+        }]),
+    );
+    let strong_secret = format!("{}\t\n\r", "j".repeat(32));
+    let mut config = empty_config();
+    config.consumers = vec![
+        legacy,
+        jwt_consumer("strong", "strong", &[strong_secret.as_str()]),
+    ];
+
+    assert!(config.quarantine_invalid_jwt_credentials().is_empty());
+    assert!(
+        config
+            .consumers
+            .iter()
+            .all(|consumer| consumer.has_credential("jwt"))
+    );
+}
+
+#[test]
+fn test_validate_fields_rejects_whitespace_padded_jwt_secrets() {
+    for secret in [
+        " ".repeat(32),
+        format!("a{}", " ".repeat(31)),
+        format!("{}x", "\t".repeat(31)),
+        format!("{}{}", "j".repeat(31), "\n".repeat(64)),
+    ] {
+        let mut consumer = make_consumer("c1", "alice");
+        consumer
+            .credentials
+            .insert("jwt".into(), serde_json::json!([{"secret": secret}]));
+        let errors = consumer.validate_fields().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must be at least 32 non-whitespace characters")),
+            "{errors:?}"
+        );
+    }
+}
+
 #[test]
 fn test_unique_consumer_credentials_no_keyauth_ok() {
     // Consumers without keyauth credentials should not conflict
@@ -2495,7 +2715,7 @@ fn test_validate_fields_rejects_short_jwt_secret() {
     let err = c.validate_fields().unwrap_err();
     assert!(
         err.iter()
-            .any(|e| e.contains("must be at least 32 characters"))
+            .any(|e| e.contains("must be at least 32 non-whitespace characters"))
     );
 }
 
@@ -2644,7 +2864,7 @@ fn test_validate_fields_rejects_short_jwt_secret_in_array() {
     let err = c.validate_fields().unwrap_err();
     assert_eq!(
         err.iter()
-            .filter(|e| e.contains("must be at least 32 characters"))
+            .filter(|e| e.contains("must be at least 32 non-whitespace characters"))
             .count(),
         2
     );

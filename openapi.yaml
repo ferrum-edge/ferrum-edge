@@ -12242,17 +12242,25 @@ components:
           type: string
           minLength: 32
           maxLength: 4096
-          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
+          allOf:
+            - pattern: '^(?:[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]){32}'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           writeOnly: true
           description: >-
-            JWT signing secret used to verify token signatures (HS256) for this
-            consumer. Must be 32-4096 characters and must not contain ASCII
-            control bytes other than horizontal tab, line feed, and carriage
-            return.
+            JWT signing secret used to verify token signatures (with the HMAC
+            algorithm the `jwt_auth` instance pins, HS256 by default) for this
+            consumer. Must contain 32-4096 characters, at least 32 of which
+            are non-whitespace, and must not contain ASCII control bytes other
+            than horizontal tab, line feed, and carriage return. Writes that
+            configure it on a different Consumer within one namespace are
+            refused: the token's signer chooses the identity claim, so a
+            shared secret lets either Consumer sign as the other. Separate
+            namespaces may reuse the same secret.
       description: >-
         JWT credential for the `jwt_auth` plugin. The only supported Consumer
-        JWT key form is exactly one HS256 `secret`; algorithm selectors,
-        public keys, and JWKS fields are not Consumer credential fields. Use
+        JWT key form is exactly one HMAC `secret`; algorithm selectors,
+        public keys, and JWKS fields are not Consumer credential fields (the
+        HMAC algorithm is the `jwt_auth` plugin's `algorithm` setting). Use
         the separate `jwks_auth` plugin configuration for RSA/EC/JWKS token
         verification. Consumer is looked up by `username`, `id`, or
         `custom_id` from the JWT claim; then all secrets are tried until one
@@ -12436,12 +12444,14 @@ components:
           type: string
           minLength: 32
           maxLength: 4096
-          pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
+          allOf:
+            - pattern: '^(?:[\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]){32}'
+            - pattern: '^[^\x00-\x08\x0B\x0C\x0E-\x1F]*$'
           description: >-
-            Canonical stored HS256 JWT secret (32-4096 characters), carried
-            unredacted in backup and restore payloads. It must not contain
-            ASCII control bytes other than horizontal tab, line feed, and
-            carriage return.
+            Canonical stored HMAC JWT secret (32-4096 characters, including at
+            least 32 non-whitespace characters), carried unredacted in backup
+            and restore payloads. It must not contain ASCII control bytes other
+            than horizontal tab, line feed, and carriage return.
       description: >-
         `jwt` entry in backup/restore payloads: the canonical unredacted
         stored HS256 secret. Public-key and JWKS key forms belong to the
@@ -24707,7 +24717,7 @@ components:
 
     JwtAuthConfig:
       type: object
-      description: "Plugin: jwt_auth — HS256 JWT Bearer token authentication."
+      description: "Plugin: jwt_auth — HMAC (HS256/HS384/HS512) JWT Bearer token authentication."
       additionalProperties: false
       not:
         required: [expected_issuer, expected_issuers]
@@ -24779,6 +24789,24 @@ components:
           minimum: 0
           maximum: 300
           description: Clock leeway for time-based JWT claims
+        algorithm:
+          type: string
+          enum: [HS256, HS384, HS512]
+          default: HS256
+          description: >-
+            HMAC algorithm every token on this instance must use. Pinned by
+            configuration and never taken from the token header: a token whose
+            header names any other algorithm is rejected. RSA/EC/JWKS
+            verification belongs to `jwks_auth`.
+        hide_credentials:
+          type: boolean
+          default: false
+          description: >-
+            Remove the token-bearing header (for `header:Authorization`, only a
+            `Bearer` value) or query parameter before forwarding an
+            authenticated request upstream, including when another mechanism
+            wins a multi-auth chain. Defaults to false so backends that
+            re-verify the JWT keep receiving it.
 
     KeyAuthConfig:
       type: object
