@@ -36236,7 +36236,7 @@ components:
           type: string
           enum: [reject, redact, warn]
           default: reject
-          description: "Action when a violation is detected in the response body. Buffered SSE is parsed and redacted by complete event; content spanning events that cannot be safely rewritten is rejected. Live SSE requests are never re-buffered by this plugin."
+          description: "Action when a violation is detected in the response body. Content rules govern successful (2xx) responses; max_scan_bytes applies to every buffered status, and a redact transform may still rewrite a buffered non-2xx body it can parse. warn records ai_response_guard_* metadata and never adds a response header. Buffered SSE is parsed and redacted by complete event; content spanning events that cannot be safely rewritten is rejected. Live SSE requests are never re-buffered by this plugin. A governed JSON body, SSE data payload, or serialized tool-arguments document with duplicate object members is uninspectable (reject/redact answer 502; warn records ambiguous_json_document) whenever a detection, required_fields, or max_completion_length rule is active."
         pii_patterns:
           type: array
           uniqueItems: true
@@ -36245,7 +36245,7 @@ components:
             type: string
             enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
           default: []
-          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban). Each name at most once."
+          description: "Built-in PII pattern names to scan for (e.g., ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban). Each name at most once. credit_card covers Visa, Mastercard (including the 2221-2720 2-series), Discover, UnionPay, JCB, American Express (contiguous, 4-6-5, or 4-4-4-3), and Diners Club numbers and is confirmed with a Luhn checksum; api_key covers multi-segment sk-proj-/sk-ant-api03- style keys plus GitHub, Google, and Slack token formats; ip_address covers IPv4 (octets 0-255) and IPv6 (full, or ::-compressed with at least three groups); iban accepts compact or space-grouped IBANs with a registry country code."
         custom_pii_patterns:
           type: array
           maxItems: 256
@@ -36328,6 +36328,30 @@ components:
           minimum: 0
           default: 0
           description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
+        allowlist:
+          type: object
+          additionalProperties: false
+          description: "Exceptions for PII findings (pii_patterns and custom_pii_patterns only; blocked_phrases and blocked_patterns are never excused). Compared against the complete matched text, identically for detection, redaction (an allowed match is left verbatim), and residual re-scans."
+          properties:
+            values:
+              type: array
+              maxItems: 1024
+              items:
+                type: string
+                minLength: 1
+                maxLength: 1024
+                description: "Exact matched text that is not a finding. The runtime bound is 1024 UTF-8 bytes, so a multi-byte value within 1024 characters can still be refused."
+              default: []
+              description: "Exact values never reported as PII, e.g. a public support address. At most 1024 entries."
+            patterns:
+              type: array
+              maxItems: 256
+              items:
+                type: string
+                minLength: 1
+                description: "Regular expression anchored by the runtime as ^(?:pattern)$, so it must match the entire matched text. Must compile on its own."
+              default: []
+              description: "Whole-match regexes for values never reported as PII, e.g. an order-number family. At most 256 entries."
         grpc:
           type: object
           additionalProperties: false

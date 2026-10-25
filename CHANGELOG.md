@@ -361,6 +361,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **`ai_response_guard` refuses duplicate-member JSON, governs gRPC methods
+  behind prefix stripping without `grpc_method_router`, and the shared AI PII
+  catalog recognizes modern card and key formats.** A governed JSON response,
+  finite SSE `data:` payload, or tool `arguments` document with duplicate
+  object members (an overwritten `\u0040`-escaped email reached the client
+  past `reject` and `redact`) is now uninspectable: enforcing actions answer
+  502 with `ambiguous_json_document`, `warn` records it. A `grpc`-enrolled
+  guard joins the backend-path boundary and enrolls on the backend-effective
+  method. `require_json` / `required_fields` now refuse an empty synthetic
+  `200`; native-gRPC redaction no longer rejects its own placeholders; content
+  mode covers Anthropic `thinking`, Bedrock Converse `toolUse` /
+  `reasoningContent`, Responses reasoning summaries, and chat
+  `reasoning_content` / `reasoning`; guard metadata keys are unions across
+  instances; a new `allowlist` (exact values / whole-match patterns) excuses
+  PII false positives; and the final phase skips re-scanning a representation
+  phase 9 already decided. In `plugins/utils/ai_pii.rs` (shared with
+  `ai_prompt_shield` and `ai_transcript_audit`): `credit_card` adds the
+  Mastercard 2-series, UnionPay, JCB, Diners Club, and 4-6-5 / 4-4-4-3 American
+  Express, and `ai_response_guard` / `ai_transcript_audit` now confirm it with a
+  Luhn checksum (Luhn-invalid card-shaped numbers are no longer findings there);
+  `api_key` matches multi-segment `sk-proj-…` / `sk-ant-api03-…` keys in full
+  plus GitHub, Google, and Slack tokens; `ip_address` adds IPv6 and no longer
+  matches out-of-range IPv4 octets; `iban` accepts space-grouped IBANs and
+  letter-bearing BBANs but requires an IBAN-registry country code.
 - **The AWS SDK resolves the fixed `aws-smithy-json` parser again** (issue
   #6755; follow-up to #6750). Bumping the direct `aws-smithy-json` pin to
   0.63.1 left `aws-config` and the Secrets Manager/STS/SSO clients on their
