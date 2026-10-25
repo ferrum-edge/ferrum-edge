@@ -8827,8 +8827,8 @@ fn shared_catalog_covers_modern_card_key_ip_and_iban_spellings() {
         ("api_key", anthropic_key.clone(), true),
         ("api_key", project_key.clone(), true),
         ("api_key", "sk_liveabcdefghijklmnopqrstuvwxyz".into(), true),
-        ("api_key", github_token.clone(), true),
-        ("api_key", google_key.clone(), true),
+        ("api_key", github_token, true),
+        ("api_key", google_key, true),
         ("api_key", "xoxb-1234567890-abcdefABCDEF".into(), true),
         (
             "api_key",
