@@ -157,30 +157,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before upgrading a compose stack.
 
 ### Fixed
-- **`sse` request checks now apply to every request flavor, and synthetic
-  responses are no longer framed under their own media type.**
-  - While `require_get_method` or `require_accept_header` is enabled (the
-    default), the plugin is route admission policy. A native gRPC request or
-    WebSocket upgrade, whose view does not run this HTTP-only plugin, is now
-    refused with `403` / `route_protocol_admission`. Before, a gRPC `POST` or
-    an upgrade without `Accept: text/event-stream` reached the backend.
-  - `wrap_non_sse_responses` frames a body only when this plugin's
-    `after_proxy` selected it and published `text/event-stream`. A
-    `response_mock` reply, terminate-mode `serverless_function` reply, or
-    cache hit no longer gets `data:` framing under `application/json`. A
-    wrap decision is also dropped when gateway policy replaces the response
-    it was made for, such as an `on_response_body` rejection.
-  - `force_sse_content_type` no longer relabels `206`/`226` or content-coded
-    responses when wrapping is off. They were already declined when wrapping
-    was on.
-  - `retry_ms` now also reaches a streamed genuine backend event stream:
-    `retry: <ms>` is written once ahead of the first backend bytes, as its
-    own line so it dispatches no event. A later backend `retry:` overrides it.
-    Content-coded (gzip/br), `no-transform`, and `206`/`226` streams are
-    forwarded unchanged.
-  - Docs now say that only the `Last-Event-ID` request header is forwarded
-    (a query-parameter cursor is not converted), and which idle timeouts
-    affect long-lived event streams.
 - **Composed `cors` policies keep wildcard response-header exposure.** An
   uncredentialed `exposed_headers: ["*"]` intersected with an explicit list
   (for example `["Content-Disposition"]`) produced an empty
