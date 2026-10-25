@@ -1,9 +1,12 @@
 //! Tests for the ai_prompt_compressor plugin.
 
-use ferrum_edge::_test_support::ai_prompt_compressor_marker_scan_work_for_test;
+use ferrum_edge::_test_support::{
+    ai_prompt_compressor_marker_scan_work_for_test, run_request_body_stage_with_context_for_test,
+};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext,
     ai_prompt_compressor::AiPromptCompressor, compression::CompressionPlugin, priority,
+    request_transformer::RequestTransformer,
 };
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -12,7 +15,7 @@ use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 
-use super::plugin_utils::{assert_continue, create_test_context};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
 /// A compressor with a low token floor so tests can use short, readable inputs.
 fn compressor(min_content_tokens: u64, ratio: f64) -> AiPromptCompressor {
@@ -153,6 +156,21 @@ fn invalid_configs_rejected() {
         json!({"max_scan_bytes": null}),
         json!({"preserve_tag": null}),
         json!({"request_family": null}),
+        json!({"request_family": "gemini"}),
+        json!({"compress_roles": (0..33).map(|index| format!("role{index}")).collect::<Vec<_>>()}),
+        json!({"compress_roles": ["r".repeat(65)]}),
+        json!({"min_content_tokens": 200.5}),
+        json!({"min_content_tokens": -1.0}),
+        json!({"target_max_tokens": 0}),
+        json!({"target_max_tokens": 131_073}),
+        json!({"target_max_tokens": "lots"}),
+        json!({"target_max_tokens": null}),
+        json!({"mode": "shadow"}),
+        json!({"mode": null}),
+        json!({"sample_rate": 0}),
+        json!({"sample_rate": -0.5}),
+        json!({"sample_rate": 1.01}),
+        json!({"sample_rate": null}),
     ] {
         assert!(
             AiPromptCompressor::new(&config).is_err(),
@@ -175,6 +193,19 @@ fn valid_configs_accepted() {
         json!({"request_family": "chat_completions"}),
         json!({"request_family": "text_completions"}),
         json!({"request_family": "text_completions", "compress_roles": [" User "]}),
+        json!({"request_family": "responses"}),
+        json!({"request_family": "anthropic_messages"}),
+        json!({"compress_roles": (0..32).map(|index| format!("role{index}")).collect::<Vec<_>>()}),
+        json!({"compress_roles": ["r".repeat(64)]}),
+        json!({"min_content_tokens": 200.0}),
+        json!({"max_scan_bytes": 2048.0}),
+        json!({"target_max_tokens": 1}),
+        json!({"target_max_tokens": 8000.0}),
+        json!({"target_max_tokens": 131_072}),
+        json!({"mode": "enforce"}),
+        json!({"mode": "observe"}),
+        json!({"sample_rate": 1}),
+        json!({"sample_rate": 0.01}),
     ] {
         assert!(
             AiPromptCompressor::new(&config).is_ok(),
@@ -1939,5 +1970,666 @@ async fn preserve_markers_stripped_when_compression_does_not_apply() {
     assert_eq!(
         compressed, "Short prompt with a protected span inside.",
         "only the markers may be removed"
+    );
+}
+
+// ─── Production-launch review regressions ────────────────────────────────────
+
+fn compressed_content(out: &Value) -> String {
+    first_message_content(out).to_string()
+}
+
+fn instance_metadata_value<'a>(ctx: &'a RequestContext, suffix: &str) -> Option<&'a str> {
+    ctx.metadata
+        .iter()
+        .find(|(key, _)| {
+            key.starts_with("ai_prompt_compressor.instances.") && key.ends_with(suffix)
+        })
+        .map(|(_, value)| value.as_str())
+}
+
+/// `s_k = "<ke" + s_{k-1} + "ep>"` with `s_0 = "<keep>"`: each removal pass
+/// deletes exactly the innermost marker and synthesizes the next one.
+fn self_synthesizing_marker(depth: usize) -> String {
+    let mut marker = "<keep>".to_string();
+    for _ in 0..depth {
+        marker = format!("<ke{marker}ep>");
+    }
+    marker
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn uppercase_negations_keep_their_complement() {
+    // SOL-1: `NOT` has acronym form; it must still protect the next word.
+    let plugin = compressor(0, 0.1);
+    let out = transform(
+        &plugin,
+        &chat_body("user", "DO NOT delete. RESTART extraordinarily"),
+    )
+    .await
+    .expect("prose should compress");
+    assert_eq!(compressed_content(&out), "DO NOT delete. RESTART");
+
+    for (input, kept) in [
+        (
+            "Please DON\u{2019}T delete extraordinarily verbose archives",
+            "DON\u{2019}T delete",
+        ),
+        (
+            "Operators NEVER restart extraordinarily verbose clusters",
+            "NEVER restart",
+        ),
+        (
+            "Assistants CANNOT disclose extraordinarily confidential credentials",
+            "CANNOT disclose",
+        ),
+        (
+            "Operators DON'T restart extraordinarily verbose clusters",
+            "DON'T restart",
+        ),
+    ] {
+        let out = transform(&plugin, &chat_body("user", input))
+            .await
+            .expect("prose should compress");
+        let compressed = compressed_content(&out);
+        assert!(
+            compressed.contains(kept),
+            "{kept:?} must survive adjacent in {compressed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn conditions_quantifiers_and_number_words_are_critical() {
+    // MUSE-3: closed-class scope words are kept at aggressive ratios, and the
+    // restrictive connectives keep their complement.
+    let plugin = compressor(0, 0.1);
+    let out = transform(
+        &plugin,
+        &chat_body(
+            "user",
+            "remove exactly three obsolete snapshots unless the administrator explicitly \
+             authorizes extended retention",
+        ),
+    )
+    .await
+    .expect("prose should compress");
+    assert_eq!(compressed_content(&out), "exactly three unless the");
+
+    let out = transform(
+        &plugin,
+        &chat_body(
+            "user",
+            "The archived snapshots must be deleted only after compliance verification \
+             if every regional infrastructure coordinator approves",
+        ),
+    )
+    .await
+    .expect("prose should compress");
+    let compressed = compressed_content(&out);
+    for kept in ["must", "only after", "if every"] {
+        assert!(
+            compressed.contains(kept),
+            "{kept:?} missing from {compressed:?}"
+        );
+    }
+
+    // Uppercase restrictive connectives keep their complement too.
+    let out = transform(
+        &plugin,
+        &chat_body("user", "Restart UNLESS maintenance extraordinarily verbose"),
+    )
+    .await
+    .expect("prose should compress");
+    assert!(compressed_content(&out).contains("UNLESS maintenance"));
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn marker_removal_reaches_a_fixpoint_on_the_fallback_path() {
+    // SOL-2 scenario A: removing an inner marker must not leave a new one.
+    let plugin =
+        AiPromptCompressor::new(&json!({"preserve_tag": "keep", "max_scan_bytes": 1})).unwrap();
+    let out = transform(
+        &plugin,
+        &chat_body("user", "<ke<keep>ep>secret</ke<keep>ep>"),
+    )
+    .await
+    .expect("markers must be removed");
+    assert_eq!(compressed_content(&out), "secret");
+
+    // The escaped spelling synthesizes a literal marker the next pass removes.
+    let raw = br#"{"messages":[{"role":"user","content":"<ke<keep>ep>secret"}]}"#;
+    let output = plugin
+        .transform_request_body(raw, Some("application/json"), &json_headers())
+        .await
+        .expect("escaped markers must be removed");
+    assert_eq!(
+        output,
+        br#"{"messages":[{"role":"user","content":"secret"}]}"#.to_vec()
+    );
+
+    // The statistical path's reserialized output reaches the same fixpoint.
+    let plugin = AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap();
+    let nested = format!("{}secret", self_synthesizing_marker(4));
+    let out = transform(&plugin, &chat_body("user", &nested))
+        .await
+        .expect("markers must be removed");
+    assert_eq!(compressed_content(&out), "secret");
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn unresolvable_marker_synthesis_fails_closed_in_final_hook() {
+    // Deeper than the bounded pass count: a residual marker is refused, never
+    // forwarded.
+    let plugin = AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap();
+    let body = chat_body("user", &format!("{}secret", self_synthesizing_marker(20)));
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    let headers = json_headers();
+    let output = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("bounded passes still rewrite the body");
+    assert!(String::from_utf8_lossy(&output).contains("<keep>"));
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &output)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn later_body_transform_cannot_reintroduce_preserve_markers() {
+    // SOL-2 scenario B: a transform ordered after the compressor (here a
+    // `request_transformer` placed later, as a priority override would) writes
+    // a marker into a string value of the admitted body.
+    let compressor =
+        std::sync::Arc::new(AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap())
+            as std::sync::Arc<dyn Plugin>;
+    let body = chat_body("user", "short prompt");
+    let raw = serde_json::to_vec(&body).unwrap();
+    let headers = json_headers();
+
+    for (value, expected_reject) in [("<keep>critical</keep>", true), ("a < b", false)] {
+        let transformer = std::sync::Arc::new(
+            RequestTransformer::new(&json!({
+                "rules": [{"operation": "add", "target": "body", "key": "note", "value": value}]
+            }))
+            .unwrap(),
+        ) as std::sync::Arc<dyn Plugin>;
+        let plugins = vec![std::sync::Arc::clone(&compressor), transformer];
+        let mut ctx = post_ctx(&body);
+        let (final_body, result) =
+            run_request_body_stage_with_context_for_test(&plugins, &mut ctx, &headers, &raw).await;
+        assert!(
+            String::from_utf8_lossy(&final_body).contains(value),
+            "fixture must place the value on the final body"
+        );
+        if expected_reject {
+            assert_reject(result, Some(400));
+        } else {
+            assert_continue(result);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn content_encoded_marker_bodies_are_verified_through_the_decoded_view() {
+    // MUSE-1: without a configured decompressor, an encoded body is never
+    // rewritten, so its decoded view must be verified or refused.
+    let plugin =
+        std::sync::Arc::new(AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap());
+    let plain = AiPromptCompressor::new(&json!({})).unwrap();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let ctx = {
+        let mut ctx = post_ctx(&chat_body("user", "placeholder"));
+        ctx.headers
+            .insert("content-encoding".to_string(), "gzip".to_string());
+        ctx
+    };
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "marker instances must buffer encoded candidates for final verification"
+    );
+    assert!(!plain.should_buffer_request_body(&ctx));
+    assert!(plugin.enforces_final_request_body_policy(&ctx, &headers, b"encoded"));
+    assert!(!plain.enforces_final_request_body_policy(&ctx, &headers, b"encoded"));
+    let mut image_ctx = post_ctx(&chat_body("user", "placeholder"));
+    image_ctx.path = "/v1/images/generations".to_string();
+    assert!(
+        !plugin.enforces_final_request_body_policy(&image_ctx, &headers, b"encoded"),
+        "auto mode must not claim unrelated operations"
+    );
+
+    let plugins = vec![std::sync::Arc::clone(&plugin) as std::sync::Arc<dyn Plugin>];
+    for (content, expected_reject) in [
+        ("before <keep>internal instruction</keep> after", true),
+        ("an ordinary prompt without markers", false),
+    ] {
+        let encoded = gzip(&serde_json::to_vec(&chat_body("user", content)).unwrap());
+        let mut ctx = post_ctx(&chat_body("user", content));
+        ctx.metadata.remove("request_body");
+        let (_, result) =
+            run_request_body_stage_with_context_for_test(&plugins, &mut ctx, &headers, &encoded)
+                .await;
+        if expected_reject {
+            assert_reject(result, Some(400));
+        } else {
+            assert_continue(result);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn final_marker_check_leaves_unadmitted_and_member_name_markers_alone() {
+    let plugin = AiPromptCompressor::new(&json!({"preserve_tag": "keep"})).unwrap();
+    let headers = json_headers();
+
+    // Markers confined to member names never trigger the check.
+    let mut ctx = post_ctx(&chat_body("user", "plain"));
+    let raw = br#"{"messages":[{"role":"user","content":"plain"}],"only<keep>key":1}"#;
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, raw)
+            .await,
+    );
+
+    // An unadmitted shape retains its bytes.
+    let mut ctx = post_ctx(&chat_body("user", "plain"));
+    let raw = br#"{"model":"gpt-4o","foo":"<keep>value</keep>"}"#;
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, raw)
+            .await,
+    );
+
+    // Instances without a preserve tag never inspect.
+    let plain = AiPromptCompressor::new(&json!({})).unwrap();
+    let mut ctx = post_ctx(&chat_body("user", "plain"));
+    let raw = br#"{"messages":[{"role":"user","content":"<keep>value</keep>"}]}"#;
+    assert_continue(
+        plain
+            .on_final_request_body_with_context(&mut ctx, &headers, raw)
+            .await,
+    );
+
+    // Escaped markers in values are still found.
+    let mut ctx = post_ctx(&chat_body("user", "plain"));
+    let raw = br#"{"messages":[{"role":"user","content":"<keep>value"}]}"#;
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, raw)
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn skipped_statistical_work_is_recorded() {
+    // MUSE-2: a skipped compression is observable rather than silent.
+    let unsampled = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 5,
+        "sample_rate": 1e-12
+    }))
+    .unwrap();
+    let body = chat_body("user", &long_prompt_text());
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut ctx = post_ctx(&body);
+    assert!(
+        unsampled
+            .transform_request_body_with_context(
+                &mut ctx,
+                &raw,
+                Some("application/json"),
+                &json_headers()
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        instance_metadata_value(&ctx, ".skipped"),
+        Some("not_sampled")
+    );
+
+    let capped = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 5,
+        "max_scan_bytes": 32
+    }))
+    .unwrap();
+    let mut ctx = post_ctx(&body);
+    assert!(
+        capped
+            .transform_request_body_with_context(
+                &mut ctx,
+                &raw,
+                Some("application/json"),
+                &json_headers()
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        instance_metadata_value(&ctx, ".skipped"),
+        Some("work_limit")
+    );
+
+    // A body too short to reach the floor is an ordinary no-op, not a skip.
+    let default_floor = AiPromptCompressor::new(&json!({})).unwrap();
+    let short = chat_body("user", "short");
+    let mut ctx = post_ctx(&short);
+    assert!(
+        default_floor
+            .transform_request_body_with_context(
+                &mut ctx,
+                &serde_json::to_vec(&short).unwrap(),
+                Some("application/json"),
+                &json_headers()
+            )
+            .await
+            .is_none()
+    );
+    assert_eq!(instance_metadata_value(&ctx, ".skipped"), None);
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn full_sample_rate_always_compresses() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 5,
+        "sample_rate": 1.0
+    }))
+    .unwrap();
+    let body = chat_body("user", &long_prompt_text());
+    let mut ctx = post_ctx(&body);
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &serde_json::to_vec(&body).unwrap(),
+                Some("application/json"),
+                &json_headers()
+            )
+            .await
+            .is_some()
+    );
+    assert_eq!(instance_metadata_value(&ctx, ".skipped"), None);
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn target_max_tokens_compresses_only_over_budget_requests() {
+    // SOL-3: an aggregate budget leaves fitting requests intact and removes
+    // only as much as needed from larger ones.
+    let prompt = long_prompt_text();
+    let tokens = prompt.chars().count().div_ceil(4);
+    let body = chat_body("user", &prompt);
+
+    let roomy = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 1,
+        "target_ratio": 0.1,
+        "target_max_tokens": tokens
+    }))
+    .unwrap();
+    assert!(
+        transform(&roomy, &body).await.is_none(),
+        "a request within the budget must not be compressed"
+    );
+
+    let tight = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 1,
+        "target_ratio": 0.1,
+        "target_max_tokens": tokens * 3 / 4
+    }))
+    .unwrap();
+    let budgeted = transform(&tight, &body)
+        .await
+        .expect("an over-budget request must compress");
+    let ratio_only = transform(&compressor(1, 0.1), &body)
+        .await
+        .expect("ratio-only compression applies");
+    let budgeted_len = first_message_content(&budgeted).chars().count();
+    assert!(budgeted_len < prompt.chars().count());
+    assert!(
+        budgeted_len > first_message_content(&ratio_only).chars().count(),
+        "the budget must remove only what is needed, not everything target_ratio allows"
+    );
+
+    // The budget is aggregate across eligible fields.
+    let two_fields = json!({
+        "messages": [
+            {"role": "user", "content": prompt},
+            {"role": "user", "content": prompt}
+        ]
+    });
+    let per_field_fits = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 1,
+        "target_max_tokens": tokens + 1
+    }))
+    .unwrap();
+    assert!(
+        transform(&per_field_fits, &two_fields).await.is_some(),
+        "two fields that each fit can still exceed the aggregate budget"
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn observe_mode_records_savings_without_rewriting() {
+    // MUSE-6: observe runs the pipeline but forwards the original prompt.
+    let observer = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 5,
+        "mode": "observe"
+    }))
+    .unwrap();
+    let body = chat_body("user", &long_prompt_text());
+    let raw = serde_json::to_vec(&body).unwrap();
+
+    let mut ctx = post_ctx(&body);
+    let original_metadata_body = ctx.metadata["request_body"].clone();
+    let mut headers = json_headers();
+    assert_continue(observer.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(ctx.metadata["request_body"], original_metadata_body);
+    assert!(
+        observer
+            .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+            .await
+            .is_none(),
+        "observe mode must forward the original representation"
+    );
+    let saved: usize = ctx.metadata["ai_prompt_compressor.observed_tokens_saved"]
+        .parse()
+        .unwrap();
+    assert!(saved > 0);
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_prompt_compressor.tokens_saved")
+    );
+    assert!(instance_metadata_value(&ctx, ".observed_tokens_saved").is_some());
+
+    // Markers are still removed in observe mode, but nothing is compressed.
+    let marker_observer = AiPromptCompressor::new(&json!({
+        "min_content_tokens": 5,
+        "mode": "observe",
+        "preserve_tag": "keep"
+    }))
+    .unwrap();
+    let prompt = format!("<keep>critical</keep> {}", long_prompt_text());
+    let out = transform(&marker_observer, &chat_body("user", &prompt))
+        .await
+        .expect("markers must still be removed");
+    assert_eq!(
+        compressed_content(&out),
+        format!("critical {}", long_prompt_text())
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn responses_family_compresses_instructions_and_message_text_parts() {
+    // MUSE-5: OpenAI Responses bodies are a fixed-family opt-in.
+    let plugin = AiPromptCompressor::new(&json!({
+        "request_family": "responses",
+        "compress_roles": ["user", "system"],
+        "min_content_tokens": 5,
+        "target_ratio": 0.4
+    }))
+    .unwrap();
+    let long = long_prompt_text();
+    let body = json!({
+        "model": "gpt-4.1",
+        "instructions": long,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": long},
+                    {"type": "input_image", "image_url": "https://img.example/x.png"}
+                ]
+            },
+            {"type": "function_call_output", "call_id": "c1", "output": long},
+            {"type": "message", "role": "assistant", "content": long}
+        ]
+    });
+    let out = transform_at_path(&plugin, &body, "/v1/responses")
+        .await
+        .expect("responses body should compress");
+    assert!(out["instructions"].as_str().unwrap().len() < long.len());
+    assert!(
+        out["input"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .len()
+            < long.len()
+    );
+    assert_eq!(
+        out["input"][0]["content"][1],
+        body["input"][0]["content"][1]
+    );
+    assert_eq!(
+        out["input"][1], body["input"][1],
+        "non-message items stay intact"
+    );
+    assert_eq!(
+        out["input"][2]["content"], body["input"][2]["content"],
+        "ineligible roles stay intact"
+    );
+
+    let string_input = json!({"model": "gpt-4.1", "input": long});
+    let out = transform_at_path(&plugin, &string_input, "/v1/responses")
+        .await
+        .expect("string input is user text");
+    assert!(out["input"].as_str().unwrap().len() < long.len());
+
+    // `auto` never admits Responses bodies, and the fixed family rejects
+    // other shapes.
+    assert!(
+        transform_at_path(&compressor(5, 0.4), &string_input, "/v1/responses")
+            .await
+            .is_none()
+    );
+    assert!(
+        transform(&plugin, &chat_body("user", &long))
+            .await
+            .is_none()
+    );
+    let malformed = json!({"input": [{"role": "user", "content": [{"type": "input_text"}]}]});
+    assert!(
+        transform_at_path(&plugin, &malformed, "/v1/responses")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+#[serial(ai_prompt_compressor_budget)]
+async fn anthropic_messages_family_compresses_system_and_text_blocks() {
+    // MUSE-5: Anthropic Messages bodies are a fixed-family opt-in.
+    let plugin = AiPromptCompressor::new(&json!({
+        "request_family": "anthropic_messages",
+        "compress_roles": ["user", "system"],
+        "min_content_tokens": 5,
+        "target_ratio": 0.4
+    }))
+    .unwrap();
+    let long = long_prompt_text();
+    let body = json!({
+        "model": "claude-sonnet",
+        "max_tokens": 256,
+        "system": [{"type": "text", "text": long, "cache_control": {"type": "ephemeral"}}],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": long},
+                {"type": "tool_result", "tool_use_id": "t1", "content": long},
+                {"type": "image", "source": {"type": "url", "url": "https://img.example/x.png"}}
+            ]
+        }]
+    });
+    let out = transform_at_path(&plugin, &body, "/v1/messages")
+        .await
+        .expect("anthropic body should compress");
+    assert!(out["system"][0]["text"].as_str().unwrap().len() < long.len());
+    assert_eq!(
+        out["system"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+    let content = &out["messages"][0]["content"];
+    assert!(content[0]["text"].as_str().unwrap().len() < long.len());
+    assert_eq!(
+        content[1], body["messages"][0]["content"][1],
+        "tool results stay intact"
+    );
+    assert_eq!(content[2], body["messages"][0]["content"][2]);
+
+    let string_system = json!({
+        "model": "claude-sonnet",
+        "system": long,
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let out = transform_at_path(&plugin, &string_system, "/v1/messages")
+        .await
+        .expect("string system prompt should compress");
+    assert!(out["system"].as_str().unwrap().len() < long.len());
+
+    // Without `system` in compress_roles the system prompt is preserved.
+    let user_only = AiPromptCompressor::new(&json!({
+        "request_family": "anthropic_messages",
+        "min_content_tokens": 5,
+        "target_ratio": 0.4
+    }))
+    .unwrap();
+    assert!(
+        transform_at_path(&user_only, &string_system, "/v1/messages")
+            .await
+            .is_none()
+    );
+    // `auto` keeps passing Anthropic-shaped bodies through.
+    assert!(
+        transform_at_path(&compressor(5, 0.4), &string_system, "/v1/messages")
+            .await
+            .is_none()
+    );
+    let with_prompt = json!({"messages": [], "prompt": long});
+    assert!(
+        transform_at_path(&plugin, &with_prompt, "/v1/messages")
+            .await
+            .is_none()
     );
 }

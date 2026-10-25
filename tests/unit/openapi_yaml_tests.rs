@@ -11665,15 +11665,33 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         "max_scan_bytes",
         "preserve_tag",
         "request_family",
+        "target_max_tokens",
+        "mode",
+        "sample_rate",
     ]
     .into_iter()
     .map(str::to_string)
     .collect();
     assert_eq!(schema_fields, runtime_fields);
 
+    let max_roles: Vec<String> = (0..32).map(|index| format!("role{index}")).collect();
+    let too_many_roles: Vec<String> = (0..33).map(|index| format!("role{index}")).collect();
     for config in [
         json!({}),
         json!({"compress_roles": ["user", "system"]}),
+        json!({"compress_roles": max_roles}),
+        json!({"compress_roles": ["r".repeat(64)]}),
+        json!({"min_content_tokens": 200.0}),
+        json!({"max_scan_bytes": 1024.0}),
+        json!({"target_max_tokens": 1}),
+        json!({"target_max_tokens": 8000.0}),
+        json!({"target_max_tokens": 131072}),
+        json!({"mode": "enforce"}),
+        json!({"mode": "observe"}),
+        json!({"sample_rate": 1}),
+        json!({"sample_rate": 0.25}),
+        json!({"request_family": "responses"}),
+        json!({"request_family": "anthropic_messages"}),
         json!({"target_ratio": 0.25}),
         json!({"min_content_tokens": 131072}),
         json!({"max_scan_bytes": 1048576}),
@@ -11703,6 +11721,20 @@ fn ai_prompt_compressor_runtime_and_openapi_contracts_match() {
         json!({"preserve_tag": "x".repeat(65)}),
         json!({"request_family": "images"}),
         json!({"request_family": "text_completions", "compress_roles": ["system"]}),
+        json!({"compress_roles": too_many_roles}),
+        json!({"compress_roles": ["r".repeat(65)]}),
+        json!({"min_content_tokens": 200.5}),
+        json!({"min_content_tokens": -1.0}),
+        json!({"target_max_tokens": 0}),
+        json!({"target_max_tokens": 131073}),
+        json!({"target_max_tokens": 10.5}),
+        json!({"target_max_tokens": null}),
+        json!({"mode": "shadow"}),
+        json!({"mode": null}),
+        json!({"sample_rate": 0}),
+        json!({"sample_rate": 1.5}),
+        json!({"sample_rate": "half"}),
+        json!({"sample_rate": null}),
     ] {
         assert!(
             validator.validate(&config).is_err(),
