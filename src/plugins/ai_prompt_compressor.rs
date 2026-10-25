@@ -2088,7 +2088,7 @@ impl Plugin for AiPromptCompressor {
             // A declared oversized candidate deliberately bypasses buffering
             // without a preserve tag; record why it was not compressed.
             if self.preserve_tags.is_none()
-                && content_length_exceeds(&ctx.headers, self.max_scan_bytes)
+                && content_length_exceeds(headers, self.max_scan_bytes)
                 && (self.request_family != RequestFamilyPolicy::Auto
                     || self
                         .classification_path(ctx)

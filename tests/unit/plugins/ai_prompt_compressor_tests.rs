@@ -2705,7 +2705,11 @@ async fn declared_oversized_unbuffered_candidate_records_work_limit() {
     ctx.headers
         .insert("content-length".to_string(), "1000".to_string());
     assert!(!plugin.should_buffer_request_body(&ctx));
+    // Core moves `ctx.headers` out before `before_proxy` on the
+    // no-header-mutation path; the hook must read its `headers` argument.
+    ctx.headers.clear();
     let mut headers = json_headers();
+    headers.insert("content-length".to_string(), "1000".to_string());
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         instance_metadata_value(&ctx, ".skipped"),
