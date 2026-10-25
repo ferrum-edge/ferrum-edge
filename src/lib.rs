@@ -7171,6 +7171,43 @@ pub mod _test_support {
         plugin.contains_connection_for_test(connection_id)
     }
 
+    /// `ws_rate_limiting`'s production hard cap on resident local/fallback keys.
+    pub fn ws_rate_limiting_max_state_entries_for_test() -> usize {
+        crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test()
+    }
+
+    /// Seed one connection's local frame state at `now`, bypassing the cap.
+    pub fn ws_rate_limiting_seed_connection_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) {
+        plugin.seed_connection_at_for_test(connection_id, now);
+    }
+
+    /// Whether the production capacity gate admits `connection_id` at `now`.
+    /// Returns false only for a previously unseen key while the map is full.
+    pub fn ws_rate_limiting_admits_at_production_cap_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        connection_id: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.seed_connection_at_with_cap_for_test(
+            connection_id,
+            now,
+            crate::plugins::ws_rate_limiting::WsRateLimiting::max_state_entries_for_test(),
+        )
+    }
+
+    /// Run the production capacity/periodic eviction gate at `now`, as every
+    /// frame does before admission.
+    pub fn ws_rate_limiting_maybe_evict_at_for_test(
+        plugin: &crate::plugins::ws_rate_limiting::WsRateLimiting,
+        now: std::time::Instant,
+    ) -> bool {
+        plugin.maybe_evict_at_for_test(now)
+    }
+
     /// Whether two `ws_rate_limiting` instances enforce on the same live state.
     pub fn ws_rate_limiting_shares_local_state_for_test(
         left: &crate::plugins::ws_rate_limiting::WsRateLimiting,

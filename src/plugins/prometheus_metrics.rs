@@ -862,8 +862,9 @@ pub struct MetricsRegistry {
     /// this is the alertable signal that the configured quota is currently
     /// being enforced once per gateway process instead of once per fleet.
     pub rate_limit_fallback_decisions: AtomicU64,
-    /// `rate_limiting` requests refused because centralized enforcement was
-    /// unavailable and `redis_failure_policy` is `fail_closed`.
+    /// `rate_limiting` requests refused, and `ws_rate_limiting` sessions
+    /// closed, because centralized enforcement was unavailable and
+    /// `redis_failure_policy` is `fail_closed`.
     pub rate_limit_unavailable_denials: AtomicU64,
     pub ai_rate_limit_local_accounting_tokens: AtomicU64,
     pub ai_rate_limit_unaccounted_tokens: AtomicU64,
@@ -1535,8 +1536,9 @@ impl MetricsRegistry {
         self.maybe_invalidate_cache();
     }
 
-    /// Record one request refused because centralized rate-limit enforcement
-    /// was unavailable under `redis_failure_policy: fail_closed`.
+    /// Record one request refused (or WebSocket session closed) because
+    /// centralized rate-limit enforcement was unavailable under
+    /// `redis_failure_policy: fail_closed`.
     pub fn record_rate_limit_enforcement_unavailable(&self) {
         self.rate_limit_unavailable_denials
             .fetch_add(1, Ordering::Relaxed);

@@ -3306,6 +3306,15 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
             "redis_url": "redis://redis-host:6379/2"
         }),
         json!({"close_reason": "レート制限"}),
+        json!({"limit_by": "connection"}),
+        json!({"limit_by": "consumer"}),
+        json!({"limit_by": "ip"}),
+        json!({"limit_by": "service"}),
+        // A local-only token bucket represents any capacity/refill pair; the
+        // integer-multiple and refill-window relations bind Redis sync only.
+        json!({"frames_per_second": 3, "burst_size": 10}),
+        json!({"frames_per_second": 1000, "burst_size": 100}),
+        json!({"frames_per_second": 1, "burst_size": 4000, "sync_mode": "local"}),
     ];
     for config in &accepted {
         assert_schema_and_constructor(
@@ -3327,6 +3336,9 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
         json!({"frames_per_second": 0}),
         json!({"sync_mode": "mysql"}),
         json!({"frames_per_secod": 10}),
+        json!({"limit_by": "tenant"}),
+        json!({"limit_by": "Consumer"}),
+        json!({"limit_by": null}),
     ];
     for config in &rejected {
         assert_schema_and_constructor(
@@ -3339,12 +3351,18 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
         );
     }
 
-    // Integer-multiple / refill-window constraints stay constructor-only.
+    // Integer-multiple / refill-window constraints bind Redis sync only and
+    // stay constructor-only.
     assert_schema_and_constructor(
         &validator,
         "ws_rate_limiting",
         "non-integral burst residual",
-        &json!({"frames_per_second": 3, "burst_size": 10}),
+        &json!({
+            "frames_per_second": 3,
+            "burst_size": 10,
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
         true,
         false,
     );
@@ -3352,7 +3370,25 @@ fn ws_rate_limiting_schema_matches_constructor_admission() {
         &validator,
         "ws_rate_limiting",
         "refill window residual",
-        &json!({"frames_per_second": 1, "burst_size": 4000}),
+        &json!({
+            "frames_per_second": 1,
+            "burst_size": 4000,
+            "sync_mode": "Redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
+        true,
+        false,
+    );
+    assert_schema_and_constructor(
+        &validator,
+        "ws_rate_limiting",
+        "burst below rate residual",
+        &json!({
+            "frames_per_second": 1000,
+            "burst_size": 100,
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0"
+        }),
         true,
         false,
     );
