@@ -4275,10 +4275,8 @@ impl MeshAuthz {
         ctx: &RequestContext,
         source_principal: Option<&SpiffeId>,
     ) -> Result<Option<&crate::modes::mesh::runtime::PolicyScopeCache>, &'static str> {
-        let identity = HboneIdentity::from_baggage_values(
-            ctx.raw_header_values(BAGGAGE_HEADER)
-                .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
-        );
+        let identity =
+            hbone_baggage_identity(ctx, ctx.headers.get(BAGGAGE_HEADER).map(String::as_str));
         let Some(pod_uid) = identity.source_pod_uid else {
             return Err("missing_or_invalid_pod_uid");
         };
@@ -4335,11 +4333,9 @@ impl MeshAuthz {
         let Some(peer) = ctx.peer_spiffe_id.as_ref() else {
             return (None, BaggageOutcome::NoBaggageOrNonHbone);
         };
-        let baggage_principal = HboneIdentity::from_baggage_values(
-            ctx.raw_header_values(BAGGAGE_HEADER)
-                .chain(ctx.headers.get(BAGGAGE_HEADER).map(String::as_str)),
-        )
-        .source_principal;
+        let baggage_principal =
+            hbone_baggage_identity(ctx, ctx.headers.get(BAGGAGE_HEADER).map(String::as_str))
+                .source_principal;
         // No asserted identity means there is nothing to authorize and nothing
         // observable for operators to triage — the assertor relation is not
         // consulted at all, so ordinary non-assertor HBONE flows stay quiet.
@@ -4368,6 +4364,43 @@ impl MeshAuthz {
             HboneBaggageHonor::Honored => (Some(baggage), BaggageOutcome::Honored),
         }
     }
+}
+
+/// The HBONE baggage identity a request asserts: every pristine wire
+/// `baggage` field-line, then the `folded` request-map value (which wins for a
+/// key both carry).
+///
+/// Shared by `mesh_authz` (which passes `ctx.headers`' folded value) and
+/// `workload_metrics`, so telemetry attribution reads the SAME baggage input
+/// authorization evaluated. A single exact-case map lookup alone would miss a
+/// wire assertion whose folded copy an earlier hook removed or re-cased, and
+/// would honor a `baggage` header a transformer added after authorization ran.
+pub(crate) fn hbone_baggage_identity(ctx: &RequestContext, folded: Option<&str>) -> HboneIdentity {
+    HboneIdentity::from_baggage_values(ctx.raw_header_values(BAGGAGE_HEADER).chain(folded))
+}
+
+/// The folded `baggage` value request-header materialization derives from the
+/// pristine wire block: every field-line that is valid UTF-8 (obs-text
+/// included), joined with `, ` exactly as
+/// [`RequestContext::materialize_headers`] joins them. This is the folded
+/// value `mesh_authz` evaluates for a materialized request, rebuilt for a hook
+/// that runs after request transforms may have rewritten the header map.
+/// `None` when no wire `baggage` field-line decodes.
+pub(crate) fn hbone_wire_folded_baggage(ctx: &RequestContext) -> Option<String> {
+    let mut folded: Option<String> = None;
+    for value in ctx.raw_header_value_bytes(BAGGAGE_HEADER) {
+        let Ok(value) = std::str::from_utf8(value) else {
+            continue;
+        };
+        match folded.as_mut() {
+            Some(existing) => {
+                existing.push_str(", ");
+                existing.push_str(value);
+            }
+            None => folded = Some(value.to_owned()),
+        }
+    }
+    folded
 }
 
 /// Disposition of a baggage assertion against the trusted-assertor relation.

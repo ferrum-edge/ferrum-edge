@@ -1460,7 +1460,15 @@ fn ai_federation_circuit_metrics_are_bounded_and_reload_safe() {
     assert!(output.contains("ferrum_ai_federation_circuits_closed_total 1"));
     assert!(output.contains("ferrum_ai_federation_circuit_half_open_probes_total 1"));
     assert!(output.contains("ferrum_ai_federation_circuit_open_skips_total 1"));
-    assert!(!output.contains("provider="));
+    // The aggregate circuit families stay provider-free; other families in the
+    // shared registry (e.g. mesh tracing span drops) may legitimately carry a
+    // `provider` label.
+    assert!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("ferrum_ai_federation_circuit"))
+            .all(|line| !line.contains("provider="))
+    );
 
     registry.record_ai_federation_circuit_opened();
     registry.release_ai_federation_open_circuit();
@@ -2033,6 +2041,182 @@ async fn workload_metrics_response_code_override_changes_selected_metric_family(
     assert!(duration.contains("response_flags=\"503\""), "{duration}");
 }
 
+/// Stamp `config`'s workload_metrics metadata onto a fresh request and return
+/// it as a summary for `status`.
+async fn workload_metrics_summary(config: serde_json::Value, status: u16) -> TransactionSummary {
+    let workload_metrics = WorkloadMetrics::new(&config).expect("workload_metrics config");
+    let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    let result = workload_metrics.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(
+        result,
+        ferrum_edge::plugins::PluginResult::Continue
+    ));
+    let mut summary = make_summary("response-code-canonical", "GET", status, 10.0, 5.0);
+    summary.metadata = ctx.metadata;
+    summary
+}
+
+fn mesh_family_lines<'a>(output: &'a str, prefix: &str) -> Vec<&'a str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with(prefix))
+        .collect()
+}
+
+/// workload_metrics-SOL-1: a numeric response-code override equal to the
+/// response's own status, literal or `string(response.code)`, renders the
+/// same labels as no override, so it must share that series in ONE registry
+/// (one sample, combined count) instead of exposing duplicate series.
+#[tokio::test]
+async fn numeric_response_code_override_shares_the_plain_status_series() {
+    let literal = json!({
+        "metrics": {"tag_overrides": [
+            {"metric": "REQUEST_COUNT", "name": "response_code",
+             "operation": {"type": "set", "value": "200"}},
+            {"metric": "REQUEST_DURATION", "name": "response_code",
+             "operation": {"type": "set", "value": "200"}}
+        ]}
+    });
+    let cel = json!({
+        "metrics": {"tag_overrides": [
+            {"metric": "REQUEST_COUNT", "name": "response_code",
+             "operation": {"type": "set_expr", "cel": "string(response.code)"}},
+            {"metric": "REQUEST_DURATION", "name": "response_code",
+             "operation": {"type": "set_expr", "cel": "string(response.code)"}}
+        ]}
+    });
+    let registry = MetricsRegistry::new();
+    registry.record(&workload_metrics_summary(json!({}), 200).await);
+    registry.record(&workload_metrics_summary(literal, 200).await);
+    registry.record(&workload_metrics_summary(cel, 200).await);
+
+    let output = registry.render_uncached();
+    let counters = mesh_family_lines(&output, "ferrum_mesh_requests_total{");
+    assert_eq!(
+        counters.len(),
+        1,
+        "one rendered series, one sample: {counters:?}"
+    );
+    assert!(
+        counters[0].contains("response_code=\"200\""),
+        "{}",
+        counters[0]
+    );
+    assert!(counters[0].ends_with(" 3"), "{}", counters[0]);
+    let durations = mesh_family_lines(&output, "ferrum_mesh_request_duration_ms_count{");
+    assert_eq!(durations.len(), 1, "{durations:?}");
+    assert!(durations[0].ends_with(" 3"), "{}", durations[0]);
+
+    // A spelling that renders differently stays a distinct series.
+    let padded = json!({
+        "metrics": {"tag_overrides": [
+            {"metric": "REQUEST_COUNT", "name": "response_code",
+             "operation": {"type": "set", "value": "0200"}}
+        ]}
+    });
+    registry.record(&workload_metrics_summary(padded, 200).await);
+    let output = registry.render_uncached();
+    let counters = mesh_family_lines(&output, "ferrum_mesh_requests_total{");
+    assert_eq!(counters.len(), 2, "{counters:?}");
+    assert!(
+        counters
+            .iter()
+            .any(|line| line.contains("response_code=\"0200\"") && line.ends_with(" 1")),
+        "{counters:?}"
+    );
+}
+
+/// workload_metrics-SOL-3: workload RED metrics carry the finalized gRPC
+/// status as Istio `grpc_response_status`, bounded to the numeric code set,
+/// so failing RPCs behind an HTTP 200 no longer merge into the success series.
+#[tokio::test]
+async fn mesh_request_metrics_split_by_bounded_grpc_response_status() {
+    let registry = MetricsRegistry::new();
+    for status in ["0", "0", "7", "13", "99", "not-a-status"] {
+        let mut summary = workload_metrics_summary(json!({}), 200).await;
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), "grpc".to_string());
+        summary
+            .metadata
+            .insert("grpc_status".to_string(), status.to_string());
+        registry.record(&summary);
+    }
+    // A gRPC request whose terminal status never reached the log is UNKNOWN.
+    let mut missing = workload_metrics_summary(json!({}), 200).await;
+    missing
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    registry.record(&missing);
+    registry.record(&workload_metrics_summary(json!({}), 200).await);
+
+    let output = registry.render_uncached();
+    let counters = mesh_family_lines(&output, "ferrum_mesh_requests_total{");
+    let count_for = |status: &str| {
+        counters
+            .iter()
+            .find(|line| line.contains(&format!("grpc_response_status=\"{status}\"")))
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_string())
+    };
+    assert_eq!(count_for("0").as_deref(), Some("2"), "{counters:?}");
+    assert_eq!(count_for("7").as_deref(), Some("1"), "{counters:?}");
+    assert_eq!(count_for("13").as_deref(), Some("1"), "{counters:?}");
+    // Out-of-range, malformed, and missing statuses are UNKNOWN (2): hostile
+    // trailers cannot mint label values.
+    assert_eq!(count_for("2").as_deref(), Some("3"), "{counters:?}");
+    assert_eq!(
+        count_for("").as_deref(),
+        Some("1"),
+        "plain HTTP: {counters:?}"
+    );
+    assert_eq!(counters.len(), 5, "{counters:?}");
+    assert!(
+        !output.contains("grpc_response_status=\"99\"")
+            && !output.contains("grpc_response_status=\"not-a-status\""),
+        "{output}"
+    );
+    let durations = mesh_family_lines(&output, "ferrum_mesh_request_duration_ms_count{");
+    assert!(
+        durations
+            .iter()
+            .any(|line| line.contains("grpc_response_status=\"13\"") && line.ends_with(" 1")),
+        "{durations:?}"
+    );
+
+    // TCP families keep Istio's fixed schema: no response code, no gRPC status.
+    let stream_metadata = HashMap::from([
+        ("mesh.source.workload".to_string(), "frontend".to_string()),
+        ("mesh.request_protocol".to_string(), "tcp".to_string()),
+    ]);
+    let stream_key =
+        prometheus_helpers::mesh_stream_key_from_metadata(&stream_metadata, "tcp-proxy", None)
+            .expect("stream mesh key");
+    let stream_labels = prometheus_helpers::mesh_label_fragment(&stream_key, None);
+    assert!(
+        !stream_labels.contains("grpc_response_status") && !stream_labels.contains("response_code"),
+        "{stream_labels}"
+    );
+
+    // The label is part of the Telemetry tag-override vocabulary.
+    let removed = workload_metrics_summary(
+        json!({"metrics": {"tag_overrides": [
+            {"name": "grpc_response_status", "operation": {"type": "remove"}}
+        ]}}),
+        200,
+    )
+    .await;
+    let removed_registry = MetricsRegistry::new();
+    removed_registry.record(&removed);
+    let removed_output = removed_registry.render_uncached();
+    assert!(
+        mesh_family_lines(&removed_output, "ferrum_mesh_requests_total{")
+            .iter()
+            .all(|line| !line.contains("grpc_response_status")),
+        "{removed_output}"
+    );
+}
+
 #[tokio::test]
 async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
     let removed_labels = [
@@ -2048,6 +2232,7 @@ async fn mesh_metrics_render_valid_labels_when_all_base_labels_are_removed() {
         "destination_service",
         "request_protocol",
         "response_code",
+        "grpc_response_status",
         "response_flags",
         "connection_security_policy",
     ];
