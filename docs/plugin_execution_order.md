@@ -1178,15 +1178,18 @@ Plugins execute in priority order (lower number runs first):
 ### Zero-Overhead Opt-In
 
 When no plugin contributes parser policy or returns `true` from
-`requires_ws_frame_hooks()`, tunnel mode may use raw copy and the parsed relay
-otherwise forwards messages without entering plugin hooks. This aggregate
+`requires_ws_frame_hooks()` / `requires_websocket_framing()`, tunnel mode may use
+raw copy and the parsed relay otherwise forwards messages without entering plugin
+hooks. A bandwidth-priced `api_chargeback` requires the parsed relay without any
+frame hook: it bills WebSocket bandwidth from the parsed relay's payload byte
+counters, which the raw copy does not produce on the same basis. This aggregate
 framing requirement is pre-computed per proxy in `PluginCache` at reload time.
 
 The same aggregate requirement gates `websocket_permessage_deflate: passthrough`:
 config admission refuses passthrough on a proxy where any effective plugin can
 require the parsed relay (`waf`, `ws_frame_logging`, `ws_message_size_limiting`,
-`ws_rate_limiting`, or a custom plugin whose `requires_websocket_framing()` is
-`true`), and at runtime the offer is only forwarded when the proxy's precomputed
+`ws_rate_limiting`, an `api_chargeback` that prices bandwidth, or a custom plugin
+whose `requires_websocket_framing()` is `true`), and at runtime the offer is only forwarded when the proxy's precomputed
 requirement is `false`. A session that negotiates `permessage-deflate` always uses
 the raw relay, on H1, H2, and H3 alike.
 

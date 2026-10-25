@@ -35,7 +35,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -109,6 +109,35 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
 /// Default maximum retained registry bytes (64 MiB).
 pub const DEFAULT_MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Smallest accepted `max_retained_bytes`.
+///
+/// The overflow reserve ([`OVERFLOW_RESERVE_DIVISOR`]) of a budget this size
+/// still holds an aggregate overflow row with ordinary-length proxy, namespace,
+/// and currency labels, so a budget the admission fallback could never use is
+/// refused at construction instead of silently dropping charges.
+pub const MIN_MAX_RETAINED_BYTES: usize = 4096;
+
+/// Ordinary billing rows may use at most `max_retained_bytes -
+/// max_retained_bytes / OVERFLOW_RESERVE_DIVISOR`. The remaining share is
+/// reserved for the aggregate overflow rows, so a flood of distinct identities
+/// can never consume the bytes the fold-into-overflow fallback needs: once the
+/// ordinary share is full, new rows fold into overflow rows that still fit.
+pub const OVERFLOW_RESERVE_DIVISOR: usize = 4;
+
+/// Largest accepted `cleanup_interval_seconds` (one year).
+///
+/// The interval is handed to `tokio::time::sleep`, whose deadline is
+/// `Instant::now() + interval`; an interval near `u64::MAX` seconds overflows
+/// that addition and would panic the singleton cleanup task. `0` remains the
+/// documented way to disable periodic cleanup.
+pub const MAX_CLEANUP_INTERVAL_SECS: u64 = 31_536_000;
+
+/// How many complete registry walks one `/charges` render may attempt while a
+/// concurrent reload keeps advancing the proxy-metadata or projection
+/// generation. After the last attempt the document is returned uncached
+/// instead of re-walking indefinitely on the admin worker.
+pub const MAX_RENDER_ATTEMPTS: usize = 3;
 
 /// Fixed per-entry accounting overhead charged on top of the owned key and
 /// metadata strings: the `ChargebackEntry` struct, its atomics, the `Arc<str>`
@@ -259,6 +288,20 @@ type HttpChargeAggregateKey = (String, String, u16, Arc<str>, Arc<str>);
 type StreamChargeAggregateKey = (String, String, Arc<str>, Arc<str>);
 type BandwidthAggregateKey = (String, String, ProtocolFamily, Arc<str>, Arc<str>);
 
+/// `(consumer, proxy namespace, proxy id, currency)`: the coarsest grouping
+/// every exported series and JSON proxy row aggregates within. Idle eviction
+/// retires a whole group at once (see [`ChargebackRegistry::evict_stale`]).
+type EvictionGroupKey = (Arc<str>, Arc<str>, Arc<str>, Arc<str>);
+
+fn eviction_group_key(entry: &ChargebackEntry) -> EvictionGroupKey {
+    (
+        Arc::clone(&entry.consumer),
+        Arc::clone(&entry.proxy_namespace),
+        Arc::clone(&entry.proxy_id),
+        Arc::clone(&entry.currency),
+    )
+}
+
 /// Currency and namespace of a single `api_chargeback` plugin instance
 /// (finding #24).
 ///
@@ -329,6 +372,13 @@ fn entry_retained_bytes(
         .saturating_add(scope.currency.len())
         .saturating_add(namespace_label_len)
         .saturating_add(ENTRY_FIXED_OVERHEAD_BYTES)
+}
+
+/// Retained bytes ordinary (identity) billing rows may occupy under a
+/// `max_retained_bytes` budget. The remainder is reserved for the aggregate
+/// overflow rows (see [`OVERFLOW_RESERVE_DIVISOR`]).
+pub fn ordinary_row_byte_ceiling(max_retained_bytes: usize) -> usize {
+    max_retained_bytes - max_retained_bytes / OVERFLOW_RESERVE_DIVISOR
 }
 
 // Keep the hot-path key fields as borrowed scalars: wrapping them in an
@@ -588,7 +638,9 @@ pub struct SharedRegistryTunables {
     /// protocol family, currency, namespace, and prices.
     pub max_entries: usize,
     /// Hard ceiling on retained registry bytes, covering ordinary billing rows
-    /// and the aggregate overflow rows together.
+    /// and the aggregate overflow rows together. Ordinary rows may use only
+    /// [`ordinary_row_byte_ceiling`] of it; the rest is reserved for overflow
+    /// rows. At least [`MIN_MAX_RETAINED_BYTES`].
     pub max_retained_bytes: usize,
 }
 
@@ -611,19 +663,44 @@ impl SharedRegistryTunables {
                 "cache_invalidation_min_age_ms",
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_MS,
             )?,
-            cleanup_interval_seconds: optional_u64(
-                config,
-                "cleanup_interval_seconds",
-                DEFAULT_CLEANUP_INTERVAL_SECS,
-            )?,
+            cleanup_interval_seconds: bounded_cleanup_interval(config)?,
             max_entries: required_positive_usize(config, "max_entries", DEFAULT_MAX_ENTRIES)?,
-            max_retained_bytes: required_positive_usize(
-                config,
-                "max_retained_bytes",
-                DEFAULT_MAX_RETAINED_BYTES,
-            )?,
+            max_retained_bytes: required_retained_bytes_budget(config)?,
         })
     }
+}
+
+/// Read `cleanup_interval_seconds`, refusing values above
+/// [`MAX_CLEANUP_INTERVAL_SECS`] so the cleanup task's sleep deadline can never
+/// overflow.
+fn bounded_cleanup_interval(config: &Value) -> Result<u64, String> {
+    let value = optional_u64(
+        config,
+        "cleanup_interval_seconds",
+        DEFAULT_CLEANUP_INTERVAL_SECS,
+    )?;
+    if value > MAX_CLEANUP_INTERVAL_SECS {
+        return Err(format!(
+            "api_chargeback: `cleanup_interval_seconds` (\"{value}\") must be at most \
+             {MAX_CLEANUP_INTERVAL_SECS} (one year); use 0 to disable periodic cleanup"
+        ));
+    }
+    Ok(value)
+}
+
+/// Read `max_retained_bytes`, refusing budgets below
+/// [`MIN_MAX_RETAINED_BYTES`] whose overflow reserve could not hold an
+/// aggregate overflow row.
+fn required_retained_bytes_budget(config: &Value) -> Result<usize, String> {
+    let value = required_positive_usize(config, "max_retained_bytes", DEFAULT_MAX_RETAINED_BYTES)?;
+    if value < MIN_MAX_RETAINED_BYTES {
+        return Err(format!(
+            "api_chargeback: `max_retained_bytes` (\"{value}\") must be at least \
+             {MIN_MAX_RETAINED_BYTES}: a quarter of the budget is reserved for the aggregate \
+             overflow rows that preserve charges once ordinary rows are refused"
+        ));
+    }
+    Ok(value)
 }
 
 /// Read a positive `usize` budget key, rejecting `0` and non-integers.
@@ -864,6 +941,61 @@ fn render_cache_reached_min_age(generated_at: Option<Instant>, min_age_nanos: u6
     }
 }
 
+/// One cached Prometheus `/charges` document.
+struct CachedPrometheusRender {
+    generated_at: Instant,
+    metadata_generation: u64,
+    /// Collection receipt of the walk that produced `output`. A cache hit
+    /// returns it so delivering the cached document acknowledges exactly the
+    /// counters that document contains.
+    receipt: CollectionReceipt,
+    output: String,
+}
+
+/// One cached JSON `/charges` document.
+struct CachedJsonRender {
+    generated_at: Instant,
+    metadata_generation: u64,
+    schema_generation: u64,
+    /// See [`CachedPrometheusRender::receipt`].
+    receipt: CollectionReceipt,
+    output: String,
+}
+
+/// Proof that one rendered `/charges` document contains the counters of every
+/// row last updated before its registry walk began (issue #5276).
+///
+/// Rendering alone acknowledges nothing: the receipt must be handed back to
+/// [`ChargebackRegistry::acknowledge_collection`] once the document has been
+/// delivered. The admin `/charges` handler does that through
+/// [`ChargesDeliveryAck`] only after the connection has taken the complete
+/// response body, so a scrape abandoned before then cannot authorize idle-age
+/// eviction of counters no collector received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionReceipt {
+    walk_started_nanos: u64,
+}
+
+/// Response extension carrying a `/charges` [`CollectionReceipt`] to the admin
+/// connection's body wrapper, which calls [`Self::acknowledge`] once hyper has
+/// taken the complete document.
+#[derive(Clone)]
+pub struct ChargesDeliveryAck {
+    registry: Arc<ChargebackRegistry>,
+    receipt: CollectionReceipt,
+}
+
+impl ChargesDeliveryAck {
+    pub fn new(registry: Arc<ChargebackRegistry>, receipt: CollectionReceipt) -> Self {
+        Self { registry, receipt }
+    }
+
+    /// Acknowledge collection of the delivered document. Idempotent.
+    pub fn acknowledge(&self) {
+        self.registry.acknowledge_collection(self.receipt);
+    }
+}
+
 /// Sentinel `status_code` for stream sessions and WebSocket-disconnect
 /// bandwidth rows. Ordinary HTTP wire statuses are in `100..=599`; the
 /// registry key also carries [`ProtocolFamily`] so a bandwidth-only stream
@@ -903,10 +1035,10 @@ pub struct ChargebackRegistry {
     /// cannot repopulate the cache after a schema transition.
     render_schema_generation: AtomicU64,
     /// Cached render output with timestamp and proxy-metadata generation.
-    prometheus_cache: ArcSwap<Option<(Instant, u64, String)>>,
+    prometheus_cache: ArcSwap<Option<CachedPrometheusRender>>,
     /// Cached JSON document tagged with proxy-metadata and projection
     /// generations. One document must use one schema snapshot.
-    json_cache: ArcSwap<Option<(Instant, u64, u64, String)>>,
+    json_cache: ArcSwap<Option<CachedJsonRender>>,
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
@@ -1572,6 +1704,12 @@ impl ChargebackRegistry {
     /// family × currency/namespace × price set), not by attacker-selectable
     /// principals. They still reserve bytes, so the retained-byte ceiling stays
     /// a hard bound on total registry footprint.
+    ///
+    /// Ordinary rows are held to the ordinary share of the byte budget
+    /// ([`OVERFLOW_RESERVE_DIVISOR`]); only aggregate rows may use the reserved
+    /// remainder. Without that reserve, ordinary rows could fill the whole
+    /// budget and leave no room for the overflow row a later refused identity
+    /// folds into, turning a refusal into a dropped charge.
     fn try_reserve(&self, entry_bytes: usize, identity_admission: bool) -> bool {
         if identity_admission {
             let max_entries = self.max_entries.load(Ordering::Acquire);
@@ -1586,6 +1724,11 @@ impl ChargebackRegistry {
             }
         }
         let max_bytes = self.max_retained_bytes.load(Ordering::Acquire);
+        let max_bytes = if identity_admission {
+            ordinary_row_byte_ceiling(max_bytes)
+        } else {
+            max_bytes
+        };
         let reserved = self
             .retained_bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -1703,12 +1846,16 @@ impl ChargebackRegistry {
         {
             return false;
         }
-        self.json_cache.store(Arc::new(Some((
-            Instant::now(),
+        self.json_cache.store(Arc::new(Some(CachedJsonRender {
+            generated_at: Instant::now(),
             metadata_generation,
             schema_generation,
+            // An arbitrary test document proves nothing was collected.
+            receipt: CollectionReceipt {
+                walk_started_nanos: 0,
+            },
             output,
-        ))));
+        })));
         if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
             && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
         {
@@ -1739,7 +1886,7 @@ impl ChargebackRegistry {
 
         let prometheus_at = {
             let cached = self.prometheus_cache.load();
-            (**cached).as_ref().map(|(at, _, _)| *at)
+            (**cached).as_ref().map(|cache| cache.generated_at)
         };
         if render_cache_reached_min_age(prometheus_at, min_age_nanos) {
             self.prometheus_cache.store(Arc::new(None));
@@ -1747,7 +1894,7 @@ impl ChargebackRegistry {
 
         let json_at = {
             let cached = self.json_cache.load();
-            (**cached).as_ref().map(|(at, _, _, _)| *at)
+            (**cached).as_ref().map(|cache| cache.generated_at)
         };
         if render_cache_reached_min_age(json_at, min_age_nanos) {
             self.json_cache.store(Arc::new(None));
@@ -1755,23 +1902,28 @@ impl ChargebackRegistry {
     }
 
     /// Snapshot the instant a `/charges` export is about to start walking the
-    /// registry. Pair with [`Self::commit_collection_watermark`].
+    /// registry. Pair with [`Self::acknowledge_collection`].
     fn begin_collection(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
     }
 
-    /// Acknowledge collection of every entry that existed when the completed
+    /// Acknowledge collection of every entry that existed when a delivered
     /// export began its walk (issue #5276).
     ///
-    /// Committed only after the document has been produced AND accepted, so a
-    /// failed render never acknowledges counters no collector received. Taken
-    /// BEFORE the walk rather than after it so a charge recorded mid-walk —
-    /// which the document may or may not include — stays uncollected and
-    /// therefore un-evictable. `fetch_max` keeps the watermark monotonic when
-    /// two exports interleave.
-    fn commit_collection_watermark(&self, walk_started_nanos: u64) {
+    /// Called only once the rendered document has been delivered — by the
+    /// admin `/charges` handler after the connection has taken the complete
+    /// response body (see [`ChargesDeliveryAck`]), or directly by
+    /// [`Self::render_json`] / [`Self::render_prometheus`] for in-process
+    /// callers that consume the returned document themselves. A failed render
+    /// produces no receipt, and a scrape abandoned before its body is taken
+    /// never acknowledges counters no collector received. The receipt's walk
+    /// start is taken BEFORE the walk rather than after it so a charge recorded
+    /// mid-walk — which the document may or may not include — stays uncollected
+    /// and therefore un-evictable. `fetch_max` keeps the watermark monotonic
+    /// when exports are delivered out of order.
+    pub fn acknowledge_collection(&self, receipt: CollectionReceipt) {
         self.collection_watermark_nanos
-            .fetch_max(walk_started_nanos, Ordering::Release);
+            .fetch_max(receipt.walk_started_nanos, Ordering::Release);
     }
 
     /// Evict entries idle for at least `ttl_nanos` **whose counters a completed
@@ -1789,30 +1941,64 @@ impl ChargebackRegistry {
     /// hold their `max_entries` / `max_retained_bytes` reservations, and a
     /// registry at either ceiling folds further new rows into the
     /// fixed-cardinality aggregate overflow row exactly as before.
+    ///
+    /// **Eviction is all-or-nothing per exported series group.** Several
+    /// internal rows (one per billable status and pricing generation) sum into
+    /// one exported Prometheus counter and one JSON proxy row. Removing only the
+    /// idle members of such a group would make a live cumulative counter
+    /// decrease, which `increase()` / `rate()` read as a reset and re-count the
+    /// surviving history as new usage. A row is therefore evicted only when
+    /// every row sharing its `(consumer, proxy namespace, proxy id, currency)`
+    /// is itself idle and collected; the whole group then retires together and
+    /// its series ends instead of shrinking. (A group revived by a record that
+    /// lands during this walk can still lose its already-evicted members; that
+    /// needs traffic to resume within the walk itself.)
     pub fn evict_stale(&self, ttl_nanos: u64) -> usize {
         let collected_before = self.collection_watermark_nanos.load(Ordering::Acquire);
-        let mut evicted = 0;
+        let evictable = |v: &ChargebackEntry| {
+            v.nanos_since_update(self.epoch) >= ttl_nanos
+                && v.last_updated.load(Ordering::Relaxed) < collected_before
+        };
+
+        // Pass 1: find the series groups that must stay because at least one
+        // member is still active or holds uncollected counters.
         let mut uncollected = 0;
-        self.entries.retain(|_, v| {
-            if v.nanos_since_update(self.epoch) < ttl_nanos {
-                return true;
+        let mut any_evictable = false;
+        let mut retained_groups: HashSet<EvictionGroupKey> = HashSet::new();
+        for entry in self.entries.iter() {
+            let v = entry.value();
+            if evictable(v) {
+                any_evictable = true;
+                continue;
             }
-            if v.last_updated.load(Ordering::Relaxed) >= collected_before {
+            if v.nanos_since_update(self.epoch) >= ttl_nanos {
                 // Idle, but its current counters have never appeared in a
-                // completed export. Deleting it here would silently discard
+                // completed export. Deleting it would silently discard
                 // uncollected charges.
                 uncollected += 1;
+            }
+            retained_groups.insert(eviction_group_key(v));
+        }
+        self.uncollected_retained_entries
+            .store(uncollected, Ordering::Relaxed);
+        if !any_evictable {
+            return 0;
+        }
+
+        // Pass 2: evict idle, collected rows whose whole group is retiring.
+        let mut evicted = 0;
+        self.entries.retain(|_, v| {
+            let entry: &ChargebackEntry = v;
+            if !evictable(entry) || retained_groups.contains(&eviction_group_key(entry)) {
                 return true;
             }
             evicted += 1;
             // Release the evicted entry's reservation so capacity recovers
             // exactly. `retain` holds the shard lock, so no concurrent
             // insert can observe the slot before the release.
-            self.release_reservation(v.retained_bytes, v.counts_against_identity_budget);
+            self.release_reservation(entry.retained_bytes, entry.counts_against_identity_budget);
             false
         });
-        self.uncollected_retained_entries
-            .store(uncollected, Ordering::Relaxed);
         if evicted > 0 {
             self.prometheus_cache.store(Arc::new(None));
             self.json_cache.store(Arc::new(None));
@@ -1820,44 +2006,75 @@ impl ChargebackRegistry {
         evicted
     }
 
-    /// Render in Prometheus exposition format with caching.
+    /// Render in Prometheus exposition format with caching, acknowledging
+    /// collection immediately.
+    ///
+    /// For in-process callers that consume the returned document themselves.
+    /// The admin `/charges` endpoint uses [`Self::render_prometheus_pending`]
+    /// and acknowledges only after delivery.
     ///
     /// Returns `Err` when any monetary sample would be non-finite; callers must
     /// surface that as an explicit export failure rather than emitting `inf`.
     pub fn render_prometheus(&self) -> Result<String, String> {
+        let (output, receipt) = self.render_prometheus_pending()?;
+        self.acknowledge_collection(receipt);
+        Ok(output)
+    }
+
+    /// Render in Prometheus exposition format with caching, returning the
+    /// document and its not-yet-acknowledged [`CollectionReceipt`].
+    ///
+    /// Pass the receipt to [`Self::acknowledge_collection`] only once the
+    /// document has been delivered (issue #5276). A cache hit returns the
+    /// receipt of the walk that produced the cached document.
+    ///
+    /// A reload that keeps advancing the proxy-metadata generation during the
+    /// walk is retried at most [`MAX_RENDER_ATTEMPTS`] times; the last document
+    /// is then returned without being cached. Its counters are complete for its
+    /// walk — only the display-name snapshot may be one generation old — so its
+    /// receipt is still valid.
+    pub fn render_prometheus_pending(&self) -> Result<(String, CollectionReceipt), String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
-        let cached = self.prometheus_cache.load();
-        if let Some((generated_at, cached_generation, ref output)) = **cached
-            && cached_generation == metadata_generation
-            && generated_at.elapsed().as_secs() < ttl_secs
         {
-            return Ok(output.clone());
+            let cached = self.prometheus_cache.load();
+            if let Some(cache) = (**cached).as_ref()
+                && cache.metadata_generation == metadata_generation
+                && cache.generated_at.elapsed().as_secs() < ttl_secs
+            {
+                return Ok((cache.output.clone(), cache.receipt));
+            }
         }
 
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
-        // Snapshot before the first walk, commit only once a document is
-        // accepted: an export that errors out, or one whose generation check
-        // discards it, must not acknowledge collection (issue #5276).
-        let walk_started = self.begin_collection();
+        // Snapshot before the first walk. The receipt is only handed out with
+        // a produced document: an export that errors out acknowledges nothing.
+        let receipt = CollectionReceipt {
+            walk_started_nanos: self.begin_collection(),
+        };
+        let mut attempt = 1;
         loop {
             let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
             let output = self.render_prometheus_uncached()?;
-            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation {
-                continue;
-            }
-            self.prometheus_cache.store(Arc::new(Some((
-                Instant::now(),
-                metadata_generation,
-                output.clone(),
-            ))));
             if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
-                self.commit_collection_watermark(walk_started);
-                return Ok(output);
+                self.prometheus_cache
+                    .store(Arc::new(Some(CachedPrometheusRender {
+                        generated_at: Instant::now(),
+                        metadata_generation,
+                        receipt,
+                        output: output.clone(),
+                    })));
+                if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+                    return Ok((output, receipt));
+                }
+                self.prometheus_cache.store(Arc::new(None));
             }
-            self.prometheus_cache.store(Arc::new(None));
+            if attempt >= MAX_RENDER_ATTEMPTS {
+                return Ok((output, receipt));
+            }
+            attempt += 1;
         }
     }
 
@@ -2200,55 +2417,79 @@ impl ChargebackRegistry {
         })
     }
 
-    /// Render as JSON with caching.
+    /// Render as JSON with caching, acknowledging collection immediately.
+    ///
+    /// For in-process callers that consume the returned document themselves.
+    /// The admin `/charges` endpoint uses [`Self::render_json_pending`] and
+    /// acknowledges only after delivery.
     ///
     /// Returns `Err` when any monetary field would be non-finite; callers must
     /// return an explicit error response rather than serializing JSON `null`.
+    pub fn render_json(&self) -> Result<String, String> {
+        let (output, receipt) = self.render_json_pending()?;
+        self.acknowledge_collection(receipt);
+        Ok(output)
+    }
+
+    /// Render as JSON with caching, returning the document and its
+    /// not-yet-acknowledged [`CollectionReceipt`] (issue #5276).
     ///
     /// Cached documents are tagged with both proxy-metadata and projection
     /// generations. A render that snapped a prior schema (or prior proxy-name
     /// snapshot) can never repopulate the cache after those generations advance.
-    pub fn render_json(&self) -> Result<String, String> {
+    /// Like [`Self::render_prometheus_pending`], a walk invalidated by a
+    /// concurrent generation change is retried at most [`MAX_RENDER_ATTEMPTS`]
+    /// times and the last document is then returned uncached. Each document
+    /// still uses one schema snapshot throughout.
+    pub fn render_json_pending(&self) -> Result<(String, CollectionReceipt), String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
         let schema_generation = self.render_schema_generation.load(Ordering::Acquire);
-        let cached = self.json_cache.load();
-        if let Some((generated_at, cached_meta_gen, cached_schema_gen, ref output)) = **cached
-            && cached_meta_gen == metadata_generation
-            && cached_schema_gen == schema_generation
-            && generated_at.elapsed().as_secs() < ttl_secs
         {
-            return Ok(output.clone());
+            let cached = self.json_cache.load();
+            if let Some(cache) = (**cached).as_ref()
+                && cache.metadata_generation == metadata_generation
+                && cache.schema_generation == schema_generation
+                && cache.generated_at.elapsed().as_secs() < ttl_secs
+            {
+                return Ok((cache.output.clone(), cache.receipt));
+            }
         }
 
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
         // Same collection contract as the Prometheus export (issue #5276):
-        // snapshot before the walk, acknowledge only an accepted document.
-        let walk_started = self.begin_collection();
+        // snapshot before the walk, hand the receipt out only with a document.
+        let receipt = CollectionReceipt {
+            walk_started_nanos: self.begin_collection(),
+        };
+        let mut attempt = 1;
         loop {
             let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
             let schema_generation = self.render_schema_generation.load(Ordering::Acquire);
             let output = self.render_json_uncached()?;
-            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation
-                || self.render_schema_generation.load(Ordering::Acquire) != schema_generation
-            {
-                continue;
+            let generations_unchanged = || {
+                self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
+                    && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
+            };
+            if generations_unchanged() {
+                self.json_cache.store(Arc::new(Some(CachedJsonRender {
+                    generated_at: Instant::now(),
+                    metadata_generation,
+                    schema_generation,
+                    receipt,
+                    output: output.clone(),
+                })));
+                if generations_unchanged() {
+                    return Ok((output, receipt));
+                }
+                self.json_cache.store(Arc::new(None));
             }
-            self.json_cache.store(Arc::new(Some((
-                Instant::now(),
-                metadata_generation,
-                schema_generation,
-                output.clone(),
-            ))));
-            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
-                && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
-            {
-                self.commit_collection_watermark(walk_started);
-                return Ok(output);
+            if attempt >= MAX_RENDER_ATTEMPTS {
+                return Ok((output, receipt));
             }
-            self.json_cache.store(Arc::new(None));
+            attempt += 1;
         }
     }
 
@@ -2729,6 +2970,22 @@ pub struct ApiChargeback {
     tunables: SharedRegistryTunables,
 }
 
+/// Whether a resolved pricing configuration bills WebSocket bandwidth and so
+/// needs the parsed relay's payload byte counters.
+fn pricing_requires_websocket_framing(pricing: &PricingConfig) -> bool {
+    pricing.bandwidth_price_sent > 0.0 || pricing.bandwidth_price_received > 0.0
+}
+
+/// Config-level form of [`Plugin::requires_websocket_framing`] for
+/// `websocket_permessage_deflate: passthrough` admission, which must not
+/// construct the plugin: an `api_chargeback` config needs the parsed WebSocket
+/// relay exactly when it prices bandwidth. An unparseable pricing block is an
+/// error so admission fails closed.
+pub(crate) fn config_requires_websocket_framing(config: &Value) -> Result<bool, String> {
+    let pricing = PricingConfig::from_config(config, "api_chargeback")?;
+    Ok(pricing_requires_websocket_framing(&pricing))
+}
+
 fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
     match config.get(key) {
         Some(value) => value
@@ -2951,6 +3208,16 @@ impl Plugin for ApiChargeback {
 
     fn requires_ws_disconnect_hooks(&self) -> bool {
         true
+    }
+
+    /// Bandwidth pricing bills WebSocket sessions from the parsed relay's
+    /// payload byte counters. The H1 raw tunnel (`FERRUM_WEBSOCKET_TUNNEL_MODE`
+    /// or a negotiated `permessage-deflate` passthrough) instead counts wire
+    /// bytes, and reports none of the relayed bytes when gateway policy stops
+    /// the session, so a bandwidth-priced instance keeps its sessions on the
+    /// parsed relay: one billing basis regardless of relay mode.
+    fn requires_websocket_framing(&self) -> bool {
+        pricing_requires_websocket_framing(&self.pricing)
     }
 
     async fn on_ws_disconnect(&self, summary: &WsDisconnectContext) {

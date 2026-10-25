@@ -45,7 +45,10 @@ pub const BUILTIN_RESPONSE_BODY_PRODUCERS: &[&str] = &[
 /// built-in that can require framing but is missing here would let a proxy
 /// accept compression the plugin then cannot see, so
 /// `tests/unit/plugins/plugin_doc_parity_tests.rs` pins the set against the
-/// documented `on_ws_frame` / parser-limit phases. Out-of-tree plugins declare
+/// documented `on_ws_frame` / parser-limit phases. `api_chargeback` is the one
+/// built-in whose need is config-dependent (only bandwidth pricing requires the
+/// parsed relay); it is deliberately absent here and passthrough admission
+/// answers for it from its parsed pricing. Out-of-tree plugins declare
 /// the capability by overriding `requires_ws_frame_hooks()`,
 /// `websocket_size_limits()`, or `requires_websocket_framing()`; admission
 /// constructs them and asks the instance.

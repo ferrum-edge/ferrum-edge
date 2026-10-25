@@ -5263,3 +5263,384 @@ fn test_uncollected_retained_entries_is_exported_without_identities() {
     assert!(prometheus.contains(&format!("# TYPE {gauge} gauge")));
     assert!(!line.contains("consumer="), "the gauge carries no labels");
 }
+
+// --- Production-launch review fixes ---
+
+/// The value of the first `family` sample labelled with `consumer`.
+fn prometheus_sample(document: &str, family: &str, consumer: &str) -> Option<f64> {
+    let prefix = format!("{family}{{");
+    let label = format!("consumer=\"{consumer}\"");
+    document
+        .lines()
+        .filter(|line| line.starts_with(&prefix))
+        .find(|line| line.contains(&label))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+}
+
+/// api_chargeback-SOL-1: ordinary rows can never consume the bytes the
+/// overflow fallback needs, so a byte-saturated registry still preserves every
+/// charge instead of counting it as dropped.
+#[test]
+fn test_byte_saturation_folds_into_reserved_overflow_without_dropping() {
+    let budget = ferrum_edge::plugins::api_chargeback::MIN_MAX_RETAINED_BYTES;
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, budget);
+
+    for index in 0..500 {
+        record_identity(&registry, &format!("user-{index}"));
+    }
+
+    assert!(
+        registry.retained_bytes_for_tests() <= budget,
+        "retained bytes {} exceeded the configured ceiling",
+        registry.retained_bytes_for_tests()
+    );
+    assert!(
+        registry.reserved_entries_for_tests() > 0,
+        "ordinary rows are still admitted up to their share"
+    );
+    let total_calls: u64 = registry
+        .entries
+        .iter()
+        .map(|entry| entry.value().call_count.load(Ordering::Relaxed))
+        .sum();
+    assert_eq!(total_calls, 500, "every billable call must be retained");
+    assert!(
+        by_consumer_calls(&registry, OVERFLOW_CONSUMER_SENTINEL) > 0,
+        "refused identities fold into the overflow row"
+    );
+    let rendered: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(rendered["registry"]["dropped_charges_total"], 0);
+}
+
+/// The reserved share is exactly what ordinary rows may not use.
+#[test]
+fn test_ordinary_row_byte_ceiling_reserves_a_quarter_for_overflow() {
+    use ferrum_edge::plugins::api_chargeback::ordinary_row_byte_ceiling;
+    assert_eq!(ordinary_row_byte_ceiling(4096), 3072);
+    assert_eq!(
+        ordinary_row_byte_ceiling(DEFAULT_MAX_RETAINED_BYTES),
+        DEFAULT_MAX_RETAINED_BYTES / 4 * 3
+    );
+}
+
+/// A budget too small for its overflow reserve to hold an overflow row is
+/// refused at construction.
+#[test]
+fn test_max_retained_bytes_below_floor_is_rejected() {
+    let floor = ferrum_edge::plugins::api_chargeback::MIN_MAX_RETAINED_BYTES;
+    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]});
+
+    let mut too_small = base.clone();
+    too_small["max_retained_bytes"] = json!(floor - 1);
+    let error = ApiChargeback::new(&too_small, "ferrum")
+        .err()
+        .expect("a budget below the floor must be refused");
+    assert!(error.contains("`max_retained_bytes`"), "{error}");
+
+    let mut at_floor = base;
+    at_floor["max_retained_bytes"] = json!(floor);
+    assert!(ApiChargeback::new(&at_floor, "ferrum").is_ok());
+}
+
+/// api_chargeback-SOL-2: an idle, collected status row whose bandwidth series
+/// is still live must not be evicted on its own — the exported cumulative
+/// counter would otherwise decrease and read as a reset.
+#[test]
+fn test_idle_row_of_a_live_series_is_not_evicted_alone() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let record = |status: u16, bytes_received: u64| {
+        registry.record_http(
+            &scope(),
+            "alice-live-series",
+            "proxy-live-series",
+            "API",
+            status,
+            0.0,
+            0,
+            bytes_received,
+            0.0,
+            0.001,
+        );
+    };
+    record(500, 100_000);
+    record(200, 1_000_000);
+    registry.render_prometheus().unwrap();
+    // Only the 200 row sees traffic after the export.
+    record(200, 1);
+
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "the idle 500 row shares a live bandwidth series"
+    );
+    assert_eq!(registry.entries.len(), 2);
+    let document = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prometheus_sample(
+            &document,
+            "ferrum_api_bytes_received_total",
+            "alice-live-series"
+        ),
+        Some(1_100_001.0),
+        "the cumulative counter must not decrease:\n{document}"
+    );
+
+    // Once every member is idle and collected, the group retires together.
+    assert_eq!(registry.evict_stale(0), 2);
+    assert!(registry.entries.is_empty());
+    assert_eq!(registry.reserved_entries_for_tests(), 0);
+}
+
+/// api_chargeback-SOL-2: a retired pricing generation shares its per-call
+/// series with the live generation and must not be evicted on its own.
+#[test]
+fn test_retired_pricing_generation_of_a_live_series_is_not_evicted_alone() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    let record = |price: f64| {
+        registry.record_http(
+            &scope(),
+            "bob-reprice",
+            "proxy-reprice",
+            "API",
+            200,
+            price,
+            0,
+            0,
+            0.0,
+            0.0,
+        );
+    };
+    record(0.01);
+    record(0.01);
+    registry.render_prometheus().unwrap();
+    // A pricing reload: new traffic lands on a new pricing-generation row.
+    record(0.02);
+
+    assert_eq!(registry.evict_stale(0), 0);
+    let document = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prometheus_sample(
+            &document,
+            "ferrum_api_chargeable_calls_total",
+            "bob-reprice"
+        ),
+        Some(3.0),
+        "{document}"
+    );
+    assert_eq!(registry.evict_stale(0), 2);
+}
+
+/// api_chargeback-CLAUDE-1: bandwidth pricing keeps WebSocket sessions on the
+/// parsed relay, so tunnel mode cannot change the billing basis.
+#[test]
+fn test_bandwidth_pricing_requires_the_parsed_websocket_relay() {
+    let framing = |config: serde_json::Value| {
+        ApiChargeback::new(&config, "ferrum")
+            .unwrap()
+            .requires_websocket_framing()
+    };
+    assert!(framing(
+        json!({"bandwidth_pricing": {"price_per_byte_sent": 0.001}})
+    ));
+    assert!(framing(json!({
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}],
+        "bandwidth_pricing": {"price_per_byte_sent": 0.0, "price_per_byte_received": 0.002}
+    })));
+    assert!(!framing(
+        json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]})
+    ));
+    assert!(!framing(
+        json!({"stream_connection_pricing": {"price_per_connection": 0.5}})
+    ));
+}
+
+/// api_chargeback-CLAUDE-2: a gRPC terminal status present on the wire but
+/// unreadable by the gateway bills at the documented `500`, not the wire `200`.
+#[tokio::test]
+async fn test_unreadable_grpc_status_bills_the_500_tier() {
+    let config = json!({
+        "pricing_tiers": [
+            {"status_codes": [200], "price_per_call": 0.001},
+            {"status_codes": [500], "price_per_call": 0.008}
+        ]
+    });
+    let plugin = ApiChargeback::new(&config, "ferrum").unwrap();
+    let registry = global_registry();
+    let consumer = "grpc-billing-unreadable-user";
+    let proxy_id = "grpc-billing-unreadable";
+    let mut summary = make_grpc_summary(proxy_id, consumer, None);
+    summary.metadata.insert(
+        "grpc_status_unreadable".to_string(),
+        "compressed_trailer_frame".to_string(),
+    );
+
+    let outcome = ferrum_edge::plugins::chargeback::http_billing_outcome(&summary);
+    assert_eq!(outcome.status_code, 500);
+    assert_eq!(outcome.http_status_code, 200);
+    assert_eq!(outcome.grpc_status, None, "the raw status stays unset");
+
+    plugin.log(&summary).await;
+    let billed = make_key_with_prices(
+        consumer,
+        proxy_id,
+        500,
+        ProtocolFamily::Http,
+        0.008,
+        0.0,
+        0.0,
+    );
+    assert!(registry.entries.contains_key(&billed));
+    let success = make_key_with_prices(
+        consumer,
+        proxy_id,
+        200,
+        ProtocolFamily::Http,
+        0.001,
+        0.0,
+        0.0,
+    );
+    assert!(
+        !registry.entries.contains_key(&success),
+        "an unreadable status must not be billed as success"
+    );
+}
+
+/// api_chargeback-CLAUDE-3: rendering a document acknowledges nothing until
+/// its receipt is returned, and a cached re-serve carries the same receipt.
+#[test]
+fn test_pending_render_acknowledges_only_when_its_receipt_is_returned() {
+    for json_format in [true, false] {
+        let registry = ChargebackRegistry::new();
+        registry.configure(600, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+        record_identity(&registry, "user-a");
+        let render = || {
+            if json_format {
+                registry.render_json_pending().unwrap()
+            } else {
+                registry.render_prometheus_pending().unwrap()
+            }
+        };
+
+        let (document, receipt) = render();
+        assert_eq!(
+            registry.evict_stale(0),
+            0,
+            "an undelivered document collected nothing (json={json_format})"
+        );
+        let (cached, cached_receipt) = render();
+        assert_eq!(cached, document, "the retry is served from the cache");
+        assert_eq!(cached_receipt, receipt);
+
+        registry.acknowledge_collection(receipt);
+        assert_eq!(registry.evict_stale(0), 1, "json={json_format}");
+    }
+}
+
+/// api_chargeback-CLAUDE-3: the admin connection acknowledges a `/charges`
+/// document only once it has taken the complete body.
+#[tokio::test]
+async fn test_charges_delivery_ack_fires_only_once_the_body_is_taken() {
+    use ferrum_edge::plugins::api_chargeback::ChargesDeliveryAck;
+
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    record_identity(&registry, "user-a");
+    let (document, receipt) = registry.render_json_pending().unwrap();
+    let response_with_ack = || {
+        let mut response = hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(
+            document.clone(),
+        )));
+        response
+            .extensions_mut()
+            .insert(ChargesDeliveryAck::new(Arc::clone(&registry), receipt));
+        response
+    };
+
+    ferrum_edge::_test_support::drop_guarded_admin_response_unpolled_for_test(response_with_ack());
+    assert_eq!(
+        registry.evict_stale(0),
+        0,
+        "a response dropped before its body was taken acknowledges nothing"
+    );
+
+    let body =
+        ferrum_edge::_test_support::collect_guarded_admin_response_for_test(response_with_ack())
+            .await;
+    assert_eq!(body.as_ref(), document.as_bytes());
+    assert_eq!(
+        registry.evict_stale(0),
+        1,
+        "a delivered document acknowledges its walk"
+    );
+}
+
+/// api_chargeback-CLAUDE-4: a reload that keeps advancing the proxy-metadata
+/// generation cannot keep one `/charges` render walking forever.
+#[test]
+fn test_render_terminates_under_continuous_generation_churn() {
+    let registry = Arc::new(ChargebackRegistry::new());
+    registry.configure(0, 3600, 0, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    // Enough rows that every walk overlaps several generation advances.
+    for index in 0..20_000 {
+        record_identity(&registry, &format!("churn-{index}"));
+    }
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flapper = {
+        let registry = Arc::clone(&registry);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut flip = false;
+            while !stop.load(Ordering::Relaxed) {
+                flip = !flip;
+                let name = if flip { "Churn A" } else { "Churn B" };
+                registry.set_active_proxy_names(active_proxy_names("ferrum", "proxy-a", name));
+            }
+        })
+    };
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    {
+        let registry = Arc::clone(&registry);
+        std::thread::spawn(move || {
+            let json = registry.render_json_pending().is_ok();
+            let prometheus = registry.render_prometheus_pending().is_ok();
+            let _ = sender.send(json && prometheus);
+        });
+    }
+    let finished = receiver.recv_timeout(std::time::Duration::from_secs(60));
+    stop.store(true, Ordering::Relaxed);
+    let _ = flapper.join();
+    assert_eq!(
+        finished,
+        Ok(true),
+        "each render must return within MAX_RENDER_ATTEMPTS walks"
+    );
+}
+
+/// api_chargeback-CLAUDE-5: an interval whose sleep deadline could overflow is
+/// refused instead of panicking the singleton cleanup task.
+#[test]
+fn test_cleanup_interval_above_one_year_is_rejected() {
+    use ferrum_edge::plugins::api_chargeback::{MAX_CLEANUP_INTERVAL_SECS, SharedRegistryTunables};
+
+    let base = json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.001}]});
+    for value in [MAX_CLEANUP_INTERVAL_SECS + 1, u64::MAX] {
+        let mut config = base.clone();
+        config["cleanup_interval_seconds"] = json!(value);
+        let error = ApiChargeback::new(&config, "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("cleanup_interval_seconds={value} must be refused"));
+        assert!(error.contains("`cleanup_interval_seconds`"), "{error}");
+        assert!(SharedRegistryTunables::from_config(&config).is_err());
+    }
+
+    let mut at_max = base;
+    at_max["cleanup_interval_seconds"] = json!(MAX_CLEANUP_INTERVAL_SECS);
+    assert!(ApiChargeback::new(&at_max, "ferrum").is_ok());
+}
