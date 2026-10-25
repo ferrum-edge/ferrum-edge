@@ -129,6 +129,7 @@ fn mesh_config_and_slice_collection_elements_require_objects() {
         ("ambient_udp_source_workloads", workload()),
         ("node_waypoint_capture_destinations", workload()),
         ("node_waypoint_capture_peer_authentications", named()),
+        ("node_waypoint_capture_mesh_policies", policy()),
         ("local_inbound_services", named()),
         ("local_inbound_workloads", workload()),
         (
