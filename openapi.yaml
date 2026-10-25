@@ -22715,7 +22715,7 @@ components:
             method: POST
             headers:
               Content-Type: application/json
-            body_template: '{"routing_key":"$ROUTING_KEY","event_action":"${event_action}","payload":{"summary":"${rule_name}: ${reason}","source":"${proxy_name}","severity":"${severity}"}}'
+            body_template: '{"routing_key":"$ROUTING_KEY","event_action":"${event_action}","dedup_key":"${incident_key}","payload":{"summary":"${rule_name}: ${reason}","source":"${proxy_name}","severity":"${severity}"}}'
         rules:
           - name: proxy_5xx_spike
             enabled: true
@@ -22906,8 +22906,12 @@ components:
           description: |
             Template body. Supports generic notification variables plus
             proxy_alerts variables such as `${rule_name}`, `${proxy_name}`,
-            `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`,
-            and `${reason}`. Empty strings are allowed. Unbalanced `${`
+            `${incident_key}` (stable per plugin config + namespace + proxy +
+            rule; use it as the receiver's correlation key, e.g. PagerDuty
+            `dedup_key`),
+            `${observed}`, `${threshold}`, `${sample_count}` (total samples in
+            the rule window), `${window_seconds}`, and `${reason}`. Empty
+            strings are allowed. Unbalanced `${`
             placeholders are rejected at construction; JSON Schema cannot
             express balanced-placeholder syntax.
 

@@ -13478,8 +13478,9 @@ pub fn create_plugin_with_http_client(
 /// it so reload generations inherit prior claims, `waf` instances isolate
 /// anomaly-score accumulators / ownership metadata, and `api_chargeback_sink`
 /// instances publish accepted-generation
-/// status/metrics under that stable identity, while `request_mirror` records
-/// attribute each shadow destination. Pass `None` for config-validation and
+/// status/metrics under that stable identity, `proxy_alerts` scopes its
+/// `${incident_key}` receiver correlation key to it, while `request_mirror`
+/// records attribute each shadow destination. Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
 /// (uses the plugin's standalone default id). Blank ids fail closed when
 /// supplied.
@@ -13734,10 +13735,16 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.namespace(),
         )?))),
-        "proxy_alerts" => Ok(Some(Arc::new(proxy_alerts::ProxyAlerts::new(
-            config,
-            http_client.clone(),
-        )?))),
+        // The stable plugin-config id scopes `${incident_key}`, so two
+        // instances that reuse a rule name on one proxy never share a
+        // receiver incident.
+        "proxy_alerts" => Ok(Some(Arc::new(
+            proxy_alerts::ProxyAlerts::new_with_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "api_chargeback" => Ok(Some(Arc::new(
             api_chargeback::ApiChargeback::new_with_shard_amount(
                 config,
