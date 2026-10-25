@@ -391,6 +391,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **BREAKING — `opa` binds external identities to their realm and screens
+  repeated headers** (#6860). `input.consumer` for an external identity now
+  carries `realm: {mechanism, authority}` (an opaque, stable hex digest of
+  the verifying authority, committed with the identity by the authentication
+  boundary; `null` when none was committed), so two accepted issuers' equal
+  `sub` values are no longer the same principal to a policy. A non-list
+  request header repeated across field lines (or map keys differing only in
+  case) is now denied before OPA is called; the new `header_ambiguity_policy:
+  delegate` instead reports it in `input.header_ambiguity` /
+  `input.header_pairs`. Default header and query redaction also applies the
+  shared sensitive-name classifier (`x-vault-token`, `refresh_token`,
+  `X-Amz-Signature`, `password`, …). With `include_body`, a proven-empty
+  HTTP/1.1 or HTTP/2 body is now `body: ""` like HTTP/3 and
+  `Content-Length: 0` (it was `null`), and the body is never read from
+  `request_body` metadata. New opt-ins: `decision_request_headers` (allow
+  decisions set listed upstream headers, whose client copies are stripped),
+  `decision_deny_response` (deny decisions choose status, body, headers), and
+  `max_concurrent_decisions` (per-instance bulkhead that takes the failure
+  posture when saturated). Every decision records `opa.decision` /
+  `opa.reason` transaction metadata. See `docs/upgrade_guide.md`.
 - **BREAKING: `mcp_gateway` gates prompts and resources by policy and keeps
   client credentials off tool-selected upstreams** (issue #6819). New
   `policy.prompts` / `policy.resources` maps (`allow` / `deny`) with

@@ -28,6 +28,35 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
+### `opa`: identity realms, repeated headers, credential redaction, and empty bodies (#6860)
+
+- **Realm-aware policies.** For an external identity (no mapped Consumer),
+  `input.consumer` now includes `realm: {mechanism, authority}`. Policies that
+  authorize on `input.consumer.identity` should also match `realm` (and
+  require it to be non-null): read each authority's digest from OPA's
+  decision log for a test request and pin it in Rego. Existing fields are
+  unchanged.
+- **Repeated headers are denied by default.** A request that repeats a
+  non-list header (for example two `X-Role` lines) now receives
+  `deny_status` before OPA is called (`opa.reason` `ambiguous_header`).
+  Clients that legitimately send such duplicates must fold them, or set
+  `header_ambiguity_policy: delegate` and deny on
+  `input.header_ambiguity` in Rego. List-valued fields (`Accept*`,
+  `Cache-Control`, `Cookie`, `Via`, `X-Forwarded-*`, …) are unaffected.
+- **More names are redacted.** Headers and query parameters that the shared
+  sensitive-name classifier recognizes as credentials (`x-vault-token`,
+  `x-session-id`, `refresh_token`, `client_secret`, `password`,
+  `X-Amz-Signature`, …) no longer reach `input.headers`, `input.query`, or
+  the pair lists. A policy that read one must stop relying on it; for query
+  names, `include_query_credentials: true` restores them.
+- **Empty bodies.** With `include_body: true`, a bodiless HTTP/1.1 or HTTP/2
+  request now has `input.body == ""` (it was `null`), matching HTTP/3 and
+  `Content-Length: 0`. `null` now only means no body was collected (for
+  example a WebSocket handshake). Rules that tested `input.body == null` for
+  an empty request must test `""`.
+- New opt-in keys `decision_request_headers`, `decision_deny_response`, and
+  `max_concurrent_decisions` change nothing unless configured.
+
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
 In `aggregate_router` mode prompts, resources, and resource templates are now
