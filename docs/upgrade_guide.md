@@ -28,36 +28,17 @@ applied by editing the file (see [File Mode](#file-mode-ferrum_modefile)).
 
 ## Upgrading to the next release (unreleased)
 
-### `ai_stream_router`: refused configurations, requests, and provider TLS isolation (#6824)
+### `cors` method and header lists are bounded (#6844)
 
-Re-run `ferrum-edge validate` on every `ai_stream_router` config. These were
-admitted before and are now configuration errors: `anthropic_version: ""`
-(omit it or use `null` for the default), an endpoint with `user:password@`
-userinfo or a `#fragment`, `default_max_tokens` on any provider other than
-`anthropic`, and a `google_gemini` endpoint without `{model}` whose
-`model_patterns` is anything but the single model name the URL path names —
-add `{model}` to the endpoint or narrow the patterns.
-
-Clients that relied on silently dropped parameters now receive an
-OpenAI-shaped `400` naming the parameter: a non-integer or non-positive
-`max_tokens` / `max_completion_tokens`; `logit_bias` (non-empty),
-`logprobs: true`, or `top_logprobs`; for Anthropic, `n > 1`, non-zero
-`presence_penalty` / `frequency_penalty`, `seed`, or a JSON `response_format`;
-for Gemini, `parallel_tool_calls: false` with callable tools or a strict
-`json_schema` that uses keywords Gemini does not enforce. Anthropic extended
-thinking (`enabled` or `adaptive`) is refused with callable tools or on a
-tool-result continuation; send `tool_choice: "none"` or disable thinking for
-tool turns. Anthropic requests without an output bound still forward `4096`
-unless the provider sets `default_max_tokens`.
-
-A claimed Anthropic `2xx` response that is not `text/event-stream` now fails
-closed with a `502` instead of streaming provider-native bytes. An `https`
-provider without `inherit_backend_tls: true` is verified against the built-in
-public roots only: a private `FERRUM_TLS_CA_BUNDLE_PATH` no longer applies, so
-an internal provider behind private PKI must set `inherit_backend_tls: true`
-(which keeps the proxy's resolved TLS and its global fallbacks), and the
-global backend client certificate is no longer presented to third-party
-providers.
+`cors` `allowed_methods`, `allowed_headers`, and `exposed_headers` each accept
+at most 128 entries, and each entry at most 256 bytes. A plugin config over
+either bound now fails startup/reload with a field-specific error naming the
+list, admin API writes are rejected by the same constructor, and an Istio
+`VirtualService` `corsPolicy` over the bound is reported as a deferred
+`http[].corsPolicy` field instead of being projected. Before upgrading, check
+those three lists in every `cors` plugin config and Istio `corsPolicy`, and
+remove duplicates or unused names until each is within the bound. Configs
+already within the bounds need no change.
 
 ### `mcp_gateway`: prompt/resource policy, client credentials, and session DELETE (#6819)
 
