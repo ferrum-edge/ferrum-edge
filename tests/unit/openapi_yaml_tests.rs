@@ -15724,6 +15724,69 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
         status_schema["properties"]["replica_limit_behavior"]["enum"][0],
         "configured_limit_per_replica"
     );
+    assert!(
+        status_schema["required"]
+            .as_array()
+            .expect("required list")
+            .contains(&json!("active_connections")),
+        "admin metrics must always report live throttle occupancy"
+    );
+    assert_eq!(
+        status_schema["properties"]["active_connections"]["type"],
+        "integer"
+    );
+    assert!(metrics_source.contains("pub active_connections: u64"));
+
+    // IPv6 grouping is an explicit, validated contract shared by the schema,
+    // the runtime parser, and the docs. It matches `rate_limiting`'s
+    // `ipv6_prefix` (default /64, range 1..=128).
+    let rate_limit_prefix = spec
+        .pointer("/components/schemas/RateLimitingConfig/properties/ipv6_prefix")
+        .expect("RateLimitingConfig.ipv6_prefix exists");
+    let prefix = &schema["properties"]["ipv6_prefix"];
+    assert_eq!(prefix["type"], "integer");
+    assert_eq!(prefix["default"], json!(64));
+    assert_eq!(prefix["minimum"], json!(1));
+    assert_eq!(prefix["maximum"], json!(128));
+    for bound in ["type", "minimum", "maximum", "default"] {
+        assert_eq!(
+            prefix[bound], rate_limit_prefix[bound],
+            "ipv6_prefix `{bound}` must match rate_limiting"
+        );
+    }
+    for (value, expected_valid) in [
+        (json!(1), true),
+        (json!(64), true),
+        (json!(128), true),
+        (json!(0), false),
+        (json!(129), false),
+        (json!("64"), false),
+    ] {
+        let config = json!({"max_connections_per_key": 1, "ipv6_prefix": value});
+        assert_component_validity(
+            &spec,
+            "TcpConnectionThrottleConfig",
+            &config,
+            expected_valid,
+        );
+        assert_eq!(
+            ferrum_edge::plugins::validate_plugin_config("tcp_connection_throttle", &config)
+                .is_ok(),
+            expected_valid,
+            "runtime and schema must agree on {config}"
+        );
+    }
+    for text in [schema_text.as_str(), plugin_docs] {
+        assert!(text.contains("ipv6_prefix"), "missing IPv6 grouping");
+        assert!(
+            text.contains("FERRUM_TCP_MAX_CONNECTIONS_PER_IP"),
+            "missing the accept-time per-IP bound interaction"
+        );
+        assert!(
+            text.contains("ferrum_tcp_connection_throttle_rejections_total"),
+            "missing the refusal counter"
+        );
+    }
 }
 
 #[test]

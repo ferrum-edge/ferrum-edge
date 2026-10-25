@@ -8922,6 +8922,23 @@ impl PluginCache {
         total
     }
 
+    /// Live TCP connections currently admitted by every `tcp_connection_throttle`
+    /// policy in the published generation, summed across keys.
+    ///
+    /// Read on demand for authenticated `/admin/metrics`: it walks each
+    /// policy's counter map and adds nothing to the stream admission path.
+    /// Connections still held by a policy that was since removed finish against
+    /// their detached state and are not counted here.
+    pub fn tcp_connection_throttle_active_connections(&self) -> u64 {
+        self.inner
+            .load()
+            .tcp_connection_throttle_instances
+            .values()
+            .fold(0u64, |total, instance| {
+                total.saturating_add(instance.state.active_connections())
+            })
+    }
+
     /// Deduplicated immutable country-MMDB bytes retained by the live cache
     /// generation. Exposed for diagnostics and admission regression tests.
     pub fn country_mmdb_snapshot_bytes(&self) -> u64 {

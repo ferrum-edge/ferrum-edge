@@ -19733,9 +19733,21 @@ components:
 
     AdminMetricsTcpConnectionThrottle:
       type: object
-      description: Runtime scope contract for TCP concurrent-connection throttling.
-      required: [enforcement_scope, replica_limit_behavior]
+      description: >-
+        Runtime scope contract and live occupancy for TCP concurrent-connection
+        throttling.
+      required: [enforcement_scope, replica_limit_behavior, active_connections]
       properties:
+        active_connections:
+          type: integer
+          minimum: 0
+          description: >-
+            Live TCP connections this process currently holds under every
+            configured tcp_connection_throttle policy, summed across all
+            Consumer/IP keys. Computed when the endpoint is read; connections
+            still held by a policy that was since removed are not counted.
+            Per-proxy refusals are exported as the Prometheus counter
+            ferrum_tcp_connection_throttle_rejections_total.
         enforcement_scope:
           type: string
           enum: [process_local]
@@ -30302,6 +30314,16 @@ components:
         Enforcement is process-local, so each replica independently permits up
         to the configured limit and the deployment-wide allowance can be the
         limit multiplied by the number of replicas receiving the same identity.
+        IP keys use the canonical client IP: IPv4 (including IPv4-mapped IPv6)
+        is keyed per address, while native IPv6 sources are grouped to
+        ipv6_prefix (default /64), so hosts in one /64 share a budget
+        unless it is raised to 128. For IP keys the gateway-wide accept-time
+        bound FERRUM_TCP_MAX_CONNECTIONS_PER_IP (default 256, counted across
+        every TCP stream listener and grouped by FERRUM_PER_IP_IPV6_PREFIX)
+        applies first and closes over-cap connections before this plugin runs,
+        so a max_connections_per_key above that bound can never bind; this
+        plugin can only tighten it. Refusals are counted per proxy in the
+        Prometheus counter ferrum_tcp_connection_throttle_rejections_total.
       required: [max_connections_per_key]
       properties:
         max_connections_per_key:
@@ -30312,7 +30334,21 @@ components:
           description: >-
             Maximum active TCP connections allowed for one Consumer/IP key in
             this ferrum-edge process. Each replica enforces this limit
-            independently.
+            independently. For IP keys the effective limit is also bounded by
+            FERRUM_TCP_MAX_CONNECTIONS_PER_IP (default 256), which is enforced
+            at accept time before this plugin runs.
+        ipv6_prefix:
+          type: integer
+          default: 64
+          minimum: 1
+          maximum: 128
+          description: >-
+            Prefix length used to group native IPv6 client addresses into one
+            IP key. The default 64 makes every host in one /64 share a budget;
+            128 keys each IPv6 address separately. IPv4 and IPv4-mapped IPv6
+            clients are always keyed per address, and Consumer keys are
+            unaffected. Independent of FERRUM_PER_IP_IPV6_PREFIX, which only
+            groups the gateway-wide FERRUM_*_PER_IP caps.
         cleanup_interval_seconds:
           type: integer
           format: uint64
