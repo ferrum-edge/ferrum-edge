@@ -8918,6 +8918,15 @@ fn cohere_preamble_body(instruction: &str, user: &str) -> Value {
     json!({"model": "command-r", "preamble": instruction, "message": user})
 }
 
+/// One instruction-container case: label, body builder, stored instruction,
+/// and the case/whitespace-only variant that must not share its scope.
+type InstructionScopeCase = (
+    &'static str,
+    fn(&str, &str) -> Value,
+    &'static str,
+    &'static str,
+);
+
 /// SOL-2: governing instructions are an exact partition of the semantic scope.
 /// A capitalization- or indentation-only instruction change must never
 /// semantic-hit, even with an identical user turn and an identical embedding;
@@ -8927,7 +8936,7 @@ async fn semantic_instruction_scope_is_byte_exact_across_instruction_containers(
     let server = MockServer::start().await;
     mount_fixed_embedding(&server).await;
 
-    let cases: [(&str, fn(&str, &str) -> Value, &str, &str); 7] = [
+    let cases: [InstructionScopeCase; 7] = [
         (
             "messages system",
             messages_system_body,

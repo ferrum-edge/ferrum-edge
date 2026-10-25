@@ -362,7 +362,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - **BREAKING — `ai_semantic_cache` hardening from the production-launch
-  review.** Exact keys and semantic scopes now bind the request's complete
+  review** (issue #6822). Exact keys and semantic scopes now bind the request's complete
   response-side policy provenance (RTDS gate content plus the static
   response-presentation digest), so an entry retained under an earlier
   `response_transformer` rule — locally or by another replica in Redis — can no
