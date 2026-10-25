@@ -15,7 +15,7 @@
 //!   "max_frame_bytes": 65536,
 //!   "max_message_bytes": 262144,
 //!   "close_reason": "Message too large",
-//!   "backend_to_client": { "max_frame_bytes": 1048576 }
+//!   "backend_to_client": { "max_frame_bytes": 1048576, "max_message_bytes": 4194304 }
 //! }
 //! ```
 //!
