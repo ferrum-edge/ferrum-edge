@@ -756,6 +756,10 @@ impl Plugin for GrpcMethodRouter {
                         plugin = "grpc_method_router",
                         "gRPC method rate limit exceeded"
                     );
+                    // The quota refusal is the operational signal the shared
+                    // exceeded counter exists for; the capacity arm above
+                    // already records it.
+                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     let remaining = outcome.remaining.unwrap_or(0);
                     let mut headers = grpc_content_type_header();
                     headers.insert(

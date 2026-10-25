@@ -18,8 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cap and is not part of the local-state fingerprint, so resizing keeps live
   budgets. Every quota `429` now carries `Retry-After` (whole seconds,
   independent of `expose_headers`): exact for the local token bucket and
-  sliding aggregate, a conservative upper bound (at most `9/8` of the window)
-  in Redis mode. Successful WebSocket handshake responses now carry the
+  sliding aggregate, a conservative upper bound (at most `19/16` of the
+  window, covering a retrying gateway whose selection lags execution by one
+  sub-bucket) in Redis mode, and the longest wait over every refusing window
+  when several refuse. Successful WebSocket handshake responses now carry the
   `x-ratelimit-*` headers under `expose_headers` and have a backend
   `x-ratelimit-identity` stripped, like every other admitted response.
 - **XML parsing moves to roxmltree 0.21.2** (issue #6590). 0.21.2 parses
@@ -160,6 +162,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   charge is in flight no longer leaves the `INCR` uncompensated (which let
   short-deadline callers keep re-arming a shared key's exhaustion). The same
   applies to `graphql` and `grpc_method_router` quotas, which share the path.
+- **`grpc_method_router` per-method quota refusals count in
+  `ferrum_rate_limit_exceeded_total`.** Only its state-capacity refusal was
+  counted; a method's exhausted budget returned `429` without touching the
+  counter every other request quota increments.
 - **NodeWaypoint capture relays evaluate the destination pod's own
   AuthorizationPolicy.** A NodeWaypoint terminating transparent inbound capture
   for an enrolled pod in another namespace stamped that pod's exact policy

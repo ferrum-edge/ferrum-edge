@@ -1238,3 +1238,51 @@ fn method_rate_shape_errors_keep_schema_and_suggestions_without_supplied_content
         }
     }
 }
+
+/// A per-method quota refusal counts in `ferrum_rate_limit_exceeded_total`, as
+/// every other request-quota refusal does (the capacity refusal already did).
+#[tokio::test]
+async fn method_quota_refusal_records_the_rate_limit_exceeded_counter() {
+    use ferrum_edge::plugins::prometheus_metrics::global_registry;
+
+    fn exceeded_total() -> u64 {
+        global_registry()
+            .render_uncached()
+            .lines()
+            .find_map(|line| {
+                let (series, value) = line.split_once(' ')?;
+                if series.starts_with("ferrum_rate_limit_exceeded_total") {
+                    value.parse::<u64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    let config = json!({
+        "method_rate_limits": {
+            "/pkg.Svc/Counted": { "max_requests": 1, "window_seconds": 60 }
+        }
+    });
+    let plugin = create_plugin("grpc_method_router", &config)
+        .unwrap()
+        .unwrap();
+    let mut ctx = create_grpc_context("/pkg.Svc/Counted");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert_continue(enforce_effective_path(plugin.as_ref(), &mut ctx).await);
+
+    let before = exceeded_total();
+    let mut ctx = create_grpc_context("/pkg.Svc/Counted");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert_reject(
+        enforce_effective_path(plugin.as_ref(), &mut ctx).await,
+        Some(429),
+    );
+    // The counter is process-wide and only grows, so concurrent tests can add
+    // to it but never hide this refusal's increment.
+    assert!(
+        exceeded_total() > before,
+        "a per-method quota refusal must increment ferrum_rate_limit_exceeded_total"
+    );
+}

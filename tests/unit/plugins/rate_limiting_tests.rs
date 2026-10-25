@@ -3400,6 +3400,43 @@ async fn quota_refusals_carry_retry_after() {
     }
 }
 
+/// PR6814-MUSE-1: a request refused by several windows is told the LONGEST
+/// wait, so a compliant client is not refused again by the longer window; the
+/// published budget still names the first refusing window.
+#[tokio::test]
+async fn a_multi_window_refusal_names_the_longest_wait() {
+    let plugin = make_rate_limiter(json!({
+        "requests_per_second": 5,
+        "requests_per_minute": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    }));
+    for _ in 0..5 {
+        let mut ctx = create_test_context();
+        assert_continue(plugin.on_request_received(&mut ctx).await);
+    }
+    let mut ctx = create_test_context();
+    match plugin.on_request_received(&mut ctx).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 429);
+            assert_eq!(header(&headers, "x-ratelimit-window"), Some("1"));
+            let seconds: u64 = header(&headers, "retry-after")
+                .expect("Retry-After")
+                .parse()
+                .expect("whole seconds");
+            assert!(
+                (60..=61).contains(&seconds),
+                "the per-minute window's wait, not the per-second one: {seconds}"
+            );
+        }
+        other => panic!("expected a 429, got {other:?}"),
+    }
+}
+
 /// rate_limiting-CLAUDE-8: the local key cap is `max_state_entries`, bounded
 /// and validated; at the cap existing keys keep their budgets.
 #[tokio::test]

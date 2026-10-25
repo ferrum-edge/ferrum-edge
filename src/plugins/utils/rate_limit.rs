@@ -302,7 +302,8 @@ pub struct RateLimitOutcome {
     /// refusals (`check_http_windows` / `check_http_windows_redis`); every
     /// other outcome leaves it `None`. An exact value where the algorithm
     /// knows one (token bucket, local sliding aggregate) and a conservative
-    /// upper bound otherwise (the Redis sub-bucket ladder).
+    /// upper bound otherwise (the Redis sub-bucket ladder). With several
+    /// refusing windows it is the longest of their waits.
     pub retry_after_seconds: Option<u64>,
 }
 
@@ -2252,7 +2253,13 @@ fn check_http_windows(
     // window 0's counter is inflated — the request was never served but
     // the rate limit budget is consumed.
 
-    // First pass: check all windows without modifying counters.
+    // First pass: check all windows without modifying counters. A refusal
+    // still checks the remaining windows (checking only refills / advances,
+    // it never charges), so `Retry-After` can name the LONGEST wait over every
+    // refusing window: retrying when only the first refusing window has freed
+    // budget would be refused again by a longer one. The refusal still names
+    // the first refusing window in `limit` / `window_seconds`.
+    let mut refused: Option<(u64, u64, u64)> = None;
     for (idx, window) in state.iter_mut().enumerate() {
         let spec = &specs[idx];
         let allowed = match window {
@@ -2266,11 +2273,19 @@ fn check_http_windows(
                     bucket.retry_after_seconds(spec.duration.as_secs())
                 }
             };
-            return RateLimitOutcome::deny()
-                .with_limit(spec.limit)
-                .with_window(spec.duration.as_secs())
-                .with_retry_after(retry_after);
+            refused = Some(match refused {
+                Some((limit, window_seconds, longest)) => {
+                    (limit, window_seconds, longest.max(retry_after))
+                }
+                None => (spec.limit, spec.duration.as_secs(), retry_after),
+            });
         }
+    }
+    if let Some((limit, window_seconds, retry_after)) = refused {
+        return RateLimitOutcome::deny()
+            .with_limit(limit)
+            .with_window(window_seconds)
+            .with_retry_after(retry_after);
     }
 
     // Second pass: all windows allow — now increment all counters.
@@ -2346,19 +2361,24 @@ async fn check_http_windows_redis_detached(
 ///
 /// Settlement keeps every retained charge keyed at the server bucket it
 /// executed in or the one before it, so no charge counted against this
-/// request is keyed later than `server_bucket`. A reader at bucket `r` counts
-/// `[r - K - 1, r + 1]`, so that newest charge — and with it every older one —
-/// has left every reader's ladder once readers reach `server_bucket + K + 2`.
-/// That is an upper bound on when the window has budget again (absent new
-/// traffic): `settled_at` lies inside `server_bucket`, so the wait is more
-/// than `K + 1` and at most `K + 2` sub-buckets — up to two sub-buckets (an
-/// eighth of the window) longer than the window itself.
+/// request is keyed later than `server_bucket`. A reader that SELECTED bucket
+/// `r` counts `[r - K - 1, r + 1]`, and settlement admits a retrying reader
+/// whose selection lags its execution by one bucket (`r = exec - 1`, a
+/// gateway whose learned offset trails Redis by its reply latency). So the
+/// newest charge — and with it every older one — has left every settled
+/// reader's ladder only once readers EXECUTE in `server_bucket + K + 3`
+/// (selecting `server_bucket + K + 2`, whose ladder starts at
+/// `server_bucket + 1`). That is an upper bound on when the window has budget
+/// again (absent new traffic): `settled_at` lies inside `server_bucket`, so
+/// the wait is more than `K + 2` and at most `K + 3` sub-buckets — up to
+/// three sub-buckets (`3/16` of the window) longer than the window itself,
+/// the same three-sub-bucket over-count the ladder documents.
 fn redis_quota_retry_after_seconds(settled_at: Duration, window_seconds: u64) -> u64 {
     let sub_bucket_nanos = redis_sub_bucket_nanos(window_seconds);
     let settled_nanos = settled_at.as_nanos();
     let server_bucket = settled_nanos / sub_bucket_nanos;
     let freed_at_nanos = server_bucket
-        .saturating_add(REDIS_WINDOW_SUB_BUCKETS as u128 + 2)
+        .saturating_add(REDIS_WINDOW_SUB_BUCKETS as u128 + 3)
         .saturating_mul(sub_bucket_nanos);
     retry_after_seconds_from_nanos(freed_at_nanos.saturating_sub(settled_nanos))
 }
@@ -2727,6 +2747,11 @@ async fn check_http_windows_redis(
 
     let mut tightest: Option<(u64, u64, u64)> = None;
     let mut refused: Option<&RateLimitWindowSpec> = None;
+    // The longest `Retry-After` bound over EVERY refusing window, not just the
+    // first: a client that waits only for the shortest refusing window to free
+    // budget is refused again by a longer one.
+    let settled_at = charged.settled_at();
+    let mut retry_after = 0_u64;
     for (index, spec) in specs.iter().enumerate() {
         // Already the full trailing-window sum, with each sub-bucket floored at
         // zero (a counter can only be negative when a compensation raced its
@@ -2734,8 +2759,15 @@ async fn check_http_windows_redis(
         // it must never be a rounded float.
         let usage = counts[index];
         if usage > spec.limit {
-            refused = Some(spec);
-            break;
+            if refused.is_none() {
+                refused = Some(spec);
+            }
+            let window_seconds = spec.duration.as_secs();
+            let bound = settled_at.map_or(window_seconds, |settled_at| {
+                redis_quota_retry_after_seconds(settled_at, window_seconds)
+            });
+            retry_after = retry_after.max(bound);
+            continue;
         }
 
         let remaining = spec.limit.saturating_sub(usage);
@@ -2758,16 +2790,12 @@ async fn check_http_windows_redis(
         // The completion handle is dropped on purpose: dropping it cannot
         // cancel the task, and unlike the rebuild there is no ladder left to
         // keep honest, so the refusal must not wait for the `DECR`.
-        let window_seconds = spec.duration.as_secs();
-        let retry_after = charged.settled_at().map_or(window_seconds, |settled_at| {
-            redis_quota_retry_after_seconds(settled_at, window_seconds)
-        });
         let _ = Arc::clone(redis)
             .spawn_uncharge_rate_limit_windows(charges)
             .await;
         return Ok(RateLimitOutcome::deny()
             .with_limit(spec.limit)
-            .with_window(window_seconds)
+            .with_window(spec.duration.as_secs())
             .with_retry_after(retry_after));
     }
 
