@@ -795,8 +795,10 @@ impl AiRateLimiter {
     /// The `model_limits` entry this request is charged against, if any.
     ///
     /// Read back from instance-scoped metadata written at admission, so every
-    /// reconciliation addresses the same window admission did — even after a
-    /// later body transform changed the request's `model`.
+    /// reconciliation addresses the same window admission did. A body
+    /// transform that changes the request's `model` re-attributes the
+    /// reservation in the final request-body hook (see
+    /// `reattribute_final_model`), which rewrites this marker.
     fn budget_model<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
         if self.model_limits.is_empty() {
             return None;
@@ -840,6 +842,12 @@ impl AiRateLimiter {
         {
             return *limit;
         }
+        self.default_limit(ctx)
+    }
+
+    /// The ceiling of this request's default (non-model) window: its
+    /// consumer's `consumer_limits` override, else `token_limit`.
+    fn default_limit(&self, ctx: &RequestContext) -> u64 {
         if self.limit_by == "consumer"
             && !self.consumer_limits.is_empty()
             && let Some(identity) = ctx.effective_identity()
@@ -848,6 +856,25 @@ impl AiRateLimiter {
             return *limit;
         }
         self.token_limit
+    }
+
+    /// The model budget an AI candidate whose `model` cannot be read is
+    /// charged against when `model_limits` is configured
+    /// (`PR6847-SOL-2`).
+    ///
+    /// A still-compressed or unparseable body may be a call to any model, so
+    /// substituting the (usually much larger) default window would let a
+    /// listed model's ceiling be exceeded simply by making the body
+    /// uninspectable. Fail closed instead: charge the STRICTEST listed model
+    /// budget when it is smaller than this request's default ceiling. A
+    /// co-located `compression` plugin with `decompress_request: true` lets
+    /// such requests be attributed to their real model.
+    fn uninspectable_budget_model(&self, ctx: &RequestContext) -> Option<String> {
+        let (model, limit) = self
+            .model_limits
+            .iter()
+            .min_by(|left, right| left.1.cmp(right.1).then_with(|| left.0.cmp(right.0)))?;
+        (*limit < self.default_limit(ctx)).then(|| model.clone())
     }
 
     fn check_budget_op(&self, limit: u64) -> AiRateLimitOp {
@@ -1345,17 +1372,23 @@ impl AiRateLimiter {
     ///
     /// A `POST` whose body does NOT parse is an uninspectable AI candidate —
     /// handled like a still-compressed body — when it is labelled JSON or
-    /// starts like a JSON object: nesting past the parser's depth limit or a
-    /// document only a lenient upstream accepts must not make a provider call
-    /// free (`ai_rate_limiter-MUSE-2`). An empty body, prose, binary uploads,
-    /// and framed gRPC-Web stay non-AI.
+    /// starts like a JSON object, under ANY label, gRPC-Web included: nesting
+    /// past the parser's depth limit or a document only a lenient upstream
+    /// accepts must not make a provider call free (`ai_rate_limiter-MUSE-2`,
+    /// `PR6847-SOL-1`). An empty body, prose, binary uploads, and genuine
+    /// frames stay non-AI.
+    ///
+    /// Only `POST` is in scope at all: a body-bearing `GET` (another plugin may
+    /// stage one) never consults the budget (`PR6847-SOL-5`).
     fn classify_staged_body(
         &self,
         ctx: &RequestContext,
         is_post: bool,
         json_label: bool,
-        framed_label: bool,
     ) -> RequestClass {
+        if !is_post {
+            return RequestClass::NonAi;
+        }
         let Some(text) = ctx.metadata.get("request_body") else {
             // No text view: an empty body, or bytes that are not UTF-8 (for
             // example UTF-16 JSON, which lenient parsers accept). Only a JSON
@@ -1365,23 +1398,28 @@ impl AiRateLimiter {
                 .get("request_body_size_bytes")
                 .and_then(|size| size.parse::<u64>().ok())
                 .is_some_and(|size| size > 0);
-            return if is_post && json_label && non_empty {
+            return if json_label && non_empty {
                 RequestClass::Uninspectable
             } else {
                 RequestClass::NonAi
             };
         };
-        if let Some(json) = parse_request_json(text) {
-            return self.classify_json(ctx, &json);
-        }
-        let first = json_body_start(text.as_bytes());
-        if !is_post || framed_label || first.is_none() {
-            return RequestClass::NonAi;
-        }
-        if json_label || first == Some(b'{') {
-            RequestClass::Uninspectable
-        } else {
-            RequestClass::NonAi
+        self.classify_body_bytes(ctx, text.as_bytes(), json_label)
+    }
+
+    /// Classify one candidate `POST` body from its bytes: a parsed document
+    /// by its LLM shape, an unparseable one by [`unparseable_body_class`].
+    /// Shared by `before_proxy` and the final request-body hook so the two
+    /// boundaries cannot disagree about a body (`PR6847-SOL-4`).
+    fn classify_body_bytes(
+        &self,
+        ctx: &RequestContext,
+        body: &[u8],
+        json_label: bool,
+    ) -> RequestClass {
+        match std::str::from_utf8(body).ok().and_then(parse_request_json) {
+            Some(json) => self.classify_json(ctx, &json),
+            None => unparseable_body_class(json_body_start(body), json_label),
         }
     }
 
@@ -1436,9 +1474,9 @@ impl AiRateLimiter {
         }
     }
 
-    /// Record the digest of a `POST` body classified as non-AI, so the final
-    /// request-body hook can tell whether a transform changed it.
-    fn record_non_ai_body_digest(&self, ctx: &mut RequestContext) {
+    /// Record the digest of the `POST` body `before_proxy` classified, so the
+    /// final request-body hook can tell whether a transform changed it.
+    fn record_classified_body_digest(&self, ctx: &mut RequestContext) {
         let Some(digest) = ctx
             .metadata
             .get("request_body")
@@ -1455,12 +1493,18 @@ impl AiRateLimiter {
     /// take a safe pre-reservation, so an AI call is tagged uninspectable and
     /// the default `charge_estimate` rejects a usage-less 2xx instead of
     /// treating the absent estimate as a free charge.
-    fn classify_deferred_final_body(
+    ///
+    /// With `model_limits`, `before_proxy` pinned the request to the strictest
+    /// model budget because its model was unknown. Now that the model is
+    /// readable, the request is re-attributed to its real budget window and
+    /// re-checked against it; nothing was reserved, so moving the window
+    /// releases nothing (`PR6847-SOL-2`).
+    async fn classify_deferred_final_body(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
-    ) {
+    ) -> PluginResult {
         // Defensive re-check against the final headers: a deferred body should
         // be JSON and decompressed by now. If `content-encoding` is somehow
         // still present (no `transform_request_body` decoded it) or the
@@ -1482,42 +1526,75 @@ impl AiRateLimiter {
         // non-AI JSON body on a shared proxy is never subjected to the
         // `on_unmetered_response` policy. A JSON body that does not parse at
         // all is an uninspectable candidate (`ai_rate_limiter-MUSE-2`).
-        let ai_candidate = !inspectable
-            || match std::str::from_utf8(body).ok().and_then(parse_request_json) {
-                Some(json) => json_looks_like_ai_request(&json, self.cohere_native_request(ctx)),
-                None => json_body_start(body).is_some(),
-            };
-        if ai_candidate {
-            ctx.metadata
-                .insert(self.keys.ai_request.clone(), "true".to_string());
-            ctx.metadata
-                .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
+        let class = if inspectable {
+            self.classify_body_bytes(ctx, body, true)
+        } else {
+            RequestClass::Uninspectable
+        };
+        let matched_model = match class {
+            RequestClass::Ai { budget_model, .. } => Some(budget_model),
+            RequestClass::Uninspectable => None,
+            RequestClass::Deferred | RequestClass::NonAi => {
+                // Not an AI call after all: drop the provisional model pin so
+                // nothing is attributed to it.
+                ctx.metadata.remove(&self.keys.budget_model);
+                return PluginResult::Continue;
+            }
+        };
+        if let Some(matched_model) = matched_model
+            && !self.model_limits.is_empty()
+            && matched_model.as_deref() != self.budget_model(ctx)
+        {
+            match matched_model {
+                Some(model) => {
+                    ctx.metadata.insert(self.keys.budget_model.clone(), model);
+                }
+                None => {
+                    ctx.metadata.remove(&self.keys.budget_model);
+                }
+            }
+            let key = self.budget_key(ctx);
+            let limit = self.effective_limit(ctx);
+            if let Err(rejection) = self.admit(key, limit, 0).await {
+                return rejection;
+            }
         }
+        ctx.metadata
+            .insert(self.keys.ai_request.clone(), "true".to_string());
+        ctx.metadata
+            .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
+        PluginResult::Continue
     }
 
     /// Re-classify a backend-visible body that differs from the one
-    /// `before_proxy` judged non-AI (`ai_rate_limiter-SOL-2`).
+    /// `before_proxy` classified.
     ///
     /// Body transforms run after `before_proxy`, so a `request_transformer`
     /// rename or add can turn an ordinary JSON `POST` into a valid provider
-    /// request. Without this pass that call carried no AI marker, its response
-    /// was never an accounting candidate, and even explicit provider usage was
-    /// discarded — a persistent bypass, not a temporary underestimate. A newly
-    /// identified AI call is admitted here against its FINAL cost (reserve, or
-    /// refuse with the usual `429`/`503`), so it enters the normal
-    /// reconciliation lifecycle. An unchanged body (the digest recorded in
-    /// `before_proxy` matches) costs one hash and no parse.
+    /// request (`ai_rate_limiter-SOL-2`). Without this pass that call carried
+    /// no AI marker, its response was never an accounting candidate, and even
+    /// explicit provider usage was discarded — a persistent bypass, not a
+    /// temporary underestimate. A newly identified AI call is admitted here
+    /// against its FINAL cost (reserve, or refuse with the usual `429`/`503`),
+    /// so it enters the normal reconciliation lifecycle. The final body is
+    /// classified exactly as `before_proxy` classifies one: a changed body
+    /// that cannot be parsed but looks like JSON enters the fail-closed
+    /// uninspectable lifecycle (`PR6847-SOL-4`). An unchanged body (the digest
+    /// recorded in `before_proxy` matches) costs one hash and no parse.
+    ///
+    /// For a request already admitted as an AI call, only its model budget can
+    /// change: see [`Self::reattribute_final_model`].
     async fn reclassify_final_body(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if ctx.method != "POST"
-            || self.response_accounting_candidate(ctx)
-            || has_non_identity_content_encoding(headers)
-            || body.is_empty()
-        {
+        if ctx.method != "POST" || has_non_identity_content_encoding(headers) || body.is_empty() {
+            return PluginResult::Continue;
+        }
+        let already_admitted = self.response_accounting_candidate(ctx);
+        if already_admitted && self.model_limits.is_empty() {
             return PluginResult::Continue;
         }
         let classified_digest = ctx
@@ -1527,18 +1604,22 @@ impl AiRateLimiter {
         if classified_digest == Some(request_body_digest(body)) {
             return PluginResult::Continue;
         }
-        let Some(json) = std::str::from_utf8(body).ok().and_then(parse_request_json) else {
-            return PluginResult::Continue;
-        };
-        let RequestClass::Ai {
-            estimate,
-            budget_model,
-        } = self.classify_json(ctx, &json)
-        else {
-            return PluginResult::Continue;
-        };
-        // Release the parsed document before the backend round trip.
-        drop(json);
+        if already_admitted {
+            return self.reattribute_final_model(ctx, body).await;
+        }
+
+        let content_type = headers.get("content-type").map(String::as_str);
+        let json_label = !content_type.is_some_and(is_framed_grpc_content_type)
+            && content_type.is_some_and(is_json_content_type);
+        let (estimate, budget_model, uninspectable) =
+            match self.classify_body_bytes(ctx, body, json_label) {
+                RequestClass::Ai {
+                    estimate,
+                    budget_model,
+                } => (estimate, budget_model, false),
+                RequestClass::Uninspectable => (0, self.uninspectable_budget_model(ctx), true),
+                RequestClass::Deferred | RequestClass::NonAi => return PluginResult::Continue,
+            };
         if let Some(model) = budget_model {
             ctx.metadata.insert(self.keys.budget_model.clone(), model);
         }
@@ -1550,6 +1631,75 @@ impl AiRateLimiter {
         };
         ctx.metadata
             .insert(self.keys.ai_request.clone(), "true".to_string());
+        if uninspectable {
+            ctx.metadata
+                .insert(self.keys.compressed_ai_request.clone(), "true".to_string());
+        }
+        self.record_admission(ctx, &outcome, estimate);
+        PluginResult::Continue
+    }
+
+    /// Re-attribute an admitted AI call whose model a body transform changed
+    /// (`PR6847-SOL-3`).
+    ///
+    /// The admission reserved against the model budget the INBOUND body named.
+    /// If the backend-visible body now names a different budget (a listed
+    /// model, a different listed model, or no listed model), that reservation
+    /// is released on its old window and the call is admitted again against
+    /// the final model's window and ceiling with the final body's estimate —
+    /// refused with the usual `429`/`503` if that window cannot cover it — so
+    /// every later reconciliation charges the window of the model the
+    /// provider actually served. A body that no longer parses, or no longer
+    /// looks like an AI call, keeps its admitted attribution.
+    async fn reattribute_final_model(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
+        let Some(json) = std::str::from_utf8(body).ok().and_then(parse_request_json) else {
+            return PluginResult::Continue;
+        };
+        if !json_looks_like_ai_request(&json, self.cohere_native_request(ctx)) {
+            return PluginResult::Continue;
+        }
+        let final_model = self.matched_budget_model(&json);
+        if final_model.as_deref() == self.budget_model(ctx) {
+            return PluginResult::Continue;
+        }
+        let estimate = self.estimate_request_tokens_from_json(&json);
+        // Release the parsed document before the backend round trips.
+        drop(json);
+
+        let reserved_tokens = self.reserved_tokens(ctx);
+        if reserved_tokens > 0 {
+            // Best effort: if the old window's store cannot be reached, its
+            // reservation simply expires with the window — the conservative
+            // direction.
+            let _ = self
+                .adjust_usage(
+                    self.budget_key(ctx),
+                    self.reservation_id(ctx),
+                    self.reserved_window_index(ctx),
+                    self.reservation_backend(ctx),
+                    0,
+                    reserved_tokens,
+                )
+                .await;
+        }
+        ctx.metadata.remove(&self.keys.reserved_tokens);
+        ctx.metadata.remove(&self.keys.reservation_id);
+        ctx.metadata.remove(&self.keys.reserved_window_index);
+        match final_model {
+            Some(model) => {
+                ctx.metadata.insert(self.keys.budget_model.clone(), model);
+            }
+            None => {
+                ctx.metadata.remove(&self.keys.budget_model);
+            }
+        }
+
+        let key = self.budget_key(ctx);
+        let limit = self.effective_limit(ctx);
+        let outcome = match self.admit(key, limit, estimate).await {
+            Ok(outcome) => outcome,
+            Err(rejection) => return rejection,
+        };
         self.record_admission(ctx, &outcome, estimate);
         PluginResult::Continue
     }
@@ -2189,6 +2339,20 @@ fn json_body_start(body: &[u8]) -> Option<u8> {
     body.iter()
         .copied()
         .find(|byte| !byte.is_ascii_whitespace())
+}
+
+/// Scope of a `POST` body that does not parse, from its first significant
+/// byte: blank is non-AI; a body that begins like a JSON object — whatever its
+/// label — or any non-blank JSON-labelled body is an uninspectable AI
+/// candidate; anything else (prose, binary, a gRPC-Web frame's flag byte) is
+/// non-AI.
+fn unparseable_body_class(first: Option<u8>, json_label: bool) -> RequestClass {
+    match first {
+        None => RequestClass::NonAi,
+        Some(b'{') => RequestClass::Uninspectable,
+        Some(_) if json_label => RequestClass::Uninspectable,
+        Some(_) => RequestClass::NonAi,
+    }
 }
 
 /// Cheap in-process digest of a request body, used only to tell whether the
@@ -3172,7 +3336,7 @@ impl Plugin for AiRateLimiter {
                 .unwrap_or(RequestClass::Deferred)
         } else {
             // Case C: uncompressed — classify the buffered inbound body.
-            self.classify_staged_body(ctx, is_post, json_label, framed_label)
+            self.classify_staged_body(ctx, is_post, json_label)
         };
 
         // Out-of-scope traffic — a `GET`, a framed gRPC-Web call, a parsed
@@ -3184,7 +3348,7 @@ impl Plugin for AiRateLimiter {
         // request-body hook can tell whether a transform changed it.
         if matches!(class, RequestClass::NonAi) {
             if is_post && !still_compressed {
-                self.record_non_ai_body_digest(ctx);
+                self.record_classified_body_digest(ctx);
             }
             return PluginResult::Continue;
         }
@@ -3247,13 +3411,18 @@ impl Plugin for AiRateLimiter {
         //    (Case B). The rare decoded fallback without a refreshed text view
         //    defers classification to `on_final_request_body`; a usage-less 2xx
         //    can therefore never turn the missing estimate into a free call.
-        if let RequestClass::Ai {
-            budget_model: Some(model),
-            ..
-        } = &class
-        {
-            ctx.metadata
-                .insert(self.keys.budget_model.clone(), model.clone());
+        // The model budget this request is charged against. A candidate whose
+        // model cannot be read is pinned to the strictest listed model budget
+        // rather than the default window (`PR6847-SOL-2`).
+        let budget_model = match &class {
+            RequestClass::Ai { budget_model, .. } => budget_model.clone(),
+            RequestClass::Uninspectable | RequestClass::Deferred => {
+                self.uninspectable_budget_model(ctx)
+            }
+            RequestClass::NonAi => None,
+        };
+        if let Some(model) = budget_model {
+            ctx.metadata.insert(self.keys.budget_model.clone(), model);
         }
         let reserved_tokens = match &class {
             RequestClass::Ai { estimate, .. } => *estimate,
@@ -3290,6 +3459,12 @@ impl Plugin for AiRateLimiter {
             RequestClass::Ai { .. } => {
                 ctx.metadata
                     .insert(self.keys.ai_request.clone(), "true".to_string());
+                // With model budgets, the final request-body hook must be able
+                // to tell whether a transform changed the body (and so,
+                // possibly, the model) after this admission (`PR6847-SOL-3`).
+                if !self.model_limits.is_empty() {
+                    self.record_classified_body_digest(ctx);
+                }
             }
             RequestClass::NonAi => {}
         }
@@ -3313,8 +3488,7 @@ impl Plugin for AiRateLimiter {
             .remove(&self.keys.deferred_compressed_classification)
             .is_some()
         {
-            self.classify_deferred_final_body(ctx, headers, body);
-            return PluginResult::Continue;
+            return self.classify_deferred_final_body(ctx, headers, body).await;
         }
         self.reclassify_final_body(ctx, headers, body).await
     }

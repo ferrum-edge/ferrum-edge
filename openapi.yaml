@@ -36052,7 +36052,12 @@ components:
             `model`. A request for a listed model is charged against that
             model's own window per identity, with this ceiling, and never
             against the default window; a model budget takes precedence over
-            consumer_limits. Unlisted models use the default budget.
+            consumer_limits. Unlisted models use the default budget. A request
+            whose model cannot be read before dispatch (still-compressed or
+            unparseable body) is charged against the strictest listed model
+            budget when that is smaller than its default ceiling. A request
+            transform that changes model re-attributes the reservation to the
+            final model's budget.
         media_token_estimate:
           type: integer
           format: uint64
