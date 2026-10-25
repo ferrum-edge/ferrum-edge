@@ -22748,8 +22748,9 @@ components:
           description: |
             Template body. Supports generic notification variables plus
             proxy_alerts variables such as `${rule_name}`, `${proxy_name}`,
-            `${incident_key}` (stable per namespace + proxy + rule; use it as
-            the receiver's correlation key, e.g. PagerDuty `dedup_key`),
+            `${incident_key}` (stable per plugin config + namespace + proxy +
+            rule; use it as the receiver's correlation key, e.g. PagerDuty
+            `dedup_key`),
             `${observed}`, `${threshold}`, `${sample_count}` (total samples in
             the rule window), `${window_seconds}`, and `${reason}`. Empty
             strings are allowed. Unbalanced `${`

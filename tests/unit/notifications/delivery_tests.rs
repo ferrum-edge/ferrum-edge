@@ -2044,3 +2044,299 @@ async fn proxy_alerts_idle_proxy_resolves_from_background_reevaluation() {
     assert_eq!(state(), Some(RuleState::Healthy));
     server.await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Fix round 1: timer-observed re-breach and policy-scoped incident keys
+// ---------------------------------------------------------------------------
+
+fn grpc_alert_summary(grpc_status: &str) -> TransactionSummary {
+    let mut summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: Some("p1".to_string()),
+        proxy_name: Some("api".to_string()),
+        response_status_code: 200,
+        body_completed: true,
+        ..TransactionSummary::default()
+    };
+    summary
+        .metadata
+        .insert("request_protocol".to_string(), "grpc".to_string());
+    summary
+        .metadata
+        .insert("grpc_status".to_string(), grpc_status.to_string());
+    summary
+}
+
+fn latency_alert_summary(total_ms: f64) -> TransactionSummary {
+    TransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: Some("p1".to_string()),
+        proxy_name: Some("api".to_string()),
+        response_status_code: 200,
+        latency_total_ms: total_ms,
+        ..TransactionSummary::default()
+    }
+}
+
+/// Drive a rule whose window re-breaches purely through aging once traffic
+/// stops, and require the timer to restart recovery instead of resolving on
+/// the stale recovery start.
+///
+/// 60s window = ten 6s buckets, `resolved_window_seconds: 70`:
+/// - t=1s one `bad` sample: Trigger, Active.
+/// - t=7s three `good` samples: the first clears the window, recovery starts.
+/// - t=31s one `bad` sample: still clear (minority), still Recovering.
+/// - t=70s: the t=1s and t=7s buckets have expired, only the t=31s `bad`
+///   sample remains, so the window breaches again with no new traffic.
+/// - t=90s: that sample expires and the window clears. Without the reset the
+///   old t=7s recovery start (83s ago) would admit Resolve immediately.
+async fn assert_timer_rebreach_restarts_recovery(
+    case: &str,
+    mut rule: serde_json::Value,
+    bad: &TransactionSummary,
+    good: &TransactionSummary,
+) {
+    let (addr, count, notify, server) = spawn_status_sequence_server(vec![200, 200]).await;
+    rule["name"] = json!("aging");
+    rule["window_seconds"] = json!(60);
+    rule["min_request_count"] = json!(1);
+    rule["recovery"] = json!({ "resolved_window_seconds": 70 });
+    rule["channels"] = json!(["c"]);
+    let cfg = json!({
+        "max_concurrent_dispatches": 4,
+        "max_delivery_retries": 0,
+        "channels": {
+            "c": { "type": "webhook", "url": format!("http://{addr}/alert"), "body_template": "x" }
+        },
+        "rules": [rule]
+    });
+    let plugin = ProxyAlerts::new(&cfg, PluginHttpClient::default()).unwrap();
+    plugin.stop_lifecycle_task_for_test();
+    let generation = plugin.dispatch_generation_for_test();
+    let state = || plugin.recovery_state_for_test(0, ALERT_PROXY, 0);
+
+    plugin.handle_sample_at_for_test(SampleInput::Http(bad), 1_000);
+    wait_for_count(&count, &notify, 1).await;
+    assert!(generation.wait_drain(Duration::from_secs(10)).await);
+    assert!(
+        matches!(state(), Some(RuleState::Active { .. })),
+        "{case}: initial breach must alert"
+    );
+
+    for _ in 0..3 {
+        plugin.handle_sample_at_for_test(SampleInput::Http(good), 7_000);
+    }
+    assert_eq!(
+        state(),
+        Some(RuleState::Recovering {
+            left_threshold_at_ms: 7_000
+        }),
+        "{case}: the first healthy sample starts recovery"
+    );
+    plugin.handle_sample_at_for_test(SampleInput::Http(bad), 31_000);
+    assert!(
+        matches!(state(), Some(RuleState::Recovering { .. })),
+        "{case}: a minority bad sample keeps the window clear"
+    );
+
+    // Traffic has stopped; aging alone re-breaches the window.
+    plugin.reevaluate_incidents_at_for_test(70_000);
+    assert_eq!(
+        state(),
+        Some(RuleState::Active {
+            fired_at_ms: 70_000
+        }),
+        "{case}: a timer-observed re-breach must reset recovery to Active"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "{case}: the timer must never send a Trigger or reminder"
+    );
+
+    // The window clears: a fresh recovery interval starts now.
+    plugin.reevaluate_incidents_at_for_test(90_000);
+    assert_eq!(
+        state(),
+        Some(RuleState::Recovering {
+            left_threshold_at_ms: 90_000
+        }),
+        "{case}: the next clear must restart recovery, not resolve on the stale start"
+    );
+    plugin.reevaluate_incidents_at_for_test(159_000);
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "{case}: Resolve before a continuous resolved_window_seconds clear"
+    );
+
+    plugin.reevaluate_incidents_at_for_test(160_000);
+    wait_for_count(&count, &notify, 2).await;
+    assert!(generation.wait_drain(Duration::from_secs(10)).await);
+    assert_eq!(state(), Some(RuleState::Healthy), "{case}");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn proxy_alerts_timer_rebreach_restarts_recovery_for_error_rate() {
+    assert_timer_rebreach_restarts_recovery(
+        "error_rate",
+        json!({ "type": "error_rate", "status_codes": [500], "threshold_percent": 75.0 }),
+        &alert_summary(500),
+        &alert_summary(200),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn proxy_alerts_timer_rebreach_restarts_recovery_for_grpc_status_rate() {
+    assert_timer_rebreach_restarts_recovery(
+        "grpc_status_rate",
+        json!({ "type": "grpc_status_rate", "grpc_statuses": [14], "threshold_percent": 75.0 }),
+        &grpc_alert_summary("14"),
+        &grpc_alert_summary("0"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn proxy_alerts_timer_rebreach_restarts_recovery_for_latency_percentile() {
+    // p50 over the window: fast samples dominate until they age out, then the
+    // single slow sample alone puts p50 in the 2500ms bucket (> 1000ms).
+    assert_timer_rebreach_restarts_recovery(
+        "latency_percentile",
+        json!({ "type": "latency_percentile", "metric": "total_ms",
+                "percentile": 50, "threshold_ms": 1000 }),
+        &latency_alert_summary(2_000.0),
+        &latency_alert_summary(10.0),
+    )
+    .await;
+}
+
+/// Reads one request's headers and `Content-Length` body.
+async fn read_request_body(socket: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buf = [0; 1024];
+    loop {
+        let n = socket.read(&mut buf).await.unwrap();
+        if n == 0 {
+            return String::new();
+        }
+        request.extend_from_slice(&buf[..n]);
+        let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            if request.len() > 65_536 {
+                return String::new();
+            }
+            continue;
+        };
+        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let body_start = end + 4;
+        while request.len() < body_start + length {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+        }
+        let body_end = (body_start + length).min(request.len());
+        return String::from_utf8_lossy(&request[body_start..body_end]).into_owned();
+    }
+}
+
+/// Request bodies recorded by [`spawn_body_capture_server`], in arrival order.
+type CapturedBodies = Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Answers `requests` sequential requests with `200`, recording each body.
+async fn spawn_body_capture_server(
+    requests: usize,
+) -> (
+    SocketAddr,
+    CapturedBodies,
+    Arc<Notify>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let notify = Arc::new(Notify::new());
+    let server_bodies = Arc::clone(&bodies);
+    let server_notify = Arc::clone(&notify);
+    let handle = tokio::spawn(async move {
+        for _ in 0..requests {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let body = read_request_body(&mut socket).await;
+            server_bodies.lock().unwrap().push(body);
+            server_notify.notify_waiters();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        }
+    });
+    (addr, bodies, notify, handle)
+}
+
+#[tokio::test]
+async fn proxy_alerts_incident_key_is_scoped_to_the_plugin_config_instance() {
+    use ferrum_edge::plugins::create_plugin_with_http_client_and_config_id;
+    use ferrum_edge::plugins::proxy_alerts::render::incident_key;
+
+    // Two proxy_alerts instances on one proxy legally reuse a rule name and
+    // page the same receiver. Built through the production factory with their
+    // plugin-config ids, they must not share a receiver incident.
+    let (addr, bodies, notify, server) = spawn_body_capture_server(2).await;
+    let cfg = json!({
+        "max_delivery_retries": 0,
+        "channels": {
+            "pd": { "type": "webhook", "url": format!("http://{addr}/enqueue"),
+                    "body_template": "${incident_key}" }
+        },
+        "rules": [
+            { "name": "upstream", "type": "status_code_count",
+              "status_codes": [500], "threshold_count": 1,
+              "cooldown_seconds": 60, "channels": ["pd"] }
+        ]
+    });
+    let build = |config_id: &str| {
+        create_plugin_with_http_client_and_config_id(
+            "proxy_alerts",
+            &cfg,
+            PluginHttpClient::default(),
+            Some(config_id),
+        )
+        .unwrap()
+        .expect("proxy_alerts is a built-in plugin")
+    };
+    let first = build("alerts-a");
+    let second = build("alerts-b");
+    let received = |expected: usize| {
+        let bodies = Arc::clone(&bodies);
+        move || bodies.lock().unwrap().len() >= expected
+    };
+
+    first.log(&alert_summary(500)).await;
+    wait_until(&notify, received(1), "first instance's Trigger").await;
+    second.log(&alert_summary(500)).await;
+    wait_until(&notify, received(2), "second instance's Trigger").await;
+    server.await.unwrap();
+
+    let bodies = bodies.lock().unwrap().clone();
+    let key_a = incident_key("alerts-a", "ferrum", "p1", "upstream");
+    let key_b = incident_key("alerts-b", "ferrum", "p1", "upstream");
+    assert_ne!(key_a, key_b);
+    assert!(
+        bodies[0].contains(&key_a) && !bodies[0].contains(&key_b),
+        "first instance must send its own key: {:?}",
+        bodies[0]
+    );
+    assert!(
+        bodies[1].contains(&key_b) && !bodies[1].contains(&key_a),
+        "second instance must send its own key: {:?}",
+        bodies[1]
+    );
+}

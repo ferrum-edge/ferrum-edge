@@ -43,7 +43,10 @@
 //!   Active/Recovering/CompensatingTrigger incidents against their windows
 //!   every `LIFECYCLE_TICK` (5s) without recording a sample, so an incident on a
 //!   proxy that stopped producing traffic still ages out of breach, enters
-//!   recovery, and resolves on schedule. The task holds only a `Weak` handle
+//!   recovery, and resolves on schedule. A window that re-breaches as samples
+//!   age out (a rate or percentile can rise when older healthy samples expire)
+//!   resets a Recovering incident to Active, so the next clear starts a fresh
+//!   recovery interval; re-evaluation never sends a Trigger or reminder. The task holds only a `Weak` handle
 //!   and is aborted on `Drop`.
 //! - **Best-effort endpoint delivery**: bounded backpressure/failure paths can
 //!   produce zero copies, while transport timeouts, post-write connection
@@ -135,6 +138,10 @@ const EVICTION_EVERY_TICKS: u32 = 12;
 /// before any lifecycle write.
 pub const UNARMED_PROXY_LIFECYCLE_GENERATION: u64 = 0;
 
+/// Policy identity used for `${incident_key}` by instances constructed without
+/// a plugin-config resource id (config validation, direct/test construction).
+pub const STANDALONE_POLICY_ID: &str = "standalone";
+
 static NEXT_DISPATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub struct ProxyAlerts {
@@ -180,6 +187,10 @@ struct AlertCore {
     enabled: AtomicBool,
     quiet_hours: Vec<QuietHourWindow>,
     lifecycle_keep_ms: u64,
+    /// Stable plugin-config resource id of this instance (or
+    /// [`STANDALONE_POLICY_ID`]). Scopes `${incident_key}` so two instances
+    /// reusing a rule name on one proxy never share a receiver incident.
+    policy_id: Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +248,25 @@ thread_local! {
 
 impl ProxyAlerts {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, None)
+    }
+
+    /// Construct with the stable plugin-config resource id the plugin cache
+    /// passes (`None` for validation/direct construction, which uses
+    /// [`STANDALONE_POLICY_ID`]). The id scopes `${incident_key}`. A supplied
+    /// blank id fails closed.
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let policy_id = match plugin_config_id {
+            Some(id) if id.trim().is_empty() => {
+                return Err("proxy_alerts: plugin config id must not be blank".to_string());
+            }
+            Some(id) => id,
+            None => STANDALONE_POLICY_ID,
+        };
         let parsed = ProxyAlertsConfig::parse(http_client.backend_allow_ips(), config)?;
 
         let rule_specs = parsed
@@ -272,6 +302,7 @@ impl ProxyAlerts {
             enabled: AtomicBool::new(parsed.enabled),
             quiet_hours: parsed.quiet_hours,
             lifecycle_keep_ms,
+            policy_id: Arc::from(policy_id),
         });
         let lifecycle_task = start_lifecycle_task(Arc::downgrade(&core));
         Ok(Self {
@@ -798,10 +829,14 @@ impl AlertCore {
     /// Background lifecycle re-evaluation (no sample recorded).
     ///
     /// For every Active / Recovering / CompensatingTrigger incident still owned
-    /// by its generation, snapshot the rule's window at `now_ms`. A window that
-    /// still breaches is left to the traffic path; a non-breaching window is
-    /// fed through the normal per-channel lifecycle, so an idle proxy enters
-    /// recovery and dispatches its single Resolve on schedule.
+    /// by its generation, snapshot the rule's window at `now_ms` and feed it
+    /// through the normal per-channel lifecycle, so an idle proxy enters
+    /// recovery and dispatches its single Resolve on schedule. A breaching
+    /// snapshot is applied too — a window can re-breach without new samples
+    /// when older healthy samples age out — so a Recovering incident returns
+    /// to Active and the next clear restarts the recovery interval. Event
+    /// admission is limited to Resolve here: a breach never sends a Trigger or
+    /// reminder from the timer (`advance_channel` with `time_driven`).
     fn reevaluate_idle_incidents(&self, now_ms: u64, now: DateTime<Utc>) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
@@ -819,9 +854,6 @@ impl AlertCore {
                     }
                     let observation =
                         rule.window_observation(&self.windows, &owner_key, generation, now_ms);
-                    if observation.breach {
-                        continue;
-                    }
                     let subject = self.subject_for(&owner_key, generation);
                     self.process_observation(
                         rule,
@@ -908,6 +940,7 @@ impl AlertCore {
                 channel_id,
                 now_ms,
                 in_quiet,
+                only_channel.is_some(),
             ) {
                 admitted.get_or_insert_with(Vec::new).push(dispatch);
             }
@@ -943,6 +976,7 @@ impl AlertCore {
                         rule,
                         observation,
                         subject,
+                        &self.policy_id,
                         dispatch.event_action,
                         now,
                     ));
@@ -978,6 +1012,11 @@ impl AlertCore {
     /// Evaluate and (when an event is owed and admitted) commit one channel's
     /// lifecycle for this observation. Returns the admitted dispatch, or
     /// `None` when nothing is sent on this channel.
+    ///
+    /// `time_driven` marks the background re-evaluation: non-event transitions
+    /// (enter recovery, re-breach back to Active, compensating fall-back) are
+    /// committed as usual, but only a Resolve may be admitted — a Trigger or
+    /// reminder is left to the traffic path and nothing is reserved for it.
     #[allow(clippy::too_many_arguments)]
     fn advance_channel(
         &self,
@@ -988,6 +1027,7 @@ impl AlertCore {
         channel_id: u32,
         now_ms: u64,
         in_quiet: bool,
+        time_driven: bool,
     ) -> Option<AdmittedDispatch> {
         let gate = self.recovery_gate(channel_id)?;
         let channel = self.channel_by_id.get(&channel_id)?;
@@ -1027,7 +1067,7 @@ impl AlertCore {
             }
             return None;
         };
-        if event_action == EventAction::Trigger && in_quiet {
+        if event_action != EventAction::Resolve && (in_quiet || time_driven) {
             return None;
         }
         // Backpressure: nothing is committed, so this channel keeps owing the

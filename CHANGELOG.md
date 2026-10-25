@@ -149,12 +149,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiver after the Resolve and reopen a recovered incident. A background
   re-evaluation (every 5s) advances Active/Recovering incidents against their
   windows without traffic, so an incident on a proxy that stopped receiving
-  requests resolves on schedule. WebSocket policy closes
+  requests resolves on schedule; a window that re-breaches as samples age out
+  returns a Recovering incident to Active so recovery restarts. WebSocket policy closes
   (`credential_expired`, `trust_withdrawn`, `max_lifetime`) now match
   `gateway_policy` instead of `graceful_shutdown`. `${sample_count}` /
   "Samples" now report the documented window total for count rules (it was
   the matched count). Webhook/email templates gain `${incident_key}`, a stable
-  per-namespace/proxy/rule key, and the PagerDuty examples send it as
+  per-plugin-config/namespace/proxy/rule key, and the PagerDuty examples send it as
   `dedup_key` so Resolve closes the Trigger's incident. Established window,
   cooldown, and recovery lookups are served from a lock-free `ArcSwap`
   snapshot instead of a per-sample mutex, and each rule walks its window

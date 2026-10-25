@@ -3410,7 +3410,7 @@ fn fused_record_and_snapshot_matches_split_record_then_snapshot() {
 }
 
 #[test]
-fn incident_key_correlates_trigger_and_resolve_per_rule_and_proxy() {
+fn incident_key_correlates_trigger_and_resolve_per_policy_rule_and_proxy() {
     use ferrum_edge::notifications::EventAction;
     use ferrum_edge::plugins::proxy_alerts::render::{
         AlertSubject, build_webhook_vars, incident_key,
@@ -3439,26 +3439,17 @@ fn incident_key_correlates_trigger_and_resolve_per_rule_and_proxy() {
         proxy_id: Some("p1"),
         proxy_name: Some("api"),
     };
-    let trigger = build_webhook_vars(
-        rule,
-        &observation,
-        subject,
-        EventAction::Trigger,
-        Utc::now(),
-    );
-    let resolve = build_webhook_vars(
-        rule,
-        &observation,
-        subject,
-        EventAction::Resolve,
-        Utc::now(),
-    );
-    let key = &trigger["incident_key"];
+    let vars = |subject: AlertSubject<'_>, policy: &str, action: EventAction| {
+        build_webhook_vars(rule, &observation, subject, policy, action, Utc::now())
+    };
+    let trigger = vars(subject, "alerts-a", EventAction::Trigger);
+    let resolve = vars(subject, "alerts-a", EventAction::Resolve);
+    let key = trigger["incident_key"].clone();
     assert_eq!(
-        key, &resolve["incident_key"],
+        key, resolve["incident_key"],
         "Resolve must close the Trigger's incident"
     );
-    assert_eq!(key, &incident_key("ferrum", "p1", "proxy_5xx"));
+    assert_eq!(key, incident_key("alerts-a", "ferrum", "p1", "proxy_5xx"));
     assert_eq!(key.len(), 4 + 64);
     assert!(key.starts_with("pa1-"));
     assert!(
@@ -3472,30 +3463,44 @@ fn incident_key_correlates_trigger_and_resolve_per_rule_and_proxy() {
         proxy_name: Some("renamed"),
         ..subject
     };
-    let renamed_vars = build_webhook_vars(
-        rule,
-        &observation,
-        renamed,
-        EventAction::Resolve,
-        Utc::now(),
+    assert_eq!(
+        key,
+        vars(renamed, "alerts-a", EventAction::Resolve)["incident_key"]
     );
-    assert_eq!(key, &renamed_vars["incident_key"]);
 
-    // Different proxies, tenants, and rules are different incidents, and the
-    // fields cannot collide by concatenation.
+    // Another proxy_alerts instance on the same proxy that reuses the rule
+    // name is a different incident: its Resolve cannot close this one.
     assert_ne!(
-        incident_key("ferrum", "p1", "r"),
-        incident_key("ferrum", "p2", "r")
+        key,
+        vars(subject, "alerts-b", EventAction::Resolve)["incident_key"],
+        "the plugin-config identity must scope the incident key"
+    );
+
+    // Different policies, proxies, tenants, and rules are different incidents,
+    // and the fields cannot collide by concatenation.
+    let base = incident_key("pc", "ferrum", "p1", "r");
+    assert_ne!(base, incident_key("pc2", "ferrum", "p1", "r"));
+    assert_ne!(base, incident_key("pc", "ferrum", "p2", "r"));
+    assert_ne!(base, incident_key("pc", "other", "p1", "r"));
+    assert_ne!(base, incident_key("pc", "ferrum", "p1", "s"));
+    assert_ne!(
+        incident_key("pc", "a|b", "c", "r"),
+        incident_key("pc", "a", "b|c", "r")
     );
     assert_ne!(
-        incident_key("ferrum", "p1", "r"),
-        incident_key("other", "p1", "r")
+        incident_key("pcferrum", "", "p1", "r"),
+        incident_key("pc", "ferrum", "p1", "r")
     );
-    assert_ne!(
-        incident_key("ferrum", "p1", "r"),
-        incident_key("ferrum", "p1", "s")
+}
+
+#[test]
+fn blank_plugin_config_id_is_rejected() {
+    let err =
+        ProxyAlerts::new_with_config_id(&minimal_config(), http_client(), Some("  ")).unwrap_err();
+    assert!(err.contains("plugin config id"), "got: {err}");
+    assert!(
+        ProxyAlerts::new_with_config_id(&minimal_config(), http_client(), Some("alerts-a")).is_ok()
     );
-    assert_ne!(incident_key("a|b", "c", "r"), incident_key("a", "b|c", "r"));
 }
 
 #[test]

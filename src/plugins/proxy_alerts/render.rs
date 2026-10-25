@@ -33,7 +33,15 @@ impl<'a> AlertSubject<'a> {
     }
 }
 
-/// Stable receiver-side incident key for one `(namespace, proxy, rule)`.
+/// Stable receiver-side incident key for one
+/// `(plugin config, namespace, proxy, rule)`.
+///
+/// `policy_id` is the stable plugin-config resource id of the `proxy_alerts`
+/// instance (rule names are unique only within one instance, and several
+/// instances may apply to one proxy), so two instances that reuse a rule name
+/// never share a receiver incident. It is the same on every replica and across
+/// compatible reloads; directly constructed instances use
+/// [`super::STANDALONE_POLICY_ID`].
 ///
 /// Identical for the Trigger, every reminder, and the Resolve of the same
 /// rule/proxy, so a receiver that correlates on it (PagerDuty `dedup_key`,
@@ -41,11 +49,11 @@ impl<'a> AlertSubject<'a> {
 /// length-prefixed before hashing so distinct identities cannot collide by
 /// concatenation; the output is fixed-length ASCII (`pa1-` + 64 hex chars),
 /// safe for any JSON string and well under PagerDuty's 255-character limit.
-pub fn incident_key(namespace: &str, proxy_id: &str, rule_name: &str) -> String {
+pub fn incident_key(policy_id: &str, namespace: &str, proxy_id: &str, rule_name: &str) -> String {
     use crate::fips::approved::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(b"ferrum-edge/proxy_alerts/incident/v1");
-    for part in [namespace, proxy_id, rule_name] {
+    for part in [policy_id, namespace, proxy_id, rule_name] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
     }
@@ -113,10 +121,12 @@ pub fn build_notification(
     builder.build()
 }
 
+/// `policy_id` is the instance's stable plugin-config id; see [`incident_key`].
 pub fn build_webhook_vars(
     rule: &Rule,
     observation: &RuleObservation,
     subject: AlertSubject<'_>,
+    policy_id: &str,
     event_action: EventAction,
     now: DateTime<Utc>,
 ) -> HashMap<String, String> {
@@ -133,7 +143,7 @@ pub fn build_webhook_vars(
     vars.insert("namespace".to_string(), subject.namespace.to_string());
     vars.insert(
         "incident_key".to_string(),
-        incident_key(subject.namespace, proxy_id, &common.name),
+        incident_key(policy_id, subject.namespace, proxy_id, &common.name),
     );
     vars.insert("fired_at".to_string(), now.to_rfc3339());
     vars.insert("observed".to_string(), rendered.observed);
